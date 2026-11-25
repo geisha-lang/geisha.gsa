@@ -528,4 +528,87 @@ fi
 echo "PASS [missing_superclass_rejected]: rejected missing superclass instance"
 PASS=$((PASS + 1))
 
+# 12. `--target wasm32`: Full Geisha -> LLVM -> wasm32 -> Node.js WebAssembly E2E (ADT + JSON + Host Import/Export)
+if [ -f "./build/wasm_rt.o" ] && command -v node >/dev/null 2>&1; then
+cat > "$TMP_DIR/t12_wasm.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use std.codec.{Encode, Decoder, object, (:=), (|>), succeed, req, withDefault, int, str}
+use std.json.{toJson, decodeString}
+
+extern "host_notify" def hostNotify(msg: String): Void
+
+data Hero {
+    Hero { name: String, hp: Int },
+}
+
+instance Encode Hero {
+    def encode(h) = object([
+        "name" := h.name,
+        "hp"   := h.hp,
+    ])
+}
+
+def decodeHero(): Decoder Hero =
+    succeed((name) -> (hp) -> Hero { name: name, hp: hp })
+        |> req("name", str)
+        |> withDefault("hp", int, 100)
+
+def counter: Cell Int = cellNew(0)
+
+def bump(delta: Int): Int = {
+    let next = cellGet(counter) + delta;
+    cellSet(counter, next);
+    next
+}
+
+def handle_json(raw: String): String =
+    match decodeString(decodeHero(), raw) {
+        Ok(h) -> {
+            let boosted = Hero { name: h.name, hp: h.hp + cellGet(counter) };
+            let out = toJson(boosted);
+            hostNotify(out);
+            out
+        },
+        Err(_) -> "{\"err\":\"bad\"}",
+    }
+
+def main(): Void = cellSet(counter, 10)
+EOF
+"$GEISHA_BIN" --target wasm32 --runtime ./build/wasm_rt.o -o "$TMP_DIR/t12_wasm.wasm" "$TMP_DIR/t12_wasm.gsa"
+WASM_OUT="$(node -e '
+const fs = require("fs");
+const bytes = fs.readFileSync(process.argv[1]);
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+let mem, ex, notified = "";
+const readStr = (ptr) => {
+  const len = ex.gs_wasm_str_len(ptr);
+  return dec.decode(new Uint8Array(mem.buffer, ptr, len));
+};
+const writeStr = (s) => {
+  const raw = enc.encode(s);
+  const ptr = ex.gs_wasm_alloc(raw.length + 1);
+  const view = new Uint8Array(mem.buffer, ptr, raw.length + 1);
+  view.set(raw);
+  view[raw.length] = 0;
+  return ptr;
+};
+WebAssembly.instantiate(bytes, {
+  env: {
+    host_notify: (ptr) => { notified = readStr(ptr); },
+    gs_log: () => {},
+  }
+}).then(({ instance }) => {
+  ex = instance.exports;
+  mem = ex.memory;
+  ex.__geisha_init();
+  const c = ex.bump(5);
+  const resPtr = ex.handle_json(writeStr("{\"name\":\"Tingfeng\"}"));
+  const res = readStr(resPtr);
+  console.log(c + "|" + res + "|" + (notified === res ? "sync" : "diff"));
+});
+' "$TMP_DIR/t12_wasm.wasm")"
+assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync' "$WASM_OUT"
+fi
+
 echo "All $PASS end-to-end test suites passed!"

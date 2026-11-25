@@ -211,22 +211,22 @@ def alignUp(offset: Int, align: Int): Int =
         if (rem == 0) offset else offset + (align - rem)
     }
 
-// Returns `(byteSize, abiAlign)` on 64-bit LP64 targets (`arm64` / `x86_64`)
-pub def typeSizeAndAlign(ty: Type): (Int, Int) = match ty {
+// Returns `(byteSize, abiAlign)` for target pointer size (`8` on LP64, `4` on wasm32)
+pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int) = match ty {
     TyVoid -> (1, 1),
     TyCon(n) ->
         if (n == "Int") (4, 4)
         else if (n == "Int64") (8, 8)
         else if (n == "Float") (8, 8)
         else if (n == "Char" || n == "Bool" || n == "Void") (1, 1)
-        else (8, 8),
-    TyArr(_, _) -> (8, 8),
-    TyComp(_, _) -> (8, 8),
+        else (ptrSize, ptrSize),
+    TyArr(_, _) -> (ptrSize, ptrSize),
+    TyComp(_, _) -> (ptrSize, ptrSize),
     TyVar(_) -> (8, 8),
-    TyTuple(elems) -> structSizeAndAlign(elems),
+    TyTuple(elems) -> structSizeAndAlignFor(elems, ptrSize),
 }
 
-pub def structSizeAndAlign(elems: List Type): (Int, Int) = match elems {
+pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = match elems {
     Nil -> (0, 1),
     _ -> {
         let off = cellNew(0);
@@ -235,7 +235,7 @@ pub def structSizeAndAlign(elems: List Type): (Int, Int) = match elems {
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(el, r) -> {
-                    let (sz, al) = typeSizeAndAlign(el);
+                    let (sz, al) = typeSizeAndAlignFor(el, ptrSize);
                     let aligned = alignUp(cellGet(off), al);
                     cellSet(off, aligned + sz);
                     if (al > cellGet(maxAl)) cellSet(maxAl, al) else ();
@@ -249,8 +249,12 @@ pub def structSizeAndAlign(elems: List Type): (Int, Int) = match elems {
     },
 }
 
-// Compute `{ i32 tag, [N x word] }` LLVM struct type AND its LP64 byte size
-def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type): (String, Int) =
+pub def typeSizeAndAlign(ty: Type): (Int, Int) = typeSizeAndAlignFor(ty, 8)
+
+pub def structSizeAndAlign(elems: List Type): (Int, Int) = structSizeAndAlignFor(elems, 8)
+
+// Compute `{ i32 tag, [N x word] }` LLVM struct type AND its byte size
+def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type, ptrSize: Int): (String, Int) =
     match strMapGet(adtReg, adtName) {
         None -> ("{ i32 }", 4),
         Some(ainfo) -> {
@@ -265,7 +269,7 @@ def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: 
                             Nil -> (),
                             fts -> {
                                 let instTys = substTypeList(fts, sub);
-                                let (sz, al) = structSizeAndAlign(instTys);
+                                let (sz, al) = structSizeAndAlignFor(instTys, ptrSize);
                                 if (sz > cellGet(maxBytes)) cellSet(maxBytes, sz) else ();
                                 if (al > cellGet(maxAlign)) cellSet(maxAlign, al) else ()
                             },
@@ -338,8 +342,39 @@ data ModEmitCtx {
         mcExterns: StrMap ExternDef,
         mcAdtReg: StrMap AdtInfo,
         mcEscape: EscapeInfo,
+        mcIsWasm: Bool,
+        mcPtrSize: Int,
+        mcWasmExports: StrMap Bool,
+        mcHasExplicitExports: Bool,
     },
 }
+
+def strlenSym(mctx: ModEmitCtx): String =
+    if (mctx.mcIsWasm) "@gs_strlen" else "@strlen"
+
+def memcpySym(mctx: ModEmitCtx): String =
+    if (mctx.mcIsWasm) "@gs_memcpy" else "@memcpy"
+
+def isDefaultWasmExport(fnName: String): Bool = {
+    let n = strLen(fnName);
+    if (n == 0 || fnName == "main") false
+    else if (n >= 2 && strByteAt(fnName, 0) == 95 && strByteAt(fnName, 1) == 95) false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let c = strByteAt(fnName, cellGet(i));
+            if (c == 46 || c == 36) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+def shouldExportWasm(mctx: ModEmitCtx, fnName: String): Bool =
+    if (!mctx.mcIsWasm) false
+    else if (mctx.mcHasExplicitExports) strMapContains(mctx.mcWasmExports, fnName)
+    else isDefaultWasmExport(fnName)
 
 def newFnEmitCtx(fnName: String): FnEmitCtx = {
     let blks: Vec BasicBlockBuf = vecNew();
@@ -505,19 +540,21 @@ def genLit(mctx: ModEmitCtx, lit: Lit): String = match lit {
 // GC Safepoint Poll & Concurrency Helpers (`box`, `unbox`, Trampolines)
 // ============================================================================
 
-def emitGcSafepointPoll(fctx: FnEmitCtx): Void = {
-    let flag = emitAssign(fctx, "load atomic i32, ptr @__gs_gc_stw_requested monotonic, align 4");
-    let needSp = emitAssign(fctx, "icmp ne i32 " + flag + ", 0");
-    let slowBlk = appendBlock(fctx, "gc.sp.slow");
-    let contBlk = appendBlock(fctx, "gc.sp.cont");
-    emitCondBr(fctx, needSp, slowBlk, contBlk);
+def emitGcSafepointPoll(mctx: ModEmitCtx, fctx: FnEmitCtx): Void =
+    if (mctx.mcIsWasm) ()
+    else {
+        let flag = emitAssign(fctx, "load atomic i32, ptr @__gs_gc_stw_requested monotonic, align 4");
+        let needSp = emitAssign(fctx, "icmp ne i32 " + flag + ", 0");
+        let slowBlk = appendBlock(fctx, "gc.sp.slow");
+        let contBlk = appendBlock(fctx, "gc.sp.cont");
+        emitCondBr(fctx, needSp, slowBlk, contBlk);
 
-    setInsertBlock(fctx, slowBlk);
-    emitLine(fctx, "call void @gc_safepoint_slow()");
-    emitBr(fctx, contBlk);
+        setInsertBlock(fctx, slowBlk);
+        emitLine(fctx, "call void @gc_safepoint_slow()");
+        emitBr(fctx, contBlk);
 
-    setInsertBlock(fctx, contBlk)
-}
+        setInsertBlock(fctx, contBlk)
+    }
 
 def mangleConcTypeSym(ty: Type): String = match ty {
     TyVoid -> "Void",
@@ -656,7 +693,7 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
 // Binary Operators, Intrinsics, Pattern Matching, and Expression Emission
 // ============================================================================
 
-def emitBinOperator(fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operandTy: Type): String = {
+def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operandTy: Type): String = {
     let tyName = match operandTy {
         TyCon(n) -> n,
         _ -> "Int",
@@ -664,14 +701,16 @@ def emitBinOperator(fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operan
     if (tyName == "String") {
         match op {
             OpAdd -> {
-                let la = emitAssign(fctx, "call i64 @strlen(ptr " + lhs + ")");
-                let lb = emitAssign(fctx, "call i64 @strlen(ptr " + rhs + ")");
+                let sl = strlenSym(mctx);
+                let mc = memcpySym(mctx);
+                let la = emitAssign(fctx, "call i64 " + sl + "(ptr " + lhs + ")");
+                let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + rhs + ")");
                 let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
                 let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
                 let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
-                emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + lhs + ", i64 " + la + ")");
+                emitLine(fctx, "call ptr " + mc + "(ptr " + dst + ", ptr " + lhs + ", i64 " + la + ")");
                 let dstB = emitGep(fctx, "i8", dst, la);
-                emitLine(fctx, "call ptr @memcpy(ptr " + dstB + ", ptr " + rhs + ", i64 " + lb + ")");
+                emitLine(fctx, "call ptr " + mc + "(ptr " + dstB + ", ptr " + rhs + ", i64 " + lb + ")");
                 let termPtr = emitGep(fctx, "i8", dst, lab);
                 emitStore(fctx, "i8", "0", termPtr);
                 dst
@@ -834,7 +873,7 @@ def tryEmitIntrinsic(
         let initVal = genExpr(mctx, fctx, a0, locals, false);
         let elemTy = schemeBody(a0.tscm);
         let elemLlvm = getValLlvmType(elemTy);
-        let (rawSz, _) = typeSizeAndAlign(elemTy);
+        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
         let byteSz = if (rawSz < 8) 8 else rawSz;
         let cellPtr = emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")");
         emitStore(fctx, elemLlvm, initVal, cellPtr);
@@ -856,7 +895,7 @@ def tryEmitIntrinsic(
         let initVal = genExpr(mctx, fctx, a1, locals, false);
         let elemTy = schemeBody(a1.tscm);
         let elemLlvm = getValLlvmType(elemTy);
-        let (rawSz, _) = typeSizeAndAlign(elemTy);
+        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
         let elemSz = if (rawSz < 1) 1 else rawSz;
 
         let badBlk = appendBlock(fctx, "arr.bad_len");
@@ -1044,16 +1083,16 @@ def tryEmitIntrinsic(
         Some("0")
     } else if (name == "ptrToString") {
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
-        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + p + ")");
+        let len64 = emitAssign(fctx, "call i64 " + strlenSym(mctx) + "(ptr " + p + ")");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
-        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + p + ", i64 " + len64 + ")");
+        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dst + ", ptr " + p + ", i64 " + len64 + ")");
         let termPtr = emitGep(fctx, "i8", dst, len64);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
     } else if (name == "strLen") {
         let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
-        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + s + ")");
+        let len64 = emitAssign(fctx, "call i64 " + strlenSym(mctx) + "(ptr " + s + ")");
         Some(emitAssign(fctx, "trunc i64 " + len64 + " to i32"))
     } else if (name == "strByteAt") {
         let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
@@ -1077,7 +1116,7 @@ def tryEmitIntrinsic(
         let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let start32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let end32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
-        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + s + ")");
+        let len64 = emitAssign(fctx, "call i64 " + strlenSym(mctx) + "(ptr " + s + ")");
         let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
         let bad1 = emitAssign(fctx, "icmp slt i32 " + start32 + ", 0");
         let bad2 = emitAssign(fctx, "icmp slt i32 " + end32 + ", " + start32);
@@ -1100,21 +1139,23 @@ def tryEmitIntrinsic(
         let allocSz = emitAssign(fctx, "add i64 " + subLen + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
         let srcPtr = emitGep(fctx, "i8", s, start64);
-        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + srcPtr + ", i64 " + subLen + ")");
+        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dst + ", ptr " + srcPtr + ", i64 " + subLen + ")");
         let termPtr = emitGep(fctx, "i8", dst, subLen);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
     } else if (name == "strConcat") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        let la = emitAssign(fctx, "call i64 @strlen(ptr " + a + ")");
-        let lb = emitAssign(fctx, "call i64 @strlen(ptr " + b + ")");
+        let sl = strlenSym(mctx);
+        let mc = memcpySym(mctx);
+        let la = emitAssign(fctx, "call i64 " + sl + "(ptr " + a + ")");
+        let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + b + ")");
         let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
         let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
-        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + a + ", i64 " + la + ")");
+        emitLine(fctx, "call ptr " + mc + "(ptr " + dst + ", ptr " + a + ", i64 " + la + ")");
         let dstB = emitGep(fctx, "i8", dst, la);
-        emitLine(fctx, "call ptr @memcpy(ptr " + dstB + ", ptr " + b + ", i64 " + lb + ")");
+        emitLine(fctx, "call ptr " + mc + "(ptr " + dstB + ", ptr " + b + ", i64 " + lb + ")");
         let termPtr = emitGep(fctx, "i8", dst, lab);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
@@ -1427,7 +1468,7 @@ def emitPatternCheck(
             Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
                 None -> (),
                 Some(vinfo) -> {
-                    let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs);
+                    let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
                     let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 0);
                     let actualTag = emitLoad(fctx, "i32", tagPtr);
                     let tagEq = emitAssign(fctx, "icmp eq i32 " + actualTag + ", " + intToStr(vinfo.tag));
@@ -1603,7 +1644,7 @@ def genExpr(
         TmBin(op, lhs, rhs) -> {
             let lval = genExpr(mctx, fctx, lhs, locals, false);
             let rval = genExpr(mctx, fctx, rhs, locals, false);
-            emitBinOperator(fctx, op, lval, rval, schemeBody(lhs.tscm))
+            emitBinOperator(mctx, fctx, op, lval, rval, schemeBody(lhs.tscm))
         },
 
         TmLet(vd, val, exp) -> {
@@ -1677,9 +1718,11 @@ def genExpr(
                             }
                         };
                         let typedArgsStr = formatTypedArgs(listRev(cellGet(argTysRev)), listRev(cellGet(argValsRev)));
-                        let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
-                        emitLine(fctx, "call i32 @_setjmp(ptr " + jbPtr + ")");
-                        emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")");
+                        if (!mctx.mcIsWasm) {
+                            let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
+                            emitLine(fctx, "call i32 @_setjmp(ptr " + jbPtr + ")");
+                            emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")")
+                        } else ();
 
                         let extRetTy = match extDef.extTy {
                             TyArr(_, r) -> r,
@@ -1694,7 +1737,7 @@ def genExpr(
                             } else {
                                 emitAssign(fctx, "call " + retLlvm + " " + cSym + "(" + typedArgsStr + ")")
                             };
-                        emitLine(fctx, "call void @gc_leave_blocking()");
+                        if (!mctx.mcIsWasm) emitLine(fctx, "call void @gc_leave_blocking()") else ();
                         cRes
                     },
                     None -> {
@@ -1780,8 +1823,8 @@ def genExpr(
             let fvGeishaTys = listRev(cellGet(fvGeishaRev));
             let envStructTy = formatLlvmStructType(fvLlvmTys);
             let clsStructTy = "{ ptr, " + envStructTy + " }";
-            let (envSz, _) = structSizeAndAlign(fvGeishaTys);
-            let clsByteSz = alignUp(8 + envSz, 8);
+            let (envSz, _) = structSizeAndAlignFor(fvGeishaTys, mctx.mcPtrSize);
+            let clsByteSz = alignUp(mctx.mcPtrSize + envSz, 8);
 
             let clsObjPtr =
                 if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
@@ -1852,7 +1895,7 @@ def genExpr(
             emitBr(fctx, condBlk);
 
             setInsertBlock(fctx, condBlk);
-            emitGcSafepointPoll(fctx);
+            emitGcSafepointPoll(mctx, fctx);
             let cval = genExpr(mctx, fctx, cond, locals, false);
             emitCondBr(fctx, cval, bodyBlk, endBlk);
 
@@ -1877,7 +1920,7 @@ def genExpr(
                 }
             };
             let fieldVals = listRev(cellGet(fvalsRev));
-            let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs);
+            let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
             let useStack =
                 if (isRecursiveAdt(mctx.mcEscape, adtName)) false
                 else match directLetVar {
@@ -2077,15 +2120,51 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     };
 
     let allowTail = !fnHasStackAlloc(mctx.mcEscape, fd.fnName);
-    emitGcSafepointPoll(fctx);
+    emitGcSafepointPoll(mctx, fctx);
     let bodyVal = genExpr(mctx, fctx, fd.fnBody, listRev(cellGet(localsRev)), allowTail);
     if (!curBlockHasTerm(fctx)) {
         if (retLlvm == "void") emitTermLine(fctx, "ret void")
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
-    let header = "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")";
+    let exportAttr =
+        if (shouldExportWasm(mctx, fd.fnName)) " \"wasm-export-name\"=\"" + fd.fnName + "\""
+        else "";
+    let header = "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")" + exportAttr;
     flushFunctionToBuf(out, header, fctx)
+}
+
+def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDef, globals: List GlobalValDef): Void = {
+    let fctx = newFnEmitCtx("__geisha_init");
+    let cg = cellNew(globals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, r) -> {
+                match strMapGet(mctx.mcGlobalSlots, g.gvName) {
+                    Some(slot) -> {
+                        if (isGcPointerType(g.gvTy)) {
+                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
+                        } else ();
+                        cellSet(fctx.fcPendingLet, None);
+                        let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
+                        emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                    },
+                    None -> (),
+                };
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+    match mainOpt {
+        Some(mainFd) -> {
+            let _ = genExpr(mctx, fctx, mainFd.fnBody, Nil, false);
+            ()
+        },
+        None -> (),
+    };
+    if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
+    flushFunctionToBuf(out, "define void @__geisha_init() \"wasm-export-name\"=\"__geisha_init\"", fctx)
 }
 
 def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef): Void = {
@@ -2126,8 +2205,23 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
     bufPushStr(out, "  ret i32 0\n}\n\n")
 }
 
-def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: StrMap FunDef): Void = {
-    let decls = [
+def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: StrMap FunDef, isWasm: Bool): Void = {
+    let decls = if (isWasm) [
+        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr)"),
+        ("gc_register_root", "declare void @gc_register_root(ptr)"),
+        ("gc_alloc", "declare ptr @gc_alloc(i64)"),
+        ("gc_alloc_atomic", "declare ptr @gc_alloc_atomic(i64)"),
+        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr)"),
+        ("gs_match_fail", "declare void @gs_match_fail()"),
+        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32)"),
+        ("gs_div_zero_fail", "declare void @gs_div_zero_fail()"),
+        ("gs_strlen", "declare i64 @gs_strlen(ptr)"),
+        ("gs_memcpy", "declare ptr @gs_memcpy(ptr, ptr, i64)"),
+        ("printLn", "declare void @printLn(ptr, ptr)"),
+        ("putNumber", "declare void @putNumber(i32, ptr)"),
+        ("putFloat", "declare void @putFloat(double, ptr)"),
+        ("putChar", "declare void @putChar(i8, ptr)")
+    ] else [
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr)"),
         ("gc_register_root", "declare void @gc_register_root(ptr)"),
         ("gc_alloc", "declare ptr @gc_alloc(i64)"),
@@ -2231,15 +2325,36 @@ def emitUserExternDeclares(
     bufPushByte(out, 10)
 }
 
-pub def emitProgramLlvmIr(prog: CoreProgram): String = {
+pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: List String): String = {
     let globalSlots: StrMap VarSlot = strMapNew();
     let globalsBuf = bufNew();
 
     bufPushStr(globalsBuf, "; ModuleID = 'geisha_module'\n");
-    bufPushStr(globalsBuf, "source_filename = \"geisha_module\"\n\n");
+    bufPushStr(globalsBuf, "source_filename = \"geisha_module\"\n");
+    if (isWasm) {
+        bufPushStr(globalsBuf, "target datalayout = \"e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20\"\n");
+        bufPushStr(globalsBuf, "target triple = \"wasm32-unknown-unknown\"\n\n")
+    } else {
+        bufPushByte(globalsBuf, 10)
+    };
     bufPushStr(globalsBuf, "@__gs_argc = internal global i32 0\n");
     bufPushStr(globalsBuf, "@__gs_argv = internal global ptr null\n");
-    bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
+    if (!isWasm) {
+        bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n")
+    } else ();
+
+    let exportMap: StrMap Bool = strMapNew();
+    let hasExplicit = match wasmExports { Nil -> false, _ -> true };
+    let ce = cellNew(wasmExports);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons(en, r) -> {
+                strMapInsert(exportMap, en, true);
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
 
     let cg = cellNew(prog.coreGlobals);
     while (match cellGet(cg) { Nil -> false, _ -> true }) {
@@ -2270,12 +2385,20 @@ pub def emitProgramLlvmIr(prog: CoreProgram): String = {
         mcExterns: prog.coreExterns,
         mcAdtReg: prog.coreAdtReg,
         mcEscape: prog.coreEscape,
+        mcIsWasm: isWasm,
+        mcPtrSize: if (isWasm) 4 else 8,
+        mcWasmExports: exportMap,
+        mcHasExplicitExports: hasExplicit,
     };
 
     let fnsBuf = bufNew();
-    match strMapGet(prog.coreFns, "main") {
-        Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals),
-        None -> (),
+    if (isWasm) {
+        emitWasmInitFunction(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals)
+    } else {
+        match strMapGet(prog.coreFns, "main") {
+            Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals),
+            None -> (),
+        }
     };
 
     let cf = cellNew(prog.coreFnNames);
@@ -2297,7 +2420,7 @@ pub def emitProgramLlvmIr(prog: CoreProgram): String = {
     let out = bufNew();
     bufPushBuf(out, globalsBuf);
     let declaredSyms: StrMap Bool = strMapNew();
-    emitRuntimeDeclares(out, declaredSyms, prog.coreFns);
+    emitRuntimeDeclares(out, declaredSyms, prog.coreFns, isWasm);
     emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames);
 
     if (bufLen(mctx.mcStrDecls) > 0) {
@@ -2312,3 +2435,6 @@ pub def emitProgramLlvmIr(prog: CoreProgram): String = {
     bufPushBuf(out, fnsBuf);
     bufToString(out)
 }
+
+pub def emitProgramLlvmIr(prog: CoreProgram): String =
+    emitProgramLlvmIrTarget(prog, false, Nil)

@@ -33,13 +33,15 @@ use loader.{loadSingleSourceProgram, loadProjectProgram}
 use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
-use codegen.emitProgramLlvmIr
+use codegen.{emitProgramLlvmIr, emitProgramLlvmIrTarget}
 
 data CliOpts {
     MkCliOpts {
         optEmitIr: Bool,
         optDumpCore: Option String,
         optCompileOnly: Bool,
+        optTarget: String,
+        optExports: List String,
         optOutPath: Option String,
         optSrcRoot: Option String,
         optRuntime: Option String,
@@ -67,6 +69,8 @@ def parseCliArgs(): Result CliOpts String = {
     let emitIr = cellNew(false);
     let dumpCore: Cell (Option String) = cellNew(None);
     let compOnly = cellNew(false);
+    let targetCell = cellNew("native");
+    let exportsRev: Cell (List String) = cellNew(Nil);
     let outPath: Cell (Option String) = cellNew(None);
     let srcRoot: Cell (Option String) = cellNew(None);
     let rtPath: Cell (Option String) = cellNew(None);
@@ -89,6 +93,25 @@ def parseCliArgs(): Result CliOpts String = {
                 cellSet(errOpt, Some("Missing output path after '--dump-core'"))
             } else {
                 cellSet(dumpCore, Some(argAt(cellGet(i) + 1)));
+                cellSet(i, cellGet(i) + 2)
+            }
+        } else if (a == "--target") {
+            if (cellGet(i) + 1 >= argc) {
+                cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32)"))
+            } else {
+                let t = argAt(cellGet(i) + 1);
+                if (t == "native" || t == "wasm32") {
+                    cellSet(targetCell, t);
+                    cellSet(i, cellGet(i) + 2)
+                } else {
+                    cellSet(errOpt, Some("Unsupported target '" + t + "' (expected 'native' or 'wasm32')"))
+                }
+            }
+        } else if (a == "--export") {
+            if (cellGet(i) + 1 >= argc) {
+                cellSet(errOpt, Some("Missing function name after '--export'"))
+            } else {
+                cellSet(exportsRev, Cons(argAt(cellGet(i) + 1), cellGet(exportsRev)));
                 cellSet(i, cellGet(i) + 2)
             }
         } else if (a == "-c" || a == "--compile-only") {
@@ -129,6 +152,8 @@ def parseCliArgs(): Result CliOpts String = {
             optEmitIr: cellGet(emitIr),
             optDumpCore: cellGet(dumpCore),
             optCompileOnly: cellGet(compOnly),
+            optTarget: cellGet(targetCell),
+            optExports: cellGet(exportsRev),
             optOutPath: cellGet(outPath),
             optSrcRoot: cellGet(srcRoot),
             optRuntime: cellGet(rtPath),
@@ -137,6 +162,46 @@ def parseCliArgs(): Result CliOpts String = {
         }),
     }
 }
+
+def resolveWasmRuntimeObj(explicitOpt: Option String): Result String String =
+    match explicitOpt {
+        Some(p) ->
+            if (fileExists(p)) Ok(p)
+            else Err("WASM runtime object not found at '" + p + "'"),
+        None -> match getEnv("GEISHA_WASM_RUNTIME") {
+            Some(envP) ->
+                if (fileExists(envP)) Ok(envP)
+                else Err("GEISHA_WASM_RUNTIME object not found at '" + envP + "'"),
+            None -> {
+                let exeDir = pathDirname(argAt(0));
+                let cand1 = pathJoin(exeDir, "wasm_rt.o");
+                let cand2 = "build/wasm_rt.o";
+                let cand3 = pathJoin(pathDirname(exeDir), "build/wasm_rt.o");
+                if (fileExists(cand1)) Ok(cand1)
+                else if (fileExists(cand2)) Ok(cand2)
+                else if (fileExists(cand3)) Ok(cand3)
+                else Err("Could not locate wasm_rt.o; run 'make wasm-runtime' or pass --runtime <path>")
+            },
+        },
+    }
+
+def resolveWasmCc(): String =
+    match getEnv("WASM_CC") {
+        Some(c) -> c,
+        None ->
+            if (fileExists("/opt/homebrew/opt/llvm@20/bin/clang")) "/opt/homebrew/opt/llvm@20/bin/clang"
+            else if (fileExists("/opt/homebrew/opt/llvm/bin/clang")) "/opt/homebrew/opt/llvm/bin/clang"
+            else "clang",
+    }
+
+def resolveWasmLdFlag(): String =
+    match getEnv("WASM_LD") {
+        Some(l) -> " -fuse-ld=" + shellQuote(l),
+        None ->
+            if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"
+            else if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"
+            else "",
+    }
 
 def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
     match explicitOpt {
@@ -160,7 +225,13 @@ def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
         },
     }
 
-def compileInputToIr(inputFile: String, srcRootOpt: Option String, dumpCoreOpt: Option String): Result String String = {
+def compileInputToIr(
+    inputFile: String,
+    srcRootOpt: Option String,
+    dumpCoreOpt: Option String,
+    isWasm: Bool,
+    wasmExports: List String
+): Result String String = {
     let rawDefs = match srcRootOpt {
         Some(root) -> loadProjectProgram(inputFile, root)?,
         None -> {
@@ -177,7 +248,7 @@ def compileInputToIr(inputFile: String, srcRootOpt: Option String, dumpCoreOpt: 
         },
         None -> (),
     };
-    Ok(emitProgramLlvmIr(coreProg))
+    Ok(emitProgramLlvmIrTarget(coreProg, isWasm, wasmExports))
 }
 
 def printUsage(): Void = {
@@ -188,10 +259,12 @@ def printUsage(): Void = {
     printLn("Options:");
     printLn("  -e, --emit-llvm        Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
     printLn("  --dump-core <file>     Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
-    printLn("  -c, --compile-only     Compile to native object file (.o) without linking");
+    printLn("  --target <t>           Target platform: 'native' (default) or 'wasm32'");
+    printLn("  --export <fn>          Export function symbol in wasm32 target (repeatable)");
+    printLn("  -c, --compile-only     Compile to object file (.o) without linking");
     printLn("  -o <output>            Write output to <output>");
     printLn("  --src-root <dir>       Multi-file module source root directory");
-    printLn("  --runtime <path.a>     Path to libgeisha_runtime.a (or $GEISHA_RUNTIME)");
+    printLn("  --runtime <path>       Path to libgeisha_runtime.a or wasm_rt.o");
     printLn("  -h, --help             Show this help message")
 }
 
@@ -205,7 +278,8 @@ def runDriver(): Result Void String = {
             Some(p) -> p,
             None -> returnErr("No input .gsa file specified (run with --help for usage)")?,
         };
-        let llText = compileInputToIr(inputFile, opts.optSrcRoot, opts.optDumpCore)?;
+        let isWasm = opts.optTarget == "wasm32";
+        let llText = compileInputToIr(inputFile, opts.optSrcRoot, opts.optDumpCore, isWasm, opts.optExports)?;
 
         if (opts.optEmitIr) {
             match opts.optOutPath {
@@ -214,6 +288,40 @@ def runDriver(): Result Void String = {
                     printLn(llText);
                     Ok(())
                 },
+            }
+        } else if (isWasm) {
+            let wasmCc = resolveWasmCc();
+            if (opts.optCompileOnly) {
+                let outObj = match opts.optOutPath {
+                    Some(p) -> p,
+                    None -> pathStem(inputFile) + ".o",
+                };
+                let tmpLl = outObj + ".tmp.ll";
+                writeFile(tmpLl, llText)?;
+                let cmd = shellQuote(wasmCc) + " --target=wasm32 -O2 -Wno-override-module -nostdlib -x ir -c "
+                          + shellQuote(tmpLl) + " -o " + shellQuote(outObj);
+                let rc = shell(cmd);
+                let _ = removeFile(tmpLl);
+                if (rc == 0) Ok(())
+                else Err("LLVM wasm32 backend failed while compiling object '" + outObj + "'")
+            } else {
+                let outWasm = match opts.optOutPath {
+                    Some(p) -> p,
+                    None -> pathStem(inputFile) + ".wasm",
+                };
+                let wasmRt = resolveWasmRuntimeObj(opts.optRuntime)?;
+                let tmpLl = outWasm + ".tmp.ll";
+                writeFile(tmpLl, llText)?;
+                let cmd = shellQuote(wasmCc)
+                          + " --target=wasm32 -O2 -Wno-override-module -nostdlib"
+                          + resolveWasmLdFlag() + " -x ir "
+                          + shellQuote(tmpLl) + " -x none " + shellQuote(wasmRt)
+                          + " -Wl,--no-entry -Wl,--allow-undefined -Wl,--gc-sections -o "
+                          + shellQuote(outWasm);
+                let rc = shell(cmd);
+                let _ = removeFile(tmpLl);
+                if (rc == 0) Ok(())
+                else Err("LLVM wasm32 backend failed while linking '" + outWasm + "' (ensure lld/wasm-ld is installed)")
             }
         } else if (opts.optCompileOnly) {
             let outObj = match opts.optOutPath {

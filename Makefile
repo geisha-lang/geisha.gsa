@@ -5,9 +5,11 @@ CFLAGS      ?= -O2 -Wall -Wextra -Iruntime/include
 STAGE0      ?= miko
 BUILD_DIR   := build
 RUNTIME_LIB := $(BUILD_DIR)/libgeisha_runtime.a
+WASM_RT_OBJ := $(BUILD_DIR)/wasm_rt.o
+WASM_CC     ?= /opt/homebrew/opt/llvm@20/bin/clang
 ENTRY       := src/mod.gsa
 
-.PHONY: all runtime stdlib-bundle stage1 stage2 stage3 bootstrap test verify-core clean
+.PHONY: all runtime wasm-runtime stdlib-bundle stage1 stage2 stage3 bootstrap test verify-core clean
 
 all: stage2
 
@@ -15,6 +17,11 @@ $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
 runtime: $(RUNTIME_LIB)
+
+wasm-runtime: $(WASM_RT_OBJ)
+
+$(WASM_RT_OBJ): runtime/wasm_rt.c | $(BUILD_DIR)
+	$(WASM_CC) --target=wasm32 -O2 -Wall -Wextra -nostdlib -ffreestanding -c runtime/wasm_rt.c -o $(WASM_RT_OBJ)
 
 $(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/base.o
