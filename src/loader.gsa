@@ -498,7 +498,7 @@ def rewriteConstraintsInMod(ctx: ModRewriteCtx, cs: List ConstraintSpec): List C
             Some(q) -> q,
             None -> c.conceptName,
         };
-        Cons(MkConstraint { conceptName: qc, typeVar: c.typeVar }, rewriteConstraintsInMod(ctx, r))
+        Cons(MkConstraint { conceptName: qc, typeArgs: rewriteTypeListInMod(ctx, c.typeArgs) }, rewriteConstraintsInMod(ctx, r))
     },
 }
 
@@ -767,7 +767,7 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
             };
             ItAlg(ps, cellGet(newVs))
         },
-        ItConcept(ps, supers, ms) -> {
+        ItConcept(ps, supers, fundeps, ms) -> {
             let newMs = cellNew(Nil);
             let cur = cellNew(ms);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -780,7 +780,7 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
                     Nil -> (),
                 }
             };
-            ItConcept(ps, rewriteConstraintsInMod(ctx, supers), cellGet(newMs))
+            ItConcept(ps, rewriteConstraintsInMod(ctx, supers), fundeps, cellGet(newMs))
         },
         ItInstance(cname, targs, cs, impls) -> {
             let qcn = match strMapGet(ctx.tyMap, cname) { Some(q) -> q, None -> cname };
@@ -937,7 +937,7 @@ def compileLoadedCache(
                                         match d.item {
                                             ItAlg(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
                                             ItAlias(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
-                                            ItConcept(_, _, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
+                                            ItConcept(_, _, _, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
                                             _ -> (),
                                         }
                                     } else ();
@@ -964,7 +964,7 @@ def compileLoadedCache(
                                                 }
                                             }
                                         },
-                                        ItConcept(_, _, ms) -> {
+                                        ItConcept(_, _, _, ms) -> {
                                             let curM = cellNew(ms);
                                             while (match cellGet(curM) { Nil -> false, _ -> true }) {
                                                 match cellGet(curM) {

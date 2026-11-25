@@ -23,6 +23,7 @@ use ast.{
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
     FieldDecl, MkFieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
+    FunDep, MkFunDep,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     Def, MkDef, UseSpec, MkUseSpec, UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
     ModuleItem, ModDef, ModUse, ModSub, ModDecl, FileModule, MkFileModule,
@@ -247,7 +248,25 @@ def buildConstrainedScheme(explicitVars: List String, cs: List ConstraintSpec, b
     while (match cellGet(cur2) { Nil -> false, _ -> true }) {
         match cellGet(cur2) {
             Cons(c, r) -> {
-                cellSet(vars, addUniqueStr(cellGet(vars), c.typeVar));
+                let ca = cellNew(c.typeArgs);
+                while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                    match cellGet(ca) {
+                        Cons(ta, ra) -> {
+                            let cfv = cellNew(ftvOrdered(ta));
+                            while (match cellGet(cfv) { Nil -> false, _ -> true }) {
+                                match cellGet(cfv) {
+                                    Cons(fv, rfv) -> {
+                                        cellSet(vars, addUniqueStr(cellGet(vars), fv));
+                                        cellSet(cfv, rfv)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            cellSet(ca, ra)
+                        },
+                        Nil -> (),
+                    }
+                };
                 cellSet(cur2, r)
             },
             Nil -> (),
@@ -275,9 +294,77 @@ def buildConstrainedScheme(explicitVars: List String, cs: List ConstraintSpec, b
 
 def parseTypeConstraint(p: Parser): Result ConstraintSpec String = {
     let cname = parseUpperIdent(p)?;
-    let tvar = parseTypeVarIdent(p)?;
-    Ok(MkConstraint { conceptName: cname, typeVar: tvar })
+    let a0 = parseTypeAtom(p)?;
+    let args = cellNew([a0]);
+    while (canStartTypeAtomInline(p)) {
+        let an = parseTypeAtom(p)?;
+        cellSet(args, listAppend(cellGet(args), [an]))
+    };
+    Ok(MkConstraint { conceptName: cname, typeArgs: cellGet(args) })
 }
+
+def canStartLowerIdentInline(p: Parser): Bool = {
+    let t = peekTok(p);
+    if (t.hadNewline) false
+    else match t.kind {
+        TkIdent(s) -> strLen(s) > 0 && isLowerByte(strByteAt(s, 0)),
+        _ -> false,
+    }
+}
+
+def parseConceptSupersClause(p: Parser): Result (List ConstraintSpec) String =
+    if (eatSym(p, ":")) {
+        match peekTok(p).kind {
+            TkLParen -> {
+                let _ = bumpTok(p);
+                let first = parseTypeConstraint(p)?;
+                let acc = cellNew([first]);
+                while (eatComma(p)) {
+                    match peekTok(p).kind {
+                        TkRParen -> (),
+                        _ -> {
+                            let c = parseTypeConstraint(p)?;
+                            cellSet(acc, listAppend(cellGet(acc), [c]))
+                        },
+                    }
+                };
+                let _ = expectRParen(p)?;
+                Ok(cellGet(acc))
+            },
+            _ -> {
+                let c = parseTypeConstraint(p)?;
+                Ok([c])
+            },
+        }
+    } else match tryParseConstraintPrefix(p) {
+        Some(cs) -> Ok(cs),
+        None -> Ok(Nil),
+    }
+
+def parseFunDepVarList(p: Parser): Result (List String) String = {
+    let v0 = parseTypeVarIdent(p)?;
+    let vs = cellNew([v0]);
+    while (canStartLowerIdentInline(p)) {
+        let vn = parseTypeVarIdent(p)?;
+        cellSet(vs, listAppend(cellGet(vs), [vn]))
+    };
+    Ok(cellGet(vs))
+}
+
+def parseFunDepsClause(p: Parser): Result (List FunDep) String =
+    if (!eatSym(p, "|")) Ok(Nil)
+    else {
+        let fds = cellNew(Nil);
+        let more = cellNew(true);
+        while (cellGet(more)) {
+            let lhs = parseFunDepVarList(p)?;
+            let _ = expectSym(p, "->")?;
+            let rhs = parseFunDepVarList(p)?;
+            cellSet(fds, listAppend(cellGet(fds), [MkFunDep { fdLhs: lhs, fdRhs: rhs }]));
+            if (!eatComma(p)) cellSet(more, false) else ()
+        };
+        Ok(cellGet(fds))
+    }
 
 /// Try parsing `(C1 a, C2 b) =>` or `C a =>`; backtracks cleanly if `=>` is absent!
 def tryParseConstraintPrefix(p: Parser): Option (List ConstraintSpec) = {
@@ -1448,10 +1535,8 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                     let _ = bumpTok(p);
                     let cname = parseUpperIdent(p)?;
                     let tparams = parseInlineTypeParams(p)?;
-                    let supers = match tryParseConstraintPrefix(p) {
-                        Some(cs) -> cs,
-                        None -> Nil,
-                    };
+                    let supers = parseConceptSupersClause(p)?;
+                    let fundeps = parseFunDepsClause(p)?;
                     let _ = expectLBrace(p)?;
                     let methods = cellNew(Nil);
                     let more = cellNew(true);
@@ -1493,7 +1578,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         }
                     };
                     let closeSp = expectRBrace(p)?;
-                    Ok(MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItConcept(tparams, supers, cellGet(methods)) })
+                    Ok(MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItConcept(tparams, supers, fundeps, cellGet(methods)) })
                 },
                 TkInstance -> {
                     let _ = bumpTok(p);

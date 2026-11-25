@@ -36,7 +36,11 @@ pub data Type {
 }
 
 pub data ConstraintSpec {
-    MkConstraint { conceptName: String, typeVar: String },
+    MkConstraint { conceptName: String, typeArgs: List Type },
+}
+
+pub data FunDep {
+    MkFunDep { fdLhs: List String, fdRhs: List String },
 }
 
 pub data Scheme {
@@ -322,7 +326,7 @@ pub data Item {
     ItExtern(String, Scheme),
     ItAlias(List String, Scheme),
     ItAlg(List String, List VariantDef),
-    ItConcept(List String, List ConstraintSpec, List MethodDecl),
+    ItConcept(List String, List ConstraintSpec, List FunDep, List MethodDecl),
     ItInstance(String, List Type, List ConstraintSpec, List MethodImpl),
 }
 

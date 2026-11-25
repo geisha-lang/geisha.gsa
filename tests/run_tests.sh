@@ -386,4 +386,146 @@ EOF
 "$GEISHA_BIN" -o "$TMP_DIR/t9_ws_loopback" "$TMP_DIR/t9_ws_loopback.gsa"
 assert_eq "net_and_ws_json_loopback" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=|srv-ok|tingfeng!" "$("$TMP_DIR/t9_ws_loopback")"
 
+# 10. Superclasses (`Functor -> Applicative -> Monad`), Multi-Param Concepts & FunDeps (`MonadState s m | m -> s`), and HKT Kinds
+cat > "$TMP_DIR/t10_mtl.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.str.intToStr
+
+concept Functor f {
+    def fmap(g: a -> b, fa: f a): f b
+}
+
+concept Applicative f : Functor f {
+    def pure(x: a): f a,
+    def ap(ff: f (a -> b), fa: f a): f b
+}
+
+concept Monad m : Applicative m {
+    def (>>=)(ma: m a, k: a -> m b): m b
+}
+
+concept MonadState s m : Monad m | m -> s {
+    def get(): m s,
+    def put(st: s): m Void
+}
+
+data State s a {
+    MkState(s -> (a, s)),
+}
+
+def runState(st: State s a, init: s): (a, s) = match st {
+    MkState(f) -> f(init),
+}
+
+instance Functor (State s) {
+    def fmap(g, st) = MkState((s0) -> {
+        let (a, s1) = runState(st, s0);
+        (g(a), s1)
+    })
+}
+
+instance Applicative (State s) {
+    def pure(x) = MkState((s0) -> (x, s0))
+    def ap(sf, sa) = MkState((s0) -> {
+        let (f, s1) = runState(sf, s0);
+        let (a, s2) = runState(sa, s1);
+        (f(a), s2)
+    })
+}
+
+instance Monad (State s) {
+    def (>>=)(ma, k) = MkState((s0) -> {
+        let (a, s1) = runState(ma, s0);
+        runState(k(a), s1)
+    })
+}
+
+instance MonadState s (State s) {
+    def get() = MkState((s0) -> (s0, s0))
+    def put(newS) = MkState((_) -> ((), newS))
+}
+
+instance Functor Option {
+    def fmap(g, o) = match o { None -> None, Some(x) -> Some(g(x)) }
+}
+
+instance Applicative Option {
+    def pure(x) = Some(x)
+    def ap(ofn, oa) = match (ofn, oa) {
+        (Some(f), Some(a)) -> Some(f(a)),
+        _ -> None,
+    }
+}
+
+instance Monad Option {
+    def (>>=)(ma, k) = match ma { None -> None, Some(x) -> k(x) }
+}
+
+// Uses grandparent `Functor` (`fmap`), parent `Applicative` (`pure`), and `Monad` (`>>=`)
+// purely from `Monad m` constraint via superclass expansion!
+def tripleViaMonad(mx, step) =
+    fmap((z) -> z + 1, mx >>= (x) -> step(x) >>= (y) -> pure(y * 3))
+
+// Polymorphic MTL computation: `s` is inferred as `Int` via `m -> s` FunDep!
+def incAndDouble(delta) =
+    get() >>= (cur) ->
+    put(cur + delta) >>= (_) ->
+    get() >>= (after) ->
+    pure(after * 2)
+
+// Higher-kinded ADT (`Free : (* -> *) -> * -> *`) verified by kind inference
+data Free f a {
+    Pure(a),
+    Bind(f (Free f a)),
+}
+
+def main() = {
+    let optRes = tripleViaMonad(Some(4), (x) -> Some(x + 1));
+    let optVal = match optRes { Some(v) -> v, None -> -1 };
+    let (resVal, finalState) = runState(incAndDouble(5), 10);
+    let freeBox: Free Option Int = Pure(7);
+    let freeVal = match freeBox { Pure(x) -> x, Bind(_) -> 0 };
+    printLn(intToStr(optVal) + "|" + intToStr(resVal) + "|" + intToStr(finalState) + "|" + intToStr(freeVal))
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t10_mtl" "$TMP_DIR/t10_mtl.gsa"
+assert_eq "hkt_superclasses_fundeps_mtl" "16|30|15|7" "$("$TMP_DIR/t10_mtl")"
+
+# 11. Negative Compile-Time Checks: Kind Mismatch & Missing Superclass Instance
+cat > "$TMP_DIR/t8_bad_kind.gsa" << 'EOF'
+concept Functor f {
+    def fmap(g: a -> b, fa: f a): f b
+}
+instance Functor Int {
+    def fmap(g, x) = x
+}
+def main() = ()
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t8_bad_kind" "$TMP_DIR/t8_bad_kind.gsa" >/dev/null 2>&1; then
+    echo "FAIL [kind_mismatch_rejected]: compiler unexpectedly accepted Functor Int" >&2
+    exit 1
+fi
+echo "PASS [kind_mismatch_rejected]: rejected kind mismatch (Functor Int)"
+PASS=$((PASS + 1))
+
+cat > "$TMP_DIR/t8_bad_super.gsa" << 'EOF'
+concept Functor f {
+    def fmap(g: a -> b, fa: f a): f b
+}
+concept Monad m : Functor m {
+    def pure(x: a): m a
+}
+data Box a { MkBox(a) }
+instance Monad Box {
+    def pure(x) = MkBox(x)
+}
+def main() = ()
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t8_bad_super" "$TMP_DIR/t8_bad_super.gsa" >/dev/null 2>&1; then
+    echo "FAIL [missing_superclass_rejected]: compiler unexpectedly accepted Monad Box without Functor Box" >&2
+    exit 1
+fi
+echo "PASS [missing_superclass_rejected]: rejected missing superclass instance"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

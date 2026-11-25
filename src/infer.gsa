@@ -11,8 +11,8 @@ use ast.{
     Span, emptySpan,
     Visibility, VisPublic,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
-    composeTypes, ftvOrdered, listContainsStr, addUniqueStr, typeToString, typesEqual,
-    ConstraintSpec, MkConstraint,
+    composeTypes, ftvOrdered, listContainsStr, addUniqueStr, typeToString, typesEqual, typeListsEqual,
+    ConstraintSpec, MkConstraint, FunDep, MkFunDep,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     schemeBody, schemeTypeParams, schemeConstraints,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit, litType,
@@ -51,11 +51,19 @@ pub data AdtInfo {
     },
 }
 
+data Kind {
+    KStar,
+    KArr(Kind, Kind),
+    KVar(String),
+}
+
 pub data ConceptInfo {
     MkConceptInfo {
         conceptName: String,
         typeParams: List String,
+        paramKinds: List Kind,
         superclasses: List ConstraintSpec,
+        fundeps: List FunDep,
         methods: List (String, Scheme),
     },
 }
@@ -71,7 +79,7 @@ pub data InstanceInfo {
 }
 
 data WantedConstraint {
-    MkWanted { wcConcept: String, wcTy: Type, wcSpan: Span },
+    MkWanted { wcConcept: String, wcArgs: List Type, wcSpan: Span },
 }
 
 pub data InferOutput {
@@ -89,6 +97,9 @@ data InferCtx {
     MkInferCtx {
         unique: Cell Int,
         subst: StrMap Type,
+        kindUnique: Cell Int,
+        kindSubst: StrMap Kind,
+        tyConKinds: StrMap Kind,
         wanted: Cell (List WantedConstraint),
         aliasReg: StrMap (List String, Type),
         adtReg: StrMap AdtInfo,
@@ -223,10 +234,18 @@ def zonkTypeList(subst: StrMap Type, ts: List Type): List Type = match ts {
     Cons(h, t) -> Cons(zonkType(subst, h), zonkTypeList(subst, t)),
 }
 
+def zonkConstraintsExcept(subst: StrMap Type, bound: List String, cs: List ConstraintSpec): List ConstraintSpec = match cs {
+    Nil -> Nil,
+    Cons(c, r) -> Cons(
+        MkConstraint { conceptName: c.conceptName, typeArgs: zonkTypeListExcept(subst, bound, c.typeArgs) },
+        zonkConstraintsExcept(subst, bound, r)
+    ),
+}
+
 def zonkScheme(subst: StrMap Type, scm: Scheme): Scheme = match scm {
     ScmMono(t) -> ScmMono(zonkType(subst, t)),
     ScmPoly(vs, t) -> ScmPoly(vs, zonkTypeExcept(subst, vs, t)),
-    ScmPolyConstrained(vs, cs, t) -> ScmPolyConstrained(vs, cs, zonkTypeExcept(subst, vs, t)),
+    ScmPolyConstrained(vs, cs, t) -> ScmPolyConstrained(vs, zonkConstraintsExcept(subst, vs, cs), zonkTypeExcept(subst, vs, t)),
     ScmSlot -> ScmSlot,
 }
 
@@ -485,6 +504,175 @@ pub def buildPairMap(ks: List String, vs: List Type): StrMap Type = {
     m
 }
 
+// ============================================================================
+// Kind Inference & Checking (`*`, `* -> *`, ...)
+// ============================================================================
+
+def freshKindVar(ctx: InferCtx): Kind = {
+    let n = cellGet(ctx.kindUnique);
+    cellSet(ctx.kindUnique, n + 1);
+    KVar("k" + intToStr(n))
+}
+
+def zonkKind(subst: StrMap Kind, k: Kind): Kind = match k {
+    KStar -> KStar,
+    KArr(a, b) -> KArr(zonkKind(subst, a), zonkKind(subst, b)),
+    KVar(v) -> match strMapGet(subst, v) {
+        None -> k,
+        Some(t) -> {
+            let zt = zonkKind(subst, t);
+            strMapInsert(subst, v, zt);
+            zt
+        },
+    },
+}
+
+def kindToString(k: Kind): String = match k {
+    KStar -> "*",
+    KArr(a, b) -> match a {
+        KArr(_, _) -> "(" + kindToString(a) + ") -> " + kindToString(b),
+        _ -> kindToString(a) + " -> " + kindToString(b),
+    },
+    KVar(v) -> v,
+}
+
+def kindOccurs(v: String, k: Kind): Bool = match k {
+    KStar -> false,
+    KVar(w) -> v == w,
+    KArr(a, b) -> kindOccurs(v, a) || kindOccurs(v, b),
+}
+
+def unifyKinds(subst: StrMap Kind, a0: Kind, b0: Kind, sp: Span): Result Void String = {
+    let a = zonkKind(subst, a0);
+    let b = zonkKind(subst, b0);
+    match (a, b) {
+        (KStar, KStar) -> Ok(()),
+        (KVar(va), KVar(vb)) ->
+            if (va == vb) Ok(())
+            else { strMapInsert(subst, va, b); Ok(()) },
+        (KVar(va), _) ->
+            if (kindOccurs(va, b)) Err(typeErr(sp, "Infinite kind involving '" + va + "'"))
+            else { strMapInsert(subst, va, b); Ok(()) },
+        (_, KVar(vb)) ->
+            if (kindOccurs(vb, a)) Err(typeErr(sp, "Infinite kind involving '" + vb + "'"))
+            else { strMapInsert(subst, vb, a); Ok(()) },
+        (KArr(a1, a2), KArr(b1, b2)) -> {
+            unifyKinds(subst, a1, b1, sp)?;
+            unifyKinds(subst, a2, b2, sp)
+        },
+        _ -> Err(typeErr(sp, "Kind mismatch: expected '" + kindToString(a) + "', got '" + kindToString(b) + "'")),
+    }
+}
+
+def defaultKindToStar(subst: StrMap Kind, k: Kind): Kind = match zonkKind(subst, k) {
+    KStar -> KStar,
+    KVar(_) -> KStar,
+    KArr(a, b) -> KArr(defaultKindToStar(subst, a), defaultKindToStar(subst, b)),
+}
+
+def buildArrowKind(paramKinds: List Kind, retKind: Kind): Kind = match paramKinds {
+    Nil -> retKind,
+    Cons(k, r) -> KArr(k, buildArrowKind(r, retKind)),
+}
+
+def inferTypeKind(ctx: InferCtx, ty: Type, tvKinds: StrMap Kind, sp: Span): Result Kind String = match ty {
+    TyVoid -> Ok(KStar),
+    TyCon(name) -> match strMapGet(ctx.tyConKinds, name) {
+        Some(k) -> Ok(k),
+        None -> Ok(KStar),
+    },
+    TyVar(v) -> match strMapGet(tvKinds, v) {
+        Some(k) -> Ok(k),
+        None -> {
+            let k = freshKindVar(ctx);
+            strMapInsert(tvKinds, v, k);
+            Ok(k)
+        },
+    },
+    TyArr(ps, r) -> {
+        let cp = cellNew(ps);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(p, rp) -> {
+                    let kp = inferTypeKind(ctx, p, tvKinds, sp)?;
+                    unifyKinds(ctx.kindSubst, kp, KStar, sp)?;
+                    cellSet(cp, rp)
+                },
+                Nil -> (),
+            }
+        };
+        let kr = inferTypeKind(ctx, r, tvKinds, sp)?;
+        unifyKinds(ctx.kindSubst, kr, KStar, sp)?;
+        Ok(KStar)
+    },
+    TyTuple(es) -> {
+        let ce = cellNew(es);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) {
+                Cons(e, re) -> {
+                    let ke = inferTypeKind(ctx, e, tvKinds, sp)?;
+                    unifyKinds(ctx.kindSubst, ke, KStar, sp)?;
+                    cellSet(ce, re)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(KStar)
+    },
+    TyComp(b, a) -> {
+        let kb = inferTypeKind(ctx, b, tvKinds, sp)?;
+        let ka = inferTypeKind(ctx, a, tvKinds, sp)?;
+        let kres = freshKindVar(ctx);
+        unifyKinds(ctx.kindSubst, kb, KArr(ka, kres), sp)?;
+        Ok(zonkKind(ctx.kindSubst, kres))
+    },
+}
+
+def checkTypeKindStar(ctx: InferCtx, ty: Type, tvKinds: StrMap Kind, sp: Span): Result Void String = {
+    let k = inferTypeKind(ctx, ty, tvKinds, sp)?;
+    unifyKinds(ctx.kindSubst, k, KStar, sp)
+}
+
+def checkConstraintsKinds(ctx: InferCtx, cs: List ConstraintSpec, tvKinds: StrMap Kind, sp: Span): Result Void String = {
+    let cur = cellNew(cs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(c, r) -> {
+                match strMapGet(ctx.conceptReg, c.conceptName) {
+                    None -> returnPatErr(sp, "Unknown concept '" + c.conceptName + "' in constraint")?,
+                    Some(cinfo) -> {
+                        if (listLen(c.typeArgs) != listLen(cinfo.paramKinds)) {
+                            returnPatErr(sp, "Concept '" + c.conceptName + "' arity mismatch in constraint")?
+                        } else ();
+                        let ca = cellNew(c.typeArgs);
+                        let ck = cellNew(cinfo.paramKinds);
+                        while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                            match (cellGet(ca), cellGet(ck)) {
+                                (Cons(ta, ra), Cons(pk, rk)) -> {
+                                    let ak = inferTypeKind(ctx, ta, tvKinds, sp)?;
+                                    unifyKinds(ctx.kindSubst, ak, pk, sp)?;
+                                    cellSet(ca, ra);
+                                    cellSet(ck, rk)
+                                },
+                                _ -> cellSet(ca, Nil),
+                            }
+                        }
+                    },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(())
+}
+
+def checkSchemeKinds(ctx: InferCtx, scm: Scheme, sp: Span): Result Void String = {
+    let tvKinds: StrMap Kind = strMapNew();
+    checkConstraintsKinds(ctx, schemeConstraints(scm), tvKinds, sp)?;
+    checkTypeKindStar(ctx, schemeBody(scm), tvKinds, sp)
+}
+
 def registerBuiltinConceptSpec(
     ctx: InferCtx,
     conceptName: String,
@@ -494,14 +682,16 @@ def registerBuiltinConceptSpec(
 ): Void = {
     let scm = ScmPolyConstrained(
         ["a"],
-        [MkConstraint { conceptName: conceptName, typeVar: "a" }],
+        [MkConstraint { conceptName: conceptName, typeArgs: [TyVar("a")] }],
         methodTy
     );
     strMapInsert(ctx.conceptMethods, methodName, (conceptName, 0));
     strMapInsert(ctx.conceptReg, conceptName, MkConceptInfo {
         conceptName: conceptName,
         typeParams: ["a"],
+        paramKinds: [KStar],
         superclasses: Nil,
+        fundeps: Nil,
         methods: [(methodName, scm)],
     });
     let cur = cellNew(primNames);
@@ -527,6 +717,9 @@ def initInferCtx(): InferCtx = {
     let ctx = MkInferCtx {
         unique: cellNew(0),
         subst: strMapNew(),
+        kindUnique: cellNew(0),
+        kindSubst: strMapNew(),
+        tyConKinds: strMapNew(),
         wanted: cellNew(Nil),
         aliasReg: strMapNew(),
         adtReg: strMapNew(),
@@ -535,6 +728,22 @@ def initInferCtx(): InferCtx = {
         conceptReg: strMapNew(),
         instanceReg: cellNew(Nil),
         conceptMethods: strMapNew(),
+    };
+    let kStarNames = ["Int", "Int64", "Float", "Char", "String", "Bool", "Void", "Ptr", "AtomicInt"];
+    let ck0 = cellNew(kStarNames);
+    while (match cellGet(ck0) { Nil -> false, _ -> true }) {
+        match cellGet(ck0) {
+            Cons(n, r) -> { strMapInsert(ctx.tyConKinds, n, KStar); cellSet(ck0, r) },
+            Nil -> (),
+        }
+    };
+    let kUnaryNames = ["List", "Cell", "MutArray", "MVar", "Chan", "Task", "Actor"];
+    let ck1 = cellNew(kUnaryNames);
+    while (match cellGet(ck1) { Nil -> false, _ -> true }) {
+        match cellGet(ck1) {
+            Cons(n, r) -> { strMapInsert(ctx.tyConKinds, n, KArr(KStar, KStar)); cellSet(ck1, r) },
+            Nil -> (),
+        }
     };
     let tvA = TyVar("a");
     let binSame = TyArr([tvA, tvA], tvA);
@@ -562,7 +771,9 @@ def initInferCtx(): InferCtx = {
     strMapInsert(ctx.conceptReg, "Send", MkConceptInfo {
         conceptName: "Send",
         typeParams: ["a"],
+        paramKinds: [KStar],
         superclasses: Nil,
+        fundeps: Nil,
         methods: Nil,
     });
 
@@ -712,11 +923,8 @@ def instantiateScheme(ctx: InferCtx, scm: Scheme, sp: Span): Type = match scm {
         while (match cellGet(curC) { Nil -> false, _ -> true }) {
             match cellGet(curC) {
                 Cons(c, r) -> {
-                    let argTy = match strMapGet(sub, c.typeVar) {
-                        Some(ft) -> ft,
-                        None -> TyVar(c.typeVar),
-                    };
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: c.conceptName, wcTy: argTy, wcSpan: sp }]));
+                    let argTys = applyExplicitSubstList(c.typeArgs, sub);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: c.conceptName, wcArgs: argTys, wcSpan: sp }]));
                     cellSet(curC, r)
                 },
                 Nil -> (),
@@ -759,7 +967,7 @@ pub def matchInstancePattern(pat: Type, concrete: Type, sub: StrMap Type): Bool 
     _ -> false,
 }
 
-def matchInstancePatList(xs: List Type, ys: List Type, sub: StrMap Type): Bool = match (xs, ys) {
+pub def matchInstancePatList(xs: List Type, ys: List Type, sub: StrMap Type): Bool = match (xs, ys) {
     (Nil, Nil) -> true,
     (Cons(x, xr), Cons(y, yr)) -> matchInstancePattern(x, y, sub) && matchInstancePatList(xr, yr, sub),
     _ -> false,
@@ -854,26 +1062,249 @@ def checkAdtVariantsSend(adtReg: StrMap AdtInfo, ainfo: AdtInfo, targs: List Typ
     cellGet(ok)
 }
 
-def hasGivenConstraint(given: List ConstraintSpec, cname: String, tvar: String): Bool = match given {
-    Nil -> false,
-    Cons(c, r) ->
-        if (c.conceptName == cname && c.typeVar == tvar) true
-        else hasGivenConstraint(r, cname, tvar),
+def applyExplicitSubstList(ts: List Type, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), applyExplicitSubstList(t, sub)),
 }
 
-def hasResidualWanted(ws: List WantedConstraint, cname: String, tvar: String): Bool = match ws {
+def constraintSpecEqual(a: ConstraintSpec, b: ConstraintSpec): Bool =
+    a.conceptName == b.conceptName && typeListsEqual(a.typeArgs, b.typeArgs)
+
+def constraintListContains(cs: List ConstraintSpec, cname: String, args: List Type): Bool = match cs {
     Nil -> false,
-    Cons(w, r) -> match w.wcTy {
-        TyVar(v) -> if (w.wcConcept == cname && v == tvar) true else hasResidualWanted(r, cname, tvar),
-        _ -> hasResidualWanted(r, cname, tvar),
+    Cons(c, r) ->
+        if (c.conceptName == cname && typeListsEqual(c.typeArgs, args)) true
+        else constraintListContains(r, cname, args),
+}
+
+def expandGivenClosure(ctx: InferCtx, given: List ConstraintSpec): List ConstraintSpec = {
+    let result = cellNew(Nil);
+    let queue = cellNew(given);
+    let steps = cellNew(0);
+    while (match cellGet(queue) { Nil -> false, _ -> cellGet(steps) < 128 }) {
+        match cellGet(queue) {
+            Cons(c, rest) -> {
+                cellSet(queue, rest);
+                cellSet(steps, cellGet(steps) + 1);
+                if (!constraintListContains(cellGet(result), c.conceptName, c.typeArgs)) {
+                    cellSet(result, listAppend(cellGet(result), [c]));
+                    match strMapGet(ctx.conceptReg, c.conceptName) {
+                        Some(cinfo) -> {
+                            let sub = buildPairMap(cinfo.typeParams, c.typeArgs);
+                            let cs = cellNew(cinfo.superclasses);
+                            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                match cellGet(cs) {
+                                    Cons(sc, rsc) -> {
+                                        let supArgs = applyExplicitSubstList(sc.typeArgs, sub);
+                                        cellSet(queue, listAppend(cellGet(queue), [MkConstraint { conceptName: sc.conceptName, typeArgs: supArgs }]));
+                                        cellSet(cs, rsc)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        None -> (),
+                    }
+                } else ()
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(result)
+}
+
+def hasGivenConstraint(ctx: InferCtx, given: List ConstraintSpec, cname: String, args: List Type): Bool = {
+    let closure = expandGivenClosure(ctx, given);
+    constraintListContains(closure, cname, args)
+}
+
+def hasResidualWanted(ws: List WantedConstraint, cname: String, args: List Type): Bool = match ws {
+    Nil -> false,
+    Cons(w, r) ->
+        if (w.wcConcept == cname && typeListsEqual(w.wcArgs, args)) true
+        else hasResidualWanted(r, cname, args),
+}
+
+def pushResidualWanted(residual: Cell (List WantedConstraint), cname: String, args: List Type, sp: Span): Void = {
+    let cur = cellGet(residual);
+    if (!hasResidualWanted(cur, cname, args)) {
+        cellSet(residual, Cons(MkWanted { wcConcept: cname, wcArgs: args, wcSpan: sp }, cur))
+    } else ()
+}
+
+def hasAnyTyVar(ty: Type): Bool = match ftvOrdered(ty) {
+    Nil -> false,
+    _ -> true,
+}
+
+def hasAnyTyVarInList(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> hasAnyTyVar(h) || hasAnyTyVarInList(t),
+}
+
+def hasNonVarInList(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> match h {
+        TyVar(_) -> hasNonVarInList(t),
+        _ -> true,
     },
 }
 
-def pushResidualWanted(residual: Cell (List WantedConstraint), cname: String, tvar: String, sp: Span): Void = {
-    let cur = cellGet(residual);
-    if (!hasResidualWanted(cur, cname, tvar)) {
-        cellSet(residual, Cons(MkWanted { wcConcept: cname, wcTy: TyVar(tvar), wcSpan: sp }, cur))
-    } else ()
+def findStrIndex(xs: List String, target: String, idx: Int): Option Int = match xs {
+    Nil -> None,
+    Cons(h, t) -> if (h == target) Some(idx) else findStrIndex(t, target, idx + 1),
+}
+
+def nthTypeOpt(ts: List Type, idx: Int): Option Type = match ts {
+    Nil -> None,
+    Cons(h, t) -> if (idx == 0) Some(h) else nthTypeOpt(t, idx - 1),
+}
+
+def joinTypeListStr(ts: List Type): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> typeToString(h),
+    Cons(h, t) -> typeToString(h) + ", " + joinTypeListStr(t),
+}
+
+def selectTypesByNames(tparams: List String, names: List String, args: List Type): List Type = {
+    let out = cellNew(Nil);
+    let cn = cellNew(names);
+    while (match cellGet(cn) { Nil -> false, _ -> true }) {
+        match cellGet(cn) {
+            Cons(nm, rn) -> {
+                match findStrIndex(tparams, nm, 0) {
+                    Some(idx) -> match nthTypeOpt(args, idx) {
+                        Some(t) -> cellSet(out, listAppend(cellGet(out), [t])),
+                        None -> (),
+                    },
+                    None -> (),
+                };
+                cellSet(cn, rn)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(out)
+}
+
+def applyFunDeps(
+    ctx: InferCtx,
+    cname: String,
+    zArgs0: List Type,
+    givenClosure: List ConstraintSpec,
+    sp: Span
+): Result (List Type) String = match strMapGet(ctx.conceptReg, cname) {
+    None -> Ok(zArgs0),
+    Some(cinfo) -> match cinfo.fundeps {
+        Nil -> Ok(zArgs0),
+        fds -> {
+            let curArgs = cellNew(zArgs0);
+            let changed = cellNew(true);
+            let rounds = cellNew(0);
+            while (cellGet(changed) && cellGet(rounds) < 16) {
+                cellSet(changed, false);
+                cellSet(rounds, cellGet(rounds) + 1);
+                let cfd = cellNew(fds);
+                while (match cellGet(cfd) { Nil -> false, _ -> true }) {
+                    match cellGet(cfd) {
+                        Cons(fd, rfd) -> {
+                            let zArgs = zonkTypeList(ctx.subst, cellGet(curArgs));
+                            let wLhs = selectTypesByNames(cinfo.typeParams, fd.fdLhs, zArgs);
+                            let wRhs = selectTypesByNames(cinfo.typeParams, fd.fdRhs, zArgs);
+
+                            // Step A: improve from given constraints (including superclasses)
+                            let cg = cellNew(givenClosure);
+                            while (match cellGet(cg) { Nil -> false, _ -> true }) {
+                                match cellGet(cg) {
+                                    Cons(g, rg) -> {
+                                        if (g.conceptName == cname) {
+                                            let gLhs = selectTypesByNames(cinfo.typeParams, fd.fdLhs, g.typeArgs);
+                                            if (typeListsEqual(wLhs, gLhs)) {
+                                                let gRhs = selectTypesByNames(cinfo.typeParams, fd.fdRhs, g.typeArgs);
+                                                let cwr = cellNew(wRhs);
+                                                let cgr = cellNew(gRhs);
+                                                while (match cellGet(cwr) { Nil -> false, _ -> true }) {
+                                                    match (cellGet(cwr), cellGet(cgr)) {
+                                                        (Cons(wr, r1), Cons(gr, r2)) -> {
+                                                            let z1 = zonkType(ctx.subst, wr);
+                                                            let z2 = zonkType(ctx.subst, gr);
+                                                            if (!typesEqual(z1, z2)) {
+                                                                unifyTypes(ctx.subst, z1, z2, sp)?;
+                                                                cellSet(changed, true)
+                                                            } else ();
+                                                            cellSet(cwr, r1);
+                                                            cellSet(cgr, r2)
+                                                        },
+                                                        _ -> cellSet(cwr, Nil),
+                                                    }
+                                                }
+                                            } else ()
+                                        } else ();
+                                        cellSet(cg, rg)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+
+                            // Step B: improve from unique matching instance on LHS when LHS has concrete structure
+                            let zArgs2 = zonkTypeList(ctx.subst, cellGet(curArgs));
+                            let wLhs2 = selectTypesByNames(cinfo.typeParams, fd.fdLhs, zArgs2);
+                            if (hasNonVarInList(wLhs2)) {
+                                let matches = cellNew(Nil);
+                                let ci = cellNew(cellGet(ctx.instanceReg));
+                                while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                                    match cellGet(ci) {
+                                        Cons(inst, ri) -> {
+                                            if (inst.conceptName == cname) {
+                                                let iLhs = selectTypesByNames(cinfo.typeParams, fd.fdLhs, inst.targetTypes);
+                                                let sub: StrMap Type = strMapNew();
+                                                if (matchInstancePatList(iLhs, wLhs2, sub)) {
+                                                    cellSet(matches, listAppend(cellGet(matches), [(inst, sub)]))
+                                                } else ()
+                                            } else ();
+                                            cellSet(ci, ri)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                match cellGet(matches) {
+                                    Cons((inst, sub), Nil) -> {
+                                        let wRhs2 = selectTypesByNames(cinfo.typeParams, fd.fdRhs, zArgs2);
+                                        let iRhs = selectTypesByNames(cinfo.typeParams, fd.fdRhs, inst.targetTypes);
+                                        let cwr = cellNew(wRhs2);
+                                        let cir = cellNew(iRhs);
+                                        while (match cellGet(cwr) { Nil -> false, _ -> true }) {
+                                            match (cellGet(cwr), cellGet(cir)) {
+                                                (Cons(wr, r1), Cons(ir, r2)) -> {
+                                                    let expIr = applyExplicitSubst(ir, sub);
+                                                    if (!hasAnyTyVar(expIr)) {
+                                                        let z1 = zonkType(ctx.subst, wr);
+                                                        if (!typesEqual(z1, expIr)) {
+                                                            unifyTypes(ctx.subst, z1, expIr, sp)?;
+                                                            cellSet(changed, true)
+                                                        } else ()
+                                                    } else ();
+                                                    cellSet(cwr, r1);
+                                                    cellSet(cir, r2)
+                                                },
+                                                _ -> cellSet(cwr, Nil),
+                                            }
+                                        }
+                                    },
+                                    _ -> (),
+                                }
+                            } else ();
+
+                            cellSet(curArgs, zonkTypeList(ctx.subst, cellGet(curArgs)));
+                            cellSet(cfd, rfd)
+                        },
+                        Nil -> (),
+                    }
+                }
+            };
+            Ok(zonkTypeList(ctx.subst, cellGet(curArgs)))
+        },
+    },
 }
 
 def dischargeConstraint(
@@ -885,44 +1316,52 @@ def dischargeConstraint(
 ): Result Void String =
     if (depth > 32) Err(typeErr(wc.wcSpan, "Constraint resolution exceeded recursion limit for '" + wc.wcConcept + "'"))
     else {
-        let zty = zonkType(ctx.subst, wc.wcTy);
-        match zty {
-            TyVar(v) -> {
-                if (!hasGivenConstraint(given, wc.wcConcept, v)) {
-                    pushResidualWanted(residual, wc.wcConcept, v, wc.wcSpan)
-                } else ();
-                Ok(())
-            },
-            _ ->
-                if (wc.wcConcept == "Send") {
-                    dischargeSendConstraint(ctx, zty, wc.wcSpan, given, residual, Nil, depth)
-                } else {
-                    let matchedInst: Cell (Option (InstanceInfo, StrMap Type)) = cellNew(None);
-                    let curI = cellNew(cellGet(ctx.instanceReg));
-                    while (match cellGet(curI) { Nil -> false, _ -> match cellGet(matchedInst) { None -> true, Some(_) -> false } }) {
-                        match cellGet(curI) {
-                            Cons(inst, rI) -> {
-                                if (inst.conceptName == wc.wcConcept) {
-                                    match inst.targetTypes {
-                                        Cons(patTy, _) -> {
-                                            let sub: StrMap Type = strMapNew();
-                                            if (matchInstancePattern(patTy, zty, sub)) {
-                                                cellSet(matchedInst, Some((inst, sub)))
-                                            } else ()
-                                        },
-                                        Nil -> (),
-                                    }
-                                } else ();
-                                cellSet(curI, rI)
-                            },
-                            Nil -> (),
-                        }
-                    };
-                    match cellGet(matchedInst) {
-                        None -> Err(typeErr(wc.wcSpan, "No instance of '" + wc.wcConcept + "' for type '" + typeToString(zty) + "'")),
-                        Some((inst, sub)) -> dischargeSubConstraints(ctx, inst.constraints, sub, wc.wcSpan, given, residual, depth + 1),
-                    }
+        let zArgs0 = zonkTypeList(ctx.subst, wc.wcArgs);
+        if (wc.wcConcept == "Send") {
+            match zArgs0 {
+                Cons(zty, _) -> match zty {
+                    TyVar(v) -> {
+                        if (!hasGivenConstraint(ctx, given, "Send", [TyVar(v)])) {
+                            pushResidualWanted(residual, "Send", [TyVar(v)], wc.wcSpan)
+                        } else ();
+                        Ok(())
+                    },
+                    _ -> dischargeSendConstraint(ctx, zty, wc.wcSpan, given, residual, Nil, depth),
                 },
+                Nil -> Ok(()),
+            }
+        } else {
+            let givenClosure = expandGivenClosure(ctx, given);
+            let zArgs = applyFunDeps(ctx, wc.wcConcept, zArgs0, givenClosure, wc.wcSpan)?;
+            if (constraintListContains(givenClosure, wc.wcConcept, zArgs)) Ok(())
+            else {
+                let matchedInst: Cell (Option (InstanceInfo, StrMap Type)) = cellNew(None);
+                let curI = cellNew(cellGet(ctx.instanceReg));
+                while (match cellGet(curI) { Nil -> false, _ -> match cellGet(matchedInst) { None -> true, Some(_) -> false } }) {
+                    match cellGet(curI) {
+                        Cons(inst, rI) -> {
+                            if (inst.conceptName == wc.wcConcept && listLen(inst.targetTypes) == listLen(zArgs)) {
+                                let sub: StrMap Type = strMapNew();
+                                if (matchInstancePatList(inst.targetTypes, zArgs, sub)) {
+                                    cellSet(matchedInst, Some((inst, sub)))
+                                } else ()
+                            } else ();
+                            cellSet(curI, rI)
+                        },
+                        Nil -> (),
+                    }
+                };
+                match cellGet(matchedInst) {
+                    Some((inst, sub)) -> dischargeSubConstraints(ctx, inst.constraints, sub, wc.wcSpan, given, residual, depth + 1),
+                    None ->
+                        if (hasAnyTyVarInList(zArgs)) {
+                            pushResidualWanted(residual, wc.wcConcept, zArgs, wc.wcSpan);
+                            Ok(())
+                        } else {
+                            Err(typeErr(wc.wcSpan, "No instance of '" + wc.wcConcept + "' for (" + joinTypeListStr(zArgs) + ")"))
+                        },
+                }
+            }
         }
     }
 
@@ -937,11 +1376,8 @@ def dischargeSubConstraints(
 ): Result Void String = match cs {
     Nil -> Ok(()),
     Cons(c, r) -> {
-        let subTy = match strMapGet(sub, c.typeVar) {
-            Some(t) -> t,
-            None -> TyVar(c.typeVar),
-        };
-        dischargeConstraint(ctx, MkWanted { wcConcept: c.conceptName, wcTy: subTy, wcSpan: sp }, given, residual, depth)?;
+        let subArgs = applyExplicitSubstList(c.typeArgs, sub);
+        dischargeConstraint(ctx, MkWanted { wcConcept: c.conceptName, wcArgs: subArgs, wcSpan: sp }, given, residual, depth)?;
         dischargeSubConstraints(ctx, r, sub, sp, given, residual, depth)
     },
 }
@@ -962,8 +1398,8 @@ def dischargeSendConstraint(
             TyVoid -> Ok(()),
             TyArr(_, _) -> Ok(()),
             TyVar(v) -> {
-                if (!hasGivenConstraint(given, "Send", v)) {
-                    pushResidualWanted(residual, "Send", v, sp)
+                if (!hasGivenConstraint(ctx, given, "Send", [TyVar(v)])) {
+                    pushResidualWanted(residual, "Send", [TyVar(v)], sp)
                 } else ();
                 Ok(())
             },
@@ -1235,8 +1671,39 @@ def collectEnvFtv(ctx: InferCtx, env: TypeEnv): List String = {
 }
 
 def addUniqueConstraint(cs: List ConstraintSpec, c: ConstraintSpec): List ConstraintSpec = {
-    if (hasGivenConstraint(cs, c.conceptName, c.typeVar)) cs
+    if (constraintListContains(cs, c.conceptName, c.typeArgs)) cs
     else listAppend(cs, [c])
+}
+
+def allVarsInList(vs: List String, allowed: List String): Bool = match vs {
+    Nil -> true,
+    Cons(v, r) -> listContainsStr(allowed, v) && allVarsInList(r, allowed),
+}
+
+def anyVarInList(vs: List String, allowed: List String): Bool = match vs {
+    Nil -> false,
+    Cons(v, r) -> listContainsStr(allowed, v) || anyVarInList(r, allowed),
+}
+
+def collectFtvsInTypeList(ts: List Type): List String = {
+    let acc = cellNew(Nil);
+    let cur = cellNew(ts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(t, r) -> {
+                let cf = cellNew(ftvOrdered(t));
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(v, rv) -> { cellSet(acc, addUniqueStr(cellGet(acc), v)); cellSet(cf, rv) },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(acc)
 }
 
 def generalizeType(
@@ -1280,16 +1747,18 @@ def generalizeType(
     while (match cellGet(curRes) { Nil -> false, _ -> true }) {
         match cellGet(curRes) {
             Cons(rw, r) -> {
-                match rw.wcTy {
-                    TyVar(v) ->
-                        if (listContainsStr(gvs, v)) {
-                            cellSet(localCs, addUniqueConstraint(cellGet(localCs), MkConstraint { conceptName: rw.wcConcept, typeVar: v }))
-                        } else if (listContainsStr(envFtvs, v)) {
-                            cellSet(outerWanted, listAppend(cellGet(outerWanted), [rw]))
+                let zArgs = zonkTypeList(ctx.subst, rw.wcArgs);
+                let fvs = collectFtvsInTypeList(zArgs);
+                match fvs {
+                    Nil -> (),
+                    _ ->
+                        if (allVarsInList(fvs, gvs)) {
+                            cellSet(localCs, addUniqueConstraint(cellGet(localCs), MkConstraint { conceptName: rw.wcConcept, typeArgs: zArgs }))
+                        } else if (anyVarInList(fvs, envFtvs)) {
+                            cellSet(outerWanted, listAppend(cellGet(outerWanted), [MkWanted { wcConcept: rw.wcConcept, wcArgs: zArgs, wcSpan: rw.wcSpan }]))
                         } else {
-                            returnPatErr(rw.wcSpan, "Ambiguous constraint '" + rw.wcConcept + "' on unquantified type variable '" + v + "'")?
+                            returnPatErr(rw.wcSpan, "Ambiguous constraint '" + rw.wcConcept + "' for (" + joinTypeListStr(zArgs) + ")")?
                         },
-                    _ -> (),
                 };
                 cellSet(curRes, r)
             },
@@ -1471,63 +1940,63 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 },
                 OpEq -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpNe -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpLt -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpLe -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpGt -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpGe -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     TyCon("Bool")
                 },
                 OpShl -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shl", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shl", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
                     zonkType(ctx.subst, a)
                 },
                 OpShr -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shr", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shr", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
                     zonkType(ctx.subst, a)
                 },
                 OpUshr -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ushr", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ushr", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
                     zonkType(ctx.subst, a)
@@ -1545,7 +2014,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                         _ -> "Add",
                     };
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: cname, wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: cname, wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, tl, a, il.pos)?;
                     unifyTypes(ctx.subst, tr, a, ir.pos)?;
                     zonkType(ctx.subst, a)
@@ -1563,13 +2032,13 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 },
                 UnNeg -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Neg", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Neg", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, to, a, io.pos)?;
                     zonkType(ctx.subst, a)
                 },
                 UnBitNot -> {
                     let a = freshVar(ctx);
-                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "BitNot", wcTy: a, wcSpan: sp }]));
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "BitNot", wcArgs: [a], wcSpan: sp }]));
                     unifyTypes(ctx.subst, to, a, io.pos)?;
                     zonkType(ctx.subst, a)
                 },
@@ -2103,12 +2572,10 @@ def extractFieldDecls(fs: List FieldDecl, ctx: InferCtx, sp: Span, named: Bool):
     Ok((if (named) Some(cellGet(names)) else None, cellGet(tys)))
 }
 
-pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
-    let ctx = initInferCtx();
-    let baseMap = buildPreludeBaseMap();
-
-    // Pass 1: Register & validate type aliases
+def inferPass1Aliases(ctx: InferCtx, rawDefs: List Def): Result Void String = {
+    // Pass 1: Register & validate type aliases (+ provisional kinds)
     let aliasNames = cellNew(Nil);
+    let aliasParamKindMaps: StrMap (List (String, Kind)) = strMapNew();
     let cur1 = cellNew(rawDefs);
     while (match cellGet(cur1) { Nil -> false, _ -> true }) {
         match cellGet(cur1) {
@@ -2116,6 +2583,22 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                 match d.item {
                     ItAlias(ps, scm) -> {
                         strMapInsert(ctx.aliasReg, d.ident, (ps, schemeBody(scm)));
+                        let pks = cellNew(Nil);
+                        let pPairs = cellNew(Nil);
+                        let cp = cellNew(ps);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(p, rp) -> {
+                                    let kv = freshKindVar(ctx);
+                                    cellSet(pks, listAppend(cellGet(pks), [kv]));
+                                    cellSet(pPairs, listAppend(cellGet(pPairs), [(p, kv)]));
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(ctx.tyConKinds, d.ident, buildArrowKind(cellGet(pks), KStar));
+                        strMapInsert(aliasParamKindMaps, d.ident, cellGet(pPairs));
                         cellSet(aliasNames, listAppend(cellGet(aliasNames), [(d.ident, ps, d.dpos)]))
                     },
                     _ -> (),
@@ -2141,13 +2624,43 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                     Nil -> TyCon(anm),
                     args -> composeTypes(Cons(TyCon(anm), args)),
                 };
-                let _ = expandType(ctx, checkTy, sp)?;
+                let expanded = expandType(ctx, checkTy, sp)?;
+                match strMapGet(aliasParamKindMaps, anm) {
+                    Some(pairs) -> {
+                        let tvKinds: StrMap Kind = strMapNew();
+                        let curP = cellNew(pairs);
+                        while (match cellGet(curP) { Nil -> false, _ -> true }) {
+                            match cellGet(curP) {
+                                Cons((pn, pk), rp) -> { strMapInsert(tvKinds, pn, pk); cellSet(curP, rp) },
+                                Nil -> (),
+                            }
+                        };
+                        let resK = inferTypeKind(ctx, expanded, tvKinds, sp)?;
+                        let pksFinal = cellNew(Nil);
+                        let curP2 = cellNew(pairs);
+                        while (match cellGet(curP2) { Nil -> false, _ -> true }) {
+                            match cellGet(curP2) {
+                                Cons((_, pk), rp) -> {
+                                    cellSet(pksFinal, listAppend(cellGet(pksFinal), [defaultKindToStar(ctx.kindSubst, pk)]));
+                                    cellSet(curP2, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(ctx.tyConKinds, anm, buildArrowKind(cellGet(pksFinal), defaultKindToStar(ctx.kindSubst, resK)))
+                    },
+                    None -> (),
+                };
                 cellSet(cur1b, r)
             },
             Nil -> (),
         }
     };
 
+    Ok(())
+}
+
+def inferPass2Adts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Result Void String = {
     // Seed default List constructors in baseMap
     match strMapGet(ctx.adtReg, "List") {
         Some(defList) -> {
@@ -2162,13 +2675,57 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
         None -> (),
     };
 
-    // Pass 2: Process ADT declarations
+    // Pass 2: Process ADT declarations (pre-seed kinds for recursive/mutually recursive ADTs)
+    let adtParamKindMaps: StrMap (List (String, Kind)) = strMapNew();
+    let cur2Pre = cellNew(rawDefs);
+    while (match cellGet(cur2Pre) { Nil -> false, _ -> true }) {
+        match cellGet(cur2Pre) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItAlg(tparams, _) -> {
+                        let pks = cellNew(Nil);
+                        let pPairs = cellNew(Nil);
+                        let cp = cellNew(tparams);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(p, rp) -> {
+                                    let kv = freshKindVar(ctx);
+                                    cellSet(pks, listAppend(cellGet(pks), [kv]));
+                                    cellSet(pPairs, listAppend(cellGet(pPairs), [(p, kv)]));
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(ctx.tyConKinds, d.ident, buildArrowKind(cellGet(pks), KStar));
+                        strMapInsert(adtParamKindMaps, d.ident, cellGet(pPairs))
+                    },
+                    _ -> (),
+                };
+                cellSet(cur2Pre, r)
+            },
+            Nil -> (),
+        }
+    };
     let cur2 = cellNew(rawDefs);
     while (match cellGet(cur2) { Nil -> false, _ -> true }) {
         match cellGet(cur2) {
             Cons(d, r) -> {
                 match d.item {
                     ItAlg(tparams, variants) -> {
+                        let tvKinds: StrMap Kind = strMapNew();
+                        match strMapGet(adtParamKindMaps, d.ident) {
+                            Some(pairs) -> {
+                                let cp0 = cellNew(pairs);
+                                while (match cellGet(cp0) { Nil -> false, _ -> true }) {
+                                    match cellGet(cp0) {
+                                        Cons((pn, pk), rp) -> { strMapInsert(tvKinds, pn, pk); cellSet(cp0, rp) },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            None -> (),
+                        };
                         let paramVars = cellNew(Nil);
                         let cp = cellNew(tparams);
                         while (match cellGet(cp) { Nil -> false, _ -> true }) {
@@ -2188,6 +2745,16 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                         VarUnit -> (None, Nil),
                                         VarTuple(fs) -> extractFieldDecls(fs, ctx, d.dpos, false)?,
                                         VarStruct(fs) -> extractFieldDecls(fs, ctx, d.dpos, true)?,
+                                    };
+                                    let cft = cellNew(ftys);
+                                    while (match cellGet(cft) { Nil -> false, _ -> true }) {
+                                        match cellGet(cft) {
+                                            Cons(ft, rft) -> {
+                                                checkTypeKindStar(ctx, ft, tvKinds, d.dpos)?;
+                                                cellSet(cft, rft)
+                                            },
+                                            Nil -> (),
+                                        }
                                     };
                                     let ctorBody = match ftys {
                                         Nil -> resTy,
@@ -2212,6 +2779,23 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                 },
                                 Nil -> (),
                             }
+                        };
+                        match strMapGet(adtParamKindMaps, d.ident) {
+                            Some(pairs) -> {
+                                let pksFinal = cellNew(Nil);
+                                let cp2 = cellNew(pairs);
+                                while (match cellGet(cp2) { Nil -> false, _ -> true }) {
+                                    match cellGet(cp2) {
+                                        Cons((_, pk), rp) -> {
+                                            cellSet(pksFinal, listAppend(cellGet(pksFinal), [defaultKindToStar(ctx.kindSubst, pk)]));
+                                            cellSet(cp2, rp)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                strMapInsert(ctx.tyConKinds, d.ident, buildArrowKind(cellGet(pksFinal), KStar))
+                            },
+                            None -> (),
                         };
                         if (!strMapContains(ctx.adtReg, d.ident)) vecPush(ctx.adtNames, d.ident) else ();
                         strMapInsert(ctx.adtReg, d.ident, MkAdtInfo {
@@ -2251,16 +2835,71 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
         }
     };
 
-    // Pass 3: Process user Concept declarations
+    Ok(())
+}
+
+def inferPass3Concepts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Result Void String = {
+    // Pass 3: Process user Concept declarations (3a: register concepts & infer kinds; 3b: validate superclasses)
+    let conceptTvKindMaps: StrMap (StrMap Kind) = strMapNew();
     let cur3 = cellNew(rawDefs);
     while (match cellGet(cur3) { Nil -> false, _ -> true }) {
         match cellGet(cur3) {
             Cons(d, r) -> {
                 match d.item {
-                    ItConcept(tparams, supers, methods) -> {
-                        let primary = match tparams {
-                            Cons(p0, _) -> p0,
-                            Nil -> { returnPatErr(d.dpos, "Concept '" + d.ident + "' must have a type parameter")?; "" },
+                    ItConcept(tparams, supers, fundeps, methods) -> {
+                        match tparams {
+                            Nil -> { returnPatErr(d.dpos, "Concept '" + d.ident + "' must have at least one type parameter")?; () },
+                            _ -> (),
+                        };
+                        // Validate FunDeps refer to declared concept type parameters
+                        let cfd = cellNew(fundeps);
+                        while (match cellGet(cfd) { Nil -> false, _ -> true }) {
+                            match cellGet(cfd) {
+                                Cons(fd, rfd) -> {
+                                    let cl = cellNew(fd.fdLhs);
+                                    while (match cellGet(cl) { Nil -> false, _ -> true }) {
+                                        match cellGet(cl) {
+                                            Cons(v, rv) -> {
+                                                if (!listContainsStr(tparams, v)) {
+                                                    returnPatErr(d.dpos, "Unknown type parameter '" + v + "' in functional dependency of '" + d.ident + "'")?
+                                                } else ();
+                                                cellSet(cl, rv)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    let cr = cellNew(fd.fdRhs);
+                                    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                                        match cellGet(cr) {
+                                            Cons(v, rv) -> {
+                                                if (!listContainsStr(tparams, v)) {
+                                                    returnPatErr(d.dpos, "Unknown type parameter '" + v + "' in functional dependency of '" + d.ident + "'")?
+                                                } else ();
+                                                cellSet(cr, rv)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    cellSet(cfd, rfd)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let tvKinds: StrMap Kind = strMapNew();
+                        let selfTypeArgs = cellNew(Nil);
+                        let pKindVars = cellNew(Nil);
+                        let ctp = cellNew(tparams);
+                        while (match cellGet(ctp) { Nil -> false, _ -> true }) {
+                            match cellGet(ctp) {
+                                Cons(tp, rtp) -> {
+                                    let kv = freshKindVar(ctx);
+                                    strMapInsert(tvKinds, tp, kv);
+                                    cellSet(pKindVars, listAppend(cellGet(pKindVars), [kv]));
+                                    cellSet(selfTypeArgs, listAppend(cellGet(selfTypeArgs), [TyVar(tp)]));
+                                    cellSet(ctp, rtp)
+                                },
+                                Nil -> (),
+                            }
                         };
                         let mInfos = cellNew(Nil);
                         let cm = cellNew(methods);
@@ -2269,6 +2908,8 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                 Cons(md, rm) -> {
                                     let escm = expandScheme(ctx, md.mty, d.dpos)?;
                                     let bty = schemeBody(escm);
+                                    checkConstraintsKinds(ctx, schemeConstraints(escm), tvKinds, d.dpos)?;
+                                    checkTypeKindStar(ctx, bty, tvKinds, d.dpos)?;
                                     let binders = cellNew(tparams);
                                     let cfv = cellNew(ftvOrdered(bty));
                                     while (match cellGet(cfv) { Nil -> false, _ -> true }) {
@@ -2280,7 +2921,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                             Nil -> (),
                                         }
                                     };
-                                    let cs = cellNew([MkConstraint { conceptName: d.ident, typeVar: primary }]);
+                                    let cs = cellNew([MkConstraint { conceptName: d.ident, typeArgs: cellGet(selfTypeArgs) }]);
                                     let cec = cellNew(schemeConstraints(escm));
                                     while (match cellGet(cec) { Nil -> false, _ -> true }) {
                                         match cellGet(cec) {
@@ -2300,10 +2941,36 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                 Nil -> (),
                             }
                         };
+                        let finalParamKinds = cellNew(Nil);
+                        let cpk = cellNew(cellGet(pKindVars));
+                        while (match cellGet(cpk) { Nil -> false, _ -> true }) {
+                            match cellGet(cpk) {
+                                Cons(kv, rkv) -> {
+                                    cellSet(finalParamKinds, listAppend(cellGet(finalParamKinds), [defaultKindToStar(ctx.kindSubst, kv)]));
+                                    cellSet(cpk, rkv)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let expSupers = cellNew(Nil);
+                        let cs0 = cellNew(supers);
+                        while (match cellGet(cs0) { Nil -> false, _ -> true }) {
+                            match cellGet(cs0) {
+                                Cons(sc, rsc) -> {
+                                    let expSArgs = expandTypeListInner(ctx, sc.typeArgs, Nil, d.dpos)?;
+                                    cellSet(expSupers, listAppend(cellGet(expSupers), [MkConstraint { conceptName: sc.conceptName, typeArgs: expSArgs }]));
+                                    cellSet(cs0, rsc)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(conceptTvKindMaps, d.ident, tvKinds);
                         strMapInsert(ctx.conceptReg, d.ident, MkConceptInfo {
                             conceptName: d.ident,
                             typeParams: tparams,
-                            superclasses: supers,
+                            paramKinds: cellGet(finalParamKinds),
+                            superclasses: cellGet(expSupers),
+                            fundeps: fundeps,
                             methods: cellGet(mInfos),
                         })
                     },
@@ -2314,9 +2981,34 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
             Nil -> (),
         }
     };
+    // Pass 3b: Validate superclass constraints & kinds after all concepts are registered
+    let cur3b = cellNew(rawDefs);
+    while (match cellGet(cur3b) { Nil -> false, _ -> true }) {
+        match cellGet(cur3b) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItConcept(_, _, _, _) -> match strMapGet(ctx.conceptReg, d.ident) {
+                        Some(cinfo) -> match strMapGet(conceptTvKindMaps, d.ident) {
+                            Some(tvKinds) -> checkConstraintsKinds(ctx, cinfo.superclasses, tvKinds, d.dpos)?,
+                            None -> (),
+                        },
+                        None -> (),
+                    },
+                    _ -> (),
+                };
+                cellSet(cur3b, r)
+            },
+            Nil -> (),
+        }
+    };
 
+    Ok(())
+}
+
+def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) String = {
     // Pass 4: Process Instance declarations & synthesize concrete/generic method `Def`s
     let synthDefs = cellNew(Nil);
+    let userInstList = cellNew(Nil);
     let cur4 = cellNew(rawDefs);
     while (match cellGet(cur4) { Nil -> false, _ -> true }) {
         match cellGet(cur4) {
@@ -2329,6 +3021,37 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                 returnPatErr(d.dpos, "Concept '" + cname + "' arity mismatch")?
                             } else ();
                             let expArgs = expandTypeListInner(ctx, rawArgs, Nil, d.dpos)?;
+                            let expConstraints = cellNew(Nil);
+                            let cc0 = cellNew(constraints);
+                            while (match cellGet(cc0) { Nil -> false, _ -> true }) {
+                                match cellGet(cc0) {
+                                    Cons(c, rc) -> {
+                                        let ecArgs = expandTypeListInner(ctx, c.typeArgs, Nil, d.dpos)?;
+                                        cellSet(expConstraints, listAppend(cellGet(expConstraints), [MkConstraint { conceptName: c.conceptName, typeArgs: ecArgs }]));
+                                        cellSet(cc0, rc)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let instCs = cellGet(expConstraints);
+
+                            // Kind-check instance target arguments & constraints
+                            let instTvKinds: StrMap Kind = strMapNew();
+                            checkConstraintsKinds(ctx, instCs, instTvKinds, d.dpos)?;
+                            let caKind = cellNew(expArgs);
+                            let cpkKind = cellNew(cinfo.paramKinds);
+                            while (match cellGet(caKind) { Nil -> false, _ -> true }) {
+                                match (cellGet(caKind), cellGet(cpkKind)) {
+                                    (Cons(ta, ra), Cons(pk, rk)) -> {
+                                        let ak = inferTypeKind(ctx, ta, instTvKinds, d.dpos)?;
+                                        unifyKinds(ctx.kindSubst, ak, pk, d.dpos)?;
+                                        cellSet(caKind, ra);
+                                        cellSet(cpkKind, rk)
+                                    },
+                                    _ -> cellSet(caKind, Nil),
+                                }
+                            };
+
                             let instTvs = cellNew(Nil);
                             let ca = cellNew(expArgs);
                             while (match cellGet(ca) { Nil -> false, _ -> true }) {
@@ -2346,11 +3069,17 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                     Nil -> (),
                                 }
                             };
-                            let cc = cellNew(constraints);
+                            let cc = cellNew(instCs);
                             while (match cellGet(cc) { Nil -> false, _ -> true }) {
                                 match cellGet(cc) {
                                     Cons(c, rc) -> {
-                                        cellSet(instTvs, addUniqueStr(cellGet(instTvs), c.typeVar));
+                                        let cf = cellNew(collectFtvsInTypeList(c.typeArgs));
+                                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                            match cellGet(cf) {
+                                                Cons(fv, rf) -> { cellSet(instTvs, addUniqueStr(cellGet(instTvs), fv)); cellSet(cf, rf) },
+                                                Nil -> (),
+                                            }
+                                        };
                                         cellSet(cc, rc)
                                     },
                                     Nil -> (),
@@ -2382,9 +3111,9 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                                 let tvList = cellGet(mTvs);
                                                 let mScm = match tvList {
                                                     Nil -> ScmMono(instBodyTy),
-                                                    _ -> match constraints {
+                                                    _ -> match instCs {
                                                         Nil -> ScmPoly(tvList, instBodyTy),
-                                                        _ -> ScmPolyConstrained(tvList, constraints, instBodyTy),
+                                                        _ -> ScmPolyConstrained(tvList, instCs, instBodyTy),
                                                     },
                                                 };
                                                 let bform = MkForm {
@@ -2411,11 +3140,12 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                             let instInfo = MkInstanceInfo {
                                 conceptName: cname,
                                 typeParams: cellGet(instTvs),
-                                constraints: constraints,
+                                constraints: instCs,
                                 targetTypes: expArgs,
                                 methodImpls: implMap,
                             };
-                            cellSet(ctx.instanceReg, Cons(instInfo, cellGet(ctx.instanceReg)))
+                            cellSet(ctx.instanceReg, Cons(instInfo, cellGet(ctx.instanceReg)));
+                            cellSet(userInstList, listAppend(cellGet(userInstList), [(instInfo, d.dpos)]))
                         },
                     },
                     _ -> (),
@@ -2426,7 +3156,71 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
         }
     };
 
-    let allDefs = listAppend(rawDefs, cellGet(synthDefs));
+    // Pass 4.5: Verify every user instance satisfies all superclass instances
+    let cur4b = cellNew(cellGet(userInstList));
+    while (match cellGet(cur4b) { Nil -> false, _ -> true }) {
+        match cellGet(cur4b) {
+            Cons((instInfo, sp), r) -> {
+                match strMapGet(ctx.conceptReg, instInfo.conceptName) {
+                    Some(cinfo) -> match cinfo.superclasses {
+                        Nil -> (),
+                        supers -> {
+                            let paramSub = buildPairMap(cinfo.typeParams, instInfo.targetTypes);
+                            let supRes: Cell (List WantedConstraint) = cellNew(Nil);
+                            dischargeSubConstraints(ctx, supers, paramSub, sp, instInfo.constraints, supRes, 0)?;
+                            match cellGet(supRes) {
+                                Cons(unmet, _) -> {
+                                    returnPatErr(sp, "Instance '" + instInfo.conceptName + "' is missing superclass instance '" + unmet.wcConcept + "' for (" + joinTypeListStr(unmet.wcArgs) + ")")?;
+                                    ()
+                                },
+                                Nil -> (),
+                            }
+                        },
+                    },
+                    None -> (),
+                };
+                cellSet(cur4b, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    Ok(cellGet(synthDefs))
+}
+
+pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
+    let ctx = initInferCtx();
+    let baseMap = buildPreludeBaseMap();
+
+    inferPass1Aliases(ctx, rawDefs)?;
+    inferPass2Adts(ctx, baseMap, rawDefs)?;
+
+    // Seed built-in concept methods into `baseMap`
+    let builtinConcepts = [
+        "Add", "Sub", "Mul", "Div", "Rem", "Neg",
+        "BitAnd", "BitOr", "BitXor", "BitNot", "Shl", "Shr", "Ushr",
+        "Eq", "Ord"
+    ];
+    let cbc = cellNew(builtinConcepts);
+    while (match cellGet(cbc) { Nil -> false, _ -> true }) {
+        match cellGet(cbc) {
+            Cons(cn, r) -> {
+                match strMapGet(ctx.conceptReg, cn) {
+                    Some(ci) -> match ci.methods {
+                        Cons((mn, ms), _) -> strMapInsert(baseMap, mn, ms),
+                        Nil -> (),
+                    },
+                    None -> (),
+                };
+                cellSet(cbc, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    inferPass3Concepts(ctx, baseMap, rawDefs)?;
+    let synth = inferPass4Instances(ctx, rawDefs)?;
+    let allDefs = listAppend(rawDefs, synth);
 
     // Pass 5: Seed initial schemes / placeholders for all top-level `ItForm` and `ItExtern`
     let placeholders: StrMap Type = strMapNew();
@@ -2440,6 +3234,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                         match f.annot {
                             Some(ann) -> {
                                 let expAnn = expandScheme(ctx, ann, d.dpos)?;
+                                checkSchemeKinds(ctx, expAnn, d.dpos)?;
                                 strMapInsert(baseMap, d.ident, expAnn)
                             },
                             None -> {
@@ -2452,6 +3247,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                     },
                     ItExtern(_, scm) -> {
                         let expScm = expandScheme(ctx, scm, d.dpos)?;
+                        checkSchemeKinds(ctx, expScm, d.dpos)?;
                         strMapInsert(baseMap, d.ident, expScm)
                     },
                     _ -> (),
@@ -2511,7 +3307,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                 };
                                 match cellGet(residual) {
                                     Cons(unmet, _) -> {
-                                        returnPatErr(unmet.wcSpan, "Unsatisfied constraint '" + unmet.wcConcept + "' for '" + typeToString(unmet.wcTy) + "'")?;
+                                        returnPatErr(unmet.wcSpan, "Unsatisfied constraint '" + unmet.wcConcept + "' for (" + joinTypeListStr(unmet.wcArgs) + ")")?;
                                         escm
                                     },
                                     Nil -> zonkScheme(ctx.subst, escm),
