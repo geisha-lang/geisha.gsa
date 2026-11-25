@@ -1,11 +1,11 @@
-# geisha.gs — Self-Hosting Geisha Compiler Makefile
+# geisha.gsa — Self-Hosting Geisha Compiler Makefile
 
 CC          ?= cc
 CFLAGS      ?= -O2 -Wall -Wextra -Iruntime/include
 STAGE0      ?= miko
 BUILD_DIR   := build
 RUNTIME_LIB := $(BUILD_DIR)/libgeisha_runtime.a
-ENTRY       := src/mod.gs
+ENTRY       := src/mod.gsa
 
 .PHONY: all runtime stdlib-bundle stage1 stage2 stage3 bootstrap test clean
 
@@ -27,12 +27,12 @@ stdlib-bundle:
 
 stage1: $(BUILD_DIR)/geisha1
 
-$(BUILD_DIR)/geisha1: $(RUNTIME_LIB) src/*.gs
+$(BUILD_DIR)/geisha1: $(RUNTIME_LIB) src/*.gsa
 	$(STAGE0) --src-root . --runtime $(RUNTIME_LIB) -o $(BUILD_DIR)/geisha1 $(ENTRY)
 
 stage2: $(BUILD_DIR)/geisha2
 
-$(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1 src/*.gs
+$(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1 src/*.gsa
 	$(BUILD_DIR)/geisha1 --src-root . -e -o $(BUILD_DIR)/stage2.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha2: $(BUILD_DIR)/stage2.ll $(RUNTIME_LIB)
@@ -40,7 +40,7 @@ $(BUILD_DIR)/geisha2: $(BUILD_DIR)/stage2.ll $(RUNTIME_LIB)
 
 stage3: $(BUILD_DIR)/geisha3
 
-$(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2 src/*.gs
+$(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2 src/*.gsa
 	$(BUILD_DIR)/geisha2 --src-root . -e -o $(BUILD_DIR)/stage3.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha3: $(BUILD_DIR)/stage3.ll $(RUNTIME_LIB)

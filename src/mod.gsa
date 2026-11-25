@@ -1,7 +1,7 @@
-// Self-Hosting Geisha Compiler CLI Driver (`geisha.gs`)
+// Self-Hosting Geisha Compiler CLI Driver (`geisha.gsa`)
 //
 // Usage:
-//   geisha [options] <input.gs>
+//   geisha [options] <input.gsa>
 //
 // Options:
 //   -e, --emit-llvm        Emit LLVM 20 textual IR (.ll) to stdout (or `-o <file.ll>`)
@@ -164,7 +164,7 @@ def compileInputToIr(inputFile: String, srcRootOpt: Option String): Result Strin
 def printUsage(): Void = {
     printLn("geisha — Self-hosting Geisha compiler (LLVM 20 IR backend)");
     printLn("");
-    printLn("Usage: geisha [options] <input.gs>");
+    printLn("Usage: geisha [options] <input.gsa>");
     printLn("");
     printLn("Options:");
     printLn("  -e, --emit-llvm      Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
@@ -183,7 +183,7 @@ def runDriver(): Result Void String = {
     } else {
         let inputFile = match opts.optInput {
             Some(p) -> p,
-            None -> returnErr("No input .gs file specified (run with --help for usage)")?,
+            None -> returnErr("No input .gsa file specified (run with --help for usage)")?,
         };
         let llText = compileInputToIr(inputFile, opts.optSrcRoot)?;
 

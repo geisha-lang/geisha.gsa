@@ -123,10 +123,10 @@ def resolveModFilePath(srcRoot: String, segs: List String): Option String = {
             Nil -> (),
         }
     };
-    let directFile = cellGet(p) + ".gs";
+    let directFile = cellGet(p) + ".gsa";
     if (fileExists(directFile)) Some(directFile)
     else {
-        let modFile = pathJoin(cellGet(p), "mod.gs");
+        let modFile = pathJoin(cellGet(p), "mod.gsa");
         if (fileExists(modFile)) Some(modFile) else None
     }
 }
@@ -287,8 +287,8 @@ def entryPathToSegments(entryFile: String, srcRoot: String): List String = {
         strSlice(rel0, strLen(normRoot), strLen(rel0))
     } else rel0;
 
-    let withoutGs = if (strEndsWith(rel, ".gs")) strSlice(rel, 0, strLen(rel) - 3) else rel;
-    let rawSegs = strSplitChar(withoutGs, '/');
+    let withoutGsa = if (strEndsWith(rel, ".gsa")) strSlice(rel, 0, strLen(rel) - 4) else rel;
+    let rawSegs = strSplitChar(withoutGsa, '/');
     let stripped = if (listLastOr(rawSegs, "") == "mod") listInit(rawSegs) else rawSegs;
     match stripped {
         Nil -> [pathStem(entryFile)],

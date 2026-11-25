@@ -1,12 +1,12 @@
 #!/bin/sh
-# End-to-end test suite for the self-hosted Geisha compiler (`geisha.gs`)
+# End-to-end test suite for the self-hosted Geisha compiler (`geisha.gsa`)
 set -eu
 
 GEISHA_BIN="${GEISHA_BIN:-./build/geisha2}"
 GEISHA_RUNTIME="${GEISHA_RUNTIME:-./build/libgeisha_runtime.a}"
 export GEISHA_RUNTIME
 
-TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/geisha_gs_tests.XXXXXX")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/geisha_gsa_tests.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 PASS=0
@@ -24,7 +24,7 @@ assert_eq() {
 }
 
 # 1. ADTs, Struct `.field`, Pattern Guards, Mutual Recursion, and `?` Sugar
-cat > "$TMP_DIR/t1_lang.gs" << 'EOF'
+cat > "$TMP_DIR/t1_lang.gsa" << 'EOF'
 use std.result.{Result, Ok, Err}
 use std.str.{intToStr, parseInt}
 
@@ -64,11 +64,11 @@ def main() = {
     printLn(classify(p) + "|" + intToStr(s1) + "|" + s2 + "|" + b)
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t1_lang" "$TMP_DIR/t1_lang.gs"
+"$GEISHA_BIN" -o "$TMP_DIR/t1_lang" "$TMP_DIR/t1_lang.gsa"
 assert_eq "adt_field_try_mutual_rec" "diag:14|42|err|even" "$("$TMP_DIR/t1_lang")"
 
 # 2. Open Concepts, Custom Symbolic Operators, Prefix `~`, Bitwise Ops & Int64
-cat > "$TMP_DIR/t2_ops.gs" << 'EOF'
+cat > "$TMP_DIR/t2_ops.gsa" << 'EOF'
 use std.str.{intToStr, i64ToStr}
 use std.bits.{popCount, trailingZeros}
 
@@ -110,11 +110,11 @@ def main() = {
     )
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t2_ops" "$TMP_DIR/t2_ops.gs"
+"$GEISHA_BIN" -o "$TMP_DIR/t2_ops" "$TMP_DIR/t2_ops.gsa"
 assert_eq "concepts_custom_and_bitwise_ops" "3|1099511628031|15|-1|8|4|34" "$("$TMP_DIR/t2_ops")"
 
 # 3. C `extern` FFI + Float IEEE-754 Bit Intrinsics
-cat > "$TMP_DIR/t3_ffi.gs" << 'EOF'
+cat > "$TMP_DIR/t3_ffi.gsa" << 'EOF'
 use std.str.{intToStr, floatToHex16, parseFloat}
 use std.result.{Ok, Err}
 
@@ -128,31 +128,31 @@ def main() = {
     printLn(intToStr(a) + "|" + intToStr(n) + "|" + floatToHex16(parsed))
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t3_ffi" "$TMP_DIR/t3_ffi.gs"
+"$GEISHA_BIN" -o "$TMP_DIR/t3_ffi" "$TMP_DIR/t3_ffi.gsa"
 assert_eq "c_extern_ffi_and_floats" "99|10|0x4014000000000000" "$("$TMP_DIR/t3_ffi")"
 
 # 4. Multi-file Project Mode (`--src-root`) with `pub use` Re-export
 mkdir -p "$TMP_DIR/proj/math"
-cat > "$TMP_DIR/proj/math/inner.gs" << 'EOF'
+cat > "$TMP_DIR/proj/math/inner.gsa" << 'EOF'
 pub def triple(x: Int): Int = x * 3
 EOF
-cat > "$TMP_DIR/proj/math/mod.gs" << 'EOF'
+cat > "$TMP_DIR/proj/math/mod.gsa" << 'EOF'
 pub mod inner
 pub use inner.triple
 pub def addOne(x: Int): Int = x + 1
 EOF
-cat > "$TMP_DIR/proj/mod.gs" << 'EOF'
+cat > "$TMP_DIR/proj/mod.gsa" << 'EOF'
 mod math
 use math.{triple, addOne}
 use std.str.intToStr
 
 def main() = printLn(intToStr(addOne(triple(13))))
 EOF
-"$GEISHA_BIN" --src-root "$TMP_DIR" -o "$TMP_DIR/t4_proj" "$TMP_DIR/proj/mod.gs"
+"$GEISHA_BIN" --src-root "$TMP_DIR" -o "$TMP_DIR/t4_proj" "$TMP_DIR/proj/mod.gsa"
 assert_eq "multifile_modules_pub_use" "40" "$("$TMP_DIR/t4_proj")"
 
 # 5. Concurrency (`Task`, `Chan`, `Actor`)
-cat > "$TMP_DIR/t5_conc.gs" << 'EOF'
+cat > "$TMP_DIR/t5_conc.gsa" << 'EOF'
 use std.task.{spawn, await}
 use std.sync.{chanNew, chanSend, chanRecv}
 use std.actor.{actorSpawn, actorSend, actorCall, actorStop}
@@ -173,18 +173,18 @@ def main() = {
     printLn(intToStr(await(t1)) + "|" + intToStr(cv) + "|" + intToStr(av))
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t5_conc" "$TMP_DIR/t5_conc.gs"
+"$GEISHA_BIN" -o "$TMP_DIR/t5_conc" "$TMP_DIR/t5_conc.gsa"
 assert_eq "concurrency_task_chan_actor" "42|100|15" "$("$TMP_DIR/t5_conc")"
 
 # 6. Negative Compile-Time Check: Non-exhaustive Pattern Match Rejected
-cat > "$TMP_DIR/t6_bad.gs" << 'EOF'
+cat > "$TMP_DIR/t6_bad.gsa" << 'EOF'
 use std.option.{Option, Some, None}
 def bad(x: Option Int): Int = match x {
     Some(v) -> v,
 }
 def main() = putNumber(bad(None))
 EOF
-if "$GEISHA_BIN" -o "$TMP_DIR/t6_bad" "$TMP_DIR/t6_bad.gs" >/dev/null 2>&1; then
+if "$GEISHA_BIN" -o "$TMP_DIR/t6_bad" "$TMP_DIR/t6_bad.gsa" >/dev/null 2>&1; then
     echo "FAIL [non_exhaustive_rejected]: compiler unexpectedly accepted non-exhaustive match" >&2
     exit 1
 fi

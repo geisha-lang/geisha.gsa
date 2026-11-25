@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Generate src/stdlib_bundle.gs from stdlib/{std,sys}/*.gs."""
+"""Generate src/stdlib_bundle.gsa from stdlib/{std,sys}/*.gsa."""
 
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STDLIB_DIR = ROOT / "stdlib"
-OUT_FILE = ROOT / "src" / "stdlib_bundle.gs"
+OUT_FILE = ROOT / "src" / "stdlib_bundle.gsa"
 
 MODULES = [
-    ("std.option", "std/option.gs"),
-    ("std.result", "std/result.gs"),
-    ("std.list", "std/list.gs"),
-    ("std.bits", "std/bits.gs"),
-    ("std.path", "std/path.gs"),
-    ("std.char", "std/char.gs"),
-    ("std.buf", "std/buf.gs"),
-    ("std.str", "std/str.gs"),
-    ("std.vec", "std/vec.gs"),
-    ("std.map", "std/map.gs"),
-    ("std.sync", "std/sync.gs"),
-    ("std.task", "std/task.gs"),
-    ("std.actor", "std/actor.gs"),
-    ("sys.io", "sys/io.gs"),
-    ("sys.fs", "sys/fs.gs"),
-    ("sys.env", "sys/env.gs"),
-    ("sys.proc", "sys/proc.gs"),
+    ("std.option", "std/option.gsa"),
+    ("std.result", "std/result.gsa"),
+    ("std.list", "std/list.gsa"),
+    ("std.bits", "std/bits.gsa"),
+    ("std.path", "std/path.gsa"),
+    ("std.char", "std/char.gsa"),
+    ("std.buf", "std/buf.gsa"),
+    ("std.str", "std/str.gsa"),
+    ("std.vec", "std/vec.gsa"),
+    ("std.map", "std/map.gsa"),
+    ("std.sync", "std/sync.gsa"),
+    ("std.task", "std/task.gsa"),
+    ("std.actor", "std/actor.gsa"),
+    ("sys.io", "sys/io.gsa"),
+    ("sys.fs", "sys/fs.gsa"),
+    ("sys.env", "sys/env.gsa"),
+    ("sys.proc", "sys/proc.gsa"),
 ]
 
 
