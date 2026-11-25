@@ -605,10 +605,21 @@ WebAssembly.instantiate(bytes, {
   const c = ex.bump(5);
   const resPtr = ex.handle_json(writeStr("{\"name\":\"Tingfeng\"}"));
   const res = readStr(resPtr);
-  console.log(c + "|" + res + "|" + (notified === res ? "sync" : "diff"));
+  const syncOk = (notified === res ? "sync" : "diff");
+  // Verify frame-boundary mark-sweep GC reclaims transient garbage while preserving global Cell root
+  let totalReclaimed = 0;
+  for (let i = 0; i < 200; i++) {
+    const p = ex.handle_json(writeStr("{\"name\":\"LoopFrame\"}"));
+    if (ex.gs_wasm_str_len(p) <= 0) throw new Error("empty json");
+    totalReclaimed += ex.gs_wasm_gc_collect();
+  }
+  const liveAfter = ex.gs_wasm_heap_live();
+  const c2 = ex.bump(1);
+  const gcOk = (totalReclaimed > 20000 && liveAfter < 4096 && c2 === 16) ? "gc-ok" : ("gc-bad:" + totalReclaimed + ":" + liveAfter + ":" + c2);
+  console.log(c + "|" + res + "|" + syncOk + "|" + gcOk);
 });
 ' "$TMP_DIR/t12_wasm.wasm")"
-assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync' "$WASM_OUT"
+assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|gc-ok' "$WASM_OUT"
 fi
 
 echo "All $PASS end-to-end test suites passed!"
