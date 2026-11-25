@@ -3,3 +3,4 @@ build/
 *.ll
 *.dSYM/
 .DS_Store
+formal/.lake/
