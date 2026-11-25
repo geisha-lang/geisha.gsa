@@ -329,6 +329,7 @@ data FnEmitCtx {
         fcBlocks: Vec BasicBlockBuf,
         fcCurBlk: Cell Int,
         fcPendingLet: Cell (Option String),
+        fcDummyBlk: BasicBlockBuf,
     },
 }
 
@@ -336,6 +337,9 @@ data ModEmitCtx {
     MkModEmitCtx {
         mcStrCnt: Cell Int,
         mcStrDecls: StringBuf,
+        mcStrPool: StrMap String,
+        mcConstPool: StrMap String,
+        mcConstCnt: Cell Int,
         mcSynthFns: StringBuf,
         mcSynthSet: StrMap Bool,
         mcGlobalSlots: StrMap VarSlot,
@@ -378,7 +382,8 @@ def shouldExportWasm(mctx: ModEmitCtx, fnName: String): Bool =
 
 def newFnEmitCtx(fnName: String): FnEmitCtx = {
     let blks: Vec BasicBlockBuf = vecNew();
-    vecPush(blks, MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) });
+    let entryBb = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    vecPush(blks, entryBb);
     MkFnEmitCtx {
         fcName: fnName,
         fcRegCnt: cellNew(0),
@@ -387,6 +392,7 @@ def newFnEmitCtx(fnName: String): FnEmitCtx = {
         fcBlocks: blks,
         fcCurBlk: cellNew(0),
         fcPendingLet: cellNew(None),
+        fcDummyBlk: entryBb,
     }
 }
 
@@ -412,20 +418,17 @@ def getInsertBlock(fctx: FnEmitCtx): Int =
     cellGet(fctx.fcCurBlk)
 
 def blockLabel(fctx: FnEmitCtx, blkIdx: Int): String = {
-    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
-    let bb = vecGetOr(fctx.fcBlocks, blkIdx, dummy);
+    let bb = vecGetOr(fctx.fcBlocks, blkIdx, fctx.fcDummyBlk);
     bb.bbLabel
 }
 
 def curBlockHasTerm(fctx: FnEmitCtx): Bool = {
-    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
-    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), fctx.fcDummyBlk);
     cellGet(bb.bbTerm)
 }
 
 def emitLine(fctx: FnEmitCtx, line: String): Void = {
-    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
-    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), fctx.fcDummyBlk);
     if (!cellGet(bb.bbTerm)) {
         bufPushStr(bb.bbInstrs, "  ");
         bufPushStr(bb.bbInstrs, line);
@@ -434,8 +437,7 @@ def emitLine(fctx: FnEmitCtx, line: String): Void = {
 }
 
 def emitTermLine(fctx: FnEmitCtx, line: String): Void = {
-    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
-    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), fctx.fcDummyBlk);
     if (!cellGet(bb.bbTerm)) {
         bufPushStr(bb.bbInstrs, "  ");
         bufPushStr(bb.bbInstrs, line);
@@ -482,13 +484,12 @@ def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = 
     bufPushStr(out, header);
     bufPushStr(out, " {\nentry:\n");
     bufPushBuf(out, fctx.fcAllocas);
-    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
-    let entryBb = vecGetOr(fctx.fcBlocks, 0, dummy);
+    let entryBb = vecGetOr(fctx.fcBlocks, 0, fctx.fcDummyBlk);
     bufPushBuf(out, entryBb.bbInstrs);
     let total = vecLen(fctx.fcBlocks);
     let i = cellNew(1);
     while (cellGet(i) < total) {
-        let bb = vecGetOr(fctx.fcBlocks, cellGet(i), dummy);
+        let bb = vecGetOr(fctx.fcBlocks, cellGet(i), fctx.fcDummyBlk);
         bufPushByte(out, 10);
         bufPushStr(out, bb.bbLabel);
         bufPushStr(out, ":\n");
@@ -513,18 +514,58 @@ def lookupLocalSlot(locals: List (String, VarSlot), name: String): Option VarSlo
     Cons((k, v), r) -> if (k == name) Some(v) else lookupLocalSlot(r, name),
 }
 
-def emitGlobalStringConst(mctx: ModEmitCtx, s: String): String = {
-    let id = cellGet(mctx.mcStrCnt);
-    cellSet(mctx.mcStrCnt, id + 1);
-    let sym = "@.str." + intToStr(id);
-    let byteLen = strLen(s) + 1;
-    bufPushStr(mctx.mcStrDecls, sym);
-    bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant [");
-    bufPushStr(mctx.mcStrDecls, intToStr(byteLen));
-    bufPushStr(mctx.mcStrDecls, " x i8] ");
-    bufPushStr(mctx.mcStrDecls, encodeLlvmCString(s));
-    bufPushStr(mctx.mcStrDecls, ", align 1\n");
-    sym
+def emitGlobalStringConst(mctx: ModEmitCtx, s: String): String =
+    match strMapGet(mctx.mcStrPool, s) {
+        Some(existing) -> existing,
+        None -> {
+            let id = cellGet(mctx.mcStrCnt);
+            cellSet(mctx.mcStrCnt, id + 1);
+            let sym = "@.str." + intToStr(id);
+            let byteLen = strLen(s) + 1;
+            bufPushStr(mctx.mcStrDecls, sym);
+            bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant [");
+            bufPushStr(mctx.mcStrDecls, intToStr(byteLen));
+            bufPushStr(mctx.mcStrDecls, " x i8] ");
+            bufPushStr(mctx.mcStrDecls, encodeLlvmCString(s));
+            bufPushStr(mctx.mcStrDecls, ", align 1\n");
+            strMapInsert(mctx.mcStrPool, s, sym);
+            sym
+        },
+    }
+
+def emitNullaryAdtConst(mctx: ModEmitCtx, tag: Int): String = {
+    let tagStr = intToStr(tag);
+    let key = "adt:" + tagStr;
+    match strMapGet(mctx.mcConstPool, key) {
+        Some(sym) -> sym,
+        None -> {
+            let sym = "@.adt.tag." + tagStr;
+            bufPushStr(mctx.mcStrDecls, sym);
+            bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { i32 } { i32 ");
+            bufPushStr(mctx.mcStrDecls, tagStr);
+            bufPushStr(mctx.mcStrDecls, " }, align 4\n");
+            strMapInsert(mctx.mcConstPool, key, sym);
+            sym
+        },
+    }
+}
+
+def emitStaticClosureConst(mctx: ModEmitCtx, entryName: String): String = {
+    let key = "cls:" + entryName;
+    match strMapGet(mctx.mcConstPool, key) {
+        Some(sym) -> sym,
+        None -> {
+            let id = cellGet(mctx.mcConstCnt);
+            cellSet(mctx.mcConstCnt, id + 1);
+            let sym = "@.cls." + intToStr(id);
+            bufPushStr(mctx.mcStrDecls, sym);
+            bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, {} } { ptr ");
+            bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
+            bufPushStr(mctx.mcStrDecls, ", {} zeroinitializer }, align 8\n");
+            strMapInsert(mctx.mcConstPool, key, sym);
+            sym
+        },
+    }
 }
 
 def genLit(mctx: ModEmitCtx, lit: Lit): String = match lit {
@@ -866,16 +907,26 @@ def tryEmitIntrinsic(
     name: String,
     args: List TaggedTerm,
     retTy: Type,
-    locals: List (String, VarSlot)
+    locals: List (String, VarSlot),
+    directLetVar: Option String
 ): Option String = {
     if (name == "cellNew") {
         let a0 = nthArgTerm(args, 0);
         let initVal = genExpr(mctx, fctx, a0, locals, false);
         let elemTy = schemeBody(a0.tscm);
         let elemLlvm = getValLlvmType(elemTy);
-        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
-        let byteSz = if (rawSz < 8) 8 else rawSz;
-        let cellPtr = emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")");
+        let useStack = match directLetVar {
+            Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
+            None -> false,
+        };
+        let cellPtr =
+            if (useStack) emitEntryAlloca(fctx, elemLlvm)
+            else {
+                let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
+                let byteSz = if (rawSz < 8) 8 else rawSz;
+                let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic" else "@gc_alloc";
+                emitAssign(fctx, "call ptr " + allocFn + "(i64 " + intToStr(byteSz) + ")")
+            };
         emitStore(fctx, elemLlvm, initVal, cellPtr);
         Some(cellPtr)
     } else if (name == "cellGet") {
@@ -1700,7 +1751,7 @@ def genExpr(
         TmApplyDir(funDecl, args) -> {
             let calleeName = funDecl.vname;
             let retGeishaTy = schemeBody(tm.tscm);
-            match tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals) {
+            match tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals, directLetVar) {
                 Some(intrinVal) -> intrinVal,
                 None -> match strMapGet(mctx.mcExterns, calleeName) {
                     Some(extDef) -> {
@@ -1796,47 +1847,52 @@ def genExpr(
         },
 
         TmMakeCls(vd, cls, exp) -> {
-            let stackAlloc = isStackAlloc(mctx.mcEscape, fctx.fcName, vd.vname);
             let clsSlotPtr = emitEntryAlloca(fctx, "ptr");
             let clsSlot = MkVarSlot { vsPtr: clsSlotPtr, vsLlvmTy: "ptr", vsGeishaTy: schemeBody(vd.vscm) };
             let extLocals = Cons((vd.vname, clsSlot), locals);
 
-            let fvLlvmRev = cellNew(Nil);
-            let fvGeishaRev = cellNew(Nil);
-            let cf = cellNew(cls.clsFvs);
-            while (match cellGet(cf) { Nil -> false, _ -> true }) {
-                match cellGet(cf) {
-                    Cons(fvName, r) -> {
-                        match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
-                            Some(s) -> {
-                                cellSet(fvLlvmRev, Cons(s.vsLlvmTy, cellGet(fvLlvmRev)));
-                                cellSet(fvGeishaRev, Cons(s.vsGeishaTy, cellGet(fvGeishaRev)))
-                            },
-                            None -> (),
-                        };
-                        cellSet(cf, r)
-                    },
-                    Nil -> (),
-                }
-            };
-            let fvLlvmTys = listRev(cellGet(fvLlvmRev));
-            let fvGeishaTys = listRev(cellGet(fvGeishaRev));
-            let envStructTy = formatLlvmStructType(fvLlvmTys);
-            let clsStructTy = "{ ptr, " + envStructTy + " }";
-            let (envSz, _) = structSizeAndAlignFor(fvGeishaTys, mctx.mcPtrSize);
-            let clsByteSz = alignUp(mctx.mcPtrSize + envSz, 8);
-
-            let clsObjPtr =
-                if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
-                else emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(clsByteSz) + ")");
-
-            emitStore(fctx, "ptr", clsObjPtr, clsSlotPtr);
-            let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
-            emitStore(fctx, "ptr", llvmSym(cls.clsEntry), fnFieldPtr);
-
-            match fvLlvmTys {
-                Nil -> (),
+            match cls.clsFvs {
+                Nil -> {
+                    let staticCls = emitStaticClosureConst(mctx, cls.clsEntry);
+                    emitStore(fctx, "ptr", staticCls, clsSlotPtr);
+                    genExpr(mctx, fctx, exp, extLocals, inTail)
+                },
                 _ -> {
+                    let stackAlloc = isStackAlloc(mctx.mcEscape, fctx.fcName, vd.vname);
+                    let fvLlvmRev = cellNew(Nil);
+                    let fvGeishaRev = cellNew(Nil);
+                    let cf = cellNew(cls.clsFvs);
+                    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                        match cellGet(cf) {
+                            Cons(fvName, r) -> {
+                                match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
+                                    Some(s) -> {
+                                        cellSet(fvLlvmRev, Cons(s.vsLlvmTy, cellGet(fvLlvmRev)));
+                                        cellSet(fvGeishaRev, Cons(s.vsGeishaTy, cellGet(fvGeishaRev)))
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(cf, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let fvLlvmTys = listRev(cellGet(fvLlvmRev));
+                    let fvGeishaTys = listRev(cellGet(fvGeishaRev));
+                    let envStructTy = formatLlvmStructType(fvLlvmTys);
+                    let clsStructTy = "{ ptr, " + envStructTy + " }";
+                    let (envSz, _) = structSizeAndAlignFor(fvGeishaTys, mctx.mcPtrSize);
+                    let clsByteSz = alignUp(mctx.mcPtrSize + envSz, 8);
+                    let clsAllocFn = if (isNoscanList(fvGeishaTys)) "@gc_alloc_atomic" else "@gc_alloc";
+
+                    let clsObjPtr =
+                        if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
+                        else emitAssign(fctx, "call ptr " + clsAllocFn + "(i64 " + intToStr(clsByteSz) + ")");
+
+                    emitStore(fctx, "ptr", clsObjPtr, clsSlotPtr);
+                    let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
+                    emitStore(fctx, "ptr", llvmSym(cls.clsEntry), fnFieldPtr);
+
                     let clsFvPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 1);
                     let idx = cellNew(0);
                     let cf2 = cellNew(cls.clsFvs);
@@ -1857,10 +1913,10 @@ def genExpr(
                             },
                             Nil -> (),
                         }
-                    }
+                    };
+                    genExpr(mctx, fctx, exp, extLocals, inTail && !stackAlloc)
                 },
-            };
-            genExpr(mctx, fctx, exp, extLocals, inTail && !stackAlloc)
+            }
         },
 
         TmIf(c, t, e) -> {
@@ -1907,58 +1963,57 @@ def genExpr(
             "0"
         },
 
-        TmMakeData(adtName, tag, fields, fieldTys, typeArgs) -> {
-            let fvalsRev = cellNew(Nil);
-            let cur = cellNew(fields);
-            while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                match cellGet(cur) {
-                    Cons(f, r) -> {
-                        cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
-                        cellSet(cur, r)
-                    },
-                    Nil -> (),
-                }
-            };
-            let fieldVals = listRev(cellGet(fvalsRev));
-            let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
-            let useStack =
-                if (isRecursiveAdt(mctx.mcEscape, adtName)) false
-                else match directLetVar {
-                    Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
-                    None -> false,
-                };
-            let adtPtr =
-                if (useStack) emitEntryAlloca(fctx, adtStorageTy)
-                else emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(adtByteSz) + ")");
-
-            let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
-            emitStore(fctx, "i32", intToStr(tag), tagPtr);
-
-            match fieldVals {
-                Nil -> (),
-                _ -> {
-                    let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 1);
-                    let fLlvmTys = mapValLlvmTypes(fieldTys);
-                    let payloadStructTy = formatLlvmStructType(fLlvmTys);
-                    let idx = cellNew(0);
-                    let cv = cellNew(fieldVals);
-                    let ct = cellNew(fLlvmTys);
-                    while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                        match (cellGet(cv), cellGet(ct)) {
-                            (Cons(fv, rv), Cons(flt, rt)) -> {
-                                let i = cellGet(idx);
-                                let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                                emitStore(fctx, flt, fv, fPtr);
-                                cellSet(idx, i + 1);
-                                cellSet(cv, rv);
-                                cellSet(ct, rt)
-                            },
-                            _ -> (),
-                        }
+        TmMakeData(adtName, tag, fields, fieldTys, typeArgs) -> match fields {
+            Nil -> emitNullaryAdtConst(mctx, tag),
+            _ -> {
+                let fvalsRev = cellNew(Nil);
+                let cur = cellNew(fields);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(f, r) -> {
+                            cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
                     }
-                },
-            };
-            adtPtr
+                };
+                let fieldVals = listRev(cellGet(fvalsRev));
+                let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
+                let useStack =
+                    if (isRecursiveAdt(mctx.mcEscape, adtName)) false
+                    else match directLetVar {
+                        Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
+                        None -> false,
+                    };
+                let adtAllocFn = if (isNoscanList(fieldTys)) "@gc_alloc_atomic" else "@gc_alloc";
+                let adtPtr =
+                    if (useStack) emitEntryAlloca(fctx, adtStorageTy)
+                    else emitAssign(fctx, "call ptr " + adtAllocFn + "(i64 " + intToStr(adtByteSz) + ")");
+
+                let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
+                emitStore(fctx, "i32", intToStr(tag), tagPtr);
+
+                let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 1);
+                let fLlvmTys = mapValLlvmTypes(fieldTys);
+                let payloadStructTy = formatLlvmStructType(fLlvmTys);
+                let idx = cellNew(0);
+                let cv = cellNew(fieldVals);
+                let ct = cellNew(fLlvmTys);
+                while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                    match (cellGet(cv), cellGet(ct)) {
+                        (Cons(fv, rv), Cons(flt, rt)) -> {
+                            let i = cellGet(idx);
+                            let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
+                            emitStore(fctx, flt, fv, fPtr);
+                            cellSet(idx, i + 1);
+                            cellSet(cv, rv);
+                            cellSet(ct, rt)
+                        },
+                        _ -> (),
+                    }
+                };
+                adtPtr
+            },
         },
 
         TmGetTag(node) -> {
@@ -2127,10 +2182,12 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
+    let isWasmExp = shouldExportWasm(mctx, fd.fnName);
+    let linkage = if (isWasmExp) "" else "internal ";
     let exportAttr =
-        if (shouldExportWasm(mctx, fd.fnName)) " \"wasm-export-name\"=\"" + fd.fnName + "\""
+        if (isWasmExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
         else "";
-    let header = "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")" + exportAttr;
+    let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")" + exportAttr;
     flushFunctionToBuf(out, header, fctx)
 }
 
@@ -2379,6 +2436,9 @@ pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: Li
     let mctx = MkModEmitCtx {
         mcStrCnt: cellNew(0),
         mcStrDecls: bufNew(),
+        mcStrPool: strMapNew(),
+        mcConstPool: strMapNew(),
+        mcConstCnt: cellNew(0),
         mcSynthFns: bufNew(),
         mcSynthSet: strMapNew(),
         mcGlobalSlots: globalSlots,

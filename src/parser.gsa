@@ -40,11 +40,14 @@ use lexer.{
 }
 
 pub data Parser {
-    MkParser { tokens: Vec Token, idx: Cell Int, pushedSym: Cell (Option Token) },
+    MkParser { tokens: Vec Token, idx: Cell Int, pushedSym: Cell (Option Token), eofTok: Token },
 }
 
+def eofToken(): Token =
+    MkToken { kind: TkEof, span: emptySpan(), hadNewline: true }
+
 def newParser(toks: Vec Token): Parser =
-    MkParser { tokens: toks, idx: cellNew(0), pushedSym: cellNew(None) }
+    MkParser { tokens: toks, idx: cellNew(0), pushedSym: cellNew(None), eofTok: eofToken() }
 
 def savePos(p: Parser): (Int, Option Token) =
     (cellGet(p.idx), cellGet(p.pushedSym))
@@ -56,15 +59,12 @@ def restorePos(p: Parser, snap: (Int, Option Token)): Void = match snap {
     },
 }
 
-def eofToken(): Token =
-    MkToken { kind: TkEof, span: emptySpan(), hadNewline: true }
-
 def peekTok(p: Parser): Token = match cellGet(p.pushedSym) {
     Some(t) -> t,
     None -> {
         let i = cellGet(p.idx);
         let n = vecLen(p.tokens);
-        if (i < n) vecGetOr(p.tokens, i, eofToken()) else eofToken()
+        if (i < n) vecGetOr(p.tokens, i, p.eofTok) else p.eofTok
     },
 }
 
@@ -77,10 +77,10 @@ def bumpTok(p: Parser): Token = match cellGet(p.pushedSym) {
         let i = cellGet(p.idx);
         let n = vecLen(p.tokens);
         if (i < n) {
-            let t = vecGetOr(p.tokens, i, eofToken());
+            let t = vecGetOr(p.tokens, i, p.eofTok);
             if (i + 1 < n) cellSet(p.idx, i + 1) else ();
             t
-        } else eofToken()
+        } else p.eofTok
     },
 }
 
@@ -92,7 +92,7 @@ def peekAt(p: Parser, offset: Int): Token =
             None -> cellGet(p.idx) + offset,
         };
         let n = vecLen(p.tokens);
-        if (base < n) vecGetOr(p.tokens, base, eofToken()) else eofToken()
+        if (base < n) vecGetOr(p.tokens, base, p.eofTok) else p.eofTok
     }
 
 def parseErr(p: Parser, msg: String): String =

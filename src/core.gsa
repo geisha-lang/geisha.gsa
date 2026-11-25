@@ -2960,6 +2960,13 @@ def collectLocalAllocs(
                 if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
                 strMapInsert(allocMap, vd.vname, (strMapContains(recAdts, tn), cellGet(contained)))
             },
+            TmApplyDir(fvd, args) if (fvd.vname == "cellNew") -> {
+                let seen: StrMap Bool = strMapNew();
+                let contained = cellNew(Nil);
+                collectVarsInCoreList(args, seen, contained);
+                if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
+                strMapInsert(allocMap, vd.vname, (false, cellGet(contained)))
+            },
             _ -> (),
         };
         collectLocalAllocs(val, recAdts, allocMap, allocKeys);
@@ -3072,6 +3079,19 @@ def analyzeAllocEscapes(
                     }
                 }
             },
+            TmApplyDir(fvd, args) if (fvd.vname == "cellNew") -> {
+                let cur = cellNew(args);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(a, r) -> {
+                            markVarsEscaping(varsOfTerm(a), allocMap, escaping, escList);
+                            analyzeAllocEscapes(a, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
             _ -> {
                 markVarsEscaping(varsOfTerm(val), allocMap, escaping, escList);
                 analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false)
@@ -3079,7 +3099,22 @@ def analyzeAllocEscapes(
         };
         analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
     },
-    TmApplyDir(vd, args) -> match strMapGet(allParamEscapes, vd.vname) {
+    TmApplyDir(vd, args) ->
+        if (vd.vname == "cellGet") {
+            match args {
+                Cons(cellArg, _) -> analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+                Nil -> (),
+            }
+        } else if (vd.vname == "cellSet") {
+            match args {
+                Cons(cellArg, Cons(valArg, _)) -> {
+                    analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+                    markVarsEscaping(varsOfTerm(valArg), allocMap, escaping, escList);
+                    analyzeAllocEscapes(valArg, allocMap, escaping, escList, allParamEscapes, recAdts, true)
+                },
+                _ -> (),
+            }
+        } else match strMapGet(allParamEscapes, vd.vname) {
         Some(calleeEsc) -> {
             let cLen = arrayLen(calleeEsc);
             let idx = cellNew(0);

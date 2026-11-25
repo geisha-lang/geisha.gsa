@@ -10,11 +10,39 @@ extern "strtod" def c_strtod(s: String, endptr: Ptr): Float
 
 pub def strIsEmpty(s: String): Bool = strLen(s) == 0
 
-pub def intToStr(n: Int): String = {
-    let b = bufNew();
-    bufPushInt(b, n);
-    bufToString(b)
-}
+pub def intToStr(n: Int): String =
+    if (n == 0) "0"
+    else if (n == -2147483647 - 1) "-2147483648"
+    else {
+        let neg = n < 0;
+        let v = cellNew(if (neg) -n else n);
+        let rev = arrayNew(12, 0);
+        let dlen = cellNew(0);
+        while (cellGet(v) > 0) {
+            let cur = cellGet(v);
+            let idx = cellGet(dlen);
+            arraySet(rev, idx, 48 + (cur % 10));
+            cellSet(dlen, idx + 1);
+            cellSet(v, cur / 10)
+        };
+        let count = cellGet(dlen);
+        let total = if (neg) count + 1 else count;
+        let out = arrayNew(total, 0);
+        let pos = cellNew(0);
+        if (neg) {
+            arraySet(out, 0, 45);
+            cellSet(pos, 1)
+        } else ();
+        let k = cellNew(count - 1);
+        while (cellGet(k) >= 0) {
+            let ki = cellGet(k);
+            let pi = cellGet(pos);
+            arraySet(out, pi, arrayGet(rev, ki));
+            cellSet(pos, pi + 1);
+            cellSet(k, ki - 1)
+        };
+        strFromBytes(out, total)
+    }
 
 pub def i64ToStr(n: Int64): String = {
     let zero = intToI64(0);
@@ -113,14 +141,33 @@ pub def strStartsWith(s: String, prefix: String): Bool = {
     let sl = strLen(s);
     let pl = strLen(prefix);
     if (pl > sl) false
-    else strSlice(s, 0, pl) == prefix
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < pl && cellGet(ok)) {
+            let idx = cellGet(i);
+            if (strByteAt(s, idx) != strByteAt(prefix, idx)) cellSet(ok, false) else ();
+            cellSet(i, idx + 1)
+        };
+        cellGet(ok)
+    }
 }
 
 pub def strEndsWith(s: String, suffix: String): Bool = {
     let sl = strLen(s);
     let xl = strLen(suffix);
     if (xl > sl) false
-    else strSlice(s, sl - xl, sl) == suffix
+    else {
+        let base = sl - xl;
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < xl && cellGet(ok)) {
+            let idx = cellGet(i);
+            if (strByteAt(s, base + idx) != strByteAt(suffix, idx)) cellSet(ok, false) else ();
+            cellSet(i, idx + 1)
+        };
+        cellGet(ok)
+    }
 }
 
 pub def strIndexOfByte(s: String, targetByte: Int, startIdx: Int): Option Int = {

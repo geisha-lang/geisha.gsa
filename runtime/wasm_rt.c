@@ -41,9 +41,7 @@ void *gc_alloc(int64_t bytes)
 
     unsigned char *ptr = (unsigned char *)gs_heap_cursor;
     gs_heap_cursor += sz;
-    for (size_t i = 0; i < sz; i++) {
-        ptr[i] = 0;
-    }
+    /* WASM linear memory from memory.grow is already zero-initialized; only zero if ever reused */
     return (void *)ptr;
 }
 
@@ -78,11 +76,8 @@ int64_t gs_strlen(const char *s)
 
 void *gs_memcpy(void *dst, const void *src, int64_t n)
 {
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    for (int64_t i = 0; i < n; i++) {
-        d[i] = s[i];
-    }
+    if (n <= 0) return dst;
+    __builtin_memcpy(dst, src, (size_t)n);
     return dst;
 }
 

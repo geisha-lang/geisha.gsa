@@ -3,7 +3,7 @@
 use std.result.{Result, Ok, Err}
 use std.char.{isDigitByte, isIdentStartByte, isIdentContByte}
 use std.vec.{Vec, vecNew, vecPush}
-use std.buf.{bufNew, bufPushByte, bufToString}
+use std.buf.{StringBuf, bufNew, bufClear, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.{Span, MkSpan}
 
@@ -92,9 +92,21 @@ def classifyWord(w: String): TokKind =
     else if (w == "Void") TkVoid
     else TkIdent(w)
 
+def sliceIntoBuf(buf: StringBuf, src: String, start: Int, end: Int): String = {
+    bufClear(buf);
+    let k = cellNew(start);
+    while (cellGet(k) < end) {
+        let idx = cellGet(k);
+        bufPushByte(buf, strByteAt(src, idx));
+        cellSet(k, idx + 1)
+    };
+    bufToString(buf)
+}
+
 pub def tokenize(src: String): Result (Vec Token) String = {
     let len = strLen(src);
     let out: Vec Token = vecNew();
+    let tokBuf = bufNew();
     let i = cellNew(0);
     let errMsg = cellNew("");
     let failed = cellNew(false);
@@ -175,7 +187,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     cellSet(i, cellGet(i) + 1)
                 };
                 let end = cellGet(i);
-                let word = strSlice(src, start, end);
+                let word = sliceIntoBuf(tokBuf, src, start, end);
                 vecPush(out, MkToken { kind: classifyWord(word), span: MkSpan { start: start, end: end }, hadNewline: nl })
             } else if (isDigitByte(b)) {
                 cellSet(i, start + 1);
@@ -206,7 +218,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     } else ()
                 } else ();
                 let end = cellGet(i);
-                let rawNum = strSlice(src, start, end);
+                let rawNum = sliceIntoBuf(tokBuf, src, start, end);
                 let k = if (cellGet(isFloat)) TkFloat(rawNum) else TkInt(rawNum);
                 vecPush(out, MkToken { kind: k, span: MkSpan { start: start, end: end }, hadNewline: nl })
             } else if (b == 34) {
@@ -296,7 +308,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     }
                 };
                 let end = cellGet(i);
-                vecPush(out, MkToken { kind: TkSym(strSlice(src, start, end)), span: MkSpan { start: start, end: end }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkSym(sliceIntoBuf(tokBuf, src, start, end)), span: MkSpan { start: start, end: end }, hadNewline: nl })
             } else {
                 cellSet(errMsg, "Unexpected character (ASCII " + intToStr(b) + ") at byte " + intToStr(start));
                 cellSet(failed, true)

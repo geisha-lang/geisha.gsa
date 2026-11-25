@@ -45,6 +45,7 @@ def rehashStrMap(m: StrMap v): Void = match m {
         let oldBuckets = cellGet(bucketsCell);
         let oldCap = arrayLen(oldBuckets);
         let newCap = oldCap * 2;
+        let mask = newCap - 1;
         let newBuckets = arrayNew(newCap, Nil);
         let i = cellNew(0);
         while (cellGet(i) < oldCap) {
@@ -55,7 +56,7 @@ def rehashStrMap(m: StrMap v): Void = match m {
                 match cellGet(cur) {
                     Nil -> cellSet(looping, false),
                     Cons((k, val), rest) -> {
-                        let target = strHash(k) % newCap;
+                        let target = strHash(k) & mask;
                         arraySet(newBuckets, target, Cons((k, val), arrayGet(newBuckets, target)));
                         cellSet(cur, rest)
                     },
@@ -70,7 +71,7 @@ def rehashStrMap(m: StrMap v): Void = match m {
 pub def strMapGet(m: StrMap v, key: String): Option v = match m {
     MkStrMap(bucketsCell, _) -> {
         let buckets = cellGet(bucketsCell);
-        let idx = strHash(key) % arrayLen(buckets);
+        let idx = strHash(key) & (arrayLen(buckets) - 1);
         bucketLookupStr(arrayGet(buckets, idx), key)
     },
 }
@@ -86,7 +87,7 @@ pub def strMapInsert(m: StrMap v, key: String, val: v): Void = match m {
             rehashStrMap(m)
         } else ();
         let buckets = cellGet(bucketsCell);
-        let idx = strHash(key) % arrayLen(buckets);
+        let idx = strHash(key) & (arrayLen(buckets) - 1);
         let (newChain, added) = bucketUpsertStr(arrayGet(buckets, idx), key, val);
         arraySet(buckets, idx, newChain);
         if (added) cellSet(szCell, cellGet(szCell) + 1) else ()
@@ -96,7 +97,7 @@ pub def strMapInsert(m: StrMap v, key: String, val: v): Void = match m {
 pub def strMapRemove(m: StrMap v, key: String): Bool = match m {
     MkStrMap(bucketsCell, szCell) -> {
         let buckets = cellGet(bucketsCell);
-        let idx = strHash(key) % arrayLen(buckets);
+        let idx = strHash(key) & (arrayLen(buckets) - 1);
         let (newChain, removed) = bucketRemoveStr(arrayGet(buckets, idx), key);
         arraySet(buckets, idx, newChain);
         if (removed) cellSet(szCell, cellGet(szCell) - 1) else ();
@@ -137,18 +138,49 @@ def bucketUpsertInt(chain: List (Int, v), key: Int, val: v): (List (Int, v), Boo
         },
 }
 
+def rehashIntMap(m: IntMap v): Void = match m {
+    MkIntMap(bucketsCell, _) -> {
+        let oldBuckets = cellGet(bucketsCell);
+        let oldCap = arrayLen(oldBuckets);
+        let newCap = oldCap * 2;
+        let mask = newCap - 1;
+        let newBuckets = arrayNew(newCap, Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < oldCap) {
+            let bidx = cellGet(i);
+            let cur = cellNew(arrayGet(oldBuckets, bidx));
+            let looping = cellNew(true);
+            while (cellGet(looping)) {
+                match cellGet(cur) {
+                    Nil -> cellSet(looping, false),
+                    Cons((k, val), rest) -> {
+                        let target = hashIntKey(k) & mask;
+                        arraySet(newBuckets, target, Cons((k, val), arrayGet(newBuckets, target)));
+                        cellSet(cur, rest)
+                    },
+                }
+            };
+            cellSet(i, bidx + 1)
+        };
+        cellSet(bucketsCell, newBuckets)
+    },
+}
+
 pub def intMapGet(m: IntMap v, key: Int): Option v = match m {
     MkIntMap(bucketsCell, _) -> {
         let buckets = cellGet(bucketsCell);
-        let idx = hashIntKey(key) % arrayLen(buckets);
+        let idx = hashIntKey(key) & (arrayLen(buckets) - 1);
         bucketLookupInt(arrayGet(buckets, idx), key)
     },
 }
 
 pub def intMapInsert(m: IntMap v, key: Int, val: v): Void = match m {
     MkIntMap(bucketsCell, szCell) -> {
+        if ((cellGet(szCell) + 1) * 4 > arrayLen(cellGet(bucketsCell)) * 3) {
+            rehashIntMap(m)
+        } else ();
         let buckets = cellGet(bucketsCell);
-        let idx = hashIntKey(key) % arrayLen(buckets);
+        let idx = hashIntKey(key) & (arrayLen(buckets) - 1);
         let (newChain, added) = bucketUpsertInt(arrayGet(buckets, idx), key, val);
         arraySet(buckets, idx, newChain);
         if (added) cellSet(szCell, cellGet(szCell) + 1) else ()
