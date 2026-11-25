@@ -1,16 +1,19 @@
 import CoreGeisha.Syntax
 
 /-!
-# Core Geisha: Small-Step Operational Semantics
+# Core Geisha: Small-Step & Concurrent Operational Semantics
 
 Strict left-to-right call-by-value small-step operational semantics
-`Step Δ Φ e σ e' σ'` with:
+`Step Δ Φ tasks e σ e' σ' spawned` and interleaved concurrent task-pool
+semantics `ConcStep Δ Φ tasks σ tasks' σ'` with:
 - Wrapping 32-bit two's-complement arithmetic (`Int32`)
 - Explicit division/remainder-by-zero traps (`Trap.divByZero`)
 - Short-circuit `&&` and `||`
 - Deterministic pattern matching (`matchPat`) with explicit `Trap.matchFailure`
 - Explicit mutable store operations (`cellNew`, `cellGet`, `cellSet`)
-- Strict trap propagation through all evaluation contexts
+- Concurrent `spawn` (forking a `shared` 0-arg closure into a new task) and
+  `await` (joining a completed task's `IsSend` value or propagating its trap)
+- Explicit active memory-access characterization (`ActiveCellAccess`, `HasDataRace`)
 -/
 
 namespace CoreGeisha
@@ -82,222 +85,447 @@ inductive ListFirstTrap : List Expr → Trap → Prop where
 def zipParams (ps : List (Ident × Ty)) (vs : List Expr) : List (Ident × Expr) :=
   (ps.map Prod.fst).zip vs
 
-/- Small-step operational semantics `⟨e, σ⟩ ⟶ ⟨e', σ'⟩`. -/
+/-- A thread expression is terminal if it is either a value or a defined runtime trap. -/
+def IsTerminal (e : Expr) : Prop :=
+  IsValue e ∨ ∃ t, e = .trap t
+
+/- Single-thread small-step transition `Step Δ Φ tasks e σ e' σ' spawned`,
+   parameterized by a read-only snapshot of the current `tasks` pool (for `spawn`
+   fresh `TaskId` allocation and `await` completion inspection), producing an
+   optional newly spawned task body `spawned : Option Expr`. -/
 mutual
-inductive Step (Δ : AdtEnv) (Φ : FunEnv) : Expr → Store → Expr → Store → Prop where
+inductive Step (Δ : AdtEnv) (Φ : FunEnv) (tasks : List Expr) :
+    Expr → Store → Expr → Store → Option Expr → Prop where
   -- Tuple: strict left-to-right
-  | tupleStep {es es' : List Expr} {σ σ' : Store} :
-      StepList Δ Φ es σ es' σ' →
-      Step Δ Φ (.tuple es) σ (.tuple es') σ'
+  | tupleStep {es es' : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      StepList Δ Φ tasks es σ es' σ' sp →
+      Step Δ Φ tasks (.tuple es) σ (.tuple es') σ' sp
   | tupleTrap {es : List Expr} {t : Trap} {σ : Store} :
       ListFirstTrap es t →
-      Step Δ Φ (.tuple es) σ (.trap t) σ
+      Step Δ Φ tasks (.tuple es) σ (.trap t) σ none
 
   -- Block: sequential evaluation
   | blockEmpty {σ : Store} :
-      Step Δ Φ (.block []) σ (.lit .unit) σ
+      Step Δ Φ tasks (.block []) σ (.lit .unit) σ none
   | blockSingle {e : Expr} {σ : Store} :
-      Step Δ Φ (.block [e]) σ e σ
-  | blockConsStep {e1 e1' e2 : Expr} {es : List Expr} {σ σ' : Store} :
-      Step Δ Φ e1 σ e1' σ' →
-      Step Δ Φ (.block (e1 :: e2 :: es)) σ (.block (e1' :: e2 :: es)) σ'
+      Step Δ Φ tasks (.block [e]) σ e σ none
+  | blockConsStep {e1 e1' e2 : Expr} {es : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e1 σ e1' σ' sp →
+      Step Δ Φ tasks (.block (e1 :: e2 :: es)) σ (.block (e1' :: e2 :: es)) σ' sp
   | blockConsVal {v1 e2 : Expr} {es : List Expr} {σ : Store} :
       IsValue v1 →
-      Step Δ Φ (.block (v1 :: e2 :: es)) σ (.block (e2 :: es)) σ
+      Step Δ Φ tasks (.block (v1 :: e2 :: es)) σ (.block (e2 :: es)) σ none
   | blockConsTrap {t : Trap} {e2 : Expr} {es : List Expr} {σ : Store} :
-      Step Δ Φ (.block (.trap t :: e2 :: es)) σ (.trap t) σ
+      Step Δ Φ tasks (.block (.trap t :: e2 :: es)) σ (.trap t) σ none
 
   -- Closure application: callee first, then args left-to-right, then β-reduction
-  | applyFn {fn fn' : Expr} {args : List Expr} {σ σ' : Store} :
-      Step Δ Φ fn σ fn' σ' →
-      Step Δ Φ (.apply fn args) σ (.apply fn' args) σ'
+  | applyFn {fn fn' : Expr} {args : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks fn σ fn' σ' sp →
+      Step Δ Φ tasks (.apply fn args) σ (.apply fn' args) σ' sp
   | applyFnTrap {t : Trap} {args : List Expr} {σ : Store} :
-      Step Δ Φ (.apply (.trap t) args) σ (.trap t) σ
-  | applyArgs {fn : Expr} {args args' : List Expr} {σ σ' : Store} :
+      Step Δ Φ tasks (.apply (.trap t) args) σ (.trap t) σ none
+  | applyArgs {fn : Expr} {args args' : List Expr} {σ σ' : Store} {sp : Option Expr} :
       IsValue fn →
-      StepList Δ Φ args σ args' σ' →
-      Step Δ Φ (.apply fn args) σ (.apply fn args') σ'
+      StepList Δ Φ tasks args σ args' σ' sp →
+      Step Δ Φ tasks (.apply fn args) σ (.apply fn args') σ' sp
   | applyArgsTrap {fn : Expr} {args : List Expr} {t : Trap} {σ : Store} :
       IsValue fn →
       ListFirstTrap args t →
-      Step Δ Φ (.apply fn args) σ (.trap t) σ
-  | applyBeta {ps : List (Ident × Ty)} {ret : Ty} {body : Expr} {args : List Expr} {σ : Store} :
+      Step Δ Φ tasks (.apply fn args) σ (.trap t) σ none
+  | applyBeta {m : Mode} {ps : List (Ident × Ty)} {ret : Ty} {body : Expr}
+      {args : List Expr} {σ : Store} :
       (∀ a ∈ args, IsValue a) →
       args.length = ps.length →
-      Step Δ Φ (.apply (.lam ps ret body) args) σ (substMany (zipParams ps args) body) σ
+      Step Δ Φ tasks (.apply (.lam m ps ret body) args) σ (substMany (zipParams ps args) body) σ none
 
   -- Direct top-level function call (`TmApplyDir`)
-  | applyDirArgs {name : Ident} {args args' : List Expr} {σ σ' : Store} :
-      StepList Δ Φ args σ args' σ' →
-      Step Δ Φ (.applyDir name args) σ (.applyDir name args') σ'
+  | applyDirArgs {name : Ident} {args args' : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      StepList Δ Φ tasks args σ args' σ' sp →
+      Step Δ Φ tasks (.applyDir name args) σ (.applyDir name args') σ' sp
   | applyDirTrap {name : Ident} {args : List Expr} {t : Trap} {σ : Store} :
       ListFirstTrap args t →
-      Step Δ Φ (.applyDir name args) σ (.trap t) σ
+      Step Δ Φ tasks (.applyDir name args) σ (.trap t) σ none
   | applyDirBeta {name : Ident} {fd : FunDef} {args : List Expr} {σ : Store} :
       Φ name = some fd →
       (∀ a ∈ args, IsValue a) →
       args.length = fd.params.length →
-      Step Δ Φ (.applyDir name args) σ (substMany (zipParams fd.params args) fd.body) σ
+      Step Δ Φ tasks (.applyDir name args) σ (substMany (zipParams fd.params args) fd.body) σ none
 
   -- Unary operators
-  | unStep {op : UnOp} {e e' : Expr} {σ σ' : Store} :
-      Step Δ Φ e σ e' σ' →
-      Step Δ Φ (.un op e) σ (.un op e') σ'
+  | unStep {op : UnOp} {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.un op e) σ (.un op e') σ' sp
   | unTrap {op : UnOp} {t : Trap} {σ : Store} :
-      Step Δ Φ (.un op (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.un op (.trap t)) σ (.trap t) σ none
   | unVal {op : UnOp} {l l' : Lit} {σ : Store} :
       evalUnOp op l = some l' →
-      Step Δ Φ (.un op (.lit l)) σ (.lit l') σ
+      Step Δ Φ tasks (.un op (.lit l)) σ (.lit l') σ none
 
   -- Binary operators (short-circuit for && and ||; strict left-to-right for all others)
-  | binLeft {op : BinOp} {e1 e1' e2 : Expr} {σ σ' : Store} :
-      Step Δ Φ e1 σ e1' σ' →
-      Step Δ Φ (.bin op e1 e2) σ (.bin op e1' e2) σ'
+  | binLeft {op : BinOp} {e1 e1' e2 : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e1 σ e1' σ' sp →
+      Step Δ Φ tasks (.bin op e1 e2) σ (.bin op e1' e2) σ' sp
   | binLeftTrap {op : BinOp} {t : Trap} {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.bin op (.trap t) e2) σ (.trap t) σ
+      Step Δ Φ tasks (.bin op (.trap t) e2) σ (.trap t) σ none
   | binAndFalse {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.bin .and (.lit (.bool false)) e2) σ (.lit (.bool false)) σ
+      Step Δ Φ tasks (.bin .and (.lit (.bool false)) e2) σ (.lit (.bool false)) σ none
   | binAndTrue {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.bin .and (.lit (.bool true)) e2) σ e2 σ
+      Step Δ Φ tasks (.bin .and (.lit (.bool true)) e2) σ e2 σ none
   | binOrTrue {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.bin .or (.lit (.bool true)) e2) σ (.lit (.bool true)) σ
+      Step Δ Φ tasks (.bin .or (.lit (.bool true)) e2) σ (.lit (.bool true)) σ none
   | binOrFalse {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.bin .or (.lit (.bool false)) e2) σ e2 σ
-  | binRight {op : BinOp} {v1 e2 e2' : Expr} {σ σ' : Store} :
+      Step Δ Φ tasks (.bin .or (.lit (.bool false)) e2) σ e2 σ none
+  | binRight {op : BinOp} {v1 e2 e2' : Expr} {σ σ' : Store} {sp : Option Expr} :
       op ≠ .and → op ≠ .or →
       IsValue v1 →
-      Step Δ Φ e2 σ e2' σ' →
-      Step Δ Φ (.bin op v1 e2) σ (.bin op v1 e2') σ'
+      Step Δ Φ tasks e2 σ e2' σ' sp →
+      Step Δ Φ tasks (.bin op v1 e2) σ (.bin op v1 e2') σ' sp
   | binRightTrap {op : BinOp} {v1 : Expr} {t : Trap} {σ : Store} :
       op ≠ .and → op ≠ .or →
       IsValue v1 →
-      Step Δ Φ (.bin op v1 (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.bin op v1 (.trap t)) σ (.trap t) σ none
   | binVal {op : BinOp} {l1 l2 l' : Lit} {σ : Store} :
       evalBinOp op l1 l2 = some (.val l') →
-      Step Δ Φ (.bin op (.lit l1) (.lit l2)) σ (.lit l') σ
+      Step Δ Φ tasks (.bin op (.lit l1) (.lit l2)) σ (.lit l') σ none
   | binTrap {op : BinOp} {l1 l2 : Lit} {t : Trap} {σ : Store} :
       evalBinOp op l1 l2 = some (.trap t) →
-      Step Δ Φ (.bin op (.lit l1) (.lit l2)) σ (.trap t) σ
+      Step Δ Φ tasks (.bin op (.lit l1) (.lit l2)) σ (.trap t) σ none
 
   -- Let binding
-  | letStep {x : Ident} {e1 e1' e2 : Expr} {σ σ' : Store} :
-      Step Δ Φ e1 σ e1' σ' →
-      Step Δ Φ (.let_ x e1 e2) σ (.let_ x e1' e2) σ'
+  | letStep {x : Ident} {e1 e1' e2 : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e1 σ e1' σ' sp →
+      Step Δ Φ tasks (.let_ x e1 e2) σ (.let_ x e1' e2) σ' sp
   | letTrap {x : Ident} {t : Trap} {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.let_ x (.trap t) e2) σ (.trap t) σ
+      Step Δ Φ tasks (.let_ x (.trap t) e2) σ (.trap t) σ none
   | letVal {x : Ident} {v1 e2 : Expr} {σ : Store} :
       IsValue v1 →
-      Step Δ Φ (.let_ x v1 e2) σ (subst x v1 e2) σ
+      Step Δ Φ tasks (.let_ x v1 e2) σ (subst x v1 e2) σ none
 
   -- Conditional
-  | ifStep {c c' t e : Expr} {σ σ' : Store} :
-      Step Δ Φ c σ c' σ' →
-      Step Δ Φ (.if_ c t e) σ (.if_ c' t e) σ'
+  | ifStep {c c' t e : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks c σ c' σ' sp →
+      Step Δ Φ tasks (.if_ c t e) σ (.if_ c' t e) σ' sp
   | ifTrap {tr : Trap} {t e : Expr} {σ : Store} :
-      Step Δ Φ (.if_ (.trap tr) t e) σ (.trap tr) σ
+      Step Δ Φ tasks (.if_ (.trap tr) t e) σ (.trap tr) σ none
   | ifTrue {t e : Expr} {σ : Store} :
-      Step Δ Φ (.if_ (.lit (.bool true)) t e) σ t σ
+      Step Δ Φ tasks (.if_ (.lit (.bool true)) t e) σ t σ none
   | ifFalse {t e : Expr} {σ : Store} :
-      Step Δ Φ (.if_ (.lit (.bool false)) t e) σ e σ
+      Step Δ Φ tasks (.if_ (.lit (.bool false)) t e) σ e σ none
 
   -- While loop (unfolds to `if c { b; while c b } else ()`)
   | whileUnfold {c b : Expr} {σ : Store} :
-      Step Δ Φ (.while_ c b) σ (.if_ c (.block [b, .while_ c b]) (.lit .unit)) σ
+      Step Δ Φ tasks (.while_ c b) σ (.if_ c (.block [b, .while_ c b]) (.lit .unit)) σ none
 
   -- Pattern matching
-  | matchScrut {s s' : Expr} {arms : List (Pat × Expr)} {σ σ' : Store} :
-      Step Δ Φ s σ s' σ' →
-      Step Δ Φ (.match_ s arms) σ (.match_ s' arms) σ'
+  | matchScrut {s s' : Expr} {arms : List (Pat × Expr)} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks s σ s' σ' sp →
+      Step Δ Φ tasks (.match_ s arms) σ (.match_ s' arms) σ' sp
   | matchScrutTrap {t : Trap} {arms : List (Pat × Expr)} {σ : Store} :
-      Step Δ Φ (.match_ (.trap t) arms) σ (.trap t) σ
+      Step Δ Φ tasks (.match_ (.trap t) arms) σ (.trap t) σ none
   | matchEmpty {v : Expr} {σ : Store} :
       IsValue v →
-      Step Δ Φ (.match_ v []) σ (.trap .matchFailure) σ
+      Step Δ Φ tasks (.match_ v []) σ (.trap .matchFailure) σ none
   | matchHit {v : Expr} {p : Pat} {body : Expr} {rest : List (Pat × Expr)}
       {env : List (Ident × Expr)} {σ : Store} :
       IsValue v →
       matchPat p v = some env →
-      Step Δ Φ (.match_ v ((p, body) :: rest)) σ (substMany env body) σ
+      Step Δ Φ tasks (.match_ v ((p, body) :: rest)) σ (substMany env body) σ none
   | matchMiss {v : Expr} {p : Pat} {body : Expr} {rest : List (Pat × Expr)} {σ : Store} :
       IsValue v →
       matchPat p v = none →
-      Step Δ Φ (.match_ v ((p, body) :: rest)) σ (.match_ v rest) σ
+      Step Δ Φ tasks (.match_ v ((p, body) :: rest)) σ (.match_ v rest) σ none
 
   -- ADT construction & tag inspection
-  | makeDataStep {adt : Ident} {tag : Nat} {es es' : List Expr} {σ σ' : Store} :
-      StepList Δ Φ es σ es' σ' →
-      Step Δ Φ (.makeData adt tag es) σ (.makeData adt tag es') σ'
+  | makeDataStep {adt : Ident} {tag : Nat} {es es' : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      StepList Δ Φ tasks es σ es' σ' sp →
+      Step Δ Φ tasks (.makeData adt tag es) σ (.makeData adt tag es') σ' sp
   | makeDataTrap {adt : Ident} {tag : Nat} {es : List Expr} {t : Trap} {σ : Store} :
       ListFirstTrap es t →
-      Step Δ Φ (.makeData adt tag es) σ (.trap t) σ
-  | getTagStep {e e' : Expr} {σ σ' : Store} :
-      Step Δ Φ e σ e' σ' →
-      Step Δ Φ (.getTag e) σ (.getTag e') σ'
+      Step Δ Φ tasks (.makeData adt tag es) σ (.trap t) σ none
+  | getTagStep {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.getTag e) σ (.getTag e') σ' sp
   | getTagTrap {t : Trap} {σ : Store} :
-      Step Δ Φ (.getTag (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.getTag (.trap t)) σ (.trap t) σ none
   | getTagVal {adt : Ident} {tag : Nat} {vs : List Expr} {σ : Store} :
       (∀ v ∈ vs, IsValue v) →
-      Step Δ Φ (.getTag (.makeData adt tag vs)) σ (.lit (.int (Int32.ofNat tag))) σ
+      Step Δ Φ tasks (.getTag (.makeData adt tag vs)) σ (.lit (.int (Int32.ofNat tag))) σ none
 
   -- Mutable Cell store operations
-  | cellNewStep {e e' : Expr} {σ σ' : Store} :
-      Step Δ Φ e σ e' σ' →
-      Step Δ Φ (.cellNew e) σ (.cellNew e') σ'
+  | cellNewStep {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.cellNew e) σ (.cellNew e') σ' sp
   | cellNewTrap {t : Trap} {σ : Store} :
-      Step Δ Φ (.cellNew (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.cellNew (.trap t)) σ (.trap t) σ none
   | cellNewVal {v : Expr} {σ : Store} :
       IsValue v →
-      Step Δ Φ (.cellNew v) σ (.loc σ.length) (σ ++ [v])
-  | cellGetStep {e e' : Expr} {σ σ' : Store} :
-      Step Δ Φ e σ e' σ' →
-      Step Δ Φ (.cellGet e) σ (.cellGet e') σ'
+      Step Δ Φ tasks (.cellNew v) σ (.loc σ.length) (σ ++ [v]) none
+  | cellGetStep {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.cellGet e) σ (.cellGet e') σ' sp
   | cellGetTrap {t : Trap} {σ : Store} :
-      Step Δ Φ (.cellGet (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.cellGet (.trap t)) σ (.trap t) σ none
   | cellGetVal {l : Loc} {v : Expr} {σ : Store} :
       σ[l]? = some v →
-      Step Δ Φ (.cellGet (.loc l)) σ v σ
-  | cellSetLeft {e1 e1' e2 : Expr} {σ σ' : Store} :
-      Step Δ Φ e1 σ e1' σ' →
-      Step Δ Φ (.cellSet e1 e2) σ (.cellSet e1' e2) σ'
+      Step Δ Φ tasks (.cellGet (.loc l)) σ v σ none
+  | cellSetLeft {e1 e1' e2 : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e1 σ e1' σ' sp →
+      Step Δ Φ tasks (.cellSet e1 e2) σ (.cellSet e1' e2) σ' sp
   | cellSetLeftTrap {t : Trap} {e2 : Expr} {σ : Store} :
-      Step Δ Φ (.cellSet (.trap t) e2) σ (.trap t) σ
-  | cellSetRight {v1 e2 e2' : Expr} {σ σ' : Store} :
+      Step Δ Φ tasks (.cellSet (.trap t) e2) σ (.trap t) σ none
+  | cellSetRight {v1 e2 e2' : Expr} {σ σ' : Store} {sp : Option Expr} :
       IsValue v1 →
-      Step Δ Φ e2 σ e2' σ' →
-      Step Δ Φ (.cellSet v1 e2) σ (.cellSet v1 e2') σ'
+      Step Δ Φ tasks e2 σ e2' σ' sp →
+      Step Δ Φ tasks (.cellSet v1 e2) σ (.cellSet v1 e2') σ' sp
   | cellSetRightTrap {v1 : Expr} {t : Trap} {σ : Store} :
       IsValue v1 →
-      Step Δ Φ (.cellSet v1 (.trap t)) σ (.trap t) σ
+      Step Δ Φ tasks (.cellSet v1 (.trap t)) σ (.trap t) σ none
   | cellSetVal {l : Loc} {v : Expr} {σ : Store} :
       l < σ.length →
       IsValue v →
-      Step Δ Φ (.cellSet (.loc l) v) σ (.lit .unit) (σ.set l v)
+      Step Δ Φ tasks (.cellSet (.loc l) v) σ (.lit .unit) (σ.set l v) none
 
-inductive StepList (Δ : AdtEnv) (Φ : FunEnv) :
-    List Expr → Store → List Expr → Store → Prop where
-  | head {e e' : Expr} {es : List Expr} {σ σ' : Store} :
-      Step Δ Φ e σ e' σ' →
-      StepList Δ Φ (e :: es) σ (e' :: es) σ'
-  | tail {v : Expr} {es es' : List Expr} {σ σ' : Store} :
+  -- Concurrent task fork (`spawn`) and join (`await`)
+  | spawnStep {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.spawn e) σ (.spawn e') σ' sp
+  | spawnTrap {t : Trap} {σ : Store} :
+      Step Δ Φ tasks (.spawn (.trap t)) σ (.trap t) σ none
+  | spawnBeta {ret : Ty} {body : Expr} {σ : Store} :
+      Step Δ Φ tasks (.spawn (.lam .shared [] ret body)) σ (.taskRef tasks.length) σ (some body)
+  | awaitStep {e e' : Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      Step Δ Φ tasks (.await e) σ (.await e') σ' sp
+  | awaitTrap {t : Trap} {σ : Store} :
+      Step Δ Φ tasks (.await (.trap t)) σ (.trap t) σ none
+  | awaitVal {tid : TaskId} {v : Expr} {σ : Store} :
+      tasks[tid]? = some v →
       IsValue v →
-      StepList Δ Φ es σ es' σ' →
-      StepList Δ Φ (v :: es) σ (v :: es') σ'
+      Step Δ Φ tasks (.await (.taskRef tid)) σ v σ none
+  | awaitTaskTrap {tid : TaskId} {t : Trap} {σ : Store} :
+      tasks[tid]? = some (.trap t) →
+      Step Δ Φ tasks (.await (.taskRef tid)) σ (.trap t) σ none
+
+inductive StepList (Δ : AdtEnv) (Φ : FunEnv) (tasks : List Expr) :
+    List Expr → Store → List Expr → Store → Option Expr → Prop where
+  | head {e e' : Expr} {es : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      Step Δ Φ tasks e σ e' σ' sp →
+      StepList Δ Φ tasks (e :: es) σ (e' :: es) σ' sp
+  | tail {v : Expr} {es es' : List Expr} {σ σ' : Store} {sp : Option Expr} :
+      IsValue v →
+      StepList Δ Φ tasks es σ es' σ' sp →
+      StepList Δ Φ tasks (v :: es) σ (v :: es') σ' sp
 end
 
-/-- Reflexive-transitive closure of `Step`. -/
+/-! ## Task-Waiting Characterization & Stuckness -/
+
+/- A thread expression is legitimately waiting on a still-running spawned task
+   if its active redex is `.await (.taskRef tid)` for a valid non-terminal `tid`. -/
+mutual
+inductive BlockedOnTask (tasks : List Expr) : Expr → Prop where
+  | awaitWait {tid : TaskId} {et : Expr} :
+      tasks[tid]? = some et →
+      ¬ IsTerminal et →
+      BlockedOnTask tasks (.await (.taskRef tid))
+  | tuple {es : List Expr} :
+      BlockedOnTaskList tasks es →
+      BlockedOnTask tasks (.tuple es)
+  | blockCons {e1 e2 : Expr} {es : List Expr} :
+      BlockedOnTask tasks e1 →
+      BlockedOnTask tasks (.block (e1 :: e2 :: es))
+  | applyFn {fn : Expr} {args : List Expr} :
+      BlockedOnTask tasks fn →
+      BlockedOnTask tasks (.apply fn args)
+  | applyArgs {fn : Expr} {args : List Expr} :
+      IsValue fn →
+      BlockedOnTaskList tasks args →
+      BlockedOnTask tasks (.apply fn args)
+  | applyDirArgs {name : Ident} {args : List Expr} :
+      BlockedOnTaskList tasks args →
+      BlockedOnTask tasks (.applyDir name args)
+  | un {op : UnOp} {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.un op e)
+  | binLeft {op : BinOp} {e1 e2 : Expr} :
+      BlockedOnTask tasks e1 →
+      BlockedOnTask tasks (.bin op e1 e2)
+  | binRight {op : BinOp} {v1 e2 : Expr} :
+      op ≠ .and → op ≠ .or →
+      IsValue v1 →
+      BlockedOnTask tasks e2 →
+      BlockedOnTask tasks (.bin op v1 e2)
+  | let_ {x : Ident} {e1 e2 : Expr} :
+      BlockedOnTask tasks e1 →
+      BlockedOnTask tasks (.let_ x e1 e2)
+  | if_ {c t e : Expr} :
+      BlockedOnTask tasks c →
+      BlockedOnTask tasks (.if_ c t e)
+  | match_ {s : Expr} {arms : List (Pat × Expr)} :
+      BlockedOnTask tasks s →
+      BlockedOnTask tasks (.match_ s arms)
+  | makeData {adt : Ident} {tag : Nat} {es : List Expr} :
+      BlockedOnTaskList tasks es →
+      BlockedOnTask tasks (.makeData adt tag es)
+  | getTag {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.getTag e)
+  | cellNew {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.cellNew e)
+  | cellGet {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.cellGet e)
+  | cellSetLeft {e1 e2 : Expr} :
+      BlockedOnTask tasks e1 →
+      BlockedOnTask tasks (.cellSet e1 e2)
+  | cellSetRight {v1 e2 : Expr} :
+      IsValue v1 →
+      BlockedOnTask tasks e2 →
+      BlockedOnTask tasks (.cellSet v1 e2)
+  | spawn {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.spawn e)
+  | awaitStep {e : Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTask tasks (.await e)
+
+inductive BlockedOnTaskList (tasks : List Expr) : List Expr → Prop where
+  | head {e : Expr} {es : List Expr} :
+      BlockedOnTask tasks e →
+      BlockedOnTaskList tasks (e :: es)
+  | tail {v : Expr} {es : List Expr} :
+      IsValue v →
+      BlockedOnTaskList tasks es →
+      BlockedOnTaskList tasks (v :: es)
+end
+
+/-- A thread is stuck (undefined behavior) if it is neither terminal, nor
+    legitimately waiting on a running `Task`, nor able to take a step. -/
+def IsStuck (Δ : AdtEnv) (Φ : FunEnv) (tasks : List Expr) (e : Expr) (σ : Store) : Prop :=
+  ¬ IsTerminal e ∧ ¬ BlockedOnTask tasks e ∧ ¬ ∃ e' σ' sp, Step Δ Φ tasks e σ e' σ' sp
+
+/-! ## Interleaved Concurrent Task-Pool Semantics & Data Races -/
+
+/-- Nondeterministic interleaved step of any runnable thread `tid` in `tasks`. -/
+inductive ConcStep (Δ : AdtEnv) (Φ : FunEnv) : List Expr → Store → List Expr → Store → Prop where
+  | stepNone {tasks : List Expr} {tid : Nat} {e e' : Expr} {σ σ' : Store} :
+      tasks[tid]? = some e →
+      Step Δ Φ tasks e σ e' σ' none →
+      ConcStep Δ Φ tasks σ (tasks.set tid e') σ'
+  | stepSpawn {tasks : List Expr} {tid : Nat} {e e' spawned : Expr} {σ σ' : Store} :
+      tasks[tid]? = some e →
+      Step Δ Φ tasks e σ e' σ' (some spawned) →
+      ConcStep Δ Φ tasks σ ((tasks.set tid e') ++ [spawned]) σ'
+
+/-- Reflexive-transitive closure of interleaved concurrent transitions `ConcStep`. -/
+inductive ConcSteps (Δ : AdtEnv) (Φ : FunEnv) : List Expr → Store → List Expr → Store → Prop where
+  | refl (tasks : List Expr) (σ : Store) : ConcSteps Δ Φ tasks σ tasks σ
+  | trans {t1 t2 t3 : List Expr} {σ1 σ2 σ3 : Store} :
+      ConcStep Δ Φ t1 σ1 t2 σ2 →
+      ConcSteps Δ Φ t2 σ2 t3 σ3 →
+      ConcSteps Δ Φ t1 σ1 t3 σ3
+
+/-- Sequential single-thread multi-step execution (special case with no task pool). -/
 inductive Steps (Δ : AdtEnv) (Φ : FunEnv) : Expr → Store → Expr → Store → Prop where
   | refl (e : Expr) (σ : Store) : Steps Δ Φ e σ e σ
   | trans {e1 e2 e3 : Expr} {σ1 σ2 σ3 : Store} :
-      Step Δ Φ e1 σ1 e2 σ2 →
+      Step Δ Φ [] e1 σ1 e2 σ2 none →
       Steps Δ Φ e2 σ2 e3 σ3 →
       Steps Δ Φ e1 σ1 e3 σ3
 
-/-- A configuration is terminal if it is either a value or a defined runtime trap. -/
-def IsTerminal (e : Expr) : Prop :=
-  IsValue e ∨ ∃ t, e = .trap t
+/- Active memory access (`isWrite = false` for `cellGet`, `isWrite = true` for
+   `cellSet`) at the current redex of a thread expression. -/
+mutual
+inductive ActiveCellAccess (isWrite : Bool) : Expr → Loc → Prop where
+  | read (l : Loc) :
+      isWrite = false →
+      ActiveCellAccess isWrite (.cellGet (.loc l)) l
+  | write (l : Loc) {v : Expr} :
+      isWrite = true →
+      IsValue v →
+      ActiveCellAccess isWrite (.cellSet (.loc l) v) l
+  | tuple {es : List Expr} {l : Loc} :
+      ActiveCellAccessList isWrite es l →
+      ActiveCellAccess isWrite (.tuple es) l
+  | blockCons {e1 e2 : Expr} {es : List Expr} {l : Loc} :
+      ActiveCellAccess isWrite e1 l →
+      ActiveCellAccess isWrite (.block (e1 :: e2 :: es)) l
+  | applyFn {fn : Expr} {args : List Expr} {l : Loc} :
+      ActiveCellAccess isWrite fn l →
+      ActiveCellAccess isWrite (.apply fn args) l
+  | applyArgs {fn : Expr} {args : List Expr} {l : Loc} :
+      IsValue fn →
+      ActiveCellAccessList isWrite args l →
+      ActiveCellAccess isWrite (.apply fn args) l
+  | applyDirArgs {name : Ident} {args : List Expr} {l : Loc} :
+      ActiveCellAccessList isWrite args l →
+      ActiveCellAccess isWrite (.applyDir name args) l
+  | un {op : UnOp} {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.un op e) l
+  | binLeft {op : BinOp} {e1 e2 : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e1 l →
+      ActiveCellAccess isWrite (.bin op e1 e2) l
+  | binRight {op : BinOp} {v1 e2 : Expr} {l : Loc} :
+      op ≠ .and → op ≠ .or →
+      IsValue v1 →
+      ActiveCellAccess isWrite e2 l →
+      ActiveCellAccess isWrite (.bin op v1 e2) l
+  | let_ {x : Ident} {e1 e2 : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e1 l →
+      ActiveCellAccess isWrite (.let_ x e1 e2) l
+  | if_ {c t e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite c l →
+      ActiveCellAccess isWrite (.if_ c t e) l
+  | match_ {s : Expr} {arms : List (Pat × Expr)} {l : Loc} :
+      ActiveCellAccess isWrite s l →
+      ActiveCellAccess isWrite (.match_ s arms) l
+  | makeData {adt : Ident} {tag : Nat} {es : List Expr} {l : Loc} :
+      ActiveCellAccessList isWrite es l →
+      ActiveCellAccess isWrite (.makeData adt tag es) l
+  | getTag {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.getTag e) l
+  | cellNew {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.cellNew e) l
+  | cellGetStep {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.cellGet e) l
+  | cellSetLeft {e1 e2 : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e1 l →
+      ActiveCellAccess isWrite (.cellSet e1 e2) l
+  | cellSetRight {v1 e2 : Expr} {l : Loc} :
+      IsValue v1 →
+      ActiveCellAccess isWrite e2 l →
+      ActiveCellAccess isWrite (.cellSet v1 e2) l
+  | spawn {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.spawn e) l
+  | awaitStep {e : Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccess isWrite (.await e) l
 
-/-- A configuration is stuck (undefined behavior) if it is neither terminal nor able to step. -/
-def IsStuck (Δ : AdtEnv) (Φ : FunEnv) (e : Expr) (σ : Store) : Prop :=
-  ¬ IsTerminal e ∧ ¬ ∃ e' σ', Step Δ Φ e σ e' σ'
+inductive ActiveCellAccessList (isWrite : Bool) : List Expr → Loc → Prop where
+  | head {e : Expr} {es : List Expr} {l : Loc} :
+      ActiveCellAccess isWrite e l →
+      ActiveCellAccessList isWrite (e :: es) l
+  | tail {v : Expr} {es : List Expr} {l : Loc} :
+      IsValue v →
+      ActiveCellAccessList isWrite es l →
+      ActiveCellAccessList isWrite (v :: es) l
+end
+
+/-- A concurrent task pool has a **data race** if two distinct threads `i ≠ j`
+    are simultaneously poised to access the same `Cell` location `l` with at
+    least one write (`cellSet`). -/
+def HasDataRace (tasks : List Expr) : Prop :=
+  ∃ (i j : Nat) (ei ej : Expr) (b1 b2 : Bool) (l : Loc),
+    i ≠ j ∧
+    tasks[i]? = some ei ∧
+    tasks[j]? = some ej ∧
+    ActiveCellAccess b1 ei l ∧
+    ActiveCellAccess b2 ej l ∧
+    (b1 = true ∨ b2 = true)
 
 end CoreGeisha

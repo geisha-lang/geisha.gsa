@@ -1,6 +1,7 @@
 // Core Geisha S-Expression Exporter (`--dump-core`)
 //
 // Serializes a monomorphized `CoreProgram` into `.gscore` S-expression format
+// (including closure capture modes `local`/`shared` and concurrent `task`/`spawn`/`await`)
 // consumed by the Lean 4 machine-checked verifier `formal/.lake/build/bin/geisha-check`.
 
 use std.option.{Option, Some, None}
@@ -11,7 +12,7 @@ use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.str.intToStr
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
-    Scheme, schemeBody,
+    Scheme, ScmSlot, schemeBody,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
@@ -24,7 +25,7 @@ use infer.{
     VariantInfo, AdtInfo, mangleType, applyExplicitSubst, buildPairMap, findVariantByName
 }
 use core.{
-    ClosureSpec, TaggedTerm, CoreArm, Term,
+    ClosureSpec, TaggedTerm, MkTerm, CoreArm, Term,
     TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
     TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
     FunDef, CoreProgram, extractTypeArgs
@@ -35,6 +36,10 @@ data DumpCtx {
         dcProg: CoreProgram,
         dcInstAdts: StrMap (String, List Type),
         dcInstAdtOrder: Cell (List String),
+        dcParamShared: StrMap Bool,
+        dcClsLocal: StrMap Bool,
+        dcRetLocal: StrMap Bool,
+        dcAdtLocal: StrMap Bool,
         dcErr: Cell (Option String),
     },
 }
@@ -88,11 +93,744 @@ def mangleCoreAdt(baseName: String, targs: List Type): String = match targs {
     },
 }
 
+// ============================================================================
+// Mode Synthesis Pass (`local` vs `shared`) on Monomorphized `CoreProgram`
+// ============================================================================
+
+def markStrMap(m: StrMap Bool, key: String, changed: Cell Bool): Void =
+    if (!strMapContains(m, key)) {
+        strMapInsert(m, key, true);
+        cellSet(changed, true)
+    } else ()
+
+def collectBodyBindings(
+    tm: TaggedTerm,
+    letRhs: StrMap TaggedTerm,
+    localCls: StrMap ClosureSpec
+): Void = match tm.tnode {
+    TmMakeCls(vd, cls, body) -> {
+        strMapInsert(localCls, vd.vname, cls);
+        collectBodyBindings(body, letRhs, localCls)
+    },
+    TmLet(vd, e1, e2) -> {
+        strMapInsert(letRhs, vd.vname, e1);
+        collectBodyBindings(e1, letRhs, localCls);
+        collectBodyBindings(e2, letRhs, localCls)
+    },
+    TmTuple(es) -> collectBodyBindingsList(es, letRhs, localCls),
+    TmBlock(es) -> collectBodyBindingsList(es, letRhs, localCls),
+    TmApplyCls(c, args) -> {
+        collectBodyBindings(c, letRhs, localCls);
+        collectBodyBindingsList(args, letRhs, localCls)
+    },
+    TmApplyDir(_, args) -> collectBodyBindingsList(args, letRhs, localCls),
+    TmBin(_, l, r) -> {
+        collectBodyBindings(l, letRhs, localCls);
+        collectBodyBindings(r, letRhs, localCls)
+    },
+    TmUn(_, e1) -> collectBodyBindings(e1, letRhs, localCls),
+    TmIf(c, t, e) -> {
+        collectBodyBindings(c, letRhs, localCls);
+        collectBodyBindings(t, letRhs, localCls);
+        collectBodyBindings(e, letRhs, localCls)
+    },
+    TmWhile(c, b) -> {
+        collectBodyBindings(c, letRhs, localCls);
+        collectBodyBindings(b, letRhs, localCls)
+    },
+    TmMatch(s, arms) -> {
+        collectBodyBindings(s, letRhs, localCls);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    collectBodyBindings(a.caBody, letRhs, localCls);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> collectBodyBindingsList(args, letRhs, localCls),
+    TmGetTag(e1) -> collectBodyBindings(e1, letRhs, localCls),
+    _ -> (),
+}
+
+def collectBodyBindingsList(
+    es: List TaggedTerm,
+    letRhs: StrMap TaggedTerm,
+    localCls: StrMap ClosureSpec
+): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectBodyBindings(h, letRhs, localCls);
+        collectBodyBindingsList(t, letRhs, localCls)
+    },
+}
+
+def requireTermSend(
+    fnName: String,
+    tm: TaggedTerm,
+    paramSet: StrMap Bool,
+    letRhs: StrMap TaggedTerm,
+    localCls: StrMap ClosureSpec,
+    visitedVars: StrMap Bool,
+    paramShared: StrMap Bool,
+    clsReqShared: StrMap Bool,
+    retReqShared: StrMap Bool,
+    changed: Cell Bool
+): Void = match tm.tnode {
+    TmVar(x) ->
+        if (!strMapContains(visitedVars, x)) {
+            strMapInsert(visitedVars, x, true);
+            if (strMapContains(paramSet, x)) {
+                markStrMap(paramShared, fnName + ":" + x, changed)
+            } else ();
+            match strMapGet(localCls, x) {
+                Some(cls) -> markStrMap(clsReqShared, cls.clsEntry, changed),
+                None -> (),
+            };
+            match strMapGet(letRhs, x) {
+                Some(rhs) -> requireTermSend(
+                    fnName, rhs, paramSet, letRhs, localCls, visitedVars,
+                    paramShared, clsReqShared, retReqShared, changed
+                ),
+                None -> (),
+            }
+        } else (),
+    TmMakeCls(_, _, body) ->
+        requireTermSend(
+            fnName, body, paramSet, letRhs, localCls, visitedVars,
+            paramShared, clsReqShared, retReqShared, changed
+        ),
+    TmLet(_, _, body) ->
+        requireTermSend(
+            fnName, body, paramSet, letRhs, localCls, visitedVars,
+            paramShared, clsReqShared, retReqShared, changed
+        ),
+    TmBlock(es) -> match listRev(es) {
+        Cons(lastTm, _) -> requireTermSend(
+            fnName, lastTm, paramSet, letRhs, localCls, visitedVars,
+            paramShared, clsReqShared, retReqShared, changed
+        ),
+        Nil -> (),
+    },
+    TmIf(_, t, e) -> {
+        requireTermSend(
+            fnName, t, paramSet, letRhs, localCls, visitedVars,
+            paramShared, clsReqShared, retReqShared, changed
+        );
+        requireTermSend(
+            fnName, e, paramSet, letRhs, localCls, visitedVars,
+            paramShared, clsReqShared, retReqShared, changed
+        )
+    },
+    TmMatch(_, arms) -> {
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    requireTermSend(
+                        fnName, a.caBody, paramSet, letRhs, localCls, visitedVars,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmTuple(es) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    requireTermSend(
+                        fnName, a, paramSet, letRhs, localCls, visitedVars,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, es, _, _) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    requireTermSend(
+                        fnName, a, paramSet, letRhs, localCls, visitedVars,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmApplyDir(vd, _) -> markStrMap(retReqShared, vd.vname, changed),
+    _ -> (),
+}
+
+def scanSendDemandsInTerm(
+    prog: CoreProgram,
+    fnName: String,
+    tm: TaggedTerm,
+    paramSet: StrMap Bool,
+    letRhs: StrMap TaggedTerm,
+    localCls: StrMap ClosureSpec,
+    paramShared: StrMap Bool,
+    clsReqShared: StrMap Bool,
+    retReqShared: StrMap Bool,
+    changed: Cell Bool
+): Void = match tm.tnode {
+    TmMakeCls(_, cls, body) -> {
+        if (strMapContains(clsReqShared, cls.clsEntry)) {
+            let cf = cellNew(cls.clsFvs);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons(fvName, r) -> {
+                        let vset: StrMap Bool = strMapNew();
+                        requireTermSend(
+                            fnName,
+                            MkTerm { tscm: ScmSlot, tnode: TmVar(fvName) },
+                            paramSet, letRhs, localCls, vset,
+                            paramShared, clsReqShared, retReqShared, changed
+                        );
+                        cellSet(cf, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        } else ();
+        scanSendDemandsInTerm(
+            prog, fnName, body, paramSet, letRhs, localCls,
+            paramShared, clsReqShared, retReqShared, changed
+        )
+    },
+    TmApplyDir(vd, args) -> {
+        if (vd.vname == "__concTaskSpawn") {
+            match args {
+                Cons(a0, _) -> {
+                    let vset: StrMap Bool = strMapNew();
+                    requireTermSend(
+                        fnName, a0, paramSet, letRhs, localCls, vset,
+                        paramShared, clsReqShared, retReqShared, changed
+                    )
+                },
+                Nil -> (),
+            }
+        } else {
+            match strMapGet(prog.coreFns, vd.vname) {
+                Some(calleeFd) -> {
+                    let cp = cellNew(calleeFd.fnParams);
+                    let ca = cellNew(args);
+                    while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(cp), cellGet(ca)) {
+                            (Cons(pvd, pr), Cons(argTm, ar)) -> {
+                                if (strMapContains(paramShared, vd.vname + ":" + pvd.vname)) {
+                                    let vset: StrMap Bool = strMapNew();
+                                    requireTermSend(
+                                        fnName, argTm, paramSet, letRhs, localCls, vset,
+                                        paramShared, clsReqShared, retReqShared, changed
+                                    )
+                                } else ();
+                                cellSet(cp, pr);
+                                cellSet(ca, ar)
+                            },
+                            _ -> (),
+                        }
+                    }
+                },
+                None -> (),
+            }
+        };
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(
+                        prog, fnName, a, paramSet, letRhs, localCls,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmApplyCls(c, args) -> {
+        scanSendDemandsInTerm(
+            prog, fnName, c, paramSet, letRhs, localCls,
+            paramShared, clsReqShared, retReqShared, changed
+        );
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(
+                        prog, fnName, a, paramSet, letRhs, localCls,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmTuple(es) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(
+                        prog, fnName, a, paramSet, letRhs, localCls,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmBlock(es) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(
+                        prog, fnName, a, paramSet, letRhs, localCls,
+                        paramShared, clsReqShared, retReqShared, changed
+                    );
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmBin(_, l, r) -> {
+        scanSendDemandsInTerm(prog, fnName, l, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        scanSendDemandsInTerm(prog, fnName, r, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed)
+    },
+    TmUn(_, e1) -> scanSendDemandsInTerm(prog, fnName, e1, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed),
+    TmLet(_, e1, e2) -> {
+        scanSendDemandsInTerm(prog, fnName, e1, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        scanSendDemandsInTerm(prog, fnName, e2, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed)
+    },
+    TmIf(c, t, e) -> {
+        scanSendDemandsInTerm(prog, fnName, c, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        scanSendDemandsInTerm(prog, fnName, t, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        scanSendDemandsInTerm(prog, fnName, e, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed)
+    },
+    TmWhile(c, b) -> {
+        scanSendDemandsInTerm(prog, fnName, c, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        scanSendDemandsInTerm(prog, fnName, b, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed)
+    },
+    TmMatch(s, arms) -> {
+        scanSendDemandsInTerm(prog, fnName, s, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(prog, fnName, a.caBody, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> {
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    scanSendDemandsInTerm(prog, fnName, a, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmGetTag(e1) -> scanSendDemandsInTerm(prog, fnName, e1, paramSet, letRhs, localCls, paramShared, clsReqShared, retReqShared, changed),
+    _ -> (),
+}
+
+def isTypeNonSendInDump(adtLocal: StrMap Bool, ty: Type, fnMode: String): Bool = match ty {
+    TyVoid -> false,
+    TyCon(n) ->
+        if (n == "Cell" || n == "MutArray" || n == "Ptr") true
+        else strMapContains(adtLocal, n),
+    TyArr(_, _, _) -> fnMode == "local",
+    TyTuple(es) -> {
+        let bad = cellNew(false);
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> !cellGet(bad) }) {
+            match cellGet(cur) {
+                Cons(t, r) -> {
+                    if (isTypeNonSendInDump(adtLocal, t, fnMode)) cellSet(bad, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(bad)
+    },
+    TyComp(_, _) -> {
+        let base = compBaseName(ty);
+        let targs = extractTypeArgs(ty);
+        if (base == "Cell" || base == "MutArray") true
+        else if (strMapContains(adtLocal, base)) true
+        else {
+            let bad = cellNew(false);
+            let cur = cellNew(targs);
+            while (match cellGet(cur) { Nil -> false, _ -> !cellGet(bad) }) {
+                match cellGet(cur) {
+                    Cons(t, r) -> {
+                        if (isTypeNonSendInDump(adtLocal, t, fnMode)) cellSet(bad, true) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(bad)
+        }
+    },
+    TyVar(_) -> false,
+}
+
+def bindPatNonSendVars(
+    adtLocal: StrMap Bool,
+    pat: Pattern,
+    scrutNonSend: Bool,
+    nonSendVars: StrMap Bool
+): Void = match pat {
+    PatWild -> (),
+    PatLit(_) -> (),
+    PatVar(x) -> if (scrutNonSend) strMapInsert(nonSendVars, x, true) else (),
+    PatTuple(ps) -> {
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    bindPatNonSendVars(adtLocal, p, scrutNonSend, nonSendVars);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    PatCtor(_, ps) -> {
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    bindPatNonSendVars(adtLocal, p, scrutNonSend, nonSendVars);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    PatStruct(_, _) -> (),
+}
+
+def propagateLocalInTerm(
+    prog: CoreProgram,
+    tm: TaggedTerm,
+    nonSendVars: StrMap Bool,
+    fvNonSend: StrMap Bool,
+    clsLocal: StrMap Bool,
+    retLocal: StrMap Bool,
+    adtLocal: StrMap Bool,
+    changed: Cell Bool
+): Bool = match tm.tnode {
+    TmLit(_) -> false,
+    TmVar(x) ->
+        strMapContains(nonSendVars, x)
+        || isTypeNonSendInDump(adtLocal, schemeBody(tm.tscm), "shared"),
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> {
+        let anyLocal = cellNew(false);
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    if (propagateLocalInTerm(prog, a, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed)) {
+                        cellSet(anyLocal, true)
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(anyLocal)
+    },
+    TmBlock(es) -> {
+        let lastLocal = cellNew(false);
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let isLoc = propagateLocalInTerm(prog, a, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+                    cellSet(lastLocal, isLoc);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(lastLocal)
+    },
+    TmMakeCls(vd, cls, body) -> {
+        let cf = cellNew(cls.clsFvs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fvName, r) -> {
+                    if (strMapContains(nonSendVars, fvName)) {
+                        markStrMap(clsLocal, cls.clsEntry, changed);
+                        markStrMap(fvNonSend, cls.clsEntry + ":" + fvName, changed)
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (strMapContains(clsLocal, cls.clsEntry)) {
+            strMapInsert(nonSendVars, vd.vname, true)
+        } else ();
+        propagateLocalInTerm(prog, body, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed)
+    },
+    TmApplyCls(c, args) -> {
+        let _ = propagateLocalInTerm(prog, c, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let _ = propagateLocalInTerm(prog, a, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        isTypeNonSendInDump(adtLocal, schemeBody(tm.tscm), "shared")
+    },
+    TmApplyDir(vd, args) -> {
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let _ = propagateLocalInTerm(prog, a, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (vd.vname == "cellNew") true
+        else strMapContains(retLocal, vd.vname) || isTypeNonSendInDump(adtLocal, schemeBody(tm.tscm), "shared")
+    },
+    TmBin(_, l, r) -> {
+        let _ = propagateLocalInTerm(prog, l, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let _ = propagateLocalInTerm(prog, r, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        false
+    },
+    TmUn(_, e1) -> {
+        let _ = propagateLocalInTerm(prog, e1, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        false
+    },
+    TmLet(vd, e1, e2) -> {
+        let v1Local = propagateLocalInTerm(prog, e1, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        if (v1Local || isTypeNonSendInDump(adtLocal, schemeBody(vd.vscm), "shared")) {
+            strMapInsert(nonSendVars, vd.vname, true)
+        } else ();
+        propagateLocalInTerm(prog, e2, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed)
+    },
+    TmIf(c, t, e) -> {
+        let _ = propagateLocalInTerm(prog, c, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let tLoc = propagateLocalInTerm(prog, t, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let eLoc = propagateLocalInTerm(prog, e, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        tLoc || eLoc
+    },
+    TmWhile(c, b) -> {
+        let _ = propagateLocalInTerm(prog, c, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let _ = propagateLocalInTerm(prog, b, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        false
+    },
+    TmMatch(s, arms) -> {
+        let sLoc = propagateLocalInTerm(prog, s, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        let anyArmLoc = cellNew(false);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(arm, r) -> {
+                    bindPatNonSendVars(adtLocal, arm.caPat, sLoc, nonSendVars);
+                    if (propagateLocalInTerm(prog, arm.caBody, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed)) {
+                        cellSet(anyArmLoc, true)
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(anyArmLoc)
+    },
+    TmMakeData(adtName, _, args, _, _) -> {
+        let anyArgLoc = cellNew(false);
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    if (propagateLocalInTerm(prog, a, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed)) {
+                        cellSet(anyArgLoc, true)
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(anyArgLoc)) {
+            markStrMap(adtLocal, adtName, changed)
+        } else ();
+        strMapContains(adtLocal, adtName) || cellGet(anyArgLoc)
+    },
+    TmGetTag(e1) -> {
+        let _ = propagateLocalInTerm(prog, e1, nonSendVars, fvNonSend, clsLocal, retLocal, adtLocal, changed);
+        false
+    },
+}
+
+def analyzeCoreModes(
+    prog: CoreProgram,
+    activeFnNames: List String,
+    paramShared: StrMap Bool,
+    clsLocal: StrMap Bool,
+    retLocal: StrMap Bool,
+    adtLocal: StrMap Bool
+): Void = {
+    let clsReqShared: StrMap Bool = strMapNew();
+    let retReqShared: StrMap Bool = strMapNew();
+
+    // Pass 1: Backward demand from `__concTaskSpawn`
+    let changed1 = cellNew(true);
+    while (cellGet(changed1)) {
+        cellSet(changed1, false);
+        let cf = cellNew(activeFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnName, r) -> {
+                    match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> {
+                            let paramSet: StrMap Bool = strMapNew();
+                            let cp = cellNew(fd.fnParams);
+                            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(pvd, pr) -> {
+                                        strMapInsert(paramSet, pvd.vname, true);
+                                        cellSet(cp, pr)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let cfv = cellNew(fd.fnFvs);
+                            while (match cellGet(cfv) { Nil -> false, _ -> true }) {
+                                match cellGet(cfv) {
+                                    Cons(fvd, fr) -> {
+                                        strMapInsert(paramSet, fvd.vname, true);
+                                        cellSet(cfv, fr)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let letRhs: StrMap TaggedTerm = strMapNew();
+                            let localCls: StrMap ClosureSpec = strMapNew();
+                            collectBodyBindings(fd.fnBody, letRhs, localCls);
+                            scanSendDemandsInTerm(
+                                prog, fnName, fd.fnBody, paramSet, letRhs, localCls,
+                                paramShared, clsReqShared, retReqShared, changed1
+                            );
+                            if (strMapContains(retReqShared, fnName)) {
+                                let vset: StrMap Bool = strMapNew();
+                                requireTermSend(
+                                    fnName, fd.fnBody, paramSet, letRhs, localCls, vset,
+                                    paramShared, clsReqShared, retReqShared, changed1
+                                )
+                            } else ()
+                        },
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
+    // Pass 2: Forward propagation of `local` (`!Send`) captures & return values
+    let fvNonSend: StrMap Bool = strMapNew();
+    let changed2 = cellNew(true);
+    while (cellGet(changed2)) {
+        cellSet(changed2, false);
+        let cf = cellNew(activeFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnName, r) -> {
+                    match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> {
+                            let nonSendVars: StrMap Bool = strMapNew();
+                            let cp = cellNew(fd.fnParams);
+                            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(pvd, pr) -> {
+                                        let pMode = if (strMapContains(paramShared, fnName + ":" + pvd.vname)) "shared" else "local";
+                                        if (isTypeNonSendInDump(adtLocal, schemeBody(pvd.vscm), pMode)) {
+                                            strMapInsert(nonSendVars, pvd.vname, true)
+                                        } else ();
+                                        cellSet(cp, pr)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let cfv = cellNew(fd.fnFvs);
+                            while (match cellGet(cfv) { Nil -> false, _ -> true }) {
+                                match cellGet(cfv) {
+                                    Cons(fvd, fr) -> {
+                                        if (strMapContains(fvNonSend, fnName + ":" + fvd.vname)
+                                            || isTypeNonSendInDump(adtLocal, schemeBody(fvd.vscm), "shared")) {
+                                            strMapInsert(nonSendVars, fvd.vname, true)
+                                        } else ();
+                                        cellSet(cfv, fr)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let bodyLoc = propagateLocalInTerm(
+                                prog, fd.fnBody, nonSendVars, fvNonSend,
+                                clsLocal, retLocal, adtLocal, changed2
+                            );
+                            if (bodyLoc) {
+                                markStrMap(retLocal, fnName, changed2)
+                            } else ()
+                        },
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Core Type, Pattern, and Term S-Expression Serialization
+// ============================================================================
+
 def registerCoreAdt(ctx: DumpCtx, baseName: String, targs: List Type): String = {
     let mangled = mangleCoreAdt(baseName, targs);
     if (!strMapContains(ctx.dcInstAdts, mangled)) {
         strMapInsert(ctx.dcInstAdts, mangled, (baseName, targs));
         cellSet(ctx.dcInstAdtOrder, Cons(mangled, cellGet(ctx.dcInstAdtOrder)));
+        let fMode = if (strMapContains(ctx.dcAdtLocal, baseName)) "local" else "shared";
         match strMapGet(ctx.dcProg.coreAdtReg, baseName) {
             Some(ainfo) -> {
                 let sub = buildPairMap(ainfo.typeParams, targs);
@@ -106,7 +844,7 @@ def registerCoreAdt(ctx: DumpCtx, baseName: String, targs: List Type): String = 
                                     Cons(ft, fr) -> {
                                         let instFt = applyExplicitSubst(ft, sub);
                                         let tmp = bufNew();
-                                        emitCoreTy(ctx, tmp, instFt);
+                                        emitCoreTyWithMode(ctx, tmp, instFt, fMode);
                                         cellSet(cf, fr)
                                     },
                                     Nil -> (),
@@ -124,7 +862,7 @@ def registerCoreAdt(ctx: DumpCtx, baseName: String, targs: List Type): String = 
     mangled
 }
 
-def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
+def emitCoreTyWithMode(ctx: DumpCtx, b: StringBuf, ty: Type, fnMode: String): Void = match ty {
     TyVoid -> bufPushStr(b, "void"),
     TyCon(n) ->
         if (n == "Void") bufPushStr(b, "void")
@@ -147,7 +885,7 @@ def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
             match cellGet(cur) {
                 Cons(t, r) -> {
                     bufPushByte(b, 32);
-                    emitCoreTy(ctx, b, t);
+                    emitCoreTyWithMode(ctx, b, t, fnMode);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -156,21 +894,23 @@ def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
         bufPushByte(b, 41)
     },
     TyArr(_, ps, ret) -> {
-        bufPushStr(b, "(fn (");
+        bufPushStr(b, "(fn ");
+        bufPushStr(b, fnMode);
+        bufPushStr(b, " (");
         let first = cellNew(true);
         let cur = cellNew(ps);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(p, r) -> {
                     if (!cellGet(first)) bufPushByte(b, 32) else cellSet(first, false);
-                    emitCoreTy(ctx, b, p);
+                    emitCoreTyWithMode(ctx, b, p, fnMode);
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
         };
         bufPushStr(b, ") ");
-        emitCoreTy(ctx, b, ret);
+        emitCoreTyWithMode(ctx, b, ret, fnMode);
         bufPushByte(b, 41)
     },
     TyComp(_, _) -> {
@@ -180,11 +920,23 @@ def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
             match targs {
                 Cons(elemTy, Nil) -> {
                     bufPushStr(b, "(cell ");
-                    emitCoreTy(ctx, b, elemTy);
+                    emitCoreTyWithMode(ctx, b, elemTy, fnMode);
                     bufPushByte(b, 41)
                 },
                 _ -> {
                     setDumpErr(ctx, "Invalid Cell type application");
+                    bufPushStr(b, "void")
+                },
+            }
+        } else if (base == "Task") {
+            match targs {
+                Cons(elemTy, Nil) -> {
+                    bufPushStr(b, "(task ");
+                    emitCoreTyWithMode(ctx, b, elemTy, "shared");
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "Invalid Task type application");
                     bufPushStr(b, "void")
                 },
             }
@@ -351,7 +1103,7 @@ def binOpCoreName(op: BinOp, lhsTy: Type): Option String = {
     }
 }
 
-def emitParamList(ctx: DumpCtx, b: StringBuf, params: List VarDecl): Void = {
+def emitParamList(ctx: DumpCtx, b: StringBuf, fnName: String, params: List VarDecl): Void = {
     bufPushByte(b, 40);
     let first = cellNew(true);
     let cur = cellNew(params);
@@ -359,10 +1111,11 @@ def emitParamList(ctx: DumpCtx, b: StringBuf, params: List VarDecl): Void = {
         match cellGet(cur) {
             Cons(vd, r) -> {
                 if (!cellGet(first)) bufPushByte(b, 32) else cellSet(first, false);
+                let pMode = if (strMapContains(ctx.dcParamShared, fnName + ":" + vd.vname)) "shared" else "local";
                 bufPushByte(b, 40);
                 pushQuotedStr(b, vd.vname);
                 bufPushByte(b, 32);
-                emitCoreTy(ctx, b, schemeBody(vd.vscm));
+                emitCoreTyWithMode(ctx, b, schemeBody(vd.vscm), pMode);
                 bufPushByte(b, 41);
                 cellSet(cur, r)
             },
@@ -420,12 +1173,16 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     TyArr(_, _, r) -> r,
                     other -> other,
                 };
+                let clsMode = if (strMapContains(ctx.dcClsLocal, cls.clsEntry)) "local" else "shared";
+                let rMode = if (strMapContains(ctx.dcRetLocal, fd.fnName)) "local" else "shared";
                 bufPushStr(b, "(let ");
                 pushQuotedStr(b, vd.vname);
                 bufPushStr(b, " (lam ");
-                emitParamList(ctx, b, fd.fnParams);
+                bufPushStr(b, clsMode);
                 bufPushByte(b, 32);
-                emitCoreTy(ctx, b, retTy);
+                emitParamList(ctx, b, fd.fnName, fd.fnParams);
+                bufPushByte(b, 32);
+                emitCoreTyWithMode(ctx, b, retTy, rMode);
                 bufPushByte(b, 32);
                 emitCoreTerm(ctx, b, fd.fnBody);
                 bufPushStr(b, ") ");
@@ -490,6 +1247,30 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                 },
                 _ -> {
                     setDumpErr(ctx, "cellSet expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concTaskSpawn") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(spawn ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concTaskSpawn expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concTaskAwait") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(await ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concTaskAwait expects 1 argument");
                     bufPushStr(b, "(lit-unit)")
                 },
             }
@@ -617,40 +1398,206 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
     },
 }
 
+def markReachFn(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    wl: Cell (List String),
+    name: String,
+    isDir: Bool
+): Void =
+    if (strMapContains(prog.coreFns, name)) {
+        if (isDir) {
+            strMapInsert(dirReach, name, true)
+        } else ();
+        if (!strMapContains(allReach, name)) {
+            strMapInsert(allReach, name, true);
+            cellSet(wl, Cons(name, cellGet(wl)))
+        } else ()
+    } else ()
+
+def scanReachTermList(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    wl: Cell (List String),
+    es: List TaggedTerm
+): Void = {
+    let cur = cellNew(es);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(e, r) -> {
+                scanReachTerm(prog, allReach, dirReach, wl, e);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def scanReachTerm(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    wl: Cell (List String),
+    tm: TaggedTerm
+): Void = match tm.tnode {
+    TmLit(_) -> (),
+    TmVar(_) -> (),
+    TmGlobalVar(_) -> (),
+    TmTuple(es) -> scanReachTermList(prog, allReach, dirReach, wl, es),
+    TmBlock(es) -> scanReachTermList(prog, allReach, dirReach, wl, es),
+    TmMakeCls(_, cls, body) -> {
+        markReachFn(prog, allReach, dirReach, wl, cls.clsEntry, false);
+        scanReachTerm(prog, allReach, dirReach, wl, body)
+    },
+    TmApplyCls(fnTm, args) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, fnTm);
+        scanReachTermList(prog, allReach, dirReach, wl, args)
+    },
+    TmApplyDir(vd, args) -> {
+        markReachFn(prog, allReach, dirReach, wl, vd.vname, true);
+        scanReachTermList(prog, allReach, dirReach, wl, args)
+    },
+    TmBin(_, e1, e2) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, e1);
+        scanReachTerm(prog, allReach, dirReach, wl, e2)
+    },
+    TmUn(_, e1) -> scanReachTerm(prog, allReach, dirReach, wl, e1),
+    TmLet(_, e1, e2) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, e1);
+        scanReachTerm(prog, allReach, dirReach, wl, e2)
+    },
+    TmIf(c, t, e) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, c);
+        scanReachTerm(prog, allReach, dirReach, wl, t);
+        scanReachTerm(prog, allReach, dirReach, wl, e)
+    },
+    TmWhile(c, body) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, c);
+        scanReachTerm(prog, allReach, dirReach, wl, body)
+    },
+    TmMatch(scrut, arms) -> {
+        scanReachTerm(prog, allReach, dirReach, wl, scrut);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(arm, r) -> {
+                    match arm.caGuard {
+                        Some(g) -> scanReachTerm(prog, allReach, dirReach, wl, g),
+                        None -> (),
+                    };
+                    scanReachTerm(prog, allReach, dirReach, wl, arm.caBody);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> scanReachTermList(prog, allReach, dirReach, wl, args),
+    TmGetTag(e1) -> scanReachTerm(prog, allReach, dirReach, wl, e1),
+}
+
+def collectReachableCoreFns(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool
+): List String =
+    if (!strMapContains(prog.coreFns, "main")) {
+        let cf = cellNew(prog.coreFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnName, r) -> {
+                    strMapInsert(allReach, fnName, true);
+                    strMapInsert(dirReach, fnName, true);
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        prog.coreFnNames
+    } else {
+        let wl: Cell (List String) = cellNew(Nil);
+        markReachFn(prog, allReach, dirReach, wl, "main", true);
+        while (match cellGet(wl) { Nil -> false, _ -> true }) {
+            match cellGet(wl) {
+                Cons(fnName, rest) -> {
+                    cellSet(wl, rest);
+                    match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> scanReachTerm(prog, allReach, dirReach, wl, fd.fnBody),
+                        None -> (),
+                    }
+                },
+                Nil -> (),
+            }
+        };
+        let revAcc: Cell (List String) = cellNew(Nil);
+        let cf = cellNew(prog.coreFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnName, r) -> {
+                    if (strMapContains(allReach, fnName)) {
+                        cellSet(revAcc, Cons(fnName, cellGet(revAcc)))
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        listRev(cellGet(revAcc))
+    }
+
 pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
+    let allReach: StrMap Bool = strMapNew();
+    let dirReach: StrMap Bool = strMapNew();
+    let activeFnNames = collectReachableCoreFns(prog, allReach, dirReach);
+
+    let paramShared: StrMap Bool = strMapNew();
+    let clsLocal: StrMap Bool = strMapNew();
+    let retLocal: StrMap Bool = strMapNew();
+    let adtLocal: StrMap Bool = strMapNew();
+    analyzeCoreModes(prog, activeFnNames, paramShared, clsLocal, retLocal, adtLocal);
+
     let ctx = MkDumpCtx {
         dcProg: prog,
         dcInstAdts: strMapNew(),
         dcInstAdtOrder: cellNew(Nil),
+        dcParamShared: paramShared,
+        dcClsLocal: clsLocal,
+        dcRetLocal: retLocal,
+        dcAdtLocal: adtLocal,
         dcErr: cellNew(None),
     };
 
     let funsBuf = bufNew();
-    let cf = cellNew(prog.coreFnNames);
+    let cf = cellNew(activeFnNames);
     while (match cellGet(cf) { Nil -> false, _ -> true }) {
         match cellGet(cf) {
             Cons(fnName, r) -> {
-                match strMapGet(prog.coreFns, fnName) {
-                    Some(fd) -> {
-                        // Lifted closures with captured free variables are inlined at `TmMakeCls`
-                        if (listLen(fd.fnFvs) == 0) {
-                            let retTy = match schemeBody(fd.fnScm) {
-                                TyArr(_, _, ret) -> ret,
-                                other -> other,
-                            };
-                            bufPushStr(funsBuf, "    (fun ");
-                            pushQuotedStr(funsBuf, fd.fnName);
-                            bufPushByte(funsBuf, 32);
-                            emitParamList(ctx, funsBuf, fd.fnParams);
-                            bufPushByte(funsBuf, 32);
-                            emitCoreTy(ctx, funsBuf, retTy);
-                            bufPushByte(funsBuf, 32);
-                            emitCoreTerm(ctx, funsBuf, fd.fnBody);
-                            bufPushStr(funsBuf, ")\n")
-                        } else ()
-                    },
-                    None -> (),
-                };
+                if (strMapContains(dirReach, fnName)) {
+                    match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> {
+                            // Lifted closures with captured free variables are inlined at `TmMakeCls`
+                            if (listLen(fd.fnFvs) == 0) {
+                                let retTy = match schemeBody(fd.fnScm) {
+                                    TyArr(_, _, ret) -> ret,
+                                    other -> other,
+                                };
+                                let rMode = if (strMapContains(ctx.dcRetLocal, fd.fnName)) "local" else "shared";
+                                bufPushStr(funsBuf, "    (fun ");
+                                pushQuotedStr(funsBuf, fd.fnName);
+                                bufPushByte(funsBuf, 32);
+                                emitParamList(ctx, funsBuf, fd.fnName, fd.fnParams);
+                                bufPushByte(funsBuf, 32);
+                                emitCoreTyWithMode(ctx, funsBuf, retTy, rMode);
+                                bufPushByte(funsBuf, 32);
+                                emitCoreTerm(ctx, funsBuf, fd.fnBody);
+                                bufPushStr(funsBuf, ")\n")
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                } else ();
                 cellSet(cf, r)
             },
             Nil -> (),
@@ -665,6 +1612,7 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
             Cons(mangled, r) -> {
                 match strMapGet(ctx.dcInstAdts, mangled) {
                     Some((baseName, targs)) -> {
+                        let fMode = if (strMapContains(ctx.dcAdtLocal, baseName)) "local" else "shared";
                         match strMapGet(prog.coreAdtReg, baseName) {
                             Some(ainfo) -> {
                                 let sub = buildPairMap(ainfo.typeParams, targs);
@@ -681,7 +1629,7 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
                                                 match cellGet(cft) {
                                                     Cons(ft, fr) -> {
                                                         bufPushByte(adtsBuf, 32);
-                                                        emitCoreTy(ctx, adtsBuf, applyExplicitSubst(ft, sub));
+                                                        emitCoreTyWithMode(ctx, adtsBuf, applyExplicitSubst(ft, sub), fMode);
                                                         cellSet(cft, fr)
                                                     },
                                                     Nil -> (),

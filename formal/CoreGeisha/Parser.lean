@@ -4,8 +4,9 @@ import CoreGeisha.Checker
 /-!
 # Core Geisha: `.gscore` S-Expression Parser
 
-Parses the serialized Core IR emitted by `geisha.gs --dump-core <file>` into
-`CoreGeisha.Program` for verified checking by `CoreGeisha.checkProgram`.
+Parses the serialized Core IR emitted by `geisha.gsa --dump-core <file>` into
+`CoreGeisha.Program` (including closure capture modes `local`/`shared` and
+concurrent `task`/`spawn`/`await`) for verified checking by `CoreGeisha.checkProgram`.
 -/
 
 namespace CoreGeisha.Parser
@@ -96,6 +97,11 @@ private def expectInt32 : SExpr → Except String Int32
     | none => .error s!"expected int32, got '{s}'"
   | other => .error s!"expected int32, got {repr other}"
 
+private def parseMode : SExpr → Except String Mode
+  | .atom "local" => .ok .local
+  | .atom "shared" => .ok .shared
+  | other => .error s!"invalid closure mode (expected 'local' or 'shared'): {repr other}"
+
 private partial def parseTy : SExpr → Except String Ty
   | .atom "void" => .ok .void
   | .atom "int" => .ok .int
@@ -104,16 +110,24 @@ private partial def parseTy : SExpr → Except String Ty
   | .list (.atom "tuple" :: ts) => do
     let ts' ← ts.mapM parseTy
     pure (.tuple ts')
+  | .list [.atom "fn", mode, .list ps, ret] => do
+    let m ← parseMode mode
+    let ps' ← ps.mapM parseTy
+    let ret' ← parseTy ret
+    pure (.fn m ps' ret')
   | .list [.atom "fn", .list ps, ret] => do
     let ps' ← ps.mapM parseTy
     let ret' ← parseTy ret
-    pure (.fn ps' ret')
+    pure (.fn .local ps' ret')
   | .list [.atom "adt", name] => do
     let n ← expectStr name
     pure (.adt n)
   | .list [.atom "cell", t] => do
     let t' ← parseTy t
     pure (.cell t')
+  | .list [.atom "task", t] => do
+    let t' ← parseTy t
+    pure (.task t')
   | other => .error s!"invalid type: {repr other}"
 
 private def parseUnOp : String → Except String UnOp
@@ -177,11 +191,17 @@ private partial def parseExpr : SExpr → Except String Expr
   | .list [.atom "var", x] => do pure (.var (← expectStr x))
   | .list (.atom "tuple" :: es) => do pure (.tuple (← es.mapM parseExpr))
   | .list (.atom "block" :: es) => do pure (.block (← es.mapM parseExpr))
+  | .list [.atom "lam", mode, .list ps, ret, body] => do
+    let m ← parseMode mode
+    let ps' ← ps.mapM parseParam
+    let ret' ← parseTy ret
+    let body' ← parseExpr body
+    pure (.lam m ps' ret' body')
   | .list [.atom "lam", .list ps, ret, body] => do
     let ps' ← ps.mapM parseParam
     let ret' ← parseTy ret
     let body' ← parseExpr body
-    pure (.lam ps' ret' body')
+    pure (.lam .local ps' ret' body')
   | .list (.atom "apply" :: fn :: args) => do
     pure (.apply (← parseExpr fn) (← args.mapM parseExpr))
   | .list (.atom "apply-dir" :: name :: args) => do
@@ -208,6 +228,8 @@ private partial def parseExpr : SExpr → Except String Expr
   | .list [.atom "cell-new", e] => do pure (.cellNew (← parseExpr e))
   | .list [.atom "cell-get", e] => do pure (.cellGet (← parseExpr e))
   | .list [.atom "cell-set", e1, e2] => do pure (.cellSet (← parseExpr e1) (← parseExpr e2))
+  | .list [.atom "spawn", e] => do pure (.spawn (← parseExpr e))
+  | .list [.atom "await", e] => do pure (.await (← parseExpr e))
   | other => .error s!"invalid expr: {repr other}"
 
 private def parseVariant : SExpr → Except String VariantDef

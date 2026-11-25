@@ -3,18 +3,21 @@ import CoreGeisha.Typing
 import CoreGeisha.Semantics
 
 /-!
-# Core Geisha: Type Soundness (Progress + Preservation)
+# Core Geisha: Type Soundness, Capture-Mode Subtyping, and Zero-Location Lemma
 
 Machine-checked proof (zero `sorry`, zero external dependencies beyond Lean 4
-core) that every well-typed closed Core Geisha expression never gets stuck (no
-undefined behavior): evaluation either terminates in a value, raises a defined
-runtime trap (`divByZero` / `matchFailure`), or takes a type- and
-store-preserving step.
+core) of:
+- Reflexivity, transitivity, and admissibility (`typing_sub`) of capture-mode subtyping
+- Coinductive unfolding and subtyping monotonicity of `IsSend`
+- **Zero-Location Lemma** (`exprLocs_empty_of_isValue_isSend`): every closed
+  well-typed `IsSend` value contains zero mutable `Cell` heap locations
+- Substitution preservation under lexical `shared` closure capture checking
+- Single-thread **Progress** and **Preservation** (including `spawn` / `await`)
 -/
 
 namespace CoreGeisha
 
-/-! ## Store & Context Auxiliary Lemmas -/
+/-! ## Store, Task & Context Auxiliary Lemmas -/
 
 theorem StoreExtends.refl (Ψ : StoreTy) : StoreExtends Ψ Ψ :=
   ⟨Nat.le_refl _, fun _ _ h => h⟩
@@ -22,6 +25,13 @@ theorem StoreExtends.refl (Ψ : StoreTy) : StoreExtends Ψ Ψ :=
 theorem StoreExtends.trans {Ψ1 Ψ2 Ψ3 : StoreTy}
     (h12 : StoreExtends Ψ1 Ψ2) (h23 : StoreExtends Ψ2 Ψ3) : StoreExtends Ψ1 Ψ3 :=
   ⟨Nat.le_trans h12.1 h23.1, fun l τ h => h23.2 l τ (h12.2 l τ h)⟩
+
+theorem TaskExtends.refl (Θ : TaskTy) : TaskExtends Θ Θ :=
+  ⟨Nat.le_refl _, fun _ _ h => h⟩
+
+theorem TaskExtends.trans {Θ1 Θ2 Θ3 : TaskTy}
+    (h12 : TaskExtends Θ1 Θ2) (h23 : TaskExtends Θ2 Θ3) : TaskExtends Θ1 Θ3 :=
+  ⟨Nat.le_trans h12.1 h23.1, fun tid τ h => h23.2 tid τ (h12.2 tid τ h)⟩
 
 theorem lt_length_of_getElem?_eq_some {α : Type} {xs : List α} {l : Nat} {a : α}
     (h : xs[l]? = some a) : l < xs.length := by
@@ -34,6 +44,12 @@ theorem lt_length_of_getElem?_eq_some {α : Type} {xs : List α} {l : Nat} {a : 
 theorem StoreExtends.append (Ψ : StoreTy) (τ : Ty) : StoreExtends Ψ (Ψ ++ [τ]) := by
   refine ⟨by simp, fun l t h => ?_⟩
   have hlt : l < Ψ.length := lt_length_of_getElem?_eq_some h
+  rw [List.getElem?_append_left hlt]
+  exact h
+
+theorem TaskExtends.append (Θ : TaskTy) (τ : Ty) : TaskExtends Θ (Θ ++ [τ]) := by
+  refine ⟨by simp, fun tid t h => ?_⟩
+  have hlt : tid < Θ.length := lt_length_of_getElem?_eq_some h
   rw [List.getElem?_append_left hlt]
   exact h
 
@@ -110,6 +126,248 @@ theorem extendMany_comm (Γ : Ctx) (x : Ident) (τx : Ty) (bs : List (Ident × T
       simp only [extendMany]
       rw [ih hnot.2, extendCtx_comm _ hnot.1]
 
+/-! ## Subtyping Reflexivity, Transitivity & Admissibility (`typing_sub`) -/
+
+theorem ModeSub.trans {m1 m2 m3 : Mode} (h12 : ModeSub m1 m2) (h23 : ModeSub m2 m3) :
+    ModeSub m1 m3 := by
+  cases h12 <;> cases h23 <;> constructor
+
+mutual
+theorem TySub.refl : (t : Ty) → TySub t t
+  | .void => .void
+  | .int => .int
+  | .bool => .bool
+  | .str => .str
+  | .tuple ts => .tuple (TyListSub.refl ts)
+  | .fn m ps r => .fn (.refl m) (TyListSub.refl ps) (TySub.refl r)
+  | .adt n => .adt n
+  | .cell t => .cell t
+  | .task t => .task (TySub.refl t)
+
+theorem TyListSub.refl : (ts : List Ty) → TyListSub ts ts
+  | [] => .nil
+  | t :: ts => .cons (TySub.refl t) (TyListSub.refl ts)
+end
+
+mutual
+theorem TySub.trans {t1 t2 t3 : Ty} (h12 : TySub t1 t2) (h23 : TySub t2 t3) :
+    TySub t1 t3 := by
+  cases t2 with
+  | void => cases h12; cases h23; exact .void
+  | int => cases h12; cases h23; exact .int
+  | bool => cases h12; cases h23; exact .bool
+  | str => cases h12; cases h23; exact .str
+  | tuple ts2 =>
+    cases h12 with
+    | tuple hs12 =>
+      cases h23 with
+      | tuple hs23 => exact .tuple (TyListSub.trans hs12 hs23)
+  | fn m2 ps2 r2 =>
+    cases h12 with
+    | fn hm12 hps12 hr12 =>
+      cases h23 with
+      | fn hm23 hps23 hr23 =>
+        exact .fn (ModeSub.trans hm12 hm23) (TyListSub.trans hps23 hps12) (TySub.trans hr12 hr23)
+  | adt n => cases h12; cases h23; exact .adt n
+  | cell t => cases h12; cases h23; exact .cell t
+  | task u2 =>
+    cases h12 with
+    | task hs12 =>
+      cases h23 with
+      | task hs23 => exact .task (TySub.trans hs12 hs23)
+termination_by sizeOf t2
+
+theorem TyListSub.trans {ts1 ts2 ts3 : List Ty}
+    (h12 : TyListSub ts1 ts2) (h23 : TyListSub ts2 ts3) : TyListSub ts1 ts3 := by
+  cases ts2 with
+  | nil => cases h12; cases h23; exact .nil
+  | cons u2 us2 =>
+    cases h12 with
+    | cons ht12 hts12 =>
+      cases h23 with
+      | cons ht23 hts23 =>
+        exact .cons (TySub.trans ht12 ht23) (TyListSub.trans hts12 hts23)
+termination_by sizeOf ts2
+end
+
+theorem tyListSub_length : {ts1 ts2 : List Ty} → TyListSub ts1 ts2 → ts1.length = ts2.length
+  | _, _, .nil => rfl
+  | _, _, .cons _ hs => by simp [tyListSub_length hs]
+
+/- Admissibility of subsumption for syntax-directed `HasType`. -/
+mutual
+theorem typing_sub {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {e : Expr} {τ1 τ2 : Ty}
+    (hsub : TySub τ1 τ2) (ht : HasType Δ Φ Ψ Θ Γ e τ1) :
+    HasType Δ Φ Ψ Θ Γ e τ2 := by
+  cases ht with
+  | lit hl =>
+    cases hl <;> cases hsub <;> exact .lit (by constructor)
+  | var hx hs0 => exact .var hx (TySub.trans hs0 hsub)
+  | loc hl =>
+    cases hsub
+    exact .loc hl
+  | taskRef htid hsend hs0 =>
+    cases hsub with
+    | task hs => exact .taskRef htid hsend (TySub.trans hs0 hs)
+  | tuple hts =>
+    cases hsub with
+    | tuple htsub => exact .tuple (typingList_sub htsub hts)
+  | blockEmpty =>
+    cases hsub
+    exact .blockEmpty
+  | blockSingle he =>
+    exact .blockSingle (typing_sub hsub he)
+  | blockCons h1 h2 =>
+    exact .blockCons h1 (typing_sub hsub h2)
+  | lam hm0 hps0 hr0 hbody hsh =>
+    cases hsub with
+    | fn hm hps hr =>
+      exact .lam (ModeSub.trans hm0 hm) (TyListSub.trans hps hps0) (TySub.trans hr0 hr) hbody hsh
+  | apply hfn hargs hr0 =>
+    exact .apply hfn hargs (TySub.trans hr0 hsub)
+  | applyDir hf hargs hr0 =>
+    exact .applyDir hf hargs (TySub.trans hr0 hsub)
+  | bin hop h1 h2 =>
+    cases hop <;> cases hsub <;> exact .bin (by constructor) h1 h2
+  | un hop h1 =>
+    cases hop <;> cases hsub <;> exact .un (by constructor) h1
+  | let_ h1 h2 =>
+    exact .let_ h1 (typing_sub hsub h2)
+  | if_ hc h1 h2 =>
+    exact .if_ hc (typing_sub hsub h1) (typing_sub hsub h2)
+  | while_ hc hb =>
+    cases hsub
+    exact .while_ hc hb
+  | match_ hs harms =>
+    exact .match_ hs (typingArms_sub hsub harms)
+  | makeData hlv hts =>
+    cases hsub
+    exact .makeData hlv hts
+  | getTag h1 =>
+    cases hsub
+    exact .getTag h1
+  | cellNew h1 =>
+    cases hsub
+    exact .cellNew h1
+  | cellGet h1 hs0 =>
+    exact .cellGet h1 (TySub.trans hs0 hsub)
+  | cellSet h1 h2 =>
+    cases hsub
+    exact .cellSet h1 h2
+  | spawn h1 hsend hs0 =>
+    cases hsub with
+    | task hs => exact .spawn h1 hsend (TySub.trans hs0 hs)
+  | await h1 hsend hs0 =>
+    exact .await h1 hsend (TySub.trans hs0 hsub)
+  | trap t _ => exact .trap t τ2
+termination_by sizeOf e
+
+theorem typingList_sub {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {es : List Expr} {ts1 ts2 : List Ty}
+    (hsub : TyListSub ts1 ts2) (hts : HasTypes Δ Φ Ψ Θ Γ es ts1) :
+    HasTypes Δ Φ Ψ Θ Γ es ts2 := by
+  cases hts with
+  | nil => cases hsub; exact .nil
+  | cons h1 hrest =>
+    cases hsub with
+    | cons hs1 hsrest =>
+      exact .cons (typing_sub hs1 h1) (typingList_sub hsrest hrest)
+termination_by sizeOf es
+
+theorem typingArms_sub {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {τs τr1 τr2 : Ty} {arms : List (Pat × Expr)}
+    (hsub : TySub τr1 τr2) (harms : ArmsHaveType Δ Φ Ψ Θ Γ τs arms τr1) :
+    ArmsHaveType Δ Φ Ψ Θ Γ τs arms τr2 := by
+  cases harms with
+  | nil => exact .nil
+  | cons hp hb hrest =>
+    exact .cons hp (typing_sub hsub hb) (typingArms_sub hsub hrest)
+termination_by sizeOf arms
+end
+
+/-! ## Coinductive `IsSend` Unfolding & Subtyping Properties -/
+
+inductive AllIsSend (Δ : AdtEnv) : List Ty → Prop where
+  | nil : AllIsSend Δ []
+  | cons {t : Ty} {ts : List Ty} : IsSend Δ t → AllIsSend Δ ts → AllIsSend Δ (t :: ts)
+
+mutual
+theorem tySendIn_of_tySub {S : Ident → Prop} {τ0 τ : Ty}
+    (hsub : TySub τ0 τ) (hsend : TySendIn S τ) : TySendIn S τ0 := by
+  cases hsub with
+  | void => exact .void
+  | int => exact .int
+  | bool => exact .bool
+  | str => exact .str
+  | tuple hts =>
+    cases hsend with
+    | tuple hls => exact .tuple (tyListSendIn_of_tyListSub hts hls)
+  | fn hm _ _ =>
+    cases hsend with
+    | fnShared _ _ =>
+      cases hm with
+      | refl => exact .fnShared _ _
+  | adt _ => exact hsend
+  | cell _ => cases hsend
+  | task ht =>
+    cases hsend with
+    | task hs => exact .task (tySendIn_of_tySub ht hs)
+
+theorem tyListSendIn_of_tyListSub {S : Ident → Prop} {ts0 ts : List Ty}
+    (hsub : TyListSub ts0 ts) (hsend : TyListSendIn S ts) : TyListSendIn S ts0 := by
+  cases hsub with
+  | nil => exact .nil
+  | cons ht hts =>
+    cases hsend with
+    | cons hs hss =>
+      exact .cons (tySendIn_of_tySub ht hs) (tyListSendIn_of_tyListSub hts hss)
+end
+
+theorem isSend_of_tySub {Δ : AdtEnv} {τ0 τ : Ty}
+    (hsub : TySub τ0 τ) (hsend : IsSend Δ τ) : IsSend Δ τ0 := by
+  rcases hsend with ⟨S, hclosed, hs⟩
+  exact ⟨S, hclosed, tySendIn_of_tySub hsub hs⟩
+
+theorem isSend_cell_false {Δ : AdtEnv} {τ : Ty} : ¬ IsSend Δ (.cell τ) := by
+  intro ⟨_, _, hs⟩
+  cases hs
+
+theorem isSend_fn_mode {Δ : AdtEnv} {m : Mode} {ps : List Ty} {ret : Ty}
+    (hsend : IsSend Δ (.fn m ps ret)) : m = .shared := by
+  rcases hsend with ⟨_, _, hs⟩
+  cases hs
+  rfl
+
+theorem tyListSendIn_to_allIsSend {Δ : AdtEnv} {S : Ident → Prop}
+    (hclosed : AdtSendClosed Δ S) : {ts : List Ty} → TyListSendIn S ts → AllIsSend Δ ts
+  | _, .nil => .nil
+  | _, .cons h1 hrest => .cons ⟨S, hclosed, h1⟩ (tyListSendIn_to_allIsSend hclosed hrest)
+
+theorem isSend_tuple_all {Δ : AdtEnv} {τs : List Ty}
+    (hsend : IsSend Δ (.tuple τs)) : AllIsSend Δ τs := by
+  rcases hsend with ⟨S, hclosed, hs⟩
+  cases hs with
+  | tuple hls => exact tyListSendIn_to_allIsSend hclosed hls
+
+theorem isSend_adt_fields {Δ : AdtEnv} {adt : Ident} {tag : Nat} {flds : List Ty}
+    (hsend : IsSend Δ (.adt adt)) (hlv : lookupVariant Δ adt tag = some flds) :
+    AllIsSend Δ flds := by
+  rcases hsend with ⟨S, hclosed, hs⟩
+  cases hs with
+  | adt hadt =>
+    rcases hclosed adt hadt with ⟨defn, hΔ, hvars⟩
+    simp only [lookupVariant, hΔ] at hlv
+    cases hfind : defn.variants.find? (fun v => v.tag == tag) with
+    | none => rw [hfind] at hlv; cases hlv
+    | some v =>
+      rw [hfind] at hlv
+      cases hlv
+      have hvmem : v ∈ defn.variants := List.mem_of_find?_eq_some hfind
+      exact tyListSendIn_to_allIsSend hclosed (hvars v hvmem)
+
+/-! ## Pattern Bound-Name & Static Zero-Location Lemmas -/
+
 mutual
 theorem patHasType_boundNames {Δ : AdtEnv} {p : Pat} {τ : Ty} {bs : List (Ident × Ty)}
     (h : PatHasType Δ p τ bs) : bs.map Prod.fst = patBoundNames p := by
@@ -130,7 +388,633 @@ theorem patsHaveType_boundNames {Δ : AdtEnv} {ps : List Pat} {τs : List Ty} {b
     rw [patHasType_boundNames hp, patsHaveType_boundNames hps]
 end
 
-/-! ## Context & Store Weakening -/
+/- Any expression well-typed under an empty store typing (`Ψ = []`) contains
+   zero literal `Cell` locations. -/
+mutual
+theorem exprLocs_empty_of_empty_store {Δ : AdtEnv} {Φ : FunEnv} {Θ : TaskTy} {Γ : Ctx}
+    {e : Expr} {τ : Ty} (h : HasType Δ Φ [] Θ Γ e τ) : exprLocs e = [] := by
+  cases h with
+  | lit _ => rfl
+  | var _ _ => rfl
+  | loc hl => simp at hl
+  | taskRef _ _ _ => rfl
+  | tuple hts => simp only [exprLocs]; exact exprLocsList_empty_of_empty_store hts
+  | blockEmpty => rfl
+  | blockSingle he =>
+    simp only [exprLocs, exprLocsList, exprLocs_empty_of_empty_store he, List.append_nil]
+  | blockCons h1 h2 =>
+    have ih1 := exprLocs_empty_of_empty_store h1
+    have ih2 := exprLocs_empty_of_empty_store h2
+    simp only [exprLocs, exprLocsList] at ih2 ⊢
+    rw [ih1, ih2, List.append_nil]
+  | lam _ _ _ hbody _ =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store hbody
+  | apply hfn hargs _ =>
+    simp [exprLocs, exprLocs_empty_of_empty_store hfn, exprLocsList_empty_of_empty_store hargs]
+  | applyDir _ hargs _ =>
+    simp only [exprLocs]; exact exprLocsList_empty_of_empty_store hargs
+  | bin _ h1 h2 =>
+    simp [exprLocs, exprLocs_empty_of_empty_store h1, exprLocs_empty_of_empty_store h2]
+  | un _ h1 =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | let_ h1 h2 =>
+    simp [exprLocs, exprLocs_empty_of_empty_store h1, exprLocs_empty_of_empty_store h2]
+  | if_ hc h1 h2 =>
+    simp [exprLocs, exprLocs_empty_of_empty_store hc,
+      exprLocs_empty_of_empty_store h1, exprLocs_empty_of_empty_store h2]
+  | while_ hc hb =>
+    simp [exprLocs, exprLocs_empty_of_empty_store hc, exprLocs_empty_of_empty_store hb]
+  | match_ hs harms =>
+    simp [exprLocs, exprLocs_empty_of_empty_store hs, exprLocsArms_empty_of_empty_store harms]
+  | makeData _ hts =>
+    simp only [exprLocs]; exact exprLocsList_empty_of_empty_store hts
+  | getTag h1 =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | cellNew h1 =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | cellGet h1 _ =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | cellSet h1 h2 =>
+    simp [exprLocs, exprLocs_empty_of_empty_store h1, exprLocs_empty_of_empty_store h2]
+  | spawn h1 _ _ =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | await h1 _ _ =>
+    simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | trap _ _ => rfl
+termination_by sizeOf e
+
+theorem exprLocsList_empty_of_empty_store {Δ : AdtEnv} {Φ : FunEnv} {Θ : TaskTy} {Γ : Ctx}
+    {es : List Expr} {τs : List Ty} (h : HasTypes Δ Φ [] Θ Γ es τs) : exprLocsList es = [] := by
+  cases h with
+  | nil => rfl
+  | cons h1 hrest =>
+    simp [exprLocsList, exprLocs_empty_of_empty_store h1, exprLocsList_empty_of_empty_store hrest]
+termination_by sizeOf es
+
+theorem exprLocsArms_empty_of_empty_store {Δ : AdtEnv} {Φ : FunEnv} {Θ : TaskTy} {Γ : Ctx}
+    {τs τr : Ty} {arms : List (Pat × Expr)}
+    (h : ArmsHaveType Δ Φ [] Θ Γ τs arms τr) : exprLocsArms arms = [] := by
+  cases h with
+  | nil => rfl
+  | cons _ hb hrest =>
+    simp [exprLocsArms, exprLocs_empty_of_empty_store hb, exprLocsArms_empty_of_empty_store hrest]
+termination_by sizeOf arms
+end
+
+/-! ## Zero-Location Lemma for Closed `IsSend` Values -/
+
+/- Key concurrency soundness lemma: any closed well-typed value `v` whose type
+   satisfies `IsSend Δ τ` embeds ZERO mutable `Cell` heap locations (`exprLocs v = []`). -/
+mutual
+theorem exprLocs_empty_of_isValue_isSend {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {v : Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v τ) (hv : IsValue v) (hsend : IsSend Δ τ) :
+    exprLocs v = [] := by
+  cases ht with
+  | lit _ => rfl
+  | var hx _ => simp [emptyCtx] at hx
+  | loc _ => exact absurd hsend isSend_cell_false
+  | taskRef _ _ _ => rfl
+  | tuple hts =>
+    cases hv with
+    | tuple hvs =>
+      simp only [exprLocs]
+      exact exprLocsList_empty_of_isValue_isSend hts hvs (isSend_tuple_all hsend)
+  | lam hm _ _ _ hsh =>
+    have hm_sh := isSend_fn_mode hsend
+    subst hm_sh
+    cases hm with
+    | refl =>
+      simp only [exprLocs]
+      exact (hsh rfl).2
+  | makeData hlv hts =>
+    cases hv with
+    | makeData _ _ hvs =>
+      simp only [exprLocs]
+      exact exprLocsList_empty_of_isValue_isSend hts hvs (isSend_adt_fields hsend hlv)
+  | blockEmpty => cases hv
+  | blockSingle _ => cases hv
+  | blockCons _ _ => cases hv
+  | apply _ _ _ => cases hv
+  | applyDir _ _ _ => cases hv
+  | bin _ _ _ => cases hv
+  | un _ _ => cases hv
+  | let_ _ _ => cases hv
+  | if_ _ _ _ => cases hv
+  | while_ _ _ => cases hv
+  | match_ _ _ => cases hv
+  | getTag _ => cases hv
+  | cellNew _ => cases hv
+  | cellGet _ _ => cases hv
+  | cellSet _ _ => cases hv
+  | spawn _ _ _ => cases hv
+  | await _ _ _ => cases hv
+  | trap _ _ => cases hv
+termination_by sizeOf v
+
+theorem exprLocsList_empty_of_isValue_isSend {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {vs : List Expr} {τs : List Ty}
+    (hts : HasTypes Δ Φ Ψ Θ emptyCtx vs τs)
+    (hvs : ∀ v ∈ vs, IsValue v)
+    (hsend : AllIsSend Δ τs) :
+    exprLocsList vs = [] := by
+  cases hts with
+  | nil => rfl
+  | cons h1 hrest =>
+    cases hsend with
+    | cons hs1 hsrest =>
+      have hv1 : IsValue _ := hvs _ (List.mem_cons_self ..)
+      have hvrest : ∀ u ∈ _, IsValue u := fun u hu => hvs u (List.mem_cons_of_mem _ hu)
+      simp [exprLocsList,
+        exprLocs_empty_of_isValue_isSend h1 hv1 hs1,
+        exprLocsList_empty_of_isValue_isSend hrest hvrest hsrest]
+termination_by sizeOf vs
+end
+
+/-! ## Free-Variable & Location Substitution Lemmas -/
+
+private theorem lookup_extendMany_or {Γ : Ctx} {bs : List (Ident × Ty)} {z : Ident} {τ : Ty}
+    (h : extendMany Γ bs z = some τ) : z ∈ bs.map Prod.fst ∨ Γ z = some τ := by
+  induction bs with
+  | nil => exact Or.inr h
+  | cons b rest ih =>
+    cases b with
+    | mk k tk =>
+      simp only [extendMany, extendCtx] at h
+      by_cases hzk : (z == k) = true
+      · rw [hzk] at h
+        have heq : z = k := beq_iff_eq.mp hzk
+        subst heq
+        exact Or.inl (List.mem_cons_self ..)
+      · have hzk' : (z == k) = false := Bool.eq_false_iff.mpr hzk
+        rw [hzk'] at h
+        simp only [Bool.false_eq_true, ↓reduceIte] at h
+        rcases ih h with hm | hg
+        · exact Or.inl (List.mem_cons_of_mem _ hm)
+        · exact Or.inr hg
+
+mutual
+theorem freeVars_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {e : Expr} {τ : Ty} (ht : HasType Δ Φ Ψ Θ Γ e τ) :
+    ∀ z ∈ freeVars e, ∃ τz, Γ z = some τz := by
+  cases ht with
+  | lit _ => intro _ h; cases h
+  | var hx _ =>
+    intro z hz
+    simp only [freeVars, List.mem_singleton] at hz
+    subst hz; exact ⟨_, hx⟩
+  | loc _ => intro _ h; cases h
+  | taskRef _ _ _ => intro _ h; cases h
+  | tuple hts => simp only [freeVars]; exact freeVarsList_typed hts
+  | blockEmpty => intro _ h; cases h
+  | blockSingle he =>
+    intro z hz
+    simp only [freeVars, freeVarsList, List.append_nil] at hz
+    exact freeVars_typed he z hz
+  | @blockCons _ e1 e2 es _ _ h1 h2 =>
+    intro z hz
+    simp only [freeVars, freeVarsList, List.mem_append] at hz
+    rcases hz with hz1 | hz2
+    · exact freeVars_typed h1 z hz1
+    · have hz2' : z ∈ freeVars (.block (e2 :: es)) := by
+        simp [freeVars, freeVarsList, hz2]
+      exact freeVars_typed h2 z hz2'
+  | @lam _ _ _ ps _ _ _ body _ _ _ hbody _ =>
+    intro z hz
+    simp only [freeVars, List.mem_filter] at hz
+    rcases freeVars_typed hbody z hz.1 with ⟨τz, hlookup⟩
+    rcases lookup_extendMany_or hlookup with hmem | hg
+    · exfalso
+      rcases List.mem_map.mp hmem with ⟨p, hp, rfl⟩
+      have hany : ps.any (fun q => q.1 == p.1) = true :=
+        List.any_eq_true.mpr ⟨p, hp, beq_self_eq_true _⟩
+      simp [hany] at hz
+    · exact ⟨τz, hg⟩
+  | apply hfn hargs _ =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with h1 | h2
+    · exact freeVars_typed hfn z h1
+    · exact freeVarsList_typed hargs z h2
+  | applyDir _ hargs _ => simp only [freeVars]; exact freeVarsList_typed hargs
+  | bin _ h1 h2 =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with hz1 | hz2
+    · exact freeVars_typed h1 z hz1
+    · exact freeVars_typed h2 z hz2
+  | un _ h1 => simp only [freeVars]; exact freeVars_typed h1
+  | @let_ _ y e1 e2 _ _ h1 h2 =>
+    intro z hz
+    simp only [freeVars, List.mem_append, List.mem_filter] at hz
+    rcases hz with hz1 | ⟨hz2, hne⟩
+    · exact freeVars_typed h1 z hz1
+    · rcases freeVars_typed h2 z hz2 with ⟨τz, hlookup⟩
+      simp only [extendCtx] at hlookup
+      have hzy : (z == y) = false := by
+        cases hq : z == y
+        · rfl
+        · simp [bne, hq] at hne
+      rw [hzy] at hlookup
+      simp only [Bool.false_eq_true, ↓reduceIte] at hlookup
+      exact ⟨τz, hlookup⟩
+  | if_ hc h1 h2 =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with (hzc | hz1) | hz2
+    · exact freeVars_typed hc z hzc
+    · exact freeVars_typed h1 z hz1
+    · exact freeVars_typed h2 z hz2
+  | while_ hc hb =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with hzc | hzb
+    · exact freeVars_typed hc z hzc
+    · exact freeVars_typed hb z hzb
+  | match_ hs harms =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with hzs | hza
+    · exact freeVars_typed hs z hzs
+    · exact freeVarsArms_typed harms z hza
+  | makeData _ hts => simp only [freeVars]; exact freeVarsList_typed hts
+  | getTag h1 => simp only [freeVars]; exact freeVars_typed h1
+  | cellNew h1 => simp only [freeVars]; exact freeVars_typed h1
+  | cellGet h1 _ => simp only [freeVars]; exact freeVars_typed h1
+  | cellSet h1 h2 =>
+    intro z hz
+    simp only [freeVars, List.mem_append] at hz
+    rcases hz with hz1 | hz2
+    · exact freeVars_typed h1 z hz1
+    · exact freeVars_typed h2 z hz2
+  | spawn h1 _ _ => simp only [freeVars]; exact freeVars_typed h1
+  | await h1 _ _ => simp only [freeVars]; exact freeVars_typed h1
+  | trap _ _ => intro _ h; cases h
+termination_by sizeOf e
+
+theorem freeVarsList_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {es : List Expr} {τs : List Ty} (hts : HasTypes Δ Φ Ψ Θ Γ es τs) :
+    ∀ z ∈ freeVarsList es, ∃ τz, Γ z = some τz := by
+  cases hts with
+  | nil => intro _ h; cases h
+  | cons h1 hrest =>
+    intro z hz
+    simp only [freeVarsList, List.mem_append] at hz
+    rcases hz with hz1 | hzr
+    · exact freeVars_typed h1 z hz1
+    · exact freeVarsList_typed hrest z hzr
+termination_by sizeOf es
+
+theorem freeVarsArms_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {τs τr : Ty} {arms : List (Pat × Expr)} (harms : ArmsHaveType Δ Φ Ψ Θ Γ τs arms τr) :
+    ∀ z ∈ freeVarsArms arms, ∃ τz, Γ z = some τz := by
+  cases harms with
+  | nil => intro _ h; cases h
+  | @cons _ _ _ p body bs rest hp hbody hrest =>
+    intro z hz
+    simp only [freeVarsArms, List.mem_append, List.mem_filter, Bool.not_eq_true',
+      List.contains_eq_mem, decide_eq_false_iff_not] at hz
+    rcases hz with ⟨hzb, hnotc⟩ | hzr
+    · rcases freeVars_typed hbody z hzb with ⟨τz, hlookup⟩
+      rcases lookup_extendMany_or hlookup with hmem | hg
+      · rw [patHasType_boundNames hp] at hmem
+        exact absurd hmem hnotc
+      · exact ⟨τz, hg⟩
+    · exact freeVarsArms_typed hrest z hzr
+termination_by sizeOf arms
+end
+
+theorem freeVars_empty_of_closed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {v : Expr} {τ : Ty} (hv : HasType Δ Φ Ψ Θ emptyCtx v τ) :
+    ∀ z, z ∉ freeVars v := by
+  intro z hz
+  rcases freeVars_typed hv z hz with ⟨_, h⟩
+  simp [emptyCtx] at h
+
+mutual
+theorem subst_not_mem_freeVars {x : Ident} {v : Expr} :
+    (e : Expr) → x ∉ freeVars e → subst x v e = e
+  | .lit _, _ => rfl
+  | .var y, hnot => by
+    simp only [freeVars, List.mem_singleton] at hnot
+    have hyx : (y == x) = false := beq_false_of_ne (Ne.symm hnot)
+    simp [subst, hyx]
+  | .loc _, _ => rfl
+  | .taskRef _, _ => rfl
+  | .tuple es, hnot => by
+    simp only [subst, substList_not_mem_freeVars es hnot]
+  | .block es, hnot => by
+    simp only [subst, substList_not_mem_freeVars es hnot]
+  | .lam m ps ret body, hnot => by
+    simp only [subst]
+    by_cases hany : ps.any (fun p => p.1 == x) = true
+    · simp [hany]
+    · simp only [hany, Bool.false_eq_true, ↓reduceIte]
+      have hnotb : x ∉ freeVars body := by
+        intro hmem
+        apply hnot
+        simp [freeVars, hmem, hany]
+      rw [subst_not_mem_freeVars body hnotb]
+  | .apply fn args, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars fn hnot.1, substList_not_mem_freeVars args hnot.2]
+  | .applyDir fn args, hnot => by
+    simp [subst, substList_not_mem_freeVars args hnot]
+  | .bin op e1 e2, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars e1 hnot.1, subst_not_mem_freeVars e2 hnot.2]
+  | .un op e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .let_ y e1 e2, hnot => by
+    simp only [freeVars, List.mem_append, List.mem_filter, not_or] at hnot
+    simp only [subst, subst_not_mem_freeVars e1 hnot.1]
+    by_cases hyx : (y == x) = true
+    · simp [hyx]
+    · simp only [hyx, Bool.false_eq_true, ↓reduceIte]
+      have hnot2 : x ∉ freeVars e2 := by
+        intro hm2
+        apply hnot.2
+        have hxy : (x != y) = true := by
+          have hne : x ≠ y := fun h => hyx (beq_iff_eq.mpr h.symm)
+          exact bne_iff_ne.mpr hne
+        exact ⟨hm2, hxy⟩
+      rw [subst_not_mem_freeVars e2 hnot2]
+  | .if_ c t e2, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars c hnot.1.1,
+      subst_not_mem_freeVars t hnot.1.2, subst_not_mem_freeVars e2 hnot.2]
+  | .while_ c b, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars c hnot.1, subst_not_mem_freeVars b hnot.2]
+  | .match_ s arms, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars s hnot.1, substArms_not_mem_freeVars arms hnot.2]
+  | .makeData adt tag es, hnot => by
+    simp [subst, substList_not_mem_freeVars es hnot]
+  | .getTag e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .cellNew e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .cellGet e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .cellSet e1 e2, hnot => by
+    simp only [freeVars, List.mem_append, not_or] at hnot
+    simp [subst, subst_not_mem_freeVars e1 hnot.1, subst_not_mem_freeVars e2 hnot.2]
+  | .spawn e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .await e1, hnot => by
+    simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .trap _, _ => rfl
+
+theorem substList_not_mem_freeVars {x : Ident} {v : Expr} :
+    (es : List Expr) → x ∉ freeVarsList es → substList x v es = es
+  | [], _ => rfl
+  | e :: es, hnot => by
+    simp only [freeVarsList, List.mem_append, not_or] at hnot
+    simp [substList, subst_not_mem_freeVars e hnot.1, substList_not_mem_freeVars es hnot.2]
+
+theorem substArms_not_mem_freeVars {x : Ident} {v : Expr} :
+    (arms : List (Pat × Expr)) → x ∉ freeVarsArms arms → substArms x v arms = arms
+  | [], _ => rfl
+  | (p, body) :: rest, hnot => by
+    simp only [freeVarsArms, List.mem_append, List.mem_filter, Bool.not_eq_true',
+      List.contains_eq_mem, decide_eq_false_iff_not, not_or] at hnot
+    simp only [substArms, substArms_not_mem_freeVars rest hnot.2]
+    by_cases hc : (patBoundNames p).contains x = true
+    · rw [hc]; simp
+    · have hc' : (patBoundNames p).contains x = false := Bool.eq_false_iff.mpr hc
+      rw [hc']
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      have hnotm : x ∉ patBoundNames p := fun hm => hc (List.contains_iff_mem.mpr hm)
+      have hnotb : x ∉ freeVars body := fun hb => hnot.1 ⟨hb, hnotm⟩
+      rw [subst_not_mem_freeVars body hnotb]
+end
+
+mutual
+theorem mem_freeVars_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ freeVars v) :
+    (e : Expr) → z ∈ freeVars (subst x v e) → z ≠ x ∧ z ∈ freeVars e
+  | .lit _, h => by cases h
+  | .var y, h => by
+    simp only [subst] at h
+    by_cases hyx : (y == x) = true
+    · rw [hyx] at h
+      simp only [↓reduceIte] at h
+      exact absurd h (hclosed z)
+    · have hyx' : (y == x) = false := Bool.eq_false_iff.mpr hyx
+      rw [hyx'] at h
+      simp only [Bool.false_eq_true, ↓reduceIte, freeVars, List.mem_singleton] at h
+      subst h
+      exact ⟨fun h => hyx (beq_iff_eq.mpr h), List.mem_singleton.mpr rfl⟩
+  | .loc _, h => by cases h
+  | .taskRef _, h => by cases h
+  | .tuple es, h => mem_freeVarsList_subst hclosed es h
+  | .block es, h => mem_freeVarsList_subst hclosed es h
+  | .lam m ps ret body, h => by
+    simp only [subst] at h
+    by_cases hany : ps.any (fun p => p.1 == x) = true
+    · rw [hany] at h
+      simp only [↓reduceIte, freeVars, List.mem_filter] at h
+      have hzx : z ≠ x := by
+        intro rfl
+        simp [hany] at h
+      exact ⟨hzx, List.mem_filter.mpr h⟩
+    · have hany' : ps.any (fun p => p.1 == x) = false := Bool.eq_false_iff.mpr hany
+      rw [hany'] at h
+      simp only [Bool.false_eq_true, ↓reduceIte, freeVars, List.mem_filter] at h
+      rcases mem_freeVars_subst hclosed body h.1 with ⟨hzx, hzb⟩
+      exact ⟨hzx, List.mem_filter.mpr ⟨hzb, h.2⟩⟩
+  | .apply fn args, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · rcases mem_freeVars_subst hclosed fn h1 with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVarsList_subst hclosed args h2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .applyDir fn args, h => mem_freeVarsList_subst hclosed args h
+  | .bin op e1 e2, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · rcases mem_freeVars_subst hclosed e1 h1 with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVars_subst hclosed e2 h2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .un op e1, h => mem_freeVars_subst hclosed e1 h
+  | .let_ y e1 e2, h => by
+    simp only [subst] at h
+    by_cases hyx : (y == x) = true
+    · rw [hyx] at h
+      simp only [↓reduceIte, freeVars, List.mem_append, List.mem_filter] at h ⊢
+      rcases h with h1 | ⟨h2, hne_zy⟩
+      · rcases mem_freeVars_subst hclosed e1 h1 with ⟨hne, hm⟩
+        exact ⟨hne, Or.inl hm⟩
+      · have hy_eq_x : y = x := beq_iff_eq.mp hyx
+        subst hy_eq_x
+        have hzx : z ≠ y := bne_iff_ne.mp hne_zy
+        exact ⟨hzx, Or.inr ⟨h2, hne_zy⟩⟩
+    · have hyx' : (y == x) = false := Bool.eq_false_iff.mpr hyx
+      rw [hyx'] at h
+      simp only [Bool.false_eq_true, ↓reduceIte, freeVars, List.mem_append, List.mem_filter] at h ⊢
+      rcases h with h1 | ⟨h2, hne_zy⟩
+      · rcases mem_freeVars_subst hclosed e1 h1 with ⟨hne, hm⟩
+        exact ⟨hne, Or.inl hm⟩
+      · rcases mem_freeVars_subst hclosed e2 h2 with ⟨hne, hm⟩
+        exact ⟨hne, Or.inr ⟨hm, hne_zy⟩⟩
+  | .if_ c t e2, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with (hc | ht) | he2
+    · rcases mem_freeVars_subst hclosed c hc with ⟨hne, hm⟩; exact ⟨hne, Or.inl (Or.inl hm)⟩
+    · rcases mem_freeVars_subst hclosed t ht with ⟨hne, hm⟩; exact ⟨hne, Or.inl (Or.inr hm)⟩
+    · rcases mem_freeVars_subst hclosed e2 he2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .while_ c b, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with hc | hb
+    · rcases mem_freeVars_subst hclosed c hc with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVars_subst hclosed b hb with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .match_ s arms, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with hs | ha
+    · rcases mem_freeVars_subst hclosed s hs with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVarsArms_subst hclosed arms ha with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .makeData adt tag es, h => mem_freeVarsList_subst hclosed es h
+  | .getTag e1, h => mem_freeVars_subst hclosed e1 h
+  | .cellNew e1, h => mem_freeVars_subst hclosed e1 h
+  | .cellGet e1, h => mem_freeVars_subst hclosed e1 h
+  | .cellSet e1 e2, h => by
+    simp only [subst, freeVars, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · rcases mem_freeVars_subst hclosed e1 h1 with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVars_subst hclosed e2 h2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+  | .spawn e1, h => mem_freeVars_subst hclosed e1 h
+  | .await e1, h => mem_freeVars_subst hclosed e1 h
+  | .trap _, h => by cases h
+
+theorem mem_freeVarsList_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ freeVars v) :
+    (es : List Expr) → z ∈ freeVarsList (substList x v es) → z ≠ x ∧ z ∈ freeVarsList es
+  | [], h => by cases h
+  | e :: es, h => by
+    simp only [substList, freeVarsList, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · rcases mem_freeVars_subst hclosed e h1 with ⟨hne, hm⟩; exact ⟨hne, Or.inl hm⟩
+    · rcases mem_freeVarsList_subst hclosed es h2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
+
+theorem mem_freeVarsArms_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ freeVars v) :
+    (arms : List (Pat × Expr)) → z ∈ freeVarsArms (substArms x v arms) → z ≠ x ∧ z ∈ freeVarsArms arms
+  | [], h => by cases h
+  | (p, body) :: rest, h => by
+    simp only [substArms, freeVarsArms, List.mem_append, List.mem_filter, Bool.not_eq_true',
+      List.contains_eq_mem, decide_eq_false_iff_not] at h ⊢
+    rcases h with ⟨hb, hnotp⟩ | hr
+    · by_cases hxm : x ∈ patBoundNames p
+      · simp only [hxm, decide_true, ↓reduceIte] at hb
+        have hzx : z ≠ x := by
+          intro rfl
+          exact hnotp hxm
+        exact ⟨hzx, Or.inl ⟨hb, hnotp⟩⟩
+      · simp only [hxm, decide_false, Bool.false_eq_true, ↓reduceIte] at hb
+        rcases mem_freeVars_subst hclosed body hb with ⟨hne, hm⟩
+        exact ⟨hne, Or.inl ⟨hm, hnotp⟩⟩
+    · rcases mem_freeVarsArms_subst hclosed rest hr with ⟨hne, hm⟩
+      exact ⟨hne, Or.inr hm⟩
+end
+
+mutual
+theorem mem_exprLocs_subst {x : Ident} {v : Expr} {l : Loc} :
+    (e : Expr) → l ∈ exprLocs (subst x v e) → l ∈ exprLocs e ∨ l ∈ exprLocs v
+  | .lit _, h => by cases h
+  | .var y, h => by
+    simp only [subst] at h
+    split at h
+    · exact Or.inr h
+    · cases h
+  | .loc _, h => Or.inl h
+  | .taskRef _, h => by cases h
+  | .tuple es, h => mem_exprLocsList_subst es h
+  | .block es, h => mem_exprLocsList_subst es h
+  | .lam m ps ret body, h => by
+    simp only [subst] at h
+    split at h
+    · exact Or.inl h
+    · exact mem_exprLocs_subst body h
+  | .apply fn args, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · exact (mem_exprLocs_subst fn h1).imp Or.inl id
+    · exact (mem_exprLocsList_subst args h2).imp Or.inr id
+  | .applyDir _ args, h => mem_exprLocsList_subst args h
+  | .bin _ e1 e2, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · exact (mem_exprLocs_subst e1 h1).imp Or.inl id
+    · exact (mem_exprLocs_subst e2 h2).imp Or.inr id
+  | .un _ e1, h => mem_exprLocs_subst e1 h
+  | .let_ y e1 e2, h => by
+    simp only [subst] at h
+    split at h
+    · simp only [exprLocs, List.mem_append] at h ⊢
+      rcases h with h1 | h2
+      · exact (mem_exprLocs_subst e1 h1).imp Or.inl id
+      · exact Or.inl (Or.inr h2)
+    · simp only [exprLocs, List.mem_append] at h ⊢
+      rcases h with h1 | h2
+      · exact (mem_exprLocs_subst e1 h1).imp Or.inl id
+      · exact (mem_exprLocs_subst e2 h2).imp Or.inr id
+  | .if_ c t e2, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with (hc | ht) | he2
+    · exact (mem_exprLocs_subst c hc).imp (fun m => Or.inl (Or.inl m)) id
+    · exact (mem_exprLocs_subst t ht).imp (fun m => Or.inl (Or.inr m)) id
+    · exact (mem_exprLocs_subst e2 he2).imp Or.inr id
+  | .while_ c b, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with hc | hb
+    · exact (mem_exprLocs_subst c hc).imp Or.inl id
+    · exact (mem_exprLocs_subst b hb).imp Or.inr id
+  | .match_ s arms, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with hs | ha
+    · exact (mem_exprLocs_subst s hs).imp Or.inl id
+    · exact (mem_exprLocsArms_subst arms ha).imp Or.inr id
+  | .makeData _ _ es, h => mem_exprLocsList_subst es h
+  | .getTag e1, h => mem_exprLocs_subst e1 h
+  | .cellNew e1, h => mem_exprLocs_subst e1 h
+  | .cellGet e1, h => mem_exprLocs_subst e1 h
+  | .cellSet e1 e2, h => by
+    simp only [subst, exprLocs, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · exact (mem_exprLocs_subst e1 h1).imp Or.inl id
+    · exact (mem_exprLocs_subst e2 h2).imp Or.inr id
+  | .spawn e1, h => mem_exprLocs_subst e1 h
+  | .await e1, h => mem_exprLocs_subst e1 h
+  | .trap _, h => by cases h
+
+theorem mem_exprLocsList_subst {x : Ident} {v : Expr} {l : Loc} :
+    (es : List Expr) → l ∈ exprLocsList (substList x v es) → l ∈ exprLocsList es ∨ l ∈ exprLocs v
+  | [], h => by cases h
+  | e :: es, h => by
+    simp only [substList, exprLocsList, List.mem_append] at h ⊢
+    rcases h with h1 | h2
+    · exact (mem_exprLocs_subst e h1).imp Or.inl id
+    · exact (mem_exprLocsList_subst es h2).imp Or.inr id
+
+theorem mem_exprLocsArms_subst {x : Ident} {v : Expr} {l : Loc} :
+    (arms : List (Pat × Expr)) → l ∈ exprLocsArms (substArms x v arms) →
+      l ∈ exprLocsArms arms ∨ l ∈ exprLocs v
+  | [], h => by cases h
+  | (p, body) :: rest, h => by
+    simp only [substArms, exprLocsArms, List.mem_append] at h ⊢
+    rcases h with hb | hr
+    · split at hb
+      · exact Or.inl (Or.inl hb)
+      · exact (mem_exprLocs_subst body hb).imp Or.inl id
+    · exact (mem_exprLocsArms_subst rest hr).imp Or.inr id
+end
+
+theorem exprLocs_subst_nil {x : Ident} {v e : Expr}
+    (he : exprLocs e = []) (hv : exprLocs v = []) :
+    exprLocs (subst x v e) = [] := by
+  apply List.eq_nil_iff_forall_not_mem.mpr
+  intro l hl
+  rcases mem_exprLocs_subst e hl with h1 | h2
+  · rw [he] at h1; cases h1
+  · rw [hv] at h2; cases h2
+
+/-! ## Context, Store & Task Weakening -/
 
 private theorem extCtx_mono {Γ1 Γ2 : Ctx} (hsub : ∀ x t, Γ1 x = some t → Γ2 x = some t)
     (x : Ident) (τ : Ty) : ∀ y t, extendCtx Γ1 x τ y = some t → extendCtx Γ2 x τ y = some t := by
@@ -147,20 +1031,29 @@ private theorem extMany_mono {Γ1 Γ2 : Ctx} (hsub : ∀ x t, Γ1 x = some t →
     | mk k tk => exact extCtx_mono ih k tk
 
 mutual
-theorem typing_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ1 Γ2 : Ctx} {e : Expr} {τ : Ty}
+theorem typing_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {Γ1 Γ2 : Ctx} {e : Expr} {τ : Ty}
     (hsub : ∀ x t, Γ1 x = some t → Γ2 x = some t)
-    (h : HasType Δ Φ Ψ Γ1 e τ) : HasType Δ Φ Ψ Γ2 e τ := by
+    (h : HasType Δ Φ Ψ Θ Γ1 e τ) : HasType Δ Φ Ψ Θ Γ2 e τ := by
   cases h with
   | lit hl => exact .lit hl
-  | var hx => exact .var (hsub _ _ hx)
+  | var hx hs => exact .var (hsub _ _ hx) hs
   | loc hl => exact .loc hl
+  | taskRef htid hsend hs => exact .taskRef htid hsend hs
   | tuple hts => exact .tuple (typingList_ctx_weaken hsub hts)
   | blockEmpty => exact .blockEmpty
   | blockSingle he => exact .blockSingle (typing_ctx_weaken hsub he)
   | blockCons h1 h2 => exact .blockCons (typing_ctx_weaken hsub h1) (typing_ctx_weaken hsub h2)
-  | lam hbody => exact .lam (typing_ctx_weaken (extMany_mono hsub _) hbody)
-  | apply hfn hargs => exact .apply (typing_ctx_weaken hsub hfn) (typingList_ctx_weaken hsub hargs)
-  | applyDir hf hargs => exact .applyDir hf (typingList_ctx_weaken hsub hargs)
+  | lam hm hps hr hbody hsh =>
+    refine .lam hm hps hr (typing_ctx_weaken (extMany_mono hsub _) hbody) (fun hms => ?_)
+    rcases hsh hms with ⟨hfv, hlocs⟩
+    refine ⟨fun x hx => ?_, hlocs⟩
+    rcases hfv x hx with ⟨τx, hgx, hsend⟩
+    exact ⟨τx, hsub x τx hgx, hsend⟩
+  | apply hfn hargs hr =>
+    exact .apply (typing_ctx_weaken hsub hfn) (typingList_ctx_weaken hsub hargs) hr
+  | applyDir hf hargs hr =>
+    exact .applyDir hf (typingList_ctx_weaken hsub hargs) hr
   | bin hop h1 h2 => exact .bin hop (typing_ctx_weaken hsub h1) (typing_ctx_weaken hsub h2)
   | un hop h1 => exact .un hop (typing_ctx_weaken hsub h1)
   | let_ h1 h2 => exact .let_ (typing_ctx_weaken hsub h1) (typing_ctx_weaken (extCtx_mono hsub _ _) h2)
@@ -171,104 +1064,123 @@ theorem typing_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ1 Γ2 : 
   | makeData hv hts => exact .makeData hv (typingList_ctx_weaken hsub hts)
   | getTag he => exact .getTag (typing_ctx_weaken hsub he)
   | cellNew he => exact .cellNew (typing_ctx_weaken hsub he)
-  | cellGet he => exact .cellGet (typing_ctx_weaken hsub he)
+  | cellGet he hs => exact .cellGet (typing_ctx_weaken hsub he) hs
   | cellSet h1 h2 => exact .cellSet (typing_ctx_weaken hsub h1) (typing_ctx_weaken hsub h2)
+  | spawn h1 hsend hs => exact .spawn (typing_ctx_weaken hsub h1) hsend hs
+  | await h1 hsend hs => exact .await (typing_ctx_weaken hsub h1) hsend hs
   | trap t τ => exact .trap t τ
+termination_by sizeOf e
 
-theorem typingList_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ1 Γ2 : Ctx}
-    {es : List Expr} {τs : List Ty}
+theorem typingList_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {Γ1 Γ2 : Ctx} {es : List Expr} {τs : List Ty}
     (hsub : ∀ x t, Γ1 x = some t → Γ2 x = some t)
-    (h : HasTypes Δ Φ Ψ Γ1 es τs) : HasTypes Δ Φ Ψ Γ2 es τs := by
+    (h : HasTypes Δ Φ Ψ Θ Γ1 es τs) : HasTypes Δ Φ Ψ Θ Γ2 es τs := by
   cases h with
   | nil => exact .nil
   | cons h1 hrest => exact .cons (typing_ctx_weaken hsub h1) (typingList_ctx_weaken hsub hrest)
+termination_by sizeOf es
 
-theorem typingArms_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ1 Γ2 : Ctx}
-    {τs τr : Ty} {arms : List (Pat × Expr)}
+theorem typingArms_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {Γ1 Γ2 : Ctx} {τs τr : Ty} {arms : List (Pat × Expr)}
     (hsub : ∀ x t, Γ1 x = some t → Γ2 x = some t)
-    (h : ArmsHaveType Δ Φ Ψ Γ1 τs arms τr) : ArmsHaveType Δ Φ Ψ Γ2 τs arms τr := by
+    (h : ArmsHaveType Δ Φ Ψ Θ Γ1 τs arms τr) : ArmsHaveType Δ Φ Ψ Θ Γ2 τs arms τr := by
   cases h with
   | nil => exact .nil
   | cons hp hb hrest =>
     exact .cons hp (typing_ctx_weaken (extMany_mono hsub _) hb) (typingArms_ctx_weaken hsub hrest)
+termination_by sizeOf arms
 end
 
-theorem typing_closed_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx} {v : Expr} {τ : Ty}
-    (h : HasType Δ Φ Ψ emptyCtx v τ) : HasType Δ Φ Ψ Γ v τ :=
+theorem typing_closed_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {Γ : Ctx} {v : Expr} {τ : Ty}
+    (h : HasType Δ Φ Ψ Θ emptyCtx v τ) : HasType Δ Φ Ψ Θ Γ v τ :=
   typing_ctx_weaken (fun _ _ hx => by simp [emptyCtx] at hx) h
 
 mutual
-theorem typing_store_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Γ : Ctx} {e : Expr} {τ : Ty}
-    (hext : StoreExtends Ψ Ψ') (h : HasType Δ Φ Ψ Γ e τ) : HasType Δ Φ Ψ' Γ e τ := by
+theorem typing_env_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Θ Θ' : TaskTy}
+    {Γ : Ctx} {e : Expr} {τ : Ty}
+    (hs : StoreExtends Ψ Ψ') (htk : TaskExtends Θ Θ')
+    (h : HasType Δ Φ Ψ Θ Γ e τ) : HasType Δ Φ Ψ' Θ' Γ e τ := by
   cases h with
   | lit hl => exact .lit hl
-  | var hx => exact .var hx
-  | loc hl => exact .loc (hext.2 _ _ hl)
-  | tuple hts => exact .tuple (typingList_store_weaken hext hts)
+  | var hx hsub => exact .var hx hsub
+  | loc hl => exact .loc (hs.2 _ _ hl)
+  | taskRef htid hsend hsub => exact .taskRef (htk.2 _ _ htid) hsend hsub
+  | tuple hts => exact .tuple (typingList_env_weaken hs htk hts)
   | blockEmpty => exact .blockEmpty
-  | blockSingle he => exact .blockSingle (typing_store_weaken hext he)
-  | blockCons h1 h2 => exact .blockCons (typing_store_weaken hext h1) (typing_store_weaken hext h2)
-  | lam hbody => exact .lam (typing_store_weaken hext hbody)
-  | apply hfn hargs => exact .apply (typing_store_weaken hext hfn) (typingList_store_weaken hext hargs)
-  | applyDir hf hargs => exact .applyDir hf (typingList_store_weaken hext hargs)
-  | bin hop h1 h2 => exact .bin hop (typing_store_weaken hext h1) (typing_store_weaken hext h2)
-  | un hop h1 => exact .un hop (typing_store_weaken hext h1)
-  | let_ h1 h2 => exact .let_ (typing_store_weaken hext h1) (typing_store_weaken hext h2)
+  | blockSingle he => exact .blockSingle (typing_env_weaken hs htk he)
+  | blockCons h1 h2 => exact .blockCons (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
+  | lam hm hps hr hbody hsh => exact .lam hm hps hr (typing_env_weaken hs htk hbody) hsh
+  | apply hfn hargs hr =>
+    exact .apply (typing_env_weaken hs htk hfn) (typingList_env_weaken hs htk hargs) hr
+  | applyDir hf hargs hr =>
+    exact .applyDir hf (typingList_env_weaken hs htk hargs) hr
+  | bin hop h1 h2 => exact .bin hop (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
+  | un hop h1 => exact .un hop (typing_env_weaken hs htk h1)
+  | let_ h1 h2 => exact .let_ (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
   | if_ hc h1 h2 =>
-    exact .if_ (typing_store_weaken hext hc) (typing_store_weaken hext h1) (typing_store_weaken hext h2)
-  | while_ hc hb => exact .while_ (typing_store_weaken hext hc) (typing_store_weaken hext hb)
-  | match_ hs harms => exact .match_ (typing_store_weaken hext hs) (typingArms_store_weaken hext harms)
-  | makeData hv hts => exact .makeData hv (typingList_store_weaken hext hts)
-  | getTag he => exact .getTag (typing_store_weaken hext he)
-  | cellNew he => exact .cellNew (typing_store_weaken hext he)
-  | cellGet he => exact .cellGet (typing_store_weaken hext he)
-  | cellSet h1 h2 => exact .cellSet (typing_store_weaken hext h1) (typing_store_weaken hext h2)
+    exact .if_ (typing_env_weaken hs htk hc) (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
+  | while_ hc hb => exact .while_ (typing_env_weaken hs htk hc) (typing_env_weaken hs htk hb)
+  | match_ hscr harms => exact .match_ (typing_env_weaken hs htk hscr) (typingArms_env_weaken hs htk harms)
+  | makeData hv hts => exact .makeData hv (typingList_env_weaken hs htk hts)
+  | getTag he => exact .getTag (typing_env_weaken hs htk he)
+  | cellNew he => exact .cellNew (typing_env_weaken hs htk he)
+  | cellGet he hsub => exact .cellGet (typing_env_weaken hs htk he) hsub
+  | cellSet h1 h2 => exact .cellSet (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
+  | spawn h1 hsend hsub => exact .spawn (typing_env_weaken hs htk h1) hsend hsub
+  | await h1 hsend hsub => exact .await (typing_env_weaken hs htk h1) hsend hsub
   | trap t τ => exact .trap t τ
+termination_by sizeOf e
 
-theorem typingList_store_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Γ : Ctx}
-    {es : List Expr} {τs : List Ty}
-    (hext : StoreExtends Ψ Ψ') (h : HasTypes Δ Φ Ψ Γ es τs) : HasTypes Δ Φ Ψ' Γ es τs := by
+theorem typingList_env_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Θ Θ' : TaskTy}
+    {Γ : Ctx} {es : List Expr} {τs : List Ty}
+    (hs : StoreExtends Ψ Ψ') (htk : TaskExtends Θ Θ')
+    (h : HasTypes Δ Φ Ψ Θ Γ es τs) : HasTypes Δ Φ Ψ' Θ' Γ es τs := by
   cases h with
   | nil => exact .nil
-  | cons h1 hrest => exact .cons (typing_store_weaken hext h1) (typingList_store_weaken hext hrest)
+  | cons h1 hrest => exact .cons (typing_env_weaken hs htk h1) (typingList_env_weaken hs htk hrest)
+termination_by sizeOf es
 
-theorem typingArms_store_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Γ : Ctx}
-    {τs τr : Ty} {arms : List (Pat × Expr)}
-    (hext : StoreExtends Ψ Ψ') (h : ArmsHaveType Δ Φ Ψ Γ τs arms τr) :
-    ArmsHaveType Δ Φ Ψ' Γ τs arms τr := by
+theorem typingArms_env_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Θ Θ' : TaskTy}
+    {Γ : Ctx} {τs τr : Ty} {arms : List (Pat × Expr)}
+    (hs : StoreExtends Ψ Ψ') (htk : TaskExtends Θ Θ')
+    (h : ArmsHaveType Δ Φ Ψ Θ Γ τs arms τr) : ArmsHaveType Δ Φ Ψ' Θ' Γ τs arms τr := by
   cases h with
   | nil => exact .nil
   | cons hp hb hrest =>
-    exact .cons hp (typing_store_weaken hext hb) (typingArms_store_weaken hext hrest)
+    exact .cons hp (typing_env_weaken hs htk hb) (typingArms_env_weaken hs htk hrest)
+termination_by sizeOf arms
 end
 
 /-! ## Substitution & Pattern-Matching Typing Lemmas -/
 
 mutual
-theorem subst_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
+theorem subst_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
     {x : Ident} {v e : Expr} {τx τ : Ty}
-    (he : HasType Δ Φ Ψ (extendCtx Γ x τx) e τ)
-    (hv : HasType Δ Φ Ψ emptyCtx v τx) :
-    HasType Δ Φ Ψ Γ (subst x v e) τ := by
+    (he : HasType Δ Φ Ψ Θ (extendCtx Γ x τx) e τ)
+    (hvVal : IsValue v)
+    (hv : HasType Δ Φ Ψ Θ emptyCtx v τx) :
+    HasType Δ Φ Ψ Θ Γ (subst x v e) τ := by
   cases he with
   | lit hl => exact .lit hl
-  | @var _ y _ hy =>
+  | @var _ y _ _ hy hsub =>
     simp only [subst, extendCtx] at hy ⊢
     by_cases hyx : (y == x) = true
     · rw [hyx] at hy ⊢
       simp only [↓reduceIte, Option.some.injEq] at hy
       subst hy
-      exact typing_closed_weaken hv
+      exact typing_sub hsub (typing_closed_weaken hv)
     · have hyx' : (y == x) = false := Bool.eq_false_iff.mpr hyx
       rw [hyx'] at hy ⊢
       simp only [Bool.false_eq_true, ↓reduceIte] at hy ⊢
-      exact .var hy
+      exact .var hy hsub
   | loc hl => exact .loc hl
-  | tuple hts => exact .tuple (substList_typing hts hv)
+  | taskRef htid hsend hsub => exact .taskRef htid hsend hsub
+  | tuple hts => exact .tuple (substList_typing hts hvVal hv)
   | blockEmpty => exact .blockEmpty
-  | blockSingle h1 => exact .blockSingle (subst_typing h1 hv)
-  | blockCons h1 h2 => exact .blockCons (subst_typing h1 hv) (subst_typing h2 hv)
-  | @lam _ ps ret body hbody =>
+  | blockSingle h1 => exact .blockSingle (subst_typing h1 hvVal hv)
+  | blockCons h1 h2 => exact .blockCons (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
+  | @lam _ m0 m ps paramTys ret0 ret body hm hps hr hbody hsh =>
     simp only [subst]
     by_cases hany : ps.any (fun p => p.1 == x) = true
     · simp only [hany, ↓reduceIte]
@@ -279,56 +1191,97 @@ theorem subst_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
         subst heqk
         exact List.mem_map.mpr ⟨(k, tk), hmemk, rfl⟩
       rw [extendMany_shadow Γ x τx ps hmem] at hbody
-      exact .lam hbody
-    · simp only [hany]
+      refine .lam hm hps hr hbody (fun hms => ?_)
+      rcases hsh hms with ⟨hfv, hlocs⟩
+      refine ⟨fun z hz => ?_, hlocs⟩
+      rcases hfv z hz with ⟨τz, hgz, hsend⟩
+      have hzx : z ≠ x := by
+        intro rfl
+        simp only [freeVars, List.mem_filter] at hz
+        simp [hany] at hz
+      have hzx' : (z == x) = false := beq_false_of_ne hzx
+      simp only [extendCtx, hzx', Bool.false_eq_true, ↓reduceIte] at hgz
+      exact ⟨τz, hgz, hsend⟩
+    · simp only [hany, Bool.false_eq_true, ↓reduceIte]
       have hnot : x ∉ ps.map Prod.fst := by
         intro hmem
         apply hany
         rw [List.any_eq_true]
         rcases List.mem_map.mp hmem with ⟨p, hp, rfl⟩
         exact ⟨p, hp, beq_self_eq_true _⟩
-      rw [extendMany_comm Γ x τx ps hnot] at hbody
-      exact .lam (subst_typing hbody hv)
-  | apply hfn hargs => exact .apply (subst_typing hfn hv) (substList_typing hargs hv)
-  | applyDir hf hargs => exact .applyDir hf (substList_typing hargs hv)
-  | bin hop h1 h2 => exact .bin hop (subst_typing h1 hv) (subst_typing h2 hv)
-  | un hop h1 => exact .un hop (subst_typing h1 hv)
-  | @let_ _ y e1 e2 τ1 τ2 h1 h2 =>
+      have hany' : ps.any (fun p => p.1 == x) = false := Bool.eq_false_iff.mpr hany
+      have hbody' := hbody
+      rw [extendMany_comm Γ x τx ps hnot] at hbody'
+      refine .lam hm hps hr (subst_typing hbody' hvVal hv) (fun hms => ?_)
+      rcases hsh hms with ⟨hfv, hlocs⟩
+      refine ⟨fun z hz => ?_, ?_⟩
+      · have hsub_lam : subst x v (.lam .shared ps ret0 body) = .lam .shared ps ret0 (subst x v body) := by
+          simp [subst, hany']
+        have hz' : z ∈ freeVars (subst x v (.lam .shared ps ret0 body)) := by
+          rw [hsub_lam]; exact hz
+        rcases mem_freeVars_subst (freeVars_empty_of_closed hv) (.lam .shared ps ret0 body) hz' with ⟨hzx, hz0⟩
+        rcases hfv z hz0 with ⟨τz, hgz, hsend⟩
+        have hzx' : (z == x) = false := beq_false_of_ne hzx
+        simp only [extendCtx, hzx', Bool.false_eq_true, ↓reduceIte] at hgz
+        exact ⟨τz, hgz, hsend⟩
+      · by_cases hxfree : x ∈ freeVars body
+        · have hxlam : x ∈ freeVars (.lam .shared ps ret0 body) := by
+            simp [freeVars, hxfree, hany']
+          rcases hfv x hxlam with ⟨τx', hgx, hsendx⟩
+          simp only [extendCtx, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hgx
+          subst hgx
+          have hvlocs : exprLocs v = [] := exprLocs_empty_of_isValue_isSend hv hvVal hsendx
+          exact exprLocs_subst_nil hlocs hvlocs
+        · rw [subst_not_mem_freeVars body hxfree]
+          exact hlocs
+  | apply hfn hargs hr =>
+    exact .apply (subst_typing hfn hvVal hv) (substList_typing hargs hvVal hv) hr
+  | applyDir hf hargs hr =>
+    exact .applyDir hf (substList_typing hargs hvVal hv) hr
+  | bin hop h1 h2 => exact .bin hop (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
+  | un hop h1 => exact .un hop (subst_typing h1 hvVal hv)
+  | @let_ _ y e1 e2 τ1 _ h1 h2 =>
     simp only [subst]
     by_cases hyx : (y == x) = true
     · simp only [hyx, ↓reduceIte]
       have heq : y = x := beq_iff_eq.mp hyx
       subst heq
       rw [extendCtx_shadow] at h2
-      exact .let_ (subst_typing h1 hv) h2
-    · simp only [hyx]
+      exact .let_ (subst_typing h1 hvVal hv) h2
+    · simp only [hyx, Bool.false_eq_true, ↓reduceIte]
       have hne : x ≠ y := fun h => hyx (beq_iff_eq.mpr h.symm)
       rw [extendCtx_comm Γ hne τx τ1] at h2
-      exact .let_ (subst_typing h1 hv) (subst_typing h2 hv)
-  | if_ hc h1 h2 => exact .if_ (subst_typing hc hv) (subst_typing h1 hv) (subst_typing h2 hv)
-  | while_ hc hb => exact .while_ (subst_typing hc hv) (subst_typing hb hv)
-  | match_ hs harms => exact .match_ (subst_typing hs hv) (substArms_typing harms hv)
-  | makeData hlv hts => exact .makeData hlv (substList_typing hts hv)
-  | getTag h1 => exact .getTag (subst_typing h1 hv)
-  | cellNew h1 => exact .cellNew (subst_typing h1 hv)
-  | cellGet h1 => exact .cellGet (subst_typing h1 hv)
-  | cellSet h1 h2 => exact .cellSet (subst_typing h1 hv) (subst_typing h2 hv)
+      exact .let_ (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
+  | if_ hc h1 h2 => exact .if_ (subst_typing hc hvVal hv) (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
+  | while_ hc hb => exact .while_ (subst_typing hc hvVal hv) (subst_typing hb hvVal hv)
+  | match_ hs harms => exact .match_ (subst_typing hs hvVal hv) (substArms_typing harms hvVal hv)
+  | makeData hlv hts => exact .makeData hlv (substList_typing hts hvVal hv)
+  | getTag h1 => exact .getTag (subst_typing h1 hvVal hv)
+  | cellNew h1 => exact .cellNew (subst_typing h1 hvVal hv)
+  | cellGet h1 hs => exact .cellGet (subst_typing h1 hvVal hv) hs
+  | cellSet h1 h2 => exact .cellSet (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
+  | spawn h1 hsend hs => exact .spawn (subst_typing h1 hvVal hv) hsend hs
+  | await h1 hsend hs => exact .await (subst_typing h1 hvVal hv) hsend hs
   | trap t τ => exact .trap t τ
+termination_by sizeOf e
 
-theorem substList_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
+theorem substList_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
     {x : Ident} {v : Expr} {es : List Expr} {τx : Ty} {τs : List Ty}
-    (hes : HasTypes Δ Φ Ψ (extendCtx Γ x τx) es τs)
-    (hv : HasType Δ Φ Ψ emptyCtx v τx) :
-    HasTypes Δ Φ Ψ Γ (substList x v es) τs := by
+    (hes : HasTypes Δ Φ Ψ Θ (extendCtx Γ x τx) es τs)
+    (hvVal : IsValue v)
+    (hv : HasType Δ Φ Ψ Θ emptyCtx v τx) :
+    HasTypes Δ Φ Ψ Θ Γ (substList x v es) τs := by
   cases hes with
   | nil => exact .nil
-  | cons h1 hrest => exact .cons (subst_typing h1 hv) (substList_typing hrest hv)
+  | cons h1 hrest => exact .cons (subst_typing h1 hvVal hv) (substList_typing hrest hvVal hv)
+termination_by sizeOf es
 
-theorem substArms_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
+theorem substArms_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
     {x : Ident} {v : Expr} {τx τs τr : Ty} {arms : List (Pat × Expr)}
-    (harms : ArmsHaveType Δ Φ Ψ (extendCtx Γ x τx) τs arms τr)
-    (hv : HasType Δ Φ Ψ emptyCtx v τx) :
-    ArmsHaveType Δ Φ Ψ Γ τs (substArms x v arms) τr := by
+    (harms : ArmsHaveType Δ Φ Ψ Θ (extendCtx Γ x τx) τs arms τr)
+    (hvVal : IsValue v)
+    (hv : HasType Δ Φ Ψ Θ emptyCtx v τx) :
+    ArmsHaveType Δ Φ Ψ Θ Γ τs (substArms x v arms) τr := by
   cases harms with
   | nil => exact .nil
   | @cons _ _ _ p body bs rest hp hbody hrest =>
@@ -340,51 +1293,52 @@ theorem substArms_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
         rw [hbn]
         exact List.contains_iff_mem.mp hcont
       rw [extendMany_shadow Γ x τx bs hmem] at hbody
-      exact .cons hp hbody (substArms_typing hrest hv)
-    · simp only [hcont]
+      exact .cons hp hbody (substArms_typing hrest hvVal hv)
+    · simp only [hcont, Bool.false_eq_true, ↓reduceIte]
       have hnot : x ∉ bs.map Prod.fst := by
         rw [hbn]
         intro hm
         exact hcont (List.contains_iff_mem.mpr hm)
       rw [extendMany_comm Γ x τx bs hnot] at hbody
-      exact .cons hp (subst_typing hbody hv) (substArms_typing hrest hv)
+      exact .cons hp (subst_typing hbody hvVal hv) (substArms_typing hrest hvVal hv)
+termination_by sizeOf arms
 end
 
 /-- Closed value bindings matching a typed binder list `bs`. -/
-inductive ValuesMatchEnv (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) :
+inductive ValuesMatchEnv (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) :
     List (Ident × Expr) → List (Ident × Ty) → Prop where
-  | nil : ValuesMatchEnv Δ Φ Ψ [] []
+  | nil : ValuesMatchEnv Δ Φ Ψ Θ [] []
   | cons {x : Ident} {v : Expr} {τ : Ty} {env : List (Ident × Expr)} {bs : List (Ident × Ty)} :
       IsValue v →
-      HasType Δ Φ Ψ emptyCtx v τ →
-      ValuesMatchEnv Δ Φ Ψ env bs →
-      ValuesMatchEnv Δ Φ Ψ ((x, v) :: env) ((x, τ) :: bs)
+      HasType Δ Φ Ψ Θ emptyCtx v τ →
+      ValuesMatchEnv Δ Φ Ψ Θ env bs →
+      ValuesMatchEnv Δ Φ Ψ Θ ((x, v) :: env) ((x, τ) :: bs)
 
-theorem ValuesMatchEnv.append {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
+theorem ValuesMatchEnv.append {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     {e1 e2 : List (Ident × Expr)} {b1 b2 : List (Ident × Ty)}
-    (h1 : ValuesMatchEnv Δ Φ Ψ e1 b1) (h2 : ValuesMatchEnv Δ Φ Ψ e2 b2) :
-    ValuesMatchEnv Δ Φ Ψ (e1 ++ e2) (b1 ++ b2) := by
+    (h1 : ValuesMatchEnv Δ Φ Ψ Θ e1 b1) (h2 : ValuesMatchEnv Δ Φ Ψ Θ e2 b2) :
+    ValuesMatchEnv Δ Φ Ψ Θ (e1 ++ e2) (b1 ++ b2) := by
   induction h1 with
   | nil => exact h2
   | cons hv ht _ ih => exact .cons hv ht ih
 
-theorem substMany_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
+theorem substMany_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
     {env : List (Ident × Expr)} {bs : List (Ident × Ty)} {e : Expr} {τ : Ty}
-    (hm : ValuesMatchEnv Δ Φ Ψ env bs)
-    (he : HasType Δ Φ Ψ (extendMany Γ bs) e τ) :
-    HasType Δ Φ Ψ Γ (substMany env e) τ := by
+    (hm : ValuesMatchEnv Δ Φ Ψ Θ env bs)
+    (he : HasType Δ Φ Ψ Θ (extendMany Γ bs) e τ) :
+    HasType Δ Φ Ψ Θ Γ (substMany env e) τ := by
   induction hm generalizing e with
   | nil => exact he
-  | cons _ hv _ ih =>
+  | cons hvVal hv _ ih =>
     simp only [extendMany] at he
     simp only [substMany]
-    exact ih (subst_typing he hv)
+    exact ih (subst_typing he hvVal hv)
 
-theorem zipParams_match {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
+theorem zipParams_match {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     {ps : List (Ident × Ty)} {args : List Expr}
-    (ht : HasTypes Δ Φ Ψ emptyCtx args (ps.map Prod.snd))
+    (ht : HasTypes Δ Φ Ψ Θ emptyCtx args (ps.map Prod.snd))
     (hvals : ∀ a ∈ args, IsValue a) :
-    ValuesMatchEnv Δ Φ Ψ (zipParams ps args) ps := by
+    ValuesMatchEnv Δ Φ Ψ Θ (zipParams ps args) ps := by
   induction ps generalizing args with
   | nil =>
     cases ht
@@ -398,8 +1352,8 @@ theorem zipParams_match {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
         exact .cons (hvals _ (List.mem_cons_self ..)) ha
           (ih hrest (fun a ha' => hvals a (List.mem_cons_of_mem _ ha')))
 
-theorem hasTypes_length {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
-    {es : List Expr} {τs : List Ty} (h : HasTypes Δ Φ Ψ Γ es τs) :
+theorem hasTypes_length {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ : Ctx}
+    {es : List Expr} {τs : List Ty} (h : HasTypes Δ Φ Ψ Θ Γ es τs) :
     es.length = τs.length := by
   induction es generalizing τs with
   | nil => cases h; rfl
@@ -408,11 +1362,11 @@ theorem hasTypes_length {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Γ : Ctx}
     | cons _ hrest => simp [ih hrest]
 
 mutual
-theorem matchPat_sound {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
+theorem matchPat_sound {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     {p : Pat} {τ : Ty} {bs : List (Ident × Ty)} {v : Expr} {env : List (Ident × Expr)}
-    (hp : PatHasType Δ p τ bs) (ht : HasType Δ Φ Ψ emptyCtx v τ) (hv : IsValue v)
+    (hp : PatHasType Δ p τ bs) (ht : HasType Δ Φ Ψ Θ emptyCtx v τ) (hv : IsValue v)
     (hm : matchPat p v = some env) :
-    ValuesMatchEnv Δ Φ Ψ env bs := by
+    ValuesMatchEnv Δ Φ Ψ Θ env bs := by
   cases hp with
   | wild _ =>
     simp only [matchPat, Option.some.injEq] at hm
@@ -445,12 +1399,12 @@ theorem matchPat_sound {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
         | makeData _ _ hvs => exact matchPats_sound hps hts hvs hm
     · cases hm
 
-theorem matchPats_sound {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy}
+theorem matchPats_sound {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     {ps : List Pat} {τs : List Ty} {bs : List (Ident × Ty)} {vs : List Expr}
     {env : List (Ident × Expr)}
-    (hps : PatsHaveType Δ ps τs bs) (hts : HasTypes Δ Φ Ψ emptyCtx vs τs)
+    (hps : PatsHaveType Δ ps τs bs) (hts : HasTypes Δ Φ Ψ Θ emptyCtx vs τs)
     (hvs : ∀ v ∈ vs, IsValue v) (hm : matchPats ps vs = some env) :
-    ValuesMatchEnv Δ Φ Ψ env bs := by
+    ValuesMatchEnv Δ Φ Ψ Θ env bs := by
   cases hps with
   | nil =>
     cases hts
@@ -476,9 +1430,17 @@ end
 
 /-! ## Store Typing Helpers -/
 
-theorem store_typed_alloc {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store} {v : Expr} {τ : Ty}
-    (hst : StoreTyped Δ Φ Ψ σ) (hv : IsValue v) (ht : HasType Δ Φ Ψ emptyCtx v τ) :
-    StoreTyped Δ Φ (Ψ ++ [τ]) (σ ++ [v]) := by
+theorem store_typed_task_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ Θ' : TaskTy} {σ : Store}
+    (htk : TaskExtends Θ Θ') (hst : StoreTyped Δ Φ Ψ Θ σ) :
+    StoreTyped Δ Φ Ψ Θ' σ := by
+  refine ⟨hst.1, fun l t hl => ?_⟩
+  rcases hst.2 l t hl with ⟨v, hv, hval, hvt⟩
+  exact ⟨v, hv, hval, typing_env_weaken (StoreExtends.refl Ψ) htk hvt⟩
+
+theorem store_typed_alloc {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {σ : Store} {v : Expr} {τ : Ty}
+    (hst : StoreTyped Δ Φ Ψ Θ σ) (hv : IsValue v) (ht : HasType Δ Φ Ψ Θ emptyCtx v τ) :
+    StoreTyped Δ Φ (Ψ ++ [τ]) Θ (σ ++ [v]) := by
   have hext : StoreExtends Ψ (Ψ ++ [τ]) := StoreExtends.append Ψ τ
   refine ⟨by simp [hst.1], fun l t hl => ?_⟩
   cases Nat.lt_or_ge l Ψ.length with
@@ -486,7 +1448,7 @@ theorem store_typed_alloc {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store
     rw [List.getElem?_append_left hlt] at hl
     rcases hst.2 l t hl with ⟨w, hw, hwv, hwt⟩
     have hlt' : l < σ.length := hst.1 ▸ hlt
-    refine ⟨w, ?_, hwv, typing_store_weaken hext hwt⟩
+    refine ⟨w, ?_, hwv, typing_env_weaken hext (TaskExtends.refl Θ) hwt⟩
     rw [List.getElem?_append_left hlt']
     exact hw
   | inr hge =>
@@ -496,15 +1458,15 @@ theorem store_typed_alloc {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store
     subst heql
     simp at hl
     subst hl
-    refine ⟨v, ?_, hv, typing_store_weaken hext ht⟩
+    refine ⟨v, ?_, hv, typing_env_weaken hext (TaskExtends.refl Θ) ht⟩
     rw [← hst.1]
     simp
 
-theorem store_typed_update {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store}
+theorem store_typed_update {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {σ : Store}
     {l : Loc} {v : Expr} {τ : Ty}
-    (hst : StoreTyped Δ Φ Ψ σ) (hl : Ψ[l]? = some τ)
-    (hv : IsValue v) (ht : HasType Δ Φ Ψ emptyCtx v τ) :
-    StoreTyped Δ Φ Ψ (σ.set l v) := by
+    (hst : StoreTyped Δ Φ Ψ Θ σ) (hl : Ψ[l]? = some τ)
+    (hv : IsValue v) (ht : HasType Δ Φ Ψ Θ emptyCtx v τ) :
+    StoreTyped Δ Φ Ψ Θ (σ.set l v) := by
   have hltΨ : l < Ψ.length := lt_length_of_getElem?_eq_some hl
   have hltσ : l < σ.length := hst.1 ▸ hltΨ
   refine ⟨by simp [hst.1], fun k t hk => ?_⟩
@@ -519,64 +1481,91 @@ theorem store_typed_update {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Stor
 
 /-! ## Canonical Forms & Operator Lemmas -/
 
-theorem canonical_bool {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr}
-    (ht : HasType Δ Φ Ψ emptyCtx v .bool) (hv : IsValue v) :
+theorem canonical_bool {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .bool) (hv : IsValue v) :
     ∃ b : Bool, v = .lit (.bool b) := by
   cases hv with
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
-  | lam _ _ _ => cases ht
+  | taskRef _ => cases ht
+  | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
-theorem canonical_int {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr}
-    (ht : HasType Δ Φ Ψ emptyCtx v .int) (hv : IsValue v) :
+theorem canonical_int {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .int) (hv : IsValue v) :
     ∃ n : Int32, v = .lit (.int n) := by
   cases hv with
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
-  | lam _ _ _ => cases ht
+  | taskRef _ => cases ht
+  | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
-theorem canonical_str {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr}
-    (ht : HasType Δ Φ Ψ emptyCtx v .str) (hv : IsValue v) :
+theorem canonical_str {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .str) (hv : IsValue v) :
     ∃ s : String, v = .lit (.str s) := by
   cases hv with
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
-  | lam _ _ _ => cases ht
+  | taskRef _ => cases ht
+  | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
-theorem canonical_fn {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr}
-    {paramTys : List Ty} {ret : Ty}
-    (ht : HasType Δ Φ Ψ emptyCtx v (.fn paramTys ret)) (hv : IsValue v) :
-    ∃ ps body, v = .lam ps ret body ∧ ps.map Prod.snd = paramTys := by
+theorem canonical_fn {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    {m : Mode} {paramTys : List Ty} {ret : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.fn m paramTys ret)) (hv : IsValue v) :
+    ∃ m0 ps ret0 body,
+      v = .lam m0 ps ret0 body ∧
+      ModeSub m0 m ∧
+      TyListSub paramTys (ps.map Prod.snd) ∧
+      TySub ret0 ret := by
   cases hv with
   | lit _ => cases ht with | lit hl => cases hl
   | loc _ => cases ht
-  | lam ps r body => cases ht; exact ⟨ps, body, rfl, rfl⟩
+  | taskRef _ => cases ht
+  | lam m0 ps ret0 body =>
+    cases ht with
+    | lam hm hps hr _ _ => exact ⟨m0, ps, ret0, body, rfl, hm, hps, hr⟩
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
-theorem canonical_adt {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr} {adt : Ident}
-    (ht : HasType Δ Φ Ψ emptyCtx v (.adt adt)) (hv : IsValue v) :
+theorem canonical_adt {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {adt : Ident}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.adt adt)) (hv : IsValue v) :
     ∃ tag vs, v = .makeData adt tag vs ∧ (∀ u ∈ vs, IsValue u) := by
   cases hv with
   | lit _ => cases ht with | lit hl => cases hl
   | loc _ => cases ht
-  | lam _ _ _ => cases ht
+  | taskRef _ => cases ht
+  | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
-  | makeData a tag hvs => cases ht; exact ⟨tag, _, rfl, hvs⟩
+  | makeData _ tag hvs =>
+    cases ht with
+    | makeData _ _ => exact ⟨tag, _, rfl, hvs⟩
 
-theorem canonical_cell {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {v : Expr} {τ : Ty}
-    (ht : HasType Δ Φ Ψ emptyCtx v (.cell τ)) (hv : IsValue v) :
+theorem canonical_cell {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.cell τ)) (hv : IsValue v) :
     ∃ l : Loc, v = .loc l ∧ Ψ[l]? = some τ := by
   cases hv with
   | lit _ => cases ht with | lit hl => cases hl
   | loc l => cases ht with | loc hl => exact ⟨l, rfl, hl⟩
-  | lam _ _ _ => cases ht
+  | taskRef _ => cases ht
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_task {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.task τ)) (hv : IsValue v) :
+    ∃ tid τ0, v = .taskRef tid ∧ Θ[tid]? = some τ0 ∧ IsSend Δ τ0 ∧ TySub τ0 τ := by
+  cases hv with
+  | lit _ => cases ht with | lit hl => cases hl
+  | loc _ => cases ht
+  | taskRef tid =>
+    cases ht with
+    | taskRef htid hsend hs => exact ⟨tid, _, rfl, htid, hsend, hs⟩
+  | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
@@ -598,288 +1587,376 @@ theorem evalBinOp_sound {op : BinOp} {l1 l2 l' : Lit} {τ1 τ2 τr : Ty}
 /-! ## Progress Theorem -/
 
 mutual
-theorem progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store} {e : Expr} {τ : Ty}
-    (hΦ : FunEnvTyped Δ Φ) (ht : HasType Δ Φ Ψ emptyCtx e τ) (hσ : StoreTyped Δ Φ Ψ σ) :
-    IsTerminal e ∨ ∃ e' σ', Step Δ Φ e σ e' σ' := by
+theorem progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {tasks : List Expr} {σ : Store} {e : Expr} {τ : Ty}
+    (hΦ : FunEnvTyped Δ Φ)
+    (ht : HasType Δ Φ Ψ Θ emptyCtx e τ)
+    (hσ : StoreTyped Δ Φ Ψ Θ σ)
+    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    IsTerminal e ∨ BlockedOnTask tasks e ∨ ∃ e' σ' sp, Step Δ Φ tasks e σ e' σ' sp := by
   cases ht with
   | lit _ => exact Or.inl (Or.inl (.lit _))
-  | var hx => simp [emptyCtx] at hx
+  | var hx _ => simp [emptyCtx] at hx
   | loc _ => exact Or.inl (Or.inl (.loc _))
+  | taskRef _ _ _ => exact Or.inl (Or.inl (.taskRef _))
   | tuple hts =>
-    rcases progressList hΦ hts hσ with hvals | ⟨t, htrap⟩ | ⟨es', σ', hstep⟩
+    rcases progressList hΦ hts hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', sp, hstep⟩
     · exact Or.inl (Or.inl (.tuple hvals))
-    · exact Or.inr ⟨.trap t, σ, .tupleTrap htrap⟩
-    · exact Or.inr ⟨.tuple es', σ', .tupleStep hstep⟩
-  | blockEmpty => exact Or.inr ⟨.lit .unit, σ, .blockEmpty⟩
-  | blockSingle _ => exact Or.inr ⟨_, σ, .blockSingle⟩
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .tupleTrap htrap⟩)
+    · exact Or.inr (Or.inl (.tuple hblk))
+    · exact Or.inr (Or.inr ⟨.tuple es', σ', sp, .tupleStep hstep⟩)
+  | blockEmpty => exact Or.inr (Or.inr ⟨.lit .unit, σ, none, .blockEmpty⟩)
+  | blockSingle _ => exact Or.inr (Or.inr ⟨_, σ, none, .blockSingle⟩)
   | blockCons h1 _ =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
-    · exact Or.inr ⟨_, σ, .blockConsVal hv1⟩
-    · exact Or.inr ⟨.trap t, σ, .blockConsTrap⟩
-    · exact Or.inr ⟨_, σ', .blockConsStep hs1⟩
-  | lam _ => exact Or.inl (Or.inl (.lam _ _ _))
-  | apply hfn hargs =>
-    rcases progress hΦ hfn hσ with (hvfn | ⟨t, rfl⟩) | ⟨fn', σ', hsfn⟩
-    · rcases progressList hΦ hargs hσ with hvals | ⟨t, htrap⟩ | ⟨args', σ', hsargs⟩
-      · rcases canonical_fn hfn hvfn with ⟨ps, body, rfl, hmap⟩
-        have hlen := hasTypes_length hargs
-        rw [← hmap, List.length_map] at hlen
-        exact Or.inr ⟨_, σ, .applyBeta hvals hlen⟩
-      · exact Or.inr ⟨.trap t, σ, .applyArgsTrap hvfn htrap⟩
-      · exact Or.inr ⟨_, σ', .applyArgs hvfn hsargs⟩
-    · exact Or.inr ⟨.trap t, σ, .applyFnTrap⟩
-    · exact Or.inr ⟨_, σ', .applyFn hsfn⟩
-  | applyDir hf hargs =>
-    rcases progressList hΦ hargs hσ with hvals | ⟨t, htrap⟩ | ⟨args', σ', hsargs⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
+    · exact Or.inr (Or.inr ⟨_, σ, none, .blockConsVal hv1⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .blockConsTrap⟩)
+    · exact Or.inr (Or.inl (.blockCons hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .blockConsStep hs1⟩)
+  | lam _ _ _ _ _ => exact Or.inl (Or.inl (.lam _ _ _ _))
+  | apply hfn hargs _ =>
+    rcases progress hΦ hfn hσ htasks with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', sp, hsfn⟩
+    · rcases progressList hΦ hargs hσ htasks with hvals | ⟨t, htrap⟩ | hblkArgs | ⟨args', σ', sp, hsargs⟩
+      · rcases canonical_fn hfn hvfn with ⟨_, ps, _, _, rfl, _, hpsSub, _⟩
+        have hlen1 := hasTypes_length hargs
+        have hlen2 := tyListSub_length hpsSub
+        rw [hlen2, List.length_map] at hlen1
+        exact Or.inr (Or.inr ⟨_, σ, none, .applyBeta hvals hlen1⟩)
+      · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyArgsTrap hvfn htrap⟩)
+      · exact Or.inr (Or.inl (.applyArgs hvfn hblkArgs))
+      · exact Or.inr (Or.inr ⟨_, σ', sp, .applyArgs hvfn hsargs⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyFnTrap⟩)
+    · exact Or.inr (Or.inl (.applyFn hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .applyFn hsfn⟩)
+  | applyDir hf hargs _ =>
+    rcases progressList hΦ hargs hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨args', σ', sp, hsargs⟩
     · have hlen := hasTypes_length hargs
       rw [List.length_map] at hlen
-      exact Or.inr ⟨_, σ, .applyDirBeta hf hvals hlen⟩
-    · exact Or.inr ⟨.trap t, σ, .applyDirTrap htrap⟩
-    · exact Or.inr ⟨_, σ', .applyDirArgs hsargs⟩
+      exact Or.inr (Or.inr ⟨_, σ, none, .applyDirBeta hf hvals hlen⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyDirTrap htrap⟩)
+    · exact Or.inr (Or.inl (.applyDirArgs hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .applyDirArgs hsargs⟩)
   | bin hop h1 h2 =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
     · cases hop with
       | and =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
         cases b
-        · exact Or.inr ⟨_, σ, .binAndFalse⟩
-        · exact Or.inr ⟨_, σ, .binAndTrue⟩
+        · exact Or.inr (Or.inr ⟨_, σ, none, .binAndFalse⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, none, .binAndTrue⟩)
       | or =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
         cases b
-        · exact Or.inr ⟨_, σ, .binOrFalse⟩
-        · exact Or.inr ⟨_, σ, .binOrTrue⟩
-        | div =>
-          rcases progress hΦ h2 hσ with (hv2 | ⟨t, rfl⟩) | ⟨e2', σ', hs2⟩
-          · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-            rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-            by_cases hb : (b == 0) = true
-            · exact Or.inr ⟨.trap .divByZero, σ, .binTrap (by simp [evalBinOp, hb])⟩
-            · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-              exact Or.inr ⟨_, σ, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩
-          · exact Or.inr ⟨.trap t, σ, .binRightTrap (by decide) (by decide) hv1⟩
-          · exact Or.inr ⟨_, σ', .binRight (by decide) (by decide) hv1 hs2⟩
-        | rem =>
-          rcases progress hΦ h2 hσ with (hv2 | ⟨t, rfl⟩) | ⟨e2', σ', hs2⟩
-          · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-            rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-            by_cases hb : (b == 0) = true
-            · exact Or.inr ⟨.trap .divByZero, σ, .binTrap (by simp [evalBinOp, hb])⟩
-            · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-              exact Or.inr ⟨_, σ, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩
-          · exact Or.inr ⟨.trap t, σ, .binRightTrap (by decide) (by decide) hv1⟩
-          · exact Or.inr ⟨_, σ', .binRight (by decide) (by decide) hv1 hs2⟩
-        | _ =>
-          rcases progress hΦ h2 hσ with (hv2 | ⟨t, rfl⟩) | ⟨e2', σ', hs2⟩
-          · first
-            | (rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-               rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-               exact Or.inr ⟨_, σ, .binVal (l' := _) rfl⟩)
-            | (rcases canonical_bool h1 hv1 with ⟨a, rfl⟩
-               rcases canonical_bool h2 hv2 with ⟨b, rfl⟩
-               exact Or.inr ⟨_, σ, .binVal (l' := _) rfl⟩)
-            | (rcases canonical_str h1 hv1 with ⟨a, rfl⟩
-               rcases canonical_str h2 hv2 with ⟨b, rfl⟩
-               exact Or.inr ⟨_, σ, .binVal (l' := _) rfl⟩)
-          · exact Or.inr ⟨.trap t, σ, .binRightTrap (by decide) (by decide) hv1⟩
-          · exact Or.inr ⟨_, σ', .binRight (by decide) (by decide) hv1 hs2⟩
-    · exact Or.inr ⟨.trap t, σ, .binLeftTrap⟩
-    · exact Or.inr ⟨_, σ', .binLeft hs1⟩
+        · exact Or.inr (Or.inr ⟨_, σ, none, .binOrFalse⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, none, .binOrTrue⟩)
+      | div =>
+        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
+          rcases canonical_int h2 hv2 with ⟨b, rfl⟩
+          by_cases hb : (b == 0) = true
+          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, none, .binTrap (by simp [evalBinOp, hb])⟩)
+          · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+            exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩)
+        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
+        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
+      | rem =>
+        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
+          rcases canonical_int h2 hv2 with ⟨b, rfl⟩
+          by_cases hb : (b == 0) = true
+          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, none, .binTrap (by simp [evalBinOp, hb])⟩)
+          · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+            exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩)
+        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
+        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
+      | _ =>
+        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        · first
+          | (rcases canonical_int h1 hv1 with ⟨a, rfl⟩
+             rcases canonical_int h2 hv2 with ⟨b, rfl⟩
+             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
+          | (rcases canonical_bool h1 hv1 with ⟨a, rfl⟩
+             rcases canonical_bool h2 hv2 with ⟨b, rfl⟩
+             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
+          | (rcases canonical_str h1 hv1 with ⟨a, rfl⟩
+             rcases canonical_str h2 hv2 with ⟨b, rfl⟩
+             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
+        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
+        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binLeftTrap⟩)
+    · exact Or.inr (Or.inl (.binLeft hblk1))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .binLeft hs1⟩)
   | un hop h1 =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
     · cases hop with
       | not =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
-        exact Or.inr ⟨_, σ, .unVal (l' := .bool (!b)) rfl⟩
+        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .bool (!b)) rfl⟩)
       | neg =>
         rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr ⟨_, σ, .unVal (l' := .int (-n)) rfl⟩
+        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .int (-n)) rfl⟩)
       | bitNot =>
         rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr ⟨_, σ, .unVal (l' := .int (~~~n)) rfl⟩
-    · exact Or.inr ⟨.trap t, σ, .unTrap⟩
-    · exact Or.inr ⟨_, σ', .unStep hs1⟩
+        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .int (~~~n)) rfl⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .unTrap⟩)
+    · exact Or.inr (Or.inl (.un hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .unStep hs1⟩)
   | let_ h1 _ =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
-    · exact Or.inr ⟨_, σ, .letVal hv1⟩
-    · exact Or.inr ⟨.trap t, σ, .letTrap⟩
-    · exact Or.inr ⟨_, σ', .letStep hs1⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
+    · exact Or.inr (Or.inr ⟨_, σ, none, .letVal hv1⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .letTrap⟩)
+    · exact Or.inr (Or.inl (.let_ hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .letStep hs1⟩)
   | if_ hc _ _ =>
-    rcases progress hΦ hc hσ with (hvc | ⟨t, rfl⟩) | ⟨c', σ', hsc⟩
+    rcases progress hΦ hc hσ htasks with (hvc | ⟨t, rfl⟩) | hblk | ⟨c', σ', sp, hsc⟩
     · rcases canonical_bool hc hvc with ⟨b, rfl⟩
       cases b
-      · exact Or.inr ⟨_, σ, .ifFalse⟩
-      · exact Or.inr ⟨_, σ, .ifTrue⟩
-    · exact Or.inr ⟨.trap t, σ, .ifTrap⟩
-    · exact Or.inr ⟨_, σ', .ifStep hsc⟩
-  | while_ _ _ => exact Or.inr ⟨_, σ, .whileUnfold⟩
+      · exact Or.inr (Or.inr ⟨_, σ, none, .ifFalse⟩)
+      · exact Or.inr (Or.inr ⟨_, σ, none, .ifTrue⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .ifTrap⟩)
+    · exact Or.inr (Or.inl (.if_ hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .ifStep hsc⟩)
+  | while_ _ _ => exact Or.inr (Or.inr ⟨_, σ, none, .whileUnfold⟩)
   | @match_ _ scrut arms _ _ hs _ =>
-    rcases progress hΦ hs hσ with (hvs | ⟨t, rfl⟩) | ⟨s', σ', hss⟩
+    rcases progress hΦ hs hσ htasks with (hvs | ⟨t, rfl⟩) | hblk | ⟨s', σ', sp, hss⟩
     · cases arms with
-      | nil => exact Or.inr ⟨.trap .matchFailure, σ, .matchEmpty hvs⟩
+      | nil => exact Or.inr (Or.inr ⟨.trap .matchFailure, σ, none, .matchEmpty hvs⟩)
       | cons arm rest =>
         cases arm with
         | mk p body =>
           cases hm : matchPat p scrut with
-          | none => exact Or.inr ⟨_, σ, .matchMiss hvs hm⟩
-          | some env => exact Or.inr ⟨_, σ, .matchHit hvs hm⟩
-    · exact Or.inr ⟨.trap t, σ, .matchScrutTrap⟩
-    · exact Or.inr ⟨_, σ', .matchScrut hss⟩
+          | none => exact Or.inr (Or.inr ⟨_, σ, none, .matchMiss hvs hm⟩)
+          | some env => exact Or.inr (Or.inr ⟨_, σ, none, .matchHit hvs hm⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .matchScrutTrap⟩)
+    · exact Or.inr (Or.inl (.match_ hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .matchScrut hss⟩)
   | makeData _ hts =>
-    rcases progressList hΦ hts hσ with hvals | ⟨t, htrap⟩ | ⟨es', σ', hstep⟩
+    rcases progressList hΦ hts hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', sp, hstep⟩
     · exact Or.inl (Or.inl (.makeData _ _ hvals))
-    · exact Or.inr ⟨.trap t, σ, .makeDataTrap htrap⟩
-    · exact Or.inr ⟨_, σ', .makeDataStep hstep⟩
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .makeDataTrap htrap⟩)
+    · exact Or.inr (Or.inl (.makeData hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .makeDataStep hstep⟩)
   | getTag he =>
-    rcases progress hΦ he hσ with (hv | ⟨t, rfl⟩) | ⟨e', σ', hse⟩
+    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
     · rcases canonical_adt he hv with ⟨tag, vs, rfl, hvs⟩
-      exact Or.inr ⟨_, σ, .getTagVal hvs⟩
-    · exact Or.inr ⟨.trap t, σ, .getTagTrap⟩
-    · exact Or.inr ⟨_, σ', .getTagStep hse⟩
+      exact Or.inr (Or.inr ⟨_, σ, none, .getTagVal hvs⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .getTagTrap⟩)
+    · exact Or.inr (Or.inl (.getTag hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .getTagStep hse⟩)
   | cellNew he =>
-    rcases progress hΦ he hσ with (hv | ⟨t, rfl⟩) | ⟨e', σ', hse⟩
-    · exact Or.inr ⟨_, _, .cellNewVal hv⟩
-    · exact Or.inr ⟨.trap t, σ, .cellNewTrap⟩
-    · exact Or.inr ⟨_, σ', .cellNewStep hse⟩
-  | cellGet he =>
-    rcases progress hΦ he hσ with (hv | ⟨t, rfl⟩) | ⟨e', σ', hse⟩
+    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
+    · exact Or.inr (Or.inr ⟨_, _, none, .cellNewVal hv⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellNewTrap⟩)
+    · exact Or.inr (Or.inl (.cellNew hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellNewStep hse⟩)
+  | cellGet he _ =>
+    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
     · rcases canonical_cell he hv with ⟨l, rfl, hl⟩
       rcases hσ.2 l _ hl with ⟨v, hvσ, _, _⟩
-      exact Or.inr ⟨v, σ, .cellGetVal hvσ⟩
-    · exact Or.inr ⟨.trap t, σ, .cellGetTrap⟩
-    · exact Or.inr ⟨_, σ', .cellGetStep hse⟩
+      exact Or.inr (Or.inr ⟨v, σ, none, .cellGetVal hvσ⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellGetTrap⟩)
+    · exact Or.inr (Or.inl (.cellGet hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellGetStep hse⟩)
   | cellSet h1 h2 =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
-    · rcases progress hΦ h2 hσ with (hv2 | ⟨t, rfl⟩) | ⟨e2', σ', hs2⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
+    · rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
       · rcases canonical_cell h1 hv1 with ⟨l, rfl, hl⟩
         have hltΨ : l < Ψ.length := lt_length_of_getElem?_eq_some hl
         have hltσ : l < σ.length := hσ.1 ▸ hltΨ
-        exact Or.inr ⟨_, _, .cellSetVal hltσ hv2⟩
-      · exact Or.inr ⟨.trap t, σ, .cellSetRightTrap hv1⟩
-      · exact Or.inr ⟨_, σ', .cellSetRight hv1 hs2⟩
-    · exact Or.inr ⟨.trap t, σ, .cellSetLeftTrap⟩
-    · exact Or.inr ⟨_, σ', .cellSetLeft hs1⟩
+        exact Or.inr (Or.inr ⟨_, _, none, .cellSetVal hltσ hv2⟩)
+      · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellSetRightTrap hv1⟩)
+      · exact Or.inr (Or.inl (.cellSetRight hv1 hblk2))
+      · exact Or.inr (Or.inr ⟨_, σ', sp, .cellSetRight hv1 hs2⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellSetLeftTrap⟩)
+    · exact Or.inr (Or.inl (.cellSetLeft hblk1))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellSetLeft hs1⟩)
+  | spawn hfn _ _ =>
+    rcases progress hΦ hfn hσ htasks with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', sp, hsfn⟩
+    · rcases canonical_fn hfn hvfn with ⟨_, ps, _, body, rfl, hmSub, hpsSub, _⟩
+      cases hmSub with
+      | refl =>
+        cases hps : ps with
+        | nil => exact Or.inr (Or.inr ⟨_, σ, some body, .spawnBeta⟩)
+        | cons _ _ => rw [hps] at hpsSub; cases hpsSub
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .spawnTrap⟩)
+    · exact Or.inr (Or.inl (.spawn hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .spawnStep hsfn⟩)
+  | await he _ _ =>
+    rcases progress hΦ he hσ htasks with (hve | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
+    · rcases canonical_task he hve with ⟨tid, τ0, rfl, htid, _, _⟩
+      rcases htasks.2 tid τ0 htid with ⟨et, het, _⟩
+      by_cases hterm : IsTerminal et
+      · rcases hterm with hval | ⟨tr, rfl⟩
+        · exact Or.inr (Or.inr ⟨et, σ, none, .awaitVal het hval⟩)
+        · exact Or.inr (Or.inr ⟨.trap tr, σ, none, .awaitTaskTrap het⟩)
+      · exact Or.inr (Or.inl (.awaitWait het hterm))
+    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .awaitTrap⟩)
+    · exact Or.inr (Or.inl (.awaitStep hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', sp, .awaitStep hse⟩)
   | trap t _ => exact Or.inl (Or.inr ⟨t, rfl⟩)
+termination_by sizeOf e
 
-theorem progressList {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ : Store}
-    {es : List Expr} {τs : List Ty}
-    (hΦ : FunEnvTyped Δ Φ) (hts : HasTypes Δ Φ Ψ emptyCtx es τs) (hσ : StoreTyped Δ Φ Ψ σ) :
-    (∀ e ∈ es, IsValue e) ∨ (∃ t, ListFirstTrap es t) ∨ (∃ es' σ', StepList Δ Φ es σ es' σ') := by
+theorem progressList {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {tasks : List Expr} {σ : Store} {es : List Expr} {τs : List Ty}
+    (hΦ : FunEnvTyped Δ Φ)
+    (hts : HasTypes Δ Φ Ψ Θ emptyCtx es τs)
+    (hσ : StoreTyped Δ Φ Ψ Θ σ)
+    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    (∀ e ∈ es, IsValue e) ∨
+    (∃ t, ListFirstTrap es t) ∨
+    BlockedOnTaskList tasks es ∨
+    (∃ es' σ' sp, StepList Δ Φ tasks es σ es' σ' sp) := by
   cases hts with
   | nil => exact Or.inl (fun _ h => by cases h)
   | cons h1 hrest =>
-    rcases progress hΦ h1 hσ with (hv1 | ⟨t, rfl⟩) | ⟨e1', σ', hs1⟩
-    · rcases progressList hΦ hrest hσ with hvals | ⟨t, htrap⟩ | ⟨es', σ', hss⟩
+    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
+    · rcases progressList hΦ hrest hσ htasks with hvals | ⟨t, htrap⟩ | hblkr | ⟨es', σ', sp, hss⟩
       · exact Or.inl (fun u hu => by
           rcases List.mem_cons.mp hu with rfl | hu'
           · exact hv1
           · exact hvals u hu')
       · exact Or.inr (Or.inl ⟨t, .tail hv1 htrap⟩)
-      · exact Or.inr (Or.inr ⟨_, σ', .tail hv1 hss⟩)
+      · exact Or.inr (Or.inr (Or.inl (.tail hv1 hblkr)))
+      · exact Or.inr (Or.inr (Or.inr ⟨_, σ', sp, .tail hv1 hss⟩))
     · exact Or.inr (Or.inl ⟨t, .head t _⟩)
-    · exact Or.inr (Or.inr ⟨_, σ', .head hs1⟩)
+    · exact Or.inr (Or.inr (Or.inl (.head hblk1)))
+    · exact Or.inr (Or.inr (Or.inr ⟨_, σ', sp, .head hs1⟩))
+termination_by sizeOf es
 end
 
 /-! ## Preservation Theorem (Subject Reduction) -/
 
+/-- Characterization of task-typing evolution across a single `Step`. -/
+def SpawnTyped (Δ : AdtEnv) (Φ : FunEnv) (Ψ' : StoreTy) (Θ Θ' : TaskTy) :
+    Option Expr → Prop
+  | none => Θ' = Θ
+  | some body =>
+    ∃ τsp, Θ' = Θ ++ [τsp] ∧ IsSend Δ τsp ∧ HasType Δ Φ Ψ' Θ' emptyCtx body τsp
+
+theorem spawnTyped_extends {Δ : AdtEnv} {Φ : FunEnv} {Ψ' : StoreTy} {Θ Θ' : TaskTy}
+    {sp : Option Expr} (hsp : SpawnTyped Δ Φ Ψ' Θ Θ' sp) : TaskExtends Θ Θ' := by
+  cases sp with
+  | none => simp only [SpawnTyped] at hsp; subst hsp; exact TaskExtends.refl _
+  | some _ =>
+    rcases hsp with ⟨τsp, rfl, _, _⟩
+    exact TaskExtends.append Θ τsp
+
 mutual
 theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
-    {e : Expr} {σ : Store} {e' : Expr} {σ' : Store}
-    (hstep : Step Δ Φ e σ e' σ')
-    {Ψ : StoreTy} {τ : Ty}
-    (ht : HasType Δ Φ Ψ emptyCtx e τ) (hσ : StoreTyped Δ Φ Ψ σ) :
-    ∃ Ψ', StoreExtends Ψ Ψ' ∧ HasType Δ Φ Ψ' emptyCtx e' τ ∧ StoreTyped Δ Φ Ψ' σ' := by
+    {Ψ : StoreTy} {Θ : TaskTy} {tasks : List Expr}
+    {e : Expr} {σ : Store} {e' : Expr} {σ' : Store} {sp : Option Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx e τ)
+    (hstep : Step Δ Φ tasks e σ e' σ' sp)
+    (hσ : StoreTyped Δ Φ Ψ Θ σ)
+    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    ∃ Ψ' Θ',
+      StoreExtends Ψ Ψ' ∧
+      SpawnTyped Δ Φ Ψ' Θ Θ' sp ∧
+      HasType Δ Φ Ψ' Θ' emptyCtx e' τ ∧
+      StoreTyped Δ Φ Ψ' Θ' σ' := by
   cases hstep with
   | tupleStep hs =>
     cases ht with
     | tuple hts =>
-      rcases preservationList hΦ hs hts hσ with ⟨Ψ', hext, hts', hσ'⟩
-      exact ⟨Ψ', hext, .tuple hts', hσ'⟩
-  | tupleTrap _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservationList hΦ hts hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hts', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .tuple hts', hσ'⟩
+  | tupleTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | blockEmpty =>
     cases ht
-    exact ⟨Ψ, StoreExtends.refl Ψ, .lit .unit, hσ⟩
+    exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit .unit, hσ⟩
   | blockSingle =>
     cases ht with
-    | blockSingle he => exact ⟨Ψ, StoreExtends.refl Ψ, he, hσ⟩
+    | blockSingle he => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, he, hσ⟩
   | blockConsStep hs =>
     cases ht with
     | blockCons h1 h2 =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .blockCons h1' (typing_store_weaken hext h2), hσ'⟩
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .blockCons h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
   | blockConsVal _ =>
     cases ht with
-    | blockCons _ h2 => exact ⟨Ψ, StoreExtends.refl Ψ, h2, hσ⟩
-  | blockConsTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+    | blockCons _ h2 => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h2, hσ⟩
+  | blockConsTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyFn hs =>
     cases ht with
-    | apply hfn hargs =>
-      rcases preservation hΦ hs hfn hσ with ⟨Ψ', hext, hfn', hσ'⟩
-      exact ⟨Ψ', hext, .apply hfn' (typingList_store_weaken hext hargs), hσ'⟩
-  | applyFnTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+    | apply hfn hargs hr =>
+      rcases preservation hΦ hfn hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hfn', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .apply hfn' (typingList_env_weaken hext (spawnTyped_extends hsp) hargs) hr, hσ'⟩
+  | applyFnTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyArgs _ hs =>
     cases ht with
-    | apply hfn hargs =>
-      rcases preservationList hΦ hs hargs hσ with ⟨Ψ', hext, hargs', hσ'⟩
-      exact ⟨Ψ', hext, .apply (typing_store_weaken hext hfn) hargs', hσ'⟩
-  | applyArgsTrap _ _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+    | apply hfn hargs hr =>
+      rcases preservationList hΦ hargs hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hargs', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .apply (typing_env_weaken hext (spawnTyped_extends hsp) hfn) hargs' hr, hσ'⟩
+  | applyArgsTrap _ _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyBeta hvals _ =>
     cases ht with
-    | apply hfn hargs =>
+    | apply hfn hargs hr =>
       cases hfn with
-      | lam hbody =>
-        have hmatch := zipParams_match hargs hvals
-        exact ⟨Ψ, StoreExtends.refl Ψ, substMany_typing hmatch hbody, hσ⟩
+      | lam _ hpsSub hrSub hbody _ =>
+        have hargs' := typingList_sub hpsSub hargs
+        have hmatch := zipParams_match hargs' hvals
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
+          typing_sub (TySub.trans hrSub hr) (substMany_typing hmatch hbody), hσ⟩
   | applyDirArgs hs =>
     cases ht with
-    | applyDir hf hargs =>
-      rcases preservationList hΦ hs hargs hσ with ⟨Ψ', hext, hargs', hσ'⟩
-      exact ⟨Ψ', hext, .applyDir hf hargs', hσ'⟩
-  | applyDirTrap _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
-  | applyDirBeta hf hvals _ =>
+    | applyDir hf hargs hr =>
+      rcases preservationList hΦ hargs hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hargs', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .applyDir hf hargs' hr, hσ'⟩
+  | applyDirTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | applyDirBeta hf' hvals _ =>
     cases ht with
-    | applyDir hf' hargs =>
+    | applyDir hf hargs hr =>
       rw [hf] at hf'; cases hf'
       have hbody0 := hΦ _ _ hf
-      have hext0 : StoreExtends [] Ψ := ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
-      have hbody := typing_store_weaken hext0 hbody0
+      have hextS : StoreExtends [] Ψ := ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
+      have hextT : TaskExtends [] Θ := ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
+      have hbody := typing_env_weaken hextS hextT hbody0
       have hmatch := zipParams_match hargs hvals
-      exact ⟨Ψ, StoreExtends.refl Ψ, substMany_typing hmatch hbody, hσ⟩
+      exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
+        typing_sub hr (substMany_typing hmatch hbody), hσ⟩
   | unStep hs =>
     cases ht with
     | un hop h1 =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .un hop h1', hσ'⟩
-  | unTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .un hop h1', hσ'⟩
+  | unTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | unVal he =>
     cases ht with
     | un hop h1 =>
       cases h1 with
-      | lit hl => exact ⟨Ψ, StoreExtends.refl Ψ, .lit (evalUnOp_sound hop hl he), hσ⟩
+      | lit hl => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit (evalUnOp_sound hop hl he), hσ⟩
   | binLeft hs =>
     cases ht with
     | bin hop h1 h2 =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .bin hop h1' (typing_store_weaken hext h2), hσ'⟩
-  | binLeftTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .bin hop h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+  | binLeftTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | binAndFalse =>
     cases ht with
-    | bin hop _ _ => cases hop; exact ⟨Ψ, StoreExtends.refl Ψ, .lit (.bool false), hσ⟩
+    | bin hop _ _ => cases hop; exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit (.bool false), hσ⟩
   | binAndTrue =>
     cases ht with
-    | bin hop _ h2 => cases hop; exact ⟨Ψ, StoreExtends.refl Ψ, h2, hσ⟩
+    | bin hop _ h2 => cases hop; exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h2, hσ⟩
   | binOrTrue =>
     cases ht with
-    | bin hop _ _ => cases hop; exact ⟨Ψ, StoreExtends.refl Ψ, .lit (.bool true), hσ⟩
+    | bin hop _ _ => cases hop; exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit (.bool true), hσ⟩
   | binOrFalse =>
     cases ht with
-    | bin hop _ h2 => cases hop; exact ⟨Ψ, StoreExtends.refl Ψ, h2, hσ⟩
+    | bin hop _ h2 => cases hop; exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h2, hσ⟩
   | binRight _ _ _ hs =>
     cases ht with
     | bin hop h1 h2 =>
-      rcases preservation hΦ hs h2 hσ with ⟨Ψ', hext, h2', hσ'⟩
-      exact ⟨Ψ', hext, .bin hop (typing_store_weaken hext h1) h2', hσ'⟩
-  | binRightTrap _ _ _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ h2 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h2', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .bin hop (typing_env_weaken hext (spawnTyped_extends hsp) h1) h2', hσ'⟩
+  | binRightTrap _ _ _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | binVal he =>
     cases ht with
     | bin hop h1 h2 =>
@@ -887,148 +1964,207 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
       | lit hl1 =>
         cases h2 with
         | lit hl2 =>
-          exact ⟨Ψ, StoreExtends.refl Ψ, .lit (evalBinOp_sound hop hl1 hl2 he), hσ⟩
-  | binTrap _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+          exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit (evalBinOp_sound hop hl1 hl2 he), hσ⟩
+  | binTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | letStep hs =>
     cases ht with
     | let_ h1 h2 =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .let_ h1' (typing_store_weaken hext h2), hσ'⟩
-  | letTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
-  | letVal _ =>
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .let_ h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+  | letTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | letVal hv1 =>
     cases ht with
-    | let_ h1 h2 => exact ⟨Ψ, StoreExtends.refl Ψ, subst_typing h2 h1, hσ⟩
+    | let_ h1 h2 =>
+      exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, subst_typing h2 hv1 h1, hσ⟩
   | ifStep hs =>
     cases ht with
     | if_ hc h1 h2 =>
-      rcases preservation hΦ hs hc hσ with ⟨Ψ', hext, hc', hσ'⟩
-      exact ⟨Ψ', hext, .if_ hc' (typing_store_weaken hext h1) (typing_store_weaken hext h2), hσ'⟩
-  | ifTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ hc hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hc', hσ'⟩
+      have htk := spawnTyped_extends hsp
+      exact ⟨Ψ', Θ', hext, hsp,
+        .if_ hc' (typing_env_weaken hext htk h1) (typing_env_weaken hext htk h2), hσ'⟩
+  | ifTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | ifTrue =>
     cases ht with
-    | if_ _ h1 _ => exact ⟨Ψ, StoreExtends.refl Ψ, h1, hσ⟩
+    | if_ _ h1 _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h1, hσ⟩
   | ifFalse =>
     cases ht with
-    | if_ _ _ h2 => exact ⟨Ψ, StoreExtends.refl Ψ, h2, hσ⟩
+    | if_ _ _ h2 => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h2, hσ⟩
   | whileUnfold =>
     cases ht with
     | while_ hc hb =>
-      exact ⟨Ψ, StoreExtends.refl Ψ,
+      exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
         .if_ hc (.blockCons hb (.blockSingle (.while_ hc hb))) (.lit .unit), hσ⟩
   | matchScrut hs =>
     cases ht with
     | match_ hscr harms =>
-      rcases preservation hΦ hs hscr hσ with ⟨Ψ', hext, hscr', hσ'⟩
-      exact ⟨Ψ', hext, .match_ hscr' (typingArms_store_weaken hext harms), hσ'⟩
-  | matchScrutTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
-  | matchEmpty _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap .matchFailure τ, hσ⟩
+      rcases preservation hΦ hscr hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hscr', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .match_ hscr' (typingArms_env_weaken hext (spawnTyped_extends hsp) harms), hσ'⟩
+  | matchScrutTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | matchEmpty _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap .matchFailure τ, hσ⟩
   | matchHit hv hm =>
     cases ht with
     | match_ hs harms =>
       cases harms with
       | cons hp hbody _ =>
         have hmatch := matchPat_sound hp hs hv hm
-        exact ⟨Ψ, StoreExtends.refl Ψ, substMany_typing hmatch hbody, hσ⟩
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, substMany_typing hmatch hbody, hσ⟩
   | matchMiss _ _ =>
     cases ht with
     | match_ hs harms =>
       cases harms with
-      | cons _ _ hrest => exact ⟨Ψ, StoreExtends.refl Ψ, .match_ hs hrest, hσ⟩
+      | cons _ _ hrest => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .match_ hs hrest, hσ⟩
   | makeDataStep hs =>
     cases ht with
-    | makeData hv hts =>
-      rcases preservationList hΦ hs hts hσ with ⟨Ψ', hext, hts', hσ'⟩
-      exact ⟨Ψ', hext, .makeData hv hts', hσ'⟩
-  | makeDataTrap _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+    | makeData hlv hts =>
+      rcases preservationList hΦ hts hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hts', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .makeData hlv hts', hσ'⟩
+  | makeDataTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | getTagStep hs =>
     cases ht with
     | getTag he =>
-      rcases preservation hΦ hs he hσ with ⟨Ψ', hext, he', hσ'⟩
-      exact ⟨Ψ', hext, .getTag he', hσ'⟩
-  | getTagTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .getTag he', hσ'⟩
+  | getTagTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | getTagVal _ =>
     cases ht with
-    | getTag _ => exact ⟨Ψ, StoreExtends.refl Ψ, .lit (.int _), hσ⟩
+    | getTag _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit (.int _), hσ⟩
   | cellNewStep hs =>
     cases ht with
     | cellNew he =>
-      rcases preservation hΦ hs he hσ with ⟨Ψ', hext, he', hσ'⟩
-      exact ⟨Ψ', hext, .cellNew he', hσ'⟩
-  | cellNewTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .cellNew he', hσ'⟩
+  | cellNewTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellNewVal hv =>
     cases ht with
     | @cellNew _ _ τ0 he =>
       have hext : StoreExtends Ψ (Ψ ++ [τ0]) := StoreExtends.append Ψ τ0
       have hloc : (Ψ ++ [τ0])[σ.length]? = some τ0 := by rw [hσ.1]; simp
-      exact ⟨Ψ ++ [τ0], hext, .loc hloc, store_typed_alloc hσ hv he⟩
+      exact ⟨Ψ ++ [τ0], Θ, hext, rfl, .loc hloc, store_typed_alloc hσ hv he⟩
   | cellGetStep hs =>
     cases ht with
-    | cellGet he =>
-      rcases preservation hΦ hs he hσ with ⟨Ψ', hext, he', hσ'⟩
-      exact ⟨Ψ', hext, .cellGet he', hσ'⟩
-  | cellGetTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+    | cellGet he hsub =>
+      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .cellGet he' hsub, hσ'⟩
+  | cellGetTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellGetVal hvσ =>
     cases ht with
-    | cellGet hloc =>
+    | cellGet hloc hsub =>
       cases hloc with
       | loc hl =>
         rcases hσ.2 _ _ hl with ⟨v', hv', _, hvt⟩
         rw [hvσ] at hv'; cases hv'
-        exact ⟨Ψ, StoreExtends.refl Ψ, hvt, hσ⟩
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, typing_sub hsub hvt, hσ⟩
   | cellSetLeft hs =>
     cases ht with
     | cellSet h1 h2 =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .cellSet h1' (typing_store_weaken hext h2), hσ'⟩
-  | cellSetLeftTrap => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .cellSet h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+  | cellSetLeftTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellSetRight _ hs =>
     cases ht with
     | cellSet h1 h2 =>
-      rcases preservation hΦ hs h2 hσ with ⟨Ψ', hext, h2', hσ'⟩
-      exact ⟨Ψ', hext, .cellSet (typing_store_weaken hext h1) h2', hσ'⟩
-  | cellSetRightTrap _ => exact ⟨Ψ, StoreExtends.refl Ψ, .trap _ τ, hσ⟩
+      rcases preservation hΦ h2 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h2', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .cellSet (typing_env_weaken hext (spawnTyped_extends hsp) h1) h2', hσ'⟩
+  | cellSetRightTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellSetVal _ hv =>
     cases ht with
     | cellSet h1 h2 =>
       cases h1 with
       | loc hl =>
-        exact ⟨Ψ, StoreExtends.refl Ψ, .lit .unit, store_typed_update hσ hl hv h2⟩
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .lit .unit, store_typed_update hσ hl hv h2⟩
+  | spawnStep hs =>
+    cases ht with
+    | spawn hfn hsend hsub =>
+      rcases preservation hΦ hfn hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hfn', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .spawn hfn' hsend hsub, hσ'⟩
+  | spawnTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | spawnBeta =>
+    cases ht with
+    | @spawn _ _ τ0 _ hfn hsend hsub =>
+      cases hfn with
+      | lam _ _ hrSub hbody _ =>
+        have hbodyτ : HasType Δ Φ Ψ Θ emptyCtx _ τ0 := typing_sub hrSub hbody
+        have htkExt : TaskExtends Θ (Θ ++ [τ0]) := TaskExtends.append Θ τ0
+        have hbody' : HasType Δ Φ Ψ (Θ ++ [τ0]) emptyCtx _ τ0 :=
+          typing_env_weaken (StoreExtends.refl Ψ) htkExt hbodyτ
+        have htid : (Θ ++ [τ0])[tasks.length]? = some τ0 := by rw [htasks.1]; simp
+        exact ⟨Ψ, Θ ++ [τ0], StoreExtends.refl Ψ,
+          ⟨τ0, rfl, hsend, hbody'⟩,
+          .taskRef htid hsend hsub,
+          store_typed_task_weaken htkExt hσ⟩
+  | awaitStep hs =>
+    cases ht with
+    | await he hsend hsub =>
+      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp, .await he' hsend hsub, hσ'⟩
+  | awaitTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | awaitVal het _ =>
+    cases ht with
+    | await href _ hsub =>
+      cases href with
+      | taskRef htid _ hs0 =>
+        rcases htasks.2 _ _ htid with ⟨et', het', hetTy⟩
+        rw [het] at het'; cases het'
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
+          typing_sub (TySub.trans hs0 hsub) hetTy, hσ⟩
+  | awaitTaskTrap _ =>
+    exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
 termination_by sizeOf e
 
 theorem preservationList {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
-    {es : List Expr} {σ : Store} {es' : List Expr} {σ' : Store}
-    (hstep : StepList Δ Φ es σ es' σ')
-    {Ψ : StoreTy} {τs : List Ty}
-    (hts : HasTypes Δ Φ Ψ emptyCtx es τs) (hσ : StoreTyped Δ Φ Ψ σ) :
-    ∃ Ψ', StoreExtends Ψ Ψ' ∧ HasTypes Δ Φ Ψ' emptyCtx es' τs ∧ StoreTyped Δ Φ Ψ' σ' := by
+    {Ψ : StoreTy} {Θ : TaskTy} {tasks : List Expr}
+    {es : List Expr} {σ : Store} {es' : List Expr} {σ' : Store} {sp : Option Expr} {τs : List Ty}
+    (hts : HasTypes Δ Φ Ψ Θ emptyCtx es τs)
+    (hstep : StepList Δ Φ tasks es σ es' σ' sp)
+    (hσ : StoreTyped Δ Φ Ψ Θ σ)
+    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    ∃ Ψ' Θ',
+      StoreExtends Ψ Ψ' ∧
+      SpawnTyped Δ Φ Ψ' Θ Θ' sp ∧
+      HasTypes Δ Φ Ψ' Θ' emptyCtx es' τs ∧
+      StoreTyped Δ Φ Ψ' Θ' σ' := by
   cases hstep with
   | head hs =>
     cases hts with
     | cons h1 hrest =>
-      rcases preservation hΦ hs h1 hσ with ⟨Ψ', hext, h1', hσ'⟩
-      exact ⟨Ψ', hext, .cons h1' (typingList_store_weaken hext hrest), hσ'⟩
+      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .cons h1' (typingList_env_weaken hext (spawnTyped_extends hsp) hrest), hσ'⟩
   | tail _ hs =>
     cases hts with
     | cons h1 hrest =>
-      rcases preservationList hΦ hs hrest hσ with ⟨Ψ', hext, hrest', hσ'⟩
-      exact ⟨Ψ', hext, .cons (typing_store_weaken hext h1) hrest', hσ'⟩
+      rcases preservationList hΦ hrest hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hrest', hσ'⟩
+      exact ⟨Ψ', Θ', hext, hsp,
+        .cons (typing_env_weaken hext (spawnTyped_extends hsp) h1) hrest', hσ'⟩
 termination_by sizeOf es
 end
 
-/-! ## Multi-Step Type Safety Corollary -/
+/-! ## Sequential Multi-Step Type Safety Corollary -/
 
 theorem type_safety {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ σ' : Store} {e e' : Expr} {τ : Ty}
-    (hΦ : FunEnvTyped Δ Φ) (ht : HasType Δ Φ Ψ emptyCtx e τ) (hσ : StoreTyped Δ Φ Ψ σ)
+    (hΦ : FunEnvTyped Δ Φ)
+    (ht : HasType Δ Φ Ψ [] emptyCtx e τ)
+    (hσ : StoreTyped Δ Φ Ψ [] σ)
     (hsteps : Steps Δ Φ e σ e' σ') :
-    ¬ IsStuck Δ Φ e' σ' := by
+    ¬ IsStuck Δ Φ [] e' σ' := by
   induction hsteps generalizing Ψ with
   | refl =>
-    intro ⟨hnt, hns⟩
-    rcases progress hΦ ht hσ with ht' | hs'
+    intro ⟨hnt, hnblk, hns⟩
+    have htasks : TasksTyped Δ Φ Ψ [] [] := ⟨rfl, fun _ _ h => by simp at h⟩
+    rcases progress hΦ ht hσ htasks with ht' | hblk | hs'
     · exact hnt ht'
+    · exact hnblk hblk
     · exact hns hs'
   | trans hstep _ ih =>
-    rcases preservation hΦ hstep ht hσ with ⟨Ψ', _, ht', hσ'⟩
+    have htasks : TasksTyped Δ Φ Ψ [] [] := ⟨rfl, fun _ _ h => by simp at h⟩
+    rcases preservation hΦ ht hstep hσ htasks with ⟨Ψ', Θ', _, hsp, ht', hσ'⟩
+    simp only [SpawnTyped] at hsp
+    subst hsp
     exact ih ht' hσ'
 
 end CoreGeisha
