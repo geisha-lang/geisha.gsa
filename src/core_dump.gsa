@@ -1,0 +1,721 @@
+// Core Geisha S-Expression Exporter (`--dump-core`)
+//
+// Serializes a monomorphized `CoreProgram` into `.gscore` S-expression format
+// consumed by the Lean 4 machine-checked verifier `formal/.lake/build/bin/geisha-check`.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listLen}
+use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.str.intToStr
+use ast.{
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, schemeBody,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct
+}
+use infer.{
+    VariantInfo, AdtInfo, mangleType, applyExplicitSubst, buildPairMap, findVariantByName
+}
+use core.{
+    ClosureSpec, TaggedTerm, CoreArm, Term,
+    TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
+    TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
+    FunDef, CoreProgram, extractTypeArgs
+}
+
+data DumpCtx {
+    MkDumpCtx {
+        dcProg: CoreProgram,
+        dcInstAdts: StrMap (String, List Type),
+        dcInstAdtOrder: Cell (List String),
+        dcErr: Cell (Option String),
+    },
+}
+
+def setDumpErr(ctx: DumpCtx, msg: String): Void =
+    match cellGet(ctx.dcErr) {
+        None -> cellSet(ctx.dcErr, Some(msg)),
+        Some(_) -> (),
+    }
+
+def pushQuotedStr(b: StringBuf, s: String): Void = {
+    bufPushByte(b, 34);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c == 34) bufPushStr(b, "\\\"")
+        else if (c == 92) bufPushStr(b, "\\\\")
+        else if (c == 10) bufPushStr(b, "\\n")
+        else if (c == 13) bufPushStr(b, "\\r")
+        else if (c == 9) bufPushStr(b, "\\t")
+        else bufPushByte(b, c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 34)
+}
+
+def compBaseName(ty: Type): String = match ty {
+    TyComp(b, _) -> compBaseName(b),
+    TyCon(n) -> n,
+    _ -> "",
+}
+
+def mangleCoreAdt(baseName: String, targs: List Type): String = match targs {
+    Nil -> baseName,
+    _ -> {
+        let b = bufNew();
+        bufPushStr(b, baseName);
+        let cur = cellNew(targs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(t, r) -> {
+                    bufPushByte(b, 95);
+                    bufPushStr(b, mangleType(t));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufToString(b)
+    },
+}
+
+def registerCoreAdt(ctx: DumpCtx, baseName: String, targs: List Type): String = {
+    let mangled = mangleCoreAdt(baseName, targs);
+    if (!strMapContains(ctx.dcInstAdts, mangled)) {
+        strMapInsert(ctx.dcInstAdts, mangled, (baseName, targs));
+        cellSet(ctx.dcInstAdtOrder, Cons(mangled, cellGet(ctx.dcInstAdtOrder)));
+        match strMapGet(ctx.dcProg.coreAdtReg, baseName) {
+            Some(ainfo) -> {
+                let sub = buildPairMap(ainfo.typeParams, targs);
+                let cv = cellNew(ainfo.variants);
+                while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                    match cellGet(cv) {
+                        Cons(vi, r) -> {
+                            let cf = cellNew(vi.fieldTypes);
+                            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                match cellGet(cf) {
+                                    Cons(ft, fr) -> {
+                                        let instFt = applyExplicitSubst(ft, sub);
+                                        let tmp = bufNew();
+                                        emitCoreTy(ctx, tmp, instFt);
+                                        cellSet(cf, fr)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            cellSet(cv, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+            None -> setDumpErr(ctx, "Unknown ADT '" + baseName + "'"),
+        }
+    } else ();
+    mangled
+}
+
+def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
+    TyVoid -> bufPushStr(b, "void"),
+    TyCon(n) ->
+        if (n == "Void") bufPushStr(b, "void")
+        else if (n == "Int") bufPushStr(b, "int")
+        else if (n == "Bool") bufPushStr(b, "bool")
+        else if (n == "String") bufPushStr(b, "str")
+        else if (strMapContains(ctx.dcProg.coreAdtReg, n)) {
+            let m = registerCoreAdt(ctx, n, Nil);
+            bufPushStr(b, "(adt ");
+            pushQuotedStr(b, m);
+            bufPushByte(b, 41)
+        } else {
+            setDumpErr(ctx, "Type '" + n + "' is outside the Core Geisha subset");
+            bufPushStr(b, "void")
+        },
+    TyTuple(es) -> {
+        bufPushStr(b, "(tuple");
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(t, r) -> {
+                    bufPushByte(b, 32);
+                    emitCoreTy(ctx, b, t);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TyArr(ps, ret) -> {
+        bufPushStr(b, "(fn (");
+        let first = cellNew(true);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    if (!cellGet(first)) bufPushByte(b, 32) else cellSet(first, false);
+                    emitCoreTy(ctx, b, p);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushStr(b, ") ");
+        emitCoreTy(ctx, b, ret);
+        bufPushByte(b, 41)
+    },
+    TyComp(_, _) -> {
+        let base = compBaseName(ty);
+        let targs = extractTypeArgs(ty);
+        if (base == "Cell") {
+            match targs {
+                Cons(elemTy, Nil) -> {
+                    bufPushStr(b, "(cell ");
+                    emitCoreTy(ctx, b, elemTy);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "Invalid Cell type application");
+                    bufPushStr(b, "void")
+                },
+            }
+        } else if (strMapContains(ctx.dcProg.coreAdtReg, base)) {
+            let m = registerCoreAdt(ctx, base, targs);
+            bufPushStr(b, "(adt ");
+            pushQuotedStr(b, m);
+            bufPushByte(b, 41)
+        } else {
+            setDumpErr(ctx, "Parameterized type '" + base + "' is outside the Core Geisha subset");
+            bufPushStr(b, "void")
+        }
+    },
+    TyVar(v) -> {
+        setDumpErr(ctx, "Unmonomorphized type variable '" + v + "' in Core IR");
+        bufPushStr(b, "void")
+    },
+}
+
+def emitCoreLit(ctx: DumpCtx, b: StringBuf, l: Lit): Void = match l {
+    LitInt(n) -> {
+        bufPushStr(b, "(lit-int ");
+        bufPushStr(b, intToStr(n));
+        bufPushByte(b, 41)
+    },
+    LitBool(v) ->
+        if (v) bufPushStr(b, "(lit-bool true)")
+        else bufPushStr(b, "(lit-bool false)"),
+    LitStr(s) -> {
+        bufPushStr(b, "(lit-str ");
+        pushQuotedStr(b, s);
+        bufPushByte(b, 41)
+    },
+    LitUnit -> bufPushStr(b, "(lit-unit)"),
+    LitFloat(_) -> {
+        setDumpErr(ctx, "Float literal is outside the Core Geisha subset");
+        bufPushStr(b, "(lit-unit)")
+    },
+    LitChar(_) -> {
+        setDumpErr(ctx, "Char literal is outside the Core Geisha subset");
+        bufPushStr(b, "(lit-unit)")
+    },
+}
+
+def emitCorePat(ctx: DumpCtx, b: StringBuf, pat: Pattern, scrutTy: Type): Void = match pat {
+    PatWild -> bufPushStr(b, "wild"),
+    PatVar(x) -> {
+        bufPushStr(b, "(pvar ");
+        pushQuotedStr(b, x);
+        bufPushByte(b, 41)
+    },
+    PatLit(l) -> {
+        bufPushStr(b, "(plit ");
+        emitCoreLit(ctx, b, l);
+        bufPushByte(b, 41)
+    },
+    PatTuple(ps) -> {
+        bufPushStr(b, "(ptuple");
+        let elemTys = match scrutTy {
+            TyTuple(ts) -> ts,
+            _ -> Nil,
+        };
+        let cp = cellNew(ps);
+        let ct = cellNew(elemTys);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(p, pr) -> {
+                    let et = match cellGet(ct) {
+                        Cons(t, tr) -> { cellSet(ct, tr); t },
+                        Nil -> TyVoid,
+                    };
+                    bufPushByte(b, 32);
+                    emitCorePat(ctx, b, p, et);
+                    cellSet(cp, pr)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    PatCtor(cname, ps) -> {
+        let baseName = compBaseName(scrutTy);
+        let targs = extractTypeArgs(scrutTy);
+        let mangled = registerCoreAdt(ctx, baseName, targs);
+        match strMapGet(ctx.dcProg.coreAdtReg, baseName) {
+            Some(ainfo) -> match findVariantByName(ainfo.variants, cname) {
+                Some(vi) -> {
+                    let sub = buildPairMap(ainfo.typeParams, targs);
+                    let rev = cellNew(Nil);
+                    let cf = cellNew(vi.fieldTypes);
+                    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                        match cellGet(cf) {
+                            Cons(ft, fr) -> {
+                                cellSet(rev, Cons(applyExplicitSubst(ft, sub), cellGet(rev)));
+                                cellSet(cf, fr)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let fldTys = listRev(cellGet(rev));
+                    bufPushStr(b, "(pctor ");
+                    pushQuotedStr(b, mangled);
+                    bufPushByte(b, 32);
+                    bufPushStr(b, intToStr(vi.tag));
+                    let cp = cellNew(ps);
+                    let ct = cellNew(fldTys);
+                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                        match cellGet(cp) {
+                            Cons(p, pr) -> {
+                                let ft = match cellGet(ct) {
+                                    Cons(t, tr) -> { cellSet(ct, tr); t },
+                                    Nil -> TyVoid,
+                                };
+                                bufPushByte(b, 32);
+                                emitCorePat(ctx, b, p, ft);
+                                cellSet(cp, pr)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    bufPushByte(b, 41)
+                },
+                None -> {
+                    setDumpErr(ctx, "Unknown constructor pattern '" + cname + "'");
+                    bufPushStr(b, "wild")
+                },
+            },
+            None -> {
+                setDumpErr(ctx, "Unknown ADT '" + baseName + "' in constructor pattern");
+                bufPushStr(b, "wild")
+            },
+        }
+    },
+    PatStruct(cname, _) -> {
+        setDumpErr(ctx, "Unnormalized struct pattern '" + cname + "' in Core IR");
+        bufPushStr(b, "wild")
+    },
+}
+
+def binOpCoreName(op: BinOp, lhsTy: Type): Option String = {
+    let tyName = match lhsTy { TyCon(n) -> n, _ -> "" };
+    match op {
+        OpAdd -> if (tyName == "String") Some("strConcat") else if (tyName == "Int") Some("add") else None,
+        OpSub -> if (tyName == "Int") Some("sub") else None,
+        OpMul -> if (tyName == "Int") Some("mul") else None,
+        OpDiv -> if (tyName == "Int") Some("div") else None,
+        OpRem -> if (tyName == "Int") Some("rem") else None,
+        OpBitAnd -> if (tyName == "Int") Some("bitAnd") else None,
+        OpBitOr -> if (tyName == "Int") Some("bitOr") else None,
+        OpBitXor -> if (tyName == "Int") Some("bitXor") else None,
+        OpAnd -> Some("and"),
+        OpOr -> Some("or"),
+        OpEq ->
+            if (tyName == "Int") Some("eqInt")
+            else if (tyName == "Bool") Some("eqBool")
+            else if (tyName == "String") Some("eqStr")
+            else None,
+        OpNe -> if (tyName == "Int") Some("neInt") else None,
+        OpLt -> if (tyName == "Int") Some("ltInt") else None,
+        OpLe -> if (tyName == "Int") Some("leInt") else None,
+        OpGt -> if (tyName == "Int") Some("gtInt") else None,
+        OpGe -> if (tyName == "Int") Some("geInt") else None,
+        _ -> None,
+    }
+}
+
+def emitParamList(ctx: DumpCtx, b: StringBuf, params: List VarDecl): Void = {
+    bufPushByte(b, 40);
+    let first = cellNew(true);
+    let cur = cellNew(params);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(vd, r) -> {
+                if (!cellGet(first)) bufPushByte(b, 32) else cellSet(first, false);
+                bufPushByte(b, 40);
+                pushQuotedStr(b, vd.vname);
+                bufPushByte(b, 32);
+                emitCoreTy(ctx, b, schemeBody(vd.vscm));
+                bufPushByte(b, 41);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(b, 41)
+}
+
+def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tnode {
+    TmLit(l) -> emitCoreLit(ctx, b, l),
+    TmVar(x) -> {
+        bufPushStr(b, "(var ");
+        pushQuotedStr(b, x);
+        bufPushByte(b, 41)
+    },
+    TmGlobalVar(g) -> {
+        setDumpErr(ctx, "Global variable '" + g + "' is outside the Core Geisha subset");
+        bufPushStr(b, "(lit-unit)")
+    },
+    TmTuple(es) -> {
+        bufPushStr(b, "(tuple");
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, e);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TmBlock(es) -> {
+        bufPushStr(b, "(block");
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, e);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TmMakeCls(vd, cls, body) -> {
+        match strMapGet(ctx.dcProg.coreFns, cls.clsEntry) {
+            Some(fd) -> {
+                let retTy = match schemeBody(fd.fnScm) {
+                    TyArr(_, r) -> r,
+                    other -> other,
+                };
+                bufPushStr(b, "(let ");
+                pushQuotedStr(b, vd.vname);
+                bufPushStr(b, " (lam ");
+                emitParamList(ctx, b, fd.fnParams);
+                bufPushByte(b, 32);
+                emitCoreTy(ctx, b, retTy);
+                bufPushByte(b, 32);
+                emitCoreTerm(ctx, b, fd.fnBody);
+                bufPushStr(b, ") ");
+                emitCoreTerm(ctx, b, body);
+                bufPushByte(b, 41)
+            },
+            None -> {
+                setDumpErr(ctx, "Missing closure entry '" + cls.clsEntry + "'");
+                bufPushStr(b, "(lit-unit)")
+            },
+        }
+    },
+    TmApplyCls(fnTm, args) -> {
+        bufPushStr(b, "(apply ");
+        emitCoreTerm(ctx, b, fnTm);
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TmApplyDir(vd, args) -> {
+        if (vd.vname == "cellNew") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(cell-new ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "cellNew expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "cellGet") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(cell-get ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "cellGet expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "cellSet") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> {
+                    bufPushStr(b, "(cell-set ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a1);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "cellSet expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (strMapContains(ctx.dcProg.coreFns, vd.vname)) {
+            bufPushStr(b, "(apply-dir ");
+            pushQuotedStr(b, vd.vname);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        bufPushByte(b, 32);
+                        emitCoreTerm(ctx, b, a);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            bufPushByte(b, 41)
+        } else {
+            setDumpErr(ctx, "Builtin/extern call '" + vd.vname + "' is outside the Core Geisha subset");
+            bufPushStr(b, "(lit-unit)")
+        }
+    },
+    TmBin(op, e1, e2) -> {
+        match binOpCoreName(op, schemeBody(e1.tscm)) {
+            Some(opName) -> {
+                bufPushStr(b, "(bin ");
+                bufPushStr(b, opName);
+                bufPushByte(b, 32);
+                emitCoreTerm(ctx, b, e1);
+                bufPushByte(b, 32);
+                emitCoreTerm(ctx, b, e2);
+                bufPushByte(b, 41)
+            },
+            None -> {
+                setDumpErr(ctx, "Binary operator is outside the Core Geisha subset");
+                bufPushStr(b, "(lit-unit)")
+            },
+        }
+    },
+    TmUn(op, e1) -> {
+        let opName = match op {
+            UnNot -> "not",
+            UnNeg -> "neg",
+            UnBitNot -> "bitNot",
+        };
+        bufPushStr(b, "(un ");
+        bufPushStr(b, opName);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, e1);
+        bufPushByte(b, 41)
+    },
+    TmLet(vd, e1, e2) -> {
+        bufPushStr(b, "(let ");
+        pushQuotedStr(b, vd.vname);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, e1);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, e2);
+        bufPushByte(b, 41)
+    },
+    TmIf(c, t, e) -> {
+        bufPushStr(b, "(if ");
+        emitCoreTerm(ctx, b, c);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, t);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, e);
+        bufPushByte(b, 41)
+    },
+    TmWhile(c, body) -> {
+        bufPushStr(b, "(while ");
+        emitCoreTerm(ctx, b, c);
+        bufPushByte(b, 32);
+        emitCoreTerm(ctx, b, body);
+        bufPushByte(b, 41)
+    },
+    TmMatch(scrut, arms) -> {
+        bufPushStr(b, "(match ");
+        emitCoreTerm(ctx, b, scrut);
+        let scrutTy = schemeBody(scrut.tscm);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(arm, r) -> {
+                    match arm.caGuard {
+                        Some(_) -> setDumpErr(ctx, "Pattern guard is outside Core Geisha v1 subset"),
+                        None -> (),
+                    };
+                    bufPushStr(b, " (arm ");
+                    emitCorePat(ctx, b, arm.caPat, scrutTy);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, arm.caBody);
+                    bufPushByte(b, 41);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TmMakeData(adtName, tag, args, _, targs) -> {
+        let mangled = registerCoreAdt(ctx, adtName, targs);
+        bufPushStr(b, "(make-data ");
+        pushQuotedStr(b, mangled);
+        bufPushByte(b, 32);
+        bufPushStr(b, intToStr(tag));
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 41)
+    },
+    TmGetTag(e1) -> {
+        bufPushStr(b, "(get-tag ");
+        emitCoreTerm(ctx, b, e1);
+        bufPushByte(b, 41)
+    },
+}
+
+pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
+    let ctx = MkDumpCtx {
+        dcProg: prog,
+        dcInstAdts: strMapNew(),
+        dcInstAdtOrder: cellNew(Nil),
+        dcErr: cellNew(None),
+    };
+
+    let funsBuf = bufNew();
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnName, r) -> {
+                match strMapGet(prog.coreFns, fnName) {
+                    Some(fd) -> {
+                        // Lifted closures with captured free variables are inlined at `TmMakeCls`
+                        if (listLen(fd.fnFvs) == 0) {
+                            let retTy = match schemeBody(fd.fnScm) {
+                                TyArr(_, ret) -> ret,
+                                other -> other,
+                            };
+                            bufPushStr(funsBuf, "    (fun ");
+                            pushQuotedStr(funsBuf, fd.fnName);
+                            bufPushByte(funsBuf, 32);
+                            emitParamList(ctx, funsBuf, fd.fnParams);
+                            bufPushByte(funsBuf, 32);
+                            emitCoreTy(ctx, funsBuf, retTy);
+                            bufPushByte(funsBuf, 32);
+                            emitCoreTerm(ctx, funsBuf, fd.fnBody);
+                            bufPushStr(funsBuf, ")\n")
+                        } else ()
+                    },
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let adtsBuf = bufNew();
+    let adtOrder = listRev(cellGet(ctx.dcInstAdtOrder));
+    let ca = cellNew(adtOrder);
+    while (match cellGet(ca) { Nil -> false, _ -> true }) {
+        match cellGet(ca) {
+            Cons(mangled, r) -> {
+                match strMapGet(ctx.dcInstAdts, mangled) {
+                    Some((baseName, targs)) -> {
+                        match strMapGet(prog.coreAdtReg, baseName) {
+                            Some(ainfo) -> {
+                                let sub = buildPairMap(ainfo.typeParams, targs);
+                                bufPushStr(adtsBuf, "    (adt ");
+                                pushQuotedStr(adtsBuf, mangled);
+                                let cv = cellNew(ainfo.variants);
+                                while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                                    match cellGet(cv) {
+                                        Cons(vi, vr) -> {
+                                            bufPushStr(adtsBuf, " (variant ");
+                                            bufPushStr(adtsBuf, intToStr(vi.tag));
+                                            let cft = cellNew(vi.fieldTypes);
+                                            while (match cellGet(cft) { Nil -> false, _ -> true }) {
+                                                match cellGet(cft) {
+                                                    Cons(ft, fr) -> {
+                                                        bufPushByte(adtsBuf, 32);
+                                                        emitCoreTy(ctx, adtsBuf, applyExplicitSubst(ft, sub));
+                                                        cellSet(cft, fr)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            bufPushByte(adtsBuf, 41);
+                                            cellSet(cv, vr)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                bufPushStr(adtsBuf, ")\n")
+                            },
+                            None -> (),
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(ca, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(ctx.dcErr) {
+        Some(errMsg) -> Err(errMsg),
+        None -> {
+            let out = bufNew();
+            bufPushStr(out, "(program\n  (adts\n");
+            bufPushStr(out, bufToString(adtsBuf));
+            bufPushStr(out, "  )\n  (funs\n");
+            bufPushStr(out, bufToString(funsBuf));
+            bufPushStr(out, "  )\n)\n");
+            Ok(bufToString(out))
+        },
+    }
+}

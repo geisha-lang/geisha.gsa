@@ -7,7 +7,7 @@ BUILD_DIR   := build
 RUNTIME_LIB := $(BUILD_DIR)/libgeisha_runtime.a
 ENTRY       := src/mod.gsa
 
-.PHONY: all runtime stdlib-bundle stage1 stage2 stage3 bootstrap test clean
+.PHONY: all runtime stdlib-bundle stage1 stage2 stage3 bootstrap test verify-core clean
 
 all: stage2
 
@@ -52,6 +52,10 @@ bootstrap: $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll $(BUILD_DIR)/geisha3
 
 test: $(BUILD_DIR)/geisha2
 	GEISHA_BIN=$(BUILD_DIR)/geisha2 GEISHA_RUNTIME=$(RUNTIME_LIB) sh tests/run_tests.sh
+
+verify-core: $(BUILD_DIR)/geisha2
+	cd formal && lake build geisha-check
+	GEISHA_BIN=$(BUILD_DIR)/geisha2 GEISHA_RUNTIME=$(RUNTIME_LIB) sh formal/tests/verify_core.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

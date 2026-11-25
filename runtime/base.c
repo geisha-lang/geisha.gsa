@@ -57,3 +57,9 @@ void gs_bounds_fail(int32_t idx, int32_t len)
     fprintf(stderr, "Runtime error: array index %d out of bounds (length %d)\n", idx, len);
     abort();
 }
+
+void gs_div_zero_fail(void)
+{
+    fprintf(stderr, "Runtime error: integer division or remainder by zero\n");
+    abort();
+}

@@ -727,8 +727,66 @@ def emitBinOperator(fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operan
             OpAdd -> emitAssign(fctx, "add " + ity + " " + lhs + ", " + rhs),
             OpSub -> emitAssign(fctx, "sub " + ity + " " + lhs + ", " + rhs),
             OpMul -> emitAssign(fctx, "mul " + ity + " " + lhs + ", " + rhs),
-            OpDiv -> emitAssign(fctx, "sdiv " + ity + " " + lhs + ", " + rhs),
-            OpRem -> emitAssign(fctx, "srem " + ity + " " + lhs + ", " + rhs),
+            OpDiv -> {
+                let divZeroBlk = appendBlock(fctx, "div.zero");
+                let divNonZeroBlk = appendBlock(fctx, "div.nonzero");
+                let divOvBlk = appendBlock(fctx, "div.ov");
+                let divNormalBlk = appendBlock(fctx, "div.normal");
+                let divDoneBlk = appendBlock(fctx, "div.done");
+                let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
+                emitCondBr(fctx, isZero, divZeroBlk, divNonZeroBlk);
+
+                setInsertBlock(fctx, divZeroBlk);
+                emitLine(fctx, "call void @gs_div_zero_fail()");
+                emitTermLine(fctx, "unreachable");
+
+                setInsertBlock(fctx, divNonZeroBlk);
+                let minLit = if (tyName == "Int64") "-9223372036854775808" else "-2147483648";
+                let isMin = emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + minLit);
+                let isNeg1 = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", -1");
+                let isOv = emitAssign(fctx, "and i1 " + isMin + ", " + isNeg1);
+                emitCondBr(fctx, isOv, divOvBlk, divNormalBlk);
+
+                setInsertBlock(fctx, divOvBlk);
+                emitBr(fctx, divDoneBlk);
+
+                setInsertBlock(fctx, divNormalBlk);
+                let q = emitAssign(fctx, "sdiv " + ity + " " + lhs + ", " + rhs);
+                emitBr(fctx, divDoneBlk);
+
+                setInsertBlock(fctx, divDoneBlk);
+                emitAssign(fctx, "phi " + ity + " [ " + minLit + ", %" + blockLabel(fctx, divOvBlk) + " ], [ " + q + ", %" + blockLabel(fctx, divNormalBlk) + " ]")
+            },
+            OpRem -> {
+                let remZeroBlk = appendBlock(fctx, "rem.zero");
+                let remNonZeroBlk = appendBlock(fctx, "rem.nonzero");
+                let remOvBlk = appendBlock(fctx, "rem.ov");
+                let remNormalBlk = appendBlock(fctx, "rem.normal");
+                let remDoneBlk = appendBlock(fctx, "rem.done");
+                let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
+                emitCondBr(fctx, isZero, remZeroBlk, remNonZeroBlk);
+
+                setInsertBlock(fctx, remZeroBlk);
+                emitLine(fctx, "call void @gs_div_zero_fail()");
+                emitTermLine(fctx, "unreachable");
+
+                setInsertBlock(fctx, remNonZeroBlk);
+                let minLit = if (tyName == "Int64") "-9223372036854775808" else "-2147483648";
+                let isMin = emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + minLit);
+                let isNeg1 = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", -1");
+                let isOv = emitAssign(fctx, "and i1 " + isMin + ", " + isNeg1);
+                emitCondBr(fctx, isOv, remOvBlk, remNormalBlk);
+
+                setInsertBlock(fctx, remOvBlk);
+                emitBr(fctx, remDoneBlk);
+
+                setInsertBlock(fctx, remNormalBlk);
+                let r = emitAssign(fctx, "srem " + ity + " " + lhs + ", " + rhs);
+                emitBr(fctx, remDoneBlk);
+
+                setInsertBlock(fctx, remDoneBlk);
+                emitAssign(fctx, "phi " + ity + " [ 0, %" + blockLabel(fctx, remOvBlk) + " ], [ " + r + ", %" + blockLabel(fctx, remNormalBlk) + " ]")
+            },
             OpBitAnd -> emitAssign(fctx, "and " + ity + " " + lhs + ", " + rhs),
             OpBitOr -> emitAssign(fctx, "or " + ity + " " + lhs + ", " + rhs),
             OpBitXor -> emitAssign(fctx, "xor " + ity + " " + lhs + ", " + rhs),
@@ -2081,6 +2139,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr)"),
         ("gs_match_fail", "declare void @gs_match_fail()"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32)"),
+        ("gs_div_zero_fail", "declare void @gs_div_zero_fail()"),
         ("strlen", "declare i64 @strlen(ptr)"),
         ("memcpy", "declare ptr @memcpy(ptr, ptr, i64)"),
         ("printLn", "declare void @printLn(ptr, ptr)"),

@@ -18,6 +18,7 @@ mod stdlib_bundle
 mod loader
 mod infer
 mod core
+mod core_dump
 mod codegen
 
 use std.option.{Option, Some, None}
@@ -31,11 +32,13 @@ use sys.proc.{exit, shell}
 use loader.{loadSingleSourceProgram, loadProjectProgram}
 use infer.inferProgram
 use core.lowerToCore
+use core_dump.dumpCoreProgramSExpr
 use codegen.emitProgramLlvmIr
 
 data CliOpts {
     MkCliOpts {
         optEmitIr: Bool,
+        optDumpCore: Option String,
         optCompileOnly: Bool,
         optOutPath: Option String,
         optSrcRoot: Option String,
@@ -62,6 +65,7 @@ def shellQuote(s: String): String = {
 
 def parseCliArgs(): Result CliOpts String = {
     let emitIr = cellNew(false);
+    let dumpCore: Cell (Option String) = cellNew(None);
     let compOnly = cellNew(false);
     let outPath: Cell (Option String) = cellNew(None);
     let srcRoot: Cell (Option String) = cellNew(None);
@@ -80,6 +84,13 @@ def parseCliArgs(): Result CliOpts String = {
         } else if (a == "-e" || a == "--emit-llvm") {
             cellSet(emitIr, true);
             cellSet(i, cellGet(i) + 1)
+        } else if (a == "--dump-core") {
+            if (cellGet(i) + 1 >= argc) {
+                cellSet(errOpt, Some("Missing output path after '--dump-core'"))
+            } else {
+                cellSet(dumpCore, Some(argAt(cellGet(i) + 1)));
+                cellSet(i, cellGet(i) + 2)
+            }
         } else if (a == "-c" || a == "--compile-only") {
             cellSet(compOnly, true);
             cellSet(i, cellGet(i) + 1)
@@ -116,6 +127,7 @@ def parseCliArgs(): Result CliOpts String = {
         Some(e) -> Err(e),
         None -> Ok(MkCliOpts {
             optEmitIr: cellGet(emitIr),
+            optDumpCore: cellGet(dumpCore),
             optCompileOnly: cellGet(compOnly),
             optOutPath: cellGet(outPath),
             optSrcRoot: cellGet(srcRoot),
@@ -148,7 +160,7 @@ def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
         },
     }
 
-def compileInputToIr(inputFile: String, srcRootOpt: Option String): Result String String = {
+def compileInputToIr(inputFile: String, srcRootOpt: Option String, dumpCoreOpt: Option String): Result String String = {
     let rawDefs = match srcRootOpt {
         Some(root) -> loadProjectProgram(inputFile, root)?,
         None -> {
@@ -158,6 +170,13 @@ def compileInputToIr(inputFile: String, srcRootOpt: Option String): Result Strin
     };
     let inf = inferProgram(rawDefs)?;
     let coreProg = lowerToCore(inf)?;
+    match dumpCoreOpt {
+        Some(dumpPath) -> {
+            let sexp = dumpCoreProgramSExpr(coreProg)?;
+            writeFile(dumpPath, sexp)?
+        },
+        None -> (),
+    };
     Ok(emitProgramLlvmIr(coreProg))
 }
 
@@ -167,12 +186,13 @@ def printUsage(): Void = {
     printLn("Usage: geisha [options] <input.gsa>");
     printLn("");
     printLn("Options:");
-    printLn("  -e, --emit-llvm      Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
-    printLn("  -c, --compile-only   Compile to native object file (.o) without linking");
-    printLn("  -o <output>          Write output to <output>");
-    printLn("  --src-root <dir>     Multi-file module source root directory");
-    printLn("  --runtime <path.a>   Path to libgeisha_runtime.a (or $GEISHA_RUNTIME)");
-    printLn("  -h, --help           Show this help message")
+    printLn("  -e, --emit-llvm        Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
+    printLn("  --dump-core <file>     Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
+    printLn("  -c, --compile-only     Compile to native object file (.o) without linking");
+    printLn("  -o <output>            Write output to <output>");
+    printLn("  --src-root <dir>       Multi-file module source root directory");
+    printLn("  --runtime <path.a>     Path to libgeisha_runtime.a (or $GEISHA_RUNTIME)");
+    printLn("  -h, --help             Show this help message")
 }
 
 def runDriver(): Result Void String = {
@@ -185,7 +205,7 @@ def runDriver(): Result Void String = {
             Some(p) -> p,
             None -> returnErr("No input .gsa file specified (run with --help for usage)")?,
         };
-        let llText = compileInputToIr(inputFile, opts.optSrcRoot)?;
+        let llText = compileInputToIr(inputFile, opts.optSrcRoot, opts.optDumpCore)?;
 
         if (opts.optEmitIr) {
             match opts.optOutPath {
