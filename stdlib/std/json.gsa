@@ -1,0 +1,464 @@
+// Pure-Geisha RFC 8259 JSON parser and serializer (`std.json`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{intToStr, i64ToStr, floatToStr, parseInt64, parseFloat}
+use std.list.listRev
+use std.codec.{
+    Value, VNull, VBool, VInt, VFloat, VStr, VArr, VObj,
+    DecodeErr, makeErr, Decoder, run, Encode, encode
+}
+
+// ---- Recursive-descent JSON parser ----
+
+data Parser {
+    Parser { src: String, len: Int, pos: Cell Int },
+}
+
+def peek(p: Parser): Int = {
+    let i = cellGet(p.pos);
+    if (i >= p.len) -1 else strByteAt(p.src, i)
+}
+
+def bump(p: Parser): Int = {
+    let i = cellGet(p.pos);
+    if (i >= p.len) -1
+    else {
+        cellSet(p.pos, i + 1);
+        strByteAt(p.src, i)
+    }
+}
+
+def skipWs(p: Parser): Void = {
+    let looping = cellNew(true);
+    while (cellGet(looping)) {
+        let c = peek(p);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            let _ = bump(p);
+            ()
+        } else {
+            cellSet(looping, false)
+        }
+    }
+}
+
+def hexVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def readHex4(p: Parser): Result Int String = {
+    let b0 = hexVal(bump(p));
+    let b1 = hexVal(bump(p));
+    let b2 = hexVal(bump(p));
+    let b3 = hexVal(bump(p));
+    if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) {
+        Err("invalid \\uXXXX hex escape at byte " + intToStr(cellGet(p.pos)))
+    } else {
+        Ok((b0 << 12) | (b1 << 8) | (b2 << 4) | b3)
+    }
+}
+
+def pushUtf8(buf: StringBuf, cp: Int): Void =
+    if (cp < 128) {
+        bufPushByte(buf, cp)
+    } else if (cp < 2048) {
+        bufPushByte(buf, 192 | (cp >>> 6));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else if (cp < 65536) {
+        bufPushByte(buf, 224 | (cp >>> 12));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else {
+        bufPushByte(buf, 240 | (cp >>> 18));
+        bufPushByte(buf, 128 | ((cp >>> 12) & 63));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    }
+
+def parseStringRaw(p: Parser): Result String String = {
+    let openQuote = bump(p);
+    if (openQuote != 34) {
+        Err("expected '\"' at byte " + intToStr(cellGet(p.pos)))
+    } else {
+        let out = bufNew();
+        let done = cellNew(false);
+        let err = cellNew("");
+        while (!cellGet(done) && strLen(cellGet(err)) == 0) {
+            let c = bump(p);
+            if (c < 0) {
+                cellSet(err, "unterminated JSON string")
+            } else if (c == 34) {
+                cellSet(done, true)
+            } else if (c == 92) {
+                let esc = bump(p);
+                if (esc == 34) bufPushByte(out, 34)
+                else if (esc == 92) bufPushByte(out, 92)
+                else if (esc == 47) bufPushByte(out, 47)
+                else if (esc == 98) bufPushByte(out, 8)
+                else if (esc == 102) bufPushByte(out, 12)
+                else if (esc == 110) bufPushByte(out, 10)
+                else if (esc == 114) bufPushByte(out, 13)
+                else if (esc == 116) bufPushByte(out, 9)
+                else if (esc == 117) {
+                    match readHex4(p) {
+                        Err(e) -> cellSet(err, e),
+                        Ok(u1) ->
+                            if (u1 >= 55296 && u1 <= 56319) {
+                                // High surrogate: expect `\u` + low surrogate
+                                let s1 = bump(p);
+                                let s2 = bump(p);
+                                if (s1 != 92 || s2 != 117) {
+                                    cellSet(err, "expected low surrogate after high surrogate")
+                                } else {
+                                    match readHex4(p) {
+                                        Err(e2) -> cellSet(err, e2),
+                                        Ok(u2) ->
+                                            if (u2 >= 56320 && u2 <= 57343) {
+                                                let cp = 65536 + ((u1 - 55296) << 10) + (u2 - 56320);
+                                                pushUtf8(out, cp)
+                                            } else {
+                                                cellSet(err, "invalid low surrogate escape")
+                                            },
+                                    }
+                                }
+                            } else {
+                                pushUtf8(out, u1)
+                            },
+                    }
+                } else {
+                    cellSet(err, "invalid escape sequence in JSON string")
+                }
+            } else if (c < 32) {
+                cellSet(err, "unescaped control character in JSON string")
+            } else {
+                bufPushByte(out, c)
+            }
+        };
+        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+        else Ok(bufToString(out))
+    }
+}
+
+def expectLiteral(p: Parser, lit: String): Result Void String = {
+    let n = strLen(lit);
+    let start = cellGet(p.pos);
+    if (start + n > p.len) {
+        Err("unexpected EOF while expecting '" + lit + "'")
+    } else if (strSlice(p.src, start, start + n) == lit) {
+        cellSet(p.pos, start + n);
+        Ok(())
+    } else {
+        Err("expected '" + lit + "' at byte " + intToStr(start))
+    }
+}
+
+def parseNumber(p: Parser): Result Value String = {
+    let start = cellGet(p.pos);
+    let isFloat = cellNew(false);
+    if (peek(p) == 45) {
+        let _ = bump(p);
+        ()
+    } else ();
+    let dStart = cellGet(p.pos);
+    while (peek(p) >= 48 && peek(p) <= 57) {
+        let _ = bump(p);
+        ()
+    };
+    if (cellGet(p.pos) == dStart) {
+        Err("invalid JSON number at byte " + intToStr(start))
+    } else {
+        if (peek(p) == 46) {
+            cellSet(isFloat, true);
+            let _ = bump(p);
+            let fStart = cellGet(p.pos);
+            while (peek(p) >= 48 && peek(p) <= 57) {
+                let _ = bump(p);
+                ()
+            };
+            if (cellGet(p.pos) == fStart) {
+                cellSet(p.pos, start)
+            } else ()
+        } else ();
+        let ec = peek(p);
+        if (ec == 101 || ec == 69) {
+            cellSet(isFloat, true);
+            let _ = bump(p);
+            let sc = peek(p);
+            if (sc == 43 || sc == 45) {
+                let _ = bump(p);
+                ()
+            } else ();
+            while (peek(p) >= 48 && peek(p) <= 57) {
+                let _ = bump(p);
+                ()
+            }
+        } else ();
+        let endIdx = cellGet(p.pos);
+        if (endIdx <= start) {
+            Err("invalid JSON number at byte " + intToStr(start))
+        } else {
+            let raw = strSlice(p.src, start, endIdx);
+            if (cellGet(isFloat)) {
+                match parseFloat(raw) {
+                    Ok(f) -> Ok(VFloat(f)),
+                    Err(e) -> Err(e),
+                }
+            } else {
+                match parseInt64(raw) {
+                    Ok(n) -> Ok(VInt(n)),
+                    Err(e) -> Err(e),
+                }
+            }
+        }
+    }
+}
+
+def parseValue(p: Parser, depth: Int): Result Value String =
+    if (depth > 128) {
+        Err("JSON nesting depth exceeded 128")
+    } else {
+        skipWs(p);
+        let c = peek(p);
+        if (c < 0) Err("unexpected EOF in JSON")
+        else if (c == 110) {
+            let _ = expectLiteral(p, "null")?;
+            Ok(VNull)
+        } else if (c == 116) {
+            let _ = expectLiteral(p, "true")?;
+            Ok(VBool(true))
+        } else if (c == 102) {
+            let _ = expectLiteral(p, "false")?;
+            Ok(VBool(false))
+        } else if (c == 34) {
+            let s = parseStringRaw(p)?;
+            Ok(VStr(s))
+        } else if (c == 91) {
+            parseArray(p, depth + 1)
+        } else if (c == 123) {
+            parseObject(p, depth + 1)
+        } else if (c == 45 || (c >= 48 && c <= 57)) {
+            parseNumber(p)
+        } else {
+            Err("unexpected character in JSON at byte " + intToStr(cellGet(p.pos)))
+        }
+    }
+
+def parseArray(p: Parser, depth: Int): Result Value String = {
+    let _ = bump(p);
+    skipWs(p);
+    if (peek(p) == 93) {
+        let _ = bump(p);
+        Ok(VArr(Nil))
+    } else {
+        let acc = cellNew(Nil);
+        let done = cellNew(false);
+        let err = cellNew("");
+        while (!cellGet(done) && strLen(cellGet(err)) == 0) {
+            match parseValue(p, depth) {
+                Err(e) -> cellSet(err, e),
+                Ok(item) -> {
+                    cellSet(acc, Cons(item, cellGet(acc)));
+                    skipWs(p);
+                    let next = peek(p);
+                    if (next == 44) {
+                        let _ = bump(p);
+                        ()
+                    } else if (next == 93) {
+                        let _ = bump(p);
+                        cellSet(done, true)
+                    } else {
+                        cellSet(err, "expected ',' or ']' in JSON array at byte " + intToStr(cellGet(p.pos)))
+                    }
+                },
+            }
+        };
+        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+        else Ok(VArr(listRev(cellGet(acc))))
+    }
+}
+
+def parseObject(p: Parser, depth: Int): Result Value String = {
+    let _ = bump(p);
+    skipWs(p);
+    if (peek(p) == 125) {
+        let _ = bump(p);
+        Ok(VObj(Nil))
+    } else {
+        let acc = cellNew(Nil);
+        let done = cellNew(false);
+        let err = cellNew("");
+        while (!cellGet(done) && strLen(cellGet(err)) == 0) {
+            skipWs(p);
+            match parseStringRaw(p) {
+                Err(e) -> cellSet(err, e),
+                Ok(key) -> {
+                    skipWs(p);
+                    if (peek(p) != 58) {
+                        cellSet(err, "expected ':' after object key at byte " + intToStr(cellGet(p.pos)))
+                    } else {
+                        let _ = bump(p);
+                        match parseValue(p, depth) {
+                            Err(e2) -> cellSet(err, e2),
+                            Ok(val) -> {
+                                cellSet(acc, Cons((key, val), cellGet(acc)));
+                                skipWs(p);
+                                let next = peek(p);
+                                if (next == 44) {
+                                    let _ = bump(p);
+                                    ()
+                                } else if (next == 125) {
+                                    let _ = bump(p);
+                                    cellSet(done, true)
+                                } else {
+                                    cellSet(err, "expected ',' or '}' in JSON object at byte " + intToStr(cellGet(p.pos)))
+                                }
+                            },
+                        }
+                    }
+                },
+            }
+        };
+        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+        else Ok(VObj(listRev(cellGet(acc))))
+    }
+}
+
+pub def parse(input: String): Result Value String = {
+    let p = Parser { src: input, len: strLen(input), pos: cellNew(0) };
+    let val = parseValue(p, 0)?;
+    skipWs(p);
+    if (cellGet(p.pos) != p.len) {
+        Err("trailing characters after JSON value at byte " + intToStr(cellGet(p.pos)))
+    } else {
+        Ok(val)
+    }
+}
+
+// ---- JSON serializer ----
+
+def hexDigitByte(n: Int): Int =
+    if (n < 10) 48 + n else 87 + n
+
+def emitJsonString(b: StringBuf, s: String): Void = {
+    bufPushByte(b, 34);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 34) bufPushStr(b, "\\\"")
+        else if (c == 92) bufPushStr(b, "\\\\")
+        else if (c == 8) bufPushStr(b, "\\b")
+        else if (c == 12) bufPushStr(b, "\\f")
+        else if (c == 10) bufPushStr(b, "\\n")
+        else if (c == 13) bufPushStr(b, "\\r")
+        else if (c == 9) bufPushStr(b, "\\t")
+        else if (c < 32) {
+            bufPushStr(b, "\\u00");
+            bufPushByte(b, hexDigitByte((c >>> 4) & 15));
+            bufPushByte(b, hexDigitByte(c & 15))
+        } else {
+            bufPushByte(b, c)
+        };
+        cellSet(i, idx + 1)
+    };
+    bufPushByte(b, 34)
+}
+
+def emitIndent(b: StringBuf, spaces: Int): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < spaces) {
+        bufPushByte(b, 32);
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def emitValue(b: StringBuf, v: Value, pretty: Bool, indent: Int): Void = match v {
+    VNull -> bufPushStr(b, "null"),
+    VBool(true) -> bufPushStr(b, "true"),
+    VBool(false) -> bufPushStr(b, "false"),
+    VInt(n) -> bufPushStr(b, i64ToStr(n)),
+    VFloat(f) -> bufPushStr(b, floatToStr(f)),
+    VStr(s) -> emitJsonString(b, s),
+    VArr(Nil) -> bufPushStr(b, "[]"),
+    VArr(xs) -> {
+        bufPushByte(b, 91);
+        let cur = cellNew(xs);
+        let first = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, t) -> {
+                    if (!cellGet(first)) bufPushByte(b, 44) else ();
+                    cellSet(first, false);
+                    if (pretty) {
+                        bufPushByte(b, 10);
+                        emitIndent(b, indent + 2)
+                    } else ();
+                    emitValue(b, h, pretty, indent + 2);
+                    cellSet(cur, t)
+                },
+                Nil -> (),
+            }
+        };
+        if (pretty) {
+            bufPushByte(b, 10);
+            emitIndent(b, indent)
+        } else ();
+        bufPushByte(b, 93)
+    },
+    VObj(Nil) -> bufPushStr(b, "{}"),
+    VObj(fields) -> {
+        bufPushByte(b, 123);
+        let cur = cellNew(fields);
+        let first = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((k, val), t) -> {
+                    if (!cellGet(first)) bufPushByte(b, 44) else ();
+                    cellSet(first, false);
+                    if (pretty) {
+                        bufPushByte(b, 10);
+                        emitIndent(b, indent + 2)
+                    } else ();
+                    emitJsonString(b, k);
+                    if (pretty) bufPushStr(b, ": ") else bufPushByte(b, 58);
+                    emitValue(b, val, pretty, indent + 2);
+                    cellSet(cur, t)
+                },
+                Nil -> (),
+            }
+        };
+        if (pretty) {
+            bufPushByte(b, 10);
+            emitIndent(b, indent)
+        } else ();
+        bufPushByte(b, 125)
+    },
+}
+
+pub def stringify(v: Value): String = {
+    let b = bufNew();
+    emitValue(b, v, false, 0);
+    bufToString(b)
+}
+
+pub def stringifyPretty(v: Value): String = {
+    let b = bufNew();
+    emitValue(b, v, true, 0);
+    bufToString(b)
+}
+
+pub def toJson(x): forall a. (Encode a) => a -> String =
+    stringify(encode(x))
+
+pub def toJsonPretty(x): forall a. (Encode a) => a -> String =
+    stringifyPretty(encode(x))
+
+pub def decodeString(dec: Decoder a, raw: String): Result a DecodeErr =
+    match parse(raw) {
+        Err(msg) -> Err(makeErr("$", msg)),
+        Ok(v) -> run(dec, v),
+    }

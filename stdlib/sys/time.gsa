@@ -1,0 +1,11 @@
+// Wall-clock and monotonic clocks (`sys.time`)
+
+extern "gs_sys_time_now_ms" def c_now_ms(): Int64
+extern "gs_sys_time_mono_ms" def c_mono_ms(): Int64
+extern "gs_sys_time_mono_ns" def c_mono_ns(): Int64
+
+pub def nowMs(): Int64 = c_now_ms()
+
+pub def monotonicMs(): Int64 = c_mono_ms()
+
+pub def monotonicNanos(): Int64 = c_mono_ns()

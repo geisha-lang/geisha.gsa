@@ -1,0 +1,297 @@
+// Format-agnostic structured values, Encode Concept, and first-class Decoder combinators (`std.codec`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listMap}
+use std.vec.{Vec, vecToList}
+use std.str.intToStr
+
+pub data Value {
+    VNull,
+    VBool(Bool),
+    VInt(Int64),
+    VFloat(Float),
+    VStr(String),
+    VArr(List Value),
+    VObj(List (String, Value)),
+}
+
+pub data DecodeErr {
+    DecodeErr { path: String, message: String },
+}
+
+pub def makeErr(path: String, message: String): DecodeErr =
+    DecodeErr { path: path, message: message }
+
+pub def formatErr(e: DecodeErr): String = e.path + ": " + e.message
+
+def prefixPath(prefix: String, e: DecodeErr): DecodeErr =
+    if (e.path == "$" || strLen(e.path) == 0) {
+        DecodeErr { path: prefix, message: e.message }
+    } else if (strLen(e.path) > 0 && strByteAt(e.path, 0) == 36) {
+        // Strip leading `$` from child path so `$` + `.a` + `.b` => `$.a.b`
+        DecodeErr { path: prefix + strSlice(e.path, 1, strLen(e.path)), message: e.message }
+    } else {
+        DecodeErr { path: prefix + "." + e.path, message: e.message }
+    }
+
+// ---- Clean Value constructors ----
+
+pub def null(): Value = VNull
+pub def boolVal(b: Bool): Value = VBool(b)
+pub def intVal(n: Int): Value = VInt(intToI64(n))
+pub def i64Val(n: Int64): Value = VInt(n)
+pub def floatVal(f: Float): Value = VFloat(f)
+pub def strVal(s: String): Value = VStr(s)
+pub def array(xs: List Value): Value = VArr(xs)
+pub def object(fields: List (String, Value)): Value = VObj(fields)
+
+// ---- Encode Concept & `:=` field pair operator ----
+
+pub concept Encode a {
+    encode: a -> Value
+}
+
+instance Encode Value {
+    def encode(v) = v
+}
+
+instance Encode Bool {
+    def encode(b) = VBool(b)
+}
+
+instance Encode Int {
+    def encode(n) = VInt(intToI64(n))
+}
+
+instance Encode Int64 {
+    def encode(n) = VInt(n)
+}
+
+instance Encode Float {
+    def encode(f) = VFloat(f)
+}
+
+instance Encode String {
+    def encode(s) = VStr(s)
+}
+
+instance (Encode a) => Encode (Option a) {
+    def encode(opt) = match opt {
+        Some(x) -> encode(x),
+        None -> VNull,
+    }
+}
+
+instance (Encode a) => Encode (List a) {
+    def encode(xs) = VArr(listMap(xs, (x) -> encode(x)))
+}
+
+instance (Encode a) => Encode (Vec a) {
+    def encode(v) = encode(vecToList(v))
+}
+
+pub def (:=)(key, val): forall a. (Encode a) => (String, a) -> (String, Value) =
+    (key, encode(val))
+
+// ---- First-class Decoder combinators (Functor / Applicative / Monad / Alternative) ----
+
+pub data Decoder a {
+    Decoder(Value -> Result a DecodeErr),
+}
+
+pub def run(dec: Decoder a, v: Value): Result a DecodeErr = match dec {
+    Decoder(f) -> f(v),
+}
+
+pub def (|>)(x: a, f: a -> b): b = f(x)
+
+pub def succeed(x: a): Decoder a =
+    Decoder((_) -> Ok(x))
+
+pub def fail(msg: String): Decoder a =
+    Decoder((_) -> Err(makeErr("$", msg)))
+
+pub def map(f: a -> b, dec: Decoder a): Decoder b =
+    Decoder((v) -> match run(dec, v) {
+        Ok(a) -> Ok(f(a)),
+        Err(e) -> Err(e),
+    })
+
+pub def apply(df: Decoder (a -> b), da: Decoder a): Decoder b =
+    Decoder((v) -> match run(df, v) {
+        Err(e) -> Err(e),
+        Ok(f) -> match run(da, v) {
+            Err(e2) -> Err(e2),
+            Ok(a) -> Ok(f(a)),
+        },
+    })
+
+pub def andThen(f: a -> Decoder b, dec: Decoder a): Decoder b =
+    Decoder((v) -> match run(dec, v) {
+        Err(e) -> Err(e),
+        Ok(a) -> run(f(a), v),
+    })
+
+pub def (<$>)(f: a -> b, dec: Decoder a): Decoder b = map(f, dec)
+pub def (<*>)(df: Decoder (a -> b), da: Decoder a): Decoder b = apply(df, da)
+pub def (>>=)(dec: Decoder a, f: a -> Decoder b): Decoder b = andThen(f, dec)
+
+pub def (<|>)(d1: Decoder a, d2: Decoder a): Decoder a =
+    Decoder((v) -> match run(d1, v) {
+        Ok(x) -> Ok(x),
+        Err(_) -> run(d2, v),
+    })
+
+// ---- Primitive decoders ----
+
+pub def value: Decoder Value =
+    Decoder((v) -> Ok(v))
+
+pub def valueTypeName(v: Value): String = match v {
+    VNull -> "null",
+    VBool(_) -> "bool",
+    VInt(_) -> "int",
+    VFloat(_) -> "float",
+    VStr(_) -> "string",
+    VArr(_) -> "array",
+    VObj(_) -> "object",
+}
+
+pub def isNull: Decoder Void =
+    Decoder((v) -> match v {
+        VNull -> Ok(()),
+        _ -> Err(makeErr("$", "expected null, got " + valueTypeName(v))),
+    })
+
+pub def bool: Decoder Bool =
+    Decoder((v) -> match v {
+        VBool(b) -> Ok(b),
+        _ -> Err(makeErr("$", "expected bool, got " + valueTypeName(v))),
+    })
+
+pub def i64: Decoder Int64 =
+    Decoder((v) -> match v {
+        VInt(n) -> Ok(n),
+        _ -> Err(makeErr("$", "expected int, got " + valueTypeName(v))),
+    })
+
+pub def int: Decoder Int =
+    Decoder((v) -> match v {
+        VInt(n) -> Ok(i64ToInt(n)),
+        _ -> Err(makeErr("$", "expected int, got " + valueTypeName(v))),
+    })
+
+pub def float: Decoder Float =
+    Decoder((v) -> match v {
+        VFloat(f) -> Ok(f),
+        VInt(n) -> Ok(intToFloat(i64ToInt(n))),
+        _ -> Err(makeErr("$", "expected number, got " + valueTypeName(v))),
+    })
+
+pub def str: Decoder String =
+    Decoder((v) -> match v {
+        VStr(s) -> Ok(s),
+        _ -> Err(makeErr("$", "expected string, got " + valueTypeName(v))),
+    })
+
+// ---- Container & Object combinators ----
+
+pub def nullable(inner: Decoder a): Decoder (Option a) =
+    Decoder((v) -> match v {
+        VNull -> Ok(None),
+        _ -> match run(inner, v) {
+            Ok(x) -> Ok(Some(x)),
+            Err(e) -> Err(e),
+        },
+    })
+
+def decodeListLoop(xs: List Value, elem: Decoder a, idx: Int, acc: List a): Result (List a) DecodeErr =
+    match xs {
+        Nil -> Ok(listRev(acc)),
+        Cons(h, t) -> match run(elem, h) {
+            Ok(item) -> decodeListLoop(t, elem, idx + 1, Cons(item, acc)),
+            Err(e) -> Err(prefixPath("$[" + intToStr(idx) + "]", e)),
+        },
+    }
+
+pub def list(elem: Decoder a): Decoder (List a) =
+    Decoder((v) -> match v {
+        VArr(xs) -> decodeListLoop(xs, elem, 0, Nil),
+        _ -> Err(makeErr("$", "expected array, got " + valueTypeName(v))),
+    })
+
+def lookupField(fields: List (String, Value), key: String): Option Value = match fields {
+    Nil -> None,
+    Cons((k, v), rest) -> if (k == key) Some(v) else lookupField(rest, key),
+}
+
+pub def at(key: String, dec: Decoder a): Decoder a =
+    Decoder((v) -> match v {
+        VObj(fields) -> match lookupField(fields, key) {
+            None -> Err(makeErr("$." + key, "missing required field")),
+            Some(fv) -> match run(dec, fv) {
+                Ok(x) -> Ok(x),
+                Err(e) -> Err(prefixPath("$." + key, e)),
+            },
+        },
+        _ -> Err(makeErr("$", "expected object for field '" + key + "', got " + valueTypeName(v))),
+    })
+
+pub def atOpt(key: String, dec: Decoder a): Decoder (Option a) =
+    Decoder((v) -> match v {
+        VObj(fields) -> match lookupField(fields, key) {
+            None -> Ok(None),
+            Some(VNull) -> Ok(None),
+            Some(fv) -> match run(dec, fv) {
+                Ok(x) -> Ok(Some(x)),
+                Err(e) -> Err(prefixPath("$." + key, e)),
+            },
+        },
+        _ -> Err(makeErr("$", "expected object for optional field '" + key + "', got " + valueTypeName(v))),
+    })
+
+pub def atOr(key: String, dec: Decoder a, fallback: a): Decoder a =
+    map((opt) -> match opt { Some(x) -> x, None -> fallback }, atOpt(key, dec))
+
+// ---- Pipeline combinators (`succeed(ctor) |> req(...) |> opt(...) |> withDefault(...)`) ----
+
+pub def req(key: String, dec: Decoder a): Decoder (a -> b) -> Decoder b =
+    (df) -> apply(df, at(key, dec))
+
+pub def opt(key: String, dec: Decoder a): Decoder (Option a -> b) -> Decoder b =
+    (df) -> apply(df, atOpt(key, dec))
+
+pub def withDefault(key: String, dec: Decoder a, fallback: a): Decoder (a -> b) -> Decoder b =
+    (df) -> apply(df, atOr(key, dec, fallback))
+
+pub def hardcoded(val: a): Decoder (a -> b) -> Decoder b =
+    (df) -> apply(df, succeed(val))
+
+// ---- Sum-type / ADT combinators ----
+
+def oneOfLoop(decs: List (Decoder a), v: Value): Result a DecodeErr = match decs {
+    Nil -> Err(makeErr("$", "no decoder in oneOf matched")),
+    Cons(d, Nil) -> run(d, v),
+    Cons(d, rest) -> match run(d, v) {
+        Ok(x) -> Ok(x),
+        Err(_) -> oneOfLoop(rest, v),
+    },
+}
+
+pub def oneOf(decs: List (Decoder a)): Decoder a =
+    Decoder((v) -> oneOfLoop(decs, v))
+
+def lookupVariant(variants: List (String, Decoder a), tag: String): Option (Decoder a) = match variants {
+    Nil -> None,
+    Cons((name, dec), rest) -> if (name == tag) Some(dec) else lookupVariant(rest, tag),
+}
+
+pub def tagged(tagField: String, variants: List (String, Decoder a)): Decoder a =
+    andThen(
+        (tag) -> match lookupVariant(variants, tag) {
+            Some(dec) -> dec,
+            None -> fail("unknown tag '" + tag + "' in field '" + tagField + "'"),
+        },
+        at(tagField, str)
+    )

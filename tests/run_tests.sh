@@ -191,4 +191,199 @@ fi
 echo "PASS [non_exhaustive_rejected]: rejected non-exhaustive match"
 PASS=$((PASS + 1))
 
+# 7. `std.codec` + `std.json`: First-class Decoder Pipelines, `Encode` + `:=`, Tagged ADTs & Path Errors
+cat > "$TMP_DIR/t7_codec_json.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.str.intToStr
+use std.codec.{
+    Value, DecodeErr, Decoder, Encode, encode, formatErr,
+    object, (:=), (|>),
+    succeed, map, int, str, list, at, req, opt, withDefault, tagged
+}
+use std.json.{toJson, decodeString}
+
+data Player {
+    Player { id: String, name: String, hp: Int, title: Option String },
+}
+
+data Action {
+    Move(String),
+    Rest,
+}
+
+instance Encode Player {
+    def encode(p) = object([
+        "id"    := p.id,
+        "name"  := p.name,
+        "hp"    := p.hp,
+        "title" := p.title,
+    ])
+}
+
+def decodePlayer(): Decoder Player =
+    succeed((id) -> (name) -> (hp) -> (title) -> Player {
+        id: id, name: name, hp: hp, title: title
+    })
+        |> req("id", str)
+        |> req("name", str)
+        |> withDefault("hp", int, 100)
+        |> opt("title", str)
+
+def decodeAction(): Decoder Action =
+    tagged("type", [
+        ("move", map((d) -> Move(d), at("dir", str))),
+        ("rest", succeed(Rest)),
+    ])
+
+def main() = {
+    let p = Player { id: "p1", name: "Linghu", hp: 85, title: Some("Swordsman") };
+    let raw = toJson(p);
+    let rt = match decodeString(decodePlayer(), raw) {
+        Ok(p2) -> p2.id + ":" + p2.name + ":" + intToStr(p2.hp) + ":" + match p2.title { Some(t) -> t, None -> "-" },
+        Err(e) -> "ERR:" + formatErr(e),
+    };
+
+    // Missing optional + default hp + Unicode escape \u0041 ('A')
+    let defRaw = "{\"id\":\"p2\",\"name\":\"\\u0041li\"}";
+    let defRes = match decodeString(decodePlayer(), defRaw) {
+        Ok(p2) -> p2.name + ":" + intToStr(p2.hp),
+        Err(e) -> "ERR:" + formatErr(e),
+    };
+
+    // Tagged ADT sum type
+    let actRes = match decodeString(decodeAction(), "{\"type\":\"move\",\"dir\":\"north\"}") {
+        Ok(Move(d)) -> "move:" + d,
+        Ok(Rest) -> "rest",
+        Err(e) -> "ERR:" + formatErr(e),
+    };
+
+    // Nested JSONPath error reporting
+    let badRes = match decodeString(at("items", list(int)), "{\"items\":[1,\"oops\",3]}") {
+        Ok(_) -> "unexpected-ok",
+        Err(e) -> e.path,
+    };
+
+    printLn(rt + "|" + defRes + "|" + actRes + "|" + badRes)
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t7_codec_json" "$TMP_DIR/t7_codec_json.gsa"
+assert_eq "codec_json_pipeline_and_errors" "p1:Linghu:85:Swordsman|Ali:100|move:north|$.items[1]" "$("$TMP_DIR/t7_codec_json")"
+
+# 8. `sys.fs` (`mkdirAll`/`isDir`/`readDir`), `sys.time`, and `std.rand`
+cat > "$TMP_DIR/t8_sys_rand.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use std.list.{listLen, listAny}
+use std.str.intToStr
+use sys.fs.{mkdirAll, isDir, writeFile, readDir}
+use sys.time.{nowMs, monotonicMs}
+use std.rand.{fromSeed, fromEntropy, nextInt, nextRange}
+
+def main() = {
+    let base = "TMP_FS_DIR_PLACEHOLDER";
+    let nested = base + "/a/b";
+    let mkOk = match mkdirAll(nested) { Ok(_) -> isDir(nested), Err(_) -> false };
+    let _ = writeFile(nested + "/one.txt", "1");
+    let _ = writeFile(nested + "/two.txt", "2");
+    let dirOk = match readDir(nested) {
+        Ok(entries) -> listLen(entries) == 2 && listAny(entries, (e) -> e == "one.txt"),
+        Err(_) -> false,
+    };
+
+    let tOk = nowMs() > (intToI64(1700000000) * intToI64(1000)) && monotonicMs() >= intToI64(0);
+
+    let r1 = fromSeed(intToI64(42));
+    let (a1, r1b) = nextRange(r1, 10, 20);
+    let (a2, _) = nextRange(fromSeed(intToI64(42)), 10, 20);
+    let (b1, _) = nextInt(r1b, 100);
+    let (_, _) = nextInt(fromEntropy(), 100);
+    let randOk = (a1 == a2) && (a1 >= 10) && (a1 <= 20) && (b1 >= 0) && (b1 < 100);
+
+    let s = (if (mkOk) "1" else "0") + (if (dirOk) "1" else "0") + (if (tOk) "1" else "0") + (if (randOk) "1" else "0");
+    printLn(s)
+}
+EOF
+sed "s|TMP_FS_DIR_PLACEHOLDER|$TMP_DIR/fs_test|g" "$TMP_DIR/t8_sys_rand.gsa" > "$TMP_DIR/t8_sys_rand_run.gsa"
+"$GEISHA_BIN" -o "$TMP_DIR/t8_sys_rand" "$TMP_DIR/t8_sys_rand_run.gsa"
+assert_eq "sys_fs_time_and_std_rand" "1111" "$("$TMP_DIR/t8_sys_rand")"
+
+# 9. `sys.net` + `std.ws`: RFC 6455 Handshake & Concurrent Loopback WebSocket + JSON Echo
+cat > "$TMP_DIR/t9_ws_loopback.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use std.task.{spawn, await}
+use std.codec.{object, (:=), at, str}
+use std.json.{toJson, decodeString}
+use sys.net.{tcpListen, tcpLocalPort, tcpAccept, tcpCloseListener}
+use std.ws.{
+    WsText, WsClose, wsAcceptKey, wsAccept, wsConnect,
+    wsRecv, wsSendText, wsSendTextMasked, wsSendClose, wsClose
+}
+
+def main() = {
+    // RFC 6455 Section 1.3 official test vector
+    let keyCheck = wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ==");
+
+    let listener = match tcpListen("127.0.0.1", 0) {
+        Ok(l) -> l,
+        Err(e) -> { printLn("LISTEN_ERR:" + e); l_fail() },
+    };
+    let port = tcpLocalPort(listener);
+
+    let srv = spawn(() -> {
+        let res = match tcpAccept(listener) {
+            Err(e) -> "ACCEPT_ERR:" + e,
+            Ok(stream) -> match wsAccept(stream) {
+                Err(e) -> "WS_ACCEPT_ERR:" + e,
+                Ok(conn) -> {
+                    let out = match wsRecv(conn) {
+                        Ok(WsText(msg)) -> match decodeString(at("msg", str), msg) {
+                            Ok(word) -> {
+                                let reply = toJson(object(["echo" := word + "!"]));
+                                let _ = wsSendText(conn, reply);
+                                "srv-ok"
+                            },
+                            Err(_) -> "decode-err",
+                        },
+                        _ -> "recv-err",
+                    };
+                    let _ = wsRecv(conn);
+                    wsClose(conn);
+                    out
+                },
+            },
+        };
+        tcpCloseListener(listener);
+        res
+    });
+
+    let cliRes = match wsConnect("127.0.0.1", port, "/ws") {
+        Err(e) -> "CLI_CONN_ERR:" + e,
+        Ok(conn) -> {
+            let payload = toJson(object(["msg" := "tingfeng"]));
+            let _ = wsSendTextMasked(conn, payload);
+            let got = match wsRecv(conn) {
+                Ok(WsText(reply)) -> match decodeString(at("echo", str), reply) {
+                    Ok(v) -> v,
+                    Err(_) -> "cli-decode-err",
+                },
+                _ -> "cli-recv-err",
+            };
+            let _ = wsSendClose(conn, 1000, "bye");
+            wsClose(conn);
+            got
+        },
+    };
+
+    let srvRes = await(srv);
+    printLn(keyCheck + "|" + srvRes + "|" + cliRes)
+}
+
+def l_fail(): sys.net.TcpListener = {
+    let _ = arrayGet(arrayNew(0, 0), 0);
+    sys.net.TcpListener(-1)
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t9_ws_loopback" "$TMP_DIR/t9_ws_loopback.gsa"
+assert_eq "net_and_ws_json_loopback" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=|srv-ok|tingfeng!" "$("$TMP_DIR/t9_ws_loopback")"
+
 echo "All $PASS end-to-end test suites passed!"

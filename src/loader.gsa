@@ -784,12 +784,29 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
         },
         ItInstance(cname, targs, cs, impls) -> {
             let qcn = match strMapGet(ctx.tyMap, cname) { Some(q) -> q, None -> cname };
+            let qcnPrefix = {
+                let n = strLen(qcn);
+                let lastDot = cellNew(-1);
+                let idx = cellNew(0);
+                while (cellGet(idx) < n) {
+                    let k = cellGet(idx);
+                    if (strByteAt(qcn, k) == 46) cellSet(lastDot, k) else ();
+                    cellSet(idx, k + 1)
+                };
+                if (cellGet(lastDot) > 0) strSlice(qcn, 0, cellGet(lastDot)) else ""
+            };
             let newImpls = cellNew(Nil);
             let cur = cellNew(impls);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
                     Cons(mi, r) -> {
-                        let nmi = MkMethodImpl { implName: mi.implName, implBody: rewriteFormInMod(ctx, mi.implBody, Nil) };
+                        let qImplName = match strMapGet(ctx.valMap, mi.implName) {
+                            Some(q) -> q,
+                            None ->
+                                if (strLen(qcnPrefix) > 0) qcnPrefix + "." + mi.implName
+                                else mi.implName,
+                        };
+                        let nmi = MkMethodImpl { implName: qImplName, implBody: rewriteFormInMod(ctx, mi.implBody, Nil) };
                         cellSet(newImpls, listAppend(cellGet(newImpls), [nmi]));
                         cellSet(cur, r)
                     },

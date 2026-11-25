@@ -1,0 +1,154 @@
+// Blocking-safe POSIX TCP sockets (`sys.net`)
+// Every `extern` call runs inside the runtime GC blocking region so concurrent
+// `accept` / `read` / `write` calls never stall multicore STW collection.
+
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushByte, bufToString}
+
+extern "gs_net_tcp_listen" def c_tcp_listen(host: String, port: Int, backlog: Int): Int
+extern "gs_net_tcp_local_port" def c_tcp_local_port(fd: Int): Int
+extern "gs_net_tcp_accept" def c_tcp_accept(fd: Int): Int
+extern "gs_net_tcp_connect" def c_tcp_connect(host: String, port: Int): Int
+extern "gs_net_tcp_read" def c_tcp_read(fd: Int, buf: Ptr, cap: Int): Int
+extern "gs_net_tcp_write" def c_tcp_write(fd: Int, buf: Ptr, len: Int): Int
+extern "gs_net_tcp_write" def c_tcp_write_str(fd: Int, buf: String, len: Int): Int
+extern "gs_net_tcp_close" def c_tcp_close(fd: Int): Int
+
+pub data TcpListener {
+    TcpListener(Int),
+}
+
+pub data TcpStream {
+    TcpStream(Int),
+}
+
+pub def tcpListen(host: String, port: Int): Result TcpListener String = {
+    let fd = c_tcp_listen(host, port, 128);
+    if (fd < 0) Err("failed to listen on " + host)
+    else Ok(TcpListener(fd))
+}
+
+pub def tcpLocalPort(listener: TcpListener): Int = match listener {
+    TcpListener(fd) -> c_tcp_local_port(fd),
+}
+
+pub def tcpAccept(listener: TcpListener): Result TcpStream String = match listener {
+    TcpListener(fd) -> {
+        let client = c_tcp_accept(fd);
+        if (client < 0) Err("tcp accept failed")
+        else Ok(TcpStream(client))
+    },
+}
+
+pub def tcpCloseListener(listener: TcpListener): Void = match listener {
+    TcpListener(fd) -> {
+        let _ = c_tcp_close(fd);
+        ()
+    },
+}
+
+pub def tcpConnect(host: String, port: Int): Result TcpStream String = {
+    let fd = c_tcp_connect(host, port);
+    if (fd < 0) Err("failed to connect to " + host)
+    else Ok(TcpStream(fd))
+}
+
+pub def tcpClose(stream: TcpStream): Void = match stream {
+    TcpStream(fd) -> {
+        let _ = c_tcp_close(fd);
+        ()
+    },
+}
+
+pub def tcpReadPtr(stream: TcpStream, buf: Ptr, cap: Int): Result Int String = match stream {
+    TcpStream(fd) -> {
+        let n = c_tcp_read(fd, buf, cap);
+        if (n < 0) Err("tcp read failed")
+        else Ok(n)
+    },
+}
+
+pub def tcpReadExactPtr(stream: TcpStream, buf: Ptr, count: Int): Result Void String = {
+    let got = cellNew(0);
+    let tmp = ptrAllocBytes(if (count <= 0) 1 else count);
+    let err = cellNew("");
+    while (cellGet(got) < count && strLen(cellGet(err)) == 0) {
+        let rem = count - cellGet(got);
+        match tcpReadPtr(stream, tmp, rem) {
+            Err(e) -> cellSet(err, e),
+            Ok(n) ->
+                if (n == 0) {
+                    cellSet(err, "unexpected EOF on tcp stream")
+                } else {
+                    let base = cellGet(got);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n) {
+                        let off = cellGet(i);
+                        ptrSetByte(buf, base + off, ptrByteAt(tmp, off));
+                        cellSet(i, off + 1)
+                    };
+                    cellSet(got, base + n)
+                },
+        }
+    };
+    if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+    else Ok(())
+}
+
+pub def tcpRead(stream: TcpStream, maxBytes: Int): Result String String = {
+    let cap = if (maxBytes <= 0) 1 else maxBytes;
+    let buf = ptrAllocBytes(cap);
+    let n = tcpReadPtr(stream, buf, cap)?;
+    let out = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        bufPushByte(out, ptrByteAt(buf, idx));
+        cellSet(i, idx + 1)
+    };
+    Ok(bufToString(out))
+}
+
+pub def tcpWritePtr(stream: TcpStream, buf: Ptr, len: Int): Result Void String = match stream {
+    TcpStream(fd) -> {
+        let sent = cellNew(0);
+        let err = cellNew("");
+        let scratch = ptrAllocBytes(if (len <= 0) 1 else len);
+        while (cellGet(sent) < len && strLen(cellGet(err)) == 0) {
+            let off = cellGet(sent);
+            let rem = len - off;
+            let n = if (off == 0) {
+                c_tcp_write(fd, buf, rem)
+            } else {
+                let i = cellNew(0);
+                while (cellGet(i) < rem) {
+                    let k = cellGet(i);
+                    ptrSetByte(scratch, k, ptrByteAt(buf, off + k));
+                    cellSet(i, k + 1)
+                };
+                c_tcp_write(fd, scratch, rem)
+            };
+            if (n <= 0) cellSet(err, "tcp write failed")
+            else cellSet(sent, off + n)
+        };
+        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+        else Ok(())
+    },
+}
+
+pub def tcpWrite(stream: TcpStream, payload: String): Result Void String = match stream {
+    TcpStream(fd) -> {
+        let total = strLen(payload);
+        let sent = cellNew(0);
+        let err = cellNew("");
+        while (cellGet(sent) < total && strLen(cellGet(err)) == 0) {
+            let off = cellGet(sent);
+            let slice = if (off == 0) payload else strSlice(payload, off, total);
+            let n = c_tcp_write_str(fd, slice, total - off);
+            if (n <= 0) cellSet(err, "tcp write failed")
+            else cellSet(sent, off + n)
+        };
+        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+        else Ok(())
+    },
+}

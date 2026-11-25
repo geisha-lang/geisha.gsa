@@ -21,10 +21,16 @@ MODULES = [
     ("std.sync", "std/sync.gsa"),
     ("std.task", "std/task.gsa"),
     ("std.actor", "std/actor.gsa"),
+    ("std.rand", "std/rand.gsa"),
+    ("std.codec", "std/codec.gsa"),
+    ("std.json", "std/json.gsa"),
+    ("std.ws", "std/ws.gsa"),
     ("sys.io", "sys/io.gsa"),
     ("sys.fs", "sys/fs.gsa"),
     ("sys.env", "sys/env.gsa"),
     ("sys.proc", "sys/proc.gsa"),
+    ("sys.time", "sys/time.gsa"),
+    ("sys.net", "sys/net.gsa"),
 ]
 
 

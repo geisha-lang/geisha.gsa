@@ -1,0 +1,64 @@
+// Deterministic pure-functional PRNG (SplitMix64) + OS entropy seeding (`std.rand`)
+
+extern "gs_sys_rand_seed" def c_rand_seed(): Int64
+
+pub data Rng {
+    Rng(Int64),
+}
+
+def u64FromHalves(hi: Int, lo: Int): Int64 = {
+    let loMask = (intToI64(1) << 32) - intToI64(1);
+    (intToI64(hi) << 32) | (intToI64(lo) & loMask)
+}
+
+pub def fromSeed(seed: Int64): Rng = Rng(seed)
+
+pub def fromIntSeed(seed: Int): Rng = Rng(intToI64(seed))
+
+pub def fromEntropy(): Rng = Rng(c_rand_seed())
+
+pub def nextI64(rng: Rng): (Int64, Rng) = match rng {
+    Rng(state) -> {
+        let gamma = u64FromHalves(-1640531527, 2135587861);
+        let mul1 = u64FromHalves(-1084733587, 484763065);
+        let mul2 = u64FromHalves(-1798288965, 321982955);
+        let nextState = state + gamma;
+        let z1 = (nextState ^ (nextState >>> 30)) * mul1;
+        let z2 = (z1 ^ (z1 >>> 27)) * mul2;
+        let out = z2 ^ (z2 >>> 31);
+        (out, Rng(nextState))
+    },
+}
+
+pub def nextInt(rng: Rng, bound: Int): (Int, Rng) =
+    if (bound <= 1) {
+        let (_, r2) = nextI64(rng);
+        (0, r2)
+    } else {
+        let (v, r2) = nextI64(rng);
+        let pos = v >>> 1;
+        let rem = pos % intToI64(bound);
+        (i64ToInt(rem), r2)
+    }
+
+pub def nextRange(rng: Rng, lo: Int, hi: Int): (Int, Rng) =
+    if (hi <= lo) {
+        let (_, r2) = nextI64(rng);
+        (lo, r2)
+    } else {
+        let (off, r2) = nextInt(rng, hi - lo + 1);
+        (lo + off, r2)
+    }
+
+pub def nextBool(rng: Rng): (Bool, Rng) = {
+    let (v, r2) = nextI64(rng);
+    ((v & intToI64(1)) != intToI64(0), r2)
+}
+
+pub def nextFloat(rng: Rng): (Float, Rng) = {
+    let (v, r2) = nextI64(rng);
+    // Use 30 uniform bits -> [0.0, 1.0)
+    let bits = i64ToInt(v >>> 34);
+    let f = intToFloat(bits) / 1073741824.0;
+    (f, r2)
+}

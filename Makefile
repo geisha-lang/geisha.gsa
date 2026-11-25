@@ -16,11 +16,12 @@ $(BUILD_DIR):
 
 runtime: $(RUNTIME_LIB)
 
-$(RUNTIME_LIB): runtime/base.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+$(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/base.o
+	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/gs_sys.o
 	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/gc_bitmap.o
 	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/gs_conc.o
-	ar rcs $(RUNTIME_LIB) $(BUILD_DIR)/base.o $(BUILD_DIR)/gc_bitmap.o $(BUILD_DIR)/gs_conc.o
+	ar rcs $(RUNTIME_LIB) $(BUILD_DIR)/base.o $(BUILD_DIR)/gs_sys.o $(BUILD_DIR)/gc_bitmap.o $(BUILD_DIR)/gs_conc.o
 
 stdlib-bundle:
 	python3 scripts/gen_stdlib.py
