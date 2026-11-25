@@ -9,14 +9,15 @@
 
 #include "gsvalue.h"
 
-/* Relaxed/release atomic flag polled by LLVM-generated loop backedges & function prologues */
+/* Relaxed/seq_cst atomic flag polled by LLVM-generated loop backedges & function prologues */
 extern int32_t __gs_gc_stw_requested;
 
 void gc_init(size_t init_size_words);
 void gc_init_with_stack(size_t init_size_words, void *stack_anchor);
+void gc_enable_generational(void);
 void gc_register_root(void **slot);
 
-/* Multicore thread lifecycle & cooperative safepoint / blocking-section protocol */
+/* Multicore thread lifecycle & cooperative safepoint / lock-free blocking-section protocol */
 void gc_thread_attach(void *stack_anchor);
 void gc_thread_detach(void);
 void gc_safepoint_slow(void);
@@ -26,7 +27,18 @@ void gc_leave_blocking(void);
 /* Allocation APIs */
 void *gc_alloc(size_t size_bytes);
 void *gc_alloc_atomic(size_t size_bytes);
+void *gc_alloc_atomic_uninit(size_t size_bytes);
+void *gc_alloc_masked(size_t size_bytes, uint64_t ptr_mask);
+
+/* Sticky generational write barrier (called on pointer mutations to Cell / MutArray) */
+void gc_write_barrier(void *container_ptr);
+
+/* Diagnostics & explicit collection */
+void gc_collect_major(void);
 size_t gc_collection_count(void);
+size_t gc_minor_collection_count(void);
+size_t gc_major_collection_count(void);
+size_t gc_heap_live_bytes(void);
 
 /* STW hooks used by `gs_conc.c` to trace in-flight concurrent containers & finalize dead handles */
 bool gc_is_obj_marked(const void *payload_ptr);

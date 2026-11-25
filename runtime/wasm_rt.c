@@ -40,8 +40,14 @@ static uintptr_t gs_raw_cursor = 0;
 static uintptr_t gs_raw_end = 0;
 
 static wasm_seg_t *gs_segs = NULL;
+static wasm_seg_t *gs_last_seg = NULL;
 static uint32_t gs_min_addr = 0xFFFFFFFFu;
 static uint32_t gs_max_addr = 0;
+
+/* Fast bump-pointer cursor inside the active segment (avoids free-list churn) */
+static wasm_seg_t *gs_bump_seg = NULL;
+static uint32_t gs_bump_cur = 0;
+static uint32_t gs_bump_end = 0;
 
 static wasm_free_t *gs_free_bins[NUM_FREE_BINS];
 static uint32_t gs_free_mask = 0;
@@ -133,18 +139,30 @@ static wasm_seg_t *alloc_segment(uint32_t min_payload_bytes)
     /* Note: memory from memory.grow is already zeroed, so alloc_bits starts all-zero */
 
     gs_segs = seg;
+    gs_last_seg = seg;
     gs_total_seg_bytes += payload_bytes;
     if (seg->payload_base < gs_min_addr) gs_min_addr = seg->payload_base;
     if (seg->payload_end > gs_max_addr) gs_max_addr = seg->payload_end;
 
-    free_list_insert(seg->payload_base, payload_bytes);
+    /* Install new segment directly as bump region (return leftover old bump region to free bins) */
+    if (gs_bump_end > gs_bump_cur && (gs_bump_end - gs_bump_cur) >= 8u) {
+        free_list_insert(gs_bump_cur, gs_bump_end - gs_bump_cur);
+    }
+    gs_bump_seg = seg;
+    gs_bump_cur = seg->payload_base;
+    gs_bump_end = seg->payload_end;
     return seg;
 }
 
 static inline wasm_seg_t *find_seg_for_hdr(uint32_t hdr_addr)
 {
+    wasm_seg_t *ls = gs_last_seg;
+    if (ls != NULL && hdr_addr >= ls->payload_base && hdr_addr < ls->payload_end) {
+        return ls;
+    }
     for (wasm_seg_t *s = gs_segs; s != NULL; s = s->next) {
         if (hdr_addr >= s->payload_base && hdr_addr < s->payload_end) {
+            gs_last_seg = s;
             return s;
         }
     }
@@ -226,22 +244,34 @@ static uint32_t pickup_free(uint32_t need_bytes, uint32_t *out_bytes)
     return 0u;
 }
 
-static void *wasm_alloc_impl(int64_t bytes, int noscan)
+static void *wasm_alloc_impl(int64_t bytes, int noscan, int zero_init)
 {
     uint32_t payload_bytes = (bytes <= 0) ? 8u : align8((uint32_t)bytes);
     uint32_t total_bytes = payload_bytes + 8u; /* +8B header */
 
     uint32_t actual_bytes = total_bytes;
-    uint32_t hdr_addr = pickup_free(total_bytes, &actual_bytes);
-    if (hdr_addr == 0u) {
-        alloc_segment(total_bytes);
+    uint32_t hdr_addr = 0u;
+    wasm_seg_t *seg = NULL;
+
+    /* 1. O(1) bump-pointer fast path in active segment */
+    if (gs_bump_cur + total_bytes <= gs_bump_end) {
+        hdr_addr = gs_bump_cur;
+        gs_bump_cur += total_bytes;
+        seg = gs_bump_seg;
+    } else {
+        /* 2. Segregated free-list allocation */
         hdr_addr = pickup_free(total_bytes, &actual_bytes);
-        if (hdr_addr == 0u) {
-            __builtin_trap();
+        if (hdr_addr != 0u) {
+            seg = find_seg_for_hdr(hdr_addr);
+        } else {
+            /* 3. Allocate a new segment and bump directly */
+            seg = alloc_segment(total_bytes);
+            hdr_addr = gs_bump_cur;
+            gs_bump_cur += total_bytes;
+            actual_bytes = total_bytes;
         }
     }
 
-    wasm_seg_t *seg = find_seg_for_hdr(hdr_addr);
     if (seg != NULL) {
         uint32_t slot = (hdr_addr - seg->payload_base) >> 3;
         seg->alloc_bits[slot >> 5] |= (1u << (slot & 31u));
@@ -251,23 +281,29 @@ static void *wasm_alloc_impl(int64_t bytes, int noscan)
     *hdr = ((uint64_t)actual_bytes) | HDR_ALLOC_BIT | (noscan ? HDR_NOSCAN_BIT : 0ULL);
     gs_live_bytes += actual_bytes;
 
-    /* Zero payload so reused freed blocks never leak stale pointers to conservative GC */
     uint64_t *p = hdr + 1;
-    uint32_t qwords = (actual_bytes - 8u) >> 3;
-    for (uint32_t i = 0; i < qwords; i++) {
-        p[i] = 0ULL;
+    if (zero_init) {
+        uint32_t qwords = (actual_bytes - 8u) >> 3;
+        for (uint32_t i = 0; i < qwords; i++) {
+            p[i] = 0ULL;
+        }
     }
     return (void *)p;
 }
 
 void *gc_alloc(int64_t bytes)
 {
-    return wasm_alloc_impl(bytes, 0);
+    return wasm_alloc_impl(bytes, 0, 1);
 }
 
 void *gc_alloc_atomic(int64_t bytes)
 {
-    return wasm_alloc_impl(bytes, 1);
+    return wasm_alloc_impl(bytes, 1, 1);
+}
+
+void *gc_alloc_atomic_uninit(int64_t bytes)
+{
+    return wasm_alloc_impl(bytes, 1, 0);
 }
 
 void gc_init_with_stack(int64_t heap_words, void *stack_anchor)
@@ -292,13 +328,11 @@ static inline uint32_t find_allocated_hdr(uint32_t payload_ptr)
         return 0u;
     }
     uint32_t hdr_addr = payload_ptr - 8u;
-    for (wasm_seg_t *s = gs_segs; s != NULL; s = s->next) {
-        if (hdr_addr >= s->payload_base && hdr_addr < s->payload_end) {
-            uint32_t slot = (hdr_addr - s->payload_base) >> 3;
-            if (s->alloc_bits[slot >> 5] & (1u << (slot & 31u))) {
-                return hdr_addr;
-            }
-            return 0u;
+    wasm_seg_t *s = find_seg_for_hdr(hdr_addr);
+    if (s != NULL) {
+        uint32_t slot = (hdr_addr - s->payload_base) >> 3;
+        if (s->alloc_bits[slot >> 5] & (1u << (slot & 31u))) {
+            return hdr_addr;
         }
     }
     return 0u;
@@ -394,8 +428,14 @@ int32_t gs_wasm_gc_collect(void)
 
     /* 2. Sweep segments, clear mark bits, and coalesce dead runs into segregated free bins */
     free_list_clear();
+    gs_bump_seg = NULL;
+    gs_bump_cur = 0;
+    gs_bump_end = 0;
     uint32_t prev_live = gs_live_bytes;
     uint32_t new_live = 0;
+    uint32_t best_bump_bytes = 0;
+    uint32_t best_bump_addr = 0;
+    wasm_seg_t *best_bump_seg = NULL;
 
     for (wasm_seg_t *s = gs_segs; s != NULL; s = s->next) {
         uint32_t cur = s->payload_base;
@@ -423,7 +463,14 @@ int32_t gs_wasm_gc_collect(void)
                 if (hdr_val & HDR_MARK_BIT) {
                     *hp = hdr_val & ~HDR_MARK_BIT;
                     if (free_bytes >= 8u) {
-                        free_list_insert(free_start, free_bytes);
+                        if (free_bytes > best_bump_bytes) {
+                            if (best_bump_bytes >= 8u) free_list_insert(best_bump_addr, best_bump_bytes);
+                            best_bump_addr = free_start;
+                            best_bump_bytes = free_bytes;
+                            best_bump_seg = s;
+                        } else {
+                            free_list_insert(free_start, free_bytes);
+                        }
                     }
                     free_bytes = 0;
                     new_live += sz;
@@ -443,8 +490,21 @@ int32_t gs_wasm_gc_collect(void)
         }
 
         if (free_bytes >= 8u) {
-            free_list_insert(free_start, free_bytes);
+            if (free_bytes > best_bump_bytes) {
+                if (best_bump_bytes >= 8u) free_list_insert(best_bump_addr, best_bump_bytes);
+                best_bump_addr = free_start;
+                best_bump_bytes = free_bytes;
+                best_bump_seg = s;
+            } else {
+                free_list_insert(free_start, free_bytes);
+            }
         }
+    }
+
+    if (best_bump_bytes >= 8u) {
+        gs_bump_seg = best_bump_seg;
+        gs_bump_cur = best_bump_addr;
+        gs_bump_end = best_bump_addr + best_bump_bytes;
     }
 
     gs_live_bytes = new_live;

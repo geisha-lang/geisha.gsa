@@ -5,7 +5,7 @@ use std.list.{listRev, listLen}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
-use std.str.{intToStr, floatToHex16, strJoin}
+use std.str.{intToStr, i64ToStr, floatToHex16, strJoin}
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, schemeBody,
@@ -252,6 +252,74 @@ pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = matc
 pub def typeSizeAndAlign(ty: Type): (Int, Int) = typeSizeAndAlignFor(ty, 8)
 
 pub def structSizeAndAlign(elems: List Type): (Int, Int) = structSizeAndAlignFor(elems, 8)
+
+// Compute exact 40-bit GC pointer word mask on LP64 (`ptrSize == 8`).
+// Returns `None` to fall back to conservative `@gc_alloc` if layout is unknown or >40 words.
+def accumPtrMaskType(ty: Type, baseOff: Int, maskAcc: Int64): Option Int64 = match ty {
+    TyVoid -> Some(maskAcc),
+    TyVar(_) -> None,
+    TyTuple(es) -> accumPtrMaskFields(es, baseOff, maskAcc),
+    _ ->
+        if (isNoscanElemType(ty)) Some(maskAcc)
+        else {
+            let wordIdx = baseOff / 8;
+            if (baseOff % 8 != 0 || wordIdx < 0 || wordIdx >= 40) None
+            else Some(maskAcc | (intToI64(1) << wordIdx))
+        },
+}
+
+def accumPtrMaskFields(ts: List Type, startOff: Int, initMask: Int64): Option Int64 = {
+    let off = cellNew(startOff);
+    let mask = cellNew(initMask);
+    let ok = cellNew(true);
+    let cur = cellNew(ts);
+    while (cellGet(ok) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(el, r) -> {
+                let (sz, al) = typeSizeAndAlignFor(el, 8);
+                let aligned = alignUp(cellGet(off), al);
+                match accumPtrMaskType(el, aligned, cellGet(mask)) {
+                    Some(m2) -> {
+                        cellSet(mask, m2);
+                        cellSet(off, aligned + sz)
+                    },
+                    None -> cellSet(ok, false),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    if (cellGet(ok)) Some(cellGet(mask)) else None
+}
+
+def emitGcAllocForType(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, ty: Type): String =
+    if (isNoscanElemType(ty)) {
+        emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+    } else if (!mctx.mcIsWasm) {
+        match accumPtrMaskType(ty, 0, intToI64(0)) {
+            Some(mask) ->
+                if (mask == intToI64(0)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+                else emitAssign(fctx, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
+            None -> emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")"),
+        }
+    } else {
+        emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")")
+    }
+
+def emitGcAllocForFields(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, fieldTys: List Type, startOff: Int): String =
+    if (isNoscanList(fieldTys)) {
+        emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+    } else if (!mctx.mcIsWasm) {
+        match accumPtrMaskFields(fieldTys, startOff, intToI64(0)) {
+            Some(mask) ->
+                if (mask == intToI64(0)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+                else emitAssign(fctx, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
+            None -> emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")"),
+        }
+    } else {
+        emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")")
+    }
 
 // Compute `{ i32 tag, [N x word] }` LLVM struct type AND its byte size
 def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type, ptrSize: Int): (String, Int) =
@@ -627,14 +695,13 @@ def replaceDotsUnderscore(s: String): String = {
     bufToString(b)
 }
 
-def boxGeishaValue(fctx: FnEmitCtx, val: String, ty: Type): String =
+def boxGeishaValue(mctx: ModEmitCtx, fctx: FnEmitCtx, val: String, ty: Type): String =
     if (isVoidGeishaType(ty)) "null"
     else {
         let elemLlvmTy = getValLlvmType(ty);
         let (rawSz, _) = typeSizeAndAlign(ty);
         let byteSz = if (rawSz < 8) 8 else rawSz;
-        let allocFn = if (isNoscanElemType(ty)) "@gc_alloc_atomic" else "@gc_alloc";
-        let boxPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + intToStr(byteSz) + ")");
+        let boxPtr = emitGcAllocForType(mctx, fctx, byteSz, ty);
         emitStore(fctx, elemLlvmTy, val, boxPtr);
         boxPtr
     }
@@ -695,9 +762,9 @@ def getOrEmitThunkRunner(mctx: ModEmitCtx, retTy: Type): String = {
             };
         let boxed =
             if (isVoidGeishaType(retTy)) {
-                emitAssign(rf, "call ptr @gc_alloc_atomic(i64 8)")
+                emitAssign(rf, "call ptr @gc_alloc_atomic_uninit(i64 8)")
             } else {
-                boxGeishaValue(rf, callVal, retTy)
+                boxGeishaValue(mctx, rf, callVal, retTy)
             };
         emitTermLine(rf, "ret ptr " + boxed);
         flushFunctionToBuf(mctx.mcSynthFns, "define internal ptr " + sym + "(ptr %cls_ptr) nounwind", rf)
@@ -726,7 +793,7 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
             };
         let boxed =
             if (isVoidGeishaType(retTy)) "null"
-            else boxGeishaValue(rf, callVal, retTy);
+            else boxGeishaValue(mctx, rf, callVal, retTy);
         emitTermLine(rf, "ret ptr " + boxed);
         flushFunctionToBuf(mctx.mcSynthFns, "define internal ptr " + sym + "(ptr %state_box, ptr %cls_ptr) nounwind", rf)
     } else ();
@@ -750,7 +817,7 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
                 let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + rhs + ")");
                 let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
                 let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
-                let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+                let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + allocSz + ")");
                 emitLlvmMemcpy(fctx, dst, lhs, la);
                 let dstB = emitGep(fctx, "i8", dst, la);
                 emitLlvmMemcpy(fctx, dstB, rhs, lb);
@@ -926,8 +993,7 @@ def tryEmitIntrinsic(
             else {
                 let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
                 let byteSz = if (rawSz < 8) 8 else rawSz;
-                let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic" else "@gc_alloc";
-                emitAssign(fctx, "call ptr " + allocFn + "(i64 " + intToStr(byteSz) + ")")
+                emitGcAllocForType(mctx, fctx, byteSz, elemTy)
             };
         emitStore(fctx, elemLlvm, initVal, cellPtr);
         Some(cellPtr)
@@ -939,7 +1005,11 @@ def tryEmitIntrinsic(
         let a1 = nthArgTerm(args, 1);
         let cellPtr = genExpr(mctx, fctx, a0, locals, false);
         let newVal = genExpr(mctx, fctx, a1, locals, false);
-        emitStore(fctx, getValLlvmType(schemeBody(a1.tscm)), newVal, cellPtr);
+        let valTy = schemeBody(a1.tscm);
+        emitStore(fctx, getValLlvmType(valTy), newVal, cellPtr);
+        if (!mctx.mcIsWasm && !isNoscanElemType(valTy)) {
+            emitLine(fctx, "call void @gc_write_barrier(ptr " + cellPtr + ")")
+        } else ();
         Some("0")
     } else if (name == "arrayNew") {
         let a0 = nthArgTerm(args, 0);
@@ -968,7 +1038,7 @@ def tryEmitIntrinsic(
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
         let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
-        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic" else "@gc_alloc";
+        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic_uninit" else "@gc_alloc";
         let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
         emitStore(fctx, "i64", len64, arrPtr);
         let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
@@ -1073,7 +1143,8 @@ def tryEmitIntrinsic(
         let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let a2 = nthArgTerm(args, 2);
         let newVal = genExpr(mctx, fctx, a2, locals, false);
-        let elemLlvm = getValLlvmType(schemeBody(a2.tscm));
+        let valTy = schemeBody(a2.tscm);
+        let elemLlvm = getValLlvmType(valTy);
         let len64 = emitLoad(fctx, "i64", arrPtr);
         let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
         let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
@@ -1091,6 +1162,9 @@ def tryEmitIntrinsic(
         let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
         let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
         emitStore(fctx, elemLlvm, newVal, slotPtr);
+        if (!mctx.mcIsWasm && !isNoscanElemType(valTy)) {
+            emitLine(fctx, "call void @gc_write_barrier(ptr " + arrPtr + ")")
+        } else ();
         Some("0")
     } else if (name == "bitAnd" || name == "bitAnd64") {
         let ity = if (name == "bitAnd64") "i64" else "i32";
@@ -1180,7 +1254,7 @@ def tryEmitIntrinsic(
     } else if (name == "ptrAllocBytes") {
         let n32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
-        Some(emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + n64 + ")"))
+        Some(emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + n64 + ")"))
     } else if (name == "ptrByteAt") {
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
@@ -1227,7 +1301,7 @@ def tryEmitIntrinsic(
         let start64 = emitAssign(fctx, "sext i32 " + start32 + " to i64");
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + alloc64 + ")");
         let srcP = emitGep(fctx, "i8", s, start64);
         emitLlvmMemcpy(fctx, dst, srcP, len64);
         let termPtr = emitGep(fctx, "i8", dst, len64);
@@ -1238,7 +1312,7 @@ def tryEmitIntrinsic(
         let len32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + alloc64 + ")");
         emitLlvmMemcpy(fctx, dst, p, len64);
         let termPtr = emitGep(fctx, "i8", dst, len64);
         emitStore(fctx, "i8", "0", termPtr);
@@ -1247,7 +1321,7 @@ def tryEmitIntrinsic(
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let len64 = emitAssign(fctx, "call i64 " + strlenSym(mctx) + "(ptr " + p + ")");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + alloc64 + ")");
         emitLlvmMemcpy(fctx, dst, p, len64);
         let termPtr = emitGep(fctx, "i8", dst, len64);
         emitStore(fctx, "i8", "0", termPtr);
@@ -1299,7 +1373,7 @@ def tryEmitIntrinsic(
         let end64 = emitAssign(fctx, "sext i32 " + end32 + " to i64");
         let subLen = emitAssign(fctx, "sub i64 " + end64 + ", " + start64);
         let allocSz = emitAssign(fctx, "add i64 " + subLen + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + allocSz + ")");
         let srcPtr = emitGep(fctx, "i8", s, start64);
         emitLlvmMemcpy(fctx, dst, srcPtr, subLen);
         let termPtr = emitGep(fctx, "i8", dst, subLen);
@@ -1313,7 +1387,7 @@ def tryEmitIntrinsic(
         let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + b + ")");
         let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
         let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + allocSz + ")");
         emitLlvmMemcpy(fctx, dst, a, la);
         let dstB = emitGep(fctx, "i8", dst, la);
         emitLlvmMemcpy(fctx, dstB, b, lb);
@@ -1343,7 +1417,7 @@ def tryEmitIntrinsic(
         setInsertBlock(fctx, allocBlk);
         let count64 = emitAssign(fctx, "sext i32 " + count32 + " to i64");
         let allocSz = emitAssign(fctx, "add i64 " + count64 + ", 1");
-        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + allocSz + ")");
         let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
         let idxSlot = emitEntryAlloca(fctx, "i64");
         emitStore(fctx, "i64", "0", idxSlot);
@@ -1426,7 +1500,7 @@ def tryEmitConcIntrinsic(
         let a0 = nthArgTerm(args, 0);
         let valTy = schemeBody(a0.tscm);
         let val = genExpr(mctx, fctx, a0, locals, false);
-        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 8)") else boxGeishaValue(mctx, fctx, val, valTy);
         Some(emitAssign(fctx, "call ptr @gs_mvar_new(ptr " + boxed + ", i32 1)"))
     } else if (name == "__concMVarEmpty") {
         Some(emitAssign(fctx, "call ptr @gs_mvar_new(ptr null, i32 0)"))
@@ -1439,7 +1513,7 @@ def tryEmitConcIntrinsic(
         let a1 = nthArgTerm(args, 1);
         let valTy = schemeBody(a1.tscm);
         let val = genExpr(mctx, fctx, a1, locals, false);
-        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 8)") else boxGeishaValue(mctx, fctx, val, valTy);
         emitLine(fctx, "call void @gs_mvar_put(ptr " + m + ", ptr " + boxed + ")");
         Some("0")
     } else if (name == "__concMVarRead") {
@@ -1458,7 +1532,7 @@ def tryEmitConcIntrinsic(
         let a1 = nthArgTerm(args, 1);
         let valTy = schemeBody(a1.tscm);
         let val = genExpr(mctx, fctx, a1, locals, false);
-        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 8)") else boxGeishaValue(mctx, fctx, val, valTy);
         let r = emitAssign(fctx, "call i32 @gs_chan_send(ptr " + ch + ", ptr " + boxed + ")");
         Some(emitAssign(fctx, "icmp ne i32 " + r + ", 0"))
     } else if (name == "__concChanRecv") {
@@ -2201,11 +2275,10 @@ def genExpr(
                     let clsStructTy = "{ ptr, " + envStructTy + " }";
                     let (envSz, _) = structSizeAndAlignFor(fvGeishaTys, mctx.mcPtrSize);
                     let clsByteSz = alignUp(mctx.mcPtrSize + envSz, 8);
-                    let clsAllocFn = if (isNoscanList(fvGeishaTys)) "@gc_alloc_atomic" else "@gc_alloc";
 
                     let clsObjPtr =
                         if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
-                        else emitAssign(fctx, "call ptr " + clsAllocFn + "(i64 " + intToStr(clsByteSz) + ")");
+                        else emitGcAllocForFields(mctx, fctx, clsByteSz, fvGeishaTys, 8);
 
                     emitStore(fctx, "ptr", clsObjPtr, clsSlotPtr);
                     let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
@@ -2303,10 +2376,9 @@ def genExpr(
                         Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
                         None -> false,
                     };
-                let adtAllocFn = if (isNoscanList(fieldTys)) "@gc_alloc_atomic" else "@gc_alloc";
                 let adtPtr =
                     if (useStack) emitEntryAlloca(fctx, adtStorageTy)
-                    else emitAssign(fctx, "call ptr " + adtAllocFn + "(i64 " + intToStr(adtByteSz) + ")");
+                    else emitGcAllocForFields(mctx, fctx, adtByteSz, fieldTys, 8);
 
                 let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
                 emitStore(fctx, "i32", intToStr(tag), tagPtr);
@@ -2627,6 +2699,7 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
     bufPushStr(out, "  %anchor = alloca i64, align 8\n");
     bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
     bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
+    bufPushStr(out, "  call void @gc_enable_generational()\n");
     bufPushStr(out, "  call void @__geisha_main()\n");
     bufPushStr(out, "  ret i32 0\n}\n\n")
 }
@@ -2637,6 +2710,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
         ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
         ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
+        ("gc_alloc_atomic_uninit", "declare noalias nonnull ptr @gc_alloc_atomic_uninit(i64) nounwind"),
         ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr) nounwind willreturn memory(argmem: read)"),
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
@@ -2653,9 +2727,13 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("putChar", "declare void @putChar(i8, ptr) nounwind")
     ] else [
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
+        ("gc_enable_generational", "declare void @gc_enable_generational() nounwind"),
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
         ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
         ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
+        ("gc_alloc_atomic_uninit", "declare noalias nonnull ptr @gc_alloc_atomic_uninit(i64) nounwind"),
+        ("gc_alloc_masked", "declare noalias nonnull ptr @gc_alloc_masked(i64, i64) nounwind"),
+        ("gc_write_barrier", "declare void @gc_write_barrier(ptr) nounwind"),
         ("gc_safepoint_slow", "declare void @gc_safepoint_slow() cold nounwind"),
         ("_setjmp", "declare i32 @_setjmp(ptr) returns_twice"),
         ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr) nounwind"),

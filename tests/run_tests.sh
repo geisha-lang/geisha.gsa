@@ -842,4 +842,90 @@ def main() = {
 EOF
 assert_compile_fails "send_reject_parmap_dirty_callback" "$TMP_DIR/t13_bad_parmap.gsa"
 
+# 14. Generational GC Stress Test: Old->Young Write Barriers (Cell & MutArray), Large Object Munmap, and Multicore STW + FFI
+cat > "$TMP_DIR/t14_gc_gen.gsa" << 'EOF'
+use std.str.intToStr
+use std.task.{spawn, await}
+
+extern "gc_collect_major" def gcCollectMajor(): Void
+extern "gc_minor_collection_count" def gcMinorCount(): Int64
+extern "gc_major_collection_count" def gcMajorCount(): Int64
+extern "gc_heap_live_bytes" def gcLiveBytes(): Int64
+extern "strlen" def c_strlen(s: String): Int64
+
+data Tree {
+    TLeaf(Int, String),
+    TNode(Tree, Tree),
+}
+
+def makeTree(d: Int): Tree =
+    if (d <= 0) TLeaf(1, "leaf-ok")
+    else TNode(makeTree(d - 1), makeTree(d - 1))
+
+def checkTree(t: Tree): Int = match t {
+    TLeaf(n, s) -> if (s == "leaf-ok") n else -999999,
+    TNode(l, r) -> checkTree(l) + checkTree(r),
+}
+
+def main() = {
+    // 1. Promote old structures via Major GC
+    let oldTree = makeTree(12);
+    let oldCell = cellNew("old-init");
+    let oldArr = arrayNew(16, "arr-init");
+    gcCollectMajor();
+
+    // 2. Mutate Old Cell & Old MutArray with Young objects across many Minor GCs
+    let i = cellNew(0);
+    while (cellGet(i) < 40000) {
+        let k = cellGet(i);
+        let youngStr = "y-" + intToStr(k);
+        if (k % 100 == 0) {
+            cellSet(oldCell, youngStr);
+            arraySet(oldArr, k % 16, youngStr)
+        } else ();
+        cellSet(i, k + 1)
+    };
+
+    // 3. Allocate and drop >64KB large objects repeatedly, then Major GC and check live bytes stay bounded
+    let j = cellNew(0);
+    while (cellGet(j) < 32) {
+        let _ = ptrAllocBytes(131072);
+        cellSet(j, cellGet(j) + 1)
+    };
+    gcCollectMajor();
+    let liveAfter = i64ToInt(gcLiveBytes());
+
+    // 4. Concurrent threads allocating + lock-free FFI while GCs run
+    let t1 = spawn(() -> {
+        let acc = cellNew(0);
+        let m = cellNew(0);
+        while (cellGet(m) < 5000) {
+            let s = "thr1-" + intToStr(cellGet(m));
+            cellSet(acc, cellGet(acc) + i64ToInt(c_strlen(s)));
+            cellSet(m, cellGet(m) + 1)
+        };
+        cellGet(acc)
+    });
+    let t2 = spawn(() -> {
+        let acc = cellNew(0);
+        let m = cellNew(0);
+        while (cellGet(m) < 5000) {
+            let s = "thr2-" + intToStr(cellGet(m));
+            cellSet(acc, cellGet(acc) + i64ToInt(c_strlen(s)));
+            cellSet(m, cellGet(m) + 1)
+        };
+        cellGet(acc)
+    });
+
+    let sumWorkers = await(t1) + await(t2);
+    let treeOk = checkTree(oldTree);
+    let cellOk = cellGet(oldCell);
+    let arrOk = arrayGet(oldArr, 39900 % 16);
+    let genOk = if (gcMinorCount() > intToI64(0) && gcMajorCount() >= intToI64(2) && liveAfter < 2000000) "gen-ok" else "gen-bad";
+    printLn(intToStr(treeOk) + "|" + cellOk + "|" + arrOk + "|" + intToStr(sumWorkers) + "|" + genOk)
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t14_gc_gen" "$TMP_DIR/t14_gc_gen.gsa"
+assert_eq "generational_gc_write_barrier_and_reclaim" "4096|y-39900|y-39900|87780|gen-ok" "$(GEISHA_GC_HEAP_WORDS=32768 "$TMP_DIR/t14_gc_gen")"
+
 echo "All $PASS end-to-end test suites passed!"
