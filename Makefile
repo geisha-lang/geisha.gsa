@@ -1,12 +1,13 @@
 # geisha.gsa — Self-Hosting Geisha Compiler Makefile
 
 CC          ?= cc
-CFLAGS      ?= -O2 -Wall -Wextra -Iruntime/include
+CFLAGS      ?= -O2 -flto=thin -Wall -Wextra -Iruntime/include
 STAGE0      ?= miko
 BUILD_DIR   := build
 RUNTIME_LIB := $(BUILD_DIR)/libgeisha_runtime.a
 WASM_RT_OBJ := $(BUILD_DIR)/wasm_rt.o
 WASM_CC     ?= /opt/homebrew/opt/llvm@20/bin/clang
+WASM_FLAGS  ?= --target=wasm32 -O2 -flto -mbulk-memory -mnontrapping-fptoint
 ENTRY       := src/mod.gsa
 
 .PHONY: all runtime wasm-runtime stdlib-bundle stage1 stage2 stage3 bootstrap test verify-core clean
@@ -21,7 +22,7 @@ runtime: $(RUNTIME_LIB)
 wasm-runtime: $(WASM_RT_OBJ)
 
 $(WASM_RT_OBJ): runtime/wasm_rt.c | $(BUILD_DIR)
-	$(WASM_CC) --target=wasm32 -O2 -Wall -Wextra -nostdlib -ffreestanding -c runtime/wasm_rt.c -o $(WASM_RT_OBJ)
+	$(WASM_CC) $(WASM_FLAGS) -Wall -Wextra -nostdlib -ffreestanding -c runtime/wasm_rt.c -o $(WASM_RT_OBJ)
 
 $(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) $(CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/base.o
@@ -44,7 +45,7 @@ $(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1 src/*.gsa
 	$(BUILD_DIR)/geisha1 --src-root . -e -o $(BUILD_DIR)/stage2.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha2: $(BUILD_DIR)/stage2.ll $(RUNTIME_LIB)
-	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) -O2 -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage2.ll -x none $(RUNTIME_LIB) -o $(BUILD_DIR)/geisha2
+	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) -O2 -flto=thin -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage2.ll -x none $(RUNTIME_LIB) -o $(BUILD_DIR)/geisha2
 
 stage3: $(BUILD_DIR)/geisha3
 
@@ -52,7 +53,7 @@ $(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2 src/*.gsa
 	$(BUILD_DIR)/geisha2 --src-root . -e -o $(BUILD_DIR)/stage3.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha3: $(BUILD_DIR)/stage3.ll $(RUNTIME_LIB)
-	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) -O2 -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage3.ll -x none $(RUNTIME_LIB) -o $(BUILD_DIR)/geisha3
+	MACOSX_DEPLOYMENT_TARGET=14.0 $(CC) -O2 -flto=thin -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage3.ll -x none $(RUNTIME_LIB) -o $(BUILD_DIR)/geisha3
 
 bootstrap: $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll $(BUILD_DIR)/geisha3
 	diff -u $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll

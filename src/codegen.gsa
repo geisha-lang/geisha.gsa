@@ -356,8 +356,11 @@ data ModEmitCtx {
 def strlenSym(mctx: ModEmitCtx): String =
     if (mctx.mcIsWasm) "@gs_strlen" else "@strlen"
 
-def memcpySym(mctx: ModEmitCtx): String =
-    if (mctx.mcIsWasm) "@gs_memcpy" else "@memcpy"
+def emitLlvmMemcpy(fctx: FnEmitCtx, dst: String, src: String, len64: String): Void =
+    emitLine(fctx, "call void @llvm.memcpy.p0.p0.i64(ptr " + dst + ", ptr " + src + ", i64 " + len64 + ", i1 false)")
+
+def emitLlvmMemmove(fctx: FnEmitCtx, dst: String, src: String, len64: String): Void =
+    emitLine(fctx, "call void @llvm.memmove.p0.p0.i64(ptr " + dst + ", ptr " + src + ", i64 " + len64 + ", i1 false)")
 
 def isDefaultWasmExport(fnName: String): Bool = {
     let n = strLen(fnName);
@@ -697,7 +700,7 @@ def getOrEmitThunkRunner(mctx: ModEmitCtx, retTy: Type): String = {
                 boxGeishaValue(rf, callVal, retTy)
             };
         emitTermLine(rf, "ret ptr " + boxed);
-        flushFunctionToBuf(mctx.mcSynthFns, "define ptr " + sym + "(ptr %cls_ptr)", rf)
+        flushFunctionToBuf(mctx.mcSynthFns, "define internal ptr " + sym + "(ptr %cls_ptr) nounwind", rf)
     } else ();
     sym
 }
@@ -725,7 +728,7 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
             if (isVoidGeishaType(retTy)) "null"
             else boxGeishaValue(rf, callVal, retTy);
         emitTermLine(rf, "ret ptr " + boxed);
-        flushFunctionToBuf(mctx.mcSynthFns, "define ptr " + sym + "(ptr %state_box, ptr %cls_ptr)", rf)
+        flushFunctionToBuf(mctx.mcSynthFns, "define internal ptr " + sym + "(ptr %state_box, ptr %cls_ptr) nounwind", rf)
     } else ();
     sym
 }
@@ -743,15 +746,14 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
         match op {
             OpAdd -> {
                 let sl = strlenSym(mctx);
-                let mc = memcpySym(mctx);
                 let la = emitAssign(fctx, "call i64 " + sl + "(ptr " + lhs + ")");
                 let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + rhs + ")");
                 let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
                 let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
                 let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
-                emitLine(fctx, "call ptr " + mc + "(ptr " + dst + ", ptr " + lhs + ", i64 " + la + ")");
+                emitLlvmMemcpy(fctx, dst, lhs, la);
                 let dstB = emitGep(fctx, "i8", dst, la);
-                emitLine(fctx, "call ptr " + mc + "(ptr " + dstB + ", ptr " + rhs + ", i64 " + lb + ")");
+                emitLlvmMemcpy(fctx, dstB, rhs, lb);
                 let termPtr = emitGep(fctx, "i8", dst, lab);
                 emitStore(fctx, "i8", "0", termPtr);
                 dst
@@ -1143,7 +1145,7 @@ def tryEmitIntrinsic(
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let dstP = emitGep(fctx, "i8", dst, dstOff64);
         let srcP = emitGep(fctx, "i8", src, srcOff64);
-        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dstP + ", ptr " + srcP + ", i64 " + len64 + ")");
+        emitLlvmMemmove(fctx, dstP, srcP, len64);
         Some("0")
     } else if (name == "ptrCopyFromStr") {
         let dst = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
@@ -1153,7 +1155,7 @@ def tryEmitIntrinsic(
         let dstOff64 = emitAssign(fctx, "sext i32 " + dstOff32 + " to i64");
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let dstP = emitGep(fctx, "i8", dst, dstOff64);
-        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dstP + ", ptr " + src + ", i64 " + len64 + ")");
+        emitLlvmMemcpy(fctx, dstP, src, len64);
         Some("0")
     } else if (name == "ptrSliceToString") {
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
@@ -1161,7 +1163,7 @@ def tryEmitIntrinsic(
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
-        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dst + ", ptr " + p + ", i64 " + len64 + ")");
+        emitLlvmMemcpy(fctx, dst, p, len64);
         let termPtr = emitGep(fctx, "i8", dst, len64);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
@@ -1170,7 +1172,7 @@ def tryEmitIntrinsic(
         let len64 = emitAssign(fctx, "call i64 " + strlenSym(mctx) + "(ptr " + p + ")");
         let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
-        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dst + ", ptr " + p + ", i64 " + len64 + ")");
+        emitLlvmMemcpy(fctx, dst, p, len64);
         let termPtr = emitGep(fctx, "i8", dst, len64);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
@@ -1223,7 +1225,7 @@ def tryEmitIntrinsic(
         let allocSz = emitAssign(fctx, "add i64 " + subLen + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
         let srcPtr = emitGep(fctx, "i8", s, start64);
-        emitLine(fctx, "call ptr " + memcpySym(mctx) + "(ptr " + dst + ", ptr " + srcPtr + ", i64 " + subLen + ")");
+        emitLlvmMemcpy(fctx, dst, srcPtr, subLen);
         let termPtr = emitGep(fctx, "i8", dst, subLen);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
@@ -1231,15 +1233,14 @@ def tryEmitIntrinsic(
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let sl = strlenSym(mctx);
-        let mc = memcpySym(mctx);
         let la = emitAssign(fctx, "call i64 " + sl + "(ptr " + a + ")");
         let lb = emitAssign(fctx, "call i64 " + sl + "(ptr " + b + ")");
         let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
         let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
         let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
-        emitLine(fctx, "call ptr " + mc + "(ptr " + dst + ", ptr " + a + ", i64 " + la + ")");
+        emitLlvmMemcpy(fctx, dst, a, la);
         let dstB = emitGep(fctx, "i8", dst, la);
-        emitLine(fctx, "call ptr " + mc + "(ptr " + dstB + ", ptr " + b + ", i64 " + lb + ")");
+        emitLlvmMemcpy(fctx, dstB, b, lb);
         let termPtr = emitGep(fctx, "i8", dst, lab);
         emitStore(fctx, "i8", "0", termPtr);
         Some(dst)
@@ -2344,6 +2345,51 @@ def genExpr(
 // Top-Level Function, Main Trampoline, and Module Emission
 // ============================================================================
 
+def termListHasCall(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(h, r) -> if (termHasCall(h)) true else termListHasCall(r),
+}
+
+def armListHasCall(arms: List CoreArm): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gCall = match a.caGuard { Some(g) -> termHasCall(g), None -> false };
+        if (gCall || termHasCall(a.caBody)) true else armListHasCall(r)
+    },
+}
+
+def isPureBuiltinIntrinsic(name: String): Bool =
+    name == "cellNew" || name == "cellGet" || name == "cellSet"
+    || name == "arrayNew" || name == "arrayLen" || name == "arrayGet" || name == "arraySet"
+    || name == "bitAnd" || name == "bitAnd64" || name == "bitOr" || name == "bitOr64"
+    || name == "bitXor" || name == "bitXor64" || name == "bitNot" || name == "bitNot64"
+    || name == "bitShl" || name == "bitShr" || name == "bitUshr"
+    || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
+    || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
+    || name == "floatToBits64" || name == "bits64ToFloat" || name == "intToFloat" || name == "floatToInt"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrAllocBytes"
+    || name == "ptrByteAt" || name == "ptrSetByte" || name == "ptrCopyBytes"
+    || name == "ptrCopyFromStr" || name == "ptrSliceToString" || name == "ptrToString"
+    || name == "strLen" || name == "strByteAt" || name == "strSlice"
+    || name == "strConcat" || name == "strFromBytes" || name == "sysArgc" || name == "sysArgv"
+
+def termHasCall(tm: TaggedTerm): Bool = match tm.tnode {
+    TmApplyCls(_, _) -> true,
+    TmApplyDir(vd, args) -> if (isPureBuiltinIntrinsic(vd.vname)) termListHasCall(args) else true,
+    TmTuple(es) -> termListHasCall(es),
+    TmBlock(es) -> termListHasCall(es),
+    TmMakeData(_, _, es, _, _) -> termListHasCall(es),
+    TmBin(_, l, r) -> termHasCall(l) || termHasCall(r),
+    TmUn(_, e) -> termHasCall(e),
+    TmGetTag(e) -> termHasCall(e),
+    TmLet(_, v, b) -> termHasCall(v) || termHasCall(b),
+    TmMakeCls(_, _, b) -> termHasCall(b),
+    TmIf(c, t, e) -> termHasCall(c) || termHasCall(t) || termHasCall(e),
+    TmWhile(c, b) -> termHasCall(c) || termHasCall(b),
+    TmMatch(s, arms) -> termHasCall(s) || armListHasCall(arms),
+    _ -> false,
+}
+
 def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     let fctx = newFnEmitCtx(fd.fnName);
     let funTy = schemeBody(fd.fnScm);
@@ -2420,7 +2466,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     };
 
     let allowTail = !fnHasStackAlloc(mctx.mcEscape, fd.fnName);
-    emitGcSafepointPoll(mctx, fctx);
+    if (termHasCall(fd.fnBody)) emitGcSafepointPoll(mctx, fctx) else ();
     let bodyVal = genExpr(mctx, fctx, fd.fnBody, listRev(cellGet(localsRev)), allowTail);
     if (!curBlockHasTerm(fctx)) {
         if (retLlvm == "void") emitTermLine(fctx, "ret void")
@@ -2432,7 +2478,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     let exportAttr =
         if (isWasmExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
         else "";
-    let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")" + exportAttr;
+    let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ") nounwind" + exportAttr;
     flushFunctionToBuf(out, header, fctx)
 }
 
@@ -2466,7 +2512,7 @@ def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDe
         None -> (),
     };
     if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
-    flushFunctionToBuf(out, "define void @__geisha_init() \"wasm-export-name\"=\"__geisha_init\"", fctx)
+    flushFunctionToBuf(out, "define void @__geisha_init() nounwind \"wasm-export-name\"=\"__geisha_init\"", fctx)
 }
 
 def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef): Void = {
@@ -2494,10 +2540,10 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
 
     let _ = genExpr(mctx, fctx, mainFd.fnBody, Nil, false);
     if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
-    flushFunctionToBuf(out, "define void @__geisha_main()", fctx);
+    flushFunctionToBuf(out, "define internal void @__geisha_main() nounwind", fctx);
 
     // Emit C entry trampoline `@main(i32 %argc, ptr %argv)` with stack anchor strictly above `@__geisha_main`
-    bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) {\nentry:\n");
+    bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind {\nentry:\n");
     bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
     bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
     bufPushStr(out, "  %anchor = alloca i64, align 8\n");
@@ -2509,39 +2555,41 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
 
 def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: StrMap FunDef, isWasm: Bool): Void = {
     let decls = if (isWasm) [
-        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr)"),
-        ("gc_register_root", "declare void @gc_register_root(ptr)"),
-        ("gc_alloc", "declare ptr @gc_alloc(i64)"),
-        ("gc_alloc_atomic", "declare ptr @gc_alloc_atomic(i64)"),
-        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr)"),
-        ("gs_match_fail", "declare void @gs_match_fail()"),
-        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32)"),
-        ("gs_div_zero_fail", "declare void @gs_div_zero_fail()"),
-        ("gs_strlen", "declare i64 @gs_strlen(ptr)"),
-        ("gs_memcpy", "declare ptr @gs_memcpy(ptr, ptr, i64)"),
-        ("printLn", "declare void @printLn(ptr, ptr)"),
-        ("putNumber", "declare void @putNumber(i32, ptr)"),
-        ("putFloat", "declare void @putFloat(double, ptr)"),
-        ("putChar", "declare void @putChar(i8, ptr)")
+        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
+        ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
+        ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
+        ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
+        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr) nounwind willreturn memory(argmem: read)"),
+        ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
+        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
+        ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
+        ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
+        ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
+        ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
+        ("putFloat", "declare void @putFloat(double, ptr) nounwind"),
+        ("putChar", "declare void @putChar(i8, ptr) nounwind")
     ] else [
-        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr)"),
-        ("gc_register_root", "declare void @gc_register_root(ptr)"),
-        ("gc_alloc", "declare ptr @gc_alloc(i64)"),
-        ("gc_alloc_atomic", "declare ptr @gc_alloc_atomic(i64)"),
-        ("gc_safepoint_slow", "declare void @gc_safepoint_slow()"),
-        ("_setjmp", "declare i32 @_setjmp(ptr)"),
-        ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr)"),
-        ("gc_leave_blocking", "declare void @gc_leave_blocking()"),
-        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr)"),
-        ("gs_match_fail", "declare void @gs_match_fail()"),
-        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32)"),
-        ("gs_div_zero_fail", "declare void @gs_div_zero_fail()"),
-        ("strlen", "declare i64 @strlen(ptr)"),
-        ("memcpy", "declare ptr @memcpy(ptr, ptr, i64)"),
-        ("printLn", "declare void @printLn(ptr, ptr)"),
-        ("putNumber", "declare void @putNumber(i32, ptr)"),
-        ("putFloat", "declare void @putFloat(double, ptr)"),
-        ("putChar", "declare void @putChar(i8, ptr)"),
+        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
+        ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
+        ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
+        ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
+        ("gc_safepoint_slow", "declare void @gc_safepoint_slow() cold nounwind"),
+        ("_setjmp", "declare i32 @_setjmp(ptr) returns_twice"),
+        ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr) nounwind"),
+        ("gc_leave_blocking", "declare void @gc_leave_blocking() nounwind"),
+        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr) nounwind willreturn memory(argmem: read)"),
+        ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
+        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
+        ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
+        ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
+        ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
+        ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
+        ("putFloat", "declare void @putFloat(double, ptr) nounwind"),
+        ("putChar", "declare void @putChar(i8, ptr) nounwind"),
         ("gs_atomic_new", "declare ptr @gs_atomic_new(i32)"),
         ("gs_atomic_load", "declare i32 @gs_atomic_load(ptr)"),
         ("gs_atomic_store", "declare void @gs_atomic_store(ptr, i32)"),

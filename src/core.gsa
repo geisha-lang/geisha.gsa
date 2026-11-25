@@ -3092,6 +3092,14 @@ def analyzeAllocEscapes(
                     }
                 }
             },
+            TmApplyDir(fvd, _) if (fvd.vname == "cellGet") ->
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+            TmBin(_, _, _) ->
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+            TmUn(_, _) ->
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+            TmGetTag(_) ->
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
             _ -> {
                 markVarsEscaping(varsOfTerm(val), allocMap, escaping, escList);
                 analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false)
