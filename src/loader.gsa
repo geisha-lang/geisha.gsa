@@ -3,6 +3,7 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend, listLen}
+use std.control.{fmap}
 use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
 use std.path.{pathJoin, pathStem}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
@@ -486,10 +487,8 @@ def rewriteTypeInMod(ctx: ModRewriteCtx, ty: Type): Type = match ty {
     TyComp(b, a) -> TyComp(rewriteTypeInMod(ctx, b), rewriteTypeInMod(ctx, a)),
 }
 
-def rewriteTypeListInMod(ctx: ModRewriteCtx, ts: List Type): List Type = match ts {
-    Nil -> Nil,
-    Cons(h, t) -> Cons(rewriteTypeInMod(ctx, h), rewriteTypeListInMod(ctx, t)),
-}
+def rewriteTypeListInMod(ctx: ModRewriteCtx, ts: List Type): List Type =
+    fmap((t) -> rewriteTypeInMod(ctx, t), ts)
 
 def rewriteConstraintsInMod(ctx: ModRewriteCtx, cs: List ConstraintSpec): List ConstraintSpec = match cs {
     Nil -> Nil,
@@ -695,7 +694,7 @@ def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
                     Nil -> (),
                 }
             };
-            let newRt = match rt { Some(t) -> Some(rewriteTypeInMod(ctx, t)), None -> None };
+            let newRt = fmap((t) -> rewriteTypeInMod(ctx, t), rt);
             ExAbs(cellGet(newPs), newRt, rewriteFormInMod(ctx, body, cellGet(innerBound)))
         },
         ExLet(vd, val, body) -> {

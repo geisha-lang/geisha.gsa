@@ -11,6 +11,7 @@ MODULES = [
     ("std.option", "std/option.gsa"),
     ("std.result", "std/result.gsa"),
     ("std.list", "std/list.gsa"),
+    ("std.control", "std/control.gsa"),
     ("std.bits", "std/bits.gsa"),
     ("std.path", "std/path.gsa"),
     ("std.char", "std/char.gsa"),

@@ -5,6 +5,7 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend, listLen}
+use std.control.{fmap, (>>=)}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.str.intToStr
@@ -1401,88 +1402,68 @@ def resolveConceptCall(
     argTys: List Type,
     retTy: Type
 ): Option (String, Scheme, Option Instantiation) =
-    match strMapGet(ctx.kConceptMethods, methodName) {
-        None -> None,
-        Some((conceptName, _)) -> match strMapGet(ctx.kConceptReg, conceptName) {
-            None -> None,
-            Some(cinfo) -> match findConceptMethodScm(cinfo.methods, methodName) {
-                None -> None,
-                Some(methodScm) -> {
-                    let callSub: StrMap Type = strMapNew();
-                    let concreteFnTy = TyArr(argTys, retTy);
-                    unifyTypesInto(schemeBody(methodScm), concreteFnTy, callSub);
-                    match collectSubstArgs(cinfo.typeParams, callSub) {
-                        None -> None,
-                        Some(concreteTargetTys) ->
-                            if (!isTypeListConcrete(concreteTargetTys)) None
-                            else {
-                                let res: Cell (Option (String, Scheme, Option Instantiation)) = cellNew(None);
-                                let curI = cellNew(ctx.kInstanceReg);
-                                while (match cellGet(curI) { Nil -> false, _ -> match cellGet(res) { None -> true, Some(_) -> false } }) {
-                                    match cellGet(curI) {
-                                        Cons(instInfo, rI) -> {
-                                            if (instInfo.conceptName == conceptName && listLen(instInfo.targetTypes) == listLen(concreteTargetTys)) {
-                                                let instSub: StrMap Type = strMapNew();
-                                                if (matchInstancePatList(instInfo.targetTypes, concreteTargetTys, instSub)) {
-                                                    match strMapGet(instInfo.methodImpls, methodName) {
-                                                        Some(baseImplName) -> match strMapGet(ctx.kGlobalFns, baseImplName) {
-                                                            Some(baseDef) -> {
-                                                                unifyTypesInto(schemeBody(baseDef.fnScm), concreteFnTy, instSub);
-                                                                let tparams = schemeTypeParams(baseDef.fnScm);
-                                                                match tparams {
-                                                                    Nil -> cellSet(res, Some((baseImplName, ScmMono(concreteFnTy), None))),
-                                                                    _ -> match collectSubstArgs(tparams, instSub) {
-                                                                        Some(targs) -> {
-                                                                            let specInst = mkInst(baseImplName, targs);
-                                                                            cellSet(res, Some((specInst.instMangled, ScmMono(concreteFnTy), Some(specInst))))
-                                                                        },
-                                                                        None -> (),
-                                                                    },
-                                                                }
-                                                            },
-                                                            None -> (),
-                                                        },
-                                                        None -> (),
-                                                    }
-                                                } else ()
-                                            } else ();
-                                            cellSet(curI, rI)
-                                        },
-                                        Nil -> (),
+    strMapGet(ctx.kConceptMethods, methodName) >>= ((pair) -> {
+        let (conceptName, _) = pair;
+        strMapGet(ctx.kConceptReg, conceptName) >>= (cinfo) ->
+        findConceptMethodScm(cinfo.methods, methodName) >>= (methodScm) -> {
+            let callSub: StrMap Type = strMapNew();
+            let concreteFnTy = TyArr(argTys, retTy);
+            unifyTypesInto(schemeBody(methodScm), concreteFnTy, callSub);
+            collectSubstArgs(cinfo.typeParams, callSub) >>= (concreteTargetTys) ->
+            if (!isTypeListConcrete(concreteTargetTys)) None
+            else {
+                let res: Cell (Option (String, Scheme, Option Instantiation)) = cellNew(None);
+                let curI = cellNew(ctx.kInstanceReg);
+                while (match cellGet(curI) { Nil -> false, _ -> match cellGet(res) { None -> true, Some(_) -> false } }) {
+                    match cellGet(curI) {
+                        Cons(instInfo, rI) -> {
+                            if (instInfo.conceptName == conceptName && listLen(instInfo.targetTypes) == listLen(concreteTargetTys)) {
+                                let instSub: StrMap Type = strMapNew();
+                                if (matchInstancePatList(instInfo.targetTypes, concreteTargetTys, instSub)) {
+                                    let resolved = strMapGet(instInfo.methodImpls, methodName) >>= (baseImplName) ->
+                                        strMapGet(ctx.kGlobalFns, baseImplName) >>= (baseDef) -> {
+                                            unifyTypesInto(schemeBody(baseDef.fnScm), concreteFnTy, instSub);
+                                            let tparams = schemeTypeParams(baseDef.fnScm);
+                                            match tparams {
+                                                Nil -> Some((baseImplName, ScmMono(concreteFnTy), None)),
+                                                _ -> fmap((targs) -> {
+                                                    let specInst = mkInst(baseImplName, targs);
+                                                    (specInst.instMangled, ScmMono(concreteFnTy), Some(specInst))
+                                                }, collectSubstArgs(tparams, instSub)),
+                                            }
+                                        };
+                                    match resolved {
+                                        Some(v) -> cellSet(res, Some(v)),
+                                        None -> (),
                                     }
-                                };
-                                cellGet(res)
-                            },
+                                } else ()
+                            } else ();
+                            cellSet(curI, rI)
+                        },
+                        Nil -> (),
                     }
-                },
-            },
-        },
-    }
+                };
+                cellGet(res)
+            }
+        }
+    })
 
 def resolvePolyFnCall(
     ctx: KCtx,
     fnName: String,
     concreteFnTy: Type
 ): Option (String, Scheme, Instantiation) =
-    match strMapGet(ctx.kGlobalFns, fnName) {
-        None -> None,
-        Some(fdef) -> {
-            let tparams = schemeTypeParams(fdef.fnScm);
-            match tparams {
-                Nil -> None,
-                _ -> {
-                    let sub: StrMap Type = strMapNew();
-                    unifyTypesInto(schemeBody(fdef.fnScm), concreteFnTy, sub);
-                    match collectSubstArgs(tparams, sub) {
-                        None -> None,
-                        Some(targs) -> {
-                            let inst = mkInst(fnName, targs);
-                            let specTy = applyExplicitSubst(schemeBody(fdef.fnScm), sub);
-                            Some((inst.instMangled, ScmMono(specTy), inst))
-                        },
-                    }
-                },
-            }
+    strMapGet(ctx.kGlobalFns, fnName) >>= (fdef) ->
+    match schemeTypeParams(fdef.fnScm) {
+        Nil -> None,
+        tparams -> {
+            let sub: StrMap Type = strMapNew();
+            unifyTypesInto(schemeBody(fdef.fnScm), concreteFnTy, sub);
+            fmap((targs) -> {
+                let inst = mkInst(fnName, targs);
+                let specTy = applyExplicitSubst(schemeBody(fdef.fnScm), sub);
+                (inst.instMangled, ScmMono(specTy), inst)
+            }, collectSubstArgs(tparams, sub))
         },
     }
 

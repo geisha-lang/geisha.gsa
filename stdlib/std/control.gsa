@@ -1,0 +1,120 @@
+// Higher-Kinded Control Abstractions (`std.control`)
+// Requires self-hosted Geisha compiler (HKT, superclasses, multi-param concepts & FunDeps).
+
+use std.option.{Option, Some, None}
+use std.list.{listRev}
+
+pub concept Functor f {
+    def fmap(g: a -> b, fa: f a): f b
+}
+
+pub concept Applicative f : Functor f {
+    def pure(x: a): f a,
+    def ap(ff: f (a -> b), fa: f a): f b
+}
+
+pub concept Monad m : Applicative m {
+    def (>>=)(ma: m a, k: a -> m b): m b
+}
+
+pub concept MonadState s m : Monad m | m -> s {
+    def get(): m s,
+    def put(st: s): m Void
+}
+
+pub concept MonadReader r m : Monad m | m -> r {
+    def ask(): m r
+}
+
+pub concept MonadError e m : Monad m | m -> e {
+    def throwErr(err: e): m a
+}
+
+// ============================================================================
+// Standard Operators & Polymorphic Combinators
+// ============================================================================
+
+pub def (<$>)(g: a -> b, fa: f a): f b = fmap(g, fa)
+
+pub def (<*>)(ff: f (a -> b), fa: f a): f b = ap(ff, fa)
+
+pub def (>>)(ma: m a, mb: m b): m b = ma >>= (_) -> mb
+
+pub def voidM(fa: f a): f Void = fmap((_) -> (), fa)
+
+pub def modify(f: s -> s): m Void =
+    get() >>= (s) -> put(f(s))
+
+pub def mapM(f: a -> m b, xs: List a): m (List b) =
+    mapMRev(f, xs, pure(Nil)) >>= (rev) -> pure(listRev(rev))
+
+def mapMRev(f: a -> m b, xs: List a, acc: m (List b)): m (List b) = match xs {
+    Nil -> acc,
+    Cons(h, t) ->
+        f(h) >>= (b) ->
+        acc >>= (bs) ->
+        mapMRev(f, t, pure(Cons(b, bs))),
+}
+
+pub def sequenceM(ms: List (m a)): m (List a) = match ms {
+    Nil -> pure(Nil),
+    Cons(mh, mt) ->
+        mh >>= (x) ->
+        sequenceM(mt) >>= (xs) ->
+        pure(Cons(x, xs)),
+}
+
+// ============================================================================
+// Standard Instances for `Option` and `List`
+// ============================================================================
+
+instance Functor Option {
+    def fmap(g, opt) = match opt {
+        None -> None,
+        Some(x) -> Some(g(x)),
+    }
+}
+
+instance Applicative Option {
+    def pure(x) = Some(x)
+    def ap(ofn, oa) = match (ofn, oa) {
+        (Some(f), Some(a)) -> Some(f(a)),
+        _ -> None,
+    }
+}
+
+instance Monad Option {
+    def (>>=)(ma, k) = match ma {
+        None -> None,
+        Some(x) -> k(x),
+    }
+}
+
+instance Functor List {
+    def fmap(g, xs) = mapListRev(g, xs, Nil)
+}
+
+def mapListRev(g: a -> b, xs: List a, acc: List b): List b = match xs {
+    Nil -> listRev(acc),
+    Cons(h, t) -> mapListRev(g, t, Cons(g(h), acc)),
+}
+
+instance Applicative List {
+    def pure(x) = [x]
+    def ap(fs, xs) = match fs {
+        Nil -> Nil,
+        Cons(f, fr) -> appendLists(fmap(f, xs), ap(fr, xs)),
+    }
+}
+
+def appendLists(xs: List a, ys: List a): List a = match xs {
+    Nil -> ys,
+    Cons(h, t) -> Cons(h, appendLists(t, ys)),
+}
+
+instance Monad List {
+    def (>>=)(xs, k) = match xs {
+        Nil -> Nil,
+        Cons(h, t) -> appendLists(k(h), t >>= k),
+    }
+}

@@ -4,6 +4,7 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend, listLen}
+use std.control.{fmap}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.str.intToStr
@@ -208,10 +209,8 @@ pub def applyExplicitSubst(ty: Type, map: StrMap Type): Type = match ty {
     TyComp(b, a) -> TyComp(applyExplicitSubst(b, map), applyExplicitSubst(a, map)),
 }
 
-def applyExplicitSubstList(ts: List Type, map: StrMap Type): List Type = match ts {
-    Nil -> Nil,
-    Cons(h, t) -> Cons(applyExplicitSubst(h, map), applyExplicitSubstList(t, map)),
-}
+def applyExplicitSubstList(ts: List Type, map: StrMap Type): List Type =
+    fmap((t) -> applyExplicitSubst(t, map), ts)
 
 def zonkType(subst: StrMap Type, ty: Type): Type = match ty {
     TyVoid -> TyVoid,
@@ -229,10 +228,8 @@ def zonkType(subst: StrMap Type, ty: Type): Type = match ty {
     TyComp(b, a) -> TyComp(zonkType(subst, b), zonkType(subst, a)),
 }
 
-def zonkTypeList(subst: StrMap Type, ts: List Type): List Type = match ts {
-    Nil -> Nil,
-    Cons(h, t) -> Cons(zonkType(subst, h), zonkTypeList(subst, t)),
-}
+def zonkTypeList(subst: StrMap Type, ts: List Type): List Type =
+    fmap((t) -> zonkType(subst, t), ts)
 
 def zonkConstraintsExcept(subst: StrMap Type, bound: List String, cs: List ConstraintSpec): List ConstraintSpec = match cs {
     Nil -> Nil,
@@ -303,7 +300,7 @@ def zonkForm(subst: StrMap Type, f: Form): Form = {
                     Nil -> (),
                 }
             };
-            let nrt = match rt { Some(t) -> Some(zonkType(subst, t)), None -> None };
+            let nrt = fmap((t) -> zonkType(subst, t), rt);
             ExAbs(cellGet(nps), nrt, zonkForm(subst, body))
         },
         ExLet(vd, val, body) ->
@@ -318,7 +315,7 @@ def zonkForm(subst: StrMap Type, f: Form): Form = {
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
                     Cons(a, r) -> {
-                        let ng = match a.guard { Some(g) -> Some(zonkForm(subst, g)), None -> None };
+                        let ng = fmap((g) -> zonkForm(subst, g), a.guard);
                         cellSet(nArms, listAppend(cellGet(nArms), [MkMatchArm { pat: a.pat, guard: ng, body: zonkForm(subst, a.body) }]));
                         cellSet(cur, r)
                     },
@@ -1060,11 +1057,6 @@ def checkAdtVariantsSend(adtReg: StrMap AdtInfo, ainfo: AdtInfo, targs: List Typ
         }
     };
     cellGet(ok)
-}
-
-def applyExplicitSubstList(ts: List Type, sub: StrMap Type): List Type = match ts {
-    Nil -> Nil,
-    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), applyExplicitSubstList(t, sub)),
 }
 
 def constraintSpecEqual(a: ConstraintSpec, b: ConstraintSpec): Bool =
