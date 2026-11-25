@@ -1,6 +1,10 @@
 name = "core_geisha"
 version = "0.1.0"
-defaultTargets = ["CoreGeisha"]
+defaultTargets = ["CoreGeisha", "geisha-check"]
 
 [[lean_lib]]
 name = "CoreGeisha"
+
+[[lean_exe]]
+name = "geisha-check"
+root = "Main"
