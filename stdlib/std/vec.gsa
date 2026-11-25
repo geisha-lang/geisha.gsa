@@ -1,14 +1,14 @@
-// Dynamic growable array (`std.vec`), backed by `MutArray (Option a)` so `vecNew()` needs no dummy value!
+// Unboxed dynamic growable array (`std.vec`), backed directly by `MutArray a` (zero `Option` boxing!)
 
 use std.option.{Option, Some, None}
 
 pub data Vec a {
-    MkVec(Cell (MutArray (Option a)), Cell Int),
+    MkVec(Cell (MutArray a), Cell Int),
 }
 
 pub def vecWithCap(cap: Int): Vec a = {
     let actual = if (cap < 8) 8 else cap;
-    MkVec(cellNew(arrayNew(actual, None)), cellNew(0))
+    MkVec(cellNew(arrayNewZeroed(actual)), cellNew(0))
 }
 
 pub def vecNew(): Vec a = vecWithCap(8)
@@ -26,7 +26,7 @@ pub def vecPush(v: Vec a, item: a): Void = match v {
         let curCap = arrayLen(curArr);
         if (curLen >= curCap) {
             let newCap = if (curCap < 8) 8 else curCap * 2;
-            let grown = arrayNew(newCap, None);
+            let grown = arrayNewZeroed(newCap);
             let i = cellNew(0);
             while (cellGet(i) < curLen) {
                 let idx = cellGet(i);
@@ -35,7 +35,7 @@ pub def vecPush(v: Vec a, item: a): Void = match v {
             };
             cellSet(arrCell, grown)
         } else ();
-        arraySet(cellGet(arrCell), curLen, Some(item));
+        arraySet(cellGet(arrCell), curLen, item);
         cellSet(lenCell, curLen + 1)
     },
 }
@@ -49,9 +49,9 @@ pub def vecPop(v: Vec a): Option a = match v {
             let arr = cellGet(arrCell);
             let out = arrayGet(arr, lastIdx);
             // Clear popped slot so dead heap references are not retained!
-            arraySet(arr, lastIdx, None);
+            arrayClearSlot(arr, lastIdx);
             cellSet(lenCell, lastIdx);
-            out
+            Some(out)
         }
     },
 }
@@ -60,13 +60,16 @@ pub def vecGet(v: Vec a, idx: Int): Option a = match v {
     MkVec(arrCell, lenCell) -> {
         let curLen = cellGet(lenCell);
         if (idx < 0 || idx >= curLen) None
-        else arrayGet(cellGet(arrCell), idx)
+        else Some(arrayGet(cellGet(arrCell), idx))
     },
 }
 
-pub def vecGetOr(v: Vec a, idx: Int, fallback: a): a = match vecGet(v, idx) {
-    Some(x) -> x,
-    None -> fallback,
+pub def vecGetOr(v: Vec a, idx: Int, fallback: a): a = match v {
+    MkVec(arrCell, lenCell) -> {
+        let curLen = cellGet(lenCell);
+        if (idx < 0 || idx >= curLen) fallback
+        else arrayGet(cellGet(arrCell), idx)
+    },
 }
 
 pub def vecSet(v: Vec a, idx: Int, item: a): Void = match v {
@@ -78,7 +81,7 @@ pub def vecSet(v: Vec a, idx: Int, item: a): Void = match v {
             let _ = arrayGet(arrayNew(curLen, 0), idx);
             ()
         } else {
-            arraySet(arr, idx, Some(item))
+            arraySet(arr, idx, item)
         }
     },
 }
@@ -90,7 +93,7 @@ pub def vecClear(v: Vec a): Void = match v {
         let i = cellNew(0);
         while (cellGet(i) < n) {
             let idx = cellGet(i);
-            arraySet(arr, idx, None);
+            arrayClearSlot(arr, idx);
             cellSet(i, idx + 1)
         };
         cellSet(lenCell, 0)
@@ -104,10 +107,7 @@ pub def vecToList(v: Vec a): List a = match v {
         let i = cellNew(cellGet(lenCell) - 1);
         while (cellGet(i) >= 0) {
             let idx = cellGet(i);
-            match arrayGet(arr, idx) {
-                Some(x) -> cellSet(acc, Cons(x, cellGet(acc))),
-                None -> (),
-            };
+            cellSet(acc, Cons(arrayGet(arr, idx), cellGet(acc)));
             cellSet(i, idx - 1)
         };
         cellGet(acc)

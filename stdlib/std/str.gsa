@@ -294,7 +294,8 @@ pub def strSplitChar(s: String, sep: Char): List String = {
         let cur = cellGet(i);
         let isEnd = if (cur == len) true else strByteAt(s, cur) == sepByte;
         if (isEnd) {
-            let part = strSlice(s, cellGet(start), cur);
+            let st = cellGet(start);
+            let part = ptrSliceFromStr(s, st, cur - st);
             cellSet(acc, Cons(part, cellGet(acc)));
             cellSet(start, cur + 1)
         } else ();

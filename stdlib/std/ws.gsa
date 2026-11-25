@@ -4,11 +4,11 @@
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
-use std.buf.{bufNew, bufPushByte, bufToString}
+use std.buf.{bufNew, bufPushByte, bufPushPtr, bufToString}
 use std.str.{strTrim, strSplitChar}
 use sys.net.{
     TcpStream, tcpConnect, tcpClose,
-    tcpReadPtr, tcpReadExactPtr, tcpWrite, tcpWritePtr
+    tcpReadPtr, tcpPeekPtr, tcpReadExactPtr, tcpWrite, tcpWritePtr
 }
 
 pub data WsMessage {
@@ -180,31 +180,47 @@ def asciiLower(s: String): String = {
 
 def readHttpHeaders(stream: TcpStream): Result String String = {
     let out = bufNew();
-    let one = ptrAllocBytes(1);
+    let chunkCap = 4096;
+    let chunk = ptrAllocBytes(chunkCap);
     let count = cellNew(0);
     let state = cellNew(0);
+    let failed = cellNew(false);
     let err = cellNew("");
-    while (cellGet(state) < 4 && cellGet(count) < 16384 && strLen(cellGet(err)) == 0) {
-        match tcpReadPtr(stream, one, 1) {
-            Err(e) -> cellSet(err, e),
+    while (cellGet(state) < 4 && cellGet(count) < 16384 && !cellGet(failed)) {
+        match tcpPeekPtr(stream, chunk, chunkCap) {
+            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
             Ok(n) ->
                 if (n == 0) {
-                    cellSet(err, "connection closed during HTTP upgrade handshake")
+                    cellSet(err, "connection closed during HTTP upgrade handshake");
+                    cellSet(failed, true)
                 } else {
-                    let b = ptrByteAt(one, 0);
-                    bufPushByte(out, b);
-                    cellSet(count, cellGet(count) + 1);
-                    let st = cellGet(state);
-                    if (st == 0 && b == 13) cellSet(state, 1)
-                    else if (st == 1 && b == 10) cellSet(state, 2)
-                    else if (st == 2 && b == 13) cellSet(state, 3)
-                    else if (st == 3 && b == 10) cellSet(state, 4)
-                    else if (b == 13) cellSet(state, 1)
-                    else cellSet(state, 0)
+                    let take = cellNew(0);
+                    let i = cellNew(0);
+                    while (cellGet(i) < n && cellGet(state) < 4) {
+                        let idx = cellGet(i);
+                        let b = ptrByteAt(chunk, idx);
+                        let st = cellGet(state);
+                        if (st == 0 && b == 13) cellSet(state, 1)
+                        else if (st == 1 && b == 10) cellSet(state, 2)
+                        else if (st == 2 && b == 13) cellSet(state, 3)
+                        else if (st == 3 && b == 10) cellSet(state, 4)
+                        else if (b == 13) cellSet(state, 1)
+                        else cellSet(state, 0);
+                        cellSet(take, idx + 1);
+                        cellSet(i, idx + 1)
+                    };
+                    let consume = cellGet(take);
+                    match tcpReadExactPtr(stream, chunk, consume) {
+                        Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
+                        Ok(_) -> {
+                            bufPushPtr(out, chunk, consume);
+                            cellSet(count, cellGet(count) + consume)
+                        },
+                    }
                 },
         }
     };
-    if (strLen(cellGet(err)) > 0) Err(cellGet(err))
+    if (cellGet(failed)) Err(cellGet(err))
     else if (cellGet(state) < 4) Err("HTTP upgrade header exceeded 16 KiB limit")
     else Ok(bufToString(out))
 }
@@ -279,16 +295,8 @@ pub def wsClose(conn: WsConn): Void = match conn {
 
 // ---- RFC 6455 Framing ----
 
-def ptrToStringLen(p: Ptr, len: Int): String = {
-    let out = bufNew();
-    let i = cellNew(0);
-    while (cellGet(i) < len) {
-        let idx = cellGet(i);
-        bufPushByte(out, ptrByteAt(p, idx));
-        cellSet(i, idx + 1)
-    };
-    bufToString(out)
-}
+def ptrToStringLen(p: Ptr, len: Int): String =
+    ptrSliceToString(p, len)
 
 pub def wsRecv(conn: WsConn): Result WsMessage String = match conn {
     WsConn(stream) -> {
@@ -411,12 +419,7 @@ def wsSendFrame(conn: WsConn, opcode: Int, payload: String, masked: Bool): Resul
                 cellSet(i, idx + 1)
             }
         } else {
-            let i = cellNew(0);
-            while (cellGet(i) < n) {
-                let idx = cellGet(i);
-                ptrSetByte(frame, hdrLen + idx, strByteAt(payload, idx) & 255);
-                cellSet(i, idx + 1)
-            }
+            if (n > 0) ptrCopyFromStr(frame, hdrLen, payload, n) else ()
         };
         tcpWritePtr(stream, frame, total)
     },
@@ -443,12 +446,7 @@ pub def wsSendClose(conn: WsConn, code: Int, reason: String): Result Void String
         ptrSetByte(frame, 1, pLen & 127);
         ptrSetByte(frame, 2, (code >>> 8) & 255);
         ptrSetByte(frame, 3, code & 255);
-        let i = cellNew(0);
-        while (cellGet(i) < rLen) {
-            let idx = cellGet(i);
-            ptrSetByte(frame, 4 + idx, strByteAt(reason, idx) & 255);
-            cellSet(i, idx + 1)
-        };
+        if (rLen > 0) ptrCopyFromStr(frame, 4, reason, rLen) else ();
         tcpWritePtr(stream, frame, 2 + pLen)
     },
 }

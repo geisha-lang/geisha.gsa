@@ -990,6 +990,59 @@ def tryEmitIntrinsic(
 
         setInsertBlock(fctx, doneBlk);
         Some(arrPtr)
+    } else if (name == "arrayNewZeroed") {
+        let len32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let elemTy = match retTy {
+            TyComp(_, et) -> et,
+            _ -> TyVoid,
+        };
+        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
+        let elemSz = if (rawSz < 1) 1 else rawSz;
+
+        let badBlk = appendBlock(fctx, "arr.bad_len");
+        let allocBlk = appendBlock(fctx, "arr.alloc");
+        let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+        emitCondBr(fctx, isNeg, badBlk, allocBlk);
+
+        setInsertBlock(fctx, badBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, allocBlk);
+        let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+        let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+        let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic" else "@gc_alloc";
+        let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
+        emitStore(fctx, "i64", len64, arrPtr);
+        Some(arrPtr)
+    } else if (name == "arrayClearSlot") {
+        let a0 = nthArgTerm(args, 0);
+        let arrPtr = genExpr(mctx, fctx, a0, locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let elemTy = match schemeBody(a0.tscm) {
+            TyComp(_, et) -> et,
+            _ -> TyVoid,
+        };
+        let elemLlvm = getValLlvmType(elemTy);
+        let len64 = emitLoad(fctx, "i64", arrPtr);
+        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
+
+        let oobBlk = appendBlock(fctx, "arr.oob_trap");
+        let okBlk = appendBlock(fctx, "arr.clr_ok");
+        emitCondBr(fctx, oob, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+        let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
+        emitStore(fctx, elemLlvm, llvmZeroValue(elemLlvm), slotPtr);
+        Some("0")
     } else if (name == "arrayLen") {
         let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let len64 = emitLoad(fctx, "i64", arrPtr);
@@ -1085,6 +1138,16 @@ def tryEmitIntrinsic(
         let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
         Some(emitAssign(fctx, "lshr i64 " + a + ", " + b64))
+    } else if (name == "bitPopCount") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call i32 @llvm.ctpop.i32(i32 " + a + ")"))
+    } else if (name == "bitPopCount64") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let c64 = emitAssign(fctx, "call i64 @llvm.ctpop.i64(i64 " + a + ")");
+        Some(emitAssign(fctx, "trunc i64 " + c64 + " to i32"))
+    } else if (name == "bitCtz") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call i32 @llvm.cttz.i32(i32 " + a + ", i1 false)"))
     } else if (name == "charToInt") {
         let c = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "zext i8 " + c + " to i32"))
@@ -1157,6 +1220,19 @@ def tryEmitIntrinsic(
         let dstP = emitGep(fctx, "i8", dst, dstOff64);
         emitLlvmMemcpy(fctx, dstP, src, len64);
         Some("0")
+    } else if (name == "ptrSliceFromStr") {
+        let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let start32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let len32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let start64 = emitAssign(fctx, "sext i32 " + start32 + " to i64");
+        let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+        let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
+        let srcP = emitGep(fctx, "i8", s, start64);
+        emitLlvmMemcpy(fctx, dst, srcP, len64);
+        let termPtr = emitGep(fctx, "i8", dst, len64);
+        emitStore(fctx, "i8", "0", termPtr);
+        Some(dst)
     } else if (name == "ptrSliceToString") {
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let len32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
@@ -2360,16 +2436,18 @@ def armListHasCall(arms: List CoreArm): Bool = match arms {
 
 def isPureBuiltinIntrinsic(name: String): Bool =
     name == "cellNew" || name == "cellGet" || name == "cellSet"
-    || name == "arrayNew" || name == "arrayLen" || name == "arrayGet" || name == "arraySet"
+    || name == "arrayNew" || name == "arrayNewZeroed" || name == "arrayLen"
+    || name == "arrayGet" || name == "arraySet" || name == "arrayClearSlot"
     || name == "bitAnd" || name == "bitAnd64" || name == "bitOr" || name == "bitOr64"
     || name == "bitXor" || name == "bitXor64" || name == "bitNot" || name == "bitNot64"
     || name == "bitShl" || name == "bitShr" || name == "bitUshr"
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
+    || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "intToFloat" || name == "floatToInt"
     || name == "ptrNull" || name == "ptrIsNull" || name == "ptrAllocBytes"
     || name == "ptrByteAt" || name == "ptrSetByte" || name == "ptrCopyBytes"
-    || name == "ptrCopyFromStr" || name == "ptrSliceToString" || name == "ptrToString"
+    || name == "ptrCopyFromStr" || name == "ptrSliceFromStr" || name == "ptrSliceToString" || name == "ptrToString"
     || name == "strLen" || name == "strByteAt" || name == "strSlice"
     || name == "strConcat" || name == "strFromBytes" || name == "sysArgc" || name == "sysArgv"
 
@@ -2566,6 +2644,9 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
+        ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
+        ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),
         ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
         ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
         ("putFloat", "declare void @putFloat(double, ptr) nounwind"),
@@ -2586,6 +2667,9 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
+        ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
+        ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),
         ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
         ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
         ("putFloat", "declare void @putFloat(double, ptr) nounwind"),

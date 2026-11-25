@@ -92,16 +92,8 @@ def classifyWord(w: String): TokKind =
     else if (w == "Void") TkVoid
     else TkIdent(w)
 
-def sliceIntoBuf(buf: StringBuf, src: String, start: Int, end: Int): String = {
-    bufClear(buf);
-    let k = cellNew(start);
-    while (cellGet(k) < end) {
-        let idx = cellGet(k);
-        bufPushByte(buf, strByteAt(src, idx));
-        cellSet(k, idx + 1)
-    };
-    bufToString(buf)
-}
+def sliceIntoBuf(buf: StringBuf, src: String, start: Int, end: Int): String =
+    ptrSliceFromStr(src, start, end - start)
 
 pub def tokenize(src: String): Result (Vec Token) String = {
     let len = strLen(src);

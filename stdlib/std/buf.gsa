@@ -67,6 +67,18 @@ pub def bufPushStr(b: StringBuf, s: String): Void = {
     } else ()
 }
 
+pub def bufPushPtr(b: StringBuf, src: Ptr, len: Int): Void =
+    if (len > 0) {
+        ensureExtra(b, len);
+        match b {
+            MkStringBuf(dataCell, lenCell, _) -> {
+                let base = cellGet(lenCell);
+                ptrCopyBytes(cellGet(dataCell), base, src, 0, len);
+                cellSet(lenCell, base + len)
+            },
+        }
+    } else ()
+
 pub def bufPushLine(b: StringBuf, s: String): Void = {
     bufPushStr(b, s);
     bufPushByte(b, 10)

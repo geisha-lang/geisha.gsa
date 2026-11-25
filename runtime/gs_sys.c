@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -64,6 +65,37 @@ int32_t gs_sys_dir_close(void *dir)
 {
     if (dir == NULL) return 0;
     return closedir((DIR *)dir);
+}
+
+int64_t gs_sys_file_size(const char *path)
+{
+    if (path == NULL) return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if (!S_ISREG(st.st_mode)) return -1;
+    return (int64_t)st.st_size;
+}
+
+void *gs_sys_mmap_open(const char *path)
+{
+    if (path == NULL) return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return NULL;
+    }
+    void *mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return NULL;
+    return mapped;
+}
+
+int32_t gs_sys_mmap_close(void *ptr, int64_t len)
+{
+    if (ptr == NULL || len <= 0) return 0;
+    return (int32_t)munmap(ptr, (size_t)len);
 }
 
 /* ---- Time helpers (`sys.time`) ---- */
@@ -215,6 +247,17 @@ int32_t gs_net_tcp_read(int32_t fd, void *buf, int32_t cap)
     if (buf == NULL || cap <= 0) return 0;
     for (;;) {
         ssize_t n = recv(fd, buf, (size_t)cap, 0);
+        if (n >= 0) return (int32_t)n;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+int32_t gs_net_tcp_peek(int32_t fd, void *buf, int32_t cap)
+{
+    if (buf == NULL || cap <= 0) return 0;
+    for (;;) {
+        ssize_t n = recv(fd, buf, (size_t)cap, MSG_PEEK);
         if (n >= 0) return (int32_t)n;
         if (errno == EINTR) continue;
         return -1;

@@ -275,7 +275,7 @@ cat > "$TMP_DIR/t8_sys_rand.gsa" << 'EOF'
 use std.result.{Ok, Err}
 use std.list.{listLen, listAny}
 use std.str.intToStr
-use sys.fs.{mkdirAll, isDir, writeFile, readDir}
+use sys.fs.{mkdirAll, isDir, writeFile, readFile, readDir, withMmap, mmapLen, mmapByteAt}
 use sys.time.{nowMs, monotonicMs}
 use std.rand.{fromSeed, fromEntropy, nextInt, nextRange}
 
@@ -283,8 +283,13 @@ def main() = {
     let base = "TMP_FS_DIR_PLACEHOLDER";
     let nested = base + "/a/b";
     let mkOk = match mkdirAll(nested) { Ok(_) -> isDir(nested), Err(_) -> false };
-    let _ = writeFile(nested + "/one.txt", "1");
+    let _ = writeFile(nested + "/one.txt", "hello-mmap");
     let _ = writeFile(nested + "/two.txt", "2");
+    let rfOk = match readFile(nested + "/one.txt") { Ok(s) -> s == "hello-mmap", Err(_) -> false };
+    let mmOk = match withMmap(nested + "/one.txt", (m) -> i64ToInt(mmapLen(m)) == 10 && mmapByteAt(m, 0) == 104 && mmapByteAt(m, 9) == 112) {
+        Ok(b) -> b,
+        Err(_) -> false,
+    };
     let dirOk = match readDir(nested) {
         Ok(entries) -> listLen(entries) == 2 && listAny(entries, (e) -> e == "one.txt"),
         Err(_) -> false,
@@ -299,7 +304,7 @@ def main() = {
     let (_, _) = nextInt(fromEntropy(), 100);
     let randOk = (a1 == a2) && (a1 >= 10) && (a1 <= 20) && (b1 >= 0) && (b1 < 100);
 
-    let s = (if (mkOk) "1" else "0") + (if (dirOk) "1" else "0") + (if (tOk) "1" else "0") + (if (randOk) "1" else "0");
+    let s = (if (mkOk && rfOk && mmOk) "1" else "0") + (if (dirOk) "1" else "0") + (if (tOk) "1" else "0") + (if (randOk) "1" else "0");
     printLn(s)
 }
 EOF

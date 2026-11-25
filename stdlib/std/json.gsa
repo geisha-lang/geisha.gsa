@@ -83,62 +83,107 @@ def parseStringRaw(p: Parser): Result String String = {
     if (openQuote != 34) {
         Err("expected '\"' at byte " + intToStr(cellGet(p.pos)))
     } else {
-        let out = bufNew();
-        let done = cellNew(false);
-        let err = cellNew("");
-        while (!cellGet(done) && strLen(cellGet(err)) == 0) {
-            let c = bump(p);
-            if (c < 0) {
-                cellSet(err, "unterminated JSON string")
-            } else if (c == 34) {
-                cellSet(done, true)
-            } else if (c == 92) {
-                let esc = bump(p);
-                if (esc == 34) bufPushByte(out, 34)
-                else if (esc == 92) bufPushByte(out, 92)
-                else if (esc == 47) bufPushByte(out, 47)
-                else if (esc == 98) bufPushByte(out, 8)
-                else if (esc == 102) bufPushByte(out, 12)
-                else if (esc == 110) bufPushByte(out, 10)
-                else if (esc == 114) bufPushByte(out, 13)
-                else if (esc == 116) bufPushByte(out, 9)
-                else if (esc == 117) {
-                    match readHex4(p) {
-                        Err(e) -> cellSet(err, e),
-                        Ok(u1) ->
-                            if (u1 >= 55296 && u1 <= 56319) {
-                                // High surrogate: expect `\u` + low surrogate
-                                let s1 = bump(p);
-                                let s2 = bump(p);
-                                if (s1 != 92 || s2 != 117) {
-                                    cellSet(err, "expected low surrogate after high surrogate")
-                                } else {
-                                    match readHex4(p) {
-                                        Err(e2) -> cellSet(err, e2),
-                                        Ok(u2) ->
-                                            if (u2 >= 56320 && u2 <= 57343) {
-                                                let cp = 65536 + ((u1 - 55296) << 10) + (u2 - 56320);
-                                                pushUtf8(out, cp)
-                                            } else {
-                                                cellSet(err, "invalid low surrogate escape")
-                                            },
-                                    }
-                                }
-                            } else {
-                                pushUtf8(out, u1)
-                            },
-                    }
-                } else {
-                    cellSet(err, "invalid escape sequence in JSON string")
-                }
-            } else if (c < 32) {
-                cellSet(err, "unescaped control character in JSON string")
+        // Fast path: scan unescaped string directly without allocating a StringBuf
+        let start = cellGet(p.pos);
+        let cur = cellNew(start);
+        let fastDone = cellNew(false);
+        let fastOk = cellNew(false);
+        let fastErr = cellNew("");
+        while (!cellGet(fastDone)) {
+            let idx = cellGet(cur);
+            if (idx >= p.len) {
+                cellSet(fastErr, "unterminated JSON string");
+                cellSet(fastDone, true)
             } else {
-                bufPushByte(out, c)
+                let c = strByteAt(p.src, idx);
+                if (c == 34) {
+                    cellSet(p.pos, idx + 1);
+                    cellSet(fastOk, true);
+                    cellSet(fastDone, true)
+                } else if (c == 92) {
+                    cellSet(fastDone, true)
+                } else if (c < 32) {
+                    cellSet(fastErr, "unescaped control character in JSON string");
+                    cellSet(fastDone, true)
+                } else {
+                    cellSet(cur, idx + 1)
+                }
             }
         };
-        if (strLen(cellGet(err)) > 0) Err(cellGet(err))
-        else Ok(bufToString(out))
+        if (cellGet(fastOk)) {
+            Ok(ptrSliceFromStr(p.src, start, cellGet(cur) - start))
+        } else if (strLen(cellGet(fastErr)) > 0) {
+            Err(cellGet(fastErr))
+        } else {
+            // Slow path: string contains escape sequences; copy unescaped prefix then decode escapes
+            let out = bufNew();
+            let prefixLen = cellGet(cur) - start;
+            if (prefixLen > 0) {
+                bufPushStr(out, ptrSliceFromStr(p.src, start, prefixLen))
+            } else ();
+            cellSet(p.pos, cellGet(cur));
+            let done = cellNew(false);
+            let failed = cellNew(false);
+            let err = cellNew("");
+            while (!cellGet(done) && !cellGet(failed)) {
+                let c = bump(p);
+                if (c < 0) {
+                    cellSet(err, "unterminated JSON string");
+                    cellSet(failed, true)
+                } else if (c == 34) {
+                    cellSet(done, true)
+                } else if (c == 92) {
+                    let esc = bump(p);
+                    if (esc == 34) bufPushByte(out, 34)
+                    else if (esc == 92) bufPushByte(out, 92)
+                    else if (esc == 47) bufPushByte(out, 47)
+                    else if (esc == 98) bufPushByte(out, 8)
+                    else if (esc == 102) bufPushByte(out, 12)
+                    else if (esc == 110) bufPushByte(out, 10)
+                    else if (esc == 114) bufPushByte(out, 13)
+                    else if (esc == 116) bufPushByte(out, 9)
+                    else if (esc == 117) {
+                        match readHex4(p) {
+                            Err(e) -> { cellSet(err, e); cellSet(failed, true) },
+                            Ok(u1) ->
+                                if (u1 >= 55296 && u1 <= 56319) {
+                                    // High surrogate: expect `\u` + low surrogate
+                                    let s1 = bump(p);
+                                    let s2 = bump(p);
+                                    if (s1 != 92 || s2 != 117) {
+                                        cellSet(err, "expected low surrogate after high surrogate");
+                                        cellSet(failed, true)
+                                    } else {
+                                        match readHex4(p) {
+                                            Err(e2) -> { cellSet(err, e2); cellSet(failed, true) },
+                                            Ok(u2) ->
+                                                if (u2 >= 56320 && u2 <= 57343) {
+                                                    let cp = 65536 + ((u1 - 55296) << 10) + (u2 - 56320);
+                                                    pushUtf8(out, cp)
+                                                } else {
+                                                    cellSet(err, "invalid low surrogate escape");
+                                                    cellSet(failed, true)
+                                                },
+                                        }
+                                    }
+                                } else {
+                                    pushUtf8(out, u1)
+                                },
+                        }
+                    } else {
+                        cellSet(err, "invalid escape sequence in JSON string");
+                        cellSet(failed, true)
+                    }
+                } else if (c < 32) {
+                    cellSet(err, "unescaped control character in JSON string");
+                    cellSet(failed, true)
+                } else {
+                    bufPushByte(out, c)
+                }
+            };
+            if (cellGet(failed)) Err(cellGet(err))
+            else Ok(bufToString(out))
+        }
     }
 }
 
@@ -147,11 +192,20 @@ def expectLiteral(p: Parser, lit: String): Result Void String = {
     let start = cellGet(p.pos);
     if (start + n > p.len) {
         Err("unexpected EOF while expecting '" + lit + "'")
-    } else if (strSlice(p.src, start, start + n) == lit) {
-        cellSet(p.pos, start + n);
-        Ok(())
     } else {
-        Err("expected '" + lit + "' at byte " + intToStr(start))
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let idx = cellGet(i);
+            if (strByteAt(p.src, start + idx) != strByteAt(lit, idx)) cellSet(ok, false) else ();
+            cellSet(i, idx + 1)
+        };
+        if (cellGet(ok)) {
+            cellSet(p.pos, start + n);
+            Ok(())
+        } else {
+            Err("expected '" + lit + "' at byte " + intToStr(start))
+        }
     }
 }
 
@@ -200,7 +254,7 @@ def parseNumber(p: Parser): Result Value String = {
         if (endIdx <= start) {
             Err("invalid JSON number at byte " + intToStr(start))
         } else {
-            let raw = strSlice(p.src, start, endIdx);
+            let raw = ptrSliceFromStr(p.src, start, endIdx - start);
             if (cellGet(isFloat)) {
                 match parseFloat(raw) {
                     Ok(f) -> Ok(VFloat(f)),
@@ -345,25 +399,38 @@ def hexDigitByte(n: Int): Int =
 def emitJsonString(b: StringBuf, s: String): Void = {
     bufPushByte(b, 34);
     let n = strLen(s);
-    let i = cellNew(0);
-    while (cellGet(i) < n) {
-        let idx = cellGet(i);
+    // Fast path: check if any byte needs JSON escaping; if not, bulk memcpy whole string
+    let needsEsc = cellNew(false);
+    let k = cellNew(0);
+    while (cellGet(k) < n && !cellGet(needsEsc)) {
+        let idx = cellGet(k);
         let c = strByteAt(s, idx);
-        if (c == 34) bufPushStr(b, "\\\"")
-        else if (c == 92) bufPushStr(b, "\\\\")
-        else if (c == 8) bufPushStr(b, "\\b")
-        else if (c == 12) bufPushStr(b, "\\f")
-        else if (c == 10) bufPushStr(b, "\\n")
-        else if (c == 13) bufPushStr(b, "\\r")
-        else if (c == 9) bufPushStr(b, "\\t")
-        else if (c < 32) {
-            bufPushStr(b, "\\u00");
-            bufPushByte(b, hexDigitByte((c >>> 4) & 15));
-            bufPushByte(b, hexDigitByte(c & 15))
-        } else {
-            bufPushByte(b, c)
-        };
-        cellSet(i, idx + 1)
+        if (c == 34 || c == 92 || c < 32) cellSet(needsEsc, true) else ();
+        cellSet(k, idx + 1)
+    };
+    if (!cellGet(needsEsc)) {
+        bufPushStr(b, s)
+    } else {
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            let c = strByteAt(s, idx);
+            if (c == 34) bufPushStr(b, "\\\"")
+            else if (c == 92) bufPushStr(b, "\\\\")
+            else if (c == 8) bufPushStr(b, "\\b")
+            else if (c == 12) bufPushStr(b, "\\f")
+            else if (c == 10) bufPushStr(b, "\\n")
+            else if (c == 13) bufPushStr(b, "\\r")
+            else if (c == 9) bufPushStr(b, "\\t")
+            else if (c < 32) {
+                bufPushStr(b, "\\u00");
+                bufPushByte(b, hexDigitByte((c >>> 4) & 15));
+                bufPushByte(b, hexDigitByte(c & 15))
+            } else {
+                bufPushByte(b, c)
+            };
+            cellSet(i, idx + 1)
+        }
     };
     bufPushByte(b, 34)
 }

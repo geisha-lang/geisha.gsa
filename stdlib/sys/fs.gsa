@@ -1,7 +1,8 @@
-// File system operations via portable POSIX / ANSI C ABI (`sys.fs`)
+// File system operations via portable POSIX / ANSI C ABI (`sys.fs`),
+// including single-shot `fstat` `readFile` and zero-copy read-only `Mmap` views.
 
 use std.result.{Result, Ok, Err}
-use std.buf.{bufNew, bufPushByte, bufToString}
+use std.buf.{bufNew, bufPushPtr, bufToString}
 use std.list.listRev
 
 extern "fopen" def c_fopen(path: String, mode: String): Ptr
@@ -15,6 +16,9 @@ extern "gs_sys_mkdir" def c_mkdir(path: String): Int
 extern "gs_sys_dir_open" def c_dir_open(path: String): Ptr
 extern "gs_sys_dir_next" def c_dir_next(dir: Ptr): Ptr
 extern "gs_sys_dir_close" def c_dir_close(dir: Ptr): Int
+extern "gs_sys_file_size" def c_file_size(path: String): Int64
+extern "gs_sys_mmap_open" def c_mmap_open(path: String): Ptr
+extern "gs_sys_mmap_close" def c_mmap_close(ptr: Ptr, len: Int64): Int
 
 pub def fileExists(path: String): Bool =
     c_access(path, 0) == 0
@@ -35,7 +39,7 @@ pub def mkdirAll(path: String): Result Void String = {
         while (cellGet(i) < n && !cellGet(failed)) {
             let idx = cellGet(i);
             if (strByteAt(path, idx) == 47) {
-                let prefix = strSlice(path, 0, idx);
+                let prefix = ptrSliceFromStr(path, 0, idx);
                 if (strLen(prefix) > 0 && !isDir(prefix)) {
                     if (c_mkdir(prefix) != 0) cellSet(failed, true) else ()
                 } else ()
@@ -72,25 +76,35 @@ pub def readFile(path: String): Result String String = {
     if (ptrIsNull(fp)) {
         Err(strConcat("failed to open file for reading: ", path))
     } else {
-        let chunkCap = 4096;
-        let chunk = ptrAllocBytes(chunkCap);
-        let out = bufNew();
-        let reading = cellNew(true);
-        while (cellGet(reading)) {
-            let got = i64ToInt(c_fread(chunk, intToI64(1), intToI64(chunkCap), fp));
-            if (got <= 0) {
-                cellSet(reading, false)
-            } else {
-                let i = cellNew(0);
-                while (cellGet(i) < got) {
-                    let idx = cellGet(i);
-                    bufPushByte(out, ptrByteAt(chunk, idx));
-                    cellSet(i, idx + 1)
+        let sz64 = c_file_size(path);
+        let maxSingle = intToI64(2147483640);
+        if (sz64 == intToI64(0)) {
+            let _ = c_fclose(fp);
+            Ok("")
+        } else if (sz64 > intToI64(0) && sz64 <= maxSingle) {
+            // Fast path: regular file — single-shot read + single bulk copy
+            let sz = i64ToInt(sz64);
+            let raw = ptrAllocBytes(sz + 1);
+            let got = i64ToInt(c_fread(raw, intToI64(1), sz64, fp));
+            let _ = c_fclose(fp);
+            Ok(ptrSliceToString(raw, if (got < 0) 0 else got))
+        } else {
+            // Fallback for pipes / non-regular files: 64 KiB chunked bulk-memcpy reads
+            let chunkCap = 65536;
+            let chunk = ptrAllocBytes(chunkCap);
+            let out = bufNew();
+            let reading = cellNew(true);
+            while (cellGet(reading)) {
+                let got = i64ToInt(c_fread(chunk, intToI64(1), intToI64(chunkCap), fp));
+                if (got <= 0) {
+                    cellSet(reading, false)
+                } else {
+                    bufPushPtr(out, chunk, got)
                 }
-            }
-        };
-        let _ = c_fclose(fp);
-        Ok(bufToString(out))
+            };
+            let _ = c_fclose(fp);
+            Ok(bufToString(out))
+        }
     }
 }
 
@@ -109,3 +123,44 @@ pub def writeFile(path: String, content: String): Result Void String = {
 
 pub def removeFile(path: String): Bool =
     c_remove(path) == 0
+
+// ---- Zero-copy read-only memory-mapped file handle (`Mmap`) ----
+
+pub data Mmap {
+    Mmap { ptr: Ptr, len: Int64 },
+}
+
+pub def mmapOpen(path: String): Result Mmap String = {
+    let sz = c_file_size(path);
+    if (sz < intToI64(0)) {
+        Err("failed to stat file for mmap: " + path)
+    } else if (sz == intToI64(0)) {
+        Ok(Mmap { ptr: ptrNull(), len: intToI64(0) })
+    } else {
+        let p = c_mmap_open(path);
+        if (ptrIsNull(p)) Err("failed to mmap file: " + path)
+        else Ok(Mmap { ptr: p, len: sz })
+    }
+}
+
+pub def mmapLen(m: Mmap): Int64 = m.len
+
+pub def mmapByteAt(m: Mmap, idx: Int): Int =
+    if (idx < 0 || intToI64(idx) >= m.len) {
+        let _ = arrayGet(arrayNew(i64ToInt(m.len), 0), idx);
+        0
+    } else {
+        ptrByteAt(m.ptr, idx)
+    }
+
+pub def mmapClose(m: Mmap): Void = {
+    let _ = c_mmap_close(m.ptr, m.len);
+    ()
+}
+
+pub def withMmap(path: String, f: Mmap -> a): Result a String = {
+    let m = mmapOpen(path)?;
+    let res = f(m);
+    mmapClose(m);
+    Ok(res)
+}
