@@ -1,0 +1,2255 @@
+// Static LP64 ABI Layout Calculator & LLVM 20 Opaque-Pointer Textual IR Emitter (`codegen`)
+
+use std.option.{Option, Some, None}
+use std.list.{listRev, listLen}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
+use std.str.{intToStr, floatToHex16, strJoin}
+use ast.{
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, ScmMono, schemeBody,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct
+}
+use infer.{
+    VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
+}
+use core.{
+    ClosureSpec, TaggedTerm, MkTerm, CoreArm, Term,
+    TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
+    TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
+    FunDef, GlobalValDef, ExternDef, EscapeInfo, CoreProgram,
+    extractTypeArgs, isStackAlloc, fnHasStackAlloc, isRecursiveAdt
+}
+
+// ============================================================================
+// LLVM Identifier Formatting & String Escaping
+// ============================================================================
+
+def isSimpleLlvmIdentByte(b: Int, isFirst: Bool): Bool =
+    if (b >= 65 && b <= 90) true
+    else if (b >= 97 && b <= 122) true
+    else if (b == 95 || b == 46) true
+    else if (!isFirst && b >= 48 && b <= 57) true
+    else false
+
+pub def llvmSym(name: String): String = {
+    let n = strLen(name);
+    if (n == 0) "@\"\""
+    else {
+        let simple = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(simple)) {
+            let idx = cellGet(i);
+            if (!isSimpleLlvmIdentByte(strByteAt(name, idx), idx == 0)) {
+                cellSet(simple, false)
+            } else ();
+            cellSet(i, idx + 1)
+        };
+        if (cellGet(simple)) "@" + name
+        else {
+            let b = bufNew();
+            bufPushByte(b, 64);
+            bufPushByte(b, 34);
+            let k = cellNew(0);
+            while (cellGet(k) < n) {
+                let c = strByteAt(name, cellGet(k));
+                if (c == 34 || c == 92) {
+                    bufPushByte(b, 92);
+                    pushHexByteUpper(b, c)
+                } else {
+                    bufPushByte(b, c)
+                };
+                cellSet(k, cellGet(k) + 1)
+            };
+            bufPushByte(b, 34);
+            bufToString(b)
+        }
+    }
+}
+
+def hexDigitUpper(nib: Int): Int =
+    if (nib < 10) 48 + nib else 55 + nib
+
+def pushHexByteUpper(b: StringBuf, byteVal: Int): Void = {
+    let v = byteVal & 255;
+    bufPushByte(b, hexDigitUpper((v >>> 4) & 15));
+    bufPushByte(b, hexDigitUpper(v & 15))
+}
+
+def encodeLlvmCString(s: String): String = {
+    let b = bufNew();
+    bufPushStr(b, "c\"");
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c >= 32 && c <= 126 && c != 34 && c != 92) {
+            bufPushByte(b, c)
+        } else {
+            bufPushByte(b, 92);
+            pushHexByteUpper(b, c)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushStr(b, "\\00\"");
+    bufToString(b)
+}
+
+// ============================================================================
+// Geisha `Type` -> LLVM 20 Opaque-Pointer Type & Static LP64 ABI Calculator
+// ============================================================================
+
+pub def isVoidGeishaType(ty: Type): Bool = match ty {
+    TyVoid -> true,
+    TyCon(n) -> n == "Void",
+    _ -> false,
+}
+
+def getCompBaseName(ty: Type): String = match ty {
+    TyComp(b, _) -> getCompBaseName(b),
+    TyCon(n) -> n,
+    _ -> "",
+}
+
+def isAdtGeishaType(ty: Type): Bool = match ty {
+    TyCon(n) ->
+        !(n == "Int" || n == "Int64" || n == "Float" || n == "Char"
+          || n == "String" || n == "Void" || n == "Bool" || n == "Ptr" || n == "AtomicInt"),
+    TyComp(_, _) -> {
+        let base = getCompBaseName(ty);
+        !(base == "Int" || base == "Int64" || base == "Float" || base == "Char"
+          || base == "String" || base == "Void" || base == "Bool" || base == "Ptr"
+          || base == "Cell" || base == "MutArray" || base == "MVar"
+          || base == "Chan" || base == "Task" || base == "Actor")
+    },
+    _ -> false,
+}
+
+pub def isNoscanElemType(ty: Type): Bool = match ty {
+    TyVoid -> true,
+    TyCon(n) ->
+        n == "Int" || n == "Int64" || n == "Float" || n == "Char"
+        || n == "Bool" || n == "Void" || n == "Ptr",
+    TyTuple(es) -> isNoscanList(es),
+    _ -> false,
+}
+
+def isNoscanList(ts: List Type): Bool = match ts {
+    Nil -> true,
+    Cons(h, t) -> isNoscanElemType(h) && isNoscanList(t),
+}
+
+pub def isGcPointerType(ty: Type): Bool = match ty {
+    TyArr(_, _) -> true,
+    TyCon(n) -> n == "String" || n == "AtomicInt" || isAdtGeishaType(ty),
+    TyComp(_, _) -> {
+        let base = getCompBaseName(ty);
+        base == "Cell" || base == "MutArray" || base == "MVar"
+        || base == "Chan" || base == "Task" || base == "Actor"
+        || isAdtGeishaType(ty)
+    },
+    _ -> false,
+}
+
+pub def getValLlvmType(ty: Type): String = match ty {
+    TyVoid -> "i8",
+    TyCon(n) ->
+        if (n == "Int") "i32"
+        else if (n == "Int64") "i64"
+        else if (n == "Float") "double"
+        else if (n == "Char") "i8"
+        else if (n == "Bool") "i1"
+        else if (n == "Void") "i8"
+        else "ptr",
+    TyArr(_, _) -> "ptr",
+    TyComp(_, _) -> "ptr",
+    TyTuple(elems) -> formatLlvmStructType(mapValLlvmTypes(elems)),
+    TyVar(_) -> "i64",
+}
+
+def mapValLlvmTypes(ts: List Type): List String = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(ts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(t, r) -> {
+                cellSet(rev, Cons(getValLlvmType(t), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def formatLlvmStructType(fieldLlvmTys: List String): String = match fieldLlvmTys {
+    Nil -> "{}",
+    _ -> "{ " + strJoin(fieldLlvmTys, ", ") + " }",
+}
+
+def getFnRetLlvmType(retTy: Type): String =
+    if (isVoidGeishaType(retTy)) "void" else getValLlvmType(retTy)
+
+def llvmZeroValue(llvmTy: String): String =
+    if (llvmTy == "i1") "false"
+    else if (llvmTy == "i8" || llvmTy == "i32" || llvmTy == "i64") "0"
+    else if (llvmTy == "double") "0x0000000000000000"
+    else if (llvmTy == "ptr") "null"
+    else "zeroinitializer"
+
+def alignUp(offset: Int, align: Int): Int =
+    if (align <= 1) offset
+    else {
+        let rem = offset % align;
+        if (rem == 0) offset else offset + (align - rem)
+    }
+
+// Returns `(byteSize, abiAlign)` on 64-bit LP64 targets (`arm64` / `x86_64`)
+pub def typeSizeAndAlign(ty: Type): (Int, Int) = match ty {
+    TyVoid -> (1, 1),
+    TyCon(n) ->
+        if (n == "Int") (4, 4)
+        else if (n == "Int64") (8, 8)
+        else if (n == "Float") (8, 8)
+        else if (n == "Char" || n == "Bool" || n == "Void") (1, 1)
+        else (8, 8),
+    TyArr(_, _) -> (8, 8),
+    TyComp(_, _) -> (8, 8),
+    TyVar(_) -> (8, 8),
+    TyTuple(elems) -> structSizeAndAlign(elems),
+}
+
+pub def structSizeAndAlign(elems: List Type): (Int, Int) = match elems {
+    Nil -> (0, 1),
+    _ -> {
+        let off = cellNew(0);
+        let maxAl = cellNew(1);
+        let cur = cellNew(elems);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(el, r) -> {
+                    let (sz, al) = typeSizeAndAlign(el);
+                    let aligned = alignUp(cellGet(off), al);
+                    cellSet(off, aligned + sz);
+                    if (al > cellGet(maxAl)) cellSet(maxAl, al) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let finalAl = cellGet(maxAl);
+        (alignUp(cellGet(off), finalAl), finalAl)
+    },
+}
+
+// Compute `{ i32 tag, [N x word] }` LLVM struct type AND its LP64 byte size
+def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type): (String, Int) =
+    match strMapGet(adtReg, adtName) {
+        None -> ("{ i32 }", 4),
+        Some(ainfo) -> {
+            let sub = buildPairMap(ainfo.typeParams, typeArgs);
+            let maxBytes = cellNew(0);
+            let maxAlign = cellNew(1);
+            let cv = cellNew(ainfo.variants);
+            while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                match cellGet(cv) {
+                    Cons(vi, r) -> {
+                        match vi.fieldTypes {
+                            Nil -> (),
+                            fts -> {
+                                let instTys = substTypeList(fts, sub);
+                                let (sz, al) = structSizeAndAlign(instTys);
+                                if (sz > cellGet(maxBytes)) cellSet(maxBytes, sz) else ();
+                                if (al > cellGet(maxAlign)) cellSet(maxAlign, al) else ()
+                            },
+                        };
+                        cellSet(cv, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let mb = cellGet(maxBytes);
+            let ma = cellGet(maxAlign);
+            if (mb == 0) {
+                ("{ i32 }", 4)
+            } else if (ma >= 8) {
+                let words = (mb + 7) / 8;
+                ("{ i32, [" + intToStr(words) + " x i64] }", 8 + words * 8)
+            } else {
+                let words = (mb + 3) / 4;
+                ("{ i32, [" + intToStr(words) + " x i32] }", 4 + words * 4)
+            }
+        },
+    }
+
+def substTypeList(ts: List Type, sub: StrMap Type): List Type = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(ts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(t, r) -> {
+                cellSet(rev, Cons(applyExplicitSubst(t, sub), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+// ============================================================================
+// Module & Function IR Builder Contexts
+// ============================================================================
+
+data VarSlot {
+    MkVarSlot { vsPtr: String, vsLlvmTy: String, vsGeishaTy: Type },
+}
+
+data BasicBlockBuf {
+    MkBlockBuf { bbLabel: String, bbInstrs: StringBuf, bbTerm: Cell Bool },
+}
+
+data FnEmitCtx {
+    MkFnEmitCtx {
+        fcName: String,
+        fcRegCnt: Cell Int,
+        fcBlkCnt: Cell Int,
+        fcAllocas: StringBuf,
+        fcBlocks: Vec BasicBlockBuf,
+        fcCurBlk: Cell Int,
+        fcPendingLet: Cell (Option String),
+    },
+}
+
+data ModEmitCtx {
+    MkModEmitCtx {
+        mcStrCnt: Cell Int,
+        mcStrDecls: StringBuf,
+        mcSynthFns: StringBuf,
+        mcSynthSet: StrMap Bool,
+        mcGlobalSlots: StrMap VarSlot,
+        mcExterns: StrMap ExternDef,
+        mcAdtReg: StrMap AdtInfo,
+        mcEscape: EscapeInfo,
+    },
+}
+
+def newFnEmitCtx(fnName: String): FnEmitCtx = {
+    let blks: Vec BasicBlockBuf = vecNew();
+    vecPush(blks, MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) });
+    MkFnEmitCtx {
+        fcName: fnName,
+        fcRegCnt: cellNew(0),
+        fcBlkCnt: cellNew(0),
+        fcAllocas: bufNew(),
+        fcBlocks: blks,
+        fcCurBlk: cellNew(0),
+        fcPendingLet: cellNew(None),
+    }
+}
+
+def freshReg(fctx: FnEmitCtx): String = {
+    let n = cellGet(fctx.fcRegCnt) + 1;
+    cellSet(fctx.fcRegCnt, n);
+    "%r" + intToStr(n)
+}
+
+def appendBlock(fctx: FnEmitCtx, prefix: String): Int = {
+    let n = cellGet(fctx.fcBlkCnt) + 1;
+    cellSet(fctx.fcBlkCnt, n);
+    let lbl = prefix + "." + intToStr(n);
+    let idx = vecLen(fctx.fcBlocks);
+    vecPush(fctx.fcBlocks, MkBlockBuf { bbLabel: lbl, bbInstrs: bufNew(), bbTerm: cellNew(false) });
+    idx
+}
+
+def setInsertBlock(fctx: FnEmitCtx, blkIdx: Int): Void =
+    cellSet(fctx.fcCurBlk, blkIdx)
+
+def getInsertBlock(fctx: FnEmitCtx): Int =
+    cellGet(fctx.fcCurBlk)
+
+def blockLabel(fctx: FnEmitCtx, blkIdx: Int): String = {
+    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    let bb = vecGetOr(fctx.fcBlocks, blkIdx, dummy);
+    bb.bbLabel
+}
+
+def curBlockHasTerm(fctx: FnEmitCtx): Bool = {
+    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    cellGet(bb.bbTerm)
+}
+
+def emitLine(fctx: FnEmitCtx, line: String): Void = {
+    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    if (!cellGet(bb.bbTerm)) {
+        bufPushStr(bb.bbInstrs, "  ");
+        bufPushStr(bb.bbInstrs, line);
+        bufPushByte(bb.bbInstrs, 10)
+    } else ()
+}
+
+def emitTermLine(fctx: FnEmitCtx, line: String): Void = {
+    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), dummy);
+    if (!cellGet(bb.bbTerm)) {
+        bufPushStr(bb.bbInstrs, "  ");
+        bufPushStr(bb.bbInstrs, line);
+        bufPushByte(bb.bbInstrs, 10);
+        cellSet(bb.bbTerm, true)
+    } else ()
+}
+
+def emitAssign(fctx: FnEmitCtx, rhs: String): String = {
+    let reg = freshReg(fctx);
+    emitLine(fctx, reg + " = " + rhs);
+    reg
+}
+
+def emitEntryAlloca(fctx: FnEmitCtx, llvmTy: String): String = {
+    let reg = freshReg(fctx);
+    bufPushStr(fctx.fcAllocas, "  ");
+    bufPushStr(fctx.fcAllocas, reg);
+    bufPushStr(fctx.fcAllocas, " = alloca ");
+    bufPushStr(fctx.fcAllocas, llvmTy);
+    bufPushByte(fctx.fcAllocas, 10);
+    reg
+}
+
+def emitBr(fctx: FnEmitCtx, targetBlk: Int): Void =
+    emitTermLine(fctx, "br label %" + blockLabel(fctx, targetBlk))
+
+def emitCondBr(fctx: FnEmitCtx, condVal: String, thenBlk: Int, elseBlk: Int): Void =
+    emitTermLine(fctx, "br i1 " + condVal + ", label %" + blockLabel(fctx, thenBlk) + ", label %" + blockLabel(fctx, elseBlk))
+
+def emitStructFieldPtr(fctx: FnEmitCtx, structTy: String, basePtr: String, fieldIdx: Int): String =
+    emitAssign(fctx, "getelementptr inbounds " + structTy + ", ptr " + basePtr + ", i32 0, i32 " + intToStr(fieldIdx))
+
+def emitGep(fctx: FnEmitCtx, elemTy: String, basePtr: String, idx64Val: String): String =
+    emitAssign(fctx, "getelementptr " + elemTy + ", ptr " + basePtr + ", i64 " + idx64Val)
+
+def emitLoad(fctx: FnEmitCtx, llvmTy: String, ptrVal: String): String =
+    emitAssign(fctx, "load " + llvmTy + ", ptr " + ptrVal)
+
+def emitStore(fctx: FnEmitCtx, llvmTy: String, val: String, ptrVal: String): Void =
+    emitLine(fctx, "store " + llvmTy + " " + val + ", ptr " + ptrVal)
+
+def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = {
+    bufPushStr(out, header);
+    bufPushStr(out, " {\nentry:\n");
+    bufPushBuf(out, fctx.fcAllocas);
+    let dummy = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+    let entryBb = vecGetOr(fctx.fcBlocks, 0, dummy);
+    bufPushBuf(out, entryBb.bbInstrs);
+    let total = vecLen(fctx.fcBlocks);
+    let i = cellNew(1);
+    while (cellGet(i) < total) {
+        let bb = vecGetOr(fctx.fcBlocks, cellGet(i), dummy);
+        bufPushByte(out, 10);
+        bufPushStr(out, bb.bbLabel);
+        bufPushStr(out, ":\n");
+        bufPushBuf(out, bb.bbInstrs);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushStr(out, "}\n\n")
+}
+
+// ============================================================================
+// Lexical Symbol Table Lookup & Global String Pool
+// ============================================================================
+
+def lookupVarSlot(locals: List (String, VarSlot), globals: StrMap VarSlot, name: String): Option VarSlot =
+    match lookupLocalSlot(locals, name) {
+        Some(s) -> Some(s),
+        None -> strMapGet(globals, name),
+    }
+
+def lookupLocalSlot(locals: List (String, VarSlot), name: String): Option VarSlot = match locals {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == name) Some(v) else lookupLocalSlot(r, name),
+}
+
+def emitGlobalStringConst(mctx: ModEmitCtx, s: String): String = {
+    let id = cellGet(mctx.mcStrCnt);
+    cellSet(mctx.mcStrCnt, id + 1);
+    let sym = "@.str." + intToStr(id);
+    let byteLen = strLen(s) + 1;
+    bufPushStr(mctx.mcStrDecls, sym);
+    bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant [");
+    bufPushStr(mctx.mcStrDecls, intToStr(byteLen));
+    bufPushStr(mctx.mcStrDecls, " x i8] ");
+    bufPushStr(mctx.mcStrDecls, encodeLlvmCString(s));
+    bufPushStr(mctx.mcStrDecls, ", align 1\n");
+    sym
+}
+
+def genLit(mctx: ModEmitCtx, lit: Lit): String = match lit {
+    LitInt(i) -> intToStr(i),
+    LitFloat(f) -> floatToHex16(f),
+    LitChar(c) -> intToStr(c & 255),
+    LitBool(b) -> if (b) "true" else "false",
+    LitUnit -> "0",
+    LitStr(s) -> emitGlobalStringConst(mctx, s),
+}
+
+// ============================================================================
+// GC Safepoint Poll & Concurrency Helpers (`box`, `unbox`, Trampolines)
+// ============================================================================
+
+def emitGcSafepointPoll(fctx: FnEmitCtx): Void = {
+    let flag = emitAssign(fctx, "load atomic i32, ptr @__gs_gc_stw_requested monotonic, align 4");
+    let needSp = emitAssign(fctx, "icmp ne i32 " + flag + ", 0");
+    let slowBlk = appendBlock(fctx, "gc.sp.slow");
+    let contBlk = appendBlock(fctx, "gc.sp.cont");
+    emitCondBr(fctx, needSp, slowBlk, contBlk);
+
+    setInsertBlock(fctx, slowBlk);
+    emitLine(fctx, "call void @gc_safepoint_slow()");
+    emitBr(fctx, contBlk);
+
+    setInsertBlock(fctx, contBlk)
+}
+
+def mangleConcTypeSym(ty: Type): String = match ty {
+    TyVoid -> "Void",
+    TyCon(n) -> replaceDotsUnderscore(n),
+    TyVar(v) -> "V_" + v,
+    TyTuple(es) -> "Tup" + intToStr(listLen(es)) + "_" + joinConcTypes(es),
+    TyArr(ps, r) -> "Fn" + intToStr(listLen(ps)) + "_" + joinConcTypes(ps) + "_to_" + mangleConcTypeSym(r),
+    TyComp(b, a) -> mangleConcTypeSym(b) + "_of_" + mangleConcTypeSym(a),
+}
+
+def joinConcTypes(ts: List Type): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> mangleConcTypeSym(h),
+    Cons(h, t) -> mangleConcTypeSym(h) + "_" + joinConcTypes(t),
+}
+
+def replaceDotsUnderscore(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        bufPushByte(b, if (c == 46) 95 else c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def boxGeishaValue(fctx: FnEmitCtx, val: String, ty: Type): String =
+    if (isVoidGeishaType(ty)) "null"
+    else {
+        let elemLlvmTy = getValLlvmType(ty);
+        let (rawSz, _) = typeSizeAndAlign(ty);
+        let byteSz = if (rawSz < 8) 8 else rawSz;
+        let allocFn = if (isNoscanElemType(ty)) "@gc_alloc_atomic" else "@gc_alloc";
+        let boxPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + intToStr(byteSz) + ")");
+        emitStore(fctx, elemLlvmTy, val, boxPtr);
+        boxPtr
+    }
+
+def unboxGeishaValue(fctx: FnEmitCtx, boxPtr: String, ty: Type): String =
+    if (isVoidGeishaType(ty)) "0"
+    else emitLoad(fctx, getValLlvmType(ty), boxPtr)
+
+def emitNullableBoxToPair(fctx: FnEmitCtx, boxPtr: String, pairRetTy: Type): String = {
+    let elemTy = match pairRetTy {
+        TyTuple(Cons(_, Cons(et, _))) -> et,
+        _ -> TyVoid,
+    };
+    let pairLlvmTy = getValLlvmType(pairRetTy);
+    let elemLlvmTy = getValLlvmType(elemTy);
+    let hasVal = emitAssign(fctx, "icmp ne ptr " + boxPtr + ", null");
+
+    let someBlk = appendBlock(fctx, "conc.some");
+    let noneBlk = appendBlock(fctx, "conc.none");
+    let mergeBlk = appendBlock(fctx, "conc.merge");
+    emitCondBr(fctx, hasVal, someBlk, noneBlk);
+
+    setInsertBlock(fctx, someBlk);
+    let loadedVal = if (isVoidGeishaType(elemTy)) "0" else emitLoad(fctx, elemLlvmTy, boxPtr);
+    let someEnd = getInsertBlock(fctx);
+    emitBr(fctx, mergeBlk);
+
+    setInsertBlock(fctx, noneBlk);
+    let zeroVal = llvmZeroValue(elemLlvmTy);
+    let noneEnd = getInsertBlock(fctx);
+    emitBr(fctx, mergeBlk);
+
+    setInsertBlock(fctx, mergeBlk);
+    let valPhi = emitAssign(
+        fctx,
+        "phi " + elemLlvmTy + " [ " + loadedVal + ", %" + blockLabel(fctx, someEnd) + " ], [ " + zeroVal + ", %" + blockLabel(fctx, noneEnd) + " ]"
+    );
+    let agg0 = emitAssign(fctx, "insertvalue " + pairLlvmTy + " undef, i1 " + hasVal + ", 0");
+    emitAssign(fctx, "insertvalue " + pairLlvmTy + " " + agg0 + ", " + elemLlvmTy + " " + valPhi + ", 1")
+}
+
+def getOrEmitThunkRunner(mctx: ModEmitCtx, retTy: Type): String = {
+    let rawSym = "__gs_thunk_runner__" + mangleConcTypeSym(retTy);
+    let sym = llvmSym(rawSym);
+    if (!strMapContains(mctx.mcSynthSet, rawSym)) {
+        strMapInsert(mctx.mcSynthSet, rawSym, true);
+        let rf = newFnEmitCtx(rawSym);
+        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
+        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fnEntry = emitLoad(rf, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let callVal =
+            if (retLlvm == "void") {
+                emitLine(rf, "call void " + fnEntry + "(ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(rf, "call " + retLlvm + " " + fnEntry + "(ptr " + fvsPtr + ")")
+            };
+        let boxed =
+            if (isVoidGeishaType(retTy)) {
+                emitAssign(rf, "call ptr @gc_alloc_atomic(i64 8)")
+            } else {
+                boxGeishaValue(rf, callVal, retTy)
+            };
+        emitTermLine(rf, "ret ptr " + boxed);
+        flushFunctionToBuf(mctx.mcSynthFns, "define ptr " + sym + "(ptr %cls_ptr)", rf)
+    } else ();
+    sym
+}
+
+def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String = {
+    let rawSym = "__gs_actor_runner__" + mangleConcTypeSym(stateTy) + "__" + mangleConcTypeSym(retTy);
+    let sym = llvmSym(rawSym);
+    if (!strMapContains(mctx.mcSynthSet, rawSym)) {
+        strMapInsert(mctx.mcSynthSet, rawSym, true);
+        let rf = newFnEmitCtx(rawSym);
+        let stVal = unboxGeishaValue(rf, "%state_box", stateTy);
+        let stLlvm = getValLlvmType(stateTy);
+        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
+        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fnEntry = emitLoad(rf, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let callVal =
+            if (retLlvm == "void") {
+                emitLine(rf, "call void " + fnEntry + "(" + stLlvm + " " + stVal + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(rf, "call " + retLlvm + " " + fnEntry + "(" + stLlvm + " " + stVal + ", ptr " + fvsPtr + ")")
+            };
+        let boxed =
+            if (isVoidGeishaType(retTy)) "null"
+            else boxGeishaValue(rf, callVal, retTy);
+        emitTermLine(rf, "ret ptr " + boxed);
+        flushFunctionToBuf(mctx.mcSynthFns, "define ptr " + sym + "(ptr %state_box, ptr %cls_ptr)", rf)
+    } else ();
+    sym
+}
+
+// ============================================================================
+// Binary Operators, Intrinsics, Pattern Matching, and Expression Emission
+// ============================================================================
+
+def emitBinOperator(fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operandTy: Type): String = {
+    let tyName = match operandTy {
+        TyCon(n) -> n,
+        _ -> "Int",
+    };
+    if (tyName == "String") {
+        match op {
+            OpAdd -> {
+                let la = emitAssign(fctx, "call i64 @strlen(ptr " + lhs + ")");
+                let lb = emitAssign(fctx, "call i64 @strlen(ptr " + rhs + ")");
+                let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
+                let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
+                let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+                emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + lhs + ", i64 " + la + ")");
+                let dstB = emitGep(fctx, "i8", dst, la);
+                emitLine(fctx, "call ptr @memcpy(ptr " + dstB + ", ptr " + rhs + ", i64 " + lb + ")");
+                let termPtr = emitGep(fctx, "i8", dst, lab);
+                emitStore(fctx, "i8", "0", termPtr);
+                dst
+            },
+            _ -> {
+                let cmpVal = emitAssign(fctx, "call i32 @gs_str_cmp(ptr " + lhs + ", ptr " + rhs + ")");
+                let pred = match op {
+                    OpEq -> "eq",
+                    OpNe -> "ne",
+                    OpLt -> "slt",
+                    OpLe -> "sle",
+                    OpGt -> "sgt",
+                    OpGe -> "sge",
+                    _ -> "eq",
+                };
+                emitAssign(fctx, "icmp " + pred + " i32 " + cmpVal + ", 0")
+            },
+        }
+    } else if (tyName == "Float") {
+        match op {
+            OpAdd -> emitAssign(fctx, "fadd double " + lhs + ", " + rhs),
+            OpSub -> emitAssign(fctx, "fsub double " + lhs + ", " + rhs),
+            OpMul -> emitAssign(fctx, "fmul double " + lhs + ", " + rhs),
+            OpDiv -> emitAssign(fctx, "fdiv double " + lhs + ", " + rhs),
+            OpEq -> emitAssign(fctx, "fcmp oeq double " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "fcmp one double " + lhs + ", " + rhs),
+            OpLt -> emitAssign(fctx, "fcmp olt double " + lhs + ", " + rhs),
+            OpLe -> emitAssign(fctx, "fcmp ole double " + lhs + ", " + rhs),
+            OpGt -> emitAssign(fctx, "fcmp ogt double " + lhs + ", " + rhs),
+            OpGe -> emitAssign(fctx, "fcmp oge double " + lhs + ", " + rhs),
+            _ -> emitAssign(fctx, "fadd double " + lhs + ", " + rhs),
+        }
+    } else if (tyName == "Bool" || tyName == "Char") {
+        let lty = if (tyName == "Bool") "i1" else "i8";
+        match op {
+            OpEq -> emitAssign(fctx, "icmp eq " + lty + " " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "icmp ne " + lty + " " + lhs + ", " + rhs),
+            OpLt -> emitAssign(fctx, "icmp ult " + lty + " " + lhs + ", " + rhs),
+            OpLe -> emitAssign(fctx, "icmp ule " + lty + " " + lhs + ", " + rhs),
+            OpGt -> emitAssign(fctx, "icmp ugt " + lty + " " + lhs + ", " + rhs),
+            OpGe -> emitAssign(fctx, "icmp uge " + lty + " " + lhs + ", " + rhs),
+            OpAnd -> emitAssign(fctx, "and " + lty + " " + lhs + ", " + rhs),
+            OpOr -> emitAssign(fctx, "or " + lty + " " + lhs + ", " + rhs),
+            OpBitAnd -> emitAssign(fctx, "and " + lty + " " + lhs + ", " + rhs),
+            OpBitOr -> emitAssign(fctx, "or " + lty + " " + lhs + ", " + rhs),
+            OpBitXor -> emitAssign(fctx, "xor " + lty + " " + lhs + ", " + rhs),
+            _ -> emitAssign(fctx, "icmp eq " + lty + " " + lhs + ", " + rhs),
+        }
+    } else {
+        // `Int` (`i32`) or `Int64` (`i64`)
+        let ity = if (tyName == "Int64") "i64" else "i32";
+        match op {
+            OpAdd -> emitAssign(fctx, "add " + ity + " " + lhs + ", " + rhs),
+            OpSub -> emitAssign(fctx, "sub " + ity + " " + lhs + ", " + rhs),
+            OpMul -> emitAssign(fctx, "mul " + ity + " " + lhs + ", " + rhs),
+            OpDiv -> emitAssign(fctx, "sdiv " + ity + " " + lhs + ", " + rhs),
+            OpRem -> emitAssign(fctx, "srem " + ity + " " + lhs + ", " + rhs),
+            OpBitAnd -> emitAssign(fctx, "and " + ity + " " + lhs + ", " + rhs),
+            OpBitOr -> emitAssign(fctx, "or " + ity + " " + lhs + ", " + rhs),
+            OpBitXor -> emitAssign(fctx, "xor " + ity + " " + lhs + ", " + rhs),
+            OpShl ->
+                if (tyName == "Int64") {
+                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    emitAssign(fctx, "shl i64 " + lhs + ", " + cnt64)
+                } else emitAssign(fctx, "shl i32 " + lhs + ", " + rhs),
+            OpShr ->
+                if (tyName == "Int64") {
+                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    emitAssign(fctx, "ashr i64 " + lhs + ", " + cnt64)
+                } else emitAssign(fctx, "ashr i32 " + lhs + ", " + rhs),
+            OpUshr ->
+                if (tyName == "Int64") {
+                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    emitAssign(fctx, "lshr i64 " + lhs + ", " + cnt64)
+                } else emitAssign(fctx, "lshr i32 " + lhs + ", " + rhs),
+            OpEq -> emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "icmp ne " + ity + " " + lhs + ", " + rhs),
+            OpLt -> emitAssign(fctx, "icmp slt " + ity + " " + lhs + ", " + rhs),
+            OpLe -> emitAssign(fctx, "icmp sle " + ity + " " + lhs + ", " + rhs),
+            OpGt -> emitAssign(fctx, "icmp sgt " + ity + " " + lhs + ", " + rhs),
+            OpGe -> emitAssign(fctx, "icmp sge " + ity + " " + lhs + ", " + rhs),
+            _ -> emitAssign(fctx, "add " + ity + " " + lhs + ", " + rhs),
+        }
+    }
+}
+
+def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
+    Cons(h, t) -> if (idx == 0) h else nthArgTerm(t, idx - 1),
+    Nil -> MkTerm { tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
+}
+
+def tryEmitIntrinsic(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    name: String,
+    args: List TaggedTerm,
+    retTy: Type,
+    locals: List (String, VarSlot)
+): Option String = {
+    if (name == "cellNew") {
+        let a0 = nthArgTerm(args, 0);
+        let initVal = genExpr(mctx, fctx, a0, locals, false);
+        let elemTy = schemeBody(a0.tscm);
+        let elemLlvm = getValLlvmType(elemTy);
+        let (rawSz, _) = typeSizeAndAlign(elemTy);
+        let byteSz = if (rawSz < 8) 8 else rawSz;
+        let cellPtr = emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")");
+        emitStore(fctx, elemLlvm, initVal, cellPtr);
+        Some(cellPtr)
+    } else if (name == "cellGet") {
+        let cellPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitLoad(fctx, getValLlvmType(retTy), cellPtr))
+    } else if (name == "cellSet") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let cellPtr = genExpr(mctx, fctx, a0, locals, false);
+        let newVal = genExpr(mctx, fctx, a1, locals, false);
+        emitStore(fctx, getValLlvmType(schemeBody(a1.tscm)), newVal, cellPtr);
+        Some("0")
+    } else if (name == "arrayNew") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let len32 = genExpr(mctx, fctx, a0, locals, false);
+        let initVal = genExpr(mctx, fctx, a1, locals, false);
+        let elemTy = schemeBody(a1.tscm);
+        let elemLlvm = getValLlvmType(elemTy);
+        let (rawSz, _) = typeSizeAndAlign(elemTy);
+        let elemSz = if (rawSz < 1) 1 else rawSz;
+
+        let badBlk = appendBlock(fctx, "arr.bad_len");
+        let allocBlk = appendBlock(fctx, "arr.alloc");
+        let condBlk = appendBlock(fctx, "arr.init.cond");
+        let bodyBlk = appendBlock(fctx, "arr.init.body");
+        let doneBlk = appendBlock(fctx, "arr.init.done");
+
+        let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+        emitCondBr(fctx, isNeg, badBlk, allocBlk);
+
+        setInsertBlock(fctx, badBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, allocBlk);
+        let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+        let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+        let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic" else "@gc_alloc";
+        let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
+        emitStore(fctx, "i64", len64, arrPtr);
+        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+        let idxSlot = emitEntryAlloca(fctx, "i64");
+        emitStore(fctx, "i64", "0", idxSlot);
+        emitBr(fctx, condBlk);
+
+        setInsertBlock(fctx, condBlk);
+        let curIdx = emitLoad(fctx, "i64", idxSlot);
+        let more = emitAssign(fctx, "icmp slt i64 " + curIdx + ", " + len64);
+        emitCondBr(fctx, more, bodyBlk, doneBlk);
+
+        setInsertBlock(fctx, bodyBlk);
+        let slotPtr = emitGep(fctx, elemLlvm, elemsBase, curIdx);
+        emitStore(fctx, elemLlvm, initVal, slotPtr);
+        let nextIdx = emitAssign(fctx, "add i64 " + curIdx + ", 1");
+        emitStore(fctx, "i64", nextIdx, idxSlot);
+        emitBr(fctx, condBlk);
+
+        setInsertBlock(fctx, doneBlk);
+        Some(arrPtr)
+    } else if (name == "arrayLen") {
+        let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let len64 = emitLoad(fctx, "i64", arrPtr);
+        Some(emitAssign(fctx, "trunc i64 " + len64 + " to i32"))
+    } else if (name == "arrayGet") {
+        let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let elemLlvm = getValLlvmType(retTy);
+        let len64 = emitLoad(fctx, "i64", arrPtr);
+        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
+
+        let oobBlk = appendBlock(fctx, "arr.oob_trap");
+        let okBlk = appendBlock(fctx, "arr.get_ok");
+        emitCondBr(fctx, oob, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+        let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
+        Some(emitLoad(fctx, elemLlvm, slotPtr))
+    } else if (name == "arraySet") {
+        let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let a2 = nthArgTerm(args, 2);
+        let newVal = genExpr(mctx, fctx, a2, locals, false);
+        let elemLlvm = getValLlvmType(schemeBody(a2.tscm));
+        let len64 = emitLoad(fctx, "i64", arrPtr);
+        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
+
+        let oobBlk = appendBlock(fctx, "arr.oob_trap");
+        let okBlk = appendBlock(fctx, "arr.set_ok");
+        emitCondBr(fctx, oob, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+        let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
+        emitStore(fctx, elemLlvm, newVal, slotPtr);
+        Some("0")
+    } else if (name == "bitAnd" || name == "bitAnd64") {
+        let ity = if (name == "bitAnd64") "i64" else "i32";
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "and " + ity + " " + a + ", " + b))
+    } else if (name == "bitOr" || name == "bitOr64") {
+        let ity = if (name == "bitOr64") "i64" else "i32";
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "or " + ity + " " + a + ", " + b))
+    } else if (name == "bitXor" || name == "bitXor64") {
+        let ity = if (name == "bitXor64") "i64" else "i32";
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "xor " + ity + " " + a + ", " + b))
+    } else if (name == "bitNot" || name == "bitNot64") {
+        let ity = if (name == "bitNot64") "i64" else "i32";
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "xor " + ity + " " + a + ", -1"))
+    } else if (name == "bitShl") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "shl i32 " + a + ", " + b))
+    } else if (name == "bitShr") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "ashr i32 " + a + ", " + b))
+    } else if (name == "bitUshr") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "lshr i32 " + a + ", " + b))
+    } else if (name == "bitShl64") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        Some(emitAssign(fctx, "shl i64 " + a + ", " + b64))
+    } else if (name == "bitShr64") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        Some(emitAssign(fctx, "ashr i64 " + a + ", " + b64))
+    } else if (name == "bitUshr64") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        Some(emitAssign(fctx, "lshr i64 " + a + ", " + b64))
+    } else if (name == "charToInt") {
+        let c = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "zext i8 " + c + " to i32"))
+    } else if (name == "intToChar") {
+        let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "trunc i32 " + n + " to i8"))
+    } else if (name == "intToI64") {
+        let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "sext i32 " + n + " to i64"))
+    } else if (name == "i64ToInt") {
+        let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "trunc i64 " + n + " to i32"))
+    } else if (name == "floatToBits64") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "bitcast double " + f + " to i64"))
+    } else if (name == "bits64ToFloat") {
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "bitcast i64 " + b + " to double"))
+    } else if (name == "intToFloat") {
+        let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "sitofp i32 " + n + " to double"))
+    } else if (name == "floatToInt") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "fptosi double " + f + " to i32"))
+    } else if (name == "ptrNull") {
+        Some("null")
+    } else if (name == "ptrIsNull") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "icmp eq ptr " + p + ", null"))
+    } else if (name == "ptrAllocBytes") {
+        let n32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
+        Some(emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + n64 + ")"))
+    } else if (name == "ptrByteAt") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        let b8 = emitLoad(fctx, "i8", bp);
+        Some(emitAssign(fctx, "zext i8 " + b8 + " to i32"))
+    } else if (name == "ptrSetByte") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let val8 = emitAssign(fctx, "trunc i32 " + val32 + " to i8");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitStore(fctx, "i8", val8, bp);
+        Some("0")
+    } else if (name == "ptrToString") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + p + ")");
+        let alloc64 = emitAssign(fctx, "add i64 " + len64 + ", 1");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + alloc64 + ")");
+        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + p + ", i64 " + len64 + ")");
+        let termPtr = emitGep(fctx, "i8", dst, len64);
+        emitStore(fctx, "i8", "0", termPtr);
+        Some(dst)
+    } else if (name == "strLen") {
+        let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + s + ")");
+        Some(emitAssign(fctx, "trunc i64 " + len64 + " to i32"))
+    } else if (name == "strByteAt") {
+        let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let oob = emitAssign(fctx, "icmp slt i32 " + idx32 + ", 0");
+
+        let oobBlk = appendBlock(fctx, "str.oob_trap");
+        let okBlk = appendBlock(fctx, "str.ok");
+        emitCondBr(fctx, oob, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 0)");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", s, idx64);
+        let b8 = emitLoad(fctx, "i8", bp);
+        Some(emitAssign(fctx, "zext i8 " + b8 + " to i32"))
+    } else if (name == "strSlice") {
+        let s = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let start32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let end32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let len64 = emitAssign(fctx, "call i64 @strlen(ptr " + s + ")");
+        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+        let bad1 = emitAssign(fctx, "icmp slt i32 " + start32 + ", 0");
+        let bad2 = emitAssign(fctx, "icmp slt i32 " + end32 + ", " + start32);
+        let bad3 = emitAssign(fctx, "icmp sgt i32 " + end32 + ", " + len32);
+        let bad12 = emitAssign(fctx, "or i1 " + bad1 + ", " + bad2);
+        let bad = emitAssign(fctx, "or i1 " + bad12 + ", " + bad3);
+
+        let oobBlk = appendBlock(fctx, "sl.oob");
+        let okBlk = appendBlock(fctx, "sl.ok");
+        emitCondBr(fctx, bad, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + end32 + ", i32 " + len32 + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let start64 = emitAssign(fctx, "sext i32 " + start32 + " to i64");
+        let end64 = emitAssign(fctx, "sext i32 " + end32 + " to i64");
+        let subLen = emitAssign(fctx, "sub i64 " + end64 + ", " + start64);
+        let allocSz = emitAssign(fctx, "add i64 " + subLen + ", 1");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        let srcPtr = emitGep(fctx, "i8", s, start64);
+        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + srcPtr + ", i64 " + subLen + ")");
+        let termPtr = emitGep(fctx, "i8", dst, subLen);
+        emitStore(fctx, "i8", "0", termPtr);
+        Some(dst)
+    } else if (name == "strConcat") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let la = emitAssign(fctx, "call i64 @strlen(ptr " + a + ")");
+        let lb = emitAssign(fctx, "call i64 @strlen(ptr " + b + ")");
+        let lab = emitAssign(fctx, "add i64 " + la + ", " + lb);
+        let allocSz = emitAssign(fctx, "add i64 " + lab + ", 1");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        emitLine(fctx, "call ptr @memcpy(ptr " + dst + ", ptr " + a + ", i64 " + la + ")");
+        let dstB = emitGep(fctx, "i8", dst, la);
+        emitLine(fctx, "call ptr @memcpy(ptr " + dstB + ", ptr " + b + ", i64 " + lb + ")");
+        let termPtr = emitGep(fctx, "i8", dst, lab);
+        emitStore(fctx, "i8", "0", termPtr);
+        Some(dst)
+    } else if (name == "strFromBytes") {
+        let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let count32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let cap64 = emitLoad(fctx, "i64", arrPtr);
+        let cap32 = emitAssign(fctx, "trunc i64 " + cap64 + " to i32");
+        let neg = emitAssign(fctx, "icmp slt i32 " + count32 + ", 0");
+        let gt = emitAssign(fctx, "icmp sgt i32 " + count32 + ", " + cap32);
+        let bad = emitAssign(fctx, "or i1 " + neg + ", " + gt);
+
+        let oobBlk = appendBlock(fctx, "sfb.oob");
+        let allocBlk = appendBlock(fctx, "sfb.alloc");
+        let condBlk = appendBlock(fctx, "sfb.cond");
+        let bodyBlk = appendBlock(fctx, "sfb.body");
+        let doneBlk = appendBlock(fctx, "sfb.done");
+        emitCondBr(fctx, bad, oobBlk, allocBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + count32 + ", i32 " + cap32 + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, allocBlk);
+        let count64 = emitAssign(fctx, "sext i32 " + count32 + " to i64");
+        let allocSz = emitAssign(fctx, "add i64 " + count64 + ", 1");
+        let dst = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + allocSz + ")");
+        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+        let idxSlot = emitEntryAlloca(fctx, "i64");
+        emitStore(fctx, "i64", "0", idxSlot);
+        emitBr(fctx, condBlk);
+
+        setInsertBlock(fctx, condBlk);
+        let cur = emitLoad(fctx, "i64", idxSlot);
+        let more = emitAssign(fctx, "icmp slt i64 " + cur + ", " + count64);
+        emitCondBr(fctx, more, bodyBlk, doneBlk);
+
+        setInsertBlock(fctx, bodyBlk);
+        let srcP = emitGep(fctx, "i32", elemsBase, cur);
+        let v32 = emitLoad(fctx, "i32", srcP);
+        let v8 = emitAssign(fctx, "trunc i32 " + v32 + " to i8");
+        let dstP = emitGep(fctx, "i8", dst, cur);
+        emitStore(fctx, "i8", v8, dstP);
+        let next = emitAssign(fctx, "add i64 " + cur + ", 1");
+        emitStore(fctx, "i64", next, idxSlot);
+        emitBr(fctx, condBlk);
+
+        setInsertBlock(fctx, doneBlk);
+        let termP = emitGep(fctx, "i8", dst, count64);
+        emitStore(fctx, "i8", "0", termP);
+        Some(dst)
+    } else if (name == "sysArgc") {
+        Some(emitLoad(fctx, "i32", "@__gs_argc"))
+    } else if (name == "sysArgv") {
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let argc = emitLoad(fctx, "i32", "@__gs_argc");
+        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + argc);
+
+        let oobBlk = appendBlock(fctx, "cli.oob_trap");
+        let okBlk = appendBlock(fctx, "cli.ok");
+        emitCondBr(fctx, oob, oobBlk, okBlk);
+
+        setInsertBlock(fctx, oobBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + argc + ")");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, okBlk);
+        let argv = emitLoad(fctx, "ptr", "@__gs_argv");
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let elemP = emitGep(fctx, "ptr", argv, idx64);
+        Some(emitLoad(fctx, "ptr", elemP))
+    } else {
+        tryEmitConcIntrinsic(mctx, fctx, name, args, retTy, locals)
+    }
+}
+
+def tryEmitConcIntrinsic(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    name: String,
+    args: List TaggedTerm,
+    retTy: Type,
+    locals: List (String, VarSlot)
+): Option String = {
+    if (name == "__concAtomicNew") {
+        let init = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call ptr @gs_atomic_new(i32 " + init + ")"))
+    } else if (name == "__concAtomicLoad") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call i32 @gs_atomic_load(ptr " + a + ")"))
+    } else if (name == "__concAtomicStore") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let v = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        emitLine(fctx, "call void @gs_atomic_store(ptr " + a + ", i32 " + v + ")");
+        Some("0")
+    } else if (name == "__concAtomicAdd") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let d = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "call i32 @gs_atomic_add(ptr " + a + ", i32 " + d + ")"))
+    } else if (name == "__concAtomicCas") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let exp = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let des = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let r = emitAssign(fctx, "call i32 @gs_atomic_cas(ptr " + a + ", i32 " + exp + ", i32 " + des + ")");
+        Some(emitAssign(fctx, "icmp ne i32 " + r + ", 0"))
+    } else if (name == "__concMVarNew") {
+        let a0 = nthArgTerm(args, 0);
+        let valTy = schemeBody(a0.tscm);
+        let val = genExpr(mctx, fctx, a0, locals, false);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        Some(emitAssign(fctx, "call ptr @gs_mvar_new(ptr " + boxed + ", i32 1)"))
+    } else if (name == "__concMVarEmpty") {
+        Some(emitAssign(fctx, "call ptr @gs_mvar_new(ptr null, i32 0)"))
+    } else if (name == "__concMVarTake") {
+        let m = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_mvar_take(ptr " + m + ")");
+        Some(unboxGeishaValue(fctx, bp, retTy))
+    } else if (name == "__concMVarPut") {
+        let m = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let a1 = nthArgTerm(args, 1);
+        let valTy = schemeBody(a1.tscm);
+        let val = genExpr(mctx, fctx, a1, locals, false);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        emitLine(fctx, "call void @gs_mvar_put(ptr " + m + ", ptr " + boxed + ")");
+        Some("0")
+    } else if (name == "__concMVarRead") {
+        let m = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_mvar_read(ptr " + m + ")");
+        Some(unboxGeishaValue(fctx, bp, retTy))
+    } else if (name == "__concMVarTryTake") {
+        let m = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_mvar_try_take(ptr " + m + ")");
+        Some(emitNullableBoxToPair(fctx, bp, retTy))
+    } else if (name == "__concChanNew") {
+        let cap = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call ptr @gs_chan_new(i32 " + cap + ")"))
+    } else if (name == "__concChanSend") {
+        let ch = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let a1 = nthArgTerm(args, 1);
+        let valTy = schemeBody(a1.tscm);
+        let val = genExpr(mctx, fctx, a1, locals, false);
+        let boxed = if (isVoidGeishaType(valTy)) emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 8)") else boxGeishaValue(fctx, val, valTy);
+        let r = emitAssign(fctx, "call i32 @gs_chan_send(ptr " + ch + ", ptr " + boxed + ")");
+        Some(emitAssign(fctx, "icmp ne i32 " + r + ", 0"))
+    } else if (name == "__concChanRecv") {
+        let ch = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_chan_recv(ptr " + ch + ")");
+        Some(emitNullableBoxToPair(fctx, bp, retTy))
+    } else if (name == "__concChanTryRecv") {
+        let ch = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_chan_try_recv(ptr " + ch + ")");
+        Some(emitNullableBoxToPair(fctx, bp, retTy))
+    } else if (name == "__concChanClose") {
+        let ch = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        emitLine(fctx, "call void @gs_chan_close(ptr " + ch + ")");
+        Some("0")
+    } else if (name == "__concChanIsClosed") {
+        let ch = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let r = emitAssign(fctx, "call i32 @gs_chan_is_closed(ptr " + ch + ")");
+        Some(emitAssign(fctx, "icmp ne i32 " + r + ", 0"))
+    } else if (name == "__concTaskSpawn") {
+        let innerTy = match retTy {
+            TyComp(_, elem) -> elem,
+            _ -> TyVoid,
+        };
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let runner = getOrEmitThunkRunner(mctx, innerTy);
+        Some(emitAssign(fctx, "call ptr @gs_task_spawn(ptr " + runner + ", ptr " + clsPtr + ")"))
+    } else if (name == "__concTaskAwait") {
+        let t = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let bp = emitAssign(fctx, "call ptr @gs_task_await(ptr " + t + ")");
+        Some(unboxGeishaValue(fctx, bp, retTy))
+    } else if (name == "__concTaskIsReady") {
+        let t = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let r = emitAssign(fctx, "call i32 @gs_task_is_ready(ptr " + t + ")");
+        Some(emitAssign(fctx, "icmp ne i32 " + r + ", 0"))
+    } else if (name == "__concTaskWaitAny") {
+        let arr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let cnt = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let tmo = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        emitLine(fctx, "call void @gs_task_wait_any(ptr " + arr + ", i32 " + cnt + ", i32 " + tmo + ")");
+        Some("0")
+    } else if (name == "__concNumCpu") {
+        Some(emitAssign(fctx, "call i32 @gs_conc_num_cpu()"))
+    } else if (name == "__concSleepMs") {
+        let ms = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        emitLine(fctx, "call void @gs_conc_sleep_ms(i32 " + ms + ")");
+        Some("0")
+    } else if (name == "__concActorSpawn") {
+        let stateTy = match retTy {
+            TyComp(_, st) -> st,
+            _ -> TyVoid,
+        };
+        let initCls = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let runner = getOrEmitThunkRunner(mctx, stateTy);
+        Some(emitAssign(fctx, "call ptr @gs_actor_spawn(ptr " + runner + ", ptr " + initCls + ")"))
+    } else if (name == "__concActorCall") {
+        let a0 = nthArgTerm(args, 0);
+        let stateTy = match schemeBody(a0.tscm) {
+            TyComp(_, st) -> st,
+            _ -> TyVoid,
+        };
+        let respTy = match retTy {
+            TyComp(_, r) -> r,
+            _ -> TyVoid,
+        };
+        let actorH = genExpr(mctx, fctx, a0, locals, false);
+        let handlerCls = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let runner = getOrEmitActorRunner(mctx, stateTy, respTy);
+        Some(emitAssign(fctx, "call ptr @gs_actor_call(ptr " + actorH + ", ptr " + runner + ", ptr " + handlerCls + ")"))
+    } else if (name == "__concActorSend") {
+        let a0 = nthArgTerm(args, 0);
+        let stateTy = match schemeBody(a0.tscm) {
+            TyComp(_, st) -> st,
+            _ -> TyVoid,
+        };
+        let actorH = genExpr(mctx, fctx, a0, locals, false);
+        let handlerCls = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let runner = getOrEmitActorRunner(mctx, stateTy, TyVoid);
+        emitLine(fctx, "call void @gs_actor_send(ptr " + actorH + ", ptr " + runner + ", ptr " + handlerCls + ")");
+        Some("0")
+    } else if (name == "__concActorStop") {
+        let actorH = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        emitLine(fctx, "call void @gs_actor_stop(ptr " + actorH + ")");
+        Some("0")
+    } else {
+        None
+    }
+}
+
+def extractAdtNameAndArgs(adtReg: StrMap AdtInfo, valTy: Type, ctorName: String): (String, List Type) = {
+    let targs = extractTypeArgs(valTy);
+    let curr = cellNew(valTy);
+    while (match cellGet(curr) { TyComp(_, _) -> true, _ -> false }) {
+        match cellGet(curr) {
+            TyComp(b, _) -> cellSet(curr, b),
+            _ -> (),
+        }
+    };
+    match cellGet(curr) {
+        TyCon(name) -> (name, targs),
+        _ -> (ctorName, Nil),
+    }
+}
+
+def emitPatternCheck(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    val: String,
+    valTy: Type,
+    pat: Pattern,
+    localsCell: Cell (List (String, VarSlot)),
+    failBlk: Int
+): Void = match pat {
+    PatWild -> (),
+    PatVar(vname) -> {
+        let llvmTy = getValLlvmType(valTy);
+        let slotPtr = emitEntryAlloca(fctx, llvmTy);
+        emitStore(fctx, llvmTy, val, slotPtr);
+        let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: llvmTy, vsGeishaTy: valTy };
+        cellSet(localsCell, Cons((vname, slot), cellGet(localsCell)))
+    },
+    PatLit(lit) -> match lit {
+        LitUnit -> (),
+        _ -> {
+            let litVal = genLit(mctx, lit);
+            let cmp = match lit {
+                LitInt(_) -> emitAssign(fctx, "icmp eq i32 " + val + ", " + litVal),
+                LitBool(_) -> emitAssign(fctx, "icmp eq i1 " + val + ", " + litVal),
+                LitChar(_) -> emitAssign(fctx, "icmp eq i8 " + val + ", " + litVal),
+                LitFloat(_) -> emitAssign(fctx, "fcmp oeq double " + val + ", " + litVal),
+                LitStr(_) -> {
+                    let diff = emitAssign(fctx, "call i32 @gs_str_cmp(ptr " + val + ", ptr " + litVal + ")");
+                    emitAssign(fctx, "icmp eq i32 " + diff + ", 0")
+                },
+                LitUnit -> "true",
+            };
+            let okBlk = appendBlock(fctx, "pat.lit.ok");
+            emitCondBr(fctx, cmp, okBlk, failBlk);
+            setInsertBlock(fctx, okBlk)
+        },
+    },
+    PatTuple(subPats) -> {
+        let tupleLlvm = getValLlvmType(valTy);
+        let elemTys = match valTy {
+            TyTuple(es) -> es,
+            _ -> Nil,
+        };
+        let idx = cellNew(0);
+        let cp = cellNew(subPats);
+        let ct = cellNew(elemTys);
+        while (match (cellGet(cp), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+            match (cellGet(cp), cellGet(ct)) {
+                (Cons(sp, rp), Cons(et, rt)) -> {
+                    let i = cellGet(idx);
+                    let elemVal = emitAssign(fctx, "extractvalue " + tupleLlvm + " " + val + ", " + intToStr(i));
+                    emitPatternCheck(mctx, fctx, elemVal, et, sp, localsCell, failBlk);
+                    cellSet(idx, i + 1);
+                    cellSet(cp, rp);
+                    cellSet(ct, rt)
+                },
+                _ -> (),
+            }
+        }
+    },
+    PatCtor(ctorName, subPats) -> {
+        let (adtName, typeArgs) = extractAdtNameAndArgs(mctx.mcAdtReg, valTy, ctorName);
+        match strMapGet(mctx.mcAdtReg, adtName) {
+            None -> (),
+            Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+                None -> (),
+                Some(vinfo) -> {
+                    let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs);
+                    let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 0);
+                    let actualTag = emitLoad(fctx, "i32", tagPtr);
+                    let tagEq = emitAssign(fctx, "icmp eq i32 " + actualTag + ", " + intToStr(vinfo.tag));
+                    let tagOkBlk = appendBlock(fctx, "pat.ctor.ok");
+                    emitCondBr(fctx, tagEq, tagOkBlk, failBlk);
+                    setInsertBlock(fctx, tagOkBlk);
+
+                    match subPats {
+                        Nil -> (),
+                        _ -> {
+                            let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                            let concreteFieldTys = substTypeList(vinfo.fieldTypes, sub);
+                            let fieldLlvmTys = mapValLlvmTypes(concreteFieldTys);
+                            let payloadStructTy = formatLlvmStructType(fieldLlvmTys);
+                            let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 1);
+
+                            let idx = cellNew(0);
+                            let cp = cellNew(subPats);
+                            let cgt = cellNew(concreteFieldTys);
+                            let clt = cellNew(fieldLlvmTys);
+                            while (match (cellGet(cp), cellGet(cgt), cellGet(clt)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                match (cellGet(cp), cellGet(cgt), cellGet(clt)) {
+                                    (Cons(sp, rp), Cons(gt, rgt), Cons(lt, rlt)) -> {
+                                        let i = cellGet(idx);
+                                        let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
+                                        let fVal = emitLoad(fctx, lt, fPtr);
+                                        emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk);
+                                        cellSet(idx, i + 1);
+                                        cellSet(cp, rp);
+                                        cellSet(cgt, rgt);
+                                        cellSet(clt, rlt)
+                                    },
+                                    _ -> (),
+                                }
+                            }
+                        },
+                    }
+                },
+            },
+        }
+    },
+    PatStruct(_, _) -> (),
+}
+
+def formatTypedArgs(argTys: List String, argVals: List String): String = {
+    let pairsRev = cellNew(Nil);
+    let ct = cellNew(argTys);
+    let cv = cellNew(argVals);
+    while (match (cellGet(ct), cellGet(cv)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+        match (cellGet(ct), cellGet(cv)) {
+            (Cons(t, rt), Cons(v, rv)) -> {
+                cellSet(pairsRev, Cons(t + " " + v, cellGet(pairsRev)));
+                cellSet(ct, rt);
+                cellSet(cv, rv)
+            },
+            _ -> (),
+        }
+    };
+    strJoin(listRev(cellGet(pairsRev)), ", ")
+}
+
+def formatPhiIncoming(pairs: List (String, String)): String = {
+    let partsRev = cellNew(Nil);
+    let cur = cellNew(pairs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((v, blkLbl), r) -> {
+                cellSet(partsRev, Cons("[ " + v + ", %" + blkLbl + " ]", cellGet(partsRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    strJoin(listRev(cellGet(partsRev)), ", ")
+}
+
+def genExpr(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    tm: TaggedTerm,
+    locals: List (String, VarSlot),
+    inTail: Bool
+): String = {
+    // Consume `fcPendingLet` immediately so subexpressions never inherit outer `let` stack strategy!
+    let directLetVar = cellGet(fctx.fcPendingLet);
+    cellSet(fctx.fcPendingLet, None);
+
+    match tm.tnode {
+        TmLit(lit) -> genLit(mctx, lit),
+
+        TmVar(vn) -> match lookupVarSlot(locals, mctx.mcGlobalSlots, vn) {
+            Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
+            None -> "0",
+        },
+
+        TmGlobalVar(vn) -> match strMapGet(mctx.mcGlobalSlots, vn) {
+            Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
+            None -> "0",
+        },
+
+        TmTuple(elems) -> {
+            let tupleLlvm = getValLlvmType(schemeBody(tm.tscm));
+            let agg = cellNew("undef");
+            let idx = cellNew(0);
+            let cur = cellNew(elems);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(el, r) -> {
+                        let i = cellGet(idx);
+                        let v = genExpr(mctx, fctx, el, locals, false);
+                        let elLlvm = getValLlvmType(schemeBody(el.tscm));
+                        cellSet(agg, emitAssign(fctx, "insertvalue " + tupleLlvm + " " + cellGet(agg) + ", " + elLlvm + " " + v + ", " + intToStr(i)));
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(agg)
+        },
+
+        TmUn(op, operand) -> {
+            let val = genExpr(mctx, fctx, operand, locals, false);
+            let opTy = schemeBody(operand.tscm);
+            match op {
+                UnNot -> emitAssign(fctx, "xor i1 " + val + ", true"),
+                UnNeg -> match opTy {
+                    TyCon("Float") -> emitAssign(fctx, "fneg double " + val),
+                    _ -> {
+                        let ity = getValLlvmType(opTy);
+                        emitAssign(fctx, "sub " + ity + " 0, " + val)
+                    },
+                },
+                UnBitNot -> {
+                    let ity = getValLlvmType(opTy);
+                    emitAssign(fctx, "xor " + ity + " " + val + ", -1")
+                },
+            }
+        },
+
+        TmBin(OpAnd, lhs, rhs) -> {
+            let lval = genExpr(mctx, fctx, lhs, locals, false);
+            let lhsEndBlk = getInsertBlock(fctx);
+            let rhsBlk = appendBlock(fctx, "and.rhs");
+            let mergeBlk = appendBlock(fctx, "and.end");
+            emitCondBr(fctx, lval, rhsBlk, mergeBlk);
+
+            setInsertBlock(fctx, rhsBlk);
+            let rval = genExpr(mctx, fctx, rhs, locals, false);
+            let rhsEndBlk = getInsertBlock(fctx);
+            emitBr(fctx, mergeBlk);
+
+            setInsertBlock(fctx, mergeBlk);
+            emitAssign(fctx, "phi i1 [ false, %" + blockLabel(fctx, lhsEndBlk) + " ], [ " + rval + ", %" + blockLabel(fctx, rhsEndBlk) + " ]")
+        },
+
+        TmBin(OpOr, lhs, rhs) -> {
+            let lval = genExpr(mctx, fctx, lhs, locals, false);
+            let lhsEndBlk = getInsertBlock(fctx);
+            let rhsBlk = appendBlock(fctx, "or.rhs");
+            let mergeBlk = appendBlock(fctx, "or.end");
+            emitCondBr(fctx, lval, mergeBlk, rhsBlk);
+
+            setInsertBlock(fctx, rhsBlk);
+            let rval = genExpr(mctx, fctx, rhs, locals, false);
+            let rhsEndBlk = getInsertBlock(fctx);
+            emitBr(fctx, mergeBlk);
+
+            setInsertBlock(fctx, mergeBlk);
+            emitAssign(fctx, "phi i1 [ true, %" + blockLabel(fctx, lhsEndBlk) + " ], [ " + rval + ", %" + blockLabel(fctx, rhsEndBlk) + " ]")
+        },
+
+        TmBin(op, lhs, rhs) -> {
+            let lval = genExpr(mctx, fctx, lhs, locals, false);
+            let rval = genExpr(mctx, fctx, rhs, locals, false);
+            emitBinOperator(fctx, op, lval, rval, schemeBody(lhs.tscm))
+        },
+
+        TmLet(vd, val, exp) -> {
+            cellSet(fctx.fcPendingLet, Some(vd.vname));
+            let initVal = genExpr(mctx, fctx, val, locals, false);
+            cellSet(fctx.fcPendingLet, None);
+
+            let vGeishaTy = schemeBody(vd.vscm);
+            let vLlvmTy = getValLlvmType(vGeishaTy);
+            let slotPtr = emitEntryAlloca(fctx, vLlvmTy);
+            emitStore(fctx, vLlvmTy, initVal, slotPtr);
+            let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: vLlvmTy, vsGeishaTy: vGeishaTy };
+            genExpr(mctx, fctx, exp, Cons((vd.vname, slot), locals), inTail)
+        },
+
+        TmApplyCls(callee, args) -> {
+            let calleePtr = genExpr(mctx, fctx, callee, locals, false);
+            let argValsRev = cellNew(Nil);
+            let argTysRev = cellNew(Nil);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        cellSet(argValsRev, Cons(genExpr(mctx, fctx, a, locals, false), cellGet(argValsRev)));
+                        cellSet(argTysRev, Cons(getValLlvmType(schemeBody(a.tscm)), cellGet(argTysRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 1);
+            let fnEntryPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 0);
+            let fnEntry = emitLoad(fctx, "ptr", fnEntryPtr);
+
+            let allTys = listRev(Cons("ptr", cellGet(argTysRev)));
+            let allVals = listRev(Cons(fvsPtr, cellGet(argValsRev)));
+            let typedArgsStr = formatTypedArgs(allTys, allVals);
+
+            let retTy = match schemeBody(callee.tscm) {
+                TyArr(_, r) -> r,
+                _ -> schemeBody(tm.tscm),
+            };
+            let retLlvm = getFnRetLlvmType(retTy);
+            let callPrefix = if (inTail) "tail call " else "call ";
+            if (retLlvm == "void") {
+                emitLine(fctx, callPrefix + "void " + fnEntry + "(" + typedArgsStr + ")");
+                "0"
+            } else {
+                emitAssign(fctx, callPrefix + retLlvm + " " + fnEntry + "(" + typedArgsStr + ")")
+            }
+        },
+
+        TmApplyDir(funDecl, args) -> {
+            let calleeName = funDecl.vname;
+            let retGeishaTy = schemeBody(tm.tscm);
+            match tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals) {
+                Some(intrinVal) -> intrinVal,
+                None -> match strMapGet(mctx.mcExterns, calleeName) {
+                    Some(extDef) -> {
+                        let argValsRev = cellNew(Nil);
+                        let argTysRev = cellNew(Nil);
+                        let cur = cellNew(args);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons(a, r) -> {
+                                    cellSet(argValsRev, Cons(genExpr(mctx, fctx, a, locals, false), cellGet(argValsRev)));
+                                    cellSet(argTysRev, Cons(getValLlvmType(schemeBody(a.tscm)), cellGet(argTysRev)));
+                                    cellSet(cur, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let typedArgsStr = formatTypedArgs(listRev(cellGet(argTysRev)), listRev(cellGet(argValsRev)));
+                        let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
+                        emitLine(fctx, "call i32 @_setjmp(ptr " + jbPtr + ")");
+                        emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")");
+
+                        let extRetTy = match extDef.extTy {
+                            TyArr(_, r) -> r,
+                            _ -> retGeishaTy,
+                        };
+                        let retLlvm = getFnRetLlvmType(extRetTy);
+                        let cSym = llvmSym(extDef.extLink);
+                        let cRes =
+                            if (retLlvm == "void") {
+                                emitLine(fctx, "call void " + cSym + "(" + typedArgsStr + ")");
+                                "0"
+                            } else {
+                                emitAssign(fctx, "call " + retLlvm + " " + cSym + "(" + typedArgsStr + ")")
+                            };
+                        emitLine(fctx, "call void @gc_leave_blocking()");
+                        cRes
+                    },
+                    None -> {
+                        let argValsRev = cellNew(Nil);
+                        let argTysRev = cellNew(Nil);
+                        let cur = cellNew(args);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons(a, r) -> {
+                                    cellSet(argValsRev, Cons(genExpr(mctx, fctx, a, locals, false), cellGet(argValsRev)));
+                                    cellSet(argTysRev, Cons(getValLlvmType(schemeBody(a.tscm)), cellGet(argTysRev)));
+                                    cellSet(cur, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let allTys = listRev(Cons("ptr", cellGet(argTysRev)));
+                        let allVals = listRev(Cons("null", cellGet(argValsRev)));
+                        let typedArgsStr = formatTypedArgs(allTys, allVals);
+
+                        let fnRetTy = match schemeBody(funDecl.vscm) {
+                            TyArr(_, r) -> r,
+                            _ -> retGeishaTy,
+                        };
+                        let retLlvm = getFnRetLlvmType(fnRetTy);
+                        let isIoFn =
+                            calleeName == "printLn" || calleeName == "putNumber"
+                            || calleeName == "putFloat" || calleeName == "putChar";
+                        let callPrefix = if (inTail && !isIoFn) "tail call " else "call ";
+                        let targetSym = llvmSym(calleeName);
+                        if (retLlvm == "void") {
+                            emitLine(fctx, callPrefix + "void " + targetSym + "(" + typedArgsStr + ")");
+                            "0"
+                        } else {
+                            emitAssign(fctx, callPrefix + retLlvm + " " + targetSym + "(" + typedArgsStr + ")")
+                        }
+                    },
+                },
+            }
+        },
+
+        TmBlock(items) -> {
+            let ret = cellNew("0");
+            let cur = cellNew(items);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(it, r) -> {
+                        let isLast = match r { Nil -> true, _ -> false };
+                        cellSet(ret, genExpr(mctx, fctx, it, locals, inTail && isLast));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(ret)
+        },
+
+        TmMakeCls(vd, cls, exp) -> {
+            let stackAlloc = isStackAlloc(mctx.mcEscape, fctx.fcName, vd.vname);
+            let clsSlotPtr = emitEntryAlloca(fctx, "ptr");
+            let clsSlot = MkVarSlot { vsPtr: clsSlotPtr, vsLlvmTy: "ptr", vsGeishaTy: schemeBody(vd.vscm) };
+            let extLocals = Cons((vd.vname, clsSlot), locals);
+
+            let fvLlvmRev = cellNew(Nil);
+            let fvGeishaRev = cellNew(Nil);
+            let cf = cellNew(cls.clsFvs);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons(fvName, r) -> {
+                        match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
+                            Some(s) -> {
+                                cellSet(fvLlvmRev, Cons(s.vsLlvmTy, cellGet(fvLlvmRev)));
+                                cellSet(fvGeishaRev, Cons(s.vsGeishaTy, cellGet(fvGeishaRev)))
+                            },
+                            None -> (),
+                        };
+                        cellSet(cf, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let fvLlvmTys = listRev(cellGet(fvLlvmRev));
+            let fvGeishaTys = listRev(cellGet(fvGeishaRev));
+            let envStructTy = formatLlvmStructType(fvLlvmTys);
+            let clsStructTy = "{ ptr, " + envStructTy + " }";
+            let (envSz, _) = structSizeAndAlign(fvGeishaTys);
+            let clsByteSz = alignUp(8 + envSz, 8);
+
+            let clsObjPtr =
+                if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
+                else emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(clsByteSz) + ")");
+
+            emitStore(fctx, "ptr", clsObjPtr, clsSlotPtr);
+            let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
+            emitStore(fctx, "ptr", llvmSym(cls.clsEntry), fnFieldPtr);
+
+            match fvLlvmTys {
+                Nil -> (),
+                _ -> {
+                    let clsFvPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 1);
+                    let idx = cellNew(0);
+                    let cf2 = cellNew(cls.clsFvs);
+                    while (match cellGet(cf2) { Nil -> false, _ -> true }) {
+                        match cellGet(cf2) {
+                            Cons(fvName, r) -> {
+                                let i = cellGet(idx);
+                                match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
+                                    Some(vs) -> {
+                                        let fvVal = emitLoad(fctx, vs.vsLlvmTy, vs.vsPtr);
+                                        let fvSlot = emitStructFieldPtr(fctx, envStructTy, clsFvPtr, i);
+                                        emitStore(fctx, vs.vsLlvmTy, fvVal, fvSlot)
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(idx, i + 1);
+                                cellSet(cf2, r)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+            };
+            genExpr(mctx, fctx, exp, extLocals, inTail && !stackAlloc)
+        },
+
+        TmIf(c, t, e) -> {
+            let condVal = genExpr(mctx, fctx, c, locals, false);
+            let thenBlk = appendBlock(fctx, "if.then");
+            let elseBlk = appendBlock(fctx, "if.else");
+            let contBlk = appendBlock(fctx, "if.cont");
+            emitCondBr(fctx, condVal, thenBlk, elseBlk);
+
+            setInsertBlock(fctx, thenBlk);
+            let thenVal = genExpr(mctx, fctx, t, locals, inTail);
+            let thenEnd = getInsertBlock(fctx);
+            emitBr(fctx, contBlk);
+
+            setInsertBlock(fctx, elseBlk);
+            let elseVal = genExpr(mctx, fctx, e, locals, inTail);
+            let elseEnd = getInsertBlock(fctx);
+            emitBr(fctx, contBlk);
+
+            setInsertBlock(fctx, contBlk);
+            let resLlvm = getValLlvmType(schemeBody(tm.tscm));
+            emitAssign(
+                fctx,
+                "phi " + resLlvm + " [ " + thenVal + ", %" + blockLabel(fctx, thenEnd) + " ], [ " + elseVal + ", %" + blockLabel(fctx, elseEnd) + " ]"
+            )
+        },
+
+        TmWhile(cond, body) -> {
+            let condBlk = appendBlock(fctx, "while.cond");
+            let bodyBlk = appendBlock(fctx, "while.body");
+            let endBlk = appendBlock(fctx, "while.end");
+            emitBr(fctx, condBlk);
+
+            setInsertBlock(fctx, condBlk);
+            emitGcSafepointPoll(fctx);
+            let cval = genExpr(mctx, fctx, cond, locals, false);
+            emitCondBr(fctx, cval, bodyBlk, endBlk);
+
+            setInsertBlock(fctx, bodyBlk);
+            let _ = genExpr(mctx, fctx, body, locals, false);
+            if (!curBlockHasTerm(fctx)) emitBr(fctx, condBlk) else ();
+
+            setInsertBlock(fctx, endBlk);
+            "0"
+        },
+
+        TmMakeData(adtName, tag, fields, fieldTys, typeArgs) -> {
+            let fvalsRev = cellNew(Nil);
+            let cur = cellNew(fields);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(f, r) -> {
+                        cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let fieldVals = listRev(cellGet(fvalsRev));
+            let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs);
+            let useStack =
+                if (isRecursiveAdt(mctx.mcEscape, adtName)) false
+                else match directLetVar {
+                    Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
+                    None -> false,
+                };
+            let adtPtr =
+                if (useStack) emitEntryAlloca(fctx, adtStorageTy)
+                else emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(adtByteSz) + ")");
+
+            let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
+            emitStore(fctx, "i32", intToStr(tag), tagPtr);
+
+            match fieldVals {
+                Nil -> (),
+                _ -> {
+                    let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 1);
+                    let fLlvmTys = mapValLlvmTypes(fieldTys);
+                    let payloadStructTy = formatLlvmStructType(fLlvmTys);
+                    let idx = cellNew(0);
+                    let cv = cellNew(fieldVals);
+                    let ct = cellNew(fLlvmTys);
+                    while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(cv), cellGet(ct)) {
+                            (Cons(fv, rv), Cons(flt, rt)) -> {
+                                let i = cellGet(idx);
+                                let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
+                                emitStore(fctx, flt, fv, fPtr);
+                                cellSet(idx, i + 1);
+                                cellSet(cv, rv);
+                                cellSet(ct, rt)
+                            },
+                            _ -> (),
+                        }
+                    }
+                },
+            };
+            adtPtr
+        },
+
+        TmGetTag(node) -> {
+            let adtPtr = genExpr(mctx, fctx, node, locals, false);
+            let tagPtr = emitStructFieldPtr(fctx, "{ i32 }", adtPtr, 0);
+            emitLoad(fctx, "i32", tagPtr)
+        },
+
+        TmMatch(scrut, arms) -> {
+            let scrutVal = genExpr(mctx, fctx, scrut, locals, false);
+            let scrutTy = schemeBody(scrut.tscm);
+            let contBlk = appendBlock(fctx, "match.cont");
+            let failBlk = appendBlock(fctx, "match.fail");
+
+            let testBlks: Vec Int = vecNew();
+            let ca0 = cellNew(arms);
+            while (match cellGet(ca0) { Nil -> false, _ -> true }) {
+                match cellGet(ca0) {
+                    Cons(_, r) -> {
+                        vecPush(testBlks, appendBlock(fctx, "match.test"));
+                        cellSet(ca0, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let armCount = vecLen(testBlks);
+            if (armCount == 0) emitBr(fctx, failBlk)
+            else emitBr(fctx, vecGetOr(testBlks, 0, failBlk));
+
+            let incomingRev: Cell (List (String, String)) = cellNew(Nil);
+            let idx = cellNew(0);
+            let ca = cellNew(arms);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(arm, r) -> {
+                        let i = cellGet(idx);
+                        let nextFail = if (i + 1 < armCount) vecGetOr(testBlks, i + 1, failBlk) else failBlk;
+                        setInsertBlock(fctx, vecGetOr(testBlks, i, failBlk));
+
+                        let armLocals = cellNew(locals);
+                        emitPatternCheck(mctx, fctx, scrutVal, scrutTy, arm.caPat, armLocals, nextFail);
+
+                        match arm.caGuard {
+                            Some(gTerm) -> {
+                                let gVal = genExpr(mctx, fctx, gTerm, cellGet(armLocals), false);
+                                let passBlk = appendBlock(fctx, "match.body");
+                                emitCondBr(fctx, gVal, passBlk, nextFail);
+                                setInsertBlock(fctx, passBlk)
+                            },
+                            None -> (),
+                        };
+
+                        let bodyVal = genExpr(mctx, fctx, arm.caBody, cellGet(armLocals), inTail);
+                        let bodyEnd = getInsertBlock(fctx);
+                        emitBr(fctx, contBlk);
+                        cellSet(incomingRev, Cons((bodyVal, blockLabel(fctx, bodyEnd)), cellGet(incomingRev)));
+                        cellSet(idx, i + 1);
+                        cellSet(ca, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            setInsertBlock(fctx, failBlk);
+            emitLine(fctx, "call void @gs_match_fail()");
+            emitTermLine(fctx, "unreachable");
+
+            setInsertBlock(fctx, contBlk);
+            let resLlvm = getValLlvmType(schemeBody(tm.tscm));
+            match listRev(cellGet(incomingRev)) {
+                Nil -> {
+                    emitTermLine(fctx, "unreachable");
+                    llvmZeroValue(resLlvm)
+                },
+                incList -> emitAssign(fctx, "phi " + resLlvm + " " + formatPhiIncoming(incList)),
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Top-Level Function, Main Trampoline, and Module Emission
+// ============================================================================
+
+def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
+    let fctx = newFnEmitCtx(fd.fnName);
+    let funTy = schemeBody(fd.fnScm);
+    let retGeishaTy = match funTy {
+        TyArr(_, r) -> r,
+        _ -> TyVoid,
+    };
+    let retLlvm = getFnRetLlvmType(retGeishaTy);
+
+    let paramSigPartsRev = cellNew(Nil);
+    let localsRev = cellNew(Nil);
+    let pIdx = cellNew(0);
+    let cp = cellNew(fd.fnParams);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(vd, r) -> {
+                let i = cellGet(pIdx);
+                let argReg = "%arg" + intToStr(i);
+                let pGeishaTy = schemeBody(vd.vscm);
+                let pLlvmTy = getValLlvmType(pGeishaTy);
+                cellSet(paramSigPartsRev, Cons(pLlvmTy + " " + argReg, cellGet(paramSigPartsRev)));
+
+                let slotPtr = emitEntryAlloca(fctx, pLlvmTy);
+                emitStore(fctx, pLlvmTy, argReg, slotPtr);
+                let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: pLlvmTy, vsGeishaTy: pGeishaTy };
+                cellSet(localsRev, Cons((vd.vname, slot), cellGet(localsRev)));
+                cellSet(pIdx, i + 1);
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(paramSigPartsRev, Cons("ptr %fvs", cellGet(paramSigPartsRev)));
+
+    // Unpack captured closure environment from `ptr %fvs`
+    match fd.fnFvs {
+        Nil -> (),
+        fvs -> {
+            let fvLlvmRev = cellNew(Nil);
+            let cf0 = cellNew(fvs);
+            while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+                match cellGet(cf0) {
+                    Cons(vd, r) -> {
+                        cellSet(fvLlvmRev, Cons(getValLlvmType(schemeBody(vd.vscm)), cellGet(fvLlvmRev)));
+                        cellSet(cf0, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let fvLlvmTys = listRev(cellGet(fvLlvmRev));
+            let fvStructTy = formatLlvmStructType(fvLlvmTys);
+
+            let idx = cellNew(0);
+            let cf1 = cellNew(fvs);
+            let clt = cellNew(fvLlvmTys);
+            while (match (cellGet(cf1), cellGet(clt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                match (cellGet(cf1), cellGet(clt)) {
+                    (Cons(vd, r1), Cons(elemTy, r2)) -> {
+                        let i = cellGet(idx);
+                        let slotPtr = emitEntryAlloca(fctx, elemTy);
+                        let fPtr = emitStructFieldPtr(fctx, fvStructTy, "%fvs", i);
+                        let fvVal = emitLoad(fctx, elemTy, fPtr);
+                        emitStore(fctx, elemTy, fvVal, slotPtr);
+                        let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: elemTy, vsGeishaTy: schemeBody(vd.vscm) };
+                        cellSet(localsRev, Cons((vd.vname, slot), cellGet(localsRev)));
+                        cellSet(idx, i + 1);
+                        cellSet(cf1, r1);
+                        cellSet(clt, r2)
+                    },
+                    _ -> (),
+                }
+            }
+        },
+    };
+
+    let allowTail = !fnHasStackAlloc(mctx.mcEscape, fd.fnName);
+    emitGcSafepointPoll(fctx);
+    let bodyVal = genExpr(mctx, fctx, fd.fnBody, listRev(cellGet(localsRev)), allowTail);
+    if (!curBlockHasTerm(fctx)) {
+        if (retLlvm == "void") emitTermLine(fctx, "ret void")
+        else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
+    } else ();
+
+    let header = "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ")";
+    flushFunctionToBuf(out, header, fctx)
+}
+
+def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef): Void = {
+    let fctx = newFnEmitCtx("main");
+    let cg = cellNew(globals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, r) -> {
+                match strMapGet(mctx.mcGlobalSlots, g.gvName) {
+                    Some(slot) -> {
+                        if (isGcPointerType(g.gvTy)) {
+                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
+                        } else ();
+                        cellSet(fctx.fcPendingLet, None);
+                        let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
+                        emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                    },
+                    None -> (),
+                };
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let _ = genExpr(mctx, fctx, mainFd.fnBody, Nil, false);
+    if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
+    flushFunctionToBuf(out, "define void @__geisha_main()", fctx);
+
+    // Emit C entry trampoline `@main(i32 %argc, ptr %argv)` with stack anchor strictly above `@__geisha_main`
+    bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) {\nentry:\n");
+    bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
+    bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
+    bufPushStr(out, "  %anchor = alloca i64, align 8\n");
+    bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
+    bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
+    bufPushStr(out, "  call void @__geisha_main()\n");
+    bufPushStr(out, "  ret i32 0\n}\n\n")
+}
+
+def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: StrMap FunDef): Void = {
+    let decls = [
+        ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr)"),
+        ("gc_register_root", "declare void @gc_register_root(ptr)"),
+        ("gc_alloc", "declare ptr @gc_alloc(i64)"),
+        ("gc_alloc_atomic", "declare ptr @gc_alloc_atomic(i64)"),
+        ("gc_safepoint_slow", "declare void @gc_safepoint_slow()"),
+        ("_setjmp", "declare i32 @_setjmp(ptr)"),
+        ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr)"),
+        ("gc_leave_blocking", "declare void @gc_leave_blocking()"),
+        ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr)"),
+        ("gs_match_fail", "declare void @gs_match_fail()"),
+        ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32)"),
+        ("strlen", "declare i64 @strlen(ptr)"),
+        ("memcpy", "declare ptr @memcpy(ptr, ptr, i64)"),
+        ("printLn", "declare void @printLn(ptr, ptr)"),
+        ("putNumber", "declare void @putNumber(i32, ptr)"),
+        ("putFloat", "declare void @putFloat(double, ptr)"),
+        ("putChar", "declare void @putChar(i8, ptr)"),
+        ("gs_atomic_new", "declare ptr @gs_atomic_new(i32)"),
+        ("gs_atomic_load", "declare i32 @gs_atomic_load(ptr)"),
+        ("gs_atomic_store", "declare void @gs_atomic_store(ptr, i32)"),
+        ("gs_atomic_add", "declare i32 @gs_atomic_add(ptr, i32)"),
+        ("gs_atomic_cas", "declare i32 @gs_atomic_cas(ptr, i32, i32)"),
+        ("gs_mvar_new", "declare ptr @gs_mvar_new(ptr, i32)"),
+        ("gs_mvar_take", "declare ptr @gs_mvar_take(ptr)"),
+        ("gs_mvar_put", "declare void @gs_mvar_put(ptr, ptr)"),
+        ("gs_mvar_read", "declare ptr @gs_mvar_read(ptr)"),
+        ("gs_mvar_try_take", "declare ptr @gs_mvar_try_take(ptr)"),
+        ("gs_chan_new", "declare ptr @gs_chan_new(i32)"),
+        ("gs_chan_send", "declare i32 @gs_chan_send(ptr, ptr)"),
+        ("gs_chan_recv", "declare ptr @gs_chan_recv(ptr)"),
+        ("gs_chan_try_recv", "declare ptr @gs_chan_try_recv(ptr)"),
+        ("gs_chan_close", "declare void @gs_chan_close(ptr)"),
+        ("gs_chan_is_closed", "declare i32 @gs_chan_is_closed(ptr)"),
+        ("gs_task_spawn", "declare ptr @gs_task_spawn(ptr, ptr)"),
+        ("gs_task_await", "declare ptr @gs_task_await(ptr)"),
+        ("gs_task_is_ready", "declare i32 @gs_task_is_ready(ptr)"),
+        ("gs_task_wait_any", "declare void @gs_task_wait_any(ptr, i32, i32)"),
+        ("gs_conc_num_cpu", "declare i32 @gs_conc_num_cpu()"),
+        ("gs_conc_sleep_ms", "declare void @gs_conc_sleep_ms(i32)"),
+        ("gs_actor_spawn", "declare ptr @gs_actor_spawn(ptr, ptr)"),
+        ("gs_actor_call", "declare ptr @gs_actor_call(ptr, ptr, ptr)"),
+        ("gs_actor_send", "declare void @gs_actor_send(ptr, ptr, ptr)"),
+        ("gs_actor_stop", "declare void @gs_actor_stop(ptr)")
+    ];
+    let cur = cellNew(decls);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((sym, line), r) -> {
+                strMapInsert(declaredSyms, sym, true);
+                if (!strMapContains(definedFns, sym)) {
+                    bufPushStr(out, line);
+                    bufPushByte(out, 10)
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(out, 10)
+}
+
+def emitUserExternDeclares(
+    out: StringBuf,
+    declaredSyms: StrMap Bool,
+    definedFns: StrMap FunDef,
+    externs: StrMap ExternDef,
+    externNames: List String
+): Void = {
+    let cur = cellNew(externNames);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ename, r) -> {
+                match strMapGet(externs, ename) {
+                    Some(ed) -> {
+                        if (!strMapContains(declaredSyms, ed.extLink) && !strMapContains(definedFns, ed.extLink)) {
+                            strMapInsert(declaredSyms, ed.extLink, true);
+                            match ed.extTy {
+                                TyArr(ps, ret) -> {
+                                    let pTys = mapValLlvmTypes(ps);
+                                    let rTy = getFnRetLlvmType(ret);
+                                    bufPushStr(out, "declare ");
+                                    bufPushStr(out, rTy);
+                                    bufPushByte(out, 32);
+                                    bufPushStr(out, llvmSym(ed.extLink));
+                                    bufPushByte(out, 40);
+                                    bufPushStr(out, strJoin(pTys, ", "));
+                                    bufPushStr(out, ")\n")
+                                },
+                                _ -> (),
+                            }
+                        } else ()
+                    },
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(out, 10)
+}
+
+pub def emitProgramLlvmIr(prog: CoreProgram): String = {
+    let globalSlots: StrMap VarSlot = strMapNew();
+    let globalsBuf = bufNew();
+
+    bufPushStr(globalsBuf, "; ModuleID = 'geisha_module'\n");
+    bufPushStr(globalsBuf, "source_filename = \"geisha_module\"\n\n");
+    bufPushStr(globalsBuf, "@__gs_argc = internal global i32 0\n");
+    bufPushStr(globalsBuf, "@__gs_argv = internal global ptr null\n");
+    bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
+
+    let cg = cellNew(prog.coreGlobals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, r) -> {
+                let rawGName = "__gval_" + g.gvName;
+                let gSym = llvmSym(rawGName);
+                let valLlvm = getValLlvmType(g.gvTy);
+                bufPushStr(globalsBuf, gSym + " = internal global " + valLlvm + " " + llvmZeroValue(valLlvm) + "\n");
+                strMapInsert(globalSlots, g.gvName, MkVarSlot {
+                    vsPtr: gSym,
+                    vsLlvmTy: valLlvm,
+                    vsGeishaTy: g.gvTy,
+                });
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(globalsBuf, 10);
+
+    let mctx = MkModEmitCtx {
+        mcStrCnt: cellNew(0),
+        mcStrDecls: bufNew(),
+        mcSynthFns: bufNew(),
+        mcSynthSet: strMapNew(),
+        mcGlobalSlots: globalSlots,
+        mcExterns: prog.coreExterns,
+        mcAdtReg: prog.coreAdtReg,
+        mcEscape: prog.coreEscape,
+    };
+
+    let fnsBuf = bufNew();
+    match strMapGet(prog.coreFns, "main") {
+        Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals),
+        None -> (),
+    };
+
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnm, r) -> {
+                if (fnm != "main") {
+                    match strMapGet(prog.coreFns, fnm) {
+                        Some(fd) -> emitTopLevelFunction(fnsBuf, mctx, fd),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let out = bufNew();
+    bufPushBuf(out, globalsBuf);
+    let declaredSyms: StrMap Bool = strMapNew();
+    emitRuntimeDeclares(out, declaredSyms, prog.coreFns);
+    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames);
+
+    if (bufLen(mctx.mcStrDecls) > 0) {
+        bufPushBuf(out, mctx.mcStrDecls);
+        bufPushByte(out, 10)
+    } else ();
+
+    if (bufLen(mctx.mcSynthFns) > 0) {
+        bufPushBuf(out, mctx.mcSynthFns)
+    } else ();
+
+    bufPushBuf(out, fnsBuf);
+    bufToString(out)
+}

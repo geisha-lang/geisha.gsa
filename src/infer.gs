@@ -1,0 +1,2641 @@
+// Hindley-Milner Type Inference, Open Concepts/Instances, `.field` Resolution,
+// `Send` Safety, and Maranget Pattern Exhaustiveness (`infer`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend, listLen}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.str.intToStr
+use ast.{
+    Span, emptySpan,
+    Visibility, VisPublic,
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    composeTypes, ftvOrdered, listContainsStr, addUniqueStr, typeToString, typesEqual,
+    ConstraintSpec, MkConstraint,
+    Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
+    schemeBody, schemeTypeParams, schemeConstraints,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit, litType,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl, MkVarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    MatchArm, MkMatchArm,
+    Form, MkForm,
+    Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
+    ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
+    VariantDef, MethodDecl, MethodImpl,
+    Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    Def, MkDef
+}
+use parser.parseTypeSchemeFromStr
+
+pub data VariantInfo {
+    MkVariantInfo {
+        vname: String,
+        tag: Int,
+        fieldNames: Option (List String),
+        fieldTypes: List Type,
+        ctorScm: Scheme,
+    },
+}
+
+pub data AdtInfo {
+    MkAdtInfo {
+        adtName: String,
+        typeParams: List String,
+        variants: List VariantInfo,
+    },
+}
+
+pub data ConceptInfo {
+    MkConceptInfo {
+        conceptName: String,
+        typeParams: List String,
+        superclasses: List ConstraintSpec,
+        methods: List (String, Scheme),
+    },
+}
+
+pub data InstanceInfo {
+    MkInstanceInfo {
+        conceptName: String,
+        typeParams: List String,
+        constraints: List ConstraintSpec,
+        targetTypes: List Type,
+        methodImpls: StrMap String,
+    },
+}
+
+data WantedConstraint {
+    MkWanted { wcConcept: String, wcTy: Type, wcSpan: Span },
+}
+
+pub data InferOutput {
+    MkInferOutput {
+        defs: List Def,
+        adtReg: StrMap AdtInfo,
+        adtNames: Vec String,
+        conceptReg: StrMap ConceptInfo,
+        instanceReg: List InstanceInfo,
+        conceptMethods: StrMap (String, Int),
+    },
+}
+
+data InferCtx {
+    MkInferCtx {
+        unique: Cell Int,
+        subst: StrMap Type,
+        wanted: Cell (List WantedConstraint),
+        aliasReg: StrMap (List String, Type),
+        adtReg: StrMap AdtInfo,
+        adtNames: Vec String,
+        ctorToAdt: StrMap String,
+        conceptReg: StrMap ConceptInfo,
+        instanceReg: Cell (List InstanceInfo),
+        conceptMethods: StrMap (String, Int),
+    },
+}
+
+// Lexical type environment: chained list of `(name, Scheme)` frames + base `StrMap Scheme`
+data TypeEnv {
+    MkTypeEnv { locals: List (String, Scheme), base: StrMap Scheme },
+}
+
+def envLookup(env: TypeEnv, name: String): Option Scheme = {
+    let cur = cellNew(env.locals);
+    let found: Cell (Option Scheme) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(found) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons((k, v), r) ->
+                if (k == name) cellSet(found, Some(v))
+                else cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    match cellGet(found) {
+        Some(s) -> Some(s),
+        None -> strMapGet(env.base, name),
+    }
+}
+
+def envExtend(env: TypeEnv, name: String, scm: Scheme): TypeEnv =
+    MkTypeEnv { locals: Cons((name, scm), env.locals), base: env.base }
+
+def envExtendMany(env: TypeEnv, bindings: List (String, Scheme)): TypeEnv =
+    MkTypeEnv { locals: listAppend(bindings, env.locals), base: env.base }
+
+pub def mangleType(ty: Type): String = match ty {
+    TyCon(n) -> replaceDots(n),
+    TyVar(v) -> "T" + stripLeadingDot(v),
+    TyVoid -> "Void",
+    TyComp(b, a) -> mangleType(b) + "Of" + mangleType(a),
+    TyTuple(es) -> "Tup" + joinMangledTypes(es, "And"),
+    TyArr(ps, r) -> match ps {
+        Nil -> "FnUnitTo" + mangleType(r),
+        _ -> "Fn" + joinMangledTypes(ps, "And") + "To" + mangleType(r),
+    },
+}
+
+def stripLeadingDot(s: String): String =
+    if (strLen(s) > 0 && strByteAt(s, 0) == 46) strSlice(s, 1, strLen(s))
+    else s
+
+def replaceDots(s: String): String = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let hasDot = cellNew(false);
+    while (cellGet(i) < n && !cellGet(hasDot)) {
+        if (strByteAt(s, cellGet(i)) == 46) cellSet(hasDot, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    if (!cellGet(hasDot)) s
+    else {
+        let out = arrayNew(n, 0);
+        let k = cellNew(0);
+        while (cellGet(k) < n) {
+            let idx = cellGet(k);
+            let b = strByteAt(s, idx);
+            arraySet(out, idx, if (b == 46) 36 else b);
+            cellSet(k, idx + 1)
+        };
+        strFromBytes(out, n)
+    }
+}
+
+def joinMangledTypes(ts: List Type, sep: String): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> mangleType(h),
+    Cons(h, t) -> mangleType(h) + sep + joinMangledTypes(t, sep),
+}
+
+def freshVar(ctx: InferCtx): Type = {
+    let n = cellGet(ctx.unique) + 1;
+    cellSet(ctx.unique, n);
+    TyVar("." + intToStr(n))
+}
+
+def typeErr(sp: Span, msg: String): String =
+    "Type error at byte " + intToStr(sp.start) + ": " + msg
+
+// ============================================================================
+// Union-Find Style Type Substitution (`zonkType` / `unifyTypes`)
+// ============================================================================
+
+pub def applyExplicitSubst(ty: Type, map: StrMap Type): Type = match ty {
+    TyVoid -> TyVoid,
+    TyCon(_) -> ty,
+    TyVar(v) -> match strMapGet(map, v) {
+        Some(target) -> target,
+        None -> ty,
+    },
+    TyArr(ps, r) -> TyArr(applyExplicitSubstList(ps, map), applyExplicitSubst(r, map)),
+    TyTuple(es) -> TyTuple(applyExplicitSubstList(es, map)),
+    TyComp(b, a) -> TyComp(applyExplicitSubst(b, map), applyExplicitSubst(a, map)),
+}
+
+def applyExplicitSubstList(ts: List Type, map: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, map), applyExplicitSubstList(t, map)),
+}
+
+def zonkType(subst: StrMap Type, ty: Type): Type = match ty {
+    TyVoid -> TyVoid,
+    TyCon(_) -> ty,
+    TyVar(v) -> match strMapGet(subst, v) {
+        Some(next) -> {
+            let resolved = zonkType(subst, next);
+            strMapInsert(subst, v, resolved);
+            resolved
+        },
+        None -> ty,
+    },
+    TyArr(ps, r) -> TyArr(zonkTypeList(subst, ps), zonkType(subst, r)),
+    TyTuple(es) -> TyTuple(zonkTypeList(subst, es)),
+    TyComp(b, a) -> TyComp(zonkType(subst, b), zonkType(subst, a)),
+}
+
+def zonkTypeList(subst: StrMap Type, ts: List Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(zonkType(subst, h), zonkTypeList(subst, t)),
+}
+
+def zonkScheme(subst: StrMap Type, scm: Scheme): Scheme = match scm {
+    ScmMono(t) -> ScmMono(zonkType(subst, t)),
+    ScmPoly(vs, t) -> ScmPoly(vs, zonkTypeExcept(subst, vs, t)),
+    ScmPolyConstrained(vs, cs, t) -> ScmPolyConstrained(vs, cs, zonkTypeExcept(subst, vs, t)),
+    ScmSlot -> ScmSlot,
+}
+
+def zonkTypeExcept(subst: StrMap Type, bound: List String, ty: Type): Type = match ty {
+    TyVoid -> TyVoid,
+    TyCon(_) -> ty,
+    TyVar(v) ->
+        if (listContainsStr(bound, v)) ty
+        else zonkType(subst, ty),
+    TyArr(ps, r) -> TyArr(zonkTypeListExcept(subst, bound, ps), zonkTypeExcept(subst, bound, r)),
+    TyTuple(es) -> TyTuple(zonkTypeListExcept(subst, bound, es)),
+    TyComp(b, a) -> TyComp(zonkTypeExcept(subst, bound, b), zonkTypeExcept(subst, bound, a)),
+}
+
+def zonkTypeListExcept(subst: StrMap Type, bound: List String, ts: List Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(zonkTypeExcept(subst, bound, h), zonkTypeListExcept(subst, bound, t)),
+}
+
+def zonkFormList(subst: StrMap Type, es: List Form): List Form = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(zonkForm(subst, h), zonkFormList(subst, t)),
+}
+
+def zonkNamedForms(subst: StrMap Type, fs: List (String, Form)): List (String, Form) = match fs {
+    Nil -> Nil,
+    Cons((k, v), t) -> Cons((k, zonkForm(subst, v)), zonkNamedForms(subst, t)),
+}
+
+def zonkForm(subst: StrMap Type, f: Form): Form = {
+    let nty = zonkScheme(subst, f.ty);
+    let nnode = match f.node {
+        ExLit(_) -> f.node,
+        ExVar(_) -> f.node,
+        ExTuple(es) -> ExTuple(zonkFormList(subst, es)),
+        ExList(es) -> ExList(zonkFormList(subst, es)),
+        ExBlock(es) -> ExBlock(zonkFormList(subst, es)),
+        ExStructInit(c, fs) -> ExStructInit(c, zonkNamedForms(subst, fs)),
+        ExApply(c, args) -> ExApply(zonkForm(subst, c), zonkFormList(subst, args)),
+        ExBin(op, l, r) -> ExBin(op, zonkForm(subst, l), zonkForm(subst, r)),
+        ExUn(op, e) -> ExUn(op, zonkForm(subst, e)),
+        ExField(e, nm) -> ExField(zonkForm(subst, e), nm),
+        ExTry(e) -> ExTry(zonkForm(subst, e)),
+        ExIf(c, t, e) -> ExIf(zonkForm(subst, c), zonkForm(subst, t), zonkForm(subst, e)),
+        ExWhile(c, b) -> ExWhile(zonkForm(subst, c), zonkForm(subst, b)),
+        ExAbs(ps, rt, body) -> {
+            let nps = cellNew(Nil);
+            let cur = cellNew(ps);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(vd, r) -> {
+                        cellSet(nps, listAppend(cellGet(nps), [MkVarDecl { vname: vd.vname, vscm: zonkScheme(subst, vd.vscm) }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let nrt = match rt { Some(t) -> Some(zonkType(subst, t)), None -> None };
+            ExAbs(cellGet(nps), nrt, zonkForm(subst, body))
+        },
+        ExLet(vd, val, body) ->
+            ExLet(
+                MkVarDecl { vname: vd.vname, vscm: zonkScheme(subst, vd.vscm) },
+                zonkForm(subst, val),
+                zonkForm(subst, body)
+            ),
+        ExMatch(scrut, arms) -> {
+            let nArms = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ng = match a.guard { Some(g) -> Some(zonkForm(subst, g)), None -> None };
+                        cellSet(nArms, listAppend(cellGet(nArms), [MkMatchArm { pat: a.pat, guard: ng, body: zonkForm(subst, a.body) }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ExMatch(zonkForm(subst, scrut), cellGet(nArms))
+        },
+    };
+    MkForm { pos: f.pos, ty: nty, annot: f.annot, node: nnode }
+}
+
+def occursIn(v: String, ty: Type): Bool = match ty {
+    TyVoid -> false,
+    TyCon(_) -> false,
+    TyVar(x) -> x == v,
+    TyArr(ps, r) -> occursInList(v, ps) || occursIn(v, r),
+    TyTuple(es) -> occursInList(v, es),
+    TyComp(b, a) -> occursIn(v, b) || occursIn(v, a),
+}
+
+def occursInList(v: String, ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> if (occursIn(v, h)) true else occursInList(v, t),
+}
+
+def bindTypeVar(subst: StrMap Type, v: String, ty: Type, sp: Span): Result Void String = {
+    let z = zonkType(subst, ty);
+    match z {
+        TyVar(v2) -> if (v == v2) Ok(()) else { strMapInsert(subst, v, z); Ok(()) },
+        _ ->
+            if (occursIn(v, z)) Err(typeErr(sp, "Infinite type: '" + v + "' occurs in '" + typeToString(z) + "'"))
+            else {
+                strMapInsert(subst, v, z);
+                Ok(())
+            },
+    }
+}
+
+def unifyTypeLists(subst: StrMap Type, xs: List Type, ys: List Type, sp: Span): Result Void String = match (xs, ys) {
+    (Nil, Nil) -> Ok(()),
+    (Cons(x, xr), Cons(y, yr)) -> {
+        unifyTypes(subst, x, y, sp)?;
+        unifyTypeLists(subst, xr, yr, sp)
+    },
+    _ -> Err(typeErr(sp, "Arity mismatch in function or tuple types")),
+}
+
+def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void String = {
+    let a = zonkType(subst, a0);
+    let b = zonkType(subst, b0);
+    match (a, b) {
+        (TyVoid, TyVoid) -> Ok(()),
+        (TyCon(voidA), TyVoid) -> if (voidA == "Void") Ok(()) else Err(typeErr(sp, "Type mismatch: expected '" + voidA + "', got 'Void'")),
+        (TyVoid, TyCon(voidB)) -> if (voidB == "Void") Ok(()) else Err(typeErr(sp, "Type mismatch: expected 'Void', got '" + voidB + "'")),
+        (TyCon(na), TyCon(nb)) ->
+            if (na == nb) Ok(())
+            else Err(typeErr(sp, "Type mismatch: '" + na + "' vs '" + nb + "'")),
+        (TyVar(va), TyVar(vb)) ->
+            if (va == vb) Ok(())
+            else if (strLen(va) > 0 && strByteAt(va, 0) != 46 && strLen(vb) > 0 && strByteAt(vb, 0) == 46) {
+                bindTypeVar(subst, vb, a, sp)
+            } else {
+                bindTypeVar(subst, va, b, sp)
+            },
+        (TyVar(va), _) -> bindTypeVar(subst, va, b, sp),
+        (_, TyVar(vb)) -> bindTypeVar(subst, vb, a, sp),
+        (TyArr(ps1, r1), TyArr(ps2, r2)) -> {
+            if (listLen(ps1) != listLen(ps2)) {
+                Err(typeErr(sp, "Function parameter count mismatch: expected " + intToStr(listLen(ps1)) + ", got " + intToStr(listLen(ps2))))
+            } else {
+                unifyTypeLists(subst, ps1, ps2, sp)?;
+                unifyTypes(subst, r1, r2, sp)
+            }
+        },
+        (TyTuple(es1), TyTuple(es2)) -> {
+            if (listLen(es1) != listLen(es2)) {
+                Err(typeErr(sp, "Tuple element count mismatch"))
+            } else unifyTypeLists(subst, es1, es2, sp)
+        },
+        (TyComp(b1, a1), TyComp(b2, a2)) -> {
+            unifyTypes(subst, b1, b2, sp)?;
+            unifyTypes(subst, a1, a2, sp)
+        },
+        _ -> Err(typeErr(sp, "Type mismatch: '" + typeToString(a) + "' vs '" + typeToString(b) + "'")),
+    }
+}
+
+// ============================================================================
+// Type Alias Expansion & Built-in Concepts / Prelude
+// ============================================================================
+
+def expandTypeInner(ctx: InferCtx, ty: Type, visiting: List String, sp: Span): Result Type String = match ty {
+    TyVoid -> Ok(TyVoid),
+    TyVar(_) -> Ok(ty),
+    TyCon(name) -> match strMapGet(ctx.aliasReg, name) {
+        None -> Ok(ty),
+        Some((params, target)) ->
+            if (listLen(params) != 0) Err(typeErr(sp, "Type alias '" + name + "' expects arguments"))
+            else if (listContainsStr(visiting, name)) Err(typeErr(sp, "Cyclic type alias involving '" + name + "'"))
+            else expandTypeInner(ctx, target, Cons(name, visiting), sp),
+    },
+    TyArr(ps, r) -> {
+        let eps = expandTypeListInner(ctx, ps, visiting, sp)?;
+        let er = expandTypeInner(ctx, r, visiting, sp)?;
+        Ok(TyArr(eps, er))
+    },
+    TyTuple(es) -> Ok(TyTuple(expandTypeListInner(ctx, es, visiting, sp)?)),
+    TyComp(_, _) -> {
+        let args = cellNew(Nil);
+        let curr = cellNew(ty);
+        let unwrapping = cellNew(true);
+        while (cellGet(unwrapping)) {
+            match cellGet(curr) {
+                TyComp(base, arg) -> {
+                    let ea = expandTypeInner(ctx, arg, visiting, sp)?;
+                    cellSet(args, Cons(ea, cellGet(args)));
+                    cellSet(curr, base)
+                },
+                _ -> cellSet(unwrapping, false),
+            }
+        };
+        let head = cellGet(curr);
+        let argList = cellGet(args);
+        match head {
+            TyCon(name) -> match strMapGet(ctx.aliasReg, name) {
+                Some((params, target)) ->
+                    if (listLen(params) != listLen(argList)) {
+                        Err(typeErr(sp, "Type alias '" + name + "' arity mismatch"))
+                    } else if (listContainsStr(visiting, name)) {
+                        Err(typeErr(sp, "Cyclic type alias involving '" + name + "'"))
+                    } else {
+                        let sub = buildPairMap(params, argList);
+                        let applied = applyExplicitSubst(target, sub);
+                        expandTypeInner(ctx, applied, Cons(name, visiting), sp)
+                    },
+                None -> {
+                    let eh = expandTypeInner(ctx, head, visiting, sp)?;
+                    Ok(composeTypes(Cons(eh, argList)))
+                },
+            },
+            _ -> {
+                let eh = expandTypeInner(ctx, head, visiting, sp)?;
+                Ok(composeTypes(Cons(eh, argList)))
+            },
+        }
+    },
+}
+
+def expandTypeListInner(ctx: InferCtx, ts: List Type, visiting: List String, sp: Span): Result (List Type) String = match ts {
+    Nil -> Ok(Nil),
+    Cons(h, t) -> {
+        let eh = expandTypeInner(ctx, h, visiting, sp)?;
+        let et = expandTypeListInner(ctx, t, visiting, sp)?;
+        Ok(Cons(eh, et))
+    },
+}
+
+def expandType(ctx: InferCtx, ty: Type, sp: Span): Result Type String =
+    expandTypeInner(ctx, ty, Nil, sp)
+
+def expandScheme(ctx: InferCtx, scm: Scheme, sp: Span): Result Scheme String = match scm {
+    ScmMono(t) -> Ok(ScmMono(expandType(ctx, t, sp)?)),
+    ScmPoly(vs, t) -> Ok(ScmPoly(vs, expandType(ctx, t, sp)?)),
+    ScmPolyConstrained(vs, cs, t) -> Ok(ScmPolyConstrained(vs, cs, expandType(ctx, t, sp)?)),
+    ScmSlot -> Ok(ScmSlot),
+}
+
+pub def buildPairMap(ks: List String, vs: List Type): StrMap Type = {
+    let m: StrMap Type = strMapNew();
+    let ck = cellNew(ks);
+    let cv = cellNew(vs);
+    while (match (cellGet(ck), cellGet(cv)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+        match (cellGet(ck), cellGet(cv)) {
+            (Cons(k, kr), Cons(v, vr)) -> {
+                strMapInsert(m, k, v);
+                cellSet(ck, kr);
+                cellSet(cv, vr)
+            },
+            _ -> (),
+        }
+    };
+    m
+}
+
+def registerBuiltinConceptSpec(
+    ctx: InferCtx,
+    conceptName: String,
+    methodName: String,
+    methodTy: Type,
+    primNames: List String
+): Void = {
+    let scm = ScmPolyConstrained(
+        ["a"],
+        [MkConstraint { conceptName: conceptName, typeVar: "a" }],
+        methodTy
+    );
+    strMapInsert(ctx.conceptMethods, methodName, (conceptName, 0));
+    strMapInsert(ctx.conceptReg, conceptName, MkConceptInfo {
+        conceptName: conceptName,
+        typeParams: ["a"],
+        superclasses: Nil,
+        methods: [(methodName, scm)],
+    });
+    let cur = cellNew(primNames);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                let inst = MkInstanceInfo {
+                    conceptName: conceptName,
+                    typeParams: Nil,
+                    constraints: Nil,
+                    targetTypes: [TyCon(p)],
+                    methodImpls: strMapNew(),
+                };
+                cellSet(ctx.instanceReg, listAppend(cellGet(ctx.instanceReg), [inst]));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def initInferCtx(): InferCtx = {
+    let ctx = MkInferCtx {
+        unique: cellNew(0),
+        subst: strMapNew(),
+        wanted: cellNew(Nil),
+        aliasReg: strMapNew(),
+        adtReg: strMapNew(),
+        adtNames: vecNew(),
+        ctorToAdt: strMapNew(),
+        conceptReg: strMapNew(),
+        instanceReg: cellNew(Nil),
+        conceptMethods: strMapNew(),
+    };
+    let tvA = TyVar("a");
+    let binSame = TyArr([tvA, tvA], tvA);
+    let unSame = TyArr([tvA], tvA);
+    let binBool = TyArr([tvA, tvA], TyCon("Bool"));
+    let binInt = TyArr([tvA, tvA], TyCon("Int"));
+    let binShift = TyArr([tvA, TyCon("Int")], tvA);
+
+    registerBuiltinConceptSpec(ctx, "Add", "$op$plus", binSame, ["Int", "Int64", "Float", "String"]);
+    registerBuiltinConceptSpec(ctx, "Sub", "$op$minus", binSame, ["Int", "Int64", "Float"]);
+    registerBuiltinConceptSpec(ctx, "Mul", "$op$star", binSame, ["Int", "Int64", "Float"]);
+    registerBuiltinConceptSpec(ctx, "Div", "$op$slash", binSame, ["Int", "Int64", "Float"]);
+    registerBuiltinConceptSpec(ctx, "Rem", "$op$rem", binSame, ["Int", "Int64"]);
+    registerBuiltinConceptSpec(ctx, "Neg", "neg", unSame, ["Int", "Int64", "Float"]);
+    registerBuiltinConceptSpec(ctx, "BitAnd", "$op$amp", binSame, ["Int", "Int64", "Bool"]);
+    registerBuiltinConceptSpec(ctx, "BitOr", "$op$bar", binSame, ["Int", "Int64", "Bool"]);
+    registerBuiltinConceptSpec(ctx, "BitXor", "$op$caret", binSame, ["Int", "Int64", "Bool"]);
+    registerBuiltinConceptSpec(ctx, "BitNot", "$op$tilde", unSame, ["Int", "Int64"]);
+    registerBuiltinConceptSpec(ctx, "Shl", "$op$lt_lt", binShift, ["Int", "Int64"]);
+    registerBuiltinConceptSpec(ctx, "Shr", "$op$gt_gt", binShift, ["Int", "Int64"]);
+    registerBuiltinConceptSpec(ctx, "Ushr", "$op$gt_gt_gt", binShift, ["Int", "Int64"]);
+    registerBuiltinConceptSpec(ctx, "Eq", "eq", binBool, ["Int", "Int64", "Float", "Bool", "Char", "String"]);
+    registerBuiltinConceptSpec(ctx, "Ord", "compare", binInt, ["Int", "Int64", "Float", "Char", "String"]);
+
+    strMapInsert(ctx.conceptReg, "Send", MkConceptInfo {
+        conceptName: "Send",
+        typeParams: ["a"],
+        superclasses: Nil,
+        methods: Nil,
+    });
+
+    // Default `List a { Nil, Cons(a, List a) }`
+    let listTy = TyComp(TyCon("List"), tvA);
+    let nilScm = ScmPoly(["a"], listTy);
+    let consScm = ScmPoly(["a"], TyArr([tvA, listTy], listTy));
+    strMapInsert(ctx.adtReg, "List", MkAdtInfo {
+        adtName: "List",
+        typeParams: ["a"],
+        variants: [
+            MkVariantInfo { vname: "Nil", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: nilScm },
+            MkVariantInfo { vname: "Cons", tag: 1, fieldNames: None, fieldTypes: [tvA, listTy], ctorScm: consScm },
+        ],
+    });
+    vecPush(ctx.adtNames, "List");
+    strMapInsert(ctx.ctorToAdt, "Nil", "List");
+    strMapInsert(ctx.ctorToAdt, "Cons", "List");
+    ctx
+}
+
+def buildPreludeBaseMap(): StrMap Scheme = {
+    let m: StrMap Scheme = strMapNew();
+    let specs = [
+        ("printLn", "String -> Void"),
+        ("putNumber", "Int -> Void"),
+        ("putFloat", "Float -> Void"),
+        ("putChar", "Char -> Void"),
+        ("cellNew", "forall a. a -> Cell a"),
+        ("cellGet", "forall a. Cell a -> a"),
+        ("cellSet", "forall a. (Cell a, a) -> Void"),
+        ("arrayNew", "forall a. (Int, a) -> MutArray a"),
+        ("arrayLen", "forall a. MutArray a -> Int"),
+        ("arrayGet", "forall a. (MutArray a, Int) -> a"),
+        ("arraySet", "forall a. (MutArray a, Int, a) -> Void"),
+        ("bitAnd", "(Int, Int) -> Int"),
+        ("bitOr", "(Int, Int) -> Int"),
+        ("bitXor", "(Int, Int) -> Int"),
+        ("bitNot", "Int -> Int"),
+        ("bitShl", "(Int, Int) -> Int"),
+        ("bitShr", "(Int, Int) -> Int"),
+        ("bitUshr", "(Int, Int) -> Int"),
+        ("bitAnd64", "(Int64, Int64) -> Int64"),
+        ("bitOr64", "(Int64, Int64) -> Int64"),
+        ("bitXor64", "(Int64, Int64) -> Int64"),
+        ("bitNot64", "Int64 -> Int64"),
+        ("bitShl64", "(Int64, Int) -> Int64"),
+        ("bitShr64", "(Int64, Int) -> Int64"),
+        ("bitUshr64", "(Int64, Int) -> Int64"),
+        ("charToInt", "Char -> Int"),
+        ("intToChar", "Int -> Char"),
+        ("intToI64", "Int -> Int64"),
+        ("i64ToInt", "Int64 -> Int"),
+        ("floatToBits64", "Float -> Int64"),
+        ("bits64ToFloat", "Int64 -> Float"),
+        ("intToFloat", "Int -> Float"),
+        ("floatToInt", "Float -> Int"),
+        ("strLen", "String -> Int"),
+        ("strByteAt", "(String, Int) -> Int"),
+        ("strSlice", "(String, Int, Int) -> String"),
+        ("strConcat", "(String, String) -> String"),
+        ("strFromBytes", "(MutArray Int, Int) -> String"),
+        ("ptrNull", "() -> Ptr"),
+        ("ptrIsNull", "Ptr -> Bool"),
+        ("ptrAllocBytes", "Int -> Ptr"),
+        ("ptrByteAt", "(Ptr, Int) -> Int"),
+        ("ptrSetByte", "(Ptr, Int, Int) -> Void"),
+        ("ptrToString", "Ptr -> String"),
+        ("sysArgc", "() -> Int"),
+        ("sysArgv", "Int -> String"),
+        ("__concAtomicNew", "Int -> AtomicInt"),
+        ("__concAtomicLoad", "AtomicInt -> Int"),
+        ("__concAtomicStore", "(AtomicInt, Int) -> Void"),
+        ("__concAtomicAdd", "(AtomicInt, Int) -> Int"),
+        ("__concAtomicCas", "(AtomicInt, Int, Int) -> Bool"),
+        ("__concMVarNew", "forall a. (Send a) => a -> MVar a"),
+        ("__concMVarEmpty", "forall a. (Send a) => () -> MVar a"),
+        ("__concMVarTake", "forall a. (Send a) => MVar a -> a"),
+        ("__concMVarPut", "forall a. (Send a) => (MVar a, a) -> Void"),
+        ("__concMVarRead", "forall a. (Send a) => MVar a -> a"),
+        ("__concMVarTryTake", "forall a. (Send a) => MVar a -> (Bool, a)"),
+        ("__concChanNew", "forall a. (Send a) => Int -> Chan a"),
+        ("__concChanSend", "forall a. (Send a) => (Chan a, a) -> Bool"),
+        ("__concChanRecv", "forall a. (Send a) => Chan a -> (Bool, a)"),
+        ("__concChanTryRecv", "forall a. (Send a) => Chan a -> (Bool, a)"),
+        ("__concChanClose", "forall a. Chan a -> Void"),
+        ("__concChanIsClosed", "forall a. Chan a -> Bool"),
+        ("__concTaskSpawn", "forall a. (Send a) => (() -> a) -> Task a"),
+        ("__concTaskAwait", "forall a. (Send a) => Task a -> a"),
+        ("__concTaskIsReady", "forall a. Task a -> Bool"),
+        ("__concTaskWaitAny", "forall a. (MutArray (Task a), Int, Int) -> Void"),
+        ("__concNumCpu", "() -> Int"),
+        ("__concSleepMs", "Int -> Void"),
+        ("__concActorSpawn", "forall s. (() -> s) -> Actor s"),
+        ("__concActorCall", "forall s r. (Send r) => (Actor s, s -> r) -> Task r"),
+        ("__concActorSend", "forall s. (Actor s, s -> Void) -> Void"),
+        ("__concActorStop", "forall s. Actor s -> Void")
+    ];
+    let cur = cellNew(specs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((nm, sig), r) -> {
+                strMapInsert(m, nm, parseTypeSchemeFromStr(sig));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    m
+}
+
+// ============================================================================
+// Scheme Instantiation, Concept Constraint Solving & `Send` Verification
+// ============================================================================
+
+def instantiateScheme(ctx: InferCtx, scm: Scheme, sp: Span): Type = match scm {
+    ScmMono(t) -> t,
+    ScmPoly(tvs, t) -> {
+        let freshVars = cellNew(Nil);
+        let cur = cellNew(tvs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(_, r) -> {
+                    cellSet(freshVars, listAppend(cellGet(freshVars), [freshVar(ctx)]));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let sub = buildPairMap(tvs, cellGet(freshVars));
+        applyExplicitSubst(t, sub)
+    },
+    ScmPolyConstrained(tvs, cs, t) -> {
+        let freshVars = cellNew(Nil);
+        let cur = cellNew(tvs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(_, r) -> {
+                    cellSet(freshVars, listAppend(cellGet(freshVars), [freshVar(ctx)]));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let sub = buildPairMap(tvs, cellGet(freshVars));
+        let curC = cellNew(cs);
+        while (match cellGet(curC) { Nil -> false, _ -> true }) {
+            match cellGet(curC) {
+                Cons(c, r) -> {
+                    let argTy = match strMapGet(sub, c.typeVar) {
+                        Some(ft) -> ft,
+                        None -> TyVar(c.typeVar),
+                    };
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: c.conceptName, wcTy: argTy, wcSpan: sp }]));
+                    cellSet(curC, r)
+                },
+                Nil -> (),
+            }
+        };
+        applyExplicitSubst(t, sub)
+    },
+    ScmSlot -> freshVar(ctx),
+}
+
+pub def decomposeAdtType(adtReg: StrMap AdtInfo, ty: Type): Option (String, List Type) = {
+    let args = cellNew(Nil);
+    let curr = cellNew(ty);
+    let looping = cellNew(true);
+    while (cellGet(looping)) {
+        match cellGet(curr) {
+            TyComp(b, a) -> {
+                cellSet(args, Cons(a, cellGet(args)));
+                cellSet(curr, b)
+            },
+            _ -> cellSet(looping, false),
+        }
+    };
+    match cellGet(curr) {
+        TyCon(name) -> if (strMapContains(adtReg, name)) Some((name, cellGet(args))) else None,
+        _ -> None,
+    }
+}
+
+pub def matchInstancePattern(pat: Type, concrete: Type, sub: StrMap Type): Bool = match (pat, concrete) {
+    (TyVar(v), t) -> match strMapGet(sub, v) {
+        Some(existing) -> typesEqual(existing, t),
+        None -> { strMapInsert(sub, v, t); true },
+    },
+    (TyVoid, TyVoid) -> true,
+    (TyCon(a), TyCon(b)) -> a == b,
+    (TyComp(b1, a1), TyComp(b2, a2)) -> matchInstancePattern(b1, b2, sub) && matchInstancePattern(a1, a2, sub),
+    (TyTuple(es1), TyTuple(es2)) -> matchInstancePatList(es1, es2, sub),
+    (TyArr(ps1, r1), TyArr(ps2, r2)) -> matchInstancePatList(ps1, ps2, sub) && matchInstancePattern(r1, r2, sub),
+    _ -> false,
+}
+
+def matchInstancePatList(xs: List Type, ys: List Type, sub: StrMap Type): Bool = match (xs, ys) {
+    (Nil, Nil) -> true,
+    (Cons(x, xr), Cons(y, yr)) -> matchInstancePattern(x, y, sub) && matchInstancePatList(xr, yr, sub),
+    _ -> false,
+}
+
+pub def isConcreteTypeSend(adtReg: StrMap AdtInfo, ty: Type): Bool =
+    checkTypeSendRec(adtReg, ty, Nil)
+
+def checkTypeSendRec(adtReg: StrMap AdtInfo, ty: Type, visiting: List String): Bool = match ty {
+    TyVoid -> true,
+    TyVar(_) -> false,
+    TyArr(_, _) -> true,
+    TyTuple(es) -> {
+        let cur = cellNew(es);
+        let ok = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    if (!checkTypeSendRec(adtReg, e, visiting)) cellSet(ok, false) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(ok)
+    },
+    TyCon(name) ->
+        if (name == "Ptr" || name == "Cell" || name == "MutArray") false
+        else if (name == "Int" || name == "Int64" || name == "Float" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt") true
+        else match strMapGet(adtReg, name) {
+            Some(ainfo) ->
+                if (listContainsStr(visiting, name)) true
+                else checkAdtVariantsSend(adtReg, ainfo, Nil, Cons(name, visiting)),
+            None -> true,
+        },
+    TyComp(_, _) -> {
+        let args = cellNew(Nil);
+        let curr = cellNew(ty);
+        let looping = cellNew(true);
+        while (cellGet(looping)) {
+            match cellGet(curr) {
+                TyComp(b, a) -> { cellSet(args, Cons(a, cellGet(args))); cellSet(curr, b) },
+                _ -> cellSet(looping, false),
+            }
+        };
+        let targs = cellGet(args);
+        match cellGet(curr) {
+            TyCon(baseName) ->
+                if (baseName == "Cell" || baseName == "MutArray") false
+                else if (baseName == "Actor") true
+                else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task") {
+                    match targs {
+                        Cons(elem, Nil) -> checkTypeSendRec(adtReg, elem, visiting),
+                        _ -> false,
+                    }
+                } else match strMapGet(adtReg, baseName) {
+                    Some(ainfo) -> {
+                        let key = mangleType(ty);
+                        if (listContainsStr(visiting, key)) true
+                        else checkAdtVariantsSend(adtReg, ainfo, targs, Cons(key, visiting))
+                    },
+                    None -> false,
+                },
+            _ -> false,
+        }
+    },
+}
+
+def checkAdtVariantsSend(adtReg: StrMap AdtInfo, ainfo: AdtInfo, targs: List Type, visiting: List String): Bool = {
+    let sub = buildPairMap(ainfo.typeParams, targs);
+    let curV = cellNew(ainfo.variants);
+    let ok = cellNew(true);
+    while (match cellGet(curV) { Nil -> false, _ -> cellGet(ok) }) {
+        match cellGet(curV) {
+            Cons(v, rV) -> {
+                let curF = cellNew(v.fieldTypes);
+                while (match cellGet(curF) { Nil -> false, _ -> cellGet(ok) }) {
+                    match cellGet(curF) {
+                        Cons(ft, rF) -> {
+                            let instFt = applyExplicitSubst(ft, sub);
+                            if (!checkTypeSendRec(adtReg, instFt, visiting)) cellSet(ok, false) else ();
+                            cellSet(curF, rF)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(curV, rV)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(ok)
+}
+
+def hasGivenConstraint(given: List ConstraintSpec, cname: String, tvar: String): Bool = match given {
+    Nil -> false,
+    Cons(c, r) ->
+        if (c.conceptName == cname && c.typeVar == tvar) true
+        else hasGivenConstraint(r, cname, tvar),
+}
+
+def hasResidualWanted(ws: List WantedConstraint, cname: String, tvar: String): Bool = match ws {
+    Nil -> false,
+    Cons(w, r) -> match w.wcTy {
+        TyVar(v) -> if (w.wcConcept == cname && v == tvar) true else hasResidualWanted(r, cname, tvar),
+        _ -> hasResidualWanted(r, cname, tvar),
+    },
+}
+
+def pushResidualWanted(residual: Cell (List WantedConstraint), cname: String, tvar: String, sp: Span): Void = {
+    let cur = cellGet(residual);
+    if (!hasResidualWanted(cur, cname, tvar)) {
+        cellSet(residual, Cons(MkWanted { wcConcept: cname, wcTy: TyVar(tvar), wcSpan: sp }, cur))
+    } else ()
+}
+
+def dischargeConstraint(
+    ctx: InferCtx,
+    wc: WantedConstraint,
+    given: List ConstraintSpec,
+    residual: Cell (List WantedConstraint),
+    depth: Int
+): Result Void String =
+    if (depth > 32) Err(typeErr(wc.wcSpan, "Constraint resolution exceeded recursion limit for '" + wc.wcConcept + "'"))
+    else {
+        let zty = zonkType(ctx.subst, wc.wcTy);
+        match zty {
+            TyVar(v) -> {
+                if (!hasGivenConstraint(given, wc.wcConcept, v)) {
+                    pushResidualWanted(residual, wc.wcConcept, v, wc.wcSpan)
+                } else ();
+                Ok(())
+            },
+            _ ->
+                if (wc.wcConcept == "Send") {
+                    dischargeSendConstraint(ctx, zty, wc.wcSpan, given, residual, Nil, depth)
+                } else {
+                    let matchedInst: Cell (Option (InstanceInfo, StrMap Type)) = cellNew(None);
+                    let curI = cellNew(cellGet(ctx.instanceReg));
+                    while (match cellGet(curI) { Nil -> false, _ -> match cellGet(matchedInst) { None -> true, Some(_) -> false } }) {
+                        match cellGet(curI) {
+                            Cons(inst, rI) -> {
+                                if (inst.conceptName == wc.wcConcept) {
+                                    match inst.targetTypes {
+                                        Cons(patTy, _) -> {
+                                            let sub: StrMap Type = strMapNew();
+                                            if (matchInstancePattern(patTy, zty, sub)) {
+                                                cellSet(matchedInst, Some((inst, sub)))
+                                            } else ()
+                                        },
+                                        Nil -> (),
+                                    }
+                                } else ();
+                                cellSet(curI, rI)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    match cellGet(matchedInst) {
+                        None -> Err(typeErr(wc.wcSpan, "No instance of '" + wc.wcConcept + "' for type '" + typeToString(zty) + "'")),
+                        Some((inst, sub)) -> dischargeSubConstraints(ctx, inst.constraints, sub, wc.wcSpan, given, residual, depth + 1),
+                    }
+                },
+        }
+    }
+
+def dischargeSubConstraints(
+    ctx: InferCtx,
+    cs: List ConstraintSpec,
+    sub: StrMap Type,
+    sp: Span,
+    given: List ConstraintSpec,
+    residual: Cell (List WantedConstraint),
+    depth: Int
+): Result Void String = match cs {
+    Nil -> Ok(()),
+    Cons(c, r) -> {
+        let subTy = match strMapGet(sub, c.typeVar) {
+            Some(t) -> t,
+            None -> TyVar(c.typeVar),
+        };
+        dischargeConstraint(ctx, MkWanted { wcConcept: c.conceptName, wcTy: subTy, wcSpan: sp }, given, residual, depth)?;
+        dischargeSubConstraints(ctx, r, sub, sp, given, residual, depth)
+    },
+}
+
+def dischargeSendConstraint(
+    ctx: InferCtx,
+    rawTy: Type,
+    sp: Span,
+    given: List ConstraintSpec,
+    residual: Cell (List WantedConstraint),
+    visiting: List String,
+    depth: Int
+): Result Void String =
+    if (depth > 32) Ok(())
+    else {
+        let ty = zonkType(ctx.subst, rawTy);
+        match ty {
+            TyVoid -> Ok(()),
+            TyArr(_, _) -> Ok(()),
+            TyVar(v) -> {
+                if (!hasGivenConstraint(given, "Send", v)) {
+                    pushResidualWanted(residual, "Send", v, sp)
+                } else ();
+                Ok(())
+            },
+            TyTuple(es) -> dischargeSendList(ctx, es, sp, given, residual, visiting, depth + 1),
+            TyCon(name) ->
+                if (name == "Ptr" || name == "Cell" || name == "MutArray") {
+                    Err(typeErr(sp, "No instance of 'Send' for non-thread-safe type '" + name + "'"))
+                } else if (name == "Int" || name == "Int64" || name == "Float" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt") {
+                    Ok(())
+                } else if (listContainsStr(visiting, name)) {
+                    Ok(())
+                } else match strMapGet(ctx.adtReg, name) {
+                    Some(ainfo) -> {
+                        let emptySub: StrMap Type = strMapNew();
+                        dischargeAdtFieldsSend(ctx, ainfo.variants, emptySub, sp, given, residual, Cons(name, visiting), depth + 1)
+                    },
+                    None -> Ok(()),
+                },
+            TyComp(_, _) -> {
+                let key = mangleType(ty);
+                if (listContainsStr(visiting, key)) Ok(())
+                else {
+                    let args = cellNew(Nil);
+                    let curr = cellNew(ty);
+                    let looping = cellNew(true);
+                    while (cellGet(looping)) {
+                        match cellGet(curr) {
+                            TyComp(b, a) -> { cellSet(args, Cons(a, cellGet(args))); cellSet(curr, b) },
+                            _ -> cellSet(looping, false),
+                        }
+                    };
+                    let targs = cellGet(args);
+                    match cellGet(curr) {
+                        TyCon(baseName) ->
+                            if (baseName == "Cell" || baseName == "MutArray") {
+                                Err(typeErr(sp, "No instance of 'Send' for mutable container '" + typeToString(ty) + "'"))
+                            } else if (baseName == "Actor") Ok(())
+                            else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task") {
+                                dischargeSendList(ctx, targs, sp, given, residual, Cons(key, visiting), depth + 1)
+                            } else match strMapGet(ctx.adtReg, baseName) {
+                                Some(ainfo) -> {
+                                    let sub = buildPairMap(ainfo.typeParams, targs);
+                                    dischargeAdtFieldsSend(ctx, ainfo.variants, sub, sp, given, residual, Cons(key, visiting), depth + 1)
+                                },
+                                None -> Err(typeErr(sp, "No instance of 'Send' for '" + typeToString(ty) + "'")),
+                            },
+                        _ -> Err(typeErr(sp, "No instance of 'Send' for '" + typeToString(ty) + "'")),
+                    }
+                }
+            },
+        }
+    }
+
+def dischargeSendList(
+    ctx: InferCtx,
+    ts: List Type,
+    sp: Span,
+    given: List ConstraintSpec,
+    residual: Cell (List WantedConstraint),
+    visiting: List String,
+    depth: Int
+): Result Void String = match ts {
+    Nil -> Ok(()),
+    Cons(h, t) -> {
+        dischargeSendConstraint(ctx, h, sp, given, residual, visiting, depth)?;
+        dischargeSendList(ctx, t, sp, given, residual, visiting, depth)
+    },
+}
+
+def dischargeAdtFieldsSend(
+    ctx: InferCtx,
+    vs: List VariantInfo,
+    sub: StrMap Type,
+    sp: Span,
+    given: List ConstraintSpec,
+    residual: Cell (List WantedConstraint),
+    visiting: List String,
+    depth: Int
+): Result Void String = match vs {
+    Nil -> Ok(()),
+    Cons(v, rest) -> {
+        let instFieldsRev = cellNew(Nil);
+        let cur = cellNew(v.fieldTypes);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(ft, r) -> {
+                    cellSet(instFieldsRev, Cons(applyExplicitSubst(ft, sub), cellGet(instFieldsRev)));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        dischargeSendList(ctx, listRev(cellGet(instFieldsRev)), sp, given, residual, visiting, depth)?;
+        dischargeAdtFieldsSend(ctx, rest, sub, sp, given, residual, visiting, depth)
+    },
+}
+
+// ============================================================================
+// Pattern & Expression HM Inference
+// ============================================================================
+
+def listIndexStr(xs: List String, target: String, idx: Int): Option Int = match xs {
+    Nil -> None,
+    Cons(h, t) -> if (h == target) Some(idx) else listIndexStr(t, target, idx + 1),
+}
+
+def listNthType(ts: List Type, idx: Int): Type = match ts {
+    Nil -> TyVoid,
+    Cons(h, t) -> if (idx == 0) h else listNthType(t, idx - 1),
+}
+
+def inferPatternInner(
+    ctx: InferCtx,
+    pat: Pattern,
+    seenVars: Cell (List String),
+    sp: Span
+): Result (Type, List (String, Scheme)) String = match pat {
+    PatWild -> Ok((freshVar(ctx), Nil)),
+    PatLit(l) -> Ok((litType(l), Nil)),
+    PatVar(v) ->
+        if (listContainsStr(cellGet(seenVars), v)) {
+            Err(typeErr(sp, "Duplicate variable '" + v + "' in pattern"))
+        } else {
+            cellSet(seenVars, Cons(v, cellGet(seenVars)));
+            let fv = freshVar(ctx);
+            Ok((fv, [(v, ScmMono(fv))]))
+        },
+    PatTuple(ps) -> {
+        let elemTys = cellNew(Nil);
+        let binds = cellNew(Nil);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    let (t, b) = inferPatternInner(ctx, p, seenVars, sp)?;
+                    cellSet(elemTys, listAppend(cellGet(elemTys), [t]));
+                    cellSet(binds, listAppend(cellGet(binds), b));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        Ok((TyTuple(cellGet(elemTys)), cellGet(binds)))
+    },
+    PatCtor(cname, subPats) -> {
+        match strMapGet(ctx.ctorToAdt, cname) {
+            None -> Err(typeErr(sp, "Unknown constructor '" + cname + "' in pattern")),
+            Some(adtName) -> match strMapGet(ctx.adtReg, adtName) {
+                None -> Err(typeErr(sp, "Unknown ADT '" + adtName + "'")),
+                Some(ainfo) -> {
+                    let vOpt = findVariantByName(ainfo.variants, cname);
+                    match vOpt {
+                        None -> Err(typeErr(sp, "Unknown variant '" + cname + "'")),
+                        Some(vinfo) -> {
+                            let ctorTy = instantiateScheme(ctx, vinfo.ctorScm, sp);
+                            match subPats {
+                                Nil ->
+                                    if (listLen(vinfo.fieldTypes) != 0) {
+                                        Err(typeErr(sp, "Constructor '" + cname + "' expects arguments"))
+                                    } else Ok((ctorTy, Nil)),
+                                _ -> match ctorTy {
+                                    TyArr(expectedTys, resTy) ->
+                                        if (listLen(expectedTys) != listLen(subPats)) {
+                                            Err(typeErr(sp, "Constructor '" + cname + "' arity mismatch"))
+                                        } else {
+                                            let binds = cellNew(Nil);
+                                            let cp = cellNew(subPats);
+                                            let ct = cellNew(expectedTys);
+                                            while (match (cellGet(cp), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                match (cellGet(cp), cellGet(ct)) {
+                                                    (Cons(sp0, pr), Cons(et0, tr)) -> {
+                                                        let (pt, pb) = inferPatternInner(ctx, sp0, seenVars, sp)?;
+                                                        unifyTypes(ctx.subst, pt, et0, sp)?;
+                                                        cellSet(binds, listAppend(cellGet(binds), pb));
+                                                        cellSet(cp, pr);
+                                                        cellSet(ct, tr)
+                                                    },
+                                                    _ -> (),
+                                                }
+                                            };
+                                            Ok((resTy, cellGet(binds)))
+                                        },
+                                    _ -> Err(typeErr(sp, "Unit constructor '" + cname + "' takes no arguments")),
+                                },
+                            }
+                        },
+                    }
+                },
+            },
+        }
+    },
+    PatStruct(cname, namedPats) -> {
+        match strMapGet(ctx.ctorToAdt, cname) {
+            None -> Err(typeErr(sp, "Unknown struct constructor '" + cname + "'")),
+            Some(adtName) -> match strMapGet(ctx.adtReg, adtName) {
+                None -> Err(typeErr(sp, "Unknown ADT '" + adtName + "'")),
+                Some(ainfo) -> match findVariantByName(ainfo.variants, cname) {
+                    None -> Err(typeErr(sp, "Unknown variant '" + cname + "'")),
+                    Some(vinfo) -> match vinfo.fieldNames {
+                        None -> Err(typeErr(sp, "Variant '" + cname + "' is not a struct variant")),
+                        Some(declNames) -> {
+                            let ctorTy = instantiateScheme(ctx, vinfo.ctorScm, sp);
+                            match ctorTy {
+                                TyArr(expectedTys, resTy) -> {
+                                    let binds = cellNew(Nil);
+                                    let cur = cellNew(namedPats);
+                                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                                        match cellGet(cur) {
+                                            Cons((fnm, fpat), r) -> {
+                                                match listIndexStr(declNames, fnm, 0) {
+                                                    None -> returnPatErr(sp, "Variant '" + cname + "' has no field '" + fnm + "'")?,
+                                                    Some(idx) -> {
+                                                        let (pt, pb) = inferPatternInner(ctx, fpat, seenVars, sp)?;
+                                                        unifyTypes(ctx.subst, pt, listNthType(expectedTys, idx), sp)?;
+                                                        cellSet(binds, listAppend(cellGet(binds), pb))
+                                                    },
+                                                };
+                                                cellSet(cur, r)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    Ok((resTy, cellGet(binds)))
+                                },
+                                _ -> Err(typeErr(sp, "Variant '" + cname + "' has no fields")),
+                            }
+                        },
+                    },
+                },
+            },
+        }
+    },
+}
+
+def returnPatErr(sp: Span, msg: String): Result Void String = Err(typeErr(sp, msg))
+
+pub def findVariantByName(vs: List VariantInfo, cname: String): Option VariantInfo = match vs {
+    Nil -> None,
+    Cons(v, r) -> if (v.vname == cname) Some(v) else findVariantByName(r, cname),
+}
+
+def collectEnvFtv(ctx: InferCtx, env: TypeEnv): List String = {
+    let out = cellNew(Nil);
+    let cur = cellNew(env.locals);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((_, scm), r) -> {
+                let zscm = zonkScheme(ctx.subst, scm);
+                let bound = schemeTypeParams(zscm);
+                let fvs = ftvOrdered(schemeBody(zscm));
+                let curF = cellNew(fvs);
+                while (match cellGet(curF) { Nil -> false, _ -> true }) {
+                    match cellGet(curF) {
+                        Cons(fv, rf) -> {
+                            if (!listContainsStr(bound, fv)) {
+                                cellSet(out, addUniqueStr(cellGet(out), fv))
+                            } else ();
+                            cellSet(curF, rf)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(out)
+}
+
+def addUniqueConstraint(cs: List ConstraintSpec, c: ConstraintSpec): List ConstraintSpec = {
+    if (hasGivenConstraint(cs, c.conceptName, c.typeVar)) cs
+    else listAppend(cs, [c])
+}
+
+def generalizeType(
+    ctx: InferCtx,
+    envFtvs: List String,
+    rawTy: Type,
+    wantedList: List WantedConstraint,
+    given: List ConstraintSpec
+): Result (Scheme, List WantedConstraint) String = {
+    let ty = zonkType(ctx.subst, rawTy);
+    let residual: Cell (List WantedConstraint) = cellNew(Nil);
+    let curW = cellNew(wantedList);
+    while (match cellGet(curW) { Nil -> false, _ -> true }) {
+        match cellGet(curW) {
+            Cons(wc, r) -> {
+                dischargeConstraint(ctx, wc, given, residual, 0)?;
+                cellSet(curW, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let genVars = cellNew(Nil);
+    let curFv = cellNew(ftvOrdered(ty));
+    while (match cellGet(curFv) { Nil -> false, _ -> true }) {
+        match cellGet(curFv) {
+            Cons(fv, r) -> {
+                if (!listContainsStr(envFtvs, fv)) {
+                    cellSet(genVars, addUniqueStr(cellGet(genVars), fv))
+                } else ();
+                cellSet(curFv, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let gvs = cellGet(genVars);
+    let localCs = cellNew(Nil);
+    let outerWanted = cellNew(Nil);
+    let curRes = cellNew(cellGet(residual));
+    while (match cellGet(curRes) { Nil -> false, _ -> true }) {
+        match cellGet(curRes) {
+            Cons(rw, r) -> {
+                match rw.wcTy {
+                    TyVar(v) ->
+                        if (listContainsStr(gvs, v)) {
+                            cellSet(localCs, addUniqueConstraint(cellGet(localCs), MkConstraint { conceptName: rw.wcConcept, typeVar: v }))
+                        } else if (listContainsStr(envFtvs, v)) {
+                            cellSet(outerWanted, listAppend(cellGet(outerWanted), [rw]))
+                        } else {
+                            returnPatErr(rw.wcSpan, "Ambiguous constraint '" + rw.wcConcept + "' on unquantified type variable '" + v + "'")?
+                        },
+                    _ -> (),
+                };
+                cellSet(curRes, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let scm = match gvs {
+        Nil -> ScmMono(ty),
+        _ -> match cellGet(localCs) {
+            Nil -> ScmPoly(gvs, ty),
+            lcs -> ScmPolyConstrained(gvs, lcs, ty),
+        },
+    };
+    Ok((scm, cellGet(outerWanted)))
+}
+
+def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
+    let sp = f.pos;
+    match f.node {
+        ExLit(lit) -> Ok(MkForm { pos: sp, ty: ScmMono(litType(lit)), annot: f.annot, node: ExLit(lit) }),
+        ExVar(name) -> match envLookup(env, name) {
+            Some(scm) -> {
+                let instTy = instantiateScheme(ctx, scm, sp);
+                Ok(MkForm { pos: sp, ty: ScmMono(instTy), annot: f.annot, node: ExVar(name) })
+            },
+            None -> Err(typeErr(sp, "Not in scope: '" + name + "'")),
+        },
+        ExTuple(elems) -> {
+            let newElems = cellNew(Nil);
+            let elemTys = cellNew(Nil);
+            let cur = cellNew(elems);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(el, r) -> {
+                        let iel = inferForm(ctx, env, el)?;
+                        cellSet(newElems, listAppend(cellGet(newElems), [iel]));
+                        cellSet(elemTys, listAppend(cellGet(elemTys), [schemeBody(iel.ty)]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(TyTuple(cellGet(elemTys))), annot: f.annot, node: ExTuple(cellGet(newElems)) })
+        },
+        ExList(elems) -> {
+            let elemTy = freshVar(ctx);
+            let newElems = cellNew(Nil);
+            let cur = cellNew(elems);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(el, r) -> {
+                        let iel = inferForm(ctx, env, el)?;
+                        unifyTypes(ctx.subst, schemeBody(iel.ty), elemTy, iel.pos)?;
+                        cellSet(newElems, listAppend(cellGet(newElems), [iel]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let listTy = TyComp(TyCon("List"), zonkType(ctx.subst, elemTy));
+            Ok(MkForm { pos: sp, ty: ScmMono(listTy), annot: f.annot, node: ExList(cellGet(newElems)) })
+        },
+        ExStructInit(cname, fieldInits) -> match strMapGet(ctx.ctorToAdt, cname) {
+            None -> Err(typeErr(sp, "Unknown struct constructor '" + cname + "'")),
+            Some(adtName) -> match strMapGet(ctx.adtReg, adtName) {
+                None -> Err(typeErr(sp, "Unknown ADT '" + adtName + "'")),
+                Some(ainfo) -> match findVariantByName(ainfo.variants, cname) {
+                    None -> Err(typeErr(sp, "Unknown variant '" + cname + "'")),
+                    Some(vinfo) -> match vinfo.fieldNames {
+                        None -> Err(typeErr(sp, "Variant '" + cname + "' is not a struct variant")),
+                        Some(declNames) -> {
+                            if (listLen(fieldInits) != listLen(declNames)) {
+                                Err(typeErr(sp, "Struct '" + cname + "' field count mismatch"))
+                            } else {
+                                let ctorTy = instantiateScheme(ctx, vinfo.ctorScm, sp);
+                                match ctorTy {
+                                    TyArr(expectedTys, resTy) -> {
+                                        let seen = cellNew(Nil);
+                                        let newFs = cellNew(Nil);
+                                        let cur = cellNew(fieldInits);
+                                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                                            match cellGet(cur) {
+                                                Cons((fnm, fexpr), r) -> {
+                                                    if (listContainsStr(cellGet(seen), fnm)) {
+                                                        returnPatErr(sp, "Duplicate field '" + fnm + "' in '" + cname + "'")?
+                                                    } else cellSet(seen, Cons(fnm, cellGet(seen)));
+                                                    match listIndexStr(declNames, fnm, 0) {
+                                                        None -> returnPatErr(sp, "Variant '" + cname + "' has no field '" + fnm + "'")?,
+                                                        Some(idx) -> {
+                                                            let infVal = inferForm(ctx, env, fexpr)?;
+                                                            unifyTypes(ctx.subst, schemeBody(infVal.ty), listNthType(expectedTys, idx), infVal.pos)?;
+                                                            cellSet(newFs, listAppend(cellGet(newFs), [(fnm, infVal)]))
+                                                        },
+                                                    };
+                                                    cellSet(cur, r)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, resTy)), annot: f.annot, node: ExStructInit(cname, cellGet(newFs)) })
+                                    },
+                                    _ -> Err(typeErr(sp, "Variant '" + cname + "' has no fields")),
+                                }
+                            }
+                        },
+                    },
+                },
+            },
+        },
+        ExAbs(params, retAnnOpt, body) -> {
+            let newParams = cellNew(Nil);
+            let paramTys = cellNew(Nil);
+            let binds = cellNew(Nil);
+            let cur = cellNew(params);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(vd, r) -> {
+                        let pscm = match vd.vscm {
+                            ScmSlot -> ScmMono(freshVar(ctx)),
+                            existing -> expandScheme(ctx, existing, sp)?,
+                        };
+                        cellSet(newParams, listAppend(cellGet(newParams), [MkVarDecl { vname: vd.vname, vscm: pscm }]));
+                        cellSet(paramTys, listAppend(cellGet(paramTys), [schemeBody(pscm)]));
+                        cellSet(binds, listAppend(cellGet(binds), [(vd.vname, pscm)]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let innerEnv = envExtendMany(env, cellGet(binds));
+            let infBody = inferForm(ctx, innerEnv, body)?;
+            let newRetAnn = match retAnnOpt {
+                Some(rt) -> {
+                    let ert = expandType(ctx, rt, sp)?;
+                    unifyTypes(ctx.subst, schemeBody(infBody.ty), ert, infBody.pos)?;
+                    Some(ert)
+                },
+                None -> None,
+            };
+            let fnTy = TyArr(zonkTypeList(ctx.subst, cellGet(paramTys)), zonkType(ctx.subst, schemeBody(infBody.ty)));
+            Ok(MkForm { pos: sp, ty: ScmMono(fnTy), annot: f.annot, node: ExAbs(cellGet(newParams), newRetAnn, infBody) })
+        },
+        ExApply(callee, args) -> {
+            let ic = inferForm(ctx, env, callee)?;
+            let iargs = cellNew(Nil);
+            let argTys = cellNew(Nil);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ia = inferForm(ctx, env, a)?;
+                        cellSet(iargs, listAppend(cellGet(iargs), [ia]));
+                        cellSet(argTys, listAppend(cellGet(argTys), [schemeBody(ia.ty)]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let retVar = freshVar(ctx);
+            unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(cellGet(argTys), retVar), sp)?;
+            Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, retVar)), annot: f.annot, node: ExApply(ic, cellGet(iargs)) })
+        },
+        ExBin(op, left, right) -> {
+            let il = inferForm(ctx, env, left)?;
+            let ir = inferForm(ctx, env, right)?;
+            let tl = schemeBody(il.ty);
+            let tr = schemeBody(ir.ty);
+            let resTy = match op {
+                OpAnd -> {
+                    unifyTypes(ctx.subst, tl, TyCon("Bool"), il.pos)?;
+                    unifyTypes(ctx.subst, tr, TyCon("Bool"), ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpOr -> {
+                    unifyTypes(ctx.subst, tl, TyCon("Bool"), il.pos)?;
+                    unifyTypes(ctx.subst, tr, TyCon("Bool"), ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpEq -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpNe -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Eq", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpLt -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpLe -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpGt -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpGe -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ord", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    TyCon("Bool")
+                },
+                OpShl -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shl", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+                OpShr -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Shr", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+                OpUshr -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Ushr", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+                _ -> {
+                    let cname = match op {
+                        OpAdd -> "Add",
+                        OpSub -> "Sub",
+                        OpMul -> "Mul",
+                        OpDiv -> "Div",
+                        OpRem -> "Rem",
+                        OpBitAnd -> "BitAnd",
+                        OpBitOr -> "BitOr",
+                        OpBitXor -> "BitXor",
+                        _ -> "Add",
+                    };
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: cname, wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, a, ir.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(resTy), annot: f.annot, node: ExBin(op, il, ir) })
+        },
+        ExUn(op, operand) -> {
+            let io = inferForm(ctx, env, operand)?;
+            let to = schemeBody(io.ty);
+            let resTy = match op {
+                UnNot -> {
+                    unifyTypes(ctx.subst, to, TyCon("Bool"), io.pos)?;
+                    TyCon("Bool")
+                },
+                UnNeg -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Neg", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, to, a, io.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+                UnBitNot -> {
+                    let a = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "BitNot", wcTy: a, wcSpan: sp }]));
+                    unifyTypes(ctx.subst, to, a, io.pos)?;
+                    zonkType(ctx.subst, a)
+                },
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(resTy), annot: f.annot, node: ExUn(op, io) })
+        },
+        ExField(base, fieldName) -> {
+            let ib0 = inferForm(ctx, env, base)?;
+            let ib = zonkForm(ctx.subst, ib0);
+            let resolvedBase = zonkType(ctx.subst, schemeBody(ib.ty));
+            match decomposeAdtType(ctx.adtReg, resolvedBase) {
+                Some((adtName, typeArgs)) -> match strMapGet(ctx.adtReg, adtName) {
+                    None -> Err(typeErr(sp, "Unknown struct type '" + adtName + "'")),
+                    Some(ainfo) ->
+                        if (listLen(ainfo.variants) != 1) {
+                            Err(typeErr(sp, "Dot field access '." + fieldName + "' requires a single-variant struct, got '" + adtName + "'"))
+                        } else match ainfo.variants {
+                            Cons(vinfo, _) -> match vinfo.fieldNames {
+                                None -> Err(typeErr(sp, "Type '" + adtName + "' is not a struct variant")),
+                                Some(declNames) -> match listIndexStr(declNames, fieldName, 0) {
+                                    None -> Err(typeErr(sp, "Struct '" + adtName + "' has no field '" + fieldName + "'")),
+                                    Some(idx) -> {
+                                        let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                                        let fty = zonkType(ctx.subst, applyExplicitSubst(listNthType(vinfo.fieldTypes, idx), sub));
+                                        Ok(MkForm { pos: sp, ty: ScmMono(fty), annot: f.annot, node: ExField(ib, fieldName) })
+                                    },
+                                },
+                            },
+                            Nil -> Err(typeErr(sp, "Empty ADT '" + adtName + "'")),
+                        },
+                },
+                None -> match resolvedBase {
+                    TyVar(_) -> {
+                        // Unique single-variant struct field inference
+                        let matches: Cell (List (AdtInfo, VariantInfo, Int)) = cellNew(Nil);
+                        let k = cellNew(0);
+                        while (cellGet(k) < vecLen(ctx.adtNames)) {
+                            let anm = vecGetOr(ctx.adtNames, cellGet(k), "");
+                            match strMapGet(ctx.adtReg, anm) {
+                                Some(ai) ->
+                                    if (listLen(ai.variants) == 1) {
+                                        match ai.variants {
+                                            Cons(vi, _) -> match vi.fieldNames {
+                                                Some(fns) -> match listIndexStr(fns, fieldName, 0) {
+                                                    Some(idx) -> cellSet(matches, listAppend(cellGet(matches), [(ai, vi, idx)])),
+                                                    None -> (),
+                                                },
+                                                None -> (),
+                                            },
+                                            Nil -> (),
+                                        }
+                                    } else (),
+                                None -> (),
+                            };
+                            cellSet(k, cellGet(k) + 1)
+                        };
+                        match cellGet(matches) {
+                            Cons((ai, vi, idx), Nil) -> {
+                                let freshArgs = cellNew(Nil);
+                                let curP = cellNew(ai.typeParams);
+                                while (match cellGet(curP) { Nil -> false, _ -> true }) {
+                                    match cellGet(curP) {
+                                        Cons(_, r) -> {
+                                            cellSet(freshArgs, listAppend(cellGet(freshArgs), [freshVar(ctx)]));
+                                            cellSet(curP, r)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let fargs = cellGet(freshArgs);
+                                let targetAdt = composeTypes(Cons(TyCon(ai.adtName), fargs));
+                                unifyTypes(ctx.subst, resolvedBase, targetAdt, ib.pos)?;
+                                let sub = buildPairMap(ai.typeParams, fargs);
+                                let fty = zonkType(ctx.subst, applyExplicitSubst(listNthType(vi.fieldTypes, idx), sub));
+                                let ibZonked = zonkForm(ctx.subst, ib);
+                                Ok(MkForm { pos: sp, ty: ScmMono(fty), annot: f.annot, node: ExField(ibZonked, fieldName) })
+                            },
+                            _ -> Err(typeErr(sp, "Cannot infer struct type for field '." + fieldName + "'; add a type annotation")),
+                        }
+                    },
+                    _ -> Err(typeErr(sp, "Cannot access field '." + fieldName + "' on non-struct type '" + typeToString(resolvedBase) + "'")),
+                },
+            }
+        },
+        ExLet(vd, val, body) -> {
+            let expandedVarScm = match vd.vscm {
+                ScmSlot -> ScmSlot,
+                s -> expandScheme(ctx, s, sp)?,
+            };
+            let placeholderTy = match expandedVarScm {
+                ScmSlot -> freshVar(ctx),
+                s -> instantiateScheme(ctx, s, sp),
+            };
+            match val.node {
+                ExAbs(_, _, _) -> {
+                    let savedWanted = cellGet(ctx.wanted);
+                    cellSet(ctx.wanted, Nil);
+                    let recEnv = envExtend(env, vd.vname, ScmMono(placeholderTy));
+                    let infVal0 = inferForm(ctx, recEnv, val)?;
+                    unifyTypes(ctx.subst, placeholderTy, schemeBody(infVal0.ty), infVal0.pos)?;
+                    let infVal = zonkForm(ctx.subst, infVal0);
+                    let envFtvs = collectEnvFtv(ctx, env);
+                    let valWanted = cellGet(ctx.wanted);
+                    let (genScm, remWanted) = generalizeType(ctx, envFtvs, placeholderTy, valWanted, Nil)?;
+                    cellSet(ctx.wanted, listAppend(savedWanted, remWanted));
+                    let infValTyped = MkForm { pos: infVal.pos, ty: genScm, annot: infVal.annot, node: infVal.node };
+                    let bodyEnv = envExtend(env, vd.vname, genScm);
+                    let infBody = inferForm(ctx, bodyEnv, body)?;
+                    Ok(MkForm {
+                        pos: sp,
+                        ty: infBody.ty,
+                        annot: f.annot,
+                        node: ExLet(MkVarDecl { vname: vd.vname, vscm: genScm }, infValTyped, infBody),
+                    })
+                },
+                _ -> {
+                    let infVal0 = inferForm(ctx, env, val)?;
+                    unifyTypes(ctx.subst, placeholderTy, schemeBody(infVal0.ty), infVal0.pos)?;
+                    let monoTy = zonkType(ctx.subst, placeholderTy);
+                    let monoScm = ScmMono(monoTy);
+                    let infVal = zonkForm(ctx.subst, infVal0);
+                    let bodyEnv = envExtend(env, vd.vname, monoScm);
+                    let infBody = inferForm(ctx, bodyEnv, body)?;
+                    Ok(MkForm {
+                        pos: sp,
+                        ty: infBody.ty,
+                        annot: f.annot,
+                        node: ExLet(MkVarDecl { vname: vd.vname, vscm: monoScm }, infVal, infBody),
+                    })
+                },
+            }
+        },
+        ExIf(cond, thenE, elseE) -> {
+            let ic = inferForm(ctx, env, cond)?;
+            let it = inferForm(ctx, env, thenE)?;
+            let ie = inferForm(ctx, env, elseE)?;
+            unifyTypes(ctx.subst, schemeBody(ic.ty), TyCon("Bool"), ic.pos)?;
+            unifyTypes(ctx.subst, schemeBody(it.ty), schemeBody(ie.ty), it.pos)?;
+            Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, schemeBody(it.ty))), annot: f.annot, node: ExIf(ic, it, ie) })
+        },
+        ExWhile(cond, body) -> {
+            let ic = inferForm(ctx, env, cond)?;
+            let ib = inferForm(ctx, env, body)?;
+            unifyTypes(ctx.subst, schemeBody(ic.ty), TyCon("Bool"), ic.pos)?;
+            unifyTypes(ctx.subst, schemeBody(ib.ty), TyVoid, ib.pos)?;
+            Ok(MkForm { pos: sp, ty: ScmMono(TyVoid), annot: f.annot, node: ExWhile(ic, ib) })
+        },
+        ExBlock(items) -> {
+            let total = listLen(items);
+            let idx = cellNew(0);
+            let newItems = cellNew(Nil);
+            let lastTy = cellNew(TyVoid);
+            let cur = cellNew(items);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(it, r) -> {
+                        let i = cellGet(idx);
+                        let infIt = inferForm(ctx, env, it)?;
+                        if (i + 1 < total) {
+                            unifyTypes(ctx.subst, schemeBody(infIt.ty), TyVoid, infIt.pos)?
+                        } else {
+                            cellSet(lastTy, zonkType(ctx.subst, schemeBody(infIt.ty)))
+                        };
+                        cellSet(newItems, listAppend(cellGet(newItems), [infIt]));
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(cellGet(lastTy)), annot: f.annot, node: ExBlock(cellGet(newItems)) })
+        },
+        ExMatch(scrut, arms) -> {
+            let is = inferForm(ctx, env, scrut)?;
+            let scrutTy = schemeBody(is.ty);
+            let resTy = freshVar(ctx);
+            let newArms = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arm, r) -> {
+                        let seenVars = cellNew(Nil);
+                        let (patTy, patBinds) = inferPatternInner(ctx, arm.pat, seenVars, sp)?;
+                        unifyTypes(ctx.subst, scrutTy, patTy, sp)?;
+                        let armEnv = envExtendMany(env, patBinds);
+                        let ng = match arm.guard {
+                            Some(g) -> {
+                                let ig = inferForm(ctx, armEnv, g)?;
+                                unifyTypes(ctx.subst, schemeBody(ig.ty), TyCon("Bool"), ig.pos)?;
+                                Some(ig)
+                            },
+                            None -> None,
+                        };
+                        let ib = inferForm(ctx, armEnv, arm.body)?;
+                        unifyTypes(ctx.subst, resTy, schemeBody(ib.ty), ib.pos)?;
+                        cellSet(newArms, listAppend(cellGet(newArms), [MkMatchArm { pat: arm.pat, guard: ng, body: ib }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, resTy)), annot: f.annot, node: ExMatch(is, cellGet(newArms)) })
+        },
+        ExTry(_) -> Err(typeErr(sp, "'?' operator is only valid inside a Result-returning expression")),
+    }
+}
+
+// ============================================================================
+// Maranget Pattern Exhaustiveness Checking
+// ============================================================================
+
+def isWildPat(p: Pattern): Bool = match p {
+    PatWild -> true,
+    PatVar(_) -> true,
+    _ -> false,
+}
+
+def normalizeStructPat(ctx: InferCtx, pat: Pattern): Pattern = match pat {
+    PatStruct(cname, named) -> match strMapGet(ctx.ctorToAdt, cname) {
+        Some(adtName) -> match strMapGet(ctx.adtReg, adtName) {
+            Some(ainfo) -> match findVariantByName(ainfo.variants, cname) {
+                Some(vinfo) -> match vinfo.fieldNames {
+                    Some(fnames) -> {
+                        let ordered = cellNew(Nil);
+                        let cur = cellNew(fnames);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons(fnm, r) -> {
+                                    let subp = lookupNamedPat(named, fnm);
+                                    cellSet(ordered, listAppend(cellGet(ordered), [normalizeStructPat(ctx, subp)]));
+                                    cellSet(cur, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        PatCtor(cname, cellGet(ordered))
+                    },
+                    None -> pat,
+                },
+                None -> pat,
+            },
+            None -> pat,
+        },
+        None -> pat,
+    },
+    PatTuple(ps) -> PatTuple(normalizeStructPatList(ctx, ps)),
+    PatCtor(c, ps) -> PatCtor(c, normalizeStructPatList(ctx, ps)),
+    _ -> pat,
+}
+
+def normalizeStructPatList(ctx: InferCtx, ps: List Pattern): List Pattern = match ps {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(normalizeStructPat(ctx, h), normalizeStructPatList(ctx, t)),
+}
+
+def lookupNamedPat(named: List (String, Pattern), target: String): Pattern = match named {
+    Nil -> PatWild,
+    Cons((k, p), r) -> if (k == target) p else lookupNamedPat(r, target),
+}
+
+def repeatWilds(n: Int): List Pattern =
+    if (n <= 0) Nil else Cons(PatWild, repeatWilds(n - 1))
+
+def allFirstColWild(matrix: List (List Pattern)): Bool = match matrix {
+    Nil -> true,
+    Cons(Cons(p0, _), r) -> if (isWildPat(p0)) allFirstColWild(r) else false,
+    Cons(Nil, r) -> allFirstColWild(r),
+}
+
+def peelFirstCol(matrix: List (List Pattern)): List (List Pattern) = match matrix {
+    Nil -> Nil,
+    Cons(Cons(_, restRow), r) -> Cons(restRow, peelFirstCol(r)),
+    Cons(Nil, r) -> peelFirstCol(r),
+}
+
+def findMissingPattern(ctx: InferCtx, matrix: List (List Pattern), tys: List Type): Option String = match tys {
+    Nil -> match matrix {
+        Nil -> Some("_"),
+        _ -> None,
+    },
+    Cons(firstTy, restTys) -> match matrix {
+        Nil -> Some("_"),
+        _ ->
+            if (allFirstColWild(matrix)) findMissingPattern(ctx, peelFirstCol(matrix), restTys)
+            else match firstTy {
+                TyVoid -> {
+                    let subM = cellNew(Nil);
+                    let cur = cellNew(matrix);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(Cons(p0, rRow), rM) -> {
+                                let matchesUnit = match p0 {
+                                    PatLit(LitUnit) -> true,
+                                    _ -> isWildPat(p0),
+                                };
+                                if (matchesUnit) cellSet(subM, listAppend(cellGet(subM), [rRow])) else ();
+                                cellSet(cur, rM)
+                            },
+                            Cons(Nil, rM) -> cellSet(cur, rM),
+                            Nil -> (),
+                        }
+                    };
+                    match findMissingPattern(ctx, cellGet(subM), restTys) {
+                        Some(_) -> Some("()"),
+                        None -> None,
+                    }
+                },
+                TyTuple(elemTys) -> {
+                    let k = listLen(elemTys);
+                    let subM = cellNew(Nil);
+                    let cur = cellNew(matrix);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(Cons(PatTuple(ps), rRow), rM) -> {
+                                if (listLen(ps) == k) cellSet(subM, listAppend(cellGet(subM), [listAppend(ps, rRow)])) else ();
+                                cellSet(cur, rM)
+                            },
+                            Cons(Cons(p0, rRow), rM) -> {
+                                if (isWildPat(p0)) cellSet(subM, listAppend(cellGet(subM), [listAppend(repeatWilds(k), rRow)])) else ();
+                                cellSet(cur, rM)
+                            },
+                            Cons(Nil, rM) -> cellSet(cur, rM),
+                            Nil -> (),
+                        }
+                    };
+                    findMissingPattern(ctx, cellGet(subM), listAppend(elemTys, restTys))
+                },
+                TyCon("Bool") -> {
+                    let missTrue = checkBoolBranch(ctx, matrix, true, restTys);
+                    match missTrue {
+                        Some(w) -> Some(w),
+                        None -> checkBoolBranch(ctx, matrix, false, restTys),
+                    }
+                },
+                _ -> match decomposeAdtType(ctx.adtReg, firstTy) {
+                    Some((adtName, typeArgs)) -> match strMapGet(ctx.adtReg, adtName) {
+                        Some(ainfo) -> {
+                            let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                            checkAdtExhaustive(ctx, matrix, ainfo.variants, sub, restTys)
+                        },
+                        None -> checkWildFallback(ctx, matrix, restTys),
+                    },
+                    None -> checkWildFallback(ctx, matrix, restTys),
+                },
+            },
+    },
+}
+
+def checkBoolBranch(ctx: InferCtx, matrix: List (List Pattern), bval: Bool, restTys: List Type): Option String = {
+    let subM = cellNew(Nil);
+    let cur = cellNew(matrix);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(Cons(PatLit(LitBool(v)), rRow), rM) -> {
+                if (v == bval) cellSet(subM, listAppend(cellGet(subM), [rRow])) else ();
+                cellSet(cur, rM)
+            },
+            Cons(Cons(p0, rRow), rM) -> {
+                if (isWildPat(p0)) cellSet(subM, listAppend(cellGet(subM), [rRow])) else ();
+                cellSet(cur, rM)
+            },
+            Cons(Nil, rM) -> cellSet(cur, rM),
+            Nil -> (),
+        }
+    };
+    match findMissingPattern(ctx, cellGet(subM), restTys) {
+        Some(_) -> Some(if (bval) "true" else "false"),
+        None -> None,
+    }
+}
+
+def checkAdtExhaustive(
+    ctx: InferCtx,
+    matrix: List (List Pattern),
+    variants: List VariantInfo,
+    sub: StrMap Type,
+    restTys: List Type
+): Option String = match variants {
+    Nil -> None,
+    Cons(v, rV) -> {
+        let arity = listLen(v.fieldTypes);
+        let fieldTys = applyExplicitSubstList(v.fieldTypes, sub);
+        let subM = cellNew(Nil);
+        let cur = cellNew(matrix);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(Cons(PatCtor(cn, subPats), rRow), rM) -> {
+                    if (cn == v.vname && listLen(subPats) == arity) {
+                        cellSet(subM, listAppend(cellGet(subM), [listAppend(subPats, rRow)]))
+                    } else ();
+                    cellSet(cur, rM)
+                },
+                Cons(Cons(p0, rRow), rM) -> {
+                    if (isWildPat(p0)) {
+                        cellSet(subM, listAppend(cellGet(subM), [listAppend(repeatWilds(arity), rRow)]))
+                    } else ();
+                    cellSet(cur, rM)
+                },
+                Cons(Nil, rM) -> cellSet(cur, rM),
+                Nil -> (),
+            }
+        };
+        match findMissingPattern(ctx, cellGet(subM), listAppend(fieldTys, restTys)) {
+            Some(innerW) ->
+                if (arity == 0) Some(v.vname)
+                else Some(v.vname + "(" + innerW + ")"),
+            None -> checkAdtExhaustive(ctx, matrix, rV, sub, restTys),
+        }
+    },
+}
+
+def checkWildFallback(ctx: InferCtx, matrix: List (List Pattern), restTys: List Type): Option String = {
+    let wildM = cellNew(Nil);
+    let cur = cellNew(matrix);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(Cons(p0, rRow), rM) -> {
+                if (isWildPat(p0)) cellSet(wildM, listAppend(cellGet(wildM), [rRow])) else ();
+                cellSet(cur, rM)
+            },
+            Cons(Nil, rM) -> cellSet(cur, rM),
+            Nil -> (),
+        }
+    };
+    findMissingPattern(ctx, cellGet(wildM), restTys)
+}
+
+def checkExhaustivenessInForm(ctx: InferCtx, f: Form): Result Void String = match f.node {
+    ExMatch(scrut, arms) -> {
+        checkExhaustivenessInForm(ctx, scrut)?;
+        let matrix = cellNew(Nil);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.guard {
+                        Some(g) -> checkExhaustivenessInForm(ctx, g)?,
+                        None -> cellSet(matrix, listAppend(cellGet(matrix), [[normalizeStructPat(ctx, a.pat)]])),
+                    };
+                    checkExhaustivenessInForm(ctx, a.body)?;
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        match findMissingPattern(ctx, cellGet(matrix), [schemeBody(scrut.ty)]) {
+            Some(missing) -> Err(typeErr(f.pos, "Non-exhaustive pattern match; missing case: " + missing)),
+            None -> Ok(()),
+        }
+    },
+    ExTuple(es) -> checkExhaustivenessInList(ctx, es),
+    ExList(es) -> checkExhaustivenessInList(ctx, es),
+    ExBlock(es) -> checkExhaustivenessInList(ctx, es),
+    ExStructInit(_, fs) -> checkExhaustivenessInNamed(ctx, fs),
+    ExApply(c, args) -> {
+        checkExhaustivenessInForm(ctx, c)?;
+        checkExhaustivenessInList(ctx, args)
+    },
+    ExAbs(_, _, b) -> checkExhaustivenessInForm(ctx, b),
+    ExBin(_, l, r) -> { checkExhaustivenessInForm(ctx, l)?; checkExhaustivenessInForm(ctx, r) },
+    ExUn(_, e) -> checkExhaustivenessInForm(ctx, e),
+    ExField(e, _) -> checkExhaustivenessInForm(ctx, e),
+    ExTry(e) -> checkExhaustivenessInForm(ctx, e),
+    ExLet(_, v, b) -> { checkExhaustivenessInForm(ctx, v)?; checkExhaustivenessInForm(ctx, b) },
+    ExIf(c, t, e) -> {
+        checkExhaustivenessInForm(ctx, c)?;
+        checkExhaustivenessInForm(ctx, t)?;
+        checkExhaustivenessInForm(ctx, e)
+    },
+    ExWhile(c, b) -> { checkExhaustivenessInForm(ctx, c)?; checkExhaustivenessInForm(ctx, b) },
+    _ -> Ok(()),
+}
+
+def checkExhaustivenessInList(ctx: InferCtx, es: List Form): Result Void String = match es {
+    Nil -> Ok(()),
+    Cons(h, t) -> { checkExhaustivenessInForm(ctx, h)?; checkExhaustivenessInList(ctx, t) },
+}
+
+def checkExhaustivenessInNamed(ctx: InferCtx, fs: List (String, Form)): Result Void String = match fs {
+    Nil -> Ok(()),
+    Cons((_, v), t) -> { checkExhaustivenessInForm(ctx, v)?; checkExhaustivenessInNamed(ctx, t) },
+}
+
+// ============================================================================
+// Top-Level Module Inference Driver (`inferProgram`)
+// ============================================================================
+
+def methodNamesMatch(expected: String, actual: String): Bool =
+    if (expected == actual) true
+    else if ((expected == "$op$plus" && actual == "add") || (expected == "add" && actual == "$op$plus")) true
+    else if ((expected == "$op$minus" && actual == "sub") || (expected == "sub" && actual == "$op$minus")) true
+    else if ((expected == "$op$star" && actual == "mul") || (expected == "mul" && actual == "$op$star")) true
+    else if ((expected == "$op$slash" && actual == "div") || (expected == "div" && actual == "$op$slash")) true
+    else if ((expected == "$op$rem" && actual == "rem") || (expected == "rem" && actual == "$op$rem")) true
+    else if (expected == "neg" && actual == "$op$minus") true
+    else if ((expected == "$op$amp" && actual == "bitAnd") || (expected == "bitAnd" && actual == "$op$amp")) true
+    else if ((expected == "$op$bar" && actual == "bitOr") || (expected == "bitOr" && actual == "$op$bar")) true
+    else if ((expected == "$op$caret" && actual == "bitXor") || (expected == "bitXor" && actual == "$op$caret")) true
+    else if ((expected == "$op$tilde" && actual == "bitNot") || (expected == "bitNot" && actual == "$op$tilde")) true
+    else if ((expected == "$op$lt_lt" && (actual == "shl" || actual == "bitShl")) || (expected == "shl" && actual == "$op$lt_lt")) true
+    else if ((expected == "$op$gt_gt" && (actual == "shr" || actual == "bitShr")) || (expected == "shr" && actual == "$op$gt_gt")) true
+    else if ((expected == "$op$gt_gt_gt" && (actual == "ushr" || actual == "bitUshr")) || (expected == "ushr" && actual == "$op$gt_gt_gt")) true
+    else if ((expected == "eq" && actual == "$op$eq_eq") || (expected == "$op$eq_eq" && actual == "eq")) true
+    else false
+
+def findMatchingMethodImpl(impls: List MethodImpl, expectedName: String): Option MethodImpl = match impls {
+    Nil -> None,
+    Cons(mi, r) -> if (methodNamesMatch(expectedName, mi.implName)) Some(mi) else findMatchingMethodImpl(r, expectedName),
+}
+
+def extractFieldDecls(fs: List FieldDecl, ctx: InferCtx, sp: Span, named: Bool): Result (Option (List String), List Type) String = {
+    let names = cellNew(Nil);
+    let tys = cellNew(Nil);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(fd, r) -> {
+                let et = expandType(ctx, fd.fty, sp)?;
+                cellSet(tys, listAppend(cellGet(tys), [et]));
+                if (named) {
+                    match fd.fname {
+                        Some(nm) -> cellSet(names, listAppend(cellGet(names), [nm])),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok((if (named) Some(cellGet(names)) else None, cellGet(tys)))
+}
+
+pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
+    let ctx = initInferCtx();
+    let baseMap = buildPreludeBaseMap();
+
+    // Pass 1: Register & validate type aliases
+    let aliasNames = cellNew(Nil);
+    let cur1 = cellNew(rawDefs);
+    while (match cellGet(cur1) { Nil -> false, _ -> true }) {
+        match cellGet(cur1) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItAlias(ps, scm) -> {
+                        strMapInsert(ctx.aliasReg, d.ident, (ps, schemeBody(scm)));
+                        cellSet(aliasNames, listAppend(cellGet(aliasNames), [(d.ident, ps, d.dpos)]))
+                    },
+                    _ -> (),
+                };
+                cellSet(cur1, r)
+            },
+            Nil -> (),
+        }
+    };
+    let cur1b = cellNew(cellGet(aliasNames));
+    while (match cellGet(cur1b) { Nil -> false, _ -> true }) {
+        match cellGet(cur1b) {
+            Cons((anm, ps, sp), r) -> {
+                let tvArgs = cellNew(Nil);
+                let cp = cellNew(ps);
+                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                    match cellGet(cp) {
+                        Cons(p, rp) -> { cellSet(tvArgs, listAppend(cellGet(tvArgs), [TyVar(p)])); cellSet(cp, rp) },
+                        Nil -> (),
+                    }
+                };
+                let checkTy = match cellGet(tvArgs) {
+                    Nil -> TyCon(anm),
+                    args -> composeTypes(Cons(TyCon(anm), args)),
+                };
+                let _ = expandType(ctx, checkTy, sp)?;
+                cellSet(cur1b, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Seed default List constructors in baseMap
+    match strMapGet(ctx.adtReg, "List") {
+        Some(defList) -> {
+            let cv = cellNew(defList.variants);
+            while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                match cellGet(cv) {
+                    Cons(vi, r) -> { strMapInsert(baseMap, vi.vname, vi.ctorScm); cellSet(cv, r) },
+                    Nil -> (),
+                }
+            }
+        },
+        None -> (),
+    };
+
+    // Pass 2: Process ADT declarations
+    let cur2 = cellNew(rawDefs);
+    while (match cellGet(cur2) { Nil -> false, _ -> true }) {
+        match cellGet(cur2) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItAlg(tparams, variants) -> {
+                        let paramVars = cellNew(Nil);
+                        let cp = cellNew(tparams);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(p, rp) -> { cellSet(paramVars, listAppend(cellGet(paramVars), [TyVar(p)])); cellSet(cp, rp) },
+                                Nil -> (),
+                            }
+                        };
+                        let resTy = composeTypes(Cons(TyCon(d.ident), cellGet(paramVars)));
+                        let vinfos = cellNew(Nil);
+                        let tagIdx = cellNew(0);
+                        let cv = cellNew(variants);
+                        while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                            match cellGet(cv) {
+                                Cons(vd, rv) -> {
+                                    let (fnames, ftys) = match vd.vbody {
+                                        VarUnit -> (None, Nil),
+                                        VarTuple(fs) -> extractFieldDecls(fs, ctx, d.dpos, false)?,
+                                        VarStruct(fs) -> extractFieldDecls(fs, ctx, d.dpos, true)?,
+                                    };
+                                    let ctorBody = match ftys {
+                                        Nil -> resTy,
+                                        _ -> TyArr(ftys, resTy),
+                                    };
+                                    let cscm = match tparams {
+                                        Nil -> ScmMono(ctorBody),
+                                        _ -> ScmPoly(tparams, ctorBody),
+                                    };
+                                    strMapInsert(baseMap, vd.vname, cscm);
+                                    strMapInsert(ctx.ctorToAdt, vd.vname, d.ident);
+                                    let tg = cellGet(tagIdx);
+                                    cellSet(tagIdx, tg + 1);
+                                    cellSet(vinfos, listAppend(cellGet(vinfos), [MkVariantInfo {
+                                        vname: vd.vname,
+                                        tag: tg,
+                                        fieldNames: fnames,
+                                        fieldTypes: ftys,
+                                        ctorScm: cscm,
+                                    }]));
+                                    cellSet(cv, rv)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        if (!strMapContains(ctx.adtReg, d.ident)) vecPush(ctx.adtNames, d.ident) else ();
+                        strMapInsert(ctx.adtReg, d.ident, MkAdtInfo {
+                            adtName: d.ident,
+                            typeParams: tparams,
+                            variants: cellGet(vinfos),
+                        })
+                    },
+                    _ -> (),
+                };
+                cellSet(cur2, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Seed built-in concept methods into `baseMap`
+    let builtinConcepts = [
+        "Add", "Sub", "Mul", "Div", "Rem", "Neg",
+        "BitAnd", "BitOr", "BitXor", "BitNot", "Shl", "Shr", "Ushr",
+        "Eq", "Ord"
+    ];
+    let cbc = cellNew(builtinConcepts);
+    while (match cellGet(cbc) { Nil -> false, _ -> true }) {
+        match cellGet(cbc) {
+            Cons(cn, r) -> {
+                match strMapGet(ctx.conceptReg, cn) {
+                    Some(ci) -> match ci.methods {
+                        Cons((mn, ms), _) -> strMapInsert(baseMap, mn, ms),
+                        Nil -> (),
+                    },
+                    None -> (),
+                };
+                cellSet(cbc, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Pass 3: Process user Concept declarations
+    let cur3 = cellNew(rawDefs);
+    while (match cellGet(cur3) { Nil -> false, _ -> true }) {
+        match cellGet(cur3) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItConcept(tparams, supers, methods) -> {
+                        let primary = match tparams {
+                            Cons(p0, _) -> p0,
+                            Nil -> { returnPatErr(d.dpos, "Concept '" + d.ident + "' must have a type parameter")?; "" },
+                        };
+                        let mInfos = cellNew(Nil);
+                        let cm = cellNew(methods);
+                        while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                            match cellGet(cm) {
+                                Cons(md, rm) -> {
+                                    let escm = expandScheme(ctx, md.mty, d.dpos)?;
+                                    let bty = schemeBody(escm);
+                                    let binders = cellNew(tparams);
+                                    let cfv = cellNew(ftvOrdered(bty));
+                                    while (match cellGet(cfv) { Nil -> false, _ -> true }) {
+                                        match cellGet(cfv) {
+                                            Cons(fv, rfv) -> {
+                                                cellSet(binders, addUniqueStr(cellGet(binders), fv));
+                                                cellSet(cfv, rfv)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    let cs = cellNew([MkConstraint { conceptName: d.ident, typeVar: primary }]);
+                                    let cec = cellNew(schemeConstraints(escm));
+                                    while (match cellGet(cec) { Nil -> false, _ -> true }) {
+                                        match cellGet(cec) {
+                                            Cons(ec, rec) -> {
+                                                cellSet(cs, addUniqueConstraint(cellGet(cs), ec));
+                                                cellSet(cec, rec)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    let fullScm = ScmPolyConstrained(cellGet(binders), cellGet(cs), bty);
+                                    strMapInsert(baseMap, md.mname, fullScm);
+                                    strMapInsert(ctx.conceptMethods, md.mname, (d.ident, 0));
+                                    cellSet(mInfos, listAppend(cellGet(mInfos), [(md.mname, fullScm)]));
+                                    cellSet(cm, rm)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(ctx.conceptReg, d.ident, MkConceptInfo {
+                            conceptName: d.ident,
+                            typeParams: tparams,
+                            superclasses: supers,
+                            methods: cellGet(mInfos),
+                        })
+                    },
+                    _ -> (),
+                };
+                cellSet(cur3, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Pass 4: Process Instance declarations & synthesize concrete/generic method `Def`s
+    let synthDefs = cellNew(Nil);
+    let cur4 = cellNew(rawDefs);
+    while (match cellGet(cur4) { Nil -> false, _ -> true }) {
+        match cellGet(cur4) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItInstance(cname, rawArgs, constraints, impls) -> match strMapGet(ctx.conceptReg, cname) {
+                        None -> returnPatErr(d.dpos, "Unknown concept '" + cname + "' in instance")?,
+                        Some(cinfo) -> {
+                            if (listLen(rawArgs) != listLen(cinfo.typeParams)) {
+                                returnPatErr(d.dpos, "Concept '" + cname + "' arity mismatch")?
+                            } else ();
+                            let expArgs = expandTypeListInner(ctx, rawArgs, Nil, d.dpos)?;
+                            let instTvs = cellNew(Nil);
+                            let ca = cellNew(expArgs);
+                            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                                match cellGet(ca) {
+                                    Cons(ta, ra) -> {
+                                        let cf = cellNew(ftvOrdered(ta));
+                                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                            match cellGet(cf) {
+                                                Cons(fv, rf) -> { cellSet(instTvs, addUniqueStr(cellGet(instTvs), fv)); cellSet(cf, rf) },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        cellSet(ca, ra)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let cc = cellNew(constraints);
+                            while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                                match cellGet(cc) {
+                                    Cons(c, rc) -> {
+                                        cellSet(instTvs, addUniqueStr(cellGet(instTvs), c.typeVar));
+                                        cellSet(cc, rc)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+
+                            let mangledArgs = joinMangledTypes(expArgs, "_");
+                            let paramSub = buildPairMap(cinfo.typeParams, expArgs);
+                            let implMap: StrMap String = strMapNew();
+
+                            let cm = cellNew(cinfo.methods);
+                            while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                                match cellGet(cm) {
+                                    Cons((expectedName, expectedScm), rm) -> {
+                                        match findMatchingMethodImpl(impls, expectedName) {
+                                            None -> returnPatErr(d.dpos, "Instance of '" + cname + "' missing method '" + expectedName + "'")?,
+                                            Some(mi) -> {
+                                                let mangledFn = "__inst_" + replaceDots(cname) + "_" + mangledArgs + "_" + expectedName;
+                                                strMapInsert(implMap, expectedName, mangledFn);
+                                                let instBodyTy = applyExplicitSubst(schemeBody(expectedScm), paramSub);
+                                                let mTvs = cellNew(cellGet(instTvs));
+                                                let cf = cellNew(ftvOrdered(instBodyTy));
+                                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                                    match cellGet(cf) {
+                                                        Cons(fv, rf) -> { cellSet(mTvs, addUniqueStr(cellGet(mTvs), fv)); cellSet(cf, rf) },
+                                                        Nil -> (),
+                                                    }
+                                                };
+                                                let tvList = cellGet(mTvs);
+                                                let mScm = match tvList {
+                                                    Nil -> ScmMono(instBodyTy),
+                                                    _ -> match constraints {
+                                                        Nil -> ScmPoly(tvList, instBodyTy),
+                                                        _ -> ScmPolyConstrained(tvList, constraints, instBodyTy),
+                                                    },
+                                                };
+                                                let bform = MkForm {
+                                                    pos: mi.implBody.pos,
+                                                    ty: mi.implBody.ty,
+                                                    annot: Some(mScm),
+                                                    node: mi.implBody.node,
+                                                };
+                                                cellSet(synthDefs, listAppend(cellGet(synthDefs), [MkDef {
+                                                    ident: mangledFn,
+                                                    dpos: d.dpos,
+                                                    vis: VisPublic,
+                                                    item: ItForm(bform),
+                                                }]))
+                                            },
+                                        };
+                                        cellSet(cm, rm)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+
+                            // Prepend user instance so it takes priority over built-in placeholders!
+                            let instInfo = MkInstanceInfo {
+                                conceptName: cname,
+                                typeParams: cellGet(instTvs),
+                                constraints: constraints,
+                                targetTypes: expArgs,
+                                methodImpls: implMap,
+                            };
+                            cellSet(ctx.instanceReg, Cons(instInfo, cellGet(ctx.instanceReg)))
+                        },
+                    },
+                    _ -> (),
+                };
+                cellSet(cur4, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let allDefs = listAppend(rawDefs, cellGet(synthDefs));
+
+    // Pass 5: Seed initial schemes / placeholders for all top-level `ItForm` and `ItExtern`
+    let placeholders: StrMap Type = strMapNew();
+    let unannotatedNames = cellNew(Nil);
+    let cur5 = cellNew(allDefs);
+    while (match cellGet(cur5) { Nil -> false, _ -> true }) {
+        match cellGet(cur5) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> {
+                        match f.annot {
+                            Some(ann) -> {
+                                let expAnn = expandScheme(ctx, ann, d.dpos)?;
+                                strMapInsert(baseMap, d.ident, expAnn)
+                            },
+                            None -> {
+                                let ph = freshVar(ctx);
+                                strMapInsert(placeholders, d.ident, ph);
+                                strMapInsert(baseMap, d.ident, ScmMono(ph));
+                                cellSet(unannotatedNames, Cons(d.ident, cellGet(unannotatedNames)))
+                            },
+                        }
+                    },
+                    ItExtern(_, scm) -> {
+                        let expScm = expandScheme(ctx, scm, d.dpos)?;
+                        strMapInsert(baseMap, d.ident, expScm)
+                    },
+                    _ -> (),
+                };
+                cellSet(cur5, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Pass 6: Infer each top-level `ItForm` definition
+    let inferredRev = cellNew(Nil);
+    let cur6 = cellNew(allDefs);
+    while (match cellGet(cur6) { Nil -> false, _ -> true }) {
+        match cellGet(cur6) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> {
+                        let expAnnot: Option Scheme = match f.annot {
+                            Some(a) -> Some(expandScheme(ctx, a, d.dpos)?),
+                            None -> None,
+                        };
+                        let givenCs = match expAnnot {
+                            Some(s) -> schemeConstraints(s),
+                            None -> Nil,
+                        };
+                        cellSet(ctx.wanted, Nil);
+                        let unannotatedForm = MkForm { pos: f.pos, ty: f.ty, annot: None, node: f.node };
+                        let env0 = MkTypeEnv { locals: Nil, base: baseMap };
+                        let inf0 = inferForm(ctx, env0, unannotatedForm)?;
+
+                        match strMapGet(placeholders, d.ident) {
+                            Some(ph) -> unifyTypes(ctx.subst, ph, schemeBody(inf0.ty), d.dpos)?,
+                            None -> (),
+                        };
+                        match expAnnot {
+                            Some(escm) -> unifyTypes(ctx.subst, schemeBody(escm), schemeBody(inf0.ty), d.dpos)?,
+                            None -> (),
+                        };
+
+                        let infZonked = zonkForm(ctx.subst, inf0);
+                        let finalBodyTy = zonkType(ctx.subst, schemeBody(infZonked.ty));
+                        let defWanted = cellGet(ctx.wanted);
+
+                        let generalScm = match expAnnot {
+                            Some(escm) -> {
+                                let residual: Cell (List WantedConstraint) = cellNew(Nil);
+                                let cw = cellNew(defWanted);
+                                while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                                    match cellGet(cw) {
+                                        Cons(wc, rw) -> {
+                                            dischargeConstraint(ctx, wc, givenCs, residual, 0)?;
+                                            cellSet(cw, rw)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                match cellGet(residual) {
+                                    Cons(unmet, _) -> {
+                                        returnPatErr(unmet.wcSpan, "Unsatisfied constraint '" + unmet.wcConcept + "' for '" + typeToString(unmet.wcTy) + "'")?;
+                                        escm
+                                    },
+                                    Nil -> zonkScheme(ctx.subst, escm),
+                                }
+                            },
+                            None -> match infZonked.node {
+                                ExAbs(_, _, _) -> {
+                                    // Collect free type vars ONLY from unannotated top-level forms not yet generalized!
+                                    let seenFtv: StrMap Bool = strMapNew();
+                                    let otherFtvs = cellNew(Nil);
+                                    let nextUnann = cellNew(Nil);
+                                    let co = cellNew(cellGet(unannotatedNames));
+                                    while (match cellGet(co) { Nil -> false, _ -> true }) {
+                                        match cellGet(co) {
+                                            Cons(onm, ro) -> {
+                                                if (onm != d.ident) {
+                                                    cellSet(nextUnann, Cons(onm, cellGet(nextUnann)));
+                                                    match strMapGet(baseMap, onm) {
+                                                        Some(oscm) -> {
+                                                            let zos = zonkScheme(ctx.subst, oscm);
+                                                            let obound = schemeTypeParams(zos);
+                                                            let ofvs = ftvOrdered(schemeBody(zos));
+                                                            let cf = cellNew(ofvs);
+                                                            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                                                match cellGet(cf) {
+                                                                    Cons(fv, rf) -> {
+                                                                        if (!listContainsStr(obound, fv) && !strMapContains(seenFtv, fv)) {
+                                                                            strMapInsert(seenFtv, fv, true);
+                                                                            cellSet(otherFtvs, Cons(fv, cellGet(otherFtvs)))
+                                                                        } else ();
+                                                                        cellSet(cf, rf)
+                                                                    },
+                                                                    Nil -> (),
+                                                                }
+                                                            }
+                                                        },
+                                                        None -> (),
+                                                    }
+                                                } else ();
+                                                cellSet(co, ro)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    cellSet(unannotatedNames, cellGet(nextUnann));
+                                    let (gscm, _) = generalizeType(ctx, cellGet(otherFtvs), finalBodyTy, defWanted, Nil)?;
+                                    gscm
+                                },
+                                _ -> {
+                                    let residual: Cell (List WantedConstraint) = cellNew(Nil);
+                                    let cw = cellNew(defWanted);
+                                    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                                        match cellGet(cw) {
+                                            Cons(wc, rw) -> {
+                                                dischargeConstraint(ctx, wc, Nil, residual, 0)?;
+                                                cellSet(cw, rw)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    match cellGet(residual) {
+                                        Cons(unmet, _) -> {
+                                            returnPatErr(unmet.wcSpan, "Unsatisfied constraint '" + unmet.wcConcept + "'")?;
+                                            ScmMono(finalBodyTy)
+                                        },
+                                        Nil -> ScmMono(finalBodyTy),
+                                    }
+                                },
+                            },
+                        };
+
+                        strMapInsert(baseMap, d.ident, generalScm);
+                        let finalForm = MkForm {
+                            pos: infZonked.pos,
+                            ty: generalScm,
+                            annot: f.annot,
+                            node: infZonked.node,
+                        };
+                        cellSet(inferredRev, Cons(MkDef {
+                            ident: d.ident,
+                            dpos: d.dpos,
+                            vis: d.vis,
+                            item: ItForm(finalForm),
+                        }, cellGet(inferredRev)))
+                    },
+                    _ -> cellSet(inferredRev, Cons(d, cellGet(inferredRev))),
+                };
+                cellSet(cur6, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Final pass: backfill mutual-recursion substitutions across all earlier definitions & check exhaustiveness!
+    let finalRev = cellNew(Nil);
+    let cur7 = cellNew(listRev(cellGet(inferredRev)));
+    while (match cellGet(cur7) { Nil -> false, _ -> true }) {
+        match cellGet(cur7) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> {
+                        let zf = zonkForm(ctx.subst, f);
+                        checkExhaustivenessInForm(ctx, zf)?;
+                        cellSet(finalRev, Cons(MkDef {
+                            ident: d.ident,
+                            dpos: d.dpos,
+                            vis: d.vis,
+                            item: ItForm(zf),
+                        }, cellGet(finalRev)))
+                    },
+                    _ -> cellSet(finalRev, Cons(d, cellGet(finalRev))),
+                };
+                cellSet(cur7, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    Ok(MkInferOutput {
+        defs: listRev(cellGet(finalRev)),
+        adtReg: ctx.adtReg,
+        adtNames: ctx.adtNames,
+        conceptReg: ctx.conceptReg,
+        instanceReg: cellGet(ctx.instanceReg),
+        conceptMethods: ctx.conceptMethods,
+    })
+}

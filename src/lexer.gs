@@ -1,0 +1,312 @@
+// Handwritten linear-time Geisha Lexer (`lexer`)
+
+use std.result.{Result, Ok, Err}
+use std.char.{isDigitByte, isIdentStartByte, isIdentContByte}
+use std.vec.{Vec, vecNew, vecPush}
+use std.buf.{bufNew, bufPushByte, bufToString}
+use std.str.intToStr
+use ast.{Span, MkSpan}
+
+pub data TokKind {
+    TkIdent(String),
+    TkInt(String),
+    TkFloat(String),
+    TkStr(String),
+    TkChar(Int),
+    TkSym(String),
+    TkQuestion,
+    TkLParen,
+    TkRParen,
+    TkLBrace,
+    TkRBrace,
+    TkLBracket,
+    TkRBracket,
+    TkComma,
+    TkSemi,
+    TkDot,
+    TkDef,
+    TkExtern,
+    TkIf,
+    TkElse,
+    TkWhile,
+    TkLet,
+    TkIn,
+    TkType,
+    TkData,
+    TkMatch,
+    TkConcept,
+    TkInstance,
+    TkForall,
+    TkPub,
+    TkUse,
+    TkMod,
+    TkOpen,
+    TkAs,
+    TkTrue,
+    TkFalse,
+    TkVoid,
+    TkEof,
+}
+
+pub data Token {
+    MkToken { kind: TokKind, span: Span, hadNewline: Bool },
+}
+
+pub def isOpByte(b: Int): Bool =
+    b == 33 || b == 35 || b == 36 || b == 37 || b == 38
+    || b == 42 || b == 43 || b == 45 || b == 47 || b == 58
+    || b == 60 || b == 61 || b == 62 || b == 63 || b == 64
+    || b == 92 || b == 94 || b == 124 || b == 126
+
+def unescapeByte(esc: Int, pos: Int): Result Int String =
+    if (esc == 110) Ok(10)
+    else if (esc == 114) Ok(13)
+    else if (esc == 116) Ok(9)
+    else if (esc == 48) Ok(0)
+    else if (esc == 92) Ok(92)
+    else if (esc == 34) Ok(34)
+    else if (esc == 39) Ok(39)
+    else Err("Invalid escape sequence at byte " + intToStr(pos))
+
+def classifyWord(w: String): TokKind =
+    if (w == "def") TkDef
+    else if (w == "extern") TkExtern
+    else if (w == "if") TkIf
+    else if (w == "else") TkElse
+    else if (w == "while") TkWhile
+    else if (w == "let") TkLet
+    else if (w == "in") TkIn
+    else if (w == "type") TkType
+    else if (w == "data") TkData
+    else if (w == "match") TkMatch
+    else if (w == "concept") TkConcept
+    else if (w == "instance") TkInstance
+    else if (w == "forall") TkForall
+    else if (w == "pub") TkPub
+    else if (w == "use") TkUse
+    else if (w == "mod") TkMod
+    else if (w == "open") TkOpen
+    else if (w == "as") TkAs
+    else if (w == "true") TkTrue
+    else if (w == "false") TkFalse
+    else if (w == "Void") TkVoid
+    else TkIdent(w)
+
+pub def tokenize(src: String): Result (Vec Token) String = {
+    let len = strLen(src);
+    let out: Vec Token = vecNew();
+    let i = cellNew(0);
+    let errMsg = cellNew("");
+    let failed = cellNew(false);
+
+    while (cellGet(i) < len && !cellGet(failed)) {
+        let sawNl = cellNew(false);
+        let skipping = cellNew(true);
+        while (cellGet(skipping) && cellGet(i) < len && !cellGet(failed)) {
+            let p = cellGet(i);
+            let b = strByteAt(src, p);
+            if (b == 32 || b == 9 || b == 13) {
+                cellSet(i, p + 1)
+            } else if (b == 10) {
+                cellSet(sawNl, true);
+                cellSet(i, p + 1)
+            } else if (b == 47 && p + 1 < len && strByteAt(src, p + 1) == 47) {
+                cellSet(i, p + 2);
+                while (cellGet(i) < len && strByteAt(src, cellGet(i)) != 10) {
+                    cellSet(i, cellGet(i) + 1)
+                }
+            } else if (b == 47 && p + 1 < len && strByteAt(src, p + 1) == 42) {
+                cellSet(i, p + 2);
+                let closed = cellNew(false);
+                while (cellGet(i) + 1 < len && !cellGet(closed)) {
+                    let k = cellGet(i);
+                    if (strByteAt(src, k) == 10) cellSet(sawNl, true) else ();
+                    if (strByteAt(src, k) == 42 && strByteAt(src, k + 1) == 47) {
+                        cellSet(i, k + 2);
+                        cellSet(closed, true)
+                    } else {
+                        cellSet(i, k + 1)
+                    }
+                };
+                if (!cellGet(closed)) {
+                    cellSet(errMsg, "Unterminated block comment at byte " + intToStr(p));
+                    cellSet(failed, true)
+                } else ()
+            } else {
+                cellSet(skipping, false)
+            }
+        };
+
+        if (!cellGet(failed) && cellGet(i) < len) {
+            let start = cellGet(i);
+            let b = strByteAt(src, start);
+            let nl = cellGet(sawNl);
+
+            if (b == 40) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkLParen, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 41) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkRParen, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 123) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkLBrace, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 125) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkRBrace, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 91) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkLBracket, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 93) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkRBracket, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 44) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkComma, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 59) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkSemi, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (b == 46) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkDot, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (isIdentStartByte(b)) {
+                cellSet(i, start + 1);
+                while (cellGet(i) < len && isIdentContByte(strByteAt(src, cellGet(i)))) {
+                    cellSet(i, cellGet(i) + 1)
+                };
+                let end = cellGet(i);
+                let word = strSlice(src, start, end);
+                vecPush(out, MkToken { kind: classifyWord(word), span: MkSpan { start: start, end: end }, hadNewline: nl })
+            } else if (isDigitByte(b)) {
+                cellSet(i, start + 1);
+                while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
+                    cellSet(i, cellGet(i) + 1)
+                };
+                let isFloat = cellNew(false);
+                if (cellGet(i) + 1 < len && strByteAt(src, cellGet(i)) == 46 && isDigitByte(strByteAt(src, cellGet(i) + 1))) {
+                    cellSet(isFloat, true);
+                    cellSet(i, cellGet(i) + 2);
+                    while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
+                        cellSet(i, cellGet(i) + 1)
+                    };
+                    if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 101 || strByteAt(src, cellGet(i)) == 69)) {
+                        let expStart = cellGet(i);
+                        cellSet(i, expStart + 1);
+                        if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 43 || strByteAt(src, cellGet(i)) == 45)) {
+                            cellSet(i, cellGet(i) + 1)
+                        } else ();
+                        let expDigits = cellNew(0);
+                        while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
+                            cellSet(expDigits, cellGet(expDigits) + 1);
+                            cellSet(i, cellGet(i) + 1)
+                        };
+                        if (cellGet(expDigits) == 0) {
+                            cellSet(i, expStart)
+                        } else ()
+                    } else ()
+                } else ();
+                let end = cellGet(i);
+                let rawNum = strSlice(src, start, end);
+                let k = if (cellGet(isFloat)) TkFloat(rawNum) else TkInt(rawNum);
+                vecPush(out, MkToken { kind: k, span: MkSpan { start: start, end: end }, hadNewline: nl })
+            } else if (b == 34) {
+                // String literal `"..."`
+                cellSet(i, start + 1);
+                let sbuf = bufNew();
+                let doneStr = cellNew(false);
+                while (cellGet(i) < len && !cellGet(doneStr) && !cellGet(failed)) {
+                    let cur = cellGet(i);
+                    let ch = strByteAt(src, cur);
+                    if (ch == 34) {
+                        cellSet(i, cur + 1);
+                        cellSet(doneStr, true)
+                    } else if (ch == 92) {
+                        if (cur + 1 >= len) {
+                            cellSet(errMsg, "Unterminated string escape at byte " + intToStr(cur));
+                            cellSet(failed, true)
+                        } else {
+                            match unescapeByte(strByteAt(src, cur + 1), cur) {
+                                Ok(ub) -> {
+                                    bufPushByte(sbuf, ub);
+                                    cellSet(i, cur + 2)
+                                },
+                                Err(e) -> {
+                                    cellSet(errMsg, e);
+                                    cellSet(failed, true)
+                                },
+                            }
+                        }
+                    } else {
+                        bufPushByte(sbuf, ch);
+                        cellSet(i, cur + 1)
+                    }
+                };
+                if (!cellGet(failed) && !cellGet(doneStr)) {
+                    cellSet(errMsg, "Unterminated string literal at byte " + intToStr(start));
+                    cellSet(failed, true)
+                } else if (!cellGet(failed)) {
+                    let end = cellGet(i);
+                    vecPush(out, MkToken { kind: TkStr(bufToString(sbuf)), span: MkSpan { start: start, end: end }, hadNewline: nl })
+                } else ()
+            } else if (b == 39) {
+                // Char literal `'a'` or `'\n'`
+                if (start + 2 >= len) {
+                    cellSet(errMsg, "Unterminated char literal at byte " + intToStr(start));
+                    cellSet(failed, true)
+                } else if (strByteAt(src, start + 1) == 92) {
+                    if (start + 3 >= len || strByteAt(src, start + 3) != 39) {
+                        cellSet(errMsg, "Invalid escaped char literal at byte " + intToStr(start));
+                        cellSet(failed, true)
+                    } else {
+                        match unescapeByte(strByteAt(src, start + 2), start + 1) {
+                            Ok(cb) -> {
+                                cellSet(i, start + 4);
+                                vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { start: start, end: start + 4 }, hadNewline: nl })
+                            },
+                            Err(e) -> {
+                                cellSet(errMsg, e);
+                                cellSet(failed, true)
+                            },
+                        }
+                    }
+                } else if (strByteAt(src, start + 2) == 39) {
+                    let cb = strByteAt(src, start + 1);
+                    cellSet(i, start + 3);
+                    vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { start: start, end: start + 3 }, hadNewline: nl })
+                } else {
+                    cellSet(errMsg, "Multi-byte or invalid char literal at byte " + intToStr(start));
+                    cellSet(failed, true)
+                }
+            } else if (b == 63 && !(start + 1 < len && (strByteAt(src, start + 1) == 63 || strByteAt(src, start + 1) == 62 || strByteAt(src, start + 1) == 61 || strByteAt(src, start + 1) == 58))) {
+                cellSet(i, start + 1);
+                vecPush(out, MkToken { kind: TkQuestion, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+            } else if (isOpByte(b)) {
+                cellSet(i, start + 1);
+                let keepOp = cellNew(true);
+                while (cellGet(i) < len && cellGet(keepOp)) {
+                    let cur = cellGet(i);
+                    let nb = strByteAt(src, cur);
+                    // Stop before `//` or `/*` comment start!
+                    if (nb == 47 && cur + 1 < len && (strByteAt(src, cur + 1) == 47 || strByteAt(src, cur + 1) == 42)) {
+                        cellSet(keepOp, false)
+                    } else if (isOpByte(nb)) {
+                        cellSet(i, cur + 1)
+                    } else {
+                        cellSet(keepOp, false)
+                    }
+                };
+                let end = cellGet(i);
+                vecPush(out, MkToken { kind: TkSym(strSlice(src, start, end)), span: MkSpan { start: start, end: end }, hadNewline: nl })
+            } else {
+                cellSet(errMsg, "Unexpected character (ASCII " + intToStr(b) + ") at byte " + intToStr(start));
+                cellSet(failed, true)
+            }
+        } else ()
+    };
+
+    if (cellGet(failed)) Err(cellGet(errMsg))
+    else {
+        vecPush(out, MkToken { kind: TkEof, span: MkSpan { start: len, end: len }, hadNewline: true });
+        Ok(out)
+    }
+}

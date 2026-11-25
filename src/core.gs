@@ -1,0 +1,3581 @@
+// Core IR, K-Conversion (Closure Conversion & Lambda Lifting),
+// Demand-Driven Worklist Monomorphization, Static Concept Dispatch,
+// Concurrent `Send` Closure Verification, and Escape Analysis (`core`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend, listLen}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.str.intToStr
+use ast.{
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
+    schemeBody, schemeTypeParams, isFnScheme,
+    listContainsStr, sortUniqueStrings, typeToString, typesEqual,
+    Lit, LitInt,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl, MkVarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    MatchArm,
+    Form, Expr,
+    ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
+    ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    Item, ItForm, ItExtern,
+    Def
+}
+use infer.{
+    VariantInfo, AdtInfo, ConceptInfo, InstanceInfo, InferOutput,
+    mangleType, applyExplicitSubst, buildPairMap, matchInstancePattern, isConcreteTypeSend
+}
+
+// ============================================================================
+// Core IR Data Types (Distinct single-variant field names across project)
+// ============================================================================
+
+pub data ClosureSpec {
+    MkClosureSpec { clsEntry: String, clsFvs: List String },
+}
+
+pub data TaggedTerm {
+    MkTerm { tscm: Scheme, tnode: Term },
+}
+
+pub data CoreArm {
+    MkCoreArm { caPat: Pattern, caGuard: Option TaggedTerm, caBody: TaggedTerm },
+}
+
+pub data Term {
+    TmLit(Lit),
+    TmVar(String),
+    TmGlobalVar(String),
+    TmTuple(List TaggedTerm),
+    TmBlock(List TaggedTerm),
+    TmMakeCls(VarDecl, ClosureSpec, TaggedTerm),
+    TmApplyCls(TaggedTerm, List TaggedTerm),
+    TmApplyDir(VarDecl, List TaggedTerm),
+    TmBin(BinOp, TaggedTerm, TaggedTerm),
+    TmUn(UnOp, TaggedTerm),
+    TmLet(VarDecl, TaggedTerm, TaggedTerm),
+    TmIf(TaggedTerm, TaggedTerm, TaggedTerm),
+    TmWhile(TaggedTerm, TaggedTerm),
+    TmMatch(TaggedTerm, List CoreArm),
+    TmMakeData(String, Int, List TaggedTerm, List Type, List Type),
+    TmGetTag(TaggedTerm),
+}
+
+pub data FunDef {
+    MkFunDef {
+        fnName: String,
+        fnScm: Scheme,
+        fnParams: List VarDecl,
+        fnFvs: List VarDecl,
+        fnBody: TaggedTerm,
+    },
+}
+
+pub data GlobalValDef {
+    MkGlobalValDef { gvName: String, gvTy: Type, gvInit: TaggedTerm },
+}
+
+pub data ExternDef {
+    MkExternDef { extName: String, extLink: String, extTy: Type },
+}
+
+pub data EscapeInfo {
+    MkEscapeInfo {
+        escRecAdts: StrMap Bool,
+        escFnStackVars: StrMap (StrMap Bool),
+        escFnHasStack: StrMap Bool,
+    },
+}
+
+pub data CoreProgram {
+    MkCoreProgram {
+        coreFns: StrMap FunDef,
+        coreFnNames: List String,
+        coreGlobals: List GlobalValDef,
+        coreExterns: StrMap ExternDef,
+        coreExternNames: List String,
+        coreAdtReg: StrMap AdtInfo,
+        coreEscape: EscapeInfo,
+    },
+}
+
+data Instantiation {
+    MkInst { instFn: String, instArgs: List Type, instMangled: String },
+}
+
+def mkInst(fnName: String, targs: List Type): Instantiation = {
+    let mangled = match targs {
+        Nil -> fnName,
+        _ -> fnName + "_" + joinMangledArgs(targs),
+    };
+    MkInst { instFn: fnName, instArgs: targs, instMangled: mangled }
+}
+
+def joinMangledArgs(ts: List Type): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> mangleType(h),
+    Cons(h, t) -> mangleType(h) + "_" + joinMangledArgs(t),
+}
+
+// ============================================================================
+// Type Helpers for K-Conversion & Monomorphization
+// ============================================================================
+
+pub def isTypeConcrete(ty: Type): Bool = match ty {
+    TyVar(_) -> false,
+    TyVoid -> true,
+    TyCon(_) -> true,
+    TyArr(ps, r) -> isTypeListConcrete(ps) && isTypeConcrete(r),
+    TyTuple(es) -> isTypeListConcrete(es),
+    TyComp(b, a) -> isTypeConcrete(b) && isTypeConcrete(a),
+}
+
+def isTypeListConcrete(ts: List Type): Bool = match ts {
+    Nil -> true,
+    Cons(h, t) -> isTypeConcrete(h) && isTypeListConcrete(t),
+}
+
+def isBuiltinOpPrimitive(ty: Type): Bool = match ty {
+    TyCon(n) -> n == "Int" || n == "Int64" || n == "Float" || n == "Bool" || n == "Char" || n == "String",
+    _ -> false,
+}
+
+def defaultPhantomType(ty: Type): Type = match ty {
+    TyVar(_) -> TyVoid,
+    TyVoid -> TyVoid,
+    TyCon(_) -> ty,
+    TyArr(ps, r) -> TyArr(defaultPhantomTypeList(ps), defaultPhantomType(r)),
+    TyTuple(es) -> TyTuple(defaultPhantomTypeList(es)),
+    TyComp(b, a) -> TyComp(defaultPhantomType(b), defaultPhantomType(a)),
+}
+
+def defaultPhantomTypeList(ts: List Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(defaultPhantomType(h), defaultPhantomTypeList(t)),
+}
+
+pub def extractTypeArgs(ty: Type): List Type = {
+    let acc = cellNew(Nil);
+    let curr = cellNew(ty);
+    let looping = cellNew(true);
+    while (cellGet(looping)) {
+        match cellGet(curr) {
+            TyComp(b, a) -> {
+                cellSet(acc, Cons(a, cellGet(acc)));
+                cellSet(curr, b)
+            },
+            _ -> cellSet(looping, false),
+        }
+    };
+    cellGet(acc)
+}
+
+def unifyTypesInto(pat: Type, concrete: Type, sub: StrMap Type): Void = match (pat, concrete) {
+    (TyVar(nm), _) ->
+        if (strMapContains(sub, nm)) ()
+        else strMapInsert(sub, nm, concrete),
+    (TyArr(ps1, r1), TyArr(ps2, r2)) ->
+        if (listLen(ps1) == listLen(ps2)) {
+            unifyListsInto(ps1, ps2, sub);
+            unifyTypesInto(r1, r2, sub)
+        } else (),
+    (TyTuple(es1), TyTuple(es2)) ->
+        if (listLen(es1) == listLen(es2)) unifyListsInto(es1, es2, sub) else (),
+    (TyComp(b1, a1), TyComp(b2, a2)) -> {
+        unifyTypesInto(b1, b2, sub);
+        unifyTypesInto(a1, a2, sub)
+    },
+    _ -> (),
+}
+
+def unifyListsInto(xs: List Type, ys: List Type, sub: StrMap Type): Void = match (xs, ys) {
+    (Cons(x, xr), Cons(y, yr)) -> {
+        unifyTypesInto(x, y, sub);
+        unifyListsInto(xr, yr, sub)
+    },
+    _ -> (),
+}
+
+def applySchemeSubst(scm: Scheme, sub: StrMap Type): Scheme = match scm {
+    ScmMono(t) -> ScmMono(applyExplicitSubst(t, sub)),
+    ScmPoly(vs, t) -> ScmPoly(vs, applyExplicitSubstExcept(t, vs, sub)),
+    ScmPolyConstrained(vs, cs, t) -> ScmPolyConstrained(vs, cs, applyExplicitSubstExcept(t, vs, sub)),
+    ScmSlot -> ScmSlot,
+}
+
+def applyExplicitSubstExcept(ty: Type, bound: List String, sub: StrMap Type): Type = match ty {
+    TyVoid -> TyVoid,
+    TyCon(_) -> ty,
+    TyVar(v) ->
+        if (listContainsStr(bound, v)) ty
+        else match strMapGet(sub, v) {
+            Some(target) -> target,
+            None -> ty,
+        },
+    TyArr(ps, r) -> TyArr(applyExplicitSubstListExcept(ps, bound, sub), applyExplicitSubstExcept(r, bound, sub)),
+    TyTuple(es) -> TyTuple(applyExplicitSubstListExcept(es, bound, sub)),
+    TyComp(b, a) -> TyComp(applyExplicitSubstExcept(b, bound, sub), applyExplicitSubstExcept(a, bound, sub)),
+}
+
+def applyExplicitSubstListExcept(ts: List Type, bound: List String, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubstExcept(h, bound, sub), applyExplicitSubstListExcept(t, bound, sub)),
+}
+
+// ============================================================================
+// Sanitize Phantom Type Variables in Concrete Terms
+// ============================================================================
+
+def sanitizePhantomTerm(tm: TaggedTerm): TaggedTerm = {
+    let nscm = ScmMono(defaultPhantomType(schemeBody(tm.tscm)));
+    let nnode = match tm.tnode {
+        TmLit(_) -> tm.tnode,
+        TmVar(_) -> tm.tnode,
+        TmGlobalVar(_) -> tm.tnode,
+        TmTuple(es) -> TmTuple(sanitizePhantomList(es)),
+        TmBlock(es) -> TmBlock(sanitizePhantomList(es)),
+        TmMakeCls(vd, cls, body) ->
+            TmMakeCls(
+                MkVarDecl { vname: vd.vname, vscm: ScmMono(defaultPhantomType(schemeBody(vd.vscm))) },
+                cls,
+                sanitizePhantomTerm(body)
+            ),
+        TmApplyCls(c, args) -> TmApplyCls(sanitizePhantomTerm(c), sanitizePhantomList(args)),
+        TmApplyDir(vd, args) ->
+            TmApplyDir(
+                MkVarDecl { vname: vd.vname, vscm: ScmMono(defaultPhantomType(schemeBody(vd.vscm))) },
+                sanitizePhantomList(args)
+            ),
+        TmBin(op, l, r) -> TmBin(op, sanitizePhantomTerm(l), sanitizePhantomTerm(r)),
+        TmUn(op, e) -> TmUn(op, sanitizePhantomTerm(e)),
+        TmGetTag(e) -> TmGetTag(sanitizePhantomTerm(e)),
+        TmLet(vd, val, body) ->
+            TmLet(
+                MkVarDecl { vname: vd.vname, vscm: ScmMono(defaultPhantomType(schemeBody(vd.vscm))) },
+                sanitizePhantomTerm(val),
+                sanitizePhantomTerm(body)
+            ),
+        TmIf(c, t, e) -> TmIf(sanitizePhantomTerm(c), sanitizePhantomTerm(t), sanitizePhantomTerm(e)),
+        TmWhile(c, b) -> TmWhile(sanitizePhantomTerm(c), sanitizePhantomTerm(b)),
+        TmMatch(s, arms) -> {
+            let rev = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ng = match a.caGuard { Some(g) -> Some(sanitizePhantomTerm(g)), None -> None };
+                        cellSet(rev, Cons(MkCoreArm { caPat: a.caPat, caGuard: ng, caBody: sanitizePhantomTerm(a.caBody) }, cellGet(rev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            TmMatch(sanitizePhantomTerm(s), listRev(cellGet(rev)))
+        },
+        TmMakeData(tn, tg, fs, ftys, targs) ->
+            TmMakeData(
+                tn,
+                tg,
+                sanitizePhantomList(fs),
+                defaultPhantomTypeList(ftys),
+                defaultPhantomTypeList(targs)
+            ),
+    };
+    MkTerm { tscm: nscm, tnode: nnode }
+}
+
+def sanitizePhantomList(es: List TaggedTerm): List TaggedTerm = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(sanitizePhantomTerm(h), sanitizePhantomList(t)),
+}
+
+// ============================================================================
+// K-Conversion Context & Helpers
+// ============================================================================
+
+data KCtx {
+    MkKCtx {
+        kCount: Cell Int,
+        kCurrentFn: Cell String,
+        kLocalEnv: Cell (List (String, Scheme)),
+        kLocalDirect: Cell (List (String, String)),
+        kPolyLifted: Cell (List (String, (String, List VarDecl, Scheme))),
+        kGlobalFns: StrMap FunDef,
+        kAllFnNames: Vec String,
+        kGlobalValsRev: Cell (List GlobalValDef),
+        kGlobalValSet: StrMap Bool,
+        kExterns: StrMap ExternDef,
+        kExternNamesRev: Cell (List String),
+        kTopDirect: StrMap String,
+        kLiftedClosures: StrMap (List String),
+        kAdtReg: StrMap AdtInfo,
+        kAdtNames: Vec String,
+        kCtorMap: StrMap (String, VariantInfo),
+        kConceptReg: StrMap ConceptInfo,
+        kInstanceReg: List InstanceInfo,
+        kConceptMethods: StrMap (String, Int),
+    },
+}
+
+def kUnique(ctx: KCtx): Int = {
+    let n = cellGet(ctx.kCount) + 1;
+    cellSet(ctx.kCount, n);
+    n
+}
+
+def kFresh(ctx: KCtx): String = ".tmp" + intToStr(kUnique(ctx))
+
+def makeClsName(ctx: KCtx, bound: String): String = {
+    let base = cellGet(ctx.kCurrentFn);
+    let cname = base + ".inner.closure." + bound + intToStr(kUnique(ctx));
+    let prev = match strMapGet(ctx.kLiftedClosures, base) {
+        Some(xs) -> xs,
+        None -> Nil,
+    };
+    strMapInsert(ctx.kLiftedClosures, base, listAppend(prev, [cname]));
+    cname
+}
+
+def removeLiftedClosure(ctx: KCtx, parent: String, child: String): Void = {
+    match strMapGet(ctx.kLiftedClosures, parent) {
+        None -> (),
+        Some(xs) -> {
+            let rev = cellNew(Nil);
+            let cur = cellNew(xs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(x, r) -> {
+                        if (x != child) cellSet(rev, Cons(x, cellGet(rev))) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            strMapInsert(ctx.kLiftedClosures, parent, listRev(cellGet(rev)))
+        },
+    }
+}
+
+def defineFn(ctx: KCtx, name: String, scm: Scheme, params: List VarDecl, fvs: List VarDecl, body: TaggedTerm): (String, List String) = {
+    if (!strMapContains(ctx.kGlobalFns, name)) {
+        let fd = MkFunDef {
+            fnName: name,
+            fnScm: scm,
+            fnParams: params,
+            fnFvs: fvs,
+            fnBody: body,
+        };
+        strMapInsert(ctx.kGlobalFns, name, fd);
+        vecPush(ctx.kAllFnNames, name)
+    } else ();
+    let fvNamesRev = cellNew(Nil);
+    let cur = cellNew(fvs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(vd, r) -> {
+                cellSet(fvNamesRev, Cons(vd.vname, cellGet(fvNamesRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (name, listRev(cellGet(fvNamesRev)))
+}
+
+def assocLookupScheme(xs: List (String, Scheme), key: String): Option Scheme = match xs {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else assocLookupScheme(r, key),
+}
+
+def assocLookupStr(xs: List (String, String), key: String): Option String = match xs {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else assocLookupStr(r, key),
+}
+
+def assocLookupPoly(
+    xs: List (String, (String, List VarDecl, Scheme)),
+    key: String
+): Option (String, List VarDecl, Scheme) = match xs {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else assocLookupPoly(r, key),
+}
+
+def lookupDirectTarget(ctx: KCtx, name: String): Option String =
+    match assocLookupStr(cellGet(ctx.kLocalDirect), name) {
+        Some(t) -> Some(t),
+        None -> strMapGet(ctx.kTopDirect, name),
+    }
+
+// Collect free local variables (present in `localEnv`) inside `tm`
+def collectFvWithBound(localEnv: List (String, Scheme), tm: TaggedTerm, boundVars: List String, seen: StrMap Bool, outKeys: Cell (List String)): Void = match tm.tnode {
+    TmLit(_) -> (),
+    TmGlobalVar(_) -> (),
+    TmVar(v) ->
+        if (!listContainsStr(boundVars, v) && !strMapContains(seen, v)) {
+            match assocLookupScheme(localEnv, v) {
+                Some(_) -> {
+                    strMapInsert(seen, v, true);
+                    cellSet(outKeys, Cons(v, cellGet(outKeys)))
+                },
+                None -> (),
+            }
+        } else (),
+    TmTuple(es) -> collectFvListWithBound(localEnv, es, boundVars, seen, outKeys),
+    TmBlock(es) -> collectFvListWithBound(localEnv, es, boundVars, seen, outKeys),
+    TmApplyDir(_, es) -> collectFvListWithBound(localEnv, es, boundVars, seen, outKeys),
+    TmMakeData(_, _, es, _, _) -> collectFvListWithBound(localEnv, es, boundVars, seen, outKeys),
+    TmApplyCls(c, args) -> {
+        collectFvWithBound(localEnv, c, boundVars, seen, outKeys);
+        collectFvListWithBound(localEnv, args, boundVars, seen, outKeys)
+    },
+    TmBin(_, l, r) -> {
+        collectFvWithBound(localEnv, l, boundVars, seen, outKeys);
+        collectFvWithBound(localEnv, r, boundVars, seen, outKeys)
+    },
+    TmUn(_, e) -> collectFvWithBound(localEnv, e, boundVars, seen, outKeys),
+    TmGetTag(e) -> collectFvWithBound(localEnv, e, boundVars, seen, outKeys),
+    TmIf(c, t, e) -> {
+        collectFvWithBound(localEnv, c, boundVars, seen, outKeys);
+        collectFvWithBound(localEnv, t, boundVars, seen, outKeys);
+        collectFvWithBound(localEnv, e, boundVars, seen, outKeys)
+    },
+    TmWhile(c, b) -> {
+        collectFvWithBound(localEnv, c, boundVars, seen, outKeys);
+        collectFvWithBound(localEnv, b, boundVars, seen, outKeys)
+    },
+    TmLet(vd, val, exp) -> {
+        collectFvWithBound(localEnv, val, boundVars, seen, outKeys);
+        collectFvWithBound(localEnv, exp, Cons(vd.vname, boundVars), seen, outKeys)
+    },
+    TmMakeCls(vd, cls, exp) -> {
+        let nextBound = Cons(vd.vname, boundVars);
+        let curFv = cellNew(cls.clsFvs);
+        while (match cellGet(curFv) { Nil -> false, _ -> true }) {
+            match cellGet(curFv) {
+                Cons(fvId, r) -> {
+                    if (!listContainsStr(nextBound, fvId) && !strMapContains(seen, fvId)) {
+                        match assocLookupScheme(localEnv, fvId) {
+                            Some(_) -> {
+                                strMapInsert(seen, fvId, true);
+                                cellSet(outKeys, Cons(fvId, cellGet(outKeys)))
+                            },
+                            None -> (),
+                        }
+                    } else ();
+                    cellSet(curFv, r)
+                },
+                Nil -> (),
+            }
+        };
+        collectFvWithBound(localEnv, exp, nextBound, seen, outKeys)
+    },
+    TmMatch(scrut, arms) -> {
+        collectFvWithBound(localEnv, scrut, boundVars, seen, outKeys);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let armBound = collectPatVarsList(a.caPat, boundVars);
+                    match a.caGuard {
+                        Some(g) -> collectFvWithBound(localEnv, g, armBound, seen, outKeys),
+                        None -> (),
+                    };
+                    collectFvWithBound(localEnv, a.caBody, armBound, seen, outKeys);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+}
+
+def collectFvListWithBound(localEnv: List (String, Scheme), es: List TaggedTerm, boundVars: List String, seen: StrMap Bool, outKeys: Cell (List String)): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectFvWithBound(localEnv, h, boundVars, seen, outKeys);
+        collectFvListWithBound(localEnv, t, boundVars, seen, outKeys)
+    },
+}
+
+def collectPatVarsList(pat: Pattern, acc: List String): List String = match pat {
+    PatVar(v) -> Cons(v, acc),
+    PatWild -> acc,
+    PatLit(_) -> acc,
+    PatTuple(ps) -> collectPatVarsInList(ps, acc),
+    PatCtor(_, ps) -> collectPatVarsInList(ps, acc),
+    PatStruct(_, fs) -> collectPatVarsInNamed(fs, acc),
+}
+
+def collectPatVarsInList(ps: List Pattern, acc: List String): List String = match ps {
+    Nil -> acc,
+    Cons(h, t) -> collectPatVarsInList(t, collectPatVarsList(h, acc)),
+}
+
+def collectPatVarsInNamed(fs: List (String, Pattern), acc: List String): List String = match fs {
+    Nil -> acc,
+    Cons((_, p), t) -> collectPatVarsInNamed(t, collectPatVarsList(p, acc)),
+}
+
+// Pattern normalization (converts `PatStruct` -> positional `PatCtor` and collects typed local bindings)
+def instantiatedVariantFields(ctx: KCtx, cname: String, scrutTy: Type): List Type =
+    match strMapGet(ctx.kCtorMap, cname) {
+        None -> Nil,
+        Some((adtName, vinfo)) -> match strMapGet(ctx.kAdtReg, adtName) {
+            None -> Nil,
+            Some(ainfo) -> {
+                let targs = extractTypeArgs(scrutTy);
+                let sub = buildPairMap(ainfo.typeParams, targs);
+                let rev = cellNew(Nil);
+                let cur = cellNew(vinfo.fieldTypes);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(ft, r) -> {
+                            cellSet(rev, Cons(applyExplicitSubst(ft, sub), cellGet(rev)));
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                listRev(cellGet(rev))
+            },
+        },
+    }
+
+def listNthTypeOrVoid(ts: List Type, idx: Int): Type = match ts {
+    Nil -> TyVoid,
+    Cons(h, t) -> if (idx == 0) h else listNthTypeOrVoid(t, idx - 1),
+}
+
+def lookupNamedPatOrWild(named: List (String, Pattern), target: String): Pattern = match named {
+    Nil -> PatWild,
+    Cons((k, p), r) -> if (k == target) p else lookupNamedPatOrWild(r, target),
+}
+
+def normalizeAndCollectPattern(ctx: KCtx, pat: Pattern, scrutTy: Type): (Pattern, List (String, Scheme)) = match pat {
+    PatVar(v) -> (PatVar(v), [(v, ScmMono(scrutTy))]),
+    PatWild -> (PatWild, Nil),
+    PatLit(l) -> (PatLit(l), Nil),
+    PatTuple(ps) -> {
+        let elemTys = match scrutTy {
+            TyTuple(es) -> es,
+            _ -> Nil,
+        };
+        let normRev = cellNew(Nil);
+        let bindsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    let i = cellGet(idx);
+                    let et = listNthTypeOrVoid(elemTys, i);
+                    let (np, bs) = normalizeAndCollectPattern(ctx, p, et);
+                    cellSet(normRev, Cons(np, cellGet(normRev)));
+                    cellSet(bindsRev, listAppend(listRev(bs), cellGet(bindsRev)));
+                    cellSet(idx, i + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (PatTuple(listRev(cellGet(normRev))), listRev(cellGet(bindsRev)))
+    },
+    PatCtor(cname, subPats) -> {
+        let ftys = instantiatedVariantFields(ctx, cname, scrutTy);
+        let normRev = cellNew(Nil);
+        let bindsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(subPats);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> {
+                    let i = cellGet(idx);
+                    let ft = listNthTypeOrVoid(ftys, i);
+                    let (np, bs) = normalizeAndCollectPattern(ctx, p, ft);
+                    cellSet(normRev, Cons(np, cellGet(normRev)));
+                    cellSet(bindsRev, listAppend(listRev(bs), cellGet(bindsRev)));
+                    cellSet(idx, i + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (PatCtor(cname, listRev(cellGet(normRev))), listRev(cellGet(bindsRev)))
+    },
+    PatStruct(cname, namedPats) -> {
+        let ftys = instantiatedVariantFields(ctx, cname, scrutTy);
+        let declNames = match strMapGet(ctx.kCtorMap, cname) {
+            Some((_, vi)) -> match vi.fieldNames {
+                Some(ns) -> ns,
+                None -> Nil,
+            },
+            None -> Nil,
+        };
+        let normRev = cellNew(Nil);
+        let bindsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(declNames);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(dn, r) -> {
+                    let i = cellGet(idx);
+                    let subP = lookupNamedPatOrWild(namedPats, dn);
+                    let ft = listNthTypeOrVoid(ftys, i);
+                    let (np, bs) = normalizeAndCollectPattern(ctx, subP, ft);
+                    cellSet(normRev, Cons(np, cellGet(normRev)));
+                    cellSet(bindsRev, listAppend(listRev(bs), cellGet(bindsRev)));
+                    cellSet(idx, i + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (PatCtor(cname, listRev(cellGet(normRev))), listRev(cellGet(bindsRev)))
+    },
+}
+
+def transLambda(ctx: KCtx, params: List VarDecl, bodyForm: Form, capFv: Bool): (List VarDecl, List VarDecl, TaggedTerm) = {
+    let outerEnv = cellGet(ctx.kLocalEnv);
+    let innerEnv = cellNew(outerEnv);
+    let paramNames = cellNew(Nil);
+    let cp = cellNew(params);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(vd, r) -> {
+                cellSet(innerEnv, Cons((vd.vname, vd.vscm), cellGet(innerEnv)));
+                cellSet(paramNames, Cons(vd.vname, cellGet(paramNames)));
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(ctx.kLocalEnv, cellGet(innerEnv));
+    let bodyTerm = transformForm(ctx, bodyForm);
+    cellSet(ctx.kLocalEnv, outerEnv);
+
+    let fvs = if (!capFv) Nil else {
+        let seen: StrMap Bool = strMapNew();
+        let rawKeys = cellNew(Nil);
+        collectFvWithBound(outerEnv, bodyTerm, cellGet(paramNames), seen, rawKeys);
+        let sortedNames = sortUniqueStrings(cellGet(rawKeys));
+        let fvDeclsRev = cellNew(Nil);
+        let cf = cellNew(sortedNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(vn, r) -> {
+                    match assocLookupScheme(outerEnv, vn) {
+                        Some(scm) -> cellSet(fvDeclsRev, Cons(MkVarDecl { vname: vn, vscm: scm }, cellGet(fvDeclsRev))),
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        listRev(cellGet(fvDeclsRev))
+    };
+    (params, fvs, bodyTerm)
+}
+
+def etaWrapGlobalFn(ctx: KCtx, fnName: String, fnScm: Scheme): Term = match schemeBody(fnScm) {
+    TyArr(paramTys, retTy) -> {
+        let clsId = makeClsName(ctx, "eta");
+        let paramsRev = cellNew(Nil);
+        let argsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(paramTys);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(pt, r) -> {
+                    let i = cellGet(idx);
+                    let pid = ".eta_arg" + intToStr(i);
+                    cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
+                    cellSet(argsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(argsRev)));
+                    cellSet(idx, i + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let callBody = MkTerm {
+            tscm: ScmMono(retTy),
+            tnode: TmApplyDir(MkVarDecl { vname: fnName, vscm: fnScm }, listRev(cellGet(argsRev))),
+        };
+        let _ = defineFn(ctx, clsId, fnScm, listRev(cellGet(paramsRev)), Nil, callBody);
+        let tmp = kFresh(ctx);
+        TmMakeCls(
+            MkVarDecl { vname: tmp, vscm: fnScm },
+            MkClosureSpec { clsEntry: clsId, clsFvs: Nil },
+            MkTerm { tscm: fnScm, tnode: TmVar(tmp) }
+        )
+    },
+    _ -> TmVar(fnName),
+}
+
+def lookupNamedForm(fs: List (String, Form), target: String): Option Form = match fs {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == target) Some(v) else lookupNamedForm(r, target),
+}
+
+def buildWildcardPatWithVar(len: Int, targetIdx: Int, varName: String, curIdx: Int): List Pattern =
+    if (curIdx >= len) Nil
+    else {
+        let p = if (curIdx == targetIdx) PatVar(varName) else PatWild;
+        Cons(p, buildWildcardPatWithVar(len, targetIdx, varName, curIdx + 1))
+    }
+
+def listIndexOfStr(xs: List String, target: String, idx: Int): Int = match xs {
+    Nil -> 0,
+    Cons(h, t) -> if (h == target) idx else listIndexOfStr(t, target, idx + 1),
+}
+
+def transformFormList(ctx: KCtx, fs: List Form): List TaggedTerm = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(f, r) -> {
+                cellSet(rev, Cons(transformForm(ctx, f), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def resolveDirectCallee(ctx: KCtx, calleeExpr: Expr): Option String = match calleeExpr {
+    ExVar(n) ->
+        match assocLookupScheme(cellGet(ctx.kLocalEnv), n) {
+            None -> Some(n),
+            Some(_) -> lookupDirectTarget(ctx, n),
+        },
+    _ -> None,
+}
+
+def collectAstFreeLocals(
+    localEnv: List (String, Scheme),
+    f: Form,
+    boundNames: List String,
+    seen: StrMap Bool,
+    outKeys: Cell (List String)
+): Void = match f.node {
+    ExLit(_) -> (),
+    ExVar(v) ->
+        if (!listContainsStr(boundNames, v) && !strMapContains(seen, v)) {
+            match assocLookupScheme(localEnv, v) {
+                Some(_) -> {
+                    strMapInsert(seen, v, true);
+                    cellSet(outKeys, Cons(v, cellGet(outKeys)))
+                },
+                None -> (),
+            }
+        } else (),
+    ExTuple(es) -> collectAstFreeLocalsList(localEnv, es, boundNames, seen, outKeys),
+    ExList(es) -> collectAstFreeLocalsList(localEnv, es, boundNames, seen, outKeys),
+    ExBlock(es) -> collectAstFreeLocalsList(localEnv, es, boundNames, seen, outKeys),
+    ExStructInit(_, fs) -> {
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, vf), r) -> {
+                    collectAstFreeLocals(localEnv, vf, boundNames, seen, outKeys);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    ExApply(c, args) -> {
+        collectAstFreeLocals(localEnv, c, boundNames, seen, outKeys);
+        collectAstFreeLocalsList(localEnv, args, boundNames, seen, outKeys)
+    },
+    ExBin(_, l, r) -> {
+        collectAstFreeLocals(localEnv, l, boundNames, seen, outKeys);
+        collectAstFreeLocals(localEnv, r, boundNames, seen, outKeys)
+    },
+    ExUn(_, e) -> collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys),
+    ExField(e, _) -> collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys),
+    ExTry(e) -> collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys),
+    ExIf(c, t, e) -> {
+        collectAstFreeLocals(localEnv, c, boundNames, seen, outKeys);
+        collectAstFreeLocals(localEnv, t, boundNames, seen, outKeys);
+        collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys)
+    },
+    ExWhile(c, b) -> {
+        collectAstFreeLocals(localEnv, c, boundNames, seen, outKeys);
+        collectAstFreeLocals(localEnv, b, boundNames, seen, outKeys)
+    },
+    ExLet(vd, val, body) -> {
+        let nextBound = Cons(vd.vname, boundNames);
+        collectAstFreeLocals(localEnv, val, nextBound, seen, outKeys);
+        collectAstFreeLocals(localEnv, body, nextBound, seen, outKeys)
+    },
+    ExAbs(ps, _, body) -> {
+        let nextBound = cellNew(boundNames);
+        let cp = cellNew(ps);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(pvd, r) -> {
+                    cellSet(nextBound, Cons(pvd.vname, cellGet(nextBound)));
+                    cellSet(cp, r)
+                },
+                Nil -> (),
+            }
+        };
+        collectAstFreeLocals(localEnv, body, cellGet(nextBound), seen, outKeys)
+    },
+    ExMatch(s, arms) -> {
+        collectAstFreeLocals(localEnv, s, boundNames, seen, outKeys);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let armBound = collectPatVarsList(a.pat, boundNames);
+                    match a.guard {
+                        Some(g) -> collectAstFreeLocals(localEnv, g, armBound, seen, outKeys),
+                        None -> (),
+                    };
+                    collectAstFreeLocals(localEnv, a.body, armBound, seen, outKeys);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+}
+
+def collectAstFreeLocalsList(
+    localEnv: List (String, Scheme),
+    es: List Form,
+    boundNames: List String,
+    seen: StrMap Bool,
+    outKeys: Cell (List String)
+): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectAstFreeLocals(localEnv, h, boundNames, seen, outKeys);
+        collectAstFreeLocalsList(localEnv, t, boundNames, seen, outKeys)
+    },
+}
+
+def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
+    let tform = form.ty;
+    match form.node {
+        ExLit(l) -> MkTerm { tscm: tform, tnode: TmLit(l) },
+        ExTuple(es) -> MkTerm { tscm: tform, tnode: TmTuple(transformFormList(ctx, es)) },
+        ExBlock(es) -> MkTerm { tscm: tform, tnode: TmBlock(transformFormList(ctx, es)) },
+        ExUn(op, e) -> MkTerm { tscm: tform, tnode: TmUn(op, transformForm(ctx, e)) },
+        ExBin(op, l, r) -> MkTerm { tscm: tform, tnode: TmBin(op, transformForm(ctx, l), transformForm(ctx, r)) },
+        ExIf(c, t, e) -> MkTerm { tscm: tform, tnode: TmIf(transformForm(ctx, c), transformForm(ctx, t), transformForm(ctx, e)) },
+        ExWhile(c, b) -> MkTerm { tscm: tform, tnode: TmWhile(transformForm(ctx, c), transformForm(ctx, b)) },
+        ExTry(e) -> transformForm(ctx, e),
+
+        ExStructInit(cname, namedFields) -> match strMapGet(ctx.kCtorMap, cname) {
+            None -> MkTerm { tscm: tform, tnode: TmLit(LitInt(0)) },
+            Some((adtName, vinfo)) -> {
+                let declNames = match vinfo.fieldNames {
+                    Some(ns) -> ns,
+                    None -> Nil,
+                };
+                let termsRev = cellNew(Nil);
+                let ftysRev = cellNew(Nil);
+                let cur = cellNew(declNames);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(dn, r) -> {
+                            match lookupNamedForm(namedFields, dn) {
+                                Some(ff) -> {
+                                    let tt = transformForm(ctx, ff);
+                                    cellSet(ftysRev, Cons(schemeBody(tt.tscm), cellGet(ftysRev)));
+                                    cellSet(termsRev, Cons(tt, cellGet(termsRev)))
+                                },
+                                None -> (),
+                            };
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let targs = extractTypeArgs(schemeBody(tform));
+                MkTerm {
+                    tscm: tform,
+                    tnode: TmMakeData(adtName, vinfo.tag, listRev(cellGet(termsRev)), listRev(cellGet(ftysRev)), targs),
+                }
+            },
+        },
+
+        ExList(elems) -> {
+            let listTy = schemeBody(tform);
+            let targs = extractTypeArgs(listTy);
+            let elemTy = match targs {
+                Cons(et, _) -> et,
+                Nil -> TyVoid,
+            };
+            let nilTag = match strMapGet(ctx.kCtorMap, "Nil") {
+                Some((_, vi)) -> vi.tag,
+                None -> 0,
+            };
+            let consTag = match strMapGet(ctx.kCtorMap, "Cons") {
+                Some((_, vi)) -> vi.tag,
+                None -> 1,
+            };
+            let transElems = transformFormList(ctx, elems);
+            let revElems = listRev(transElems);
+            let acc = cellNew(MkTerm {
+                tscm: ScmMono(listTy),
+                tnode: TmMakeData("List", nilTag, Nil, Nil, targs),
+            });
+            let cur = cellNew(revElems);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(ht, r) -> {
+                        cellSet(acc, MkTerm {
+                            tscm: ScmMono(listTy),
+                            tnode: TmMakeData("List", consTag, [ht, cellGet(acc)], [elemTy, listTy], targs),
+                        });
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(acc)
+        },
+
+        ExField(base, fieldName) -> {
+            let baseTy = schemeBody(base.ty);
+            let curr = cellNew(baseTy);
+            while (match cellGet(curr) { TyComp(_, _) -> true, _ -> false }) {
+                match cellGet(curr) {
+                    TyComp(b, _) -> cellSet(curr, b),
+                    _ -> (),
+                }
+            };
+            let adtName = match cellGet(curr) {
+                TyCon(n) -> n,
+                _ -> "",
+            };
+            match strMapGet(ctx.kAdtReg, adtName) {
+                Some(ainfo) -> match ainfo.variants {
+                    Cons(vinfo, _) -> {
+                        let declNames = match vinfo.fieldNames {
+                            Some(ns) -> ns,
+                            None -> Nil,
+                        };
+                        let idx = listIndexOfStr(declNames, fieldName, 0);
+                        let baseTerm = transformForm(ctx, base);
+                        let resId = kFresh(ctx);
+                        let pats = buildWildcardPatWithVar(listLen(declNames), idx, resId, 0);
+                        let arm = MkCoreArm {
+                            caPat: PatCtor(vinfo.vname, pats),
+                            caGuard: None,
+                            caBody: MkTerm { tscm: tform, tnode: TmVar(resId) },
+                        };
+                        MkTerm { tscm: tform, tnode: TmMatch(baseTerm, [arm]) }
+                    },
+                    Nil -> transformForm(ctx, base),
+                },
+                None -> transformForm(ctx, base),
+            }
+        },
+
+        ExVar(varName) -> {
+            // 1. ADT constructor?
+            match strMapGet(ctx.kCtorMap, varName) {
+                Some((adtName, vinfo)) ->
+                    match vinfo.fieldTypes {
+                        Nil -> {
+                            let targs = extractTypeArgs(schemeBody(tform));
+                            MkTerm { tscm: tform, tnode: TmMakeData(adtName, vinfo.tag, Nil, Nil, targs) }
+                        },
+                        _ -> match schemeBody(tform) {
+                            TyArr(paramTys, retTy) -> {
+                                let clsId = makeClsName(ctx, "ctor");
+                                let paramsRev = cellNew(Nil);
+                                let fieldsRev = cellNew(Nil);
+                                let idx = cellNew(0);
+                                let cur = cellNew(paramTys);
+                                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                                    match cellGet(cur) {
+                                        Cons(pt, r) -> {
+                                            let i = cellGet(idx);
+                                            let pid = ".ctor_arg" + intToStr(i);
+                                            cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
+                                            cellSet(fieldsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(fieldsRev)));
+                                            cellSet(idx, i + 1);
+                                            cellSet(cur, r)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let targs = extractTypeArgs(retTy);
+                                let body = MkTerm {
+                                    tscm: ScmMono(retTy),
+                                    tnode: TmMakeData(adtName, vinfo.tag, listRev(cellGet(fieldsRev)), paramTys, targs),
+                                };
+                                let _ = defineFn(ctx, clsId, tform, listRev(cellGet(paramsRev)), Nil, body);
+                                let tmp = kFresh(ctx);
+                                MkTerm {
+                                    tscm: tform,
+                                    tnode: TmMakeCls(
+                                        MkVarDecl { vname: tmp, vscm: tform },
+                                        MkClosureSpec { clsEntry: clsId, clsFvs: Nil },
+                                        MkTerm { tscm: tform, tnode: TmVar(tmp) }
+                                    ),
+                                }
+                            },
+                            _ -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                        },
+                    },
+                None -> {
+                    // 2. Lambda-lifted polymorphic local `let` function referenced as first-class value?
+                    match assocLookupPoly(cellGet(ctx.kPolyLifted), varName) {
+                        Some((liftedFnId, fvDecls, liftedScm)) -> match schemeBody(tform) {
+                            TyArr(paramTys, retTy) -> {
+                                let etaId = makeClsName(ctx, "poly_eta");
+                                let paramsRev = cellNew(Nil);
+                                let allArgsRev = cellNew(Nil);
+                                let fvIdsRev = cellNew(Nil);
+                                let cf = cellNew(fvDecls);
+                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons(fvd, r) -> {
+                                            cellSet(allArgsRev, Cons(MkTerm { tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(allArgsRev)));
+                                            cellSet(fvIdsRev, Cons(fvd.vname, cellGet(fvIdsRev)));
+                                            cellSet(cf, r)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let idx = cellNew(0);
+                                let cp = cellNew(paramTys);
+                                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                    match cellGet(cp) {
+                                        Cons(pt, r) -> {
+                                            let i = cellGet(idx);
+                                            let pid = ".poly_eta_arg" + intToStr(i);
+                                            cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
+                                            cellSet(allArgsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(allArgsRev)));
+                                            cellSet(idx, i + 1);
+                                            cellSet(cp, r)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let callBody = MkTerm {
+                                    tscm: ScmMono(retTy),
+                                    tnode: TmApplyDir(MkVarDecl { vname: liftedFnId, vscm: liftedScm }, listRev(cellGet(allArgsRev))),
+                                };
+                                let _ = defineFn(ctx, etaId, tform, listRev(cellGet(paramsRev)), fvDecls, callBody);
+                                let tmp = kFresh(ctx);
+                                MkTerm {
+                                    tscm: tform,
+                                    tnode: TmMakeCls(
+                                        MkVarDecl { vname: tmp, vscm: tform },
+                                        MkClosureSpec { clsEntry: etaId, clsFvs: listRev(cellGet(fvIdsRev)) },
+                                        MkTerm { tscm: tform, tnode: TmVar(tmp) }
+                                    ),
+                                }
+                            },
+                            _ -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                        },
+                        None -> {
+                            // 3. Lexical local vs top-level global val vs first-class top-level function
+                            match assocLookupScheme(cellGet(ctx.kLocalEnv), varName) {
+                                Some(_) -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                                None ->
+                                    if (strMapContains(ctx.kGlobalValSet, varName)) {
+                                        MkTerm { tscm: tform, tnode: TmGlobalVar(varName) }
+                                    } else if (isFnScheme(tform)) {
+                                        let target = match lookupDirectTarget(ctx, varName) {
+                                            Some(t) -> t,
+                                            None -> varName,
+                                        };
+                                        MkTerm { tscm: tform, tnode: etaWrapGlobalFn(ctx, target, tform) }
+                                    } else {
+                                        MkTerm { tscm: tform, tnode: TmVar(varName) }
+                                    },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+
+        ExLet(vd, val, exp) -> {
+            let vname = vd.vname;
+            let scm = vd.vscm;
+            let isPolyAbs = match (schemeTypeParams(scm), val.node) {
+                (Cons(_, _), ExAbs(_, _, _)) -> true,
+                _ -> false,
+            };
+            if (isPolyAbs) {
+                match val.node {
+                    ExAbs(ps, _, bd) -> {
+                        let clsFnId = makeClsName(ctx, vname);
+                        let parentFn = cellGet(ctx.kCurrentFn);
+                        removeLiftedClosure(ctx, parentFn, clsFnId);
+
+                        let outerEnv = cellGet(ctx.kLocalEnv);
+                        let initBound = cellNew([vname]);
+                        let cp0 = cellNew(ps);
+                        while (match cellGet(cp0) { Nil -> false, _ -> true }) {
+                            match cellGet(cp0) {
+                                Cons(pvd, r) -> {
+                                    cellSet(initBound, Cons(pvd.vname, cellGet(initBound)));
+                                    cellSet(cp0, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let seenAstFv: StrMap Bool = strMapNew();
+                        let rawAstFvs = cellNew(Nil);
+                        collectAstFreeLocals(outerEnv, bd, cellGet(initBound), seenAstFv, rawAstFvs);
+                        let sortedFvNames = sortUniqueStrings(cellGet(rawAstFvs));
+                        let fvDeclsRev = cellNew(Nil);
+                        let cf0 = cellNew(sortedFvNames);
+                        while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+                            match cellGet(cf0) {
+                                Cons(fvn, r) -> {
+                                    match assocLookupScheme(outerEnv, fvn) {
+                                        Some(fscm) -> cellSet(fvDeclsRev, Cons(MkVarDecl { vname: fvn, vscm: fscm }, cellGet(fvDeclsRev))),
+                                        None -> (),
+                                    };
+                                    cellSet(cf0, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let fvDecls = listRev(cellGet(fvDeclsRev));
+
+                        let liftedScm = match fvDecls {
+                            Nil -> scm,
+                            _ -> {
+                                let fvTysRev = cellNew(Nil);
+                                let cf = cellNew(fvDecls);
+                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons(fvd, r) -> {
+                                            cellSet(fvTysRev, Cons(schemeBody(fvd.vscm), cellGet(fvTysRev)));
+                                            cellSet(cf, r)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let newBody = match schemeBody(scm) {
+                                    TyArr(ptys, rty) -> TyArr(listAppend(listRev(cellGet(fvTysRev)), ptys), rty),
+                                    other -> other,
+                                };
+                                match scm {
+                                    ScmPoly(vs, _) -> ScmPoly(vs, newBody),
+                                    ScmPolyConstrained(vs, cs, _) -> ScmPolyConstrained(vs, cs, newBody),
+                                    other -> other,
+                                }
+                            },
+                        };
+
+                        let savedPoly = cellGet(ctx.kPolyLifted);
+                        cellSet(ctx.kPolyLifted, Cons((vname, (clsFnId, fvDecls, liftedScm)), savedPoly));
+                        cellSet(ctx.kCurrentFn, clsFnId);
+                        let (lps, _, lbd) = transLambda(ctx, ps, bd, false);
+                        cellSet(ctx.kCurrentFn, parentFn);
+
+                        let allParams = listAppend(fvDecls, lps);
+                        let _ = defineFn(ctx, clsFnId, liftedScm, allParams, Nil, lbd);
+                        let expTerm = transformForm(ctx, exp);
+                        cellSet(ctx.kPolyLifted, savedPoly);
+                        expTerm
+                    },
+                    _ -> transformForm(ctx, exp),
+                }
+            } else {
+                let savedEnv = cellGet(ctx.kLocalEnv);
+                cellSet(ctx.kLocalEnv, Cons((vname, scm), savedEnv));
+                let resNode = match val.node {
+                    ExAbs(ps, _, bd) -> {
+                        let clsFnId = makeClsName(ctx, vname);
+                        let savedDirect = cellGet(ctx.kLocalDirect);
+                        cellSet(ctx.kLocalDirect, Cons((vname, clsFnId), savedDirect));
+                        let (ps1, fv1, bd1) = transLambda(ctx, ps, bd, true);
+                        cellSet(ctx.kLocalDirect, savedDirect);
+
+                        let (clsName, clsFvs) = match fv1 {
+                            Nil -> defineFn(ctx, clsFnId, scm, ps1, Nil, bd1),
+                            _ -> {
+                                let (ps2, fv2, bd2) = transLambda(ctx, ps, bd, true);
+                                defineFn(ctx, clsFnId, scm, ps2, fv2, bd2)
+                            },
+                        };
+
+                        let expTerm = match clsFvs {
+                            Nil -> {
+                                let sd2 = cellGet(ctx.kLocalDirect);
+                                cellSet(ctx.kLocalDirect, Cons((vname, clsName), sd2));
+                                let et = transformForm(ctx, exp);
+                                cellSet(ctx.kLocalDirect, sd2);
+                                et
+                            },
+                            _ -> transformForm(ctx, exp),
+                        };
+                        TmMakeCls(vd, MkClosureSpec { clsEntry: clsName, clsFvs: clsFvs }, expTerm)
+                    },
+                    _ -> {
+                        let valTerm = transformForm(ctx, val);
+                        let expTerm = transformForm(ctx, exp);
+                        TmLet(vd, valTerm, expTerm)
+                    },
+                };
+                cellSet(ctx.kLocalEnv, savedEnv);
+                MkTerm { tscm: tform, tnode: resNode }
+            }
+        },
+
+        ExApply(callee, args) -> {
+            // 1. ADT Constructor application?
+            let ctorOpt = match callee.node {
+                ExVar(cn) -> strMapGet(ctx.kCtorMap, cn),
+                _ -> None,
+            };
+            match ctorOpt {
+                Some((adtName, vinfo)) -> {
+                    let argTerms = transformFormList(ctx, args);
+                    let ftysRev = cellNew(Nil);
+                    let cur = cellNew(argTerms);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(at, r) -> {
+                                cellSet(ftysRev, Cons(schemeBody(at.tscm), cellGet(ftysRev)));
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let targs = extractTypeArgs(schemeBody(tform));
+                    MkTerm {
+                        tscm: tform,
+                        tnode: TmMakeData(adtName, vinfo.tag, argTerms, listRev(cellGet(ftysRev)), targs),
+                    }
+                },
+                None -> {
+                    // 2. Lambda-lifted polymorphic local `let` call?
+                    let polyOpt = match callee.node {
+                        ExVar(cn) -> assocLookupPoly(cellGet(ctx.kPolyLifted), cn),
+                        _ -> None,
+                    };
+                    match polyOpt {
+                        Some((liftedFnId, fvDecls, liftedScm)) -> {
+                            let fvArgsRev = cellNew(Nil);
+                            let cf = cellNew(fvDecls);
+                            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                match cellGet(cf) {
+                                    Cons(fvd, r) -> {
+                                        cellSet(fvArgsRev, Cons(MkTerm { tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(fvArgsRev)));
+                                        cellSet(cf, r)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            let allArgs = listAppend(listRev(cellGet(fvArgsRev)), transformFormList(ctx, args));
+                            MkTerm {
+                                tscm: tform,
+                                tnode: TmApplyDir(MkVarDecl { vname: liftedFnId, vscm: liftedScm }, allArgs),
+                            }
+                        },
+                        None -> {
+                            // 3. Direct function / concept method / intrinsic call?
+                            match resolveDirectCallee(ctx, callee.node) {
+                                Some(directName) ->
+                                    if (!strMapContains(ctx.kGlobalValSet, directName)) {
+                                        let target = match lookupDirectTarget(ctx, directName) {
+                                            Some(t) -> t,
+                                            None -> directName,
+                                        };
+                                        let argTerms = transformFormList(ctx, args);
+                                        MkTerm {
+                                            tscm: tform,
+                                            tnode: TmApplyDir(MkVarDecl { vname: target, vscm: callee.ty }, argTerms),
+                                        }
+                                    } else {
+                                        let ct = transformForm(ctx, callee);
+                                        MkTerm { tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
+                                    },
+                                None -> {
+                                    let ct = transformForm(ctx, callee);
+                                    MkTerm { tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        },
+
+        ExMatch(scrut, arms) -> {
+            let scrutTy = schemeBody(scrut.ty);
+            let scrutTerm = transformForm(ctx, scrut);
+            let armsRev = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let (normPat, binds) = normalizeAndCollectPattern(ctx, a.pat, scrutTy);
+                        let savedEnv = cellGet(ctx.kLocalEnv);
+                        cellSet(ctx.kLocalEnv, listAppend(binds, savedEnv));
+                        let gTerm = match a.guard {
+                            Some(g) -> Some(transformForm(ctx, g)),
+                            None -> None,
+                        };
+                        let bTerm = transformForm(ctx, a.body);
+                        cellSet(ctx.kLocalEnv, savedEnv);
+                        cellSet(armsRev, Cons(MkCoreArm { caPat: normPat, caGuard: gTerm, caBody: bTerm }, cellGet(armsRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            MkTerm { tscm: tform, tnode: TmMatch(scrutTerm, listRev(cellGet(armsRev))) }
+        },
+
+        ExAbs(ps, _, bd) -> {
+            let frName = kFresh(ctx);
+            let tmpFnId = makeClsName(ctx, frName);
+            let (lps, fvs, lbd) = transLambda(ctx, ps, bd, true);
+            let (clsName, clsFvs) = defineFn(ctx, tmpFnId, tform, lps, fvs, lbd);
+            let clsVar = kFresh(ctx);
+            MkTerm {
+                tscm: tform,
+                tnode: TmMakeCls(
+                    MkVarDecl { vname: clsVar, vscm: tform },
+                    MkClosureSpec { clsEntry: clsName, clsFvs: clsFvs },
+                    MkTerm { tscm: tform, tnode: TmVar(clsVar) }
+                ),
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Worklist Monomorphization & Static Concept Method Dispatch
+// ============================================================================
+
+def findConceptMethodScm(ms: List (String, Scheme), mname: String): Option Scheme = match ms {
+    Nil -> None,
+    Cons((k, s), r) -> if (k == mname) Some(s) else findConceptMethodScm(r, mname),
+}
+
+def listNthStr(xs: List String, idx: Int): Option String = match xs {
+    Nil -> None,
+    Cons(h, t) -> if (idx == 0) Some(h) else listNthStr(t, idx - 1),
+}
+
+def collectSubstArgs(tparams: List String, sub: StrMap Type): Option (List Type) = {
+    let rev = cellNew(Nil);
+    let ok = cellNew(true);
+    let cur = cellNew(tparams);
+    while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                match strMapGet(sub, p) {
+                    Some(t) ->
+                        if (isTypeConcrete(t)) cellSet(rev, Cons(t, cellGet(rev)))
+                        else cellSet(ok, false),
+                    None -> cellSet(ok, false),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    if (cellGet(ok)) Some(listRev(cellGet(rev))) else None
+}
+
+def resolveConceptCall(
+    ctx: KCtx,
+    methodName: String,
+    argTys: List Type,
+    retTy: Type
+): Option (String, Scheme, Option Instantiation) =
+    match strMapGet(ctx.kConceptMethods, methodName) {
+        None -> None,
+        Some((conceptName, paramIdx)) -> match strMapGet(ctx.kConceptReg, conceptName) {
+            None -> None,
+            Some(cinfo) -> match findConceptMethodScm(cinfo.methods, methodName) {
+                None -> None,
+                Some(methodScm) -> {
+                    let callSub: StrMap Type = strMapNew();
+                    let concreteFnTy = TyArr(argTys, retTy);
+                    unifyTypesInto(schemeBody(methodScm), concreteFnTy, callSub);
+                    match listNthStr(cinfo.typeParams, paramIdx) {
+                        None -> None,
+                        Some(conceptTv) -> match strMapGet(callSub, conceptTv) {
+                            None -> None,
+                            Some(concreteTargetTy) ->
+                                if (!isTypeConcrete(concreteTargetTy)) None
+                                else {
+                                    let res: Cell (Option (String, Scheme, Option Instantiation)) = cellNew(None);
+                                    let curI = cellNew(ctx.kInstanceReg);
+                                    while (match cellGet(curI) { Nil -> false, _ -> match cellGet(res) { None -> true, Some(_) -> false } }) {
+                                        match cellGet(curI) {
+                                            Cons(instInfo, rI) -> {
+                                                if (instInfo.conceptName == conceptName) {
+                                                    match instInfo.targetTypes {
+                                                        Cons(patTy, _) -> {
+                                                            let instSub: StrMap Type = strMapNew();
+                                                            if (matchInstancePattern(patTy, concreteTargetTy, instSub)) {
+                                                                match strMapGet(instInfo.methodImpls, methodName) {
+                                                                    Some(baseImplName) -> match strMapGet(ctx.kGlobalFns, baseImplName) {
+                                                                        Some(baseDef) -> {
+                                                                            unifyTypesInto(schemeBody(baseDef.fnScm), concreteFnTy, instSub);
+                                                                            let tparams = schemeTypeParams(baseDef.fnScm);
+                                                                            match tparams {
+                                                                                Nil -> cellSet(res, Some((baseImplName, ScmMono(concreteFnTy), None))),
+                                                                                _ -> match collectSubstArgs(tparams, instSub) {
+                                                                                    Some(targs) -> {
+                                                                                        let specInst = mkInst(baseImplName, targs);
+                                                                                        cellSet(res, Some((specInst.instMangled, ScmMono(concreteFnTy), Some(specInst))))
+                                                                                    },
+                                                                                    None -> (),
+                                                                                },
+                                                                            }
+                                                                        },
+                                                                        None -> (),
+                                                                    },
+                                                                    None -> (),
+                                                                }
+                                                            } else ()
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                } else ();
+                                                cellSet(curI, rI)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    cellGet(res)
+                                },
+                        },
+                    }
+                },
+            },
+        },
+    }
+
+def resolvePolyFnCall(
+    ctx: KCtx,
+    fnName: String,
+    concreteFnTy: Type
+): Option (String, Scheme, Instantiation) =
+    match strMapGet(ctx.kGlobalFns, fnName) {
+        None -> None,
+        Some(fdef) -> {
+            let tparams = schemeTypeParams(fdef.fnScm);
+            match tparams {
+                Nil -> None,
+                _ -> {
+                    let sub: StrMap Type = strMapNew();
+                    unifyTypesInto(schemeBody(fdef.fnScm), concreteFnTy, sub);
+                    match collectSubstArgs(tparams, sub) {
+                        None -> None,
+                        Some(targs) -> {
+                            let inst = mkInst(fnName, targs);
+                            let specTy = applyExplicitSubst(schemeBody(fdef.fnScm), sub);
+                            Some((inst.instMangled, ScmMono(specTy), inst))
+                        },
+                    }
+                },
+            }
+        },
+    }
+
+def rewriteTermList(ctx: KCtx, es: List TaggedTerm, discovered: Cell (List Instantiation)): List TaggedTerm = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(es);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(e, r) -> {
+                cellSet(rev, Cons(rewriteCallsInTerm(ctx, e, discovered), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def pushDiscovered(discovered: Cell (List Instantiation), optInst: Option Instantiation): Void = match optInst {
+    Some(i) -> cellSet(discovered, Cons(i, cellGet(discovered))),
+    None -> (),
+}
+
+def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instantiation)): TaggedTerm = {
+    let nodeTy = schemeBody(tm.tscm);
+    match tm.tnode {
+        TmLit(_) -> tm,
+        TmGlobalVar(_) -> tm,
+        TmVar(name) -> {
+            let resolvedConcept: Option TaggedTerm =
+                if (isTypeConcrete(nodeTy) && !strMapContains(ctx.kGlobalFns, name)) {
+                    match nodeTy {
+                        TyArr(ps, r) -> match resolveConceptCall(ctx, name, ps, r) {
+                            Some((mangled, specScm, optInst)) -> {
+                                strMapInsert(ctx.kTopDirect, mangled, mangled);
+                                pushDiscovered(discovered, optInst);
+                                Some(MkTerm { tscm: specScm, tnode: TmVar(mangled) })
+                            },
+                            None -> None,
+                        },
+                        _ -> None,
+                    }
+                } else None;
+            match resolvedConcept {
+                Some(rt) -> rt,
+                None ->
+                    if (isTypeConcrete(nodeTy)) {
+                        match resolvePolyFnCall(ctx, name, nodeTy) {
+                            Some((mangled, specScm, inst)) -> {
+                                strMapInsert(ctx.kTopDirect, mangled, mangled);
+                                cellSet(discovered, Cons(inst, cellGet(discovered)));
+                                MkTerm { tscm: specScm, tnode: TmVar(mangled) }
+                            },
+                            None -> tm,
+                        }
+                    } else tm,
+            }
+        },
+        TmTuple(es) -> MkTerm { tscm: tm.tscm, tnode: TmTuple(rewriteTermList(ctx, es, discovered)) },
+        TmBlock(es) -> MkTerm { tscm: tm.tscm, tnode: TmBlock(rewriteTermList(ctx, es, discovered)) },
+        TmMakeCls(vd, cls, body) -> MkTerm { tscm: tm.tscm, tnode: TmMakeCls(vd, cls, rewriteCallsInTerm(ctx, body, discovered)) },
+        TmApplyCls(c, args) -> MkTerm {
+            tscm: tm.tscm,
+            tnode: TmApplyCls(rewriteCallsInTerm(ctx, c, discovered), rewriteTermList(ctx, args, discovered)),
+        },
+        TmApplyDir(calleeDecl, rawArgs) -> {
+            let args = rewriteTermList(ctx, rawArgs, discovered);
+            let fnName = calleeDecl.vname;
+            let argTysRev = cellNew(Nil);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        cellSet(argTysRev, Cons(schemeBody(a.tscm), cellGet(argTysRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let argTys = listRev(cellGet(argTysRev));
+            let retTy = nodeTy;
+
+            let conceptAttempt: Option TaggedTerm =
+                if (!strMapContains(ctx.kGlobalFns, fnName)) {
+                    match resolveConceptCall(ctx, fnName, argTys, retTy) {
+                        Some((mangled, specScm, optInst)) -> {
+                            strMapInsert(ctx.kTopDirect, mangled, mangled);
+                            pushDiscovered(discovered, optInst);
+                            Some(MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) })
+                        },
+                        None -> match args {
+                            Cons(a0, Cons(b0, Nil)) ->
+                                if (isBuiltinOpPrimitive(schemeBody(a0.tscm))) {
+                                    if (fnName == "eq") {
+                                        Some(MkTerm { tscm: tm.tscm, tnode: TmBin(OpEq, a0, b0) })
+                                    } else if (fnName == "compare") {
+                                        let boolScm = ScmMono(TyCon("Bool"));
+                                        let intScm = ScmMono(TyCon("Int"));
+                                        let ltCond = MkTerm { tscm: boolScm, tnode: TmBin(OpLt, a0, b0) };
+                                        let eqCond = MkTerm { tscm: boolScm, tnode: TmBin(OpEq, a0, b0) };
+                                        let negOne = MkTerm { tscm: intScm, tnode: TmLit(LitInt(0 - 1)) };
+                                        let zero = MkTerm { tscm: intScm, tnode: TmLit(LitInt(0)) };
+                                        let posOne = MkTerm { tscm: intScm, tnode: TmLit(LitInt(1)) };
+                                        let innerIf = MkTerm { tscm: intScm, tnode: TmIf(eqCond, zero, posOne) };
+                                        Some(MkTerm { tscm: tm.tscm, tnode: TmIf(ltCond, negOne, innerIf) })
+                                    } else None
+                                } else None,
+                            _ -> None,
+                        },
+                    }
+                } else None;
+
+            match conceptAttempt {
+                Some(rewritten) -> rewritten,
+                None -> {
+                    let concreteFnTy = TyArr(argTys, retTy);
+                    match resolvePolyFnCall(ctx, fnName, concreteFnTy) {
+                        Some((mangled, specScm, inst)) -> {
+                            strMapInsert(ctx.kTopDirect, mangled, mangled);
+                            cellSet(discovered, Cons(inst, cellGet(discovered)));
+                            MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) }
+                        },
+                        None -> MkTerm { tscm: tm.tscm, tnode: TmApplyDir(calleeDecl, args) },
+                    }
+                },
+            }
+        },
+        TmBin(bop, rawL, rawR) -> {
+            let l = rewriteCallsInTerm(ctx, rawL, discovered);
+            let r = rewriteCallsInTerm(ctx, rawR, discovered);
+            let opTy = schemeBody(l.tscm);
+            if (isTypeConcrete(opTy) && !isBuiltinOpPrimitive(opTy)) {
+                let argTys = [opTy, schemeBody(r.tscm)];
+                match bop {
+                    OpAnd -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                    OpOr -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                    OpEq -> match resolveConceptCall(ctx, "eq", argTys, nodeTy) {
+                        Some((mangled, specScm, optInst)) -> {
+                            strMapInsert(ctx.kTopDirect, mangled, mangled);
+                            pushDiscovered(discovered, optInst);
+                            MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
+                        },
+                        None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                    },
+                    OpNe -> {
+                        let boolTy = TyCon("Bool");
+                        match resolveConceptCall(ctx, "eq", argTys, boolTy) {
+                            Some((mangled, specScm, optInst)) -> {
+                                strMapInsert(ctx.kTopDirect, mangled, mangled);
+                                pushDiscovered(discovered, optInst);
+                                let eqCall = MkTerm {
+                                    tscm: ScmMono(boolTy),
+                                    tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]),
+                                };
+                                MkTerm { tscm: tm.tscm, tnode: TmUn(UnNot, eqCall) }
+                            },
+                            None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                        }
+                    },
+                    OpLt -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
+                    OpLe -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
+                    OpGt -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
+                    OpGe -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
+                    _ -> {
+                        let mname = match bop {
+                            OpAdd -> "$op$plus",
+                            OpSub -> "$op$minus",
+                            OpMul -> "$op$star",
+                            OpDiv -> "$op$slash",
+                            OpRem -> "$op$rem",
+                            OpBitAnd -> "$op$amp",
+                            OpBitOr -> "$op$bar",
+                            OpBitXor -> "$op$caret",
+                            OpShl -> "$op$lt_lt",
+                            OpShr -> "$op$gt_gt",
+                            OpUshr -> "$op$gt_gt_gt",
+                            _ -> "$op$plus",
+                        };
+                        match resolveConceptCall(ctx, mname, argTys, nodeTy) {
+                            Some((mangled, specScm, optInst)) -> {
+                                strMapInsert(ctx.kTopDirect, mangled, mangled);
+                                pushDiscovered(discovered, optInst);
+                                MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
+                            },
+                            None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                        }
+                    },
+                }
+            } else MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) }
+        },
+        TmUn(uop, rawE) -> {
+            let e = rewriteCallsInTerm(ctx, rawE, discovered);
+            let opTy = schemeBody(e.tscm);
+            match uop {
+                UnNot -> MkTerm { tscm: tm.tscm, tnode: TmUn(UnNot, e) },
+                _ ->
+                    if (isTypeConcrete(opTy) && !isBuiltinOpPrimitive(opTy)) {
+                        let mname = match uop {
+                            UnNeg -> "neg",
+                            UnBitNot -> "$op$tilde",
+                            _ -> "neg",
+                        };
+                        match resolveConceptCall(ctx, mname, [opTy], opTy) {
+                            Some((mangled, specScm, optInst)) -> {
+                                strMapInsert(ctx.kTopDirect, mangled, mangled);
+                                pushDiscovered(discovered, optInst);
+                                MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [e]) }
+                            },
+                            None -> MkTerm { tscm: tm.tscm, tnode: TmUn(uop, e) },
+                        }
+                    } else MkTerm { tscm: tm.tscm, tnode: TmUn(uop, e) },
+            }
+        },
+        TmGetTag(e) -> MkTerm { tscm: tm.tscm, tnode: TmGetTag(rewriteCallsInTerm(ctx, e, discovered)) },
+        TmLet(vd, v, b) -> MkTerm {
+            tscm: tm.tscm,
+            tnode: TmLet(vd, rewriteCallsInTerm(ctx, v, discovered), rewriteCallsInTerm(ctx, b, discovered)),
+        },
+        TmIf(c, t, e) -> MkTerm {
+            tscm: tm.tscm,
+            tnode: TmIf(
+                rewriteCallsInTerm(ctx, c, discovered),
+                rewriteCallsInTerm(ctx, t, discovered),
+                rewriteCallsInTerm(ctx, e, discovered)
+            ),
+        },
+        TmWhile(c, b) -> MkTerm {
+            tscm: tm.tscm,
+            tnode: TmWhile(rewriteCallsInTerm(ctx, c, discovered), rewriteCallsInTerm(ctx, b, discovered)),
+        },
+        TmMatch(s, arms) -> {
+            let ns = rewriteCallsInTerm(ctx, s, discovered);
+            let rev = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ng = match a.caGuard { Some(g) -> Some(rewriteCallsInTerm(ctx, g, discovered)), None -> None };
+                        cellSet(rev, Cons(MkCoreArm { caPat: a.caPat, caGuard: ng, caBody: rewriteCallsInTerm(ctx, a.caBody, discovered) }, cellGet(rev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            MkTerm { tscm: tm.tscm, tnode: TmMatch(ns, listRev(cellGet(rev))) }
+        },
+        TmMakeData(tn, tg, fs, ftys, targs) -> MkTerm {
+            tscm: tm.tscm,
+            tnode: TmMakeData(tn, tg, rewriteTermList(ctx, fs, discovered), ftys, targs),
+        },
+    }
+}
+
+def rewriteOrdBinOp(
+    ctx: KCtx,
+    bop: BinOp,
+    l: TaggedTerm,
+    r: TaggedTerm,
+    argTys: List Type,
+    tscm: Scheme,
+    discovered: Cell (List Instantiation)
+): TaggedTerm = {
+    let intTy = TyCon("Int");
+    match resolveConceptCall(ctx, "compare", argTys, intTy) {
+        Some((mangled, specScm, optInst)) -> {
+            strMapInsert(ctx.kTopDirect, mangled, mangled);
+            pushDiscovered(discovered, optInst);
+            let cmpCall = MkTerm {
+                tscm: ScmMono(intTy),
+                tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]),
+            };
+            let zero = MkTerm { tscm: ScmMono(intTy), tnode: TmLit(LitInt(0)) };
+            MkTerm { tscm: tscm, tnode: TmBin(bop, cmpCall, zero) }
+        },
+        None -> MkTerm { tscm: tscm, tnode: TmBin(bop, l, r) },
+    }
+}
+
+def specializeTermList(es: List TaggedTerm, typeSub: StrMap Type, fnRename: StrMap String): List TaggedTerm = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(es);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(e, r) -> {
+                cellSet(rev, Cons(specializeTerm(e, typeSub, fnRename), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def applyExplicitSubstListCore(ts: List Type, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), applyExplicitSubstListCore(t, sub)),
+}
+
+def specializeTerm(tm: TaggedTerm, typeSub: StrMap Type, fnRename: StrMap String): TaggedTerm = {
+    let nscm = applySchemeSubst(tm.tscm, typeSub);
+    let nnode = match tm.tnode {
+        TmLit(l) -> TmLit(l),
+        TmGlobalVar(g) -> TmGlobalVar(g),
+        TmVar(id) -> match strMapGet(fnRename, id) {
+            Some(nid) -> TmVar(nid),
+            None -> TmVar(id),
+        },
+        TmTuple(es) -> TmTuple(specializeTermList(es, typeSub, fnRename)),
+        TmBlock(es) -> TmBlock(specializeTermList(es, typeSub, fnRename)),
+        TmBin(op, l, r) -> TmBin(op, specializeTerm(l, typeSub, fnRename), specializeTerm(r, typeSub, fnRename)),
+        TmUn(op, e) -> TmUn(op, specializeTerm(e, typeSub, fnRename)),
+        TmGetTag(e) -> TmGetTag(specializeTerm(e, typeSub, fnRename)),
+        TmLet(vd, v, b) -> TmLet(
+            MkVarDecl { vname: vd.vname, vscm: applySchemeSubst(vd.vscm, typeSub) },
+            specializeTerm(v, typeSub, fnRename),
+            specializeTerm(b, typeSub, fnRename)
+        ),
+        TmIf(c, t, e) -> TmIf(
+            specializeTerm(c, typeSub, fnRename),
+            specializeTerm(t, typeSub, fnRename),
+            specializeTerm(e, typeSub, fnRename)
+        ),
+        TmWhile(c, b) -> TmWhile(specializeTerm(c, typeSub, fnRename), specializeTerm(b, typeSub, fnRename)),
+        TmApplyDir(vd, args) -> {
+            let nid = match strMapGet(fnRename, vd.vname) {
+                Some(r) -> r,
+                None -> vd.vname,
+            };
+            TmApplyDir(
+                MkVarDecl { vname: nid, vscm: applySchemeSubst(vd.vscm, typeSub) },
+                specializeTermList(args, typeSub, fnRename)
+            )
+        },
+        TmApplyCls(c, args) -> TmApplyCls(specializeTerm(c, typeSub, fnRename), specializeTermList(args, typeSub, fnRename)),
+        TmMakeCls(vd, cls, body) -> {
+            let newEntry = match strMapGet(fnRename, cls.clsEntry) {
+                Some(r) -> r,
+                None -> cls.clsEntry,
+            };
+            TmMakeCls(
+                MkVarDecl { vname: vd.vname, vscm: applySchemeSubst(vd.vscm, typeSub) },
+                MkClosureSpec { clsEntry: newEntry, clsFvs: cls.clsFvs },
+                specializeTerm(body, typeSub, fnRename)
+            )
+        },
+        TmMatch(s, arms) -> {
+            let rev = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ng = match a.caGuard { Some(g) -> Some(specializeTerm(g, typeSub, fnRename)), None -> None };
+                        cellSet(rev, Cons(MkCoreArm {
+                            caPat: a.caPat,
+                            caGuard: ng,
+                            caBody: specializeTerm(a.caBody, typeSub, fnRename),
+                        }, cellGet(rev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            TmMatch(specializeTerm(s, typeSub, fnRename), listRev(cellGet(rev)))
+        },
+        TmMakeData(tn, tg, fs, ftys, targs) -> TmMakeData(
+            tn,
+            tg,
+            specializeTermList(fs, typeSub, fnRename),
+            applyExplicitSubstListCore(ftys, typeSub),
+            applyExplicitSubstListCore(targs, typeSub)
+        ),
+    };
+    MkTerm { tscm: nscm, tnode: nnode }
+}
+
+def specializeVarDecls(vds: List VarDecl, sub: StrMap Type): List VarDecl = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(vds);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(vd, r) -> {
+                cellSet(rev, Cons(MkVarDecl { vname: vd.vname, vscm: applySchemeSubst(vd.vscm, sub) }, cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def sanitizeVarDecls(vds: List VarDecl): List VarDecl = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(vds);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(vd, r) -> {
+                cellSet(rev, Cons(MkVarDecl { vname: vd.vname, vscm: ScmMono(defaultPhantomType(schemeBody(vd.vscm))) }, cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def buildSpecializedFunDef(orig: FunDef, newName: String, sub: StrMap Type, fnRename: StrMap String): FunDef = {
+    let specTy = defaultPhantomType(applyExplicitSubst(schemeBody(orig.fnScm), sub));
+    let specParams = sanitizeVarDecls(specializeVarDecls(orig.fnParams, sub));
+    let specFvs = sanitizeVarDecls(specializeVarDecls(orig.fnFvs, sub));
+    let specBody = sanitizePhantomTerm(specializeTerm(orig.fnBody, sub, fnRename));
+    MkFunDef {
+        fnName: newName,
+        fnScm: ScmMono(specTy),
+        fnParams: specParams,
+        fnFvs: specFvs,
+        fnBody: specBody,
+    }
+}
+
+def collectTransitiveClosuresRec(liftedMap: StrMap (List String), fnId: String, seen: StrMap Bool, outRev: Cell (List String)): Void =
+    match strMapGet(liftedMap, fnId) {
+        None -> (),
+        Some(cids) -> {
+            let cur = cellNew(cids);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(cid, r) -> {
+                        if (!strMapContains(seen, cid)) {
+                            strMapInsert(seen, cid, true);
+                            cellSet(outRev, Cons(cid, cellGet(outRev)));
+                            collectTransitiveClosuresRec(liftedMap, cid, seen, outRev)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+
+def collectTransitiveClosures(liftedMap: StrMap (List String), fnId: String): List String = {
+    let seen: StrMap Bool = strMapNew();
+    let outRev = cellNew(Nil);
+    collectTransitiveClosuresRec(liftedMap, fnId, seen, outRev);
+    listRev(cellGet(outRev))
+}
+
+def materializeSpecialization(ctx: KCtx, inst: Instantiation): List String =
+    match strMapGet(ctx.kGlobalFns, inst.instFn) {
+        None -> Nil,
+        Some(orig) -> {
+            let tparams = schemeTypeParams(orig.fnScm);
+            if (listLen(tparams) != listLen(inst.instArgs)) Nil
+            else if (strMapContains(ctx.kGlobalFns, inst.instMangled)) [inst.instMangled]
+            else {
+                let sub = buildPairMap(tparams, inst.instArgs);
+                let suffix =
+                    if (strLen(inst.instMangled) > strLen(inst.instFn)) {
+                        strSlice(inst.instMangled, strLen(inst.instFn), strLen(inst.instMangled))
+                    } else "";
+                let fnRename: StrMap String = strMapNew();
+                strMapInsert(fnRename, inst.instFn, inst.instMangled);
+
+                let innerCls = collectTransitiveClosures(ctx.kLiftedClosures, inst.instFn);
+                let cc1 = cellNew(innerCls);
+                while (match cellGet(cc1) { Nil -> false, _ -> true }) {
+                    match cellGet(cc1) {
+                        Cons(cid, r) -> {
+                            strMapInsert(fnRename, cid, cid + suffix);
+                            cellSet(cc1, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+
+                let createdRev = cellNew(Nil);
+                let cc2 = cellNew(innerCls);
+                while (match cellGet(cc2) { Nil -> false, _ -> true }) {
+                    match cellGet(cc2) {
+                        Cons(cid, r) -> {
+                            match strMapGet(ctx.kGlobalFns, cid) {
+                                Some(clsDef) -> {
+                                    let specClsId = cid + suffix;
+                                    let specCls = buildSpecializedFunDef(clsDef, specClsId, sub, fnRename);
+                                    strMapInsert(ctx.kTopDirect, specClsId, specClsId);
+                                    strMapInsert(ctx.kGlobalFns, specClsId, specCls);
+                                    vecPush(ctx.kAllFnNames, specClsId);
+                                    cellSet(createdRev, Cons(specClsId, cellGet(createdRev)))
+                                },
+                                None -> (),
+                            };
+                            cellSet(cc2, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+
+                let specFn = buildSpecializedFunDef(orig, inst.instMangled, sub, fnRename);
+                strMapInsert(ctx.kTopDirect, inst.instMangled, inst.instMangled);
+                strMapInsert(ctx.kGlobalFns, inst.instMangled, specFn);
+                vecPush(ctx.kAllFnNames, inst.instMangled);
+                cellSet(createdRev, Cons(inst.instMangled, cellGet(createdRev)));
+                listRev(cellGet(createdRev))
+            }
+        },
+    }
+
+def markTransitiveTemplateClosures(liftedMap: StrMap (List String), fnId: String, out: StrMap Bool): Void =
+    match strMapGet(liftedMap, fnId) {
+        None -> (),
+        Some(cids) -> {
+            let cur = cellNew(cids);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(cid, r) -> {
+                        if (!strMapContains(out, cid)) {
+                            strMapInsert(out, cid, true);
+                            markTransitiveTemplateClosures(liftedMap, cid, out)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+
+def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List GlobalValDef) = {
+    let queue: Vec String = vecNew();
+    let qHead = cellNew(0);
+    let processed: StrMap Bool = strMapNew();
+    let createdSpecs: StrMap Bool = strMapNew();
+
+    // Identify inner closures belonging to polymorphic templates so unspecialized templates are never seeded/emitted
+    let templateClosures: StrMap Bool = strMapNew();
+    let totalInitial = vecLen(ctx.kAllFnNames);
+    let t0 = cellNew(0);
+    while (cellGet(t0) < totalInitial) {
+        let fnm = vecGetOr(ctx.kAllFnNames, cellGet(t0), "");
+        match strMapGet(ctx.kGlobalFns, fnm) {
+            Some(fd) -> match schemeTypeParams(fd.fnScm) {
+                Cons(_, _) -> markTransitiveTemplateClosures(ctx.kLiftedClosures, fnm, templateClosures),
+                Nil -> (),
+            },
+            None -> (),
+        };
+        cellSet(t0, cellGet(t0) + 1)
+    };
+
+    // Seed with concrete monomorphic top-level functions
+    let i = cellNew(0);
+    while (cellGet(i) < totalInitial) {
+        let fnm = vecGetOr(ctx.kAllFnNames, cellGet(i), "");
+        if (!strMapContains(templateClosures, fnm)) {
+            match strMapGet(ctx.kGlobalFns, fnm) {
+                Some(fd) -> {
+                    let isMono = match schemeTypeParams(fd.fnScm) {
+                        Nil -> isTypeConcrete(schemeBody(fd.fnScm)),
+                        _ -> false,
+                    };
+                    if (isMono) {
+                        let cleanFd = MkFunDef {
+                            fnName: fd.fnName,
+                            fnScm: ScmMono(defaultPhantomType(schemeBody(fd.fnScm))),
+                            fnParams: sanitizeVarDecls(fd.fnParams),
+                            fnFvs: sanitizeVarDecls(fd.fnFvs),
+                            fnBody: sanitizePhantomTerm(fd.fnBody),
+                        };
+                        strMapInsert(ctx.kGlobalFns, fnm, cleanFd);
+                        vecPush(queue, fnm)
+                    } else ()
+                },
+                None -> (),
+            }
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    // Rewrite global value initializers
+    let initDiscovered: Cell (List Instantiation) = cellNew(Nil);
+    let newGlobalsRev = cellNew(Nil);
+    let curG = cellNew(listRev(cellGet(ctx.kGlobalValsRev)));
+    while (match cellGet(curG) { Nil -> false, _ -> true }) {
+        match cellGet(curG) {
+            Cons(g, r) -> {
+                let cleanTy = defaultPhantomType(g.gvTy);
+                let cleanInit = sanitizePhantomTerm(g.gvInit);
+                let rwInit = rewriteCallsInTerm(ctx, cleanInit, initDiscovered);
+                cellSet(newGlobalsRev, Cons(MkGlobalValDef { gvName: g.gvName, gvTy: cleanTy, gvInit: rwInit }, cellGet(newGlobalsRev)));
+                cellSet(curG, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    enqueueDiscoveredSpecs(ctx, listRev(cellGet(initDiscovered)), createdSpecs, queue);
+
+    // Drain worklist to transitive fixed point
+    while (cellGet(qHead) < vecLen(queue)) {
+        let h = cellGet(qHead);
+        cellSet(qHead, h + 1);
+        let fnId = vecGetOr(queue, h, "");
+        if (!strMapContains(processed, fnId)) {
+            strMapInsert(processed, fnId, true);
+            match strMapGet(ctx.kGlobalFns, fnId) {
+                Some(fd) -> {
+                    let disc: Cell (List Instantiation) = cellNew(Nil);
+                    let rwBody = rewriteCallsInTerm(ctx, fd.fnBody, disc);
+                    strMapInsert(ctx.kGlobalFns, fnId, MkFunDef {
+                        fnName: fd.fnName,
+                        fnScm: fd.fnScm,
+                        fnParams: fd.fnParams,
+                        fnFvs: fd.fnFvs,
+                        fnBody: rwBody,
+                    });
+                    enqueueDiscoveredSpecs(ctx, listRev(cellGet(disc)), createdSpecs, queue)
+                },
+                None -> (),
+            }
+        } else ()
+    };
+
+    // Keep only concrete monomorphic functions, sorted deterministically by name!
+    let concreteFns: StrMap FunDef = strMapNew();
+    let concreteNamesRev = cellNew(Nil);
+    let k = cellNew(0);
+    while (cellGet(k) < vecLen(ctx.kAllFnNames)) {
+        let fnm = vecGetOr(ctx.kAllFnNames, cellGet(k), "");
+        match strMapGet(ctx.kGlobalFns, fnm) {
+            Some(fd) -> {
+                let keep = match schemeTypeParams(fd.fnScm) {
+                    Nil ->
+                        !strMapContains(templateClosures, fnm)
+                        && isTypeConcrete(schemeBody(fd.fnScm))
+                        && !strMapContains(concreteFns, fnm),
+                    _ -> false,
+                };
+                if (keep) {
+                    strMapInsert(concreteFns, fnm, fd);
+                    cellSet(concreteNamesRev, Cons(fnm, cellGet(concreteNamesRev)))
+                } else ()
+            },
+            None -> (),
+        };
+        cellSet(k, cellGet(k) + 1)
+    };
+
+    (concreteFns, sortUniqueStrings(cellGet(concreteNamesRev)), listRev(cellGet(newGlobalsRev)))
+}
+
+def enqueueDiscoveredSpecs(
+    ctx: KCtx,
+    insts: List Instantiation,
+    createdSpecs: StrMap Bool,
+    queue: Vec String
+): Void = {
+    let cur = cellNew(insts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(inst, r) -> {
+                if (!strMapContains(createdSpecs, inst.instMangled)) {
+                    strMapInsert(createdSpecs, inst.instMangled, true);
+                    let sids = materializeSpecialization(ctx, inst);
+                    let cs = cellNew(sids);
+                    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                        match cellGet(cs) {
+                            Cons(sid, rs) -> {
+                                vecPush(queue, sid);
+                                cellSet(cs, rs)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+// ============================================================================
+// Concurrent `Send` Closure Verification
+// ============================================================================
+
+def intrinsicSendClosureArg(callee: String): Option Int =
+    if (callee == "__concTaskSpawn" || callee == "__concActorSpawn") Some(0)
+    else if (callee == "__concActorCall" || callee == "__concActorSend") Some(1)
+    else None
+
+def findNonSendGlobalInTerm(
+    tm: TaggedTerm,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo,
+    visitedFns: StrMap Bool
+): Option (String, Type) = match tm.tnode {
+    TmGlobalVar(gn) -> match strMapGet(globalTys, gn) {
+        Some(gty) -> if (!isConcreteTypeSend(adtReg, gty)) Some((gn, gty)) else None,
+        None -> None,
+    },
+    TmApplyDir(vd, args) -> {
+        let inArgs = findNonSendGlobalInList(args, fns, globalTys, adtReg, visitedFns);
+        match inArgs {
+            Some(hit) -> Some(hit),
+            None ->
+                if (!strMapContains(visitedFns, vd.vname)) {
+                    strMapInsert(visitedFns, vd.vname, true);
+                    match strMapGet(fns, vd.vname) {
+                        Some(fd) -> findNonSendGlobalInTerm(fd.fnBody, fns, globalTys, adtReg, visitedFns),
+                        None -> None,
+                    }
+                } else None,
+        }
+    },
+    TmMakeCls(_, cls, body) -> {
+        let inCls =
+            if (!strMapContains(visitedFns, cls.clsEntry)) {
+                strMapInsert(visitedFns, cls.clsEntry, true);
+                match strMapGet(fns, cls.clsEntry) {
+                    Some(fd) -> findNonSendGlobalInTerm(fd.fnBody, fns, globalTys, adtReg, visitedFns),
+                    None -> None,
+                }
+            } else None;
+        match inCls {
+            Some(hit) -> Some(hit),
+            None -> findNonSendGlobalInTerm(body, fns, globalTys, adtReg, visitedFns),
+        }
+    },
+    TmApplyCls(c, args) -> match findNonSendGlobalInTerm(c, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInList(args, fns, globalTys, adtReg, visitedFns),
+    },
+    TmTuple(es) -> findNonSendGlobalInList(es, fns, globalTys, adtReg, visitedFns),
+    TmBlock(es) -> findNonSendGlobalInList(es, fns, globalTys, adtReg, visitedFns),
+    TmMakeData(_, _, es, _, _) -> findNonSendGlobalInList(es, fns, globalTys, adtReg, visitedFns),
+    TmBin(_, l, r) -> match findNonSendGlobalInTerm(l, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInTerm(r, fns, globalTys, adtReg, visitedFns),
+    },
+    TmUn(_, e) -> findNonSendGlobalInTerm(e, fns, globalTys, adtReg, visitedFns),
+    TmGetTag(e) -> findNonSendGlobalInTerm(e, fns, globalTys, adtReg, visitedFns),
+    TmLet(_, v, b) -> match findNonSendGlobalInTerm(v, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInTerm(b, fns, globalTys, adtReg, visitedFns),
+    },
+    TmIf(c, t, e) -> match findNonSendGlobalInTerm(c, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> match findNonSendGlobalInTerm(t, fns, globalTys, adtReg, visitedFns) {
+            Some(hit) -> Some(hit),
+            None -> findNonSendGlobalInTerm(e, fns, globalTys, adtReg, visitedFns),
+        },
+    },
+    TmWhile(c, b) -> match findNonSendGlobalInTerm(c, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInTerm(b, fns, globalTys, adtReg, visitedFns),
+    },
+    TmMatch(s, arms) -> match findNonSendGlobalInTerm(s, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInArms(arms, fns, globalTys, adtReg, visitedFns),
+    },
+    _ -> None,
+}
+
+def findNonSendGlobalInList(
+    es: List TaggedTerm,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo,
+    visitedFns: StrMap Bool
+): Option (String, Type) = match es {
+    Nil -> None,
+    Cons(h, t) -> match findNonSendGlobalInTerm(h, fns, globalTys, adtReg, visitedFns) {
+        Some(hit) -> Some(hit),
+        None -> findNonSendGlobalInList(t, fns, globalTys, adtReg, visitedFns),
+    },
+}
+
+def findNonSendGlobalInArms(
+    arms: List CoreArm,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo,
+    visitedFns: StrMap Bool
+): Option (String, Type) = match arms {
+    Nil -> None,
+    Cons(a, r) -> {
+        let gHit = match a.caGuard {
+            Some(g) -> findNonSendGlobalInTerm(g, fns, globalTys, adtReg, visitedFns),
+            None -> None,
+        };
+        match gHit {
+            Some(hit) -> Some(hit),
+            None -> match findNonSendGlobalInTerm(a.caBody, fns, globalTys, adtReg, visitedFns) {
+                Some(hit) -> Some(hit),
+                None -> findNonSendGlobalInArms(r, fns, globalTys, adtReg, visitedFns),
+            },
+        }
+    },
+}
+
+def collectLocalClosuresInTerm(tm: TaggedTerm, closures: StrMap ClosureSpec, aliases: StrMap String): Void = match tm.tnode {
+    TmMakeCls(vd, cls, body) -> {
+        strMapInsert(closures, vd.vname, cls);
+        collectLocalClosuresInTerm(body, closures, aliases)
+    },
+    TmLet(vd, val, body) -> {
+        match val.tnode {
+            TmVar(rhs) -> strMapInsert(aliases, vd.vname, rhs),
+            _ -> (),
+        };
+        collectLocalClosuresInTerm(val, closures, aliases);
+        collectLocalClosuresInTerm(body, closures, aliases)
+    },
+    TmTuple(es) -> collectLocalClosuresInList(es, closures, aliases),
+    TmBlock(es) -> collectLocalClosuresInList(es, closures, aliases),
+    TmApplyDir(_, args) -> collectLocalClosuresInList(args, closures, aliases),
+    TmMakeData(_, _, args, _, _) -> collectLocalClosuresInList(args, closures, aliases),
+    TmApplyCls(c, args) -> {
+        collectLocalClosuresInTerm(c, closures, aliases);
+        collectLocalClosuresInList(args, closures, aliases)
+    },
+    TmBin(_, l, r) -> {
+        collectLocalClosuresInTerm(l, closures, aliases);
+        collectLocalClosuresInTerm(r, closures, aliases)
+    },
+    TmUn(_, e) -> collectLocalClosuresInTerm(e, closures, aliases),
+    TmGetTag(e) -> collectLocalClosuresInTerm(e, closures, aliases),
+    TmIf(c, t, e) -> {
+        collectLocalClosuresInTerm(c, closures, aliases);
+        collectLocalClosuresInTerm(t, closures, aliases);
+        collectLocalClosuresInTerm(e, closures, aliases)
+    },
+    TmWhile(c, b) -> {
+        collectLocalClosuresInTerm(c, closures, aliases);
+        collectLocalClosuresInTerm(b, closures, aliases)
+    },
+    TmMatch(s, arms) -> {
+        collectLocalClosuresInTerm(s, closures, aliases);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> collectLocalClosuresInTerm(g, closures, aliases), None -> () };
+                    collectLocalClosuresInTerm(a.caBody, closures, aliases);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    _ -> (),
+}
+
+def collectLocalClosuresInList(es: List TaggedTerm, closures: StrMap ClosureSpec, aliases: StrMap String): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectLocalClosuresInTerm(h, closures, aliases);
+        collectLocalClosuresInList(t, closures, aliases)
+    },
+}
+
+def resolveAliasName(id: String, aliases: StrMap String, hops: Int): String =
+    if (hops > 32) id
+    else match strMapGet(aliases, id) {
+        Some(next) -> if (next == id) id else resolveAliasName(next, aliases, hops + 1),
+        None -> id,
+    }
+
+def resolveClosureSpecArg(tm: TaggedTerm, closures: StrMap ClosureSpec, aliases: StrMap String): Option ClosureSpec = match tm.tnode {
+    TmMakeCls(vd, cls, body) -> match body.tnode {
+        TmVar(retId) -> if (retId == vd.vname) Some(cls) else resolveClosureSpecArg(body, closures, aliases),
+        _ -> resolveClosureSpecArg(body, closures, aliases),
+    },
+    TmLet(_, _, body) -> resolveClosureSpecArg(body, closures, aliases),
+    TmBlock(es) -> match listRev(es) {
+        Cons(last, _) -> resolveClosureSpecArg(last, closures, aliases),
+        Nil -> None,
+    },
+    TmVar(id) -> strMapGet(closures, resolveAliasName(id, aliases, 0)),
+    _ -> None,
+}
+
+def listNthTerm(es: List TaggedTerm, idx: Int): Option TaggedTerm = match es {
+    Nil -> None,
+    Cons(h, t) -> if (idx == 0) Some(h) else listNthTerm(t, idx - 1),
+}
+
+def verifySinkClosureSpec(
+    cls: ClosureSpec,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo
+): Result Void String =
+    match strMapGet(fns, cls.clsEntry) {
+        None -> Ok(()),
+        Some(clsFn) -> {
+            let curFv = cellNew(clsFn.fnFvs);
+            while (match cellGet(curFv) { Nil -> false, _ -> true }) {
+                match cellGet(curFv) {
+                    Cons(fvd, r) -> {
+                        let fvTy = schemeBody(fvd.vscm);
+                        if (!isConcreteTypeSend(adtReg, fvTy)) {
+                            returnCoreErr("Concurrent closure captures non-Send variable '" + fvd.vname + "' of type '" + typeToString(fvTy) + "'")?
+                        } else ();
+                        cellSet(curFv, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let visited: StrMap Bool = strMapNew();
+            strMapInsert(visited, cls.clsEntry, true);
+            match findNonSendGlobalInTerm(clsFn.fnBody, fns, globalTys, adtReg, visited) {
+                Some((gn, gty)) -> Err("Concurrent closure accesses non-Send global '" + gn + "' of type '" + typeToString(gty) + "'"),
+                None -> Ok(()),
+            }
+        },
+    }
+
+def returnCoreErr(msg: String): Result Void String = Err(msg)
+
+def verifyConcCallsInTerm(
+    tm: TaggedTerm,
+    closures: StrMap ClosureSpec,
+    aliases: StrMap String,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo
+): Result Void String = match tm.tnode {
+    TmApplyDir(vd, args) -> {
+        verifyConcCallsInList(args, closures, aliases, fns, globalTys, adtReg)?;
+        match intrinsicSendClosureArg(vd.vname) {
+            Some(argIdx) -> match listNthTerm(args, argIdx) {
+                Some(argTm) -> match resolveClosureSpecArg(argTm, closures, aliases) {
+                    Some(cls) -> verifySinkClosureSpec(cls, fns, globalTys, adtReg),
+                    None -> Ok(()),
+                },
+                None -> Ok(()),
+            },
+            None -> Ok(()),
+        }
+    },
+    TmMakeCls(_, _, body) -> verifyConcCallsInTerm(body, closures, aliases, fns, globalTys, adtReg),
+    TmApplyCls(c, args) -> {
+        verifyConcCallsInTerm(c, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInList(args, closures, aliases, fns, globalTys, adtReg)
+    },
+    TmTuple(es) -> verifyConcCallsInList(es, closures, aliases, fns, globalTys, adtReg),
+    TmBlock(es) -> verifyConcCallsInList(es, closures, aliases, fns, globalTys, adtReg),
+    TmMakeData(_, _, es, _, _) -> verifyConcCallsInList(es, closures, aliases, fns, globalTys, adtReg),
+    TmBin(_, l, r) -> {
+        verifyConcCallsInTerm(l, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInTerm(r, closures, aliases, fns, globalTys, adtReg)
+    },
+    TmUn(_, e) -> verifyConcCallsInTerm(e, closures, aliases, fns, globalTys, adtReg),
+    TmGetTag(e) -> verifyConcCallsInTerm(e, closures, aliases, fns, globalTys, adtReg),
+    TmLet(_, v, b) -> {
+        verifyConcCallsInTerm(v, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInTerm(b, closures, aliases, fns, globalTys, adtReg)
+    },
+    TmIf(c, t, e) -> {
+        verifyConcCallsInTerm(c, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInTerm(t, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInTerm(e, closures, aliases, fns, globalTys, adtReg)
+    },
+    TmWhile(c, b) -> {
+        verifyConcCallsInTerm(c, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInTerm(b, closures, aliases, fns, globalTys, adtReg)
+    },
+    TmMatch(s, arms) -> {
+        verifyConcCallsInTerm(s, closures, aliases, fns, globalTys, adtReg)?;
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> verifyConcCallsInTerm(g, closures, aliases, fns, globalTys, adtReg)?, None -> () };
+                    verifyConcCallsInTerm(a.caBody, closures, aliases, fns, globalTys, adtReg)?;
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(())
+    },
+    _ -> Ok(()),
+}
+
+def verifyConcCallsInList(
+    es: List TaggedTerm,
+    closures: StrMap ClosureSpec,
+    aliases: StrMap String,
+    fns: StrMap FunDef,
+    globalTys: StrMap Type,
+    adtReg: StrMap AdtInfo
+): Result Void String = match es {
+    Nil -> Ok(()),
+    Cons(h, t) -> {
+        verifyConcCallsInTerm(h, closures, aliases, fns, globalTys, adtReg)?;
+        verifyConcCallsInList(t, closures, aliases, fns, globalTys, adtReg)
+    },
+}
+
+def verifyConcurrentClosures(
+    fns: StrMap FunDef,
+    fnNames: List String,
+    globals: List GlobalValDef,
+    adtReg: StrMap AdtInfo
+): Result Void String = {
+    let globalTys: StrMap Type = strMapNew();
+    let cg = cellNew(globals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, r) -> { strMapInsert(globalTys, g.gvName, g.gvTy); cellSet(cg, r) },
+            Nil -> (),
+        }
+    };
+    let cf = cellNew(fnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnm, r) -> {
+                match strMapGet(fns, fnm) {
+                    Some(fd) -> {
+                        let closures: StrMap ClosureSpec = strMapNew();
+                        let aliases: StrMap String = strMapNew();
+                        collectLocalClosuresInTerm(fd.fnBody, closures, aliases);
+                        verifyConcCallsInTerm(fd.fnBody, closures, aliases, fns, globalTys, adtReg)?
+                    },
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(())
+}
+
+// ============================================================================
+// Recursive ADT Detection & Sound Escape Analysis
+// ============================================================================
+
+def collectAdtRefsInType(adtReg: StrMap AdtInfo, ty: Type, acc: List String): List String = match ty {
+    TyCon(n) -> if (strMapContains(adtReg, n) && !listContainsStr(acc, n)) Cons(n, acc) else acc,
+    TyComp(b, a) -> collectAdtRefsInType(adtReg, a, collectAdtRefsInType(adtReg, b, acc)),
+    TyTuple(es) -> collectAdtRefsInList(adtReg, es, acc),
+    TyArr(ps, r) -> collectAdtRefsInType(adtReg, r, collectAdtRefsInList(adtReg, ps, acc)),
+    _ -> acc,
+}
+
+def collectAdtRefsInList(adtReg: StrMap AdtInfo, ts: List Type, acc: List String): List String = match ts {
+    Nil -> acc,
+    Cons(h, t) -> collectAdtRefsInList(adtReg, t, collectAdtRefsInType(adtReg, h, acc)),
+}
+
+def canAdtReachTarget(adtReg: StrMap AdtInfo, curr: String, target: String, visited: StrMap Bool): Bool =
+    match strMapGet(adtReg, curr) {
+        None -> false,
+        Some(ainfo) -> {
+            let refs = cellNew(Nil);
+            let cv = cellNew(ainfo.variants);
+            while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                match cellGet(cv) {
+                    Cons(vi, r) -> {
+                        cellSet(refs, collectAdtRefsInList(adtReg, vi.fieldTypes, cellGet(refs)));
+                        cellSet(cv, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let hit = cellNew(false);
+            let cr = cellNew(cellGet(refs));
+            while (match cellGet(cr) { Nil -> false, _ -> !cellGet(hit) }) {
+                match cellGet(cr) {
+                    Cons(nextAdt, rr) -> {
+                        if (nextAdt == target) cellSet(hit, true)
+                        else if (!strMapContains(visited, nextAdt)) {
+                            strMapInsert(visited, nextAdt, true);
+                            if (canAdtReachTarget(adtReg, nextAdt, target, visited)) cellSet(hit, true) else ()
+                        } else ();
+                        cellSet(cr, rr)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        },
+    }
+
+def computeRecursiveAdts(adtReg: StrMap AdtInfo, adtNames: Vec String): StrMap Bool = {
+    let recMap: StrMap Bool = strMapNew();
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(adtNames)) {
+        let nm = vecGetOr(adtNames, cellGet(i), "");
+        let vis: StrMap Bool = strMapNew();
+        if (canAdtReachTarget(adtReg, nm, nm, vis)) strMapInsert(recMap, nm, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    recMap
+}
+
+// ParamEscape levels encoded as `Int`: 0 = NoEscape, 1 = EscapesReturn, 2 = EscapesCapture, 3 = EscapesStore
+def maxInt(a: Int, b: Int): Int = if (a > b) a else b
+
+def addUniqueInt(xs: List Int, v: Int): List Int = match xs {
+    Nil -> [v],
+    Cons(h, t) -> if (h == v) xs else Cons(h, addUniqueInt(t, v)),
+}
+
+def unionInts(xs: List Int, ys: List Int): List Int = match ys {
+    Nil -> xs,
+    Cons(h, t) -> unionInts(addUniqueInt(xs, h), t),
+}
+
+def collectVarsInCoreTerm(tm: TaggedTerm, seen: StrMap Bool, out: Cell (List String)): Void = match tm.tnode {
+    TmVar(id) ->
+        if (!strMapContains(seen, id)) {
+            strMapInsert(seen, id, true);
+            cellSet(out, Cons(id, cellGet(out)))
+        } else (),
+    TmTuple(es) -> collectVarsInCoreList(es, seen, out),
+    TmBlock(es) -> collectVarsInCoreList(es, seen, out),
+    TmApplyDir(_, es) -> collectVarsInCoreList(es, seen, out),
+    TmMakeData(_, _, es, _, _) -> collectVarsInCoreList(es, seen, out),
+    TmApplyCls(c, args) -> {
+        collectVarsInCoreTerm(c, seen, out);
+        collectVarsInCoreList(args, seen, out)
+    },
+    TmIf(c, t, e) -> {
+        collectVarsInCoreTerm(c, seen, out);
+        collectVarsInCoreTerm(t, seen, out);
+        collectVarsInCoreTerm(e, seen, out)
+    },
+    TmWhile(c, b) -> {
+        collectVarsInCoreTerm(c, seen, out);
+        collectVarsInCoreTerm(b, seen, out)
+    },
+    TmMatch(s, arms) -> {
+        collectVarsInCoreTerm(s, seen, out);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> collectVarsInCoreTerm(g, seen, out), None -> () };
+                    collectVarsInCoreTerm(a.caBody, seen, out);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmLet(_, v, b) -> {
+        collectVarsInCoreTerm(v, seen, out);
+        collectVarsInCoreTerm(b, seen, out)
+    },
+    TmMakeCls(_, cls, b) -> {
+        let cf = cellNew(cls.clsFvs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fv, r) -> {
+                    if (!strMapContains(seen, fv)) {
+                        strMapInsert(seen, fv, true);
+                        cellSet(out, Cons(fv, cellGet(out)))
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        collectVarsInCoreTerm(b, seen, out)
+    },
+    TmUn(_, e) -> collectVarsInCoreTerm(e, seen, out),
+    TmGetTag(e) -> collectVarsInCoreTerm(e, seen, out),
+    TmBin(_, l, r) -> {
+        collectVarsInCoreTerm(l, seen, out);
+        collectVarsInCoreTerm(r, seen, out)
+    },
+    _ -> (),
+}
+
+def collectVarsInCoreList(es: List TaggedTerm, seen: StrMap Bool, out: Cell (List String)): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectVarsInCoreTerm(h, seen, out);
+        collectVarsInCoreList(t, seen, out)
+    },
+}
+
+def varsOfTerm(tm: TaggedTerm): List String = {
+    let seen: StrMap Bool = strMapNew();
+    let out = cellNew(Nil);
+    collectVarsInCoreTerm(tm, seen, out);
+    cellGet(out)
+}
+
+def taintUnionForVars(vars: List String, taints: StrMap (List Int)): List Int = {
+    let u = cellNew(Nil);
+    let cur = cellNew(vars);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(v, r) -> {
+                match strMapGet(taints, v) {
+                    Some(ts) -> cellSet(u, unionInts(cellGet(u), ts)),
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(u)
+}
+
+def analyzeParamEscapesInTerm(
+    tm: TaggedTerm,
+    taints: StrMap (List Int),
+    escapesArr: MutArray Int,
+    knownEscapes: StrMap (MutArray Int),
+    recAdts: StrMap Bool,
+    inTail: Bool
+): Void = match tm.tnode {
+    TmVar(id) ->
+        if (inTail) {
+            match strMapGet(taints, id) {
+                Some(ts) -> {
+                    let cur = cellNew(ts);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(idx, r) -> {
+                                arraySet(escapesArr, idx, maxInt(arrayGet(escapesArr, idx), 1));
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+                None -> (),
+            }
+        } else (),
+    TmTuple(es) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    analyzeParamEscapesInTerm(e, taints, escapesArr, knownEscapes, recAdts, inTail);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeCls(vd, cls, body) -> {
+        let clsTaint = cellNew(Nil);
+        let cf = cellNew(cls.clsFvs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fvId, r) -> {
+                    match strMapGet(taints, fvId) {
+                        Some(ts) -> {
+                            cellSet(clsTaint, unionInts(cellGet(clsTaint), ts));
+                            let ct = cellNew(ts);
+                            while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                                match cellGet(ct) {
+                                    Cons(idx, rt) -> {
+                                        arraySet(escapesArr, idx, maxInt(arrayGet(escapesArr, idx), 2));
+                                        cellSet(ct, rt)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        match cellGet(clsTaint) {
+            Nil -> (),
+            ct -> strMapInsert(taints, vd.vname, ct),
+        };
+        analyzeParamEscapesInTerm(body, taints, escapesArr, knownEscapes, recAdts, inTail)
+    },
+    TmLet(vd, val, body) -> {
+        let rhsTaint = taintUnionForVars(varsOfTerm(val), taints);
+        match rhsTaint {
+            Nil -> (),
+            rt -> strMapInsert(taints, vd.vname, rt),
+        };
+        analyzeParamEscapesInTerm(val, taints, escapesArr, knownEscapes, recAdts, false);
+        analyzeParamEscapesInTerm(body, taints, escapesArr, knownEscapes, recAdts, inTail)
+    },
+    TmApplyDir(vd, args) -> match strMapGet(knownEscapes, vd.vname) {
+        Some(calleeEsc) -> {
+            let cLen = arrayLen(calleeEsc);
+            let idx = cellNew(0);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arg, r) -> {
+                        let i = cellGet(idx);
+                        let argTaints = taintUnionForVars(varsOfTerm(arg), taints);
+                        let ct = cellNew(argTaints);
+                        while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                            match cellGet(ct) {
+                                Cons(pidx, rt) -> {
+                                    if (i < cLen) {
+                                        let ce = arrayGet(calleeEsc, i);
+                                        if (ce >= 2) arraySet(escapesArr, pidx, 3)
+                                        else if (ce == 1 && inTail) arraySet(escapesArr, pidx, maxInt(arrayGet(escapesArr, pidx), 1))
+                                        else ()
+                                    } else ();
+                                    cellSet(ct, rt)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        analyzeParamEscapesInTerm(arg, taints, escapesArr, knownEscapes, recAdts, false);
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        None -> {
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arg, r) -> {
+                        let argTaints = taintUnionForVars(varsOfTerm(arg), taints);
+                        let ct = cellNew(argTaints);
+                        while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                            match cellGet(ct) {
+                                Cons(pidx, rt) -> {
+                                    arraySet(escapesArr, pidx, 3);
+                                    cellSet(ct, rt)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        analyzeParamEscapesInTerm(arg, taints, escapesArr, knownEscapes, recAdts, true);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    },
+    TmApplyCls(c, args) -> {
+        analyzeParamEscapesInTerm(c, taints, escapesArr, knownEscapes, recAdts, false);
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(arg, r) -> {
+                    let argTaints = taintUnionForVars(varsOfTerm(arg), taints);
+                    let ct = cellNew(argTaints);
+                    while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                        match cellGet(ct) {
+                            Cons(pidx, rt) -> {
+                                arraySet(escapesArr, pidx, 3);
+                                cellSet(ct, rt)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    analyzeParamEscapesInTerm(arg, taints, escapesArr, knownEscapes, recAdts, true);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmIf(c, t, e) -> {
+        analyzeParamEscapesInTerm(c, taints, escapesArr, knownEscapes, recAdts, false);
+        analyzeParamEscapesInTerm(t, taints, escapesArr, knownEscapes, recAdts, inTail);
+        analyzeParamEscapesInTerm(e, taints, escapesArr, knownEscapes, recAdts, inTail)
+    },
+    TmWhile(c, b) -> {
+        analyzeParamEscapesInTerm(c, taints, escapesArr, knownEscapes, recAdts, false);
+        analyzeParamEscapesInTerm(b, taints, escapesArr, knownEscapes, recAdts, false)
+    },
+    TmBin(_, l, r) -> {
+        analyzeParamEscapesInTerm(l, taints, escapesArr, knownEscapes, recAdts, false);
+        analyzeParamEscapesInTerm(r, taints, escapesArr, knownEscapes, recAdts, false)
+    },
+    TmUn(_, e) -> analyzeParamEscapesInTerm(e, taints, escapesArr, knownEscapes, recAdts, false),
+    TmGetTag(e) -> analyzeParamEscapesInTerm(e, taints, escapesArr, knownEscapes, recAdts, false),
+    TmMatch(s, arms) -> {
+        let scrutTaints = taintUnionForVars(varsOfTerm(s), taints);
+        if (inTail) {
+            let ct = cellNew(scrutTaints);
+            while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                match cellGet(ct) {
+                    Cons(pidx, rt) -> {
+                        arraySet(escapesArr, pidx, maxInt(arrayGet(escapesArr, pidx), 1));
+                        cellSet(ct, rt)
+                    },
+                    Nil -> (),
+                }
+            }
+        } else ();
+        analyzeParamEscapesInTerm(s, taints, escapesArr, knownEscapes, recAdts, false);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match scrutTaints {
+                        Nil -> (),
+                        st -> {
+                            let pvars = collectPatVarsList(a.caPat, Nil);
+                            let cp = cellNew(pvars);
+                            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(pv, rp) -> {
+                                        let existing = match strMapGet(taints, pv) { Some(ex) -> ex, None -> Nil };
+                                        strMapInsert(taints, pv, unionInts(existing, st));
+                                        cellSet(cp, rp)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                    };
+                    match a.caGuard { Some(g) -> analyzeParamEscapesInTerm(g, taints, escapesArr, knownEscapes, recAdts, false), None -> () };
+                    analyzeParamEscapesInTerm(a.caBody, taints, escapesArr, knownEscapes, recAdts, inTail);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(tn, _, fs, _, _) -> {
+        let isRec = strMapContains(recAdts, tn);
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(f, r) -> {
+                    analyzeParamEscapesInTerm(f, taints, escapesArr, knownEscapes, recAdts, isRec || inTail);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmBlock(items) -> {
+        let cur = cellNew(items);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(it, r) -> {
+                    let isLast = match r { Nil -> true, _ -> false };
+                    analyzeParamEscapesInTerm(it, taints, escapesArr, knownEscapes, recAdts, inTail && isLast);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    _ -> (),
+}
+
+def intArraysEqual(a: MutArray Int, b: MutArray Int): Bool = {
+    let n = arrayLen(a);
+    if (n != arrayLen(b)) false
+    else {
+        let i = cellNew(0);
+        let eq = cellNew(true);
+        while (cellGet(i) < n && cellGet(eq)) {
+            let idx = cellGet(i);
+            if (arrayGet(a, idx) != arrayGet(b, idx)) cellSet(eq, false) else ();
+            cellSet(i, idx + 1)
+        };
+        cellGet(eq)
+    }
+}
+
+def collectLocalAllocs(
+    tm: TaggedTerm,
+    recAdts: StrMap Bool,
+    allocMap: StrMap (Bool, List String),
+    allocKeys: Cell (List String)
+): Void = match tm.tnode {
+    TmMakeCls(vd, cls, body) -> {
+        if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
+        strMapInsert(allocMap, vd.vname, (false, cls.clsFvs));
+        collectLocalAllocs(body, recAdts, allocMap, allocKeys)
+    },
+    TmLet(vd, val, body) -> {
+        match val.tnode {
+            TmMakeData(tn, _, fs, _, _) -> {
+                let seen: StrMap Bool = strMapNew();
+                let contained = cellNew(Nil);
+                collectVarsInCoreList(fs, seen, contained);
+                if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
+                strMapInsert(allocMap, vd.vname, (strMapContains(recAdts, tn), cellGet(contained)))
+            },
+            _ -> (),
+        };
+        collectLocalAllocs(val, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(body, recAdts, allocMap, allocKeys)
+    },
+    TmIf(c, t, e) -> {
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(t, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(e, recAdts, allocMap, allocKeys)
+    },
+    TmWhile(c, b) -> {
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(b, recAdts, allocMap, allocKeys)
+    },
+    TmBin(_, l, r) -> {
+        collectLocalAllocs(l, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(r, recAdts, allocMap, allocKeys)
+    },
+    TmUn(_, e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys),
+    TmGetTag(e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys),
+    TmMatch(s, arms) -> {
+        collectLocalAllocs(s, recAdts, allocMap, allocKeys);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> collectLocalAllocs(g, recAdts, allocMap, allocKeys), None -> () };
+                    collectLocalAllocs(a.caBody, recAdts, allocMap, allocKeys);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmApplyDir(_, es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
+    TmTuple(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
+    TmBlock(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
+    TmMakeData(_, _, es, _, _) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
+    TmApplyCls(c, args) -> {
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
+        collectLocalAllocsInList(args, recAdts, allocMap, allocKeys)
+    },
+    _ -> (),
+}
+
+def collectLocalAllocsInList(
+    es: List TaggedTerm,
+    recAdts: StrMap Bool,
+    allocMap: StrMap (Bool, List String),
+    allocKeys: Cell (List String)
+): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectLocalAllocs(h, recAdts, allocMap, allocKeys);
+        collectLocalAllocsInList(t, recAdts, allocMap, allocKeys)
+    },
+}
+
+def markEscaping(id: String, allocMap: StrMap (Bool, List String), escaping: StrMap Bool, escList: Cell (List String)): Void =
+    if (strMapContains(allocMap, id) && !strMapContains(escaping, id)) {
+        strMapInsert(escaping, id, true);
+        cellSet(escList, Cons(id, cellGet(escList)))
+    } else ()
+
+def markVarsEscaping(vars: List String, allocMap: StrMap (Bool, List String), escaping: StrMap Bool, escList: Cell (List String)): Void = match vars {
+    Nil -> (),
+    Cons(v, r) -> {
+        markEscaping(v, allocMap, escaping, escList);
+        markVarsEscaping(r, allocMap, escaping, escList)
+    },
+}
+
+def analyzeAllocEscapes(
+    tm: TaggedTerm,
+    allocMap: StrMap (Bool, List String),
+    escaping: StrMap Bool,
+    escList: Cell (List String),
+    allParamEscapes: StrMap (MutArray Int),
+    recAdts: StrMap Bool,
+    inTail: Bool
+): Void = match tm.tnode {
+    TmVar(id) -> if (inTail) markEscaping(id, allocMap, escaping, escList) else (),
+    TmTuple(es) -> {
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeCls(_, cls, body) -> {
+        markVarsEscaping(cls.clsFvs, allocMap, escaping, escList);
+        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+    },
+    TmLet(_, val, body) -> {
+        match val.tnode {
+            TmMakeData(_, _, fs, _, _) -> {
+                let cur = cellNew(fs);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(f, r) -> {
+                            analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+            _ -> {
+                markVarsEscaping(varsOfTerm(val), allocMap, escaping, escList);
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false)
+            },
+        };
+        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+    },
+    TmApplyDir(vd, args) -> match strMapGet(allParamEscapes, vd.vname) {
+        Some(calleeEsc) -> {
+            let cLen = arrayLen(calleeEsc);
+            let idx = cellNew(0);
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arg, r) -> {
+                        let i = cellGet(idx);
+                        let argEscapes =
+                            if (i < cLen) {
+                                let ce = arrayGet(calleeEsc, i);
+                                if (ce >= 2) true else if (ce == 1) inTail else false
+                            } else true;
+                        if (argEscapes) markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList) else ();
+                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, argEscapes);
+                        cellSet(idx, i + 1);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        None -> {
+            let cur = cellNew(args);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arg, r) -> {
+                        markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList);
+                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    },
+    TmApplyCls(c, args) -> {
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(arg, r) -> {
+                    markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList);
+                    analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmIf(c, t, e) -> {
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        analyzeAllocEscapes(t, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
+        analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+    },
+    TmWhile(c, b) -> {
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        let loopMap: StrMap (Bool, List String) = strMapNew();
+        let loopKeys = cellNew(Nil);
+        collectLocalAllocs(b, recAdts, loopMap, loopKeys);
+        markVarsEscaping(cellGet(loopKeys), allocMap, escaping, escList);
+        analyzeAllocEscapes(b, allocMap, escaping, escList, allParamEscapes, recAdts, true)
+    },
+    TmBin(_, l, r) -> {
+        analyzeAllocEscapes(l, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        analyzeAllocEscapes(r, allocMap, escaping, escList, allParamEscapes, recAdts, false)
+    },
+    TmUn(_, e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+    TmGetTag(e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+    TmMatch(s, arms) -> {
+        if (inTail) markVarsEscaping(varsOfTerm(s), allocMap, escaping, escList) else ();
+        let scrutVars = varsOfTerm(s);
+        let pvarsAll = cellNew(Nil);
+        let cur0 = cellNew(arms);
+        while (match cellGet(cur0) { Nil -> false, _ -> true }) {
+            match cellGet(cur0) {
+                Cons(a, r) -> {
+                    cellSet(pvarsAll, collectPatVarsList(a.caPat, cellGet(pvarsAll)));
+                    cellSet(cur0, r)
+                },
+                Nil -> (),
+            }
+        };
+        let cp = cellNew(cellGet(pvarsAll));
+        let scrutAdded = cellNew(false);
+        while (match cellGet(cp) { Nil -> false, _ -> !cellGet(scrutAdded) }) {
+            match cellGet(cp) {
+                Cons(pv, rp) -> {
+                    // Conservatively propagate if pattern-extracted field could be stored/captured inside arm
+                    let curSV = cellNew(scrutVars);
+                    while (match cellGet(curSV) { Nil -> false, _ -> true }) {
+                        match cellGet(curSV) {
+                            Cons(sv, rsv) -> {
+                                match strMapGet(allocMap, sv) {
+                                    Some((isRec, cList)) ->
+                                        strMapInsert(allocMap, pv, (isRec, Cons(sv, cList))),
+                                    None -> (),
+                                };
+                                cellSet(curSV, rsv)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellSet(cp, rp)
+                },
+                Nil -> (),
+            }
+        };
+        analyzeAllocEscapes(s, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> analyzeAllocEscapes(g, allocMap, escaping, escList, allParamEscapes, recAdts, false), None -> () };
+                    analyzeAllocEscapes(a.caBody, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, fs, _, _) -> {
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(f, r) -> {
+                    markVarsEscaping(varsOfTerm(f), allocMap, escaping, escList);
+                    analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmBlock(items) -> {
+        let cur = cellNew(items);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(it, r) -> {
+                    let isLast = match r { Nil -> true, _ -> false };
+                    analyzeAllocEscapes(it, allocMap, escaping, escList, allParamEscapes, recAdts, inTail && isLast);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    _ -> (),
+}
+
+def runEscapeAnalysis(
+    fns: StrMap FunDef,
+    fnNames: List String,
+    adtReg: StrMap AdtInfo,
+    adtNames: Vec String
+): EscapeInfo = {
+    let recAdts = computeRecursiveAdts(adtReg, adtNames);
+
+    // Phase 1: Interprocedural parameter escape fixed-point
+    let paramEscapes: StrMap (MutArray Int) = strMapNew();
+    let cf0 = cellNew(fnNames);
+    while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+        match cellGet(cf0) {
+            Cons(fnm, r) -> {
+                match strMapGet(fns, fnm) {
+                    Some(fd) -> strMapInsert(paramEscapes, fnm, arrayNew(listLen(fd.fnParams), 0)),
+                    None -> (),
+                };
+                cellSet(cf0, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let changed = cellNew(true);
+    let iters = cellNew(0);
+    while (cellGet(changed) && cellGet(iters) < 64) {
+        cellSet(changed, false);
+        cellSet(iters, cellGet(iters) + 1);
+        let cf = cellNew(fnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnm, r) -> {
+                    match strMapGet(fns, fnm) {
+                        Some(fd) -> {
+                            let pCount = listLen(fd.fnParams);
+                            let nextEsc = arrayNew(pCount, 0);
+                            let taints: StrMap (List Int) = strMapNew();
+                            let pi = cellNew(0);
+                            let cp = cellNew(fd.fnParams);
+                            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(pvd, rp) -> {
+                                        let idx = cellGet(pi);
+                                        strMapInsert(taints, pvd.vname, [idx]);
+                                        cellSet(pi, idx + 1);
+                                        cellSet(cp, rp)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            analyzeParamEscapesInTerm(fd.fnBody, taints, nextEsc, paramEscapes, recAdts, true);
+                            match strMapGet(paramEscapes, fnm) {
+                                Some(oldEsc) ->
+                                    if (!intArraysEqual(oldEsc, nextEsc)) {
+                                        cellSet(changed, true);
+                                        strMapInsert(paramEscapes, fnm, nextEsc)
+                                    } else (),
+                                None -> strMapInsert(paramEscapes, fnm, nextEsc),
+                            }
+                        },
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
+    // Phase 2: Intraprocedural local allocation analysis + containment propagation
+    let fnStackVars: StrMap (StrMap Bool) = strMapNew();
+    let fnHasStack: StrMap Bool = strMapNew();
+    let cf2 = cellNew(fnNames);
+    while (match cellGet(cf2) { Nil -> false, _ -> true }) {
+        match cellGet(cf2) {
+            Cons(fnm, r) -> {
+                match strMapGet(fns, fnm) {
+                    Some(fd) -> {
+                        let allocMap: StrMap (Bool, List String) = strMapNew();
+                        let allocKeys = cellNew(Nil);
+                        collectLocalAllocs(fd.fnBody, recAdts, allocMap, allocKeys);
+                        let origKeys = cellGet(allocKeys);
+
+                        let escaping: StrMap Bool = strMapNew();
+                        let escList = cellNew(Nil);
+                        let ck0 = cellNew(origKeys);
+                        while (match cellGet(ck0) { Nil -> false, _ -> true }) {
+                            match cellGet(ck0) {
+                                Cons(aid, rk) -> {
+                                    match strMapGet(allocMap, aid) {
+                                        Some((isRec, _)) -> if (isRec) markEscaping(aid, allocMap, escaping, escList) else (),
+                                        None -> (),
+                                    };
+                                    cellSet(ck0, rk)
+                                },
+                                Nil -> (),
+                            }
+                        };
+
+                        analyzeAllocEscapes(fd.fnBody, allocMap, escaping, escList, paramEscapes, recAdts, true);
+
+                        // Containment fixed-point propagation
+                        let propChanged = cellNew(true);
+                        while (cellGet(propChanged)) {
+                            cellSet(propChanged, false);
+                            let snap = cellGet(escList);
+                            let cs = cellNew(snap);
+                            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                match cellGet(cs) {
+                                    Cons(outerId, rs) -> {
+                                        match strMapGet(allocMap, outerId) {
+                                            Some((_, contained)) -> {
+                                                let cc = cellNew(contained);
+                                                while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                                                    match cellGet(cc) {
+                                                        Cons(innerId, rc) -> {
+                                                            if (strMapContains(allocMap, innerId) && !strMapContains(escaping, innerId)) {
+                                                                strMapInsert(escaping, innerId, true);
+                                                                cellSet(escList, Cons(innerId, cellGet(escList)));
+                                                                cellSet(propChanged, true)
+                                                            } else ();
+                                                            cellSet(cc, rc)
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                }
+                                            },
+                                            None -> (),
+                                        };
+                                        cellSet(cs, rs)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        };
+
+                        let stackSet: StrMap Bool = strMapNew();
+                        let hasStack = cellNew(false);
+                        let ck1 = cellNew(origKeys);
+                        while (match cellGet(ck1) { Nil -> false, _ -> true }) {
+                            match cellGet(ck1) {
+                                Cons(aid, rk) -> {
+                                    if (!strMapContains(escaping, aid)) {
+                                        strMapInsert(stackSet, aid, true);
+                                        cellSet(hasStack, true)
+                                    } else ();
+                                    cellSet(ck1, rk)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(fnStackVars, fnm, stackSet);
+                        if (cellGet(hasStack)) strMapInsert(fnHasStack, fnm, true) else ()
+                    },
+                    None -> (),
+                };
+                cellSet(cf2, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    MkEscapeInfo {
+        escRecAdts: recAdts,
+        escFnStackVars: fnStackVars,
+        escFnHasStack: fnHasStack,
+    }
+}
+
+pub def isStackAlloc(esc: EscapeInfo, fnName: String, bindingName: String): Bool =
+    match strMapGet(esc.escFnStackVars, fnName) {
+        Some(m) -> strMapContains(m, bindingName),
+        None -> false,
+    }
+
+pub def fnHasStackAlloc(esc: EscapeInfo, fnName: String): Bool =
+    strMapContains(esc.escFnHasStack, fnName)
+
+pub def isRecursiveAdt(esc: EscapeInfo, adtName: String): Bool =
+    strMapContains(esc.escRecAdts, adtName)
+
+// ============================================================================
+// Top-Level Entry Point (`lowerToCore`)
+// ============================================================================
+
+pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
+    let ctorMap: StrMap (String, VariantInfo) = strMapNew();
+    let ai = cellNew(0);
+    while (cellGet(ai) < vecLen(inf.adtNames)) {
+        let adtName = vecGetOr(inf.adtNames, cellGet(ai), "");
+        match strMapGet(inf.adtReg, adtName) {
+            Some(ainfo) -> {
+                let cv = cellNew(ainfo.variants);
+                while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                    match cellGet(cv) {
+                        Cons(vi, r) -> {
+                            strMapInsert(ctorMap, vi.vname, (adtName, vi));
+                            cellSet(cv, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+            None -> (),
+        };
+        cellSet(ai, cellGet(ai) + 1)
+    };
+
+    let globalValSet: StrMap Bool = strMapNew();
+    let cd0 = cellNew(inf.defs);
+    while (match cellGet(cd0) { Nil -> false, _ -> true }) {
+        match cellGet(cd0) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> match f.node {
+                        ExAbs(_, _, _) -> (),
+                        _ -> strMapInsert(globalValSet, d.ident, true),
+                    },
+                    _ -> (),
+                };
+                cellSet(cd0, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let ctx = MkKCtx {
+        kCount: cellNew(0),
+        kCurrentFn: cellNew(""),
+        kLocalEnv: cellNew(Nil),
+        kLocalDirect: cellNew(Nil),
+        kPolyLifted: cellNew(Nil),
+        kGlobalFns: strMapNew(),
+        kAllFnNames: vecNew(),
+        kGlobalValsRev: cellNew(Nil),
+        kGlobalValSet: globalValSet,
+        kExterns: strMapNew(),
+        kExternNamesRev: cellNew(Nil),
+        kTopDirect: strMapNew(),
+        kLiftedClosures: strMapNew(),
+        kAdtReg: inf.adtReg,
+        kAdtNames: inf.adtNames,
+        kCtorMap: ctorMap,
+        kConceptReg: inf.conceptReg,
+        kInstanceReg: inf.instanceReg,
+        kConceptMethods: inf.conceptMethods,
+    };
+
+    // Pre-register direct top-level functions & externs
+    let cd1 = cellNew(inf.defs);
+    while (match cellGet(cd1) { Nil -> false, _ -> true }) {
+        match cellGet(cd1) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(_) ->
+                        if (!strMapContains(globalValSet, d.ident)) {
+                            strMapInsert(ctx.kTopDirect, d.ident, d.ident)
+                        } else (),
+                    ItExtern(linkName, scm) -> {
+                        strMapInsert(ctx.kTopDirect, d.ident, d.ident);
+                        strMapInsert(ctx.kExterns, d.ident, MkExternDef {
+                            extName: d.ident,
+                            extLink: linkName,
+                            extTy: schemeBody(scm),
+                        });
+                        cellSet(ctx.kExternNamesRev, Cons(d.ident, cellGet(ctx.kExternNamesRev)))
+                    },
+                    _ -> (),
+                };
+                cellSet(cd1, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Convert each top-level `ItForm`
+    let cd2 = cellNew(inf.defs);
+    while (match cellGet(cd2) { Nil -> false, _ -> true }) {
+        match cellGet(cd2) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> {
+                        cellSet(ctx.kCurrentFn, d.ident);
+                        match f.node {
+                            ExAbs(ps, _, bd) -> {
+                                let (lps, _, lbd) = transLambda(ctx, ps, bd, false);
+                                let _ = defineFn(ctx, d.ident, f.ty, lps, Nil, lbd);
+                                ()
+                            },
+                            _ -> {
+                                let initTerm = transformForm(ctx, f);
+                                cellSet(ctx.kGlobalValsRev, Cons(MkGlobalValDef {
+                                    gvName: d.ident,
+                                    gvTy: schemeBody(f.ty),
+                                    gvInit: initTerm,
+                                }, cellGet(ctx.kGlobalValsRev)))
+                            },
+                        }
+                    },
+                    _ -> (),
+                };
+                cellSet(cd2, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let (concreteFns, concreteNames, concreteGlobals) = runMonomorphizationWorklist(ctx);
+    verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
+    let escapeInfo = runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames);
+
+    Ok(MkCoreProgram {
+        coreFns: concreteFns,
+        coreFnNames: concreteNames,
+        coreGlobals: concreteGlobals,
+        coreExterns: ctx.kExterns,
+        coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
+        coreAdtReg: inf.adtReg,
+        coreEscape: escapeInfo,
+    })
+}

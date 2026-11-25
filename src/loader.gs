@@ -1,0 +1,1231 @@
+// Multi-file + Inline Module Loader, Topological Sort, and Qualified Name Rewriter (`loader`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend, listLen}
+use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
+use std.path.{pathJoin, pathStem}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use sys.fs.{fileExists, readFile}
+use std.char.isUpperByte
+use ast.{
+    Span, Visibility, VisPublic, isPublicVis,
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    ConstraintSpec, MkConstraint,
+    Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
+    VarDecl, MkVarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    MatchArm, MkMatchArm,
+    Form, MkForm, mkForm,
+    Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
+    ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    FieldDecl, MkFieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
+    VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
+    Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    Def, MkDef, UseSpec, useSpecLocalName,
+    UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
+    ModuleItem, ModDef, ModUse, ModSub, ModDecl, FileModule,
+    listContainsStr, addUniqueStr
+}
+use parser.{parseFileModule, defContainsTry, desugarTryInDef}
+use stdlib_bundle.builtinModuleSource
+
+pub data LoadedMod {
+    MkLoadedMod {
+        key: String,
+        modPath: List String,
+        defs: List (Visibility, Def),
+        imports: List (Visibility, UseItem),
+        submodules: List String,
+    },
+}
+
+pub data NameInfo {
+    MkNameInfo { qualifiedName: String, isPublic: Bool, definedInMod: String },
+}
+
+def listInit(xs: List String): List String = match xs {
+    Nil -> Nil,
+    Cons(_, Nil) -> Nil,
+    Cons(h, t) -> Cons(h, listInit(t)),
+}
+
+def listLastOr(xs: List String, fallback: String): String = match xs {
+    Nil -> fallback,
+    Cons(h, Nil) -> h,
+    Cons(_, t) -> listLastOr(t, fallback),
+}
+
+def importTargetModuleKey(u: UseItem): String = match u {
+    UseSingle(p) -> strJoin(listInit(p), "."),
+    UseAlias(p, _) -> strJoin(listInit(p), "."),
+    UseMulti(p, _) -> strJoin(p, "."),
+    UseGlob(p) -> strJoin(p, "."),
+}
+
+def extractModuleItems(
+    modPath: List String,
+    items: List ModuleItem,
+    inlineOut: Cell (List LoadedMod)
+): (List (Visibility, Def), List (Visibility, UseItem), List String) = {
+    let defs = cellNew(Nil);
+    let imps = cellNew(Nil);
+    let subs = cellNew(Nil);
+    let cur = cellNew(items);
+    let curKey = strJoin(modPath, ".");
+
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(vis, d), r) -> {
+                cellSet(defs, listAppend(cellGet(defs), [(vis, d)]));
+                cellSet(cur, r)
+            },
+            Cons(ModUse(vis, u), r) -> {
+                cellSet(imps, listAppend(cellGet(imps), [(vis, u)]));
+                cellSet(cur, r)
+            },
+            Cons(ModDecl(_, childName), r) -> {
+                let childKey = if (curKey == "") childName else curKey + "." + childName;
+                cellSet(subs, addUniqueStr(cellGet(subs), childKey));
+                cellSet(cur, r)
+            },
+            Cons(ModSub(_, subName, subItems, _), r) -> {
+                let subPath = listAppend(modPath, [subName]);
+                let subKey = strJoin(subPath, ".");
+                let (sDefs, sImps, sSubs) = extractModuleItems(subPath, subItems, inlineOut);
+                let subLoaded = MkLoadedMod {
+                    key: subKey,
+                    modPath: subPath,
+                    defs: sDefs,
+                    imports: sImps,
+                    submodules: sSubs,
+                };
+                cellSet(inlineOut, listAppend(cellGet(inlineOut), [subLoaded]));
+                cellSet(subs, addUniqueStr(cellGet(subs), subKey));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (cellGet(defs), cellGet(imps), cellGet(subs))
+}
+
+def resolveModFilePath(srcRoot: String, segs: List String): Option String = {
+    let cur = cellNew(segs);
+    let p = cellNew(srcRoot);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(s, r) -> {
+                cellSet(p, pathJoin(cellGet(p), s));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let directFile = cellGet(p) + ".gs";
+    if (fileExists(directFile)) Some(directFile)
+    else {
+        let modFile = pathJoin(cellGet(p), "mod.gs");
+        if (fileExists(modFile)) Some(modFile) else None
+    }
+}
+
+def loadFileModuleRec(
+    srcRoot: String,
+    segs: List String,
+    cache: StrMap LoadedMod,
+    orderKeys: Vec String,
+    loadingStack: List String
+): Result Void String = {
+    let key = strJoin(segs, ".");
+    if (strMapContains(cache, key)) Ok(())
+    else if (listContainsStr(loadingStack, key)) {
+        Err("Circular module dependency involving '" + key + "'")
+    } else {
+        match resolveModFilePath(srcRoot, segs) {
+            None -> Err("Module '" + key + "' not found under '" + srcRoot + "'"),
+            Some(fpath) -> {
+                let src = readFile(fpath)?;
+                let fm = parseFileModule(src, segs)?;
+                let inlines: Cell (List LoadedMod) = cellNew(Nil);
+                let (defs, imps, subs) = extractModuleItems(segs, fm.items, inlines);
+                let loaded = MkLoadedMod {
+                    key: key,
+                    modPath: segs,
+                    defs: defs,
+                    imports: imps,
+                    submodules: subs,
+                };
+                strMapInsert(cache, key, loaded);
+                vecPush(orderKeys, key);
+
+                let curInl = cellNew(cellGet(inlines));
+                while (match cellGet(curInl) { Nil -> false, _ -> true }) {
+                    match cellGet(curInl) {
+                        Cons(im, r) -> {
+                            strMapInsert(cache, im.key, im);
+                            vecPush(orderKeys, im.key);
+                            cellSet(curInl, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+
+                loadSubmoduleList(srcRoot, subs, cache, orderKeys, Cons(key, loadingStack))
+            },
+        }
+    }
+}
+
+def loadSubmoduleList(
+    srcRoot: String,
+    subs: List String,
+    cache: StrMap LoadedMod,
+    orderKeys: Vec String,
+    loadingStack: List String
+): Result Void String = match subs {
+    Nil -> Ok(()),
+    Cons(childKey, rest) -> {
+        if (!strMapContains(cache, childKey)) {
+            let childSegs = strSplitChar(childKey, '.');
+            loadFileModuleRec(srcRoot, childSegs, cache, orderKeys, loadingStack)?;
+            loadSubmoduleList(srcRoot, rest, cache, orderKeys, loadingStack)
+        } else loadSubmoduleList(srcRoot, rest, cache, orderKeys, loadingStack)
+    },
+}
+
+def moduleUsesTry(defs: List (Visibility, Def)): Bool = match defs {
+    Nil -> false,
+    Cons((_, d), r) -> if (defContainsTry(d)) true else moduleUsesTry(r),
+}
+
+def loadBuiltinImports(cache: StrMap LoadedMod, orderKeys: Vec String): Result Void String = {
+    let keepGoing = cellNew(true);
+    let errCell: Cell (Option String) = cellNew(None);
+
+    while (cellGet(keepGoing) && match cellGet(errCell) { None -> true, Some(_) -> false }) {
+        let needed = cellNew(Nil);
+        let n = vecLen(orderKeys);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let k = vecGetOr(orderKeys, cellGet(i), "");
+            match strMapGet(cache, k) {
+                Some(m) -> {
+                    if (!strMapContains(cache, "std.result") && moduleUsesTry(m.defs)) {
+                        cellSet(needed, addUniqueStr(cellGet(needed), "std.result"))
+                    } else ();
+                    let curImp = cellNew(m.imports);
+                    while (match cellGet(curImp) { Nil -> false, _ -> true }) {
+                        match cellGet(curImp) {
+                            Cons((_, u), r) -> {
+                                let target = importTargetModuleKey(u);
+                                if (target != "" && !strMapContains(cache, target)) {
+                                    match builtinModuleSource(target) {
+                                        Some(_) -> cellSet(needed, addUniqueStr(cellGet(needed), target)),
+                                        None -> (),
+                                    }
+                                } else ();
+                                cellSet(curImp, r)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+
+        match cellGet(needed) {
+            Nil -> cellSet(keepGoing, false),
+            reqList -> {
+                let curReq = cellNew(reqList);
+                while (match cellGet(curReq) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                    match cellGet(curReq) {
+                        Cons(bkey, r) -> {
+                            match builtinModuleSource(bkey) {
+                                Some(bsrc) -> {
+                                    let bsegs = strSplitChar(bkey, '.');
+                                    match parseFileModule(bsrc, bsegs) {
+                                        Ok(fm) -> {
+                                            let inlines: Cell (List LoadedMod) = cellNew(Nil);
+                                            let (defs, imps, subs) = extractModuleItems(bsegs, fm.items, inlines);
+                                            strMapInsert(cache, bkey, MkLoadedMod {
+                                                key: bkey,
+                                                modPath: bsegs,
+                                                defs: defs,
+                                                imports: imps,
+                                                submodules: subs,
+                                            });
+                                            vecPush(orderKeys, bkey)
+                                        },
+                                        Err(e) -> cellSet(errCell, Some("Stdlib '" + bkey + "': " + e)),
+                                    }
+                                },
+                                None -> (),
+                            };
+                            cellSet(curReq, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+        }
+    };
+
+    match cellGet(errCell) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
+def entryPathToSegments(entryFile: String, srcRoot: String): List String = {
+    let normRoot = if (srcRoot == ".") "" else if (strEndsWith(srcRoot, "/")) srcRoot else srcRoot + "/";
+    let rel0 = if (strStartsWith(entryFile, "./")) strSlice(entryFile, 2, strLen(entryFile)) else entryFile;
+    let rel = if (normRoot != "" && strStartsWith(rel0, normRoot)) {
+        strSlice(rel0, strLen(normRoot), strLen(rel0))
+    } else rel0;
+
+    let withoutGs = if (strEndsWith(rel, ".gs")) strSlice(rel, 0, strLen(rel) - 3) else rel;
+    let rawSegs = strSplitChar(withoutGs, '/');
+    let stripped = if (listLastOr(rawSegs, "") == "mod") listInit(rawSegs) else rawSegs;
+    match stripped {
+        Nil -> [pathStem(entryFile)],
+        _ -> stripped,
+    }
+}
+
+def relativeModulePrefix(modKey: String, entryKey: String): String =
+    if (modKey == entryKey) ""
+    else if (entryKey != "" && strStartsWith(modKey, entryKey + ".")) {
+        strSlice(modKey, strLen(entryKey) + 1, strLen(modKey))
+    } else modKey
+
+// ============================================================================
+// Topological Sort & Qualified Module AST Rewriting
+// ============================================================================
+
+def topoVisit(
+    key: String,
+    depsMap: StrMap (List String),
+    stateMap: StrMap Int,
+    outOrder: Cell (List String)
+): Result Void String = {
+    let st = match strMapGet(stateMap, key) { Some(v) -> v, None -> 0 };
+    if (st == 2) Ok(())
+    else if (st == 1) Err("Circular dependency detected involving module '" + key + "'")
+    else {
+        strMapInsert(stateMap, key, 1);
+        let deps = match strMapGet(depsMap, key) { Some(ds) -> ds, None -> Nil };
+        topoVisitList(deps, depsMap, stateMap, outOrder)?;
+        strMapInsert(stateMap, key, 2);
+        cellSet(outOrder, listAppend(cellGet(outOrder), [key]));
+        Ok(())
+    }
+}
+
+def topoVisitList(
+    keys: List String,
+    depsMap: StrMap (List String),
+    stateMap: StrMap Int,
+    outOrder: Cell (List String)
+): Result Void String = match keys {
+    Nil -> Ok(()),
+    Cons(k, r) -> {
+        topoVisit(k, depsMap, stateMap, outOrder)?;
+        topoVisitList(r, depsMap, stateMap, outOrder)
+    },
+}
+
+def lookupCandidate(rawTarget: String, curMod: String, avail: StrMap NameInfo): Option NameInfo =
+    if (curMod != "") {
+        match strMapGet(avail, curMod + "." + rawTarget) {
+            Some(info) -> Some(info),
+            None -> strMapGet(avail, rawTarget),
+        }
+    } else strMapGet(avail, rawTarget)
+
+def resolveModuleImports(
+    imports: List (Visibility, UseItem),
+    curMod: String,
+    avail: StrMap NameInfo,
+    allExportKeys: Vec String
+): Result (List (String, String)) String = {
+    let mappings: Cell (List (String, String)) = cellNew(Nil);
+    let errCell: Cell (Option String) = cellNew(None);
+    let cur = cellNew(imports);
+
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons((_, UseSingle(path)), r) -> {
+                let fullPath = strJoin(path, ".");
+                let modStr = strJoin(listInit(path), ".");
+                let itemName = listLastOr(path, "");
+                match lookupCandidate(fullPath, curMod, avail) {
+                    Some(info) ->
+                        if (info.isPublic || info.definedInMod == curMod) {
+                            cellSet(mappings, listAppend(cellGet(mappings), [(itemName, info.qualifiedName)]))
+                        } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
+                    None -> cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                };
+                cellSet(cur, r)
+            },
+            Cons((_, UseAlias(path, alias)), r) -> {
+                let fullPath = strJoin(path, ".");
+                let modStr = strJoin(listInit(path), ".");
+                let itemName = listLastOr(path, "");
+                match lookupCandidate(fullPath, curMod, avail) {
+                    Some(info) ->
+                        if (info.isPublic || info.definedInMod == curMod) {
+                            cellSet(mappings, listAppend(cellGet(mappings), [(alias, info.qualifiedName)]))
+                        } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
+                    None -> cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                };
+                cellSet(cur, r)
+            },
+            Cons((_, UseMulti(basePath, specs)), r) -> {
+                let baseStr = strJoin(basePath, ".");
+                let curSp = cellNew(specs);
+                while (match cellGet(curSp) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                    match cellGet(curSp) {
+                        Cons(sp, sr) -> {
+                            let fullPath = if (baseStr == "") sp.orig else baseStr + "." + sp.orig;
+                            match lookupCandidate(fullPath, curMod, avail) {
+                                Some(info) ->
+                                    if (info.isPublic || info.definedInMod == curMod) {
+                                        cellSet(mappings, listAppend(cellGet(mappings), [(useSpecLocalName(sp), info.qualifiedName)]))
+                                    } else cellSet(errCell, Some("cannot import private item '" + sp.orig + "' from module '" + baseStr + "'")),
+                                None -> cellSet(errCell, Some("item '" + sp.orig + "' not found in module '" + baseStr + "'")),
+                            };
+                            cellSet(curSp, sr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cur, r)
+            },
+            Cons((_, UseGlob(basePath)), r) -> {
+                let baseStr = strJoin(basePath, ".");
+                let pref1 = if (curMod != "") curMod + "." + baseStr + "." else "";
+                let pref2 = if (baseStr == "") "" else baseStr + ".";
+                let matched1 = cellNew(false);
+                if (pref1 != "") {
+                    let i = cellNew(0);
+                    while (cellGet(i) < vecLen(allExportKeys)) {
+                        let k = vecGetOr(allExportKeys, cellGet(i), "");
+                        if (strStartsWith(k, pref1)) {
+                            let rem = strSlice(k, strLen(pref1), strLen(k));
+                            if (rem != "" && listLen(strSplitChar(rem, '.')) == 1) {
+                                match strMapGet(avail, k) {
+                                    Some(info) ->
+                                        if (info.isPublic) {
+                                            cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]));
+                                            cellSet(matched1, true)
+                                        } else (),
+                                    None -> (),
+                                }
+                            } else ()
+                        } else ();
+                        cellSet(i, cellGet(i) + 1)
+                    }
+                } else ();
+
+                if (!cellGet(matched1)) {
+                    let i = cellNew(0);
+                    while (cellGet(i) < vecLen(allExportKeys)) {
+                        let k = vecGetOr(allExportKeys, cellGet(i), "");
+                        if (strStartsWith(k, pref2)) {
+                            let rem = strSlice(k, strLen(pref2), strLen(k));
+                            if (rem != "" && listLen(strSplitChar(rem, '.')) == 1) {
+                                match strMapGet(avail, k) {
+                                    Some(info) ->
+                                        if (info.isPublic) {
+                                            cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]))
+                                        } else (),
+                                    None -> (),
+                                }
+                            } else ()
+                        } else ();
+                        cellSet(i, cellGet(i) + 1)
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(errCell) {
+        Some(e) -> Err(e),
+        None -> Ok(cellGet(mappings)),
+    }
+}
+
+data ModRewriteCtx {
+    MkModRewriteCtx {
+        curPrefix: String,
+        valMap: StrMap String,
+        tyMap: StrMap String,
+        ctorMap: StrMap String,
+        avail: StrMap NameInfo,
+        allExportKeys: Vec String,
+        errors: Cell (List String),
+    },
+}
+
+def rewriteTypeInMod(ctx: ModRewriteCtx, ty: Type): Type = match ty {
+    TyVoid -> TyVoid,
+    TyVar(_) -> ty,
+    TyCon(n) -> match strMapGet(ctx.tyMap, n) {
+        Some(qn) -> TyCon(qn),
+        None -> ty,
+    },
+    TyArr(ps, r) -> TyArr(rewriteTypeListInMod(ctx, ps), rewriteTypeInMod(ctx, r)),
+    TyTuple(es) -> TyTuple(rewriteTypeListInMod(ctx, es)),
+    TyComp(b, a) -> TyComp(rewriteTypeInMod(ctx, b), rewriteTypeInMod(ctx, a)),
+}
+
+def rewriteTypeListInMod(ctx: ModRewriteCtx, ts: List Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(rewriteTypeInMod(ctx, h), rewriteTypeListInMod(ctx, t)),
+}
+
+def rewriteConstraintsInMod(ctx: ModRewriteCtx, cs: List ConstraintSpec): List ConstraintSpec = match cs {
+    Nil -> Nil,
+    Cons(c, r) -> {
+        let qc = match strMapGet(ctx.tyMap, c.conceptName) {
+            Some(q) -> q,
+            None -> c.conceptName,
+        };
+        Cons(MkConstraint { conceptName: qc, typeVar: c.typeVar }, rewriteConstraintsInMod(ctx, r))
+    },
+}
+
+def rewriteSchemeInMod(ctx: ModRewriteCtx, scm: Scheme): Scheme = match scm {
+    ScmMono(t) -> ScmMono(rewriteTypeInMod(ctx, t)),
+    ScmPoly(vs, t) -> ScmPoly(vs, rewriteTypeInMod(ctx, t)),
+    ScmPolyConstrained(vs, cs, t) -> ScmPolyConstrained(vs, rewriteConstraintsInMod(ctx, cs), rewriteTypeInMod(ctx, t)),
+    ScmSlot -> ScmSlot,
+}
+
+def rewritePatInMod(ctx: ModRewriteCtx, pat: Pattern, bound: Cell (List String)): Pattern = match pat {
+    PatVar(v) -> {
+        cellSet(bound, addUniqueStr(cellGet(bound), v));
+        PatVar(v)
+    },
+    PatWild -> PatWild,
+    PatLit(_) -> pat,
+    PatTuple(ps) -> PatTuple(rewritePatListInMod(ctx, ps, bound)),
+    PatCtor(cn, ps) -> {
+        let qcn = match strMapGet(ctx.ctorMap, cn) { Some(q) -> q, None -> cn };
+        PatCtor(qcn, rewritePatListInMod(ctx, ps, bound))
+    },
+    PatStruct(cn, fs) -> {
+        let qcn = match strMapGet(ctx.ctorMap, cn) { Some(q) -> q, None -> cn };
+        PatStruct(qcn, rewritePatStructFields(ctx, fs, bound))
+    },
+}
+
+def rewritePatListInMod(ctx: ModRewriteCtx, ps: List Pattern, bound: Cell (List String)): List Pattern = match ps {
+    Nil -> Nil,
+    Cons(h, t) -> {
+        let nh = rewritePatInMod(ctx, h, bound);
+        Cons(nh, rewritePatListInMod(ctx, t, bound))
+    },
+}
+
+def rewritePatStructFields(ctx: ModRewriteCtx, fs: List (String, Pattern), bound: Cell (List String)): List (String, Pattern) = match fs {
+    Nil -> Nil,
+    Cons((k, p), t) -> {
+        let np = rewritePatInMod(ctx, p, bound);
+        Cons((k, np), rewritePatStructFields(ctx, t, bound))
+    },
+}
+
+def flattenFieldChain(f: Form): Option (String, List (Span, String)) = match f.node {
+    ExVar(root) -> Some((root, Nil)),
+    ExField(inner, fname) -> match flattenFieldChain(inner) {
+        Some((root, segs)) -> Some((root, listAppend(segs, [(f.pos, fname)]))),
+        None -> None,
+    },
+    _ -> None,
+}
+
+def hasKnownModulePrefix(allKeys: Vec String, modDot: String): Bool = {
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < vecLen(allKeys) && !cellGet(found)) {
+        if (strStartsWith(vecGetOr(allKeys, cellGet(i), ""), modDot)) cellSet(found, true)
+        else cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def rewriteFormListInMod(ctx: ModRewriteCtx, es: List Form, bound: List String): List Form = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(rewriteFormInMod(ctx, h, bound), rewriteFormListInMod(ctx, t, bound)),
+}
+
+def rewriteNamedFormsInMod(ctx: ModRewriteCtx, fs: List (String, Form), bound: List String): List (String, Form) = match fs {
+    Nil -> Nil,
+    Cons((k, v), t) -> Cons((k, rewriteFormInMod(ctx, v, bound)), rewriteNamedFormsInMod(ctx, t, bound)),
+}
+
+def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
+    let newAnn = match f.annot {
+        Some(a) -> Some(rewriteSchemeInMod(ctx, a)),
+        None -> None,
+    };
+    let newNode = match f.node {
+        ExLit(_) -> f.node,
+        ExVar(name) ->
+            if (listContainsStr(bound, name)) ExVar(name)
+            else match strMapGet(ctx.valMap, name) {
+                Some(qn) -> ExVar(qn),
+                None -> ExVar(name),
+            },
+        ExField(base, fname) -> {
+            let resolvedChain: Option Expr = match flattenFieldChain(base) {
+                Some((root, segs0)) -> {
+                    let segs = listAppend(segs0, [(f.pos, fname)]);
+                    if (listContainsStr(bound, root) || strMapContains(ctx.valMap, root) || strMapContains(ctx.avail, root)) {
+                        None
+                    } else {
+                        // Try longest prefix `root.s0...sk` in `ctx.avail`
+                        let segVec: Vec (Span, String) = vecNew();
+                        let curS = cellNew(segs);
+                        while (match cellGet(curS) { Nil -> false, _ -> true }) {
+                            match cellGet(curS) {
+                                Cons(pair, r) -> { vecPush(segVec, pair); cellSet(curS, r) },
+                                Nil -> (),
+                            }
+                        };
+                        let totalSegs = vecLen(segVec);
+                        let matchedK = cellNew(-1);
+                        let matchedInfo: Cell (Option NameInfo) = cellNew(None);
+                        let k = cellNew(totalSegs - 1);
+                        while (cellGet(k) >= 0 && cellGet(matchedK) < 0) {
+                            let parts = cellNew([root]);
+                            let j = cellNew(0);
+                            while (cellGet(j) <= cellGet(k)) {
+                                let (_, sn) = vecGetOr(segVec, cellGet(j), (f.pos, ""));
+                                cellSet(parts, listAppend(cellGet(parts), [sn]));
+                                cellSet(j, cellGet(j) + 1)
+                            };
+                            let cand = strJoin(cellGet(parts), ".");
+                            match lookupCandidate(cand, ctx.curPrefix, ctx.avail) {
+                                Some(info) -> {
+                                    cellSet(matchedK, cellGet(k));
+                                    cellSet(matchedInfo, Some(info))
+                                },
+                                None -> cellSet(k, cellGet(k) - 1),
+                            }
+                        };
+
+                        match cellGet(matchedInfo) {
+                            Some(info) -> {
+                                let mk = cellGet(matchedK);
+                                let (mkSp, mkName) = vecGetOr(segVec, mk, (f.pos, fname));
+                                if (!info.isPublic && info.definedInMod != ctx.curPrefix) {
+                                    cellSet(ctx.errors, listAppend(cellGet(ctx.errors), [
+                                        "cannot access private item '" + mkName + "' from module '" + info.definedInMod + "'"
+                                    ]))
+                                } else ();
+                                let rebuilt = cellNew(mkForm(mkSp, ExVar(info.qualifiedName)));
+                                let remIdx = cellNew(mk + 1);
+                                while (cellGet(remIdx) < totalSegs) {
+                                    let (rsp, rname) = vecGetOr(segVec, cellGet(remIdx), (f.pos, ""));
+                                    cellSet(rebuilt, mkForm(rsp, ExField(cellGet(rebuilt), rname)));
+                                    cellSet(remIdx, cellGet(remIdx) + 1)
+                                };
+                                Some(cellGet(rebuilt).node)
+                            },
+                            None -> {
+                                // Check missing module item error
+                                let modParts = cellNew([root]);
+                                let j = cellNew(0);
+                                while (cellGet(j) < totalSegs - 1) {
+                                    let (_, sn) = vecGetOr(segVec, cellGet(j), (f.pos, ""));
+                                    cellSet(modParts, listAppend(cellGet(modParts), [sn]));
+                                    cellSet(j, cellGet(j) + 1)
+                                };
+                                let modCand = strJoin(cellGet(modParts), ".");
+                                if (hasKnownModulePrefix(ctx.allExportKeys, modCand + ".")) {
+                                    cellSet(ctx.errors, listAppend(cellGet(ctx.errors), [
+                                        "item '" + fname + "' not found in module '" + modCand + "'"
+                                    ]));
+                                    Some(ExVar(fname))
+                                } else None
+                            },
+                        }
+                    }
+                },
+                None -> None,
+            };
+            match resolvedChain {
+                Some(en) -> en,
+                None -> ExField(rewriteFormInMod(ctx, base, bound), fname),
+            }
+        },
+        ExStructInit(cname, fs) -> {
+            let qcn = match strMapGet(ctx.ctorMap, cname) { Some(q) -> q, None -> cname };
+            ExStructInit(qcn, rewriteNamedFormsInMod(ctx, fs, bound))
+        },
+        ExTuple(es) -> ExTuple(rewriteFormListInMod(ctx, es, bound)),
+        ExList(es) -> ExList(rewriteFormListInMod(ctx, es, bound)),
+        ExBlock(es) -> ExBlock(rewriteFormListInMod(ctx, es, bound)),
+        ExApply(c, args) -> ExApply(rewriteFormInMod(ctx, c, bound), rewriteFormListInMod(ctx, args, bound)),
+        ExBin(op, l, r) -> ExBin(op, rewriteFormInMod(ctx, l, bound), rewriteFormInMod(ctx, r, bound)),
+        ExUn(op, e) -> ExUn(op, rewriteFormInMod(ctx, e, bound)),
+        ExTry(e) -> ExTry(rewriteFormInMod(ctx, e, bound)),
+        ExIf(c, t, e) -> ExIf(rewriteFormInMod(ctx, c, bound), rewriteFormInMod(ctx, t, bound), rewriteFormInMod(ctx, e, bound)),
+        ExWhile(c, b) -> ExWhile(rewriteFormInMod(ctx, c, bound), rewriteFormInMod(ctx, b, bound)),
+        ExAbs(ps, rt, body) -> {
+            let innerBound = cellNew(bound);
+            let newPs = cellNew(Nil);
+            let cur = cellNew(ps);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(vd, r) -> {
+                        cellSet(innerBound, addUniqueStr(cellGet(innerBound), vd.vname));
+                        cellSet(newPs, listAppend(cellGet(newPs), [MkVarDecl { vname: vd.vname, vscm: rewriteSchemeInMod(ctx, vd.vscm) }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let newRt = match rt { Some(t) -> Some(rewriteTypeInMod(ctx, t)), None -> None };
+            ExAbs(cellGet(newPs), newRt, rewriteFormInMod(ctx, body, cellGet(innerBound)))
+        },
+        ExLet(vd, val, body) -> {
+            let nvd = MkVarDecl { vname: vd.vname, vscm: rewriteSchemeInMod(ctx, vd.vscm) };
+            let valBound = match val.node {
+                ExAbs(_, _, _) -> addUniqueStr(bound, vd.vname),
+                _ -> bound,
+            };
+            let bodyBound = addUniqueStr(bound, vd.vname);
+            ExLet(nvd, rewriteFormInMod(ctx, val, valBound), rewriteFormInMod(ctx, body, bodyBound))
+        },
+        ExMatch(scrut, arms) -> {
+            let cs = rewriteFormInMod(ctx, scrut, bound);
+            let newArms = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let armBound = cellNew(bound);
+                        let np = rewritePatInMod(ctx, a.pat, armBound);
+                        let ng = match a.guard {
+                            Some(g) -> Some(rewriteFormInMod(ctx, g, cellGet(armBound))),
+                            None -> None,
+                        };
+                        let nb = rewriteFormInMod(ctx, a.body, cellGet(armBound));
+                        cellSet(newArms, listAppend(cellGet(newArms), [MkMatchArm { pat: np, guard: ng, body: nb }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ExMatch(cs, cellGet(newArms))
+        },
+    };
+    MkForm { pos: f.pos, ty: f.ty, annot: newAnn, node: newNode }
+}
+
+def rewriteFieldsInMod(ctx: ModRewriteCtx, fs: List FieldDecl): List FieldDecl = match fs {
+    Nil -> Nil,
+    Cons(f, r) -> Cons(MkFieldDecl { fname: f.fname, fty: rewriteTypeInMod(ctx, f.fty) }, rewriteFieldsInMod(ctx, r)),
+}
+
+def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
+    let qIdent = match strMapGet(ctx.valMap, d.ident) {
+        Some(q) -> q,
+        None -> d.ident,
+    };
+    let newItem = match d.item {
+        ItForm(f) -> ItForm(rewriteFormInMod(ctx, f, Nil)),
+        ItExtern(sym, scm) -> ItExtern(sym, rewriteSchemeInMod(ctx, scm)),
+        ItAlias(ps, scm) -> ItAlias(ps, rewriteSchemeInMod(ctx, scm)),
+        ItAlg(ps, vs) -> {
+            let newVs = cellNew(Nil);
+            let cur = cellNew(vs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(v, r) -> {
+                        let qvn = match strMapGet(ctx.ctorMap, v.vname) { Some(q) -> q, None -> v.vname };
+                        let nvb = match v.vbody {
+                            VarUnit -> VarUnit,
+                            VarTuple(fs) -> VarTuple(rewriteFieldsInMod(ctx, fs)),
+                            VarStruct(fs) -> VarStruct(rewriteFieldsInMod(ctx, fs)),
+                        };
+                        cellSet(newVs, listAppend(cellGet(newVs), [MkVariantDef { vname: qvn, vbody: nvb }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ItAlg(ps, cellGet(newVs))
+        },
+        ItConcept(ps, supers, ms) -> {
+            let newMs = cellNew(Nil);
+            let cur = cellNew(ms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(m, r) -> {
+                        let qmn = match strMapGet(ctx.valMap, m.mname) { Some(q) -> q, None -> m.mname };
+                        cellSet(newMs, listAppend(cellGet(newMs), [MkMethodDecl { mname: qmn, mty: rewriteSchemeInMod(ctx, m.mty) }]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ItConcept(ps, rewriteConstraintsInMod(ctx, supers), cellGet(newMs))
+        },
+        ItInstance(cname, targs, cs, impls) -> {
+            let qcn = match strMapGet(ctx.tyMap, cname) { Some(q) -> q, None -> cname };
+            let newImpls = cellNew(Nil);
+            let cur = cellNew(impls);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(mi, r) -> {
+                        let nmi = MkMethodImpl { implName: mi.implName, implBody: rewriteFormInMod(ctx, mi.implBody, Nil) };
+                        cellSet(newImpls, listAppend(cellGet(newImpls), [nmi]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ItInstance(qcn, rewriteTypeListInMod(ctx, targs), rewriteConstraintsInMod(ctx, cs), cellGet(newImpls))
+        },
+    };
+    MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, item: newItem }
+}
+
+def registerExport(
+    avail: StrMap NameInfo,
+    allExportKeys: Vec String,
+    key: String,
+    info: NameInfo
+): Void = {
+    if (!strMapContains(avail, key)) vecPush(allExportKeys, key) else ();
+    strMapInsert(avail, key, info)
+}
+
+def compileLoadedCache(
+    cache: StrMap LoadedMod,
+    orderKeys: Vec String,
+    entryKey: String
+): Result (List Def) String = {
+    // 1. Build prefix -> key map & dependency graph
+    let prefixToKey: StrMap String = strMapNew();
+    let totalMods = vecLen(orderKeys);
+    let i0 = cellNew(0);
+    while (cellGet(i0) < totalMods) {
+        let mk = vecGetOr(orderKeys, cellGet(i0), "");
+        strMapInsert(prefixToKey, relativeModulePrefix(mk, entryKey), mk);
+        cellSet(i0, cellGet(i0) + 1)
+    };
+
+    let depsMap: StrMap (List String) = strMapNew();
+    let i1 = cellNew(0);
+    while (cellGet(i1) < totalMods) {
+        let mk = vecGetOr(orderKeys, cellGet(i1), "");
+        let mPref = relativeModulePrefix(mk, entryKey);
+        let deps = cellNew(Nil);
+        match strMapGet(cache, mk) {
+            Some(m) -> {
+                if (strMapContains(cache, "std.result") && mk != "std.result" && moduleUsesTry(m.defs)) {
+                    cellSet(deps, addUniqueStr(cellGet(deps), "std.result"))
+                } else ();
+                let curSub = cellNew(m.submodules);
+                while (match cellGet(curSub) { Nil -> false, _ -> true }) {
+                    match cellGet(curSub) {
+                        Cons(ck, r) -> {
+                            if (ck != mk && strMapContains(cache, ck)) cellSet(deps, addUniqueStr(cellGet(deps), ck)) else ();
+                            cellSet(curSub, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let curImp = cellNew(m.imports);
+                while (match cellGet(curImp) { Nil -> false, _ -> true }) {
+                    match cellGet(curImp) {
+                        Cons((_, u), r) -> {
+                            let rawMod = importTargetModuleKey(u);
+                            if (rawMod != "") {
+                                let relCand = if (mPref == "") rawMod else mPref + "." + rawMod;
+                                let tkOpt = match strMapGet(prefixToKey, relCand) {
+                                    Some(tk) -> Some(tk),
+                                    None -> strMapGet(prefixToKey, rawMod),
+                                };
+                                match tkOpt {
+                                    Some(tk) -> if (tk != mk) cellSet(deps, addUniqueStr(cellGet(deps), tk)) else (),
+                                    None -> (),
+                                }
+                            } else ();
+                            cellSet(curImp, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+            None -> (),
+        };
+        strMapInsert(depsMap, mk, cellGet(deps));
+        cellSet(i1, cellGet(i1) + 1)
+    };
+
+    let stateMap: StrMap Int = strMapNew();
+    let topoOut: Cell (List String) = cellNew(Nil);
+    let allKeyList = cellNew(Nil);
+    let i2 = cellNew(0);
+    while (cellGet(i2) < totalMods) {
+        cellSet(allKeyList, listAppend(cellGet(allKeyList), [vecGetOr(orderKeys, cellGet(i2), "")]));
+        cellSet(i2, cellGet(i2) + 1)
+    };
+    topoVisitList(cellGet(allKeyList), depsMap, stateMap, topoOut)?;
+    let topoKeys = cellGet(topoOut);
+
+    // 2. Register module exports & own renames
+    let avail: StrMap NameInfo = strMapNew();
+    let allExportKeys: Vec String = vecNew();
+    let modOwnVals: StrMap (List (String, String)) = strMapNew();
+    let modOwnTys: StrMap (List (String, String)) = strMapNew();
+    let modOwnCtors: StrMap (List (String, String)) = strMapNew();
+
+    let curT = cellNew(topoKeys);
+    while (match cellGet(curT) { Nil -> false, _ -> true }) {
+        match cellGet(curT) {
+            Cons(mk, rT) -> {
+                let pref = relativeModulePrefix(mk, entryKey);
+                let ownV = cellNew(Nil);
+                let ownT = cellNew(Nil);
+                let ownC = cellNew(Nil);
+                match strMapGet(cache, mk) {
+                    Some(m) -> {
+                        let curD = cellNew(m.defs);
+                        while (match cellGet(curD) { Nil -> false, _ -> true }) {
+                            match cellGet(curD) {
+                                Cons((vis, d), rD) -> {
+                                    let orig = d.ident;
+                                    let qname = if (pref == "") orig else pref + "." + orig;
+                                    registerExport(avail, allExportKeys, qname, MkNameInfo {
+                                        qualifiedName: qname,
+                                        isPublic: isPublicVis(vis),
+                                        definedInMod: pref,
+                                    });
+                                    if (pref != "") {
+                                        cellSet(ownV, listAppend(cellGet(ownV), [(orig, qname)]));
+                                        match d.item {
+                                            ItAlg(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
+                                            ItAlias(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
+                                            ItConcept(_, _, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
+                                            _ -> (),
+                                        }
+                                    } else ();
+
+                                    match d.item {
+                                        ItAlg(_, vs) -> {
+                                            let curV = cellNew(vs);
+                                            while (match cellGet(curV) { Nil -> false, _ -> true }) {
+                                                match cellGet(curV) {
+                                                    Cons(vd, rV) -> {
+                                                        let qctor = if (pref == "") vd.vname else pref + "." + vd.vname;
+                                                        registerExport(avail, allExportKeys, qctor, MkNameInfo {
+                                                            qualifiedName: qctor,
+                                                            isPublic: isPublicVis(vis),
+                                                            definedInMod: pref,
+                                                        });
+                                                        if (pref != "") {
+                                                            cellSet(ownV, listAppend(cellGet(ownV), [(vd.vname, qctor)]));
+                                                            cellSet(ownC, listAppend(cellGet(ownC), [(vd.vname, qctor)]))
+                                                        } else ();
+                                                        cellSet(curV, rV)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        },
+                                        ItConcept(_, _, ms) -> {
+                                            let curM = cellNew(ms);
+                                            while (match cellGet(curM) { Nil -> false, _ -> true }) {
+                                                match cellGet(curM) {
+                                                    Cons(md, rM) -> {
+                                                        let qm = if (pref == "") md.mname else pref + "." + md.mname;
+                                                        registerExport(avail, allExportKeys, qm, MkNameInfo {
+                                                            qualifiedName: qm,
+                                                            isPublic: isPublicVis(vis),
+                                                            definedInMod: pref,
+                                                        });
+                                                        if (pref != "") {
+                                                            cellSet(ownV, listAppend(cellGet(ownV), [(md.mname, qm)]))
+                                                        } else ();
+                                                        cellSet(curM, rM)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        },
+                                        _ -> (),
+                                    };
+                                    cellSet(curD, rD)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    None -> (),
+                };
+                strMapInsert(modOwnVals, mk, cellGet(ownV));
+                strMapInsert(modOwnTys, mk, cellGet(ownT));
+                strMapInsert(modOwnCtors, mk, cellGet(ownC));
+                cellSet(curT, rT)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Built-in concurrent handle exports from std.{sync,task,actor}
+    if (strMapContains(cache, "std.sync")) {
+        registerExport(avail, allExportKeys, "std.sync.AtomicInt", MkNameInfo { qualifiedName: "AtomicInt", isPublic: true, definedInMod: "std.sync" });
+        registerExport(avail, allExportKeys, "std.sync.MVar", MkNameInfo { qualifiedName: "MVar", isPublic: true, definedInMod: "std.sync" });
+        registerExport(avail, allExportKeys, "std.sync.Chan", MkNameInfo { qualifiedName: "Chan", isPublic: true, definedInMod: "std.sync" })
+    } else ();
+    if (strMapContains(cache, "std.task")) {
+        registerExport(avail, allExportKeys, "std.task.Task", MkNameInfo { qualifiedName: "Task", isPublic: true, definedInMod: "std.task" })
+    } else ();
+    if (strMapContains(cache, "std.actor")) {
+        registerExport(avail, allExportKeys, "std.actor.Actor", MkNameInfo { qualifiedName: "Actor", isPublic: true, definedInMod: "std.actor" })
+    } else ();
+
+    // 3. Resolve imports per module in topological order, handle `pub use`, desugar `?`, and rewrite AST!
+    let outDefs: Cell (List Def) = cellNew(Nil);
+    let curM2 = cellNew(topoKeys);
+    let errFinal: Cell (Option String) = cellNew(None);
+
+    while (match cellGet(curM2) { Nil -> false, _ -> match cellGet(errFinal) { None -> true, Some(_) -> false } }) {
+        match cellGet(curM2) {
+            Cons(mk, rM2) -> {
+                match strMapGet(cache, mk) {
+                    Some(m) -> {
+                        let pref = relativeModulePrefix(mk, entryKey);
+                        match resolveModuleImports(m.imports, pref, avail, allExportKeys) {
+                            Err(e) -> cellSet(errFinal, Some(e)),
+                            Ok(impPairs) -> {
+                                let imapLookup: StrMap String = strMapNew();
+                                let curIP = cellNew(impPairs);
+                                while (match cellGet(curIP) { Nil -> false, _ -> true }) {
+                                    match cellGet(curIP) {
+                                        Cons((ln, qn), rIP) -> {
+                                            strMapInsert(imapLookup, ln, qn);
+                                            cellSet(curIP, rIP)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+
+                                // Handle `pub use` re-exports
+                                let curPU = cellNew(m.imports);
+                                while (match cellGet(curPU) { Nil -> false, _ -> true }) {
+                                    match cellGet(curPU) {
+                                        Cons((VisPublic, u), rPU) -> {
+                                            match u {
+                                                UseSingle(p) -> {
+                                                    let nm = listLastOr(p, "");
+                                                    match strMapGet(imapLookup, nm) {
+                                                        Some(tq) -> {
+                                                            let ek = if (pref == "") nm else pref + "." + nm;
+                                                            registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                        },
+                                                        None -> (),
+                                                    }
+                                                },
+                                                UseAlias(_, al) -> match strMapGet(imapLookup, al) {
+                                                    Some(tq) -> {
+                                                        let ek = if (pref == "") al else pref + "." + al;
+                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                    },
+                                                    None -> (),
+                                                },
+                                                UseMulti(_, sps) -> {
+                                                    let curS = cellNew(sps);
+                                                    while (match cellGet(curS) { Nil -> false, _ -> true }) {
+                                                        match cellGet(curS) {
+                                                            Cons(sp, rS) -> {
+                                                                let ln = useSpecLocalName(sp);
+                                                                match strMapGet(imapLookup, ln) {
+                                                                    Some(tq) -> {
+                                                                        let ek = if (pref == "") ln else pref + "." + ln;
+                                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                                    },
+                                                                    None -> (),
+                                                                };
+                                                                cellSet(curS, rS)
+                                                            },
+                                                            Nil -> (),
+                                                        }
+                                                    }
+                                                },
+                                                UseGlob(_) -> {
+                                                    let curG = cellNew(impPairs);
+                                                    while (match cellGet(curG) { Nil -> false, _ -> true }) {
+                                                        match cellGet(curG) {
+                                                            Cons((ln, tq), rG) -> {
+                                                                let ek = if (pref == "") ln else pref + "." + ln;
+                                                                if (!strMapContains(avail, ek)) {
+                                                                    registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                                } else ();
+                                                                cellSet(curG, rG)
+                                                            },
+                                                            Nil -> (),
+                                                        }
+                                                    }
+                                                },
+                                            };
+                                            cellSet(curPU, rPU)
+                                        },
+                                        Cons(_, rPU) -> cellSet(curPU, rPU),
+                                        Nil -> (),
+                                    }
+                                };
+
+                                let valMap: StrMap String = strMapNew();
+                                let tyMap: StrMap String = strMapNew();
+                                let ctorMap: StrMap String = strMapNew();
+
+                                let curP = cellNew(impPairs);
+                                while (match cellGet(curP) { Nil -> false, _ -> true }) {
+                                    match cellGet(curP) {
+                                        Cons((ln, qn), rP) -> {
+                                            strMapInsert(valMap, ln, qn);
+                                            if (strLen(ln) > 0 && isUpperByte(strByteAt(ln, 0))) {
+                                                strMapInsert(tyMap, ln, qn);
+                                                strMapInsert(ctorMap, ln, qn)
+                                            } else ();
+                                            cellSet(curP, rP)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+
+                                match strMapGet(modOwnVals, mk) {
+                                    Some(ovs) -> {
+                                        let c = cellNew(ovs);
+                                        while (match cellGet(c) { Nil -> false, _ -> true }) {
+                                            match cellGet(c) { Cons((k, v), r) -> { strMapInsert(valMap, k, v); cellSet(c, r) }, Nil -> () }
+                                        }
+                                    },
+                                    None -> (),
+                                };
+                                match strMapGet(modOwnTys, mk) {
+                                    Some(ots) -> {
+                                        let c = cellNew(ots);
+                                        while (match cellGet(c) { Nil -> false, _ -> true }) {
+                                            match cellGet(c) { Cons((k, v), r) -> { strMapInsert(tyMap, k, v); cellSet(c, r) }, Nil -> () }
+                                        }
+                                    },
+                                    None -> (),
+                                };
+                                match strMapGet(modOwnCtors, mk) {
+                                    Some(ocs) -> {
+                                        let c = cellNew(ocs);
+                                        while (match cellGet(c) { Nil -> false, _ -> true }) {
+                                            match cellGet(c) { Cons((k, v), r) -> { strMapInsert(ctorMap, k, v); cellSet(c, r) }, Nil -> () }
+                                        }
+                                    },
+                                    None -> (),
+                                };
+
+                                let okCtor = match strMapGet(ctorMap, "Ok") {
+                                    Some(q) -> q,
+                                    None -> if (strMapContains(avail, "std.result.Ok") && !strMapContains(avail, "Ok")) "std.result.Ok" else "Ok",
+                                };
+                                let errCtor = match strMapGet(ctorMap, "Err") {
+                                    Some(q) -> q,
+                                    None -> if (strMapContains(avail, "std.result.Err") && !strMapContains(avail, "Err")) "std.result.Err" else "Err",
+                                };
+
+                                let errsCell: Cell (List String) = cellNew(Nil);
+                                let rctx = MkModRewriteCtx {
+                                    curPrefix: pref,
+                                    valMap: valMap,
+                                    tyMap: tyMap,
+                                    ctorMap: ctorMap,
+                                    avail: avail,
+                                    allExportKeys: allExportKeys,
+                                    errors: errsCell,
+                                };
+
+                                let curDefs = cellNew(m.defs);
+                                while (match cellGet(curDefs) { Nil -> false, _ -> true }) {
+                                    match cellGet(curDefs) {
+                                        Cons((_, rawDef), rDef) -> {
+                                            let desugared = desugarTryInDef(rawDef, okCtor, errCtor);
+                                            let rw = rewriteDefInMod(rctx, desugared);
+                                            cellSet(outDefs, listAppend(cellGet(outDefs), [rw]));
+                                            cellSet(curDefs, rDef)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+
+                                match cellGet(errsCell) {
+                                    Nil -> (),
+                                    es -> cellSet(errFinal, Some(strJoin(es, "\n"))),
+                                }
+                            },
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(curM2, rM2)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(errFinal) {
+        Some(e) -> Err(e),
+        None -> Ok(cellGet(outDefs)),
+    }
+}
+
+pub def loadSingleSourceProgram(src: String): Result (List Def) String = {
+    let cache: StrMap LoadedMod = strMapNew();
+    let orderKeys: Vec String = vecNew();
+    let fm = parseFileModule(src, Nil)?;
+    let inlines: Cell (List LoadedMod) = cellNew(Nil);
+    let (defs, imps, subs) = extractModuleItems(Nil, fm.items, inlines);
+    strMapInsert(cache, "", MkLoadedMod {
+        key: "",
+        modPath: Nil,
+        defs: defs,
+        imports: imps,
+        submodules: subs,
+    });
+    vecPush(orderKeys, "");
+    let curInl = cellNew(cellGet(inlines));
+    while (match cellGet(curInl) { Nil -> false, _ -> true }) {
+        match cellGet(curInl) {
+            Cons(im, r) -> {
+                strMapInsert(cache, im.key, im);
+                vecPush(orderKeys, im.key);
+                cellSet(curInl, r)
+            },
+            Nil -> (),
+        }
+    };
+    loadBuiltinImports(cache, orderKeys)?;
+    compileLoadedCache(cache, orderKeys, "")
+}
+
+pub def loadProjectProgram(entryFile: String, srcRoot: String): Result (List Def) String = {
+    let cache: StrMap LoadedMod = strMapNew();
+    let orderKeys: Vec String = vecNew();
+    let entrySegs = entryPathToSegments(entryFile, srcRoot);
+    let entryKey = strJoin(entrySegs, ".");
+    loadFileModuleRec(srcRoot, entrySegs, cache, orderKeys, Nil)?;
+    loadBuiltinImports(cache, orderKeys)?;
+    compileLoadedCache(cache, orderKeys, entryKey)
+}

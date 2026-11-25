@@ -1,0 +1,461 @@
+// Core AST, Type, Scheme, and Operator Precedence definitions (`ast`)
+
+use std.option.{Option, Some, None}
+use std.list.{listRev, listAppend, listLen}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+
+pub data Span {
+    MkSpan { start: Int, end: Int },
+}
+
+pub def emptySpan(): Span = MkSpan { start: 0, end: 0 }
+
+pub def unionSpan(a: Span, b: Span): Span = {
+    let s = if (a.start < b.start) a.start else b.start;
+    let e = if (a.end > b.end) a.end else b.end;
+    MkSpan { start: s, end: e }
+}
+
+pub data Visibility {
+    VisPrivate,
+    VisPublic,
+}
+
+pub def isPublicVis(v: Visibility): Bool = match v {
+    VisPublic -> true,
+    VisPrivate -> false,
+}
+
+pub data Type {
+    TyVoid,
+    TyVar(String),
+    TyCon(String),
+    TyArr(List Type, Type),
+    TyTuple(List Type),
+    TyComp(Type, Type),
+}
+
+pub data ConstraintSpec {
+    MkConstraint { conceptName: String, typeVar: String },
+}
+
+pub data Scheme {
+    ScmMono(Type),
+    ScmPoly(List String, Type),
+    ScmPolyConstrained(List String, List ConstraintSpec, Type),
+    ScmSlot,
+}
+
+pub def schemeBody(scm: Scheme): Type = match scm {
+    ScmMono(t) -> t,
+    ScmPoly(_, t) -> t,
+    ScmPolyConstrained(_, _, t) -> t,
+    ScmSlot -> TyVoid,
+}
+
+pub def schemeTypeParams(scm: Scheme): List String = match scm {
+    ScmPoly(vs, _) -> vs,
+    ScmPolyConstrained(vs, _, _) -> vs,
+    _ -> Nil,
+}
+
+pub def schemeConstraints(scm: Scheme): List ConstraintSpec = match scm {
+    ScmPolyConstrained(_, cs, _) -> cs,
+    _ -> Nil,
+}
+
+pub def isFnScheme(scm: Scheme): Bool = match schemeBody(scm) {
+    TyArr(_, _) -> true,
+    _ -> false,
+}
+
+pub def composeTypes(ts: List Type): Type = match ts {
+    Nil -> TyVoid,
+    Cons(first, rest) -> {
+        let cur = cellNew(rest);
+        let acc = cellNew(first);
+        let going = cellNew(true);
+        while (cellGet(going)) {
+            match cellGet(cur) {
+                Nil -> cellSet(going, false),
+                Cons(h, t) -> {
+                    cellSet(acc, TyComp(cellGet(acc), h));
+                    cellSet(cur, t)
+                },
+            }
+        };
+        cellGet(acc)
+    },
+}
+
+pub def listContainsStr(xs: List String, target: String): Bool = match xs {
+    Nil -> false,
+    Cons(h, t) -> if (h == target) true else listContainsStr(t, target),
+}
+
+pub def addUniqueStr(acc: List String, s: String): List String =
+    if (listContainsStr(acc, s)) acc else listAppend(acc, [s])
+
+def collectFtvInList(ts: List Type, acc: List String): List String = match ts {
+    Nil -> acc,
+    Cons(h, t) -> collectFtvInList(t, collectFtvOrdered(h, acc)),
+}
+
+pub def collectFtvOrdered(ty: Type, acc: List String): List String = match ty {
+    TyVoid -> acc,
+    TyCon(_) -> acc,
+    TyVar(v) -> addUniqueStr(acc, v),
+    TyArr(ps, ret) -> collectFtvOrdered(ret, collectFtvInList(ps, acc)),
+    TyTuple(es) -> collectFtvInList(es, acc),
+    TyComp(b, a) -> collectFtvOrdered(a, collectFtvOrdered(b, acc)),
+}
+
+pub def ftvOrdered(ty: Type): List String = collectFtvOrdered(ty, Nil)
+
+pub def sortUniqueStrings(xs: List String): List String = {
+    let n = listLen(xs);
+    if (n <= 1) xs
+    else {
+        let arr = arrayNew(n, "");
+        let k = cellNew(0);
+        let cur = cellNew(xs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(s, r) -> {
+                    let idx = cellGet(k);
+                    arraySet(arr, idx, s);
+                    cellSet(k, idx + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        // Iterative Knuth Shellsort on `arr` (O(N^1.25), 0 recursion, 1 allocation)
+        let gap = cellNew(1);
+        while (cellGet(gap) < n / 3) {
+            cellSet(gap, cellGet(gap) * 3 + 1)
+        };
+        while (cellGet(gap) >= 1) {
+            let g = cellGet(gap);
+            let i = cellNew(g);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let v = arrayGet(arr, idx);
+                let j = cellNew(idx);
+                while (cellGet(j) >= g && arrayGet(arr, cellGet(j) - g) > v) {
+                    let cj = cellGet(j);
+                    arraySet(arr, cj, arrayGet(arr, cj - g));
+                    cellSet(j, cj - g)
+                };
+                arraySet(arr, cellGet(j), v);
+                cellSet(i, idx + 1)
+            };
+            cellSet(gap, g / 3)
+        };
+        // Build deduplicated sorted list from right to left in O(N)
+        let acc = cellNew([arrayGet(arr, n - 1)]);
+        let prev = cellNew(arrayGet(arr, n - 1));
+        let m = cellNew(n - 2);
+        while (cellGet(m) >= 0) {
+            let s = arrayGet(arr, cellGet(m));
+            if (s != cellGet(prev)) {
+                cellSet(acc, Cons(s, cellGet(acc)));
+                cellSet(prev, s)
+            } else ();
+            cellSet(m, cellGet(m) - 1)
+        };
+        cellGet(acc)
+    }
+}
+
+pub def typeToString(ty: Type): String = match ty {
+    TyVoid -> "Void",
+    TyVar(v) -> v,
+    TyCon(n) -> n,
+    TyTuple(es) -> "(" + joinTypeStrings(es, ", ") + ")",
+    TyArr(ps, r) -> "(" + joinTypeStrings(ps, ", ") + ") -> " + typeToString(r),
+    TyComp(b, a) -> typeToString(b) + " (" + typeToString(a) + ")",
+}
+
+def joinTypeStrings(ts: List Type, sep: String): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> typeToString(h),
+    Cons(h, t) -> typeToString(h) + sep + joinTypeStrings(t, sep),
+}
+
+pub def typesEqual(a: Type, b: Type): Bool = match (a, b) {
+    (TyVoid, TyVoid) -> true,
+    (TyVar(x), TyVar(y)) -> x == y,
+    (TyCon(x), TyCon(y)) -> x == y,
+    (TyComp(b1, a1), TyComp(b2, a2)) -> typesEqual(b1, b2) && typesEqual(a1, a2),
+    (TyTuple(es1), TyTuple(es2)) -> typeListsEqual(es1, es2),
+    (TyArr(ps1, r1), TyArr(ps2, r2)) -> typeListsEqual(ps1, ps2) && typesEqual(r1, r2),
+    _ -> false,
+}
+
+pub def typeListsEqual(xs: List Type, ys: List Type): Bool = match (xs, ys) {
+    (Nil, Nil) -> true,
+    (Cons(x, xr), Cons(y, yr)) -> typesEqual(x, y) && typeListsEqual(xr, yr),
+    _ -> false,
+}
+
+// ============================================================================
+// Literals, Operators, Patterns, Expressions, and Module Items
+// ============================================================================
+
+pub data Lit {
+    LitInt(Int),
+    LitFloat(Float),
+    LitChar(Int),
+    LitStr(String),
+    LitBool(Bool),
+    LitUnit,
+}
+
+pub def litType(l: Lit): Type = match l {
+    LitInt(_) -> TyCon("Int"),
+    LitFloat(_) -> TyCon("Float"),
+    LitChar(_) -> TyCon("Char"),
+    LitStr(_) -> TyCon("String"),
+    LitBool(_) -> TyCon("Bool"),
+    LitUnit -> TyVoid,
+}
+
+pub data BinOp {
+    OpAdd,
+    OpSub,
+    OpMul,
+    OpDiv,
+    OpRem,
+    OpAnd,
+    OpOr,
+    OpBitAnd,
+    OpBitOr,
+    OpBitXor,
+    OpShl,
+    OpShr,
+    OpUshr,
+    OpEq,
+    OpNe,
+    OpLt,
+    OpLe,
+    OpGt,
+    OpGe,
+}
+
+pub data UnOp {
+    UnNot,
+    UnNeg,
+    UnBitNot,
+}
+
+pub data VarDecl {
+    MkVarDecl { vname: String, vscm: Scheme },
+}
+
+pub data Pattern {
+    PatVar(String),
+    PatWild,
+    PatLit(Lit),
+    PatTuple(List Pattern),
+    PatCtor(String, List Pattern),
+    PatStruct(String, List (String, Pattern)),
+}
+
+pub data MatchArm {
+    MkMatchArm { pat: Pattern, guard: Option Form, body: Form },
+}
+
+pub data Form {
+    MkForm { pos: Span, ty: Scheme, annot: Option Scheme, node: Expr },
+}
+
+pub data Expr {
+    ExLit(Lit),
+    ExVar(String),
+    ExTuple(List Form),
+    ExStructInit(String, List (String, Form)),
+    ExList(List Form),
+    ExBlock(List Form),
+    ExApply(Form, List Form),
+    ExAbs(List VarDecl, Option Type, Form),
+    ExBin(BinOp, Form, Form),
+    ExUn(UnOp, Form),
+    ExLet(VarDecl, Form, Form),
+    ExIf(Form, Form, Form),
+    ExWhile(Form, Form),
+    ExMatch(Form, List MatchArm),
+    ExField(Form, String),
+    ExTry(Form),
+}
+
+pub def mkForm(pos: Span, node: Expr): Form =
+    MkForm { pos: pos, ty: ScmSlot, annot: None, node: node }
+
+pub def mkTypedForm(pos: Span, scm: Scheme, node: Expr): Form =
+    MkForm { pos: pos, ty: scm, annot: None, node: node }
+
+pub data FieldDecl {
+    MkFieldDecl { fname: Option String, fty: Type },
+}
+
+pub data VariantBody {
+    VarUnit,
+    VarTuple(List FieldDecl),
+    VarStruct(List FieldDecl),
+}
+
+pub data VariantDef {
+    MkVariantDef { vname: String, vbody: VariantBody },
+}
+
+pub data MethodDecl {
+    MkMethodDecl { mname: String, mty: Scheme },
+}
+
+pub data MethodImpl {
+    MkMethodImpl { implName: String, implBody: Form },
+}
+
+pub data Item {
+    ItForm(Form),
+    ItExtern(String, Scheme),
+    ItAlias(List String, Scheme),
+    ItAlg(List String, List VariantDef),
+    ItConcept(List String, List ConstraintSpec, List MethodDecl),
+    ItInstance(String, List Type, List ConstraintSpec, List MethodImpl),
+}
+
+pub data Def {
+    MkDef { ident: String, dpos: Span, vis: Visibility, item: Item },
+}
+
+pub data UseSpec {
+    MkUseSpec { orig: String, alias: Option String },
+}
+
+pub def useSpecLocalName(s: UseSpec): String = match s.alias {
+    Some(a) -> a,
+    None -> s.orig,
+}
+
+pub data UseItem {
+    UseSingle(List String),
+    UseMulti(List String, List UseSpec),
+    UseGlob(List String),
+    UseAlias(List String, String),
+}
+
+pub data ModuleItem {
+    ModDef(Visibility, Def),
+    ModUse(Visibility, UseItem),
+    ModSub(Visibility, String, List ModuleItem, Span),
+    ModDecl(Visibility, String),
+}
+
+pub data FileModule {
+    MkFileModule { modPath: List String, items: List ModuleItem },
+}
+
+// ============================================================================
+// Operator Name Encoding & Precedence Table (Matches `miko` 1-to-1)
+// ============================================================================
+
+def opByteToken(b: Int): String =
+    if (b == 43) "plus"
+    else if (b == 45) "minus"
+    else if (b == 42) "star"
+    else if (b == 47) "slash"
+    else if (b == 37) "rem"
+    else if (b == 61) "eq"
+    else if (b == 33) "bang"
+    else if (b == 60) "lt"
+    else if (b == 62) "gt"
+    else if (b == 38) "amp"
+    else if (b == 124) "bar"
+    else if (b == 94) "caret"
+    else if (b == 58) "colon"
+    else if (b == 126) "tilde"
+    else if (b == 63) "qmark"
+    else if (b == 64) "at"
+    else if (b == 35) "hash"
+    else if (b == 36) "dollar"
+    else if (b == 92) "bslash"
+    else "sym"
+
+pub def encodeOpName(op: String): String = {
+    let b = bufNew();
+    bufPushStr(b, "$op$");
+    let n = strLen(op);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        if (idx > 0) bufPushByte(b, 95) else ();
+        bufPushStr(b, opByteToken(strByteAt(op, idx)));
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+pub def isReservedNonOp(s: String): Bool =
+    s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||" || s == "!" || s == "~" || s == "?"
+
+pub def isDefinableOp(s: String): Bool =
+    !(s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||" || s == "!" || s == "?")
+
+pub def builtinBinOpFromStr(s: String): Option BinOp =
+    if (s == "+") Some(OpAdd)
+    else if (s == "-") Some(OpSub)
+    else if (s == "*") Some(OpMul)
+    else if (s == "/") Some(OpDiv)
+    else if (s == "%") Some(OpRem)
+    else if (s == "&") Some(OpBitAnd)
+    else if (s == "|") Some(OpBitOr)
+    else if (s == "^") Some(OpBitXor)
+    else if (s == "<<") Some(OpShl)
+    else if (s == ">>") Some(OpShr)
+    else if (s == ">>>") Some(OpUshr)
+    else if (s == "==") Some(OpEq)
+    else if (s == "!=") Some(OpNe)
+    else if (s == "<") Some(OpLt)
+    else if (s == "<=") Some(OpLe)
+    else if (s == ">") Some(OpGt)
+    else if (s == ">=") Some(OpGe)
+    else None
+
+/// Infix precedence levels (1 = lowest, 13 = highest):
+///   1: multi-char `|`-leading pipelines (except `||`)
+///   2: `||` (short-circuit logical OR)
+///   3: `&&` (short-circuit logical AND)
+///   4: `=` / `!`-leading equality (`==`, `!=`, `===`, ...)
+///   5: `<` / `>`-leading comparisons & combinators except shifts
+///   6: `:`-leading (`::` right-assoc)
+///   7: single `|` bitwise OR
+///   8: `^`-leading bitwise XOR
+///   9: `&`-leading bitwise AND (except `&&`)
+///  10: shifts `<<`, `>>`, `>>>`
+///  11: `+` / `-`-leading additive
+///  12: `*` / `/` / `%`-leading multiplicative
+///  13: `@`, `#`, `$`, multi-char `?`, multi-char `~`, `\`
+pub def infixPrecedence(op: String): Int =
+    if (op == "||") 2
+    else if (op == "&&") 3
+    else if (isReservedNonOp(op) || strLen(op) == 0) 0
+    else if (op == "|") 7
+    else if (op == "<<" || op == ">>" || op == ">>>") 10
+    else {
+        let c = strByteAt(op, 0);
+        if (c == 124) 1
+        else if (c == 61 || c == 33) 4
+        else if (c == 60 || c == 62) 5
+        else if (c == 58) 6
+        else if (c == 94) 8
+        else if (c == 38) 9
+        else if (c == 43 || c == 45) 11
+        else if (c == 42 || c == 47 || c == 37) 12
+        else if (c == 64 || c == 35 || c == 36 || c == 63 || c == 126 || c == 92) 13
+        else 0
+    }
+
+pub def isRightAssocOp(op: String): Bool =
+    strLen(op) > 0 && strByteAt(op, strLen(op) - 1) == 58
