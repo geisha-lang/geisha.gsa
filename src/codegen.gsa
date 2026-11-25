@@ -630,9 +630,15 @@ def emitStaticClosureConst(mctx: ModEmitCtx, entryName: String): String = {
             cellSet(mctx.mcConstCnt, id + 1);
             let sym = "@.cls." + intToStr(id);
             bufPushStr(mctx.mcStrDecls, sym);
-            bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, {} } { ptr ");
-            bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
-            bufPushStr(mctx.mcStrDecls, ", {} zeroinitializer }, align 8\n");
+            if (mctx.mcIsWasm) {
+                bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, i32, {} } { ptr ");
+                bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
+                bufPushStr(mctx.mcStrDecls, ", i32 0, {} zeroinitializer }, align 8\n")
+            } else {
+                bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, {} } { ptr ");
+                bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
+                bufPushStr(mctx.mcStrDecls, ", {} zeroinitializer }, align 8\n")
+            };
             strMapInsert(mctx.mcConstPool, key, sym);
             sym
         },
@@ -2118,8 +2124,12 @@ def genExpr(
                     Nil -> (),
                 }
             };
-            let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 1);
-            let fnEntryPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 0);
+            let fvsPtr =
+                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 2)
+                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 1);
+            let fnEntryPtr =
+                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 0)
+                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 0);
             let fnEntry = emitLoad(fctx, "ptr", fnEntryPtr);
 
             let allTys = listRev(Cons("ptr", cellGet(argTysRev)));
@@ -2272,9 +2282,12 @@ def genExpr(
                     let fvLlvmTys = listRev(cellGet(fvLlvmRev));
                     let fvGeishaTys = listRev(cellGet(fvGeishaRev));
                     let envStructTy = formatLlvmStructType(fvLlvmTys);
-                    let clsStructTy = "{ ptr, " + envStructTy + " }";
+                    let clsStructTy =
+                        if (mctx.mcIsWasm) "{ ptr, i32, " + envStructTy + " }"
+                        else "{ ptr, " + envStructTy + " }";
+                    let clsEnvFieldIdx = if (mctx.mcIsWasm) 2 else 1;
                     let (envSz, _) = structSizeAndAlignFor(fvGeishaTys, mctx.mcPtrSize);
-                    let clsByteSz = alignUp(mctx.mcPtrSize + envSz, 8);
+                    let clsByteSz = alignUp(8 + envSz, 8);
 
                     let clsObjPtr =
                         if (stackAlloc) emitEntryAlloca(fctx, clsStructTy)
@@ -2284,7 +2297,7 @@ def genExpr(
                     let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
                     emitStore(fctx, "ptr", llvmSym(cls.clsEntry), fnFieldPtr);
 
-                    let clsFvPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 1);
+                    let clsFvPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, clsEnvFieldIdx);
                     let idx = cellNew(0);
                     let cf2 = cellNew(cls.clsFvs);
                     while (match cellGet(cf2) { Nil -> false, _ -> true }) {

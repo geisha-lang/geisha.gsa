@@ -577,6 +577,13 @@ def handle_json(raw: String): String =
         Err(_) -> "{\"err\":\"bad\"}",
     }
 
+def applyClosure(f: Float -> String, x: Float): String = f(x)
+
+def float_closure_probe(tag: String, w: Float, y0: Float): String = {
+    let fmt = (cx: Float) -> tag + ":" + std.str.intToStr(floatToInt(cx + w * 2.0 + y0));
+    applyClosure(fmt, 10.5)
+}
+
 def main(): Void = cellSet(counter, 10)
 EOF
 "$GEISHA_BIN" --target wasm32 --runtime ./build/wasm_rt.o -o "$TMP_DIR/t12_wasm.wasm" "$TMP_DIR/t12_wasm.gsa"
@@ -611,6 +618,7 @@ WebAssembly.instantiate(bytes, {
   const resPtr = ex.handle_json(writeStr("{\"name\":\"Tingfeng\"}"));
   const res = readStr(resPtr);
   const syncOk = (notified === res ? "sync" : "diff");
+  const clsRes = readStr(ex.float_closure_probe(writeStr("card"), 25.0, 4.5));
   // Verify frame-boundary mark-sweep GC reclaims transient garbage while preserving global Cell root
   let totalReclaimed = 0;
   for (let i = 0; i < 200; i++) {
@@ -621,10 +629,10 @@ WebAssembly.instantiate(bytes, {
   const liveAfter = ex.gs_wasm_heap_live();
   const c2 = ex.bump(1);
   const gcOk = (totalReclaimed > 20000 && liveAfter < 4096 && c2 === 16) ? "gc-ok" : ("gc-bad:" + totalReclaimed + ":" + liveAfter + ":" + c2);
-  console.log(c + "|" + res + "|" + syncOk + "|" + gcOk);
+  console.log(c + "|" + res + "|" + syncOk + "|" + clsRes + "|" + gcOk);
 });
 ' "$TMP_DIR/t12_wasm.wasm")"
-assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|gc-ok' "$WASM_OUT"
+assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|card:65|gc-ok' "$WASM_OUT"
 fi
 
 # 13. Mode-Polymorphic `Send` Closures & Implicit Mode-Lifted ADTs (Positive + 8 Negative Soundness Checks)
