@@ -132,7 +132,7 @@ pub def isTypeConcrete(ty: Type): Bool = match ty {
     TyVar(_) -> false,
     TyVoid -> true,
     TyCon(_) -> true,
-    TyArr(ps, r) -> isTypeListConcrete(ps) && isTypeConcrete(r),
+    TyArr(_, ps, r) -> isTypeListConcrete(ps) && isTypeConcrete(r),
     TyTuple(es) -> isTypeListConcrete(es),
     TyComp(b, a) -> isTypeConcrete(b) && isTypeConcrete(a),
 }
@@ -151,7 +151,7 @@ def defaultPhantomType(ty: Type): Type = match ty {
     TyVar(_) -> TyVoid,
     TyVoid -> TyVoid,
     TyCon(_) -> ty,
-    TyArr(ps, r) -> TyArr(defaultPhantomTypeList(ps), defaultPhantomType(r)),
+    TyArr(_, ps, r) -> TyArr(TyVoid, defaultPhantomTypeList(ps), defaultPhantomType(r)),
     TyTuple(es) -> TyTuple(defaultPhantomTypeList(es)),
     TyComp(b, a) -> TyComp(defaultPhantomType(b), defaultPhantomType(a)),
 }
@@ -181,7 +181,7 @@ def unifyTypesInto(pat: Type, concrete: Type, sub: StrMap Type): Void = match (p
     (TyVar(nm), _) ->
         if (strMapContains(sub, nm)) ()
         else strMapInsert(sub, nm, concrete),
-    (TyArr(ps1, r1), TyArr(ps2, r2)) ->
+    (TyArr(_, ps1, r1), TyArr(_, ps2, r2)) ->
         if (listLen(ps1) == listLen(ps2)) {
             unifyListsInto(ps1, ps2, sub);
             unifyTypesInto(r1, r2, sub)
@@ -219,7 +219,7 @@ def applyExplicitSubstExcept(ty: Type, bound: List String, sub: StrMap Type): Ty
             Some(target) -> target,
             None -> ty,
         },
-    TyArr(ps, r) -> TyArr(applyExplicitSubstListExcept(ps, bound, sub), applyExplicitSubstExcept(r, bound, sub)),
+    TyArr(m, ps, r) -> TyArr(applyExplicitSubstExcept(m, bound, sub), applyExplicitSubstListExcept(ps, bound, sub), applyExplicitSubstExcept(r, bound, sub)),
     TyTuple(es) -> TyTuple(applyExplicitSubstListExcept(es, bound, sub)),
     TyComp(b, a) -> TyComp(applyExplicitSubstExcept(b, bound, sub), applyExplicitSubstExcept(a, bound, sub)),
 }
@@ -685,7 +685,7 @@ def transLambda(ctx: KCtx, params: List VarDecl, bodyForm: Form, capFv: Bool): (
 }
 
 def etaWrapGlobalFn(ctx: KCtx, fnName: String, fnScm: Scheme): Term = match schemeBody(fnScm) {
-    TyArr(paramTys, retTy) -> {
+    TyArr(_, paramTys, retTy) -> {
         let clsId = makeClsName(ctx, "eta");
         let paramsRev = cellNew(Nil);
         let argsRev = cellNew(Nil);
@@ -996,7 +996,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                             MkTerm { tscm: tform, tnode: TmMakeData(adtName, vinfo.tag, Nil, Nil, targs) }
                         },
                         _ -> match schemeBody(tform) {
-                            TyArr(paramTys, retTy) -> {
+                            TyArr(_, paramTys, retTy) -> {
                                 let clsId = makeClsName(ctx, "ctor");
                                 let paramsRev = cellNew(Nil);
                                 let fieldsRev = cellNew(Nil);
@@ -1038,7 +1038,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                     // 2. Lambda-lifted polymorphic local `let` function referenced as first-class value?
                     match assocLookupPoly(cellGet(ctx.kPolyLifted), varName) {
                         Some((liftedFnId, fvDecls, liftedScm)) -> match schemeBody(tform) {
-                            TyArr(paramTys, retTy) -> {
+                            TyArr(_, paramTys, retTy) -> {
                                 let etaId = makeClsName(ctx, "poly_eta");
                                 let paramsRev = cellNew(Nil);
                                 let allArgsRev = cellNew(Nil);
@@ -1170,7 +1170,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                     }
                                 };
                                 let newBody = match schemeBody(scm) {
-                                    TyArr(ptys, rty) -> TyArr(listAppend(listRev(cellGet(fvTysRev)), ptys), rty),
+                                    TyArr(m, ptys, rty) -> TyArr(m, listAppend(listRev(cellGet(fvTysRev)), ptys), rty),
                                     other -> other,
                                 };
                                 match scm {
@@ -1407,7 +1407,7 @@ def resolveConceptCall(
         strMapGet(ctx.kConceptReg, conceptName) >>= (cinfo) ->
         findConceptMethodScm(cinfo.methods, methodName) >>= (methodScm) -> {
             let callSub: StrMap Type = strMapNew();
-            let concreteFnTy = TyArr(argTys, retTy);
+            let concreteFnTy = TyArr(TyVoid, argTys, retTy);
             unifyTypesInto(schemeBody(methodScm), concreteFnTy, callSub);
             collectSubstArgs(cinfo.typeParams, callSub) >>= (concreteTargetTys) ->
             if (!isTypeListConcrete(concreteTargetTys)) None
@@ -1496,7 +1496,7 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
             let resolvedConcept: Option TaggedTerm =
                 if (isTypeConcrete(nodeTy) && !strMapContains(ctx.kGlobalFns, name)) {
                     match nodeTy {
-                        TyArr(ps, r) -> match resolveConceptCall(ctx, name, ps, r) {
+                        TyArr(_, ps, r) -> match resolveConceptCall(ctx, name, ps, r) {
                             Some((mangled, specScm, optInst)) -> {
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 pushDiscovered(discovered, optInst);
@@ -1579,7 +1579,7 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
             match conceptAttempt {
                 Some(rewritten) -> rewritten,
                 None -> {
-                    let concreteFnTy = TyArr(argTys, retTy);
+                    let concreteFnTy = TyArr(TyVoid, argTys, retTy);
                     match resolvePolyFnCall(ctx, fnName, concreteFnTy) {
                         Some((mangled, specScm, inst)) -> {
                             strMapInsert(ctx.kTopDirect, mangled, mangled);
@@ -2509,7 +2509,7 @@ def collectAdtRefsInType(adtReg: StrMap AdtInfo, ty: Type, acc: List String): Li
     TyCon(n) -> if (strMapContains(adtReg, n) && !listContainsStr(acc, n)) Cons(n, acc) else acc,
     TyComp(b, a) -> collectAdtRefsInType(adtReg, a, collectAdtRefsInType(adtReg, b, acc)),
     TyTuple(es) -> collectAdtRefsInList(adtReg, es, acc),
-    TyArr(ps, r) -> collectAdtRefsInType(adtReg, r, collectAdtRefsInList(adtReg, ps, acc)),
+    TyArr(_, ps, r) -> collectAdtRefsInType(adtReg, r, collectAdtRefsInList(adtReg, ps, acc)),
     _ -> acc,
 }
 

@@ -30,10 +30,13 @@ pub data Type {
     TyVoid,
     TyVar(String),
     TyCon(String),
-    TyArr(List Type, Type),
+    TyArr(Type, List Type, Type),
     TyTuple(List Type),
     TyComp(Type, Type),
 }
+
+pub def isModeVarName(v: String): Bool =
+    strLen(v) >= 3 && strByteAt(v, 0) == 46 && strByteAt(v, 1) == 36 && strByteAt(v, 2) == 109
 
 pub data ConstraintSpec {
     MkConstraint { conceptName: String, typeArgs: List Type },
@@ -69,7 +72,7 @@ pub def schemeConstraints(scm: Scheme): List ConstraintSpec = match scm {
 }
 
 pub def isFnScheme(scm: Scheme): Bool = match schemeBody(scm) {
-    TyArr(_, _) -> true,
+    TyArr(_, _, _) -> true,
     _ -> false,
 }
 
@@ -109,7 +112,7 @@ pub def collectFtvOrdered(ty: Type, acc: List String): List String = match ty {
     TyVoid -> acc,
     TyCon(_) -> acc,
     TyVar(v) -> addUniqueStr(acc, v),
-    TyArr(ps, ret) -> collectFtvOrdered(ret, collectFtvInList(ps, acc)),
+    TyArr(m, ps, ret) -> collectFtvOrdered(ret, collectFtvInList(ps, collectFtvOrdered(m, acc))),
     TyTuple(es) -> collectFtvInList(es, acc),
     TyComp(b, a) -> collectFtvOrdered(a, collectFtvOrdered(b, acc)),
 }
@@ -177,7 +180,7 @@ pub def typeToString(ty: Type): String = match ty {
     TyVar(v) -> v,
     TyCon(n) -> n,
     TyTuple(es) -> "(" + joinTypeStrings(es, ", ") + ")",
-    TyArr(ps, r) -> "(" + joinTypeStrings(ps, ", ") + ") -> " + typeToString(r),
+    TyArr(_, ps, r) -> "(" + joinTypeStrings(ps, ", ") + ") -> " + typeToString(r),
     TyComp(b, a) -> typeToString(b) + " (" + typeToString(a) + ")",
 }
 
@@ -193,7 +196,7 @@ pub def typesEqual(a: Type, b: Type): Bool = match (a, b) {
     (TyCon(x), TyCon(y)) -> x == y,
     (TyComp(b1, a1), TyComp(b2, a2)) -> typesEqual(b1, b2) && typesEqual(a1, a2),
     (TyTuple(es1), TyTuple(es2)) -> typeListsEqual(es1, es2),
-    (TyArr(ps1, r1), TyArr(ps2, r2)) -> typeListsEqual(ps1, ps2) && typesEqual(r1, r2),
+    (TyArr(m1, ps1, r1), TyArr(m2, ps2, r2)) -> typesEqual(m1, m2) && typeListsEqual(ps1, ps2) && typesEqual(r1, r2),
     _ -> false,
 }
 

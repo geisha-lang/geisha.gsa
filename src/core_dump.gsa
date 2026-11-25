@@ -155,7 +155,7 @@ def emitCoreTy(ctx: DumpCtx, b: StringBuf, ty: Type): Void = match ty {
         };
         bufPushByte(b, 41)
     },
-    TyArr(ps, ret) -> {
+    TyArr(_, ps, ret) -> {
         bufPushStr(b, "(fn (");
         let first = cellNew(true);
         let cur = cellNew(ps);
@@ -417,7 +417,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
         match strMapGet(ctx.dcProg.coreFns, cls.clsEntry) {
             Some(fd) -> {
                 let retTy = match schemeBody(fd.fnScm) {
-                    TyArr(_, r) -> r,
+                    TyArr(_, _, r) -> r,
                     other -> other,
                 };
                 bufPushStr(b, "(let ");
@@ -635,7 +635,7 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
                         // Lifted closures with captured free variables are inlined at `TmMakeCls`
                         if (listLen(fd.fnFvs) == 0) {
                             let retTy = match schemeBody(fd.fnScm) {
-                                TyArr(_, ret) -> ret,
+                                TyArr(_, _, ret) -> ret,
                                 other -> other,
                             };
                             bufPushStr(funsBuf, "    (fun ");

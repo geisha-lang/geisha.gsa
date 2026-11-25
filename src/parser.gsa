@@ -510,7 +510,7 @@ pub def parseTypeExpr(p: Parser): Result Type String = {
                     let _ = bumpTok(p);
                     if (eatSym(p, "->")) {
                         Some(match parseTypeExpr(p) {
-                            Ok(rhs) -> Ok(TyArr(cellGet(ps), rhs)),
+                            Ok(rhs) -> Ok(TyArr(TyVoid, cellGet(ps), rhs)),
                             Err(e) -> Err(e),
                         })
                     } else {
@@ -537,7 +537,7 @@ pub def parseTypeExpr(p: Parser): Result Type String = {
                     TyVoid -> Nil,
                     _ -> [lhs],
                 };
-                Ok(TyArr(params, rhs))
+                Ok(TyArr(TyVoid, params, rhs))
             } else Ok(lhs)
         },
     }
@@ -1495,7 +1495,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         Some(s) -> s,
                         None -> fnName,
                     };
-                    let fnTy = TyArr(cellGet(ps), retTy);
+                    let fnTy = TyArr(TyVoid, cellGet(ps), retTy);
                     Ok(MkDef {
                         ident: fnName,
                         dpos: unionSpan(startSp, closeSp),
@@ -1562,7 +1562,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                 };
                                 let _ = expectRParen(p)?;
                                 let retTy = if (eatSym(p, ":")) parseTypeExpr(p)? else TyVoid;
-                                let mscm = ScmMono(TyArr(listRev(cellGet(ptysRev)), retTy));
+                                let mscm = ScmMono(TyArr(TyVoid, listRev(cellGet(ptysRev)), retTy));
                                 cellSet(methods, listAppend(cellGet(methods), [MkMethodDecl { mname: mname, mty: mscm }]));
                                 let _ = eatComma(p);
                                 skipSemis(p)

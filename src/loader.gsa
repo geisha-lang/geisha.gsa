@@ -482,7 +482,7 @@ def rewriteTypeInMod(ctx: ModRewriteCtx, ty: Type): Type = match ty {
         Some(qn) -> TyCon(qn),
         None -> ty,
     },
-    TyArr(ps, r) -> TyArr(rewriteTypeListInMod(ctx, ps), rewriteTypeInMod(ctx, r)),
+    TyArr(m, ps, r) -> TyArr(rewriteTypeInMod(ctx, m), rewriteTypeListInMod(ctx, ps), rewriteTypeInMod(ctx, r)),
     TyTuple(es) -> TyTuple(rewriteTypeListInMod(ctx, es)),
     TyComp(b, a) -> TyComp(rewriteTypeInMod(ctx, b), rewriteTypeInMod(ctx, a)),
 }

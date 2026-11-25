@@ -627,4 +627,219 @@ WebAssembly.instantiate(bytes, {
 assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|gc-ok' "$WASM_OUT"
 fi
 
+# 13. Mode-Polymorphic `Send` Closures & Implicit Mode-Lifted ADTs (Positive + 8 Negative Soundness Checks)
+cat > "$TMP_DIR/t13_send_modes_ok.gsa" << 'EOF'
+use std.option.{Some, None}
+use std.list.listMap
+use std.str.intToStr
+use std.sync.{chanNew, chanSend, chanRecv}
+use std.task.{Task, spawn, await, parMap}
+
+// Zero `=>` syntax: `Lens` automatically receives hidden capture-mode parameter!
+data Lens s a {
+    MkLens { viewL: s -> a, setL: (s, a) -> s },
+}
+
+data Pair {
+    MkPair { fst: Int, snd: Int },
+}
+
+// Mode-polymorphic HOF: accepts both `$Local` and `$Shared` closures
+def applyTwice(f: a -> a, x: a): a = f(f(x))
+
+// Higher-order concurrency wrapper: HM automatically infers `f` must be `$Shared`!
+def runAsync(f: () -> a): Task a = spawn(f)
+
+// Conditional capture (`SendIf`): works with `Cell Int` locally AND `Int` across threads!
+def makeGetter(x: a): () -> a = () -> x
+
+def main() = {
+    // 1. Local `$Local` closure with `applyTwice`, `makeGetter`, and local `Lens`
+    let localAcc = cellNew(0);
+    let localBump = (n: Int) -> {
+        cellSet(localAcc, cellGet(localAcc) + 1);
+        n + 10
+    };
+    let r1 = applyTwice(localBump, 5); // 25, localAcc == 2
+    let getCell = makeGetter(localAcc);
+    let r2 = cellGet(getCell()); // 2
+
+    let dirtyLens = MkLens {
+        viewL: (p: Pair) -> {
+            cellSet(localAcc, cellGet(localAcc) + 1);
+            p.fst
+        },
+        setL: (p: Pair, v: Int) -> MkPair { fst: v, snd: p.snd },
+    };
+    let r3 = dirtyLens.viewL(MkPair { fst: 7, snd: 8 }) + cellGet(localAcc); // 7 + 3 = 10
+
+    // 2. Clean `$Shared` closures & `Lens` across `runAsync`, `Chan`, and `parMap`
+    let fstLens = MkLens {
+        viewL: (p: Pair) -> p.fst,
+        setL: (p: Pair, v: Int) -> MkPair { fst: v, snd: p.snd },
+    };
+    let lensCh = chanNew(2);
+    let _ = chanSend(lensCh, fstLens);
+    let tLens = runAsync(() -> match chanRecv(lensCh) {
+        Some(l) -> {
+            let p2 = l.setL(MkPair { fst: 1, snd: 9 }, 40);
+            l.viewL(p2) + p2.snd
+        },
+        None -> 0,
+    });
+
+    let tGetter = runAsync(makeGetter(100));
+
+    // 3. Thread-local `Cell` created INSIDE `spawn` with nested `$Local` helper closure
+    let tNestedLocal = spawn(() -> {
+        let inner = cellNew(10);
+        let incInner = () -> cellSet(inner, cellGet(inner) + 6);
+        incInner();
+        incInner();
+        cellGet(inner)
+    });
+
+    let mapped = parMap([1, 2, 3], (x) -> applyTwice((y) -> y + 1, x));
+    let sumMapped = match mapped {
+        Cons(a, Cons(b, Cons(c, Nil))) -> a + b + c,
+        _ -> 0,
+    };
+
+    printLn(
+        intToStr(r1) + "|" +
+        intToStr(r2) + "|" +
+        intToStr(r3) + "|" +
+        intToStr(await(tLens)) + "|" +
+        intToStr(await(tGetter)) + "|" +
+        intToStr(await(tNestedLocal)) + "|" +
+        intToStr(sumMapped)
+    )
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t13_send_modes_ok" "$TMP_DIR/t13_send_modes_ok.gsa"
+assert_eq "typed_send_closures_and_mode_adts" "25|2|10|49|100|22|12" "$("$TMP_DIR/t13_send_modes_ok")"
+
+assert_compile_fails() {
+    name="$1"
+    src_file="$2"
+    if "$GEISHA_BIN" -o "$TMP_DIR/bad_out" "$src_file" >/dev/null 2>&1; then
+        echo "FAIL [$name]: compiler unexpectedly accepted unsound concurrent program" >&2
+        exit 1
+    fi
+    echo "PASS [$name]: rejected unsound !Send closure"
+    PASS=$((PASS + 1))
+}
+
+# 13a. Higher-order `runAsync(f)` wrapper around `spawn(f)` must reject `!Send` closure
+cat > "$TMP_DIR/t13_bad_hof.gsa" << 'EOF'
+use std.task.{Task, spawn, await}
+def runAsync(f: () -> Int): Task Int = spawn(f)
+def main() = {
+    let c = cellNew(0);
+    let _ = await(runAsync(() -> cellGet(c)));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_higher_order_spawn" "$TMP_DIR/t13_bad_hof.gsa"
+
+# 13b. Sending a closure that captures `Cell` over `Chan` must be rejected
+cat > "$TMP_DIR/t13_bad_chan_fn.gsa" << 'EOF'
+use std.sync.{chanNew, chanSend}
+def main() = {
+    let c = cellNew(0);
+    let ch = chanNew(2);
+    let _ = chanSend(ch, () -> cellSet(c, 1));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_chan_dirty_closure" "$TMP_DIR/t13_bad_chan_fn.gsa"
+
+# 13c. Function-bearing ADT (`BoxFn`) holding a dirty closure must be rejected by `spawn`
+cat > "$TMP_DIR/t13_bad_adt_fn.gsa" << 'EOF'
+use std.task.{spawn, await}
+data BoxFn { MkBox(() -> Int) }
+def runBox(b: BoxFn): Int = match b { MkBox(f) -> f() }
+def main() = {
+    let c = cellNew(7);
+    let b = MkBox(() -> cellGet(c));
+    let _ = await(spawn(() -> runBox(b)));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_dirty_mode_adt" "$TMP_DIR/t13_bad_adt_fn.gsa"
+
+# 13d. Conditional capture (`makeGetter`) instantiated with `Cell` must be rejected by `spawn`
+cat > "$TMP_DIR/t13_bad_cond_cap.gsa" << 'EOF'
+use std.task.{spawn, await}
+def makeGetter(x: a): () -> a = () -> x
+def main() = {
+    let c = cellNew(1);
+    let g = makeGetter(c);
+    let _ = await(spawn(() -> { let _ = g(); 0 }));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_conditional_capture_cell" "$TMP_DIR/t13_bad_cond_cap.gsa"
+
+# 13e. Returning a closure that captures a thread-local `Cell` out of `spawn` must be rejected
+cat > "$TMP_DIR/t13_bad_return_cls.gsa" << 'EOF'
+use std.task.{spawn, await}
+def main() = {
+    let f = await(spawn(() -> {
+        let c = cellNew(0);
+        () -> cellGet(c)
+    }));
+    let _ = f();
+    ()
+}
+EOF
+assert_compile_fails "send_reject_returning_local_closure_from_spawn" "$TMP_DIR/t13_bad_return_cls.gsa"
+
+# 13f. HKT `State` tainted via `Functor.fmap` with a dirty closure must be rejected by `spawn`
+cat > "$TMP_DIR/t13_bad_hkt_state.gsa" << 'EOF'
+use std.control.{Functor, fmap}
+use std.task.{spawn, await}
+data State s a { MkState(s -> (a, s)) }
+def runState(st: State s a, init: s): (a, s) = match st { MkState(f) -> f(init) }
+instance Functor (State s) {
+    def fmap(g, st) = MkState((s0) -> {
+        let (a, s1) = runState(st, s0);
+        (g(a), s1)
+    })
+}
+def main() = {
+    let c = cellNew(0);
+    let st0 = MkState((s: Int) -> (s, s));
+    let st1 = fmap((x: Int) -> { cellSet(c, x); x }, st0);
+    let _ = await(spawn(() -> { let (v, _) = runState(st1, 1); v }));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_tainted_hkt_state" "$TMP_DIR/t13_bad_hkt_state.gsa"
+
+# 13g. Forward/mutually-recursive top-level function touching `!Send` global passed to `runAsync`
+cat > "$TMP_DIR/t13_bad_global_mutrec.gsa" << 'EOF'
+use std.task.{Task, spawn, await}
+def runAsync(f: () -> Int): Task Int = spawn(f)
+def stepA(): Int = stepB()
+def stepB(): Int = cellGet(globalCell)
+def globalCell: Cell Int = cellNew(42)
+def main() = {
+    let _ = await(runAsync(stepA));
+    ()
+}
+EOF
+assert_compile_fails "send_reject_mutrec_global_cell_via_hof" "$TMP_DIR/t13_bad_global_mutrec.gsa"
+
+# 13h. `parMap` callback capturing `Cell` must be rejected
+cat > "$TMP_DIR/t13_bad_parmap.gsa" << 'EOF'
+use std.task.parMap
+def main() = {
+    let c = cellNew(0);
+    let _ = parMap([1, 2, 3], (x) -> { cellSet(c, x); x });
+    ()
+}
+EOF
+assert_compile_fails "send_reject_parmap_dirty_callback" "$TMP_DIR/t13_bad_parmap.gsa"
+
 echo "All $PASS end-to-end test suites passed!"

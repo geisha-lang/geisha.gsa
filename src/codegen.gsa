@@ -147,7 +147,7 @@ def isNoscanList(ts: List Type): Bool = match ts {
 }
 
 pub def isGcPointerType(ty: Type): Bool = match ty {
-    TyArr(_, _) -> true,
+    TyArr(_, _, _) -> true,
     TyCon(n) -> n == "String" || n == "AtomicInt" || isAdtGeishaType(ty),
     TyComp(_, _) -> {
         let base = getCompBaseName(ty);
@@ -168,7 +168,7 @@ pub def getValLlvmType(ty: Type): String = match ty {
         else if (n == "Bool") "i1"
         else if (n == "Void") "i8"
         else "ptr",
-    TyArr(_, _) -> "ptr",
+    TyArr(_, _, _) -> "ptr",
     TyComp(_, _) -> "ptr",
     TyTuple(elems) -> formatLlvmStructType(mapValLlvmTypes(elems)),
     TyVar(_) -> "i64",
@@ -220,7 +220,7 @@ pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int) = match ty {
         else if (n == "Float") (8, 8)
         else if (n == "Char" || n == "Bool" || n == "Void") (1, 1)
         else (ptrSize, ptrSize),
-    TyArr(_, _) -> (ptrSize, ptrSize),
+    TyArr(_, _, _) -> (ptrSize, ptrSize),
     TyComp(_, _) -> (ptrSize, ptrSize),
     TyVar(_) -> (8, 8),
     TyTuple(elems) -> structSizeAndAlignFor(elems, ptrSize),
@@ -605,7 +605,7 @@ def mangleConcTypeSym(ty: Type): String = match ty {
     TyCon(n) -> replaceDotsUnderscore(n),
     TyVar(v) -> "V_" + v,
     TyTuple(es) -> "Tup" + intToStr(listLen(es)) + "_" + joinConcTypes(es),
-    TyArr(ps, r) -> "Fn" + intToStr(listLen(ps)) + "_" + joinConcTypes(ps) + "_to_" + mangleConcTypeSym(r),
+    TyArr(_, ps, r) -> "Fn" + intToStr(listLen(ps)) + "_" + joinConcTypes(ps) + "_to_" + mangleConcTypeSym(r),
     TyComp(b, a) -> mangleConcTypeSym(b) + "_of_" + mangleConcTypeSym(a),
 }
 
@@ -2053,7 +2053,7 @@ def genExpr(
             let typedArgsStr = formatTypedArgs(allTys, allVals);
 
             let retTy = match schemeBody(callee.tscm) {
-                TyArr(_, r) -> r,
+                TyArr(_, _, r) -> r,
                 _ -> schemeBody(tm.tscm),
             };
             let retLlvm = getFnRetLlvmType(retTy);
@@ -2094,7 +2094,7 @@ def genExpr(
                         } else ();
 
                         let extRetTy = match extDef.extTy {
-                            TyArr(_, r) -> r,
+                            TyArr(_, _, r) -> r,
                             _ -> retGeishaTy,
                         };
                         let retLlvm = getFnRetLlvmType(extRetTy);
@@ -2128,7 +2128,7 @@ def genExpr(
                         let typedArgsStr = formatTypedArgs(allTys, allVals);
 
                         let fnRetTy = match schemeBody(funDecl.vscm) {
-                            TyArr(_, r) -> r,
+                            TyArr(_, _, r) -> r,
                             _ -> retGeishaTy,
                         };
                         let retLlvm = getFnRetLlvmType(fnRetTy);
@@ -2472,7 +2472,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     let fctx = newFnEmitCtx(fd.fnName);
     let funTy = schemeBody(fd.fnScm);
     let retGeishaTy = match funTy {
-        TyArr(_, r) -> r,
+        TyArr(_, _, r) -> r,
         _ -> TyVoid,
     };
     let retLlvm = getFnRetLlvmType(retGeishaTy);
@@ -2734,7 +2734,7 @@ def emitUserExternDeclares(
                         if (!strMapContains(declaredSyms, ed.extLink) && !strMapContains(definedFns, ed.extLink)) {
                             strMapInsert(declaredSyms, ed.extLink, true);
                             match ed.extTy {
-                                TyArr(ps, ret) -> {
+                                TyArr(_, ps, ret) -> {
                                     let pTys = mapValLlvmTypes(ps);
                                     let rTy = getFnRetLlvmType(ret);
                                     bufPushStr(out, "declare ");
