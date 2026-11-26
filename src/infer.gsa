@@ -147,6 +147,7 @@ pub def mangleType(ty: Type): String = match ty {
     TyCon(n) ->
         if (n == "$Local") "Local"
         else if (n == "$Shared") "Shared"
+        else if (n == "$Scoped") "Scoped"
         else replaceDots(n),
     TyVar(v) -> "T" + stripLeadingDot(v),
     TyVoid -> "Void",
@@ -387,6 +388,10 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
             if (na == nb) Ok(())
             else if ((na == "$Local" && nb == "$Shared") || (na == "$Shared" && nb == "$Local")) {
                 Err(typeErr(sp, "Cannot pass non-Send closure (captures local mutable state) where a thread-safe 'Send' function is required"))
+            } else if ((na == "$Scoped" && nb == "$Shared") || (na == "$Shared" && nb == "$Scoped")) {
+                Err(typeErr(sp, "Cannot pass scoped closure (captures ScopedPtr/Arena) where a thread-safe 'Send' function is required"))
+            } else if ((na == "$Scoped" && nb == "$Local") || (na == "$Local" && nb == "$Scoped")) {
+                Err(typeErr(sp, "Cannot pass scoped closure (captures ScopedPtr/Arena) where an escaping closure is required"))
             } else Err(typeErr(sp, "Type mismatch: '" + na + "' vs '" + nb + "'")),
         (TyVar(va), TyVar(vb)) ->
             if (va == vb) Ok(())
@@ -424,7 +429,7 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
 // ============================================================================
 
 def isModeTypeArg(ty: Type): Bool = match ty {
-    TyCon(n) -> n == "$Local" || n == "$Shared",
+    TyCon(n) -> n == "$Local" || n == "$Shared" || n == "$Scoped",
     TyVar(v) -> isModeVarName(v),
     _ -> false,
 }
@@ -791,6 +796,51 @@ def checkSchemeKinds(ctx: InferCtx, scm: Scheme, sp: Span): Result Void String =
     checkTypeKindStar(ctx, schemeBody(scm), tvKinds, sp)
 }
 
+def registerBuiltinArithConceptSpec(
+    ctx: InferCtx,
+    conceptName: String,
+    methodName: String,
+    primNames: List String
+): Void = {
+    let tvA = TyVar("a");
+    let tvB = TyVar("b");
+    let tvC = TyVar("c");
+    let tvM = TyVar(".$m_op");
+    let methodTy = TyArr(tvM, [tvA, tvB], tvC);
+    let scm = ScmPolyConstrained(
+        ["a", "b", "c", ".$m_op"],
+        [MkConstraint { conceptName: conceptName, typeArgs: [tvA, tvB, tvC] }],
+        methodTy
+    );
+    strMapInsert(ctx.conceptMethods, methodName, (conceptName, 0));
+    strMapInsert(ctx.conceptReg, conceptName, MkConceptInfo {
+        conceptName: conceptName,
+        typeParams: ["a", "b", "c"],
+        paramKinds: [KStar, KStar, KStar],
+        superclasses: Nil,
+        fundeps: [MkFunDep { fdLhs: ["a", "b"], fdRhs: ["c"] }],
+        methods: [(methodName, scm)],
+    });
+    let cur = cellNew(primNames);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                let pt = TyCon(p);
+                let inst = MkInstanceInfo {
+                    conceptName: conceptName,
+                    typeParams: Nil,
+                    constraints: Nil,
+                    targetTypes: [pt, pt, pt],
+                    methodImpls: strMapNew(),
+                };
+                cellSet(ctx.instanceReg, listAppend(cellGet(ctx.instanceReg), [inst]));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
 def registerBuiltinConceptSpec(
     ctx: InferCtx,
     conceptName: String,
@@ -850,7 +900,7 @@ def initInferCtx(): InferCtx = {
         instanceReg: cellNew(Nil),
         conceptMethods: strMapNew(),
     };
-    let kStarNames = ["Int", "Int64", "Float", "Char", "String", "Bool", "Void", "Ptr", "AtomicInt", "$Local", "$Shared"];
+    let kStarNames = ["Int", "Int64", "Float", "Float32", "Char", "String", "Bool", "Void", "Ptr", "ForeignPtr", "ScopedPtr", "Arena", "AtomicInt", "$Local", "$Shared", "$Scoped"];
     let ck0 = cellNew(kStarNames);
     while (match cellGet(ck0) { Nil -> false, _ -> true }) {
         match cellGet(ck0) {
@@ -858,7 +908,7 @@ def initInferCtx(): InferCtx = {
             Nil -> (),
         }
     };
-    let kUnaryNames = ["List", "Cell", "MutArray", "MVar", "Chan", "Task", "Actor"];
+    let kUnaryNames = ["List", "Cell", "MutArray", "ImmArray", "MVar", "Chan", "Task", "Actor"];
     let ck1 = cellNew(kUnaryNames);
     while (match cellGet(ck1) { Nil -> false, _ -> true }) {
         match cellGet(ck1) {
@@ -874,12 +924,12 @@ def initInferCtx(): InferCtx = {
     let binInt = TyArr(tvM, [tvA, tvA], TyCon("Int"));
     let binShift = TyArr(tvM, [tvA, TyCon("Int")], tvA);
 
-    registerBuiltinConceptSpec(ctx, "Add", "$op$plus", binSame, ["Int", "Int64", "Float", "String"]);
-    registerBuiltinConceptSpec(ctx, "Sub", "$op$minus", binSame, ["Int", "Int64", "Float"]);
-    registerBuiltinConceptSpec(ctx, "Mul", "$op$star", binSame, ["Int", "Int64", "Float"]);
-    registerBuiltinConceptSpec(ctx, "Div", "$op$slash", binSame, ["Int", "Int64", "Float"]);
+    registerBuiltinArithConceptSpec(ctx, "Add", "$op$plus", ["Int", "Int64", "Float", "Float32", "String"]);
+    registerBuiltinArithConceptSpec(ctx, "Sub", "$op$minus", ["Int", "Int64", "Float", "Float32"]);
+    registerBuiltinArithConceptSpec(ctx, "Mul", "$op$star", ["Int", "Int64", "Float", "Float32"]);
+    registerBuiltinArithConceptSpec(ctx, "Div", "$op$slash", ["Int", "Int64", "Float", "Float32"]);
     registerBuiltinConceptSpec(ctx, "Rem", "$op$rem", binSame, ["Int", "Int64"]);
-    registerBuiltinConceptSpec(ctx, "Neg", "neg", unSame, ["Int", "Int64", "Float"]);
+    registerBuiltinConceptSpec(ctx, "Neg", "neg", unSame, ["Int", "Int64", "Float", "Float32"]);
     registerBuiltinConceptSpec(ctx, "BitAnd", "$op$amp", binSame, ["Int", "Int64", "Bool"]);
     registerBuiltinConceptSpec(ctx, "BitOr", "$op$bar", binSame, ["Int", "Int64", "Bool"]);
     registerBuiltinConceptSpec(ctx, "BitXor", "$op$caret", binSame, ["Int", "Int64", "Bool"]);
@@ -887,8 +937,8 @@ def initInferCtx(): InferCtx = {
     registerBuiltinConceptSpec(ctx, "Shl", "$op$lt_lt", binShift, ["Int", "Int64"]);
     registerBuiltinConceptSpec(ctx, "Shr", "$op$gt_gt", binShift, ["Int", "Int64"]);
     registerBuiltinConceptSpec(ctx, "Ushr", "$op$gt_gt_gt", binShift, ["Int", "Int64"]);
-    registerBuiltinConceptSpec(ctx, "Eq", "eq", binBool, ["Int", "Int64", "Float", "Bool", "Char", "String"]);
-    registerBuiltinConceptSpec(ctx, "Ord", "compare", binInt, ["Int", "Int64", "Float", "Char", "String"]);
+    registerBuiltinConceptSpec(ctx, "Eq", "eq", binBool, ["Int", "Int64", "Float", "Float32", "Bool", "Char", "String"]);
+    registerBuiltinConceptSpec(ctx, "Ord", "compare", binInt, ["Int", "Int64", "Float", "Float32", "Char", "String"]);
 
     strMapInsert(ctx.conceptReg, "Send", MkConceptInfo {
         conceptName: "Send",
@@ -972,7 +1022,7 @@ def fillPreludeModesList(ts: List Type, counter: Cell Int): List Type = match ts
 def finalizePreludeScheme(nm: String, rawScm: Scheme): Scheme = {
     let sharedIdx: Option Int =
         if (nm == "__concTaskSpawn" || nm == "__concActorSpawn") Some(0)
-        else if (nm == "__concActorCall" || nm == "__concActorSend") Some(1)
+        else if (nm == "__concActorCall" || nm == "__concActorSend" || nm == "parTabulate") Some(1)
         else None;
     let cnt = cellNew(0);
     let updated = match rawScm {
@@ -990,6 +1040,7 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("printLn", "String -> Void"),
         ("putNumber", "Int -> Void"),
         ("putFloat", "Float -> Void"),
+        ("putF32", "Float32 -> Void"),
         ("putChar", "Char -> Void"),
         ("cellNew", "forall a. a -> Cell a"),
         ("cellGet", "forall a. Cell a -> a"),
@@ -1000,6 +1051,10 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("arrayGet", "forall a. (MutArray a, Int) -> a"),
         ("arraySet", "forall a. (MutArray a, Int, a) -> Void"),
         ("arrayClearSlot", "forall a. (MutArray a, Int) -> Void"),
+        ("arrayFreeze", "forall a. MutArray a -> ImmArray a"),
+        ("immArrayLen", "forall a. ImmArray a -> Int"),
+        ("immArrayGet", "forall a. (ImmArray a, Int) -> a"),
+        ("parTabulate", "forall a. (Send a) => (Int, Int -> a) -> ImmArray a"),
         ("bitAnd", "(Int, Int) -> Int"),
         ("bitOr", "(Int, Int) -> Int"),
         ("bitXor", "(Int, Int) -> Int"),
@@ -1027,6 +1082,34 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("bits32ToFloat", "Int -> Float"),
         ("intToFloat", "Int -> Float"),
         ("floatToInt", "Float -> Int"),
+        ("floatToF32", "Float -> Float32"),
+        ("f32ToFloat", "Float32 -> Float"),
+        ("intToF32", "Int -> Float32"),
+        ("f32ToInt", "Float32 -> Int"),
+        ("f32ToBits32", "Float32 -> Int"),
+        ("bits32ToF32", "Int -> Float32"),
+        ("mathExp", "Float -> Float"),
+        ("mathLog", "Float -> Float"),
+        ("mathSqrt", "Float -> Float"),
+        ("mathSin", "Float -> Float"),
+        ("mathCos", "Float -> Float"),
+        ("mathTanh", "Float -> Float"),
+        ("mathPow", "(Float, Float) -> Float"),
+        ("mathAbs", "Float -> Float"),
+        ("mathFloor", "Float -> Float"),
+        ("mathCeil", "Float -> Float"),
+        ("mathFma", "(Float, Float, Float) -> Float"),
+        ("mathExpF32", "Float32 -> Float32"),
+        ("mathLogF32", "Float32 -> Float32"),
+        ("mathSqrtF32", "Float32 -> Float32"),
+        ("mathSinF32", "Float32 -> Float32"),
+        ("mathCosF32", "Float32 -> Float32"),
+        ("mathTanhF32", "Float32 -> Float32"),
+        ("mathPowF32", "(Float32, Float32) -> Float32"),
+        ("mathAbsF32", "Float32 -> Float32"),
+        ("mathFloorF32", "Float32 -> Float32"),
+        ("mathCeilF32", "Float32 -> Float32"),
+        ("mathFmaF32", "(Float32, Float32, Float32) -> Float32"),
         ("strLen", "String -> Int"),
         ("strByteAt", "(String, Int) -> Int"),
         ("strSlice", "(String, Int, Int) -> String"),
@@ -1050,17 +1133,49 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("ptrWriteI64Le", "(Ptr, Int, Int64) -> Void"),
         ("ptrWriteF32Le", "(Ptr, Int, Float) -> Void"),
         ("ptrWriteF64Le", "(Ptr, Int, Float) -> Void"),
+        ("ptrAllocBytes64", "Int64 -> Ptr"),
+        ("ptrReadI64Le64", "(Ptr, Int64) -> Int64"),
+        ("ptrWriteI64Le64", "(Ptr, Int64, Int64) -> Void"),
+        ("ptrReadF32Le64", "(Ptr, Int64) -> Float32"),
+        ("ptrWriteF32Le64", "(Ptr, Int64, Float32) -> Void"),
+        ("ptrReadF64Le64", "(Ptr, Int64) -> Float"),
+        ("ptrWriteF64Le64", "(Ptr, Int64, Float) -> Void"),
         ("ptrCopyBytes", "(Ptr, Int, Ptr, Int, Int) -> Void"),
+        ("ptrCopyBytes64", "(Ptr, Int64, Ptr, Int64, Int64) -> Void"),
         ("ptrCopyFromStr", "(Ptr, Int, String, Int) -> Void"),
         ("ptrSliceFromStr", "(String, Int, Int) -> String"),
         ("ptrSliceToString", "(Ptr, Int) -> String"),
         ("ptrToString", "Ptr -> String"),
+        ("foreignPtrAlloc", "Int64 -> ForeignPtr"),
+        ("foreignPtrNew", "(Ptr, Ptr, Int64) -> ForeignPtr"),
+        ("withForeignPtr", "forall r. (ForeignPtr, ScopedPtr -> r) -> r"),
+        ("withAlloca", "forall r. (Int, ScopedPtr -> r) -> r"),
+        ("withArena", "forall r. (Arena -> r) -> r"),
+        ("arenaAlloc", "(Arena, Int64) -> ScopedPtr"),
+        ("scopedPtrOffset", "(ScopedPtr, Int) -> ScopedPtr"),
+        ("scopedPtrOffset64", "(ScopedPtr, Int64) -> ScopedPtr"),
+        ("scopedPtrByteAt", "(ScopedPtr, Int) -> Int"),
+        ("scopedPtrSetByte", "(ScopedPtr, Int, Int) -> Void"),
+        ("scopedPtrReadI32Le", "(ScopedPtr, Int) -> Int"),
+        ("scopedPtrWriteI32Le", "(ScopedPtr, Int, Int) -> Void"),
+        ("scopedPtrReadI64Le", "(ScopedPtr, Int64) -> Int64"),
+        ("scopedPtrWriteI64Le", "(ScopedPtr, Int64, Int64) -> Void"),
+        ("scopedPtrReadF32Le", "(ScopedPtr, Int) -> Float32"),
+        ("scopedPtrWriteF32Le", "(ScopedPtr, Int, Float32) -> Void"),
+        ("scopedPtrReadF32Le64", "(ScopedPtr, Int64) -> Float32"),
+        ("scopedPtrWriteF32Le64", "(ScopedPtr, Int64, Float32) -> Void"),
+        ("scopedPtrReadF64Le", "(ScopedPtr, Int) -> Float"),
+        ("scopedPtrWriteF64Le", "(ScopedPtr, Int, Float) -> Void"),
+        ("scopedPtrReadF64Le64", "(ScopedPtr, Int64) -> Float"),
+        ("scopedPtrWriteF64Le64", "(ScopedPtr, Int64, Float) -> Void"),
+        ("scopedPtrCopyBytes", "(ScopedPtr, Int64, ScopedPtr, Int64, Int64) -> Void"),
         ("gcHandleNew", "forall a. a -> Int64"),
         ("gcHandleGet", "forall a. Int64 -> a"),
         ("gcHandleFree", "Int64 -> Void"),
         ("gcTrim", "() -> Void"),
         ("gcSetThresholds", "(Int64, Int64) -> Void"),
         ("gcHeapLiveBytes", "() -> Int64"),
+        ("gcExternalLiveBytes", "() -> Int64"),
         ("sysArgc", "() -> Int"),
         ("sysArgv", "Int -> String"),
         ("__concAtomicNew", "Int -> AtomicInt"),
@@ -1182,7 +1297,7 @@ pub def matchInstancePattern(pat: Type, concrete: Type, sub: StrMap Type): Bool 
     },
     (TyVoid, TyVoid) -> true,
     (TyCon(a), TyCon(b)) -> a == b,
-    (TyCon(mPat), TyVar(mv)) if ((mPat == "$Local" || mPat == "$Shared") && isModeVarName(mv)) -> true,
+    (TyCon(mPat), TyVar(mv)) if ((mPat == "$Local" || mPat == "$Shared" || mPat == "$Scoped") && isModeVarName(mv)) -> true,
     (TyComp(b1, a1), TyComp(b2, a2)) -> matchInstancePattern(b1, b2, sub) && matchInstancePattern(a1, a2, sub),
     (TyTuple(es1), TyTuple(es2)) -> matchInstancePatList(es1, es2, sub),
     (TyArr(m1, ps1, r1), TyArr(m2, ps2, r2)) -> matchInstancePattern(m1, m2, sub) && matchInstancePatList(ps1, ps2, sub) && matchInstancePattern(r1, r2, sub),
@@ -1221,8 +1336,8 @@ def checkTypeSendRec(adtReg: StrMap AdtInfo, ty: Type, visiting: List String): B
         cellGet(ok)
     },
     TyCon(name) ->
-        if (name == "Ptr" || name == "Cell" || name == "MutArray") false
-        else if (name == "Int" || name == "Int64" || name == "Float" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt") true
+        if (name == "Ptr" || name == "Cell" || name == "MutArray" || name == "ForeignPtr" || name == "ScopedPtr" || name == "Arena" || name == "$Local" || name == "$Scoped") false
+        else if (name == "Int" || name == "Int64" || name == "Float" || name == "Float32" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt" || name == "$Shared") true
         else match strMapGet(adtReg, name) {
             Some(ainfo) ->
                 if (listContainsStr(visiting, name)) true
@@ -1244,7 +1359,7 @@ def checkTypeSendRec(adtReg: StrMap AdtInfo, ty: Type, visiting: List String): B
             TyCon(baseName) ->
                 if (baseName == "Cell" || baseName == "MutArray") false
                 else if (baseName == "Actor") true
-                else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task") {
+                else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                     match targs {
                         Cons(elem, Nil) -> checkTypeSendRec(adtReg, elem, visiting),
                         _ -> false,
@@ -1533,7 +1648,7 @@ def bindMatchedModes(subst: StrMap Type, pat: Type, conc: Type, sp: Span): Resul
     let zc = zonkType(subst, conc);
     match (zp, zc) {
         (TyCon(mPat), TyVar(mv)) ->
-            if ((mPat == "$Local" || mPat == "$Shared") && isModeVarName(mv)) {
+            if ((mPat == "$Local" || mPat == "$Shared" || mPat == "$Scoped") && isModeVarName(mv)) {
                 unifyTypes(subst, TyVar(mv), TyCon(mPat), sp)
             } else Ok(()),
         (TyComp(b1, a1), TyComp(b2, a2)) -> {
@@ -1586,6 +1701,16 @@ def dischargeConstraint(
                 Cons(mTy, Cons(targetTy, _)) ->
                     dischargeSendIf(ctx, mTy, targetTy, wc.wcSpan, given, residual, depth),
                 _ -> Ok(()),
+            }
+        } else if (wc.wcConcept == "NoScoped") {
+            match zArgs0 {
+                Cons(targetTy, _) -> {
+                    let zt = zonkType(ctx.subst, targetTy);
+                    if (typeContainsScoped(ctx.adtReg, ctx.subst, zt, Nil)) {
+                        Err(typeErr(wc.wcSpan, "Scoped value ('ScopedPtr' / 'Arena' / '$Scoped' closure) cannot escape its scope or be stored in a mutable container: '" + typeToString(zt) + "'"))
+                    } else Ok(())
+                },
+                Nil -> Ok(()),
             }
         } else {
             let givenClosure = expandGivenClosure(ctx, given);
@@ -1668,7 +1793,7 @@ def evalSendStatus(ctx: InferCtx, rawTy: Type, assumeSharedVarOpt: Option String
             match m {
                 TyCon(mn) ->
                     if (mn == "$Shared") SendYes
-                    else if (mn == "$Local") SendNo
+                    else if (mn == "$Local" || mn == "$Scoped") SendNo
                     else SendUnknown,
                 TyVar(mv) -> match assumeSharedVarOpt {
                     Some(av) -> if (mv == av) SendYes else SendUnknown,
@@ -1679,8 +1804,8 @@ def evalSendStatus(ctx: InferCtx, rawTy: Type, assumeSharedVarOpt: Option String
         },
         TyTuple(es) -> evalSendStatusList(ctx, es, assumeSharedVarOpt, visiting),
         TyCon(name) ->
-            if (name == "Ptr" || name == "Cell" || name == "MutArray" || name == "$Local") SendNo
-            else if (name == "Int" || name == "Int64" || name == "Float" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt" || name == "$Shared") SendYes
+            if (name == "Ptr" || name == "Cell" || name == "MutArray" || name == "ForeignPtr" || name == "ScopedPtr" || name == "Arena" || name == "$Local" || name == "$Scoped") SendNo
+            else if (name == "Int" || name == "Int64" || name == "Float" || name == "Float32" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt" || name == "$Shared") SendYes
             else if (listContainsStr(visiting, name)) SendYes
             else match strMapGet(ctx.adtReg, name) {
                 Some(ainfo) -> {
@@ -1707,7 +1832,7 @@ def evalSendStatus(ctx: InferCtx, rawTy: Type, assumeSharedVarOpt: Option String
                     TyCon(baseName) ->
                         if (baseName == "Cell" || baseName == "MutArray") SendNo
                         else if (baseName == "Actor") SendYes
-                        else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task") {
+                        else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                             evalSendStatusList(ctx, targs, assumeSharedVarOpt, Cons(key, visiting))
                         } else match strMapGet(ctx.adtReg, baseName) {
                             Some(ainfo) -> {
@@ -1761,7 +1886,7 @@ def dischargeSendIf(
         let t = zonkType(ctx.subst, rawTarget);
         match m {
             TyCon(mn) ->
-                if (mn == "$Local") Ok(())
+                if (mn == "$Local" || mn == "$Scoped") Ok(())
                 else if (mn == "$Shared") dischargeSendConstraint(ctx, t, sp, given, residual, Nil, depth + 1)
                 else Ok(()),
             _ -> {
@@ -1806,9 +1931,9 @@ def dischargeSendConstraint(
             },
             TyTuple(es) -> dischargeSendList(ctx, es, sp, given, residual, visiting, depth + 1),
             TyCon(name) ->
-                if (name == "Ptr" || name == "Cell" || name == "MutArray" || name == "$Local") {
+                if (name == "Ptr" || name == "Cell" || name == "MutArray" || name == "ForeignPtr" || name == "ScopedPtr" || name == "Arena" || name == "$Local" || name == "$Scoped") {
                     Err(typeErr(sp, "No instance of 'Send' for non-thread-safe type '" + name + "'"))
-                } else if (name == "Int" || name == "Int64" || name == "Float" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt" || name == "$Shared") {
+                } else if (name == "Int" || name == "Int64" || name == "Float" || name == "Float32" || name == "Bool" || name == "Char" || name == "String" || name == "Void" || name == "AtomicInt" || name == "$Shared") {
                     Ok(())
                 } else if (listContainsStr(visiting, name)) {
                     Ok(())
@@ -1838,7 +1963,7 @@ def dischargeSendConstraint(
                             if (baseName == "Cell" || baseName == "MutArray") {
                                 Err(typeErr(sp, "No instance of 'Send' for mutable container '" + typeToString(ty) + "'"))
                             } else if (baseName == "Actor") Ok(())
-                            else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task") {
+                            else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                                 dischargeSendList(ctx, targs, sp, given, residual, Cons(key, visiting), depth + 1)
                             } else match strMapGet(ctx.adtReg, baseName) {
                                 Some(ainfo) -> {
@@ -2195,7 +2320,90 @@ def generalizeType(
         }
     };
 
+    // FunDep-closed generalization: any type variable on the RHS of a functional dependency
+    // whose LHS free variables are already in `genVars` is uniquely determined (not ambiguous).
+    let grewGen = cellNew(true);
+    while (cellGet(grewGen)) {
+        cellSet(grewGen, false);
+        let cFd = cellNew(remRes);
+        while (match cellGet(cFd) { Nil -> false, _ -> true }) {
+            match cellGet(cFd) {
+                Cons(rw, rr) -> {
+                    match strMapGet(ctx.conceptReg, rw.wcConcept) {
+                        Some(cinfo) -> {
+                            let zArgs = zonkTypeList(ctx.subst, rw.wcArgs);
+                            let cfds = cellNew(cinfo.fundeps);
+                            while (match cellGet(cfds) { Nil -> false, _ -> true }) {
+                                match cellGet(cfds) {
+                                    Cons(fd, rfd) -> {
+                                        let lhsFvs = collectFtvsInTypeList(selectTypesByNames(cinfo.typeParams, fd.fdLhs, zArgs));
+                                        if (allVarsInList(lhsFvs, cellGet(genVars))) {
+                                            let rhsFvs = collectFtvsInTypeList(selectTypesByNames(cinfo.typeParams, fd.fdRhs, zArgs));
+                                            let crf = cellNew(rhsFvs);
+                                            while (match cellGet(crf) { Nil -> false, _ -> true }) {
+                                                match cellGet(crf) {
+                                                    Cons(rv, rrv) -> {
+                                                        if (!listContainsStr(envFtvs, rv) && !listContainsStr(cellGet(genVars), rv)) {
+                                                            cellSet(genVars, addUniqueStr(cellGet(genVars), rv));
+                                                            cellSet(grewGen, true)
+                                                        } else ();
+                                                        cellSet(crf, rrv)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        } else ();
+                                        cellSet(cfds, rfd)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        None -> (),
+                    };
+                    cellSet(cFd, rr)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
     let gvs = cellGet(genVars);
+    // Compute transitive closure of type variables reachable from `envFtvs` through residual constraints
+    // (handles chained multi-parameter fundep constraints inside mutual recursion, e.g. `Add String .a .b` + `Add .b String String`).
+    let outerFtvs = cellNew(envFtvs);
+    let grewOuter = cellNew(true);
+    while (cellGet(grewOuter)) {
+        cellSet(grewOuter, false);
+        let cScan = cellNew(remRes);
+        while (match cellGet(cScan) { Nil -> false, _ -> true }) {
+            match cellGet(cScan) {
+                Cons(rw, r) -> {
+                    let zArgs = zonkTypeList(ctx.subst, rw.wcArgs);
+                    let fvs = collectFtvsInTypeList(zArgs);
+                    if (anyVarInList(fvs, cellGet(outerFtvs))) {
+                        let cf = cellNew(fvs);
+                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                            match cellGet(cf) {
+                                Cons(fv, rf) -> {
+                                    if (!listContainsStr(cellGet(outerFtvs), fv)) {
+                                        cellSet(outerFtvs, Cons(fv, cellGet(outerFtvs)));
+                                        cellSet(grewOuter, true)
+                                    } else ();
+                                    cellSet(cf, rf)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    } else ();
+                    cellSet(cScan, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    let reachableOuterFtvs = cellGet(outerFtvs);
+
     let localCs = cellNew(Nil);
     let outerWanted = cellNew(Nil);
     let curRes = cellNew(remRes);
@@ -2216,7 +2424,7 @@ def generalizeType(
                     _ ->
                         if (allVarsInList(fvs, gvs) || isQuantifiedSendIf) {
                             cellSet(localCs, addUniqueConstraint(cellGet(localCs), MkConstraint { conceptName: rw.wcConcept, typeArgs: zArgs }))
-                        } else if (anyVarInList(fvs, envFtvs)) {
+                        } else if (anyVarInList(fvs, reachableOuterFtvs)) {
                             cellSet(outerWanted, listAppend(cellGet(outerWanted), [MkWanted { wcConcept: rw.wcConcept, wcArgs: zArgs, wcSpan: rw.wcSpan }]))
                         } else {
                             returnPatErr(rw.wcSpan, "Ambiguous constraint '" + rw.wcConcept + "' for (" + joinTypeListStr(zArgs) + ")")?
@@ -2364,6 +2572,9 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 None -> None,
             };
             let modeVar = freshModeVar(ctx);
+            if (closureCapturesScoped(ctx, env, infBody, cellGet(paramNames))) {
+                unifyTypes(ctx.subst, modeVar, TyCon("$Scoped"), sp)?
+            } else ();
             checkClosureCaptures(ctx, env, infBody, cellGet(paramNames), modeVar, sp)?;
             let fnTy = TyArr(
                 zonkType(ctx.subst, modeVar),
@@ -2391,7 +2602,36 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             let callMode = freshModeVar(ctx);
             let retVar = freshVar(ctx);
             unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, cellGet(argTys), retVar), sp)?;
-            Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, retVar)), annot: f.annot, node: ExApply(ic, cellGet(iargs)) })
+            let resZ = zonkType(ctx.subst, retVar);
+            match ic.node {
+                ExVar(fnNm) -> {
+                    if (fnNm == "withForeignPtr" || fnNm == "withAlloca" || fnNm == "withArena") {
+                        cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [resZ], wcSpan: sp }]))
+                    } else if (fnNm == "cellNew") {
+                        match cellGet(argTys) {
+                            Cons(et, _) -> cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [et], wcSpan: sp }])),
+                            _ -> (),
+                        }
+                    } else if (fnNm == "cellSet" || fnNm == "arrayNew") {
+                        match cellGet(argTys) {
+                            Cons(_, Cons(et, _)) -> cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [et], wcSpan: sp }])),
+                            _ -> (),
+                        }
+                    } else if (fnNm == "arrayNewZeroed") {
+                        match resZ {
+                            TyComp(_, et) -> cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [et], wcSpan: sp }])),
+                            _ -> (),
+                        }
+                    } else if (fnNm == "arraySet") {
+                        match cellGet(argTys) {
+                            Cons(_, Cons(_, Cons(et, _))) -> cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [et], wcSpan: sp }])),
+                            _ -> (),
+                        }
+                    } else ()
+                },
+                _ -> (),
+            };
+            Ok(MkForm { pos: sp, ty: ScmMono(resZ), annot: f.annot, node: ExApply(ic, cellGet(iargs)) })
         },
         ExBin(op, left, right) -> {
             let il = inferForm(ctx, env, left)?;
@@ -2472,17 +2712,53 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                     unifyTypes(ctx.subst, tr, TyCon("Int"), ir.pos)?;
                     zonkType(ctx.subst, a)
                 },
+                OpAdd -> {
+                    let a = freshVar(ctx);
+                    let b = freshVar(ctx);
+                    let c = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Add", wcArgs: [a, b, c], wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, b, ir.pos)?;
+                    let _ = applyFunDeps(ctx, "Add", [a, b, c], Nil, sp)?;
+                    zonkType(ctx.subst, c)
+                },
+                OpSub -> {
+                    let a = freshVar(ctx);
+                    let b = freshVar(ctx);
+                    let c = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Sub", wcArgs: [a, b, c], wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, b, ir.pos)?;
+                    let _ = applyFunDeps(ctx, "Sub", [a, b, c], Nil, sp)?;
+                    zonkType(ctx.subst, c)
+                },
+                OpMul -> {
+                    let a = freshVar(ctx);
+                    let b = freshVar(ctx);
+                    let c = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Mul", wcArgs: [a, b, c], wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, b, ir.pos)?;
+                    let _ = applyFunDeps(ctx, "Mul", [a, b, c], Nil, sp)?;
+                    zonkType(ctx.subst, c)
+                },
+                OpDiv -> {
+                    let a = freshVar(ctx);
+                    let b = freshVar(ctx);
+                    let c = freshVar(ctx);
+                    cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "Div", wcArgs: [a, b, c], wcSpan: sp }]));
+                    unifyTypes(ctx.subst, tl, a, il.pos)?;
+                    unifyTypes(ctx.subst, tr, b, ir.pos)?;
+                    let _ = applyFunDeps(ctx, "Div", [a, b, c], Nil, sp)?;
+                    zonkType(ctx.subst, c)
+                },
                 _ -> {
                     let cname = match op {
-                        OpAdd -> "Add",
-                        OpSub -> "Sub",
-                        OpMul -> "Mul",
-                        OpDiv -> "Div",
                         OpRem -> "Rem",
                         OpBitAnd -> "BitAnd",
                         OpBitOr -> "BitOr",
                         OpBitXor -> "BitXor",
-                        _ -> "Add",
+                        _ -> "Rem",
                     };
                     let a = freshVar(ctx);
                     cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: cname, wcArgs: [a], wcSpan: sp }]));
@@ -2745,6 +3021,142 @@ def extendBoundWithPatList(ps: List Pattern, bound: List String): List String = 
 def extendBoundWithNamedPats(fs: List (String, Pattern), bound: List String): List String = match fs {
     Nil -> bound,
     Cons((_, p), r) -> extendBoundWithNamedPats(r, extendBoundWithPattern(p, bound)),
+}
+
+def typeContainsScopedList(adtReg: StrMap AdtInfo, subst: StrMap Type, ts: List Type, visiting: List String): Bool = match ts {
+    Nil -> false,
+    Cons(h, r) ->
+        if (typeContainsScoped(adtReg, subst, h, visiting)) true
+        else typeContainsScopedList(adtReg, subst, r, visiting),
+}
+
+def typeContainsScopedVariants(adtReg: StrMap AdtInfo, subst: StrMap Type, vs: List VariantInfo, sub: StrMap Type, visiting: List String): Bool = match vs {
+    Nil -> false,
+    Cons(v, rv) -> {
+        let curF = cellNew(v.fieldTypes);
+        let hit = cellNew(false);
+        while (match cellGet(curF) { Nil -> false, _ -> !cellGet(hit) }) {
+            match cellGet(curF) {
+                Cons(ft, rF) -> {
+                    let instFt = applyExplicitSubst(ft, sub);
+                    if (typeContainsScoped(adtReg, subst, instFt, visiting)) cellSet(hit, true) else ();
+                    cellSet(curF, rF)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(hit)) true else typeContainsScopedVariants(adtReg, subst, rv, sub, visiting)
+    },
+}
+
+def typeContainsScoped(adtReg: StrMap AdtInfo, subst: StrMap Type, rawTy: Type, visiting: List String): Bool = {
+    let ty = zonkType(subst, rawTy);
+    match ty {
+        TyVoid -> false,
+        TyVar(_) -> false,
+        TyArr(m, _, _) -> match zonkType(subst, m) {
+            TyCon(mn) -> mn == "$Scoped",
+            _ -> false,
+        },
+        TyTuple(es) -> typeContainsScopedList(adtReg, subst, es, visiting),
+        TyCon(name) ->
+            if (name == "ScopedPtr" || name == "Arena" || name == "$Scoped") true
+            else if (listContainsStr(visiting, name)) false
+            else match strMapGet(adtReg, name) {
+                Some(ainfo) -> {
+                    let emptySub: StrMap Type = strMapNew();
+                    typeContainsScopedVariants(adtReg, subst, ainfo.variants, emptySub, Cons(name, visiting))
+                },
+                None -> false,
+            },
+        TyComp(_, _) -> {
+            let key = mangleType(ty);
+            if (listContainsStr(visiting, key)) false
+            else {
+                let args = cellNew(Nil);
+                let curr = cellNew(ty);
+                let looping = cellNew(true);
+                while (cellGet(looping)) {
+                    match cellGet(curr) {
+                        TyComp(b, a) -> { cellSet(args, Cons(a, cellGet(args))); cellSet(curr, b) },
+                        _ -> cellSet(looping, false),
+                    }
+                };
+                let targs = cellGet(args);
+                if (typeContainsScopedList(adtReg, subst, targs, Cons(key, visiting))) true
+                else match cellGet(curr) {
+                    TyCon(baseName) -> match strMapGet(adtReg, baseName) {
+                        Some(ainfo) -> {
+                            let sub = buildPairMap(ainfo.typeParams, targs);
+                            typeContainsScopedVariants(adtReg, subst, ainfo.variants, sub, Cons(key, visiting))
+                        },
+                        None -> false,
+                    },
+                    _ -> false,
+                }
+            }
+        },
+    }
+}
+
+def closureCapturesScopedList(ctx: InferCtx, env: TypeEnv, fs: List Form, boundNames: List String): Bool = match fs {
+    Nil -> false,
+    Cons(h, r) ->
+        if (closureCapturesScoped(ctx, env, h, boundNames)) true
+        else closureCapturesScopedList(ctx, env, r, boundNames),
+}
+
+def closureCapturesScopedNamed(ctx: InferCtx, env: TypeEnv, fs: List (String, Form), boundNames: List String): Bool = match fs {
+    Nil -> false,
+    Cons((_, h), r) ->
+        if (closureCapturesScoped(ctx, env, h, boundNames)) true
+        else closureCapturesScopedNamed(ctx, env, r, boundNames),
+}
+
+def closureCapturesScopedArms(ctx: InferCtx, env: TypeEnv, arms: List MatchArm, boundNames: List String): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let nb = extendBoundWithPattern(a.pat, boundNames);
+        let gHit = match a.guard {
+            Some(g) -> closureCapturesScoped(ctx, env, g, nb),
+            None -> false,
+        };
+        if (gHit || closureCapturesScoped(ctx, env, a.body, nb)) true
+        else closureCapturesScopedArms(ctx, env, r, boundNames)
+    },
+}
+
+def closureCapturesScoped(ctx: InferCtx, env: TypeEnv, f: Form, boundNames: List String): Bool = match f.node {
+    ExLit(_) -> false,
+    ExVar(vname) ->
+        if (listContainsStr(boundNames, vname)) false
+        else if (hasEnvLocal(env.locals, vname) || strMapContains(ctx.globalValSet, vname)) {
+            typeContainsScoped(ctx.adtReg, ctx.subst, schemeBody(f.ty), Nil)
+        } else false,
+    ExTuple(es) -> closureCapturesScopedList(ctx, env, es, boundNames),
+    ExList(es) -> closureCapturesScopedList(ctx, env, es, boundNames),
+    ExBlock(es) -> closureCapturesScopedList(ctx, env, es, boundNames),
+    ExStructInit(_, fs) -> closureCapturesScopedNamed(ctx, env, fs, boundNames),
+    ExApply(c, args) ->
+        closureCapturesScoped(ctx, env, c, boundNames) || closureCapturesScopedList(ctx, env, args, boundNames),
+    ExAbs(ps2, _, b2) ->
+        closureCapturesScoped(ctx, env, b2, extendBoundWithVarDecls(ps2, boundNames)),
+    ExBin(_, l, r) ->
+        closureCapturesScoped(ctx, env, l, boundNames) || closureCapturesScoped(ctx, env, r, boundNames),
+    ExUn(_, e) -> closureCapturesScoped(ctx, env, e, boundNames),
+    ExField(e, _) -> closureCapturesScoped(ctx, env, e, boundNames),
+    ExTry(e) -> closureCapturesScoped(ctx, env, e, boundNames),
+    ExIf(c, t, e) ->
+        closureCapturesScoped(ctx, env, c, boundNames)
+        || closureCapturesScoped(ctx, env, t, boundNames)
+        || closureCapturesScoped(ctx, env, e, boundNames),
+    ExWhile(c, b) ->
+        closureCapturesScoped(ctx, env, c, boundNames) || closureCapturesScoped(ctx, env, b, boundNames),
+    ExLet(vd, val, body) ->
+        closureCapturesScoped(ctx, env, val, boundNames)
+        || closureCapturesScoped(ctx, env, body, Cons(vd.vname, boundNames)),
+    ExMatch(s, arms) ->
+        closureCapturesScoped(ctx, env, s, boundNames) || closureCapturesScopedArms(ctx, env, arms, boundNames),
 }
 
 def checkClosureCaptures(
@@ -4148,7 +4560,7 @@ def filterNonModeStrings(xs: List String): List String = match xs {
 
 def eraseTypeModes(modeAdtSet: StrMap Bool, ty: Type): Type = match ty {
     TyVoid -> TyVoid,
-    TyCon(n) -> if (n == "$Local" || n == "$Shared") TyVoid else ty,
+    TyCon(n) -> if (n == "$Local" || n == "$Shared" || n == "$Scoped") TyVoid else ty,
     TyVar(v) -> if (isModeVarName(v)) TyVoid else ty,
     TyArr(_, ps, r) -> TyArr(TyVoid, eraseTypeListModes(modeAdtSet, ps), eraseTypeModes(modeAdtSet, r)),
     TyTuple(es) -> TyTuple(eraseTypeListModes(modeAdtSet, es)),
@@ -4187,7 +4599,7 @@ def eraseTypeListModes(modeAdtSet: StrMap Bool, ts: List Type): List Type =
 def eraseConstraintsModes(modeAdtSet: StrMap Bool, cs: List ConstraintSpec): List ConstraintSpec = match cs {
     Nil -> Nil,
     Cons(c, r) ->
-        if (c.conceptName == "SendIf") eraseConstraintsModes(modeAdtSet, r)
+        if (c.conceptName == "SendIf" || c.conceptName == "NoScoped") eraseConstraintsModes(modeAdtSet, r)
         else Cons(
             MkConstraint { conceptName: c.conceptName, typeArgs: eraseTypeListModes(modeAdtSet, c.typeArgs) },
             eraseConstraintsModes(modeAdtSet, r)
@@ -4458,6 +4870,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
 
     // Pass 6: Infer each top-level `ItForm` definition
     let inferredRev = cellNew(Nil);
+    let deferredTopWanted: Cell (List WantedConstraint) = cellNew(Nil);
     let cur6 = cellNew(allDefs);
     while (match cellGet(cur6) { Nil -> false, _ -> true }) {
         match cellGet(cur6) {
@@ -4572,7 +4985,8 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                         }
                                     };
                                     cellSet(unannotatedNames, cellGet(nextUnann));
-                                    let (gscm, _) = generalizeType(ctx, cellGet(otherFtvs), finalBodyTy0, defWanted, Nil)?;
+                                    let (gscm, ow) = generalizeType(ctx, cellGet(otherFtvs), finalBodyTy0, defWanted, Nil)?;
+                                    cellSet(deferredTopWanted, listAppend(cellGet(deferredTopWanted), ow));
                                     gscm
                                 },
                                 _ -> {
@@ -4613,6 +5027,9 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
             Nil -> (),
         }
     };
+
+    // Discharge any top-level constraints deferred across mutually recursive definitions
+    let _ = dischargeWantedFixedPoint(ctx, cellGet(deferredTopWanted), Nil, Nil)?;
 
     // Final pass: backfill mutual-recursion substitutions across all earlier definitions & check exhaustiveness!
     let finalRev = cellNew(Nil);

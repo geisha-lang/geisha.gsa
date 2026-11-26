@@ -1518,4 +1518,238 @@ PASS=$((PASS + 1))
 "$GEISHA_BIN" -o "$TMP_DIR/t23_unbox" "$TMP_DIR/t23_unbox.gsa"
 assert_eq "transparent_adt_unbox_exec" "42|100|cand-42|63" "$("$TMP_DIR/t23_unbox")"
 
+# 24. Heterogeneous Multi-Parameter Operator Concepts (`Add`/`Sub`/`Mul`/`Div` with `a b -> c` fundep)
+cat > "$TMP_DIR/t24_hetero_ops.gsa" << 'EOF'
+use std.str.intToStr
+
+data Vec2 {
+    MkVec2 { x: Float, y: Float },
+}
+
+instance Add Vec2 Vec2 Vec2 {
+    def (+)(a: Vec2, b: Vec2): Vec2 = MkVec2 { x: a.x + b.x, y: a.y + b.y }
+}
+
+instance Add Vec2 Float Vec2 {
+    def (+)(a: Vec2, s: Float): Vec2 = MkVec2 { x: a.x + s, y: a.y + s }
+}
+
+instance Add Float Vec2 Vec2 {
+    def (+)(s: Float, a: Vec2): Vec2 = MkVec2 { x: s + a.x, y: s + a.y }
+}
+
+instance Mul Float Vec2 Vec2 {
+    def (*)(s: Float, a: Vec2): Vec2 = MkVec2 { x: s * a.x, y: s * a.y }
+}
+
+instance Mul Vec2 Float Vec2 {
+    def (*)(a: Vec2, s: Float): Vec2 = MkVec2 { x: a.x * s, y: a.y * s }
+}
+
+def main(): Void = {
+    let v = MkVec2 { x: 2.0, y: 3.0 };
+    let r = (2.0 * v + 1.0) + (v * 3.0);
+    // 2.0*(2,3)+1 = (5,7); v*3 = (6,9); sum = (11, 16)
+    printLn(intToStr(floatToInt(r.x)) + "|" + intToStr(floatToInt(r.y)))
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t24_hetero_ops" "$TMP_DIR/t24_hetero_ops.gsa"
+assert_eq "hetero_fundep_ops" "11|16" "$("$TMP_DIR/t24_hetero_ops")"
+
+# 25. First-class `Float32`, `std.math` LLVM intrinsics, 64-bit `Ptr` ops, and Leaf-Loop Safepoint Omission
+cat > "$TMP_DIR/t25_f32_math.gsa" << 'EOF'
+use std.math.{sqrt, exp, log, tanh, fma, sqrtF32, fmaF32, absF32}
+use std.str.intToStr
+
+def dotF32(a: MutArray Float32, b: MutArray Float32, n: Int): Float32 = {
+    let acc = cellNew(intToF32(0));
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        cellSet(acc, mathFmaF32(arrayGet(a, idx), arrayGet(b, idx), cellGet(acc)));
+        cellSet(i, idx + 1)
+    };
+    cellGet(acc)
+}
+
+def main(): Void = {
+    let a = arrayNew(4, intToF32(0));
+    let b = arrayNew(4, intToF32(0));
+    arraySet(a, 0, floatToF32(1.0)); arraySet(a, 1, floatToF32(2.0));
+    arraySet(a, 2, floatToF32(3.0)); arraySet(a, 3, floatToF32(4.0));
+    arraySet(b, 0, floatToF32(2.0)); arraySet(b, 1, floatToF32(3.0));
+    arraySet(b, 2, floatToF32(4.0)); arraySet(b, 3, floatToF32(5.0));
+    let d = dotF32(a, b, 4); // 2 + 6 + 12 + 20 = 40.0
+
+    let p = ptrAllocBytes64(intToI64(16));
+    ptrWriteF32Le64(p, intToI64(0), d);
+    let dBack = ptrReadF32Le64(p, intToI64(0));
+
+    let s = sqrtF32(floatToF32(16.0)); // 4.0
+    let negAbs = absF32(-s);           // 4.0
+    let m = floatToInt(sqrt(25.0) + fma(2.0, 3.0, 4.0) + log(exp(3.0)) + tanh(0.0)); // 5 + 10 + 3 + 0 = 18
+    printLn(intToStr(f32ToInt(dBack)) + "|" + intToStr(f32ToInt(negAbs)) + "|" + intToStr(m))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t25_f32_math.ll" "$TMP_DIR/t25_f32_math.gsa"
+if awk '/define .*@dotF32\(/,/^}/' "$TMP_DIR/t25_f32_math.ll" | grep -q "gc_safepoint_slow"; then
+    echo "FAIL [leaf_loop_safepoint_ir]: pure numerical leaf loop dotF32 should not emit gc_safepoint_slow" >&2
+    exit 1
+fi
+echo "PASS [leaf_loop_safepoint_ir]: pure numerical leaf loop omits inner safepoint poll"
+PASS=$((PASS + 1))
+"$GEISHA_BIN" -o "$TMP_DIR/t25_f32_math" "$TMP_DIR/t25_f32_math.gsa"
+assert_eq "f32_math_and_ptr64" "40|4|18" "$("$TMP_DIR/t25_f32_math")"
+
+# 26. Two-Phase GC Cleanup (`ForeignPtr` + `withForeignPtr` keep-alive), `withAlloca` (`stacksave`/`stackrestore`), & `withArena`
+cat > "$TMP_DIR/t26_scoped_mem.gsa" << 'EOF'
+use std.str.intToStr
+
+def allocAndReadForeign(): Int = {
+    let fp = foreignPtrAlloc(intToI64(4096));
+    let liveBefore = i64ToInt(gcExternalLiveBytes());
+    let v = withForeignPtr(fp, (p) -> {
+        scopedPtrWriteF32Le(p, 0, floatToF32(42.5));
+        f32ToInt(scopedPtrReadF32Le(p, 0) + floatToF32(0.5))
+    });
+    if (liveBefore >= 4096) v else -1
+}
+
+def main(): Void = {
+    let fv = allocAndReadForeign();
+    let k = cellNew(0);
+    while (cellGet(k) < 32) {
+        let _ = allocAndReadForeign();
+        cellSet(k, cellGet(k) + 1)
+    };
+    let livePeak = i64ToInt(gcExternalLiveBytes());
+    gcTrim();
+    let liveAfter = i64ToInt(gcExternalLiveBytes());
+    let reclaimedOk = if (livePeak >= 4096 && liveAfter < livePeak) 1 else 0;
+
+    // Exercise withAlloca 5000 times in a loop (would stack-overflow without stacksave/stackrestore)
+    let sumAlloca = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < 5000) {
+        let cur = withAlloca(4096, (p) -> {
+            scopedPtrWriteI32Le(p, 0, 1);
+            scopedPtrReadI32Le(p, 0)
+        });
+        cellSet(sumAlloca, cellGet(sumAlloca) + cur);
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    let arenaRes = withArena((a) -> {
+        let p1 = arenaAlloc(a, intToI64(1024));
+        let p2 = arenaAlloc(a, intToI64(1024));
+        scopedPtrWriteF32Le64(p1, intToI64(0), floatToF32(12.0));
+        scopedPtrWriteF32Le64(p2, intToI64(0), floatToF32(30.0));
+        f32ToInt(scopedPtrReadF32Le64(p1, intToI64(0)) + scopedPtrReadF32Le64(p2, intToI64(0)))
+    });
+
+    printLn(intToStr(fv) + "|" + intToStr(reclaimedOk) + "|" + intToStr(cellGet(sumAlloca)) + "|" + intToStr(arenaRes))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t26_scoped_mem.ll" "$TMP_DIR/t26_scoped_mem.gsa"
+if ! grep -q "asm sideeffect" "$TMP_DIR/t26_scoped_mem.ll"; then
+    echo "FAIL [withForeignPtr_keepalive_ir]: expected compiler keep-alive asm barrier in LLVM IR" >&2
+    exit 1
+fi
+echo "PASS [withForeignPtr_keepalive_ir]: keep-alive barrier verified in LLVM IR"
+PASS=$((PASS + 1))
+"$GEISHA_BIN" -o "$TMP_DIR/t26_scoped_mem" "$TMP_DIR/t26_scoped_mem.gsa"
+assert_eq "scoped_foreign_alloca_arena" "43|1|5000|42" "$("$TMP_DIR/t26_scoped_mem")"
+
+# 27. `$Scoped` Mode Compile-Time Escape Rejections (all 5 must fail to compile)
+cat > "$TMP_DIR/t27_esc1.gsa" << 'EOF'
+def main(): Void = {
+    let _ = withAlloca(64, (p) -> p);
+    ()
+}
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t27_esc1" "$TMP_DIR/t27_esc1.gsa" 2>/dev/null; then
+    echo "FAIL [scoped_escape_direct]: returning ScopedPtr from withAlloca should be rejected" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t27_esc2.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+def main(): Void = {
+    let fp = foreignPtrAlloc(intToI64(64));
+    let _ = withForeignPtr(fp, (p) -> Some(p));
+    ()
+}
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t27_esc2" "$TMP_DIR/t27_esc2.gsa" 2>/dev/null; then
+    echo "FAIL [scoped_escape_adt]: returning Some(ScopedPtr) from withForeignPtr should be rejected" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t27_esc3.gsa" << 'EOF'
+def main(): Void = {
+    let _ = withArena((a) -> {
+        let p = arenaAlloc(a, intToI64(64));
+        () -> scopedPtrByteAt(p, 0)
+    });
+    ()
+}
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t27_esc3" "$TMP_DIR/t27_esc3.gsa" 2>/dev/null; then
+    echo "FAIL [scoped_escape_closure]: returning $Scoped closure capturing ScopedPtr should be rejected" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t27_esc4.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+def main(): Void = {
+    let c = cellNew(None);
+    withAlloca(64, (p) -> cellSet(c, Some(p)))
+}
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t27_esc4" "$TMP_DIR/t27_esc4.gsa" 2>/dev/null; then
+    echo "FAIL [scoped_escape_cell]: storing ScopedPtr in Cell should be rejected" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t27_esc5.gsa" << 'EOF'
+use std.task.{spawn, await}
+def main(): Void = {
+    let _ = withAlloca(64, (p) -> {
+        let t = spawn(() -> scopedPtrByteAt(p, 0));
+        await(t)
+    });
+    ()
+}
+EOF
+if "$GEISHA_BIN" -o "$TMP_DIR/t27_esc5" "$TMP_DIR/t27_esc5.gsa" 2>/dev/null; then
+    echo "FAIL [scoped_escape_spawn]: capturing ScopedPtr in spawn should be rejected" >&2
+    exit 1
+fi
+echo "PASS [scoped_mode_escape_rejected]: all 5 ScopedPtr/Arena escape attempts rejected at compile time"
+PASS=$((PASS + 1))
+
+# 28. Thread-Safe `ImmArray` (`Send`) + Data-Parallel `parTabulate`
+cat > "$TMP_DIR/t28_imm_par.gsa" << 'EOF'
+use std.str.intToStr
+
+def main(): Void = {
+    let src = arrayNew(1000, intToF32(0));
+    let i = cellNew(0);
+    while (cellGet(i) < 1000) {
+        let idx = cellGet(i);
+        arraySet(src, idx, intToF32(idx));
+        cellSet(i, idx + 1)
+    };
+    let frozen: ImmArray Float32 = arrayFreeze(src);
+    // Capture `frozen` (Send!) inside `parTabulate`'s $Shared closure across multicore workers
+    let doubled: ImmArray Float32 = parTabulate(1000, (idx) -> immArrayGet(frozen, idx) * floatToF32(2.0));
+    let acc = cellNew(intToF32(0));
+    let k = cellNew(0);
+    while (cellGet(k) < immArrayLen(doubled)) {
+        cellSet(acc, cellGet(acc) + immArrayGet(doubled, cellGet(k)));
+        cellSet(k, cellGet(k) + 1)
+    };
+    // sum_{i=0}^{999} 2*i = 999 * 1000 = 999000
+    printLn(intToStr(immArrayLen(doubled)) + "|" + intToStr(f32ToInt(cellGet(acc))))
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t28_imm_par" "$TMP_DIR/t28_imm_par.gsa"
+assert_eq "imm_array_and_par_tabulate" "1000|999000" "$("$TMP_DIR/t28_imm_par")"
+
 echo "All $PASS end-to-end test suites passed!"

@@ -223,7 +223,7 @@ pub def unboxedAdtFields(ty: Type): Option (List Type) = unboxedAdtFieldsRec(ty,
 pub def isNoscanElemType(ty: Type): Bool = match ty {
     TyVoid -> true,
     TyCon(n) ->
-        if (n == "Int" || n == "Int64" || n == "Float" || n == "Char" || n == "Bool" || n == "Void") true
+        if (n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Char" || n == "Bool" || n == "Void" || n == "ScopedPtr" || n == "Arena") true
         else match unboxedAdtFields(ty) {
             Some(fs) -> isNoscanList(fs),
             None -> false,
@@ -244,12 +244,12 @@ def isNoscanList(ts: List Type): Bool = match ts {
 pub def isGcPointerType(ty: Type): Bool = match ty {
     TyArr(_, _, _) -> true,
     TyCon(n) ->
-        if (n == "String" || n == "AtomicInt") true
+        if (n == "String" || n == "AtomicInt" || n == "ForeignPtr") true
         else if (isAdtGeishaType(ty)) match unboxedAdtFields(ty) { Some(_) -> false, None -> true }
         else false,
     TyComp(_, _) -> {
         let base = getCompBaseName(ty);
-        if (base == "Cell" || base == "MutArray" || base == "MVar"
+        if (base == "Cell" || base == "MutArray" || base == "ImmArray" || base == "MVar"
             || base == "Chan" || base == "Task" || base == "Actor") true
         else if (isAdtGeishaType(ty)) match unboxedAdtFields(ty) { Some(_) -> false, None -> true }
         else false
@@ -263,6 +263,7 @@ pub def getValLlvmType(ty: Type): String = match ty {
         if (n == "Int") "i32"
         else if (n == "Int64") "i64"
         else if (n == "Float") "double"
+        else if (n == "Float32") "float"
         else if (n == "Char") "i8"
         else if (n == "Bool") "i1"
         else if (n == "Void") "i8"
@@ -306,6 +307,7 @@ def llvmZeroValue(llvmTy: String): String =
     if (llvmTy == "i1") "false"
     else if (llvmTy == "i8" || llvmTy == "i32" || llvmTy == "i64") "0"
     else if (llvmTy == "double") "0x0000000000000000"
+    else if (llvmTy == "float") "0.000000e+00"
     else if (llvmTy == "ptr") "null"
     else "zeroinitializer"
 
@@ -323,6 +325,7 @@ def typeSizeAndAlignRec(ty: Type, ptrSize: Int, visiting: List String, depth: In
         if (n == "Int") (4, 4)
         else if (n == "Int64") (8, 8)
         else if (n == "Float") (8, 8)
+        else if (n == "Float32") (4, 4)
         else if (n == "Char" || n == "Bool" || n == "Void") (1, 1)
         else match unboxedAdtFieldsRec(ty, visiting, depth) {
             Some(fs) -> structSizeAndAlignRec(fs, ptrSize, Cons(unboxTypeKey(ty), visiting), depth + 1),
@@ -929,6 +932,57 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
     sym
 }
 
+def getOrEmitTabulateRunner(mctx: ModEmitCtx, elemTy: Type): String = {
+    let rawSym = "__gs_tabulate_runner__" + mangleConcTypeSym(elemTy);
+    let sym = llvmSym(rawSym);
+    if (!strMapContains(mctx.mcSynthSet, rawSym)) {
+        strMapInsert(mctx.mcSynthSet, rawSym, true);
+        let rf = newFnEmitCtx(rawSym);
+        let elemLlvm = getValLlvmType(elemTy);
+        let retLlvm = getFnRetLlvmType(elemTy);
+        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
+        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fnEntry = emitLoad(rf, "ptr", fnSlot);
+        let elemsBase = emitGep(rf, "i8", "%arr_ptr", "8");
+        let idxSlot = emitEntryAlloca(rf, "i32");
+        emitStore(rf, "i32", "%lo", idxSlot);
+
+        let condBlk = appendBlock(rf, "tab.cond");
+        let bodyBlk = appendBlock(rf, "tab.body");
+        let doneBlk = appendBlock(rf, "tab.done");
+        emitBr(rf, condBlk);
+
+        setInsertBlock(rf, condBlk);
+        emitGcSafepointPoll(mctx, rf);
+        let curI = emitLoad(rf, "i32", idxSlot);
+        let more = emitAssign(rf, "icmp slt i32 " + curI + ", %hi");
+        emitCondBr(rf, more, bodyBlk, doneBlk);
+
+        setInsertBlock(rf, bodyBlk);
+        let callVal =
+            if (retLlvm == "void") {
+                emitLine(rf, "call void " + fnEntry + "(i32 " + curI + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(rf, "call " + retLlvm + " " + fnEntry + "(i32 " + curI + ", ptr " + fvsPtr + ")")
+            };
+        let i64Idx = emitAssign(rf, "sext i32 " + curI + " to i64");
+        let slotPtr = emitGep(rf, elemLlvm, elemsBase, i64Idx);
+        emitStore(rf, elemLlvm, callVal, slotPtr);
+        if (!mctx.mcIsWasm && !isNoscanElemType(elemTy)) {
+            emitLine(rf, "call void @gc_write_barrier(ptr %arr_ptr)")
+        } else ();
+        let nextI = emitAssign(rf, "add i32 " + curI + ", 1");
+        emitStore(rf, "i32", nextI, idxSlot);
+        emitBr(rf, condBlk);
+
+        setInsertBlock(rf, doneBlk);
+        emitTermLine(rf, "ret void");
+        flushFunctionToBuf(mctx.mcSynthFns, "define internal void " + sym + "(ptr %arr_ptr, i32 %lo, i32 %hi, ptr %cls_ptr) nounwind", rf)
+    } else ();
+    sym
+}
+
 // ============================================================================
 // Binary Operators, Intrinsics, Pattern Matching, and Expression Emission
 // ============================================================================
@@ -981,6 +1035,20 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
             OpGt -> emitAssign(fctx, "fcmp ogt double " + lhs + ", " + rhs),
             OpGe -> emitAssign(fctx, "fcmp oge double " + lhs + ", " + rhs),
             _ -> emitAssign(fctx, "fadd double " + lhs + ", " + rhs),
+        }
+    } else if (tyName == "Float32") {
+        match op {
+            OpAdd -> emitAssign(fctx, "fadd float " + lhs + ", " + rhs),
+            OpSub -> emitAssign(fctx, "fsub float " + lhs + ", " + rhs),
+            OpMul -> emitAssign(fctx, "fmul float " + lhs + ", " + rhs),
+            OpDiv -> emitAssign(fctx, "fdiv float " + lhs + ", " + rhs),
+            OpEq -> emitAssign(fctx, "fcmp oeq float " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "fcmp one float " + lhs + ", " + rhs),
+            OpLt -> emitAssign(fctx, "fcmp olt float " + lhs + ", " + rhs),
+            OpLe -> emitAssign(fctx, "fcmp ole float " + lhs + ", " + rhs),
+            OpGt -> emitAssign(fctx, "fcmp ogt float " + lhs + ", " + rhs),
+            OpGe -> emitAssign(fctx, "fcmp oge float " + lhs + ", " + rhs),
+            _ -> emitAssign(fctx, "fadd float " + lhs + ", " + rhs),
         }
     } else if (tyName == "Bool" || tyName == "Char") {
         let lty = if (tyName == "Bool") "i1" else "i8";
@@ -1242,11 +1310,57 @@ def tryEmitIntrinsic(
         let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
         emitStore(fctx, elemLlvm, llvmZeroValue(elemLlvm), slotPtr);
         Some("0")
-    } else if (name == "arrayLen") {
+    } else if (name == "arrayLen" || name == "immArrayLen") {
         let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let len64 = emitLoad(fctx, "i64", arrPtr);
         Some(emitAssign(fctx, "trunc i64 " + len64 + " to i32"))
-    } else if (name == "arrayGet") {
+    } else if (name == "arrayFreeze") {
+        // Freeze MutArray a -> ImmArray a via defensive shallow copy so mutating the original never races with ImmArray readers
+        let a0 = nthArgTerm(args, 0);
+        let srcPtr = genExpr(mctx, fctx, a0, locals, false);
+        let elemTy = match retTy {
+            TyComp(_, et) -> et,
+            _ -> TyVoid,
+        };
+        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
+        let elemSz = if (rawSz < 1) 1 else rawSz;
+        let len64 = emitLoad(fctx, "i64", srcPtr);
+        let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+        let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic_uninit" else "@gc_alloc";
+        let dstPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
+        emitLlvmMemcpy(fctx, dstPtr, srcPtr, totalBytes);
+        Some(dstPtr)
+    } else if (name == "parTabulate") {
+        let len32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let elemTy = match retTy {
+            TyComp(_, et) -> et,
+            _ -> TyVoid,
+        };
+        let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
+        let elemSz = if (rawSz < 1) 1 else rawSz;
+
+        let badBlk = appendBlock(fctx, "ptab.bad_len");
+        let allocBlk = appendBlock(fctx, "ptab.alloc");
+        let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+        emitCondBr(fctx, isNeg, badBlk, allocBlk);
+
+        setInsertBlock(fctx, badBlk);
+        emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+        emitTermLine(fctx, "unreachable");
+
+        setInsertBlock(fctx, allocBlk);
+        let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+        let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+        let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic_uninit" else "@gc_alloc";
+        let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
+        emitStore(fctx, "i64", len64, arrPtr);
+        let runner = getOrEmitTabulateRunner(mctx, elemTy);
+        emitLine(fctx, "call void @gs_conc_par_tabulate(ptr " + arrPtr + ", i32 " + len32 + ", ptr " + runner + ", ptr " + clsPtr + ")");
+        Some(arrPtr)
+    } else if (name == "arrayGet" || name == "immArrayGet") {
         let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let elemLlvm = getValLlvmType(retTy);
@@ -1383,6 +1497,96 @@ def tryEmitIntrinsic(
     } else if (name == "floatToInt") {
         let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "fptosi double " + f + " to i32"))
+    } else if (name == "floatToF32") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "fptrunc double " + f + " to float"))
+    } else if (name == "f32ToFloat") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "fpext float " + f + " to double"))
+    } else if (name == "intToF32") {
+        let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "sitofp i32 " + n + " to float"))
+    } else if (name == "f32ToInt") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "fptosi float " + f + " to i32"))
+    } else if (name == "f32ToBits32") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "bitcast float " + f + " to i32"))
+    } else if (name == "bits32ToF32") {
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "bitcast i32 " + b + " to float"))
+    } else if (name == "mathExp") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.exp.f64(double " + x + ")"))
+    } else if (name == "mathLog") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.log.f64(double " + x + ")"))
+    } else if (name == "mathSqrt") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.sqrt.f64(double " + x + ")"))
+    } else if (name == "mathSin") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.sin.f64(double " + x + ")"))
+    } else if (name == "mathCos") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.cos.f64(double " + x + ")"))
+    } else if (name == "mathTanh") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @tanh(double " + x + ")"))
+    } else if (name == "mathPow") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.pow.f64(double " + a + ", double " + b + ")"))
+    } else if (name == "mathAbs") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.fabs.f64(double " + x + ")"))
+    } else if (name == "mathFloor") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.floor.f64(double " + x + ")"))
+    } else if (name == "mathCeil") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.ceil.f64(double " + x + ")"))
+    } else if (name == "mathFma") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let c = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        Some(emitAssign(fctx, "call double @llvm.fma.f64(double " + a + ", double " + b + ", double " + c + ")"))
+    } else if (name == "mathExpF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.exp.f32(float " + x + ")"))
+    } else if (name == "mathLogF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.log.f32(float " + x + ")"))
+    } else if (name == "mathSqrtF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.sqrt.f32(float " + x + ")"))
+    } else if (name == "mathSinF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.sin.f32(float " + x + ")"))
+    } else if (name == "mathCosF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.cos.f32(float " + x + ")"))
+    } else if (name == "mathTanhF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @tanhf(float " + x + ")"))
+    } else if (name == "mathPowF32") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.pow.f32(float " + a + ", float " + b + ")"))
+    } else if (name == "mathAbsF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.fabs.f32(float " + x + ")"))
+    } else if (name == "mathFloorF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.floor.f32(float " + x + ")"))
+    } else if (name == "mathCeilF32") {
+        let x = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.ceil.f32(float " + x + ")"))
+    } else if (name == "mathFmaF32") {
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let c = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        Some(emitAssign(fctx, "call float @llvm.fma.f32(float " + a + ", float " + b + ", float " + c + ")"))
     } else if (name == "ptrNull") {
         Some("null")
     } else if (name == "ptrIsNull") {
@@ -1498,6 +1702,191 @@ def tryEmitIntrinsic(
         let bp = emitGep(fctx, "i8", p, idx64);
         emitLine(fctx, "store double " + valF + ", ptr " + bp + ", align 1");
         Some("0")
+    } else if (name == "ptrAllocBytes64") {
+        let n64 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + n64 + ")"))
+    } else if (name == "ptrReadI64Le64" || name == "scopedPtrReadI64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load i64, ptr " + bp + ", align 1"))
+    } else if (name == "ptrWriteI64Le64" || name == "scopedPtrWriteI64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val64 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store i64 " + val64 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrReadF32Le64" || name == "scopedPtrReadF32Le64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load float, ptr " + bp + ", align 1"))
+    } else if (name == "ptrWriteF32Le64" || name == "scopedPtrWriteF32Le64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store float " + valF + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrReadF64Le64" || name == "scopedPtrReadF64Le64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load double, ptr " + bp + ", align 1"))
+    } else if (name == "ptrWriteF64Le64" || name == "scopedPtrWriteF64Le64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store double " + valF + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrCopyBytes64" || name == "scopedPtrCopyBytes") {
+        let dst = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let dstOff64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let src = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let srcOff64 = genExpr(mctx, fctx, nthArgTerm(args, 3), locals, false);
+        let len64 = genExpr(mctx, fctx, nthArgTerm(args, 4), locals, false);
+        let dstP = emitGep(fctx, "i8", dst, dstOff64);
+        let srcP = emitGep(fctx, "i8", src, srcOff64);
+        emitLlvmMemmove(fctx, dstP, srcP, len64);
+        Some("0")
+    } else if (name == "scopedPtrOffset") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let off32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let off64 = emitAssign(fctx, "sext i32 " + off32 + " to i64");
+        Some(emitGep(fctx, "i8", p, off64))
+    } else if (name == "scopedPtrOffset64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let off64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitGep(fctx, "i8", p, off64))
+    } else if (name == "scopedPtrByteAt") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        let b8 = emitLoad(fctx, "i8", bp);
+        Some(emitAssign(fctx, "zext i8 " + b8 + " to i32"))
+    } else if (name == "scopedPtrSetByte") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let val8 = emitAssign(fctx, "trunc i32 " + val32 + " to i8");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitStore(fctx, "i8", val8, bp);
+        Some("0")
+    } else if (name == "scopedPtrReadI32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load i32, ptr " + bp + ", align 1"))
+    } else if (name == "scopedPtrWriteI32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store i32 " + val32 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "scopedPtrReadF32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load float, ptr " + bp + ", align 1"))
+    } else if (name == "scopedPtrWriteF32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store float " + valF + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "scopedPtrReadF64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load double, ptr " + bp + ", align 1"))
+    } else if (name == "scopedPtrWriteF64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store double " + valF + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "foreignPtrAlloc") {
+        let sz64 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call ptr @gc_foreign_ptr_alloc(i64 " + sz64 + ")"))
+    } else if (name == "foreignPtrNew") {
+        let rawP = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let fnP = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let extB = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        Some(emitAssign(fctx, "call ptr @gc_foreign_ptr_new(ptr " + rawP + ", ptr " + fnP + ", i64 " + extB + ")"))
+    } else if (name == "gcExternalLiveBytes") {
+        Some(emitAssign(fctx, "call i64 @gc_external_live_bytes()"))
+    } else if (name == "withForeignPtr") {
+        let fp = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let rawP = emitAssign(fctx, "call ptr @gc_foreign_ptr_get(ptr " + fp + ")");
+        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
+        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnEntry = emitLoad(fctx, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let res =
+            if (retLlvm == "void") {
+                emitLine(fctx, "call void " + fnEntry + "(ptr " + rawP + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(fctx, "call " + retLlvm + " " + fnEntry + "(ptr " + rawP + ", ptr " + fvsPtr + ")")
+            };
+        // Compiler-enforced keep-alive barrier: guarantees `fp` stays live across the entire scope
+        if (!mctx.mcIsWasm) {
+            emitLine(fctx, "call void asm sideeffect \"\", \"r,~{memory}\"(ptr " + fp + ")")
+        } else ();
+        Some(res)
+    } else if (name == "withAlloca") {
+        let n32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
+        let savedSp = emitAssign(fctx, "call ptr @llvm.stacksave.p0()");
+        let bufPtr = emitAssign(fctx, "alloca i8, i64 " + n64 + ", align 16");
+        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
+        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnEntry = emitLoad(fctx, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let res =
+            if (retLlvm == "void") {
+                emitLine(fctx, "call void " + fnEntry + "(ptr " + bufPtr + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(fctx, "call " + retLlvm + " " + fnEntry + "(ptr " + bufPtr + ", ptr " + fvsPtr + ")")
+            };
+        emitLine(fctx, "call void @llvm.stackrestore.p0(ptr " + savedSp + ")");
+        Some(res)
+    } else if (name == "withArena") {
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let arenaPtr = emitAssign(fctx, "call ptr @gc_arena_new()");
+        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
+        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnEntry = emitLoad(fctx, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let res =
+            if (retLlvm == "void") {
+                emitLine(fctx, "call void " + fnEntry + "(ptr " + arenaPtr + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(fctx, "call " + retLlvm + " " + fnEntry + "(ptr " + arenaPtr + ", ptr " + fvsPtr + ")")
+            };
+        emitLine(fctx, "call void @gc_arena_destroy(ptr " + arenaPtr + ")");
+        Some(res)
+    } else if (name == "arenaAlloc") {
+        let arenaPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let sz64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitAssign(fctx, "call ptr @gc_arena_alloc(ptr " + arenaPtr + ", i64 " + sz64 + ")"))
     } else if (name == "gcHandleNew") {
         let argTerm = nthArgTerm(args, 0);
         let argTy = schemeBody(argTerm.tscm);
@@ -2319,6 +2708,7 @@ def genExpr(
                 UnNot -> emitAssign(fctx, "xor i1 " + val + ", true"),
                 UnNeg -> match opTy {
                     TyCon("Float") -> emitAssign(fctx, "fneg double " + val),
+                    TyCon("Float32") -> emitAssign(fctx, "fneg float " + val),
                     _ -> {
                         let ity = getValLlvmType(opTy);
                         emitAssign(fctx, "sub " + ity + " 0, " + val)
@@ -2492,7 +2882,7 @@ def genExpr(
                         let retLlvm = getFnRetLlvmType(fnRetTy);
                         let isIoFn =
                             calleeName == "printLn" || calleeName == "putNumber"
-                            || calleeName == "putFloat" || calleeName == "putChar";
+                            || calleeName == "putFloat" || calleeName == "putF32" || calleeName == "putChar";
                         let callPrefix = if (inTail && !isIoFn) "tail call " else "call ";
                         let targetSym = llvmSym(calleeName);
                         if (retLlvm == "void") {
@@ -2629,7 +3019,9 @@ def genExpr(
             emitBr(fctx, condBlk);
 
             setInsertBlock(fctx, condBlk);
-            emitGcSafepointPoll(mctx, fctx);
+            if (termNeedsSafepoint(cond) || termNeedsSafepoint(body)) {
+                emitGcSafepointPoll(mctx, fctx)
+            } else ();
             let cval = genExpr(mctx, fctx, cond, locals, false);
             emitCondBr(fctx, cval, bodyBlk, endBlk);
 
@@ -2832,6 +3224,7 @@ def isPureBuiltinIntrinsic(name: String): Bool =
     name == "cellNew" || name == "cellGet" || name == "cellSet"
     || name == "arrayNew" || name == "arrayNewZeroed" || name == "arrayLen"
     || name == "arrayGet" || name == "arraySet" || name == "arrayClearSlot"
+    || name == "arrayFreeze" || name == "immArrayLen" || name == "immArrayGet"
     || name == "bitAnd" || name == "bitAnd64" || name == "bitOr" || name == "bitOr64"
     || name == "bitXor" || name == "bitXor64" || name == "bitNot" || name == "bitNot64"
     || name == "bitShl" || name == "bitShr" || name == "bitUshr"
@@ -2840,16 +3233,111 @@ def isPureBuiltinIntrinsic(name: String): Bool =
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
     || name == "intToFloat" || name == "floatToInt"
-    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "ptrAllocBytes"
+    || name == "floatToF32" || name == "f32ToFloat" || name == "intToF32" || name == "f32ToInt"
+    || name == "f32ToBits32" || name == "bits32ToF32"
+    || name == "mathExp" || name == "mathLog" || name == "mathSqrt" || name == "mathSin" || name == "mathCos"
+    || name == "mathTanh" || name == "mathPow" || name == "mathAbs" || name == "mathFloor" || name == "mathCeil" || name == "mathFma"
+    || name == "mathExpF32" || name == "mathLogF32" || name == "mathSqrtF32" || name == "mathSinF32" || name == "mathCosF32"
+    || name == "mathTanhF32" || name == "mathPowF32" || name == "mathAbsF32" || name == "mathFloorF32" || name == "mathCeilF32" || name == "mathFmaF32"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "ptrAllocBytes" || name == "ptrAllocBytes64"
     || name == "ptrByteAt" || name == "ptrSetByte"
     || name == "ptrReadI8" || name == "ptrReadU16Le" || name == "ptrReadU32Le"
     || name == "ptrReadI64Le" || name == "ptrReadF32Le" || name == "ptrReadF64Le"
     || name == "ptrWriteU16Le" || name == "ptrWriteU32Le"
     || name == "ptrWriteI64Le" || name == "ptrWriteF32Le" || name == "ptrWriteF64Le"
-    || name == "ptrCopyBytes"
+    || name == "ptrReadI64Le64" || name == "ptrWriteI64Le64"
+    || name == "ptrReadF32Le64" || name == "ptrWriteF32Le64"
+    || name == "ptrReadF64Le64" || name == "ptrWriteF64Le64"
+    || name == "ptrCopyBytes" || name == "ptrCopyBytes64"
+    || name == "scopedPtrOffset" || name == "scopedPtrOffset64" || name == "scopedPtrByteAt" || name == "scopedPtrSetByte"
+    || name == "scopedPtrReadI32Le" || name == "scopedPtrWriteI32Le"
+    || name == "scopedPtrReadI64Le" || name == "scopedPtrWriteI64Le"
+    || name == "scopedPtrReadF32Le" || name == "scopedPtrWriteF32Le"
+    || name == "scopedPtrReadF32Le64" || name == "scopedPtrWriteF32Le64"
+    || name == "scopedPtrReadF64Le" || name == "scopedPtrWriteF64Le"
+    || name == "scopedPtrReadF64Le64" || name == "scopedPtrWriteF64Le64"
+    || name == "scopedPtrCopyBytes"
     || name == "ptrCopyFromStr" || name == "ptrSliceFromStr" || name == "ptrSliceToString" || name == "ptrToString"
     || name == "strLen" || name == "strByteAt" || name == "strSlice"
     || name == "strConcat" || name == "strFromBytes" || name == "sysArgc" || name == "sysArgv"
+
+def isNonAllocLeafIntrinsic(name: String): Bool =
+    name == "cellGet" || name == "cellSet"
+    || name == "arrayLen" || name == "arrayGet" || name == "arraySet" || name == "arrayClearSlot"
+    || name == "immArrayLen" || name == "immArrayGet"
+    || name == "bitAnd" || name == "bitAnd64" || name == "bitOr" || name == "bitOr64"
+    || name == "bitXor" || name == "bitXor64" || name == "bitNot" || name == "bitNot64"
+    || name == "bitShl" || name == "bitShr" || name == "bitUshr"
+    || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
+    || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
+    || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
+    || name == "intToFloat" || name == "floatToInt"
+    || name == "floatToF32" || name == "f32ToFloat" || name == "intToF32" || name == "f32ToInt"
+    || name == "f32ToBits32" || name == "bits32ToF32"
+    || name == "mathExp" || name == "mathLog" || name == "mathSqrt" || name == "mathSin" || name == "mathCos"
+    || name == "mathTanh" || name == "mathPow" || name == "mathAbs" || name == "mathFloor" || name == "mathCeil" || name == "mathFma"
+    || name == "mathExpF32" || name == "mathLogF32" || name == "mathSqrtF32" || name == "mathSinF32" || name == "mathCosF32"
+    || name == "mathTanhF32" || name == "mathPowF32" || name == "mathAbsF32" || name == "mathFloorF32" || name == "mathCeilF32" || name == "mathFmaF32"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64"
+    || name == "ptrByteAt" || name == "ptrSetByte"
+    || name == "ptrReadI8" || name == "ptrReadU16Le" || name == "ptrReadU32Le"
+    || name == "ptrReadI64Le" || name == "ptrReadF32Le" || name == "ptrReadF64Le"
+    || name == "ptrWriteU16Le" || name == "ptrWriteU32Le"
+    || name == "ptrWriteI64Le" || name == "ptrWriteF32Le" || name == "ptrWriteF64Le"
+    || name == "ptrReadI64Le64" || name == "ptrWriteI64Le64"
+    || name == "ptrReadF32Le64" || name == "ptrWriteF32Le64"
+    || name == "ptrReadF64Le64" || name == "ptrWriteF64Le64"
+    || name == "ptrCopyBytes" || name == "ptrCopyBytes64"
+    || name == "scopedPtrOffset" || name == "scopedPtrOffset64" || name == "scopedPtrByteAt" || name == "scopedPtrSetByte"
+    || name == "scopedPtrReadI32Le" || name == "scopedPtrWriteI32Le"
+    || name == "scopedPtrReadI64Le" || name == "scopedPtrWriteI64Le"
+    || name == "scopedPtrReadF32Le" || name == "scopedPtrWriteF32Le"
+    || name == "scopedPtrReadF32Le64" || name == "scopedPtrWriteF32Le64"
+    || name == "scopedPtrReadF64Le" || name == "scopedPtrWriteF64Le"
+    || name == "scopedPtrReadF64Le64" || name == "scopedPtrWriteF64Le64"
+    || name == "scopedPtrCopyBytes"
+
+def termListNeedsSafepoint(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(h, r) -> if (termNeedsSafepoint(h)) true else termListNeedsSafepoint(r),
+}
+
+def armListNeedsSafepoint(arms: List CoreArm): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gSp = match a.caGuard { Some(g) -> termNeedsSafepoint(g), None -> false };
+        if (gSp || termNeedsSafepoint(a.caBody)) true else armListNeedsSafepoint(r)
+    },
+}
+
+// Pure numerical leaf loops (no calls, no heap allocations, no nested loops) omit the inner-loop
+// atomic safepoint poll so LLVM LoopVectorizer can auto-vectorize (NEON / AVX SIMD).
+def termNeedsSafepoint(tm: TaggedTerm): Bool = match tm.tnode {
+    TmApplyCls(_, _) -> true,
+    TmApplyDir(vd, args) -> if (isNonAllocLeafIntrinsic(vd.vname)) termListNeedsSafepoint(args) else true,
+    TmTuple(es) -> termListNeedsSafepoint(es),
+    TmBlock(es) -> termListNeedsSafepoint(es),
+    TmMakeData(_, _, es, _, _) -> match es {
+        Nil -> false,
+        _ -> match unboxedAdtFields(schemeBody(tm.tscm)) {
+            Some(_) -> termListNeedsSafepoint(es),
+            None -> true,
+        },
+    },
+    TmBin(op, l, r) -> match (op, schemeBody(l.tscm)) {
+        (OpAdd, TyCon("String")) -> true,
+        _ -> termNeedsSafepoint(l) || termNeedsSafepoint(r),
+    },
+    TmUn(_, e) -> termNeedsSafepoint(e),
+    TmGetTag(e) -> termNeedsSafepoint(e),
+    TmLet(_, v, b) -> termNeedsSafepoint(v) || termNeedsSafepoint(b),
+    TmMakeCls(_, _, _) -> true,
+    TmIf(c, t, e) -> termNeedsSafepoint(c) || termNeedsSafepoint(t) || termNeedsSafepoint(e),
+    TmWhile(_, _) -> true,
+    TmMatch(s, arms) -> termNeedsSafepoint(s) || armListNeedsSafepoint(arms),
+    _ -> false,
+}
 
 def termHasCall(tm: TaggedTerm): Bool = match tm.tnode {
     TmApplyCls(_, _) -> true,
@@ -3103,9 +3591,42 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
         ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
         ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),
+        ("llvm.stacksave.p0", "declare ptr @llvm.stacksave.p0() nounwind"),
+        ("llvm.stackrestore.p0", "declare void @llvm.stackrestore.p0(ptr) nounwind"),
+        ("llvm.exp.f64", "declare double @llvm.exp.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.log.f64", "declare double @llvm.log.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.sqrt.f64", "declare double @llvm.sqrt.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.sin.f64", "declare double @llvm.sin.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.cos.f64", "declare double @llvm.cos.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.pow.f64", "declare double @llvm.pow.f64(double, double) nounwind willreturn memory(none)"),
+        ("llvm.fabs.f64", "declare double @llvm.fabs.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.floor.f64", "declare double @llvm.floor.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.ceil.f64", "declare double @llvm.ceil.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.fma.f64", "declare double @llvm.fma.f64(double, double, double) nounwind willreturn memory(none)"),
+        ("llvm.exp.f32", "declare float @llvm.exp.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.log.f32", "declare float @llvm.log.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.sqrt.f32", "declare float @llvm.sqrt.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.sin.f32", "declare float @llvm.sin.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.cos.f32", "declare float @llvm.cos.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.pow.f32", "declare float @llvm.pow.f32(float, float) nounwind willreturn memory(none)"),
+        ("llvm.fabs.f32", "declare float @llvm.fabs.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.floor.f32", "declare float @llvm.floor.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.ceil.f32", "declare float @llvm.ceil.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.fma.f32", "declare float @llvm.fma.f32(float, float, float) nounwind willreturn memory(none)"),
+        ("tanh", "declare double @tanh(double) nounwind willreturn memory(none)"),
+        ("tanhf", "declare float @tanhf(float) nounwind willreturn memory(none)"),
+        ("gc_foreign_ptr_new", "declare ptr @gc_foreign_ptr_new(ptr, ptr, i64) nounwind"),
+        ("gc_foreign_ptr_alloc", "declare ptr @gc_foreign_ptr_alloc(i64) nounwind"),
+        ("gc_foreign_ptr_get", "declare ptr @gc_foreign_ptr_get(ptr) nounwind"),
+        ("gc_external_live_bytes", "declare i64 @gc_external_live_bytes() nounwind"),
+        ("gc_arena_new", "declare ptr @gc_arena_new() nounwind"),
+        ("gc_arena_alloc", "declare ptr @gc_arena_alloc(ptr, i64) nounwind"),
+        ("gc_arena_destroy", "declare void @gc_arena_destroy(ptr) nounwind"),
+        ("gs_conc_par_tabulate", "declare void @gs_conc_par_tabulate(ptr, i32, ptr, ptr)"),
         ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
         ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
         ("putFloat", "declare void @putFloat(double, ptr) nounwind"),
+        ("putF32", "declare void @putF32(float, ptr) nounwind"),
         ("putChar", "declare void @putChar(i8, ptr) nounwind")
     ] else [
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
@@ -3138,9 +3659,42 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
         ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
         ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),
+        ("llvm.stacksave.p0", "declare ptr @llvm.stacksave.p0() nounwind"),
+        ("llvm.stackrestore.p0", "declare void @llvm.stackrestore.p0(ptr) nounwind"),
+        ("llvm.exp.f64", "declare double @llvm.exp.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.log.f64", "declare double @llvm.log.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.sqrt.f64", "declare double @llvm.sqrt.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.sin.f64", "declare double @llvm.sin.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.cos.f64", "declare double @llvm.cos.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.pow.f64", "declare double @llvm.pow.f64(double, double) nounwind willreturn memory(none)"),
+        ("llvm.fabs.f64", "declare double @llvm.fabs.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.floor.f64", "declare double @llvm.floor.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.ceil.f64", "declare double @llvm.ceil.f64(double) nounwind willreturn memory(none)"),
+        ("llvm.fma.f64", "declare double @llvm.fma.f64(double, double, double) nounwind willreturn memory(none)"),
+        ("llvm.exp.f32", "declare float @llvm.exp.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.log.f32", "declare float @llvm.log.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.sqrt.f32", "declare float @llvm.sqrt.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.sin.f32", "declare float @llvm.sin.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.cos.f32", "declare float @llvm.cos.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.pow.f32", "declare float @llvm.pow.f32(float, float) nounwind willreturn memory(none)"),
+        ("llvm.fabs.f32", "declare float @llvm.fabs.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.floor.f32", "declare float @llvm.floor.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.ceil.f32", "declare float @llvm.ceil.f32(float) nounwind willreturn memory(none)"),
+        ("llvm.fma.f32", "declare float @llvm.fma.f32(float, float, float) nounwind willreturn memory(none)"),
+        ("tanh", "declare double @tanh(double) nounwind willreturn memory(none)"),
+        ("tanhf", "declare float @tanhf(float) nounwind willreturn memory(none)"),
+        ("gc_foreign_ptr_new", "declare ptr @gc_foreign_ptr_new(ptr, ptr, i64) nounwind"),
+        ("gc_foreign_ptr_alloc", "declare ptr @gc_foreign_ptr_alloc(i64) nounwind"),
+        ("gc_foreign_ptr_get", "declare ptr @gc_foreign_ptr_get(ptr) nounwind"),
+        ("gc_external_live_bytes", "declare i64 @gc_external_live_bytes() nounwind"),
+        ("gc_arena_new", "declare ptr @gc_arena_new() nounwind"),
+        ("gc_arena_alloc", "declare ptr @gc_arena_alloc(ptr, i64) nounwind"),
+        ("gc_arena_destroy", "declare void @gc_arena_destroy(ptr) nounwind"),
+        ("gs_conc_par_tabulate", "declare void @gs_conc_par_tabulate(ptr, i32, ptr, ptr)"),
         ("printLn", "declare void @printLn(ptr, ptr) nounwind"),
         ("putNumber", "declare void @putNumber(i32, ptr) nounwind"),
         ("putFloat", "declare void @putFloat(double, ptr) nounwind"),
+        ("putF32", "declare void @putF32(float, ptr) nounwind"),
         ("putChar", "declare void @putChar(i8, ptr) nounwind"),
         ("gs_atomic_new", "declare ptr @gs_atomic_new(i32)"),
         ("gs_atomic_load", "declare i32 @gs_atomic_load(ptr)"),

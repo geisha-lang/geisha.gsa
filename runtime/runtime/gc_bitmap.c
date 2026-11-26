@@ -136,6 +136,46 @@ static gc_large_t **_large_table = NULL;
 static size_t _large_table_cap = 0;
 static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
+
+/* Two-phase GC Cleanup registry (non-resurrecting finalizers) & External Memory Pressure */
+typedef struct gc_cleanup_entry_t {
+    int64_t token;
+    void *owner; /* weak reference to GC payload_ptr (never scanned as root) */
+    gc_cleanup_fn fn;
+    void *arg;
+    size_t external_bytes;
+    struct gc_cleanup_entry_t *prev;
+    struct gc_cleanup_entry_t *next;
+} gc_cleanup_entry_t;
+
+static gc_cleanup_entry_t *_cleanup_active_head = NULL;
+static gc_cleanup_entry_t *_cleanup_pending_head = NULL;
+static gc_cleanup_entry_t *_cleanup_pending_tail = NULL;
+static int64_t _cleanup_next_token = 1;
+static size_t _external_bytes_live = 0;
+static size_t _external_bytes_since_gc = 0;
+static size_t _external_gc_threshold = 64u * 1024u * 1024u; /* 64 MB initial external pressure threshold */
+
+static void gc_drain_cleanups_unlocked(void)
+{
+    if (__builtin_expect(__atomic_load_n(&_cleanup_pending_head, __ATOMIC_ACQUIRE) == NULL, 1)) {
+        return;
+    }
+    pthread_mutex_lock(&_gc_mu);
+    gc_cleanup_entry_t *list = _cleanup_pending_head;
+    _cleanup_pending_head = NULL;
+    _cleanup_pending_tail = NULL;
+    pthread_mutex_unlock(&_gc_mu);
+
+    while (list != NULL) {
+        gc_cleanup_entry_t *next = list->next;
+        if (list->fn != NULL) {
+            list->fn(list->arg);
+        }
+        free(list);
+        list = next;
+    }
+}
 static uintptr_t _min_large_addr = UINTPTR_MAX;
 static uintptr_t _max_large_addr = 0;
 
@@ -1161,6 +1201,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
 
     _bytes_alloc_since_gc += map_size;
     pthread_mutex_unlock(&_gc_mu);
+    gc_drain_cleanups_unlocked();
 
     (void)zero_init; /* Freshly mmap'd anonymous memory is already zeroed by the OS */
     return (void *)payload_ptr;
@@ -1231,6 +1272,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
     *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
 
     pthread_mutex_unlock(&_gc_mu);
+    gc_drain_cleanups_unlocked();
 
     void *payload = (void *)(hdr + 1);
     if (has_mask) {
@@ -1306,6 +1348,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
     header_t *hdr = (header_t *)cur;
     *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
     pthread_mutex_unlock(&_gc_mu);
+    gc_drain_cleanups_unlocked();
 
     void *payload = (void *)(hdr + 1);
     if (has_mask) {
@@ -1758,6 +1801,38 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     /* 5. Reclaim unreachable synchronization handles */
     gs_conc_sweep_unreachable();
 
+    /* 5b. Phase 1 Cleanup: detach unreachable cleanup entries (ZERO user calls during STW!) */
+    {
+        gc_cleanup_entry_t *e = _cleanup_active_head;
+        while (e != NULL) {
+            gc_cleanup_entry_t *next = e->next;
+            if (!gc_is_obj_marked(e->owner)) {
+                if (e->prev != NULL) e->prev->next = e->next;
+                else _cleanup_active_head = e->next;
+                if (e->next != NULL) e->next->prev = e->prev;
+                if (_external_bytes_live >= e->external_bytes) {
+                    _external_bytes_live -= e->external_bytes;
+                } else {
+                    _external_bytes_live = 0;
+                }
+                e->prev = NULL;
+                e->next = NULL;
+                if (_cleanup_pending_tail != NULL) {
+                    _cleanup_pending_tail->next = e;
+                    _cleanup_pending_tail = e;
+                } else {
+                    _cleanup_pending_head = e;
+                    _cleanup_pending_tail = e;
+                }
+            }
+            e = next;
+        }
+        _external_bytes_since_gc = 0;
+        size_t next_ext = _external_bytes_live / 2u;
+        if (next_ext < 64u * 1024u * 1024u) next_ext = 64u * 1024u * 1024u;
+        _external_gc_threshold = next_ext;
+    }
+
     /* 6. Reclassify slab pages (ZERO per-object sweep during STW!) & release empty pages to OS */
     size_t total_live_bytes = 0;
     for (size_t c = 0; c < GC_NUM_CLASSES; c++) {
@@ -1901,6 +1976,7 @@ void gc_collect_major(void)
     }
     gc_collect_locked(self, true);
     pthread_mutex_unlock(&_gc_mu);
+    gc_drain_cleanups_unlocked();
 }
 
 void geisha_rt_init(void)
@@ -2073,4 +2149,171 @@ void gc_trim(void)
 #endif
     }
     pthread_mutex_unlock(&_gc_mu);
+}
+
+/* ============================================================================
+ * Two-Phase GC Cleanup, ForeignPtr & Scoped Bump-Pointer Arena
+ * ============================================================================ */
+
+int64_t gc_cleanup_register(void *owner, gc_cleanup_fn fn, void *arg, size_t external_bytes)
+{
+    if (owner == NULL || fn == NULL) return 0;
+    gc_cleanup_entry_t *e = (gc_cleanup_entry_t *)malloc(sizeof(gc_cleanup_entry_t));
+    if (e == NULL) abort();
+
+    bool trigger_gc = false;
+    pthread_mutex_lock(&_gc_mu);
+    int64_t tok = _cleanup_next_token++;
+    e->token = tok;
+    e->owner = owner;
+    e->fn = fn;
+    e->arg = arg;
+    e->external_bytes = external_bytes;
+    e->prev = NULL;
+    e->next = _cleanup_active_head;
+    if (_cleanup_active_head != NULL) {
+        _cleanup_active_head->prev = e;
+    }
+    _cleanup_active_head = e;
+    _external_bytes_live += external_bytes;
+    _external_bytes_since_gc += external_bytes;
+    if (_external_bytes_since_gc >= _external_gc_threshold && !_stw_in_progress) {
+        trigger_gc = true;
+    }
+    pthread_mutex_unlock(&_gc_mu);
+
+    if (trigger_gc) {
+        volatile void *keep_owner = owner;
+        gc_collect_major();
+        (void)keep_owner;
+    }
+    return tok;
+}
+
+bool gc_cleanup_cancel(int64_t token)
+{
+    if (token <= 0) return false;
+    gc_cleanup_entry_t *found = NULL;
+    pthread_mutex_lock(&_gc_mu);
+    for (gc_cleanup_entry_t *e = _cleanup_active_head; e != NULL; e = e->next) {
+        if (e->token == token) {
+            if (e->prev != NULL) e->prev->next = e->next;
+            else _cleanup_active_head = e->next;
+            if (e->next != NULL) e->next->prev = e->prev;
+            if (_external_bytes_live >= e->external_bytes) {
+                _external_bytes_live -= e->external_bytes;
+            } else {
+                _external_bytes_live = 0;
+            }
+            found = e;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&_gc_mu);
+    if (found != NULL) {
+        free(found);
+        return true;
+    }
+    return false;
+}
+
+size_t gc_external_live_bytes(void)
+{
+    pthread_mutex_lock(&_gc_mu);
+    size_t v = _external_bytes_live;
+    pthread_mutex_unlock(&_gc_mu);
+    return v;
+}
+
+typedef struct {
+    void *raw_ptr;
+    int64_t token;
+} gc_foreign_ptr_t;
+
+void *gc_foreign_ptr_new(void *raw_ptr, gc_cleanup_fn fn, size_t external_bytes)
+{
+    gc_foreign_ptr_t *fp = (gc_foreign_ptr_t *)gc_alloc_atomic(sizeof(gc_foreign_ptr_t));
+    fp->raw_ptr = raw_ptr;
+    fp->token = 0;
+    if (fn != NULL && raw_ptr != NULL) {
+        fp->token = gc_cleanup_register((void *)fp, fn, raw_ptr, external_bytes);
+    }
+    return (void *)fp;
+}
+
+void *gc_foreign_ptr_alloc(int64_t size_bytes)
+{
+    if (size_bytes <= 0) size_bytes = 1;
+    void *raw = NULL;
+    size_t n = ((size_t)size_bytes + 63u) & ~(size_t)63u;
+    if (posix_memalign(&raw, 64u, n) != 0 || raw == NULL) abort();
+    memset(raw, 0, n);
+    return gc_foreign_ptr_new(raw, free, n);
+}
+
+void *gc_foreign_ptr_get(void *fp_void)
+{
+    if (fp_void == NULL) return NULL;
+    gc_foreign_ptr_t *fp = (gc_foreign_ptr_t *)fp_void;
+    return fp->raw_ptr;
+}
+
+/* Scoped Bump-Pointer Arena (NoScan raw bytes, 64-byte SIMD-aligned allocations) */
+#define ARENA_DEFAULT_BLOCK_SIZE (64u * 1024u)
+
+typedef struct gc_arena_block_t {
+    struct gc_arena_block_t *next;
+    size_t cap;
+    size_t used;
+    unsigned char data[];
+} gc_arena_block_t;
+
+typedef struct {
+    gc_arena_block_t *head;
+} gc_arena_t;
+
+void *gc_arena_new(void)
+{
+    gc_arena_t *a = (gc_arena_t *)malloc(sizeof(gc_arena_t));
+    if (a == NULL) abort();
+    a->head = NULL;
+    return (void *)a;
+}
+
+void *gc_arena_alloc(void *arena_void, int64_t size_bytes)
+{
+    if (arena_void == NULL || size_bytes <= 0) return NULL;
+    gc_arena_t *a = (gc_arena_t *)arena_void;
+    size_t n = ((size_t)size_bytes + 63u) & ~(size_t)63u;
+    gc_arena_block_t *b = a->head;
+    if (b == NULL || b->used + n > b->cap) {
+        size_t blk_cap = (n > ARENA_DEFAULT_BLOCK_SIZE) ? n : ARENA_DEFAULT_BLOCK_SIZE;
+        size_t hdr_sz = (sizeof(gc_arena_block_t) + 63u) & ~(size_t)63u;
+        unsigned char *raw = NULL;
+        if (posix_memalign((void **)&raw, 64u, hdr_sz + blk_cap) != 0 || raw == NULL) {
+            abort();
+        }
+        b = (gc_arena_block_t *)raw;
+        b->next = a->head;
+        b->cap = blk_cap;
+        b->used = 0;
+        a->head = b;
+    }
+    size_t hdr_sz = (sizeof(gc_arena_block_t) + 63u) & ~(size_t)63u;
+    void *ptr = (unsigned char *)b + hdr_sz + b->used;
+    b->used += n;
+    return ptr;
+}
+
+void gc_arena_destroy(void *arena_void)
+{
+    if (arena_void == NULL) return;
+    gc_arena_t *a = (gc_arena_t *)arena_void;
+    gc_arena_block_t *b = a->head;
+    while (b != NULL) {
+        gc_arena_block_t *next = b->next;
+        free(b);
+        b = next;
+    }
+    free(a);
 }

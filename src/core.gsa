@@ -12,7 +12,7 @@ use std.str.intToStr
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
-    schemeBody, schemeTypeParams, isFnScheme,
+    ConstraintSpec, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
     listContainsStr, sortUniqueStrings, typeToString, typesEqual,
     Lit, LitInt,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
@@ -143,7 +143,7 @@ def isTypeListConcrete(ts: List Type): Bool = match ts {
 }
 
 def isBuiltinOpPrimitive(ty: Type): Bool = match ty {
-    TyCon(n) -> n == "Int" || n == "Int64" || n == "Float" || n == "Bool" || n == "Char" || n == "String",
+    TyCon(n) -> n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Bool" || n == "Char" || n == "String",
     _ -> false,
 }
 
@@ -1448,6 +1448,96 @@ def resolveConceptCall(
         }
     })
 
+def selectCoreTypesByNames(params: List String, names: List String, args: List Type): List Type = match names {
+    Nil -> Nil,
+    Cons(nm, rest) -> {
+        let found = cellNew(TyVoid);
+        let cp = cellNew(params);
+        let ca = cellNew(args);
+        while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+            match (cellGet(cp), cellGet(ca)) {
+                (Cons(p, rp), Cons(a, ra)) -> {
+                    if (p == nm) cellSet(found, a) else ();
+                    cellSet(cp, rp);
+                    cellSet(ca, ra)
+                },
+                _ -> (),
+            }
+        };
+        Cons(cellGet(found), selectCoreTypesByNames(params, rest, args))
+    },
+}
+
+def applySubstToTypeList(ts: List Type, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), applySubstToTypeList(t, sub)),
+}
+
+def unifyTypeListsInto(pats: List Type, concs: List Type, sub: StrMap Type): Void = match (pats, concs) {
+    (Cons(p, pr), Cons(c, cr)) -> {
+        unifyTypesInto(p, c, sub);
+        unifyTypeListsInto(pr, cr, sub)
+    },
+    _ -> (),
+}
+
+def resolveFunDepsInSubst(ctx: KCtx, cs: List ConstraintSpec, sub: StrMap Type): Void = match cs {
+    Nil -> (),
+    _ -> {
+        let round = cellNew(0);
+        while (cellGet(round) < 8) {
+            cellSet(round, cellGet(round) + 1);
+            let cc = cellNew(cs);
+            while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                match cellGet(cc) {
+                    Cons(c, rc) -> {
+                        match strMapGet(ctx.kConceptReg, c.conceptName) {
+                            Some(cinfo) -> {
+                                let curArgs = applySubstToTypeList(c.typeArgs, sub);
+                                let cfds = cellNew(cinfo.fundeps);
+                                while (match cellGet(cfds) { Nil -> false, _ -> true }) {
+                                    match cellGet(cfds) {
+                                        Cons(fd, rfd) -> {
+                                            let wLhs = selectCoreTypesByNames(cinfo.typeParams, fd.fdLhs, curArgs);
+                                            if (isTypeListConcrete(wLhs)) {
+                                                let ci = cellNew(ctx.kInstanceReg);
+                                                let matched = cellNew(false);
+                                                while (match cellGet(ci) { Nil -> false, _ -> !cellGet(matched) }) {
+                                                    match cellGet(ci) {
+                                                        Cons(inst, ri) -> {
+                                                            if (inst.conceptName == c.conceptName) {
+                                                                let iLhs = selectCoreTypesByNames(cinfo.typeParams, fd.fdLhs, inst.targetTypes);
+                                                                let instSub: StrMap Type = strMapNew();
+                                                                if (matchInstancePatList(iLhs, wLhs, instSub)) {
+                                                                    let wRhs = selectCoreTypesByNames(cinfo.typeParams, fd.fdRhs, curArgs);
+                                                                    let iRhs = applySubstToTypeList(selectCoreTypesByNames(cinfo.typeParams, fd.fdRhs, inst.targetTypes), instSub);
+                                                                    unifyTypeListsInto(wRhs, iRhs, sub);
+                                                                    cellSet(matched, true)
+                                                                } else ()
+                                                            } else ();
+                                                            cellSet(ci, ri)
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                }
+                                            } else ();
+                                            cellSet(cfds, rfd)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            None -> (),
+                        };
+                        cellSet(cc, rc)
+                    },
+                    Nil -> (),
+                }
+            }
+        }
+    },
+}
+
 def resolvePolyFnCall(
     ctx: KCtx,
     fnName: String,
@@ -1459,6 +1549,7 @@ def resolvePolyFnCall(
         tparams -> {
             let sub: StrMap Type = strMapNew();
             unifyTypesInto(schemeBody(fdef.fnScm), concreteFnTy, sub);
+            resolveFunDepsInSubst(ctx, schemeConstraints(fdef.fnScm), sub);
             fmap((targs) -> {
                 let inst = mkInst(fnName, targs);
                 let specTy = applyExplicitSubst(schemeBody(fdef.fnScm), sub);
@@ -1595,8 +1686,15 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
             let l = rewriteCallsInTerm(ctx, rawL, discovered);
             let r = rewriteCallsInTerm(ctx, rawR, discovered);
             let opTy = schemeBody(l.tscm);
-            if (isTypeConcrete(opTy) && !isBuiltinOpPrimitive(opTy)) {
-                let argTys = [opTy, schemeBody(r.tscm)];
+            let rTy = schemeBody(r.tscm);
+            let isPrimBin = match bop {
+                OpShl -> isBuiltinOpPrimitive(opTy),
+                OpShr -> isBuiltinOpPrimitive(opTy),
+                OpUshr -> isBuiltinOpPrimitive(opTy),
+                _ -> isBuiltinOpPrimitive(opTy) && typesEqual(opTy, rTy),
+            };
+            if (isTypeConcrete(opTy) && isTypeConcrete(rTy) && !isPrimBin) {
+                let argTys = [opTy, rTy];
                 match bop {
                     OpAnd -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
                     OpOr -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
@@ -2151,7 +2249,7 @@ def enqueueDiscoveredSpecs(
 
 def intrinsicSendClosureArg(callee: String): Option Int =
     if (callee == "__concTaskSpawn" || callee == "__concActorSpawn") Some(0)
-    else if (callee == "__concActorCall" || callee == "__concActorSend") Some(1)
+    else if (callee == "__concActorCall" || callee == "__concActorSend" || callee == "parTabulate") Some(1)
     else None
 
 def findNonSendGlobalInTerm(

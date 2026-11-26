@@ -866,3 +866,75 @@ void gs_conc_sweep_unreachable(void)
         cur = next;
     }
 }
+
+typedef struct {
+    void *arr_ptr;
+    int32_t lo;
+    int32_t hi;
+    gs_tabulate_chunk_fn chunk_fn;
+    void *cls_ptr;
+} gs_tabulate_arg_t;
+
+static void *tabulate_worker_entry(void *arg_void)
+{
+    volatile uintptr_t stack_anchor = 0;
+    gs_tabulate_arg_t *arg = (gs_tabulate_arg_t *)arg_void;
+    gc_thread_attach((void *)&stack_anchor);
+    arg->chunk_fn(arg->arr_ptr, arg->lo, arg->hi, arg->cls_ptr);
+    gc_thread_detach();
+    return NULL;
+}
+
+void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_fn, void *cls_ptr)
+{
+    if (n <= 0 || chunk_fn == NULL) return;
+    int32_t workers = gs_conc_num_cpu();
+    if (workers <= 1 || n < 64) {
+        chunk_fn(arr_ptr, 0, n, cls_ptr);
+        return;
+    }
+    if (workers > 32) workers = 32;
+    if (workers > n) workers = n;
+
+    volatile void *keep_arr = arr_ptr;
+    volatile void *keep_cls = cls_ptr;
+
+    int32_t spawned = workers - 1;
+    pthread_t tids[32];
+    gs_tabulate_arg_t args[32];
+    int32_t chunk = (n + workers - 1) / workers;
+    int32_t launched = 0;
+
+    for (int32_t w = 0; w < spawned; w++) {
+        int32_t lo = w * chunk;
+        int32_t hi = lo + chunk;
+        if (lo >= n) break;
+        if (hi > n) hi = n;
+        args[launched].arr_ptr = arr_ptr;
+        args[launched].lo = lo;
+        args[launched].hi = hi;
+        args[launched].chunk_fn = chunk_fn;
+        args[launched].cls_ptr = cls_ptr;
+        if (pthread_create(&tids[launched], NULL, tabulate_worker_entry, &args[launched]) == 0) {
+            launched++;
+        } else {
+            chunk_fn(arr_ptr, lo, hi, cls_ptr);
+        }
+    }
+
+    int32_t tail_lo = spawned * chunk;
+    if (tail_lo < n) {
+        chunk_fn(arr_ptr, tail_lo, n, cls_ptr);
+    }
+
+    jmp_buf jb;
+    _setjmp(jb);
+    gc_enter_blocking(&jb);
+    for (int32_t i = 0; i < launched; i++) {
+        pthread_join(tids[i], NULL);
+    }
+    gc_leave_blocking();
+
+    (void)keep_arr;
+    (void)keep_cls;
+}

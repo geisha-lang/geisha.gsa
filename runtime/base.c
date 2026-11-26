@@ -37,6 +37,13 @@ void putFloat(const double f, void *fv)
     fflush(stdout);
 }
 
+void putF32(const float f, void *fv)
+{
+    (void)fv;
+    printf("%g", (double)f);
+    fflush(stdout);
+}
+
 int32_t gs_str_cmp(const char *a, const char *b)
 {
     if (a == b) return 0;

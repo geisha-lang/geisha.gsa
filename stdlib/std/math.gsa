@@ -1,0 +1,28 @@
+// Mathematical functions backed by LLVM intrinsics (`std.math`)
+
+pub def pi(): Float = 3.141592653589793
+pub def e(): Float = 2.718281828459045
+
+pub def exp(x: Float): Float = mathExp(x)
+pub def log(x: Float): Float = mathLog(x)
+pub def sqrt(x: Float): Float = mathSqrt(x)
+pub def sin(x: Float): Float = mathSin(x)
+pub def cos(x: Float): Float = mathCos(x)
+pub def tanh(x: Float): Float = mathTanh(x)
+pub def pow(a: Float, b: Float): Float = mathPow(a, b)
+pub def abs(x: Float): Float = mathAbs(x)
+pub def floor(x: Float): Float = mathFloor(x)
+pub def ceil(x: Float): Float = mathCeil(x)
+pub def fma(a: Float, b: Float, c: Float): Float = mathFma(a, b, c)
+
+pub def expF32(x: Float32): Float32 = mathExpF32(x)
+pub def logF32(x: Float32): Float32 = mathLogF32(x)
+pub def sqrtF32(x: Float32): Float32 = mathSqrtF32(x)
+pub def sinF32(x: Float32): Float32 = mathSinF32(x)
+pub def cosF32(x: Float32): Float32 = mathCosF32(x)
+pub def tanhF32(x: Float32): Float32 = mathTanhF32(x)
+pub def powF32(a: Float32, b: Float32): Float32 = mathPowF32(a, b)
+pub def absF32(x: Float32): Float32 = mathAbsF32(x)
+pub def floorF32(x: Float32): Float32 = mathFloorF32(x)
+pub def ceilF32(x: Float32): Float32 = mathCeilF32(x)
+pub def fmaF32(a: Float32, b: Float32, c: Float32): Float32 = mathFmaF32(a, b, c)

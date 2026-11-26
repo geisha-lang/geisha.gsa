@@ -46,6 +46,10 @@ void gs_task_wait_any(void *mut_arr_ptr, int32_t count, int32_t timeout_ms);
 int32_t gs_conc_num_cpu(void);
 void gs_conc_sleep_ms(int32_t ms);
 
+/* Structured data-parallel array tabulation (disjoint chunk writes, GC-safe) */
+typedef void (*gs_tabulate_chunk_fn)(void *arr_ptr, int32_t lo, int32_t hi, void *cls_ptr);
+void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_fn, void *cls_ptr);
+
 /* Actor (`std.actor`) */
 void *gs_actor_spawn(gs_thunk_runner_fn init_runner, void *init_cls);
 void *gs_actor_call(void *actor_handle, gs_actor_runner_fn runner, void *handler_cls);

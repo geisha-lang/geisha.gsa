@@ -54,6 +54,22 @@ void gc_handle_free(int64_t handle);
 bool gc_is_obj_marked(const void *payload_ptr);
 bool gc_mark_ptr(const void *payload_ptr);
 
+/* Two-phase GC Cleanup (non-resurrecting finalizer) + External Memory Pressure accounting */
+typedef void (*gc_cleanup_fn)(void *arg);
+int64_t gc_cleanup_register(void *owner, gc_cleanup_fn fn, void *arg, size_t external_bytes);
+bool gc_cleanup_cancel(int64_t token);
+size_t gc_external_live_bytes(void);
+
+/* GC-managed ForeignPtr (binds external raw pointer + cleanup + external bytes to a GC object) */
+void *gc_foreign_ptr_new(void *raw_ptr, gc_cleanup_fn fn, size_t external_bytes);
+void *gc_foreign_ptr_alloc(int64_t size_bytes);
+void *gc_foreign_ptr_get(void *fp);
+
+/* Scoped bump-pointer Arena for NoScan raw byte buffers (destroyed deterministically on scope exit) */
+void *gc_arena_new(void);
+void *gc_arena_alloc(void *arena, int64_t size_bytes);
+void gc_arena_destroy(void *arena);
+
 #ifdef __DEBUG
 #ifndef __DEBUG_OUT
 #define __DEBUG_OUT stderr

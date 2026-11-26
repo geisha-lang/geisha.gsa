@@ -706,6 +706,12 @@ void putFloat(const double f, void *fv)
     (void)fv;
 }
 
+void putF32(const float f, void *fv)
+{
+    (void)f;
+    (void)fv;
+}
+
 /* ---- JS/WASM interop bridge exports ---- */
 
 __attribute__((export_name("gs_wasm_alloc")))
@@ -779,4 +785,73 @@ void gc_set_thresholds(int64_t minor_bytes, int64_t major_bytes)
 int64_t gc_heap_live_bytes(void)
 {
     return (int64_t)gs_live_bytes;
+}
+
+typedef void (*gc_cleanup_fn)(void *arg);
+
+int64_t gc_cleanup_register(void *owner, gc_cleanup_fn fn, void *arg, size_t external_bytes)
+{
+    (void)owner;
+    (void)fn;
+    (void)arg;
+    (void)external_bytes;
+    return 0;
+}
+
+int32_t gc_cleanup_cancel(int64_t token)
+{
+    (void)token;
+    return 0;
+}
+
+size_t gc_external_live_bytes(void)
+{
+    return 0;
+}
+
+void *gc_foreign_ptr_new(void *raw_ptr, gc_cleanup_fn fn, size_t external_bytes)
+{
+    (void)fn;
+    (void)external_bytes;
+    void **fp = (void **)gc_alloc_atomic((int64_t)sizeof(void *));
+    *fp = raw_ptr;
+    return (void *)fp;
+}
+
+void *gc_foreign_ptr_alloc(int64_t size_bytes)
+{
+    if (size_bytes <= 0) size_bytes = 1;
+    void *raw = gc_alloc_atomic(size_bytes);
+    return gc_foreign_ptr_new(raw, NULL, (size_t)size_bytes);
+}
+
+void *gc_foreign_ptr_get(void *fp_void)
+{
+    if (fp_void == NULL) return NULL;
+    return *(void **)fp_void;
+}
+
+void *gc_arena_new(void)
+{
+    return (void *)1;
+}
+
+void *gc_arena_alloc(void *arena_void, int64_t size_bytes)
+{
+    (void)arena_void;
+    if (size_bytes <= 0) return NULL;
+    return gc_alloc_atomic_uninit(size_bytes);
+}
+
+void gc_arena_destroy(void *arena_void)
+{
+    (void)arena_void;
+}
+
+typedef void (*gs_tabulate_chunk_fn)(void *arr_ptr, int32_t lo, int32_t hi, void *cls_ptr);
+
+void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_fn, void *cls_ptr)
+{
+    if (n <= 0 || chunk_fn == NULL) return;
+    chunk_fn(arr_ptr, 0, n, cls_ptr);
 }
