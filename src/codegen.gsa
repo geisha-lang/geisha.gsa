@@ -784,6 +784,20 @@ def genLit(mctx: ModEmitCtx, lit: Lit): String = match lit {
 // GC Safepoint Poll & Concurrency Helpers (`box`, `unbox`, Trampolines)
 // ============================================================================
 
+def emitInlineWriteBarrier(fctx: FnEmitCtx, containerPtr: String): Void = {
+    let hdrPtr = emitAssign(fctx, "getelementptr i8, ptr " + containerPtr + ", i64 -8");
+    let hdrVal = emitAssign(fctx, "load i64, ptr " + hdrPtr + ", align 8");
+    let bits = emitAssign(fctx, "and i64 " + hdrVal + ", 8388610");
+    let need = emitAssign(fctx, "icmp eq i64 " + bits + ", 8388608");
+    let slowBlk = appendBlock(fctx, "wb.slow");
+    let doneBlk = appendBlock(fctx, "wb.done");
+    emitCondBr(fctx, need, slowBlk, doneBlk);
+    setInsertBlock(fctx, slowBlk);
+    emitLine(fctx, "call void @gc_write_barrier(ptr " + containerPtr + ")");
+    emitBr(fctx, doneBlk);
+    setInsertBlock(fctx, doneBlk)
+}
+
 def emitGcSafepointPoll(mctx: ModEmitCtx, fctx: FnEmitCtx): Void =
     if (mctx.mcIsWasm) ()
     else {
@@ -970,7 +984,7 @@ def getOrEmitTabulateRunner(mctx: ModEmitCtx, elemTy: Type): String = {
         let slotPtr = emitGep(rf, elemLlvm, elemsBase, i64Idx);
         emitStore(rf, elemLlvm, callVal, slotPtr);
         if (!mctx.mcIsWasm && !isNoscanElemType(elemTy)) {
-            emitLine(rf, "call void @gc_write_barrier(ptr %arr_ptr)")
+            emitInlineWriteBarrier(rf, "%arr_ptr")
         } else ();
         let nextI = emitAssign(rf, "add i32 " + curI + ", 1");
         emitStore(rf, "i32", nextI, idxSlot);
@@ -1209,7 +1223,7 @@ def tryEmitIntrinsic(
             _ -> false,
         };
         if (!mctx.mcIsWasm && !isStackCell && !isNoscanElemType(valTy)) {
-            emitLine(fctx, "call void @gc_write_barrier(ptr " + cellPtr + ")")
+            emitInlineWriteBarrier(fctx, cellPtr)
         } else ();
         Some("0")
     } else if (name == "arrayNew") {
@@ -1410,7 +1424,7 @@ def tryEmitIntrinsic(
         let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
         emitStore(fctx, elemLlvm, newVal, slotPtr);
         if (!mctx.mcIsWasm && !isNoscanElemType(valTy)) {
-            emitLine(fctx, "call void @gc_write_barrier(ptr " + arrPtr + ")")
+            emitInlineWriteBarrier(fctx, arrPtr)
         } else ();
         Some("0")
     } else if (name == "bitAnd" || name == "bitAnd64") {
@@ -3679,7 +3693,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
         ("gc_alloc_atomic_uninit", "declare noalias nonnull ptr @gc_alloc_atomic_uninit(i64) nounwind"),
         ("gc_alloc_masked", "declare noalias nonnull ptr @gc_alloc_masked(i64, i64) nounwind"),
-        ("gc_write_barrier", "declare void @gc_write_barrier(ptr) nounwind"),
+        ("gc_write_barrier", "declare void @gc_write_barrier(ptr) cold nounwind"),
         ("gc_safepoint_slow", "declare void @gc_safepoint_slow() cold nounwind"),
         ("_setjmp", "declare i32 @_setjmp(ptr) returns_twice"),
         ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr) nounwind"),

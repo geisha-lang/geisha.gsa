@@ -633,9 +633,14 @@ static void large_table_remove_locked(gc_large_t *obj)
     }
 }
 
+#define GC_LARGE_HDR_OFFSET ((sizeof(gc_large_t) + Header_size + 15u) & ~(size_t)15u)
+
 static inline gc_large_t *find_large_obj(uintptr_t payload_ptr)
 {
-    if (_large_count == 0 || payload_ptr < _min_large_addr || payload_ptr >= _max_large_addr) {
+    if (_large_count == 0
+        || (payload_ptr & (GC_PAGE_SIZE - 1)) != GC_LARGE_HDR_OFFSET
+        || payload_ptr < _min_large_addr
+        || payload_ptr >= _max_large_addr) {
         return NULL;
     }
     size_t mask = _large_table_mask;
@@ -1524,7 +1529,9 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
 
         nurs->mark_bits[widx] |= bit;
         nurs->live_count++;
-        header_t hdr = *(const header_t *)hdr_addr;
+        header_t *hp = (header_t *)hdr_addr;
+        header_t hdr = *hp | HEADER_OLD_BIT;
+        *hp = hdr;
         if (!Is_noscan_hdr(hdr)) {
             __builtin_prefetch((const void *)payload_ptr, 0, 1);
             mark_stack_push(hdr_addr, 0, sp);
@@ -1553,7 +1560,9 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
         page->mark_bits[widx] |= bit;
         page->live_count++;
 
-        header_t hdr = *(const header_t *)hdr_addr;
+        header_t *hp = (header_t *)hdr_addr;
+        header_t hdr = *hp | HEADER_OLD_BIT;
+        *hp = hdr;
         if (!Is_noscan_hdr(hdr)) {
             __builtin_prefetch((const void *)payload_ptr, 0, 1);
             mark_stack_push(hdr_addr, 0, sp);
@@ -1565,7 +1574,9 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
     if (lo != NULL && !lo->marked) {
         lo->marked = true;
         uintptr_t hdr_addr = payload_ptr - Header_size;
-        header_t hdr = *(const header_t *)hdr_addr;
+        header_t *hp = (header_t *)hdr_addr;
+        header_t hdr = *hp | HEADER_OLD_BIT;
+        *hp = hdr;
         if (!Is_noscan_hdr(hdr)) {
             mark_stack_push(hdr_addr, lo->payload_words, sp);
         }

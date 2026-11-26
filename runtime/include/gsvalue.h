@@ -15,14 +15,16 @@ typedef header_t value_t;
  *   Bit  0:      HEADER_NOSCAN_BIT      (1 = leaf object containing no GC pointers)
  *   Bit  1:      HEADER_REMEMBERED_BIT  (1 = old-gen object already recorded in thread remset)
  *   Bit  2:      HEADER_HAS_MASK_BIT    (1 = bits [24..63] hold an exact 40-bit word pointer mask)
- *   Bits 3..23:  payload_words          (21 bits, up to 2,097,151 words; large objs use gc_large_t)
+ *   Bits 3..22:  payload_words          (20 bits, up to 1,048,575 words; large objs use gc_large_t)
+ *   Bit  23:     HEADER_OLD_BIT         (1 = survived >=1 GC; used by inline write-barrier fast path)
  *   Bits 24..63: ptr_mask               (40-bit exact pointer bitmask when HEADER_HAS_MASK_BIT == 1)
  */
 #define HEADER_NOSCAN_BIT      ((header_t)1ULL)
 #define HEADER_REMEMBERED_BIT  ((header_t)2ULL)
 #define HEADER_HAS_MASK_BIT    ((header_t)4ULL)
+#define HEADER_OLD_BIT         ((header_t)1ULL << 23u)
 #define HEADER_WORDS_SHIFT     3u
-#define HEADER_WORDS_MASK      ((header_t)0x1FFFFFULL)
+#define HEADER_WORDS_MASK      ((header_t)0xFFFFFULL)
 #define HEADER_MASK_SHIFT      24u
 
 /* Pointer `p` points to object payload right after the 1-word header */
