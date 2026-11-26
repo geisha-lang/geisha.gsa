@@ -1,0 +1,216 @@
+// Pure-Geisha FIPS 180-4 SHA-256 cryptographic hash (`std.sha256`).
+// Portable across both `native` and `wasm32` targets with zero C FFI dependencies.
+
+use std.buf.{bufNew, bufPushByte, bufToString}
+
+pub data Sha256 {
+    MkSha256 {
+        shState: MutArray Int,
+        shBlock: MutArray Int,
+        shBlockLen: Cell Int,
+        shTotalBytes: Cell Int64,
+        shWBuf: MutArray Int,
+    },
+}
+
+def rotr32(x: Int, n: Int): Int =
+    (x >>> n) | (x << (32 - n))
+
+def sha256KTable(): MutArray Int = {
+    let ks = [
+        1116352408, 1899447441, -1245643825, -373957723, 961987163, 1508970993, -1841331548, -1424204075,
+        -670586216, 310598401, 607225278, 1426881987, 1925078388, -2132889090, -1680079193, -1046744716,
+        -459576895, -272742522, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        -1740746414, -1473132947, -1341970488, -1084653625, -958395405, -710438585, 113926993, 338241895,
+        666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, -2117940946, -1838011259,
+        -1564481375, -1474664885, -1035236496, -949202525, -778901479, -694614492, -200395387, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+        1955562222, 2024104815, -2067236844, -1933114872, -1866530822, -1538233109, -1090935817, -965641998
+    ];
+    let arr = arrayNew(64, 0);
+    let cur = cellNew(ks);
+    let idx = cellNew(0);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(v, r) -> {
+                let i = cellGet(idx);
+                arraySet(arr, i, v);
+                cellSet(idx, i + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    arr
+}
+
+def kTable: MutArray Int = sha256KTable()
+
+def compressBlock(st: MutArray Int, blk: MutArray Int, w: MutArray Int): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < 16) {
+        let j = cellGet(i);
+        let b = j * 4;
+        let word = ((arrayGet(blk, b) & 255) << 24)
+                 | ((arrayGet(blk, b + 1) & 255) << 16)
+                 | ((arrayGet(blk, b + 2) & 255) << 8)
+                 | (arrayGet(blk, b + 3) & 255);
+        arraySet(w, j, word);
+        cellSet(i, j + 1)
+    };
+    while (cellGet(i) < 64) {
+        let j = cellGet(i);
+        let w15 = arrayGet(w, j - 15);
+        let w2 = arrayGet(w, j - 2);
+        let s0 = rotr32(w15, 7) ^ rotr32(w15, 18) ^ (w15 >>> 3);
+        let s1 = rotr32(w2, 17) ^ rotr32(w2, 19) ^ (w2 >>> 10);
+        arraySet(w, j, arrayGet(w, j - 16) + s0 + arrayGet(w, j - 7) + s1);
+        cellSet(i, j + 1)
+    };
+
+    let a = cellNew(arrayGet(st, 0));
+    let b = cellNew(arrayGet(st, 1));
+    let c = cellNew(arrayGet(st, 2));
+    let d = cellNew(arrayGet(st, 3));
+    let e = cellNew(arrayGet(st, 4));
+    let f = cellNew(arrayGet(st, 5));
+    let g = cellNew(arrayGet(st, 6));
+    let h = cellNew(arrayGet(st, 7));
+
+    let r = cellNew(0);
+    while (cellGet(r) < 64) {
+        let idx = cellGet(r);
+        let av = cellGet(a);
+        let bv = cellGet(b);
+        let cv = cellGet(c);
+        let dv = cellGet(d);
+        let ev = cellGet(e);
+        let fv = cellGet(f);
+        let gv = cellGet(g);
+        let hv = cellGet(h);
+
+        let bigS1 = rotr32(ev, 6) ^ rotr32(ev, 11) ^ rotr32(ev, 25);
+        let ch = (ev & fv) ^ ((~ev) & gv);
+        let temp1 = hv + bigS1 + ch + arrayGet(kTable, idx) + arrayGet(w, idx);
+        let bigS0 = rotr32(av, 2) ^ rotr32(av, 13) ^ rotr32(av, 22);
+        let maj = (av & bv) ^ (av & cv) ^ (bv & cv);
+        let temp2 = bigS0 + maj;
+
+        cellSet(h, gv);
+        cellSet(g, fv);
+        cellSet(f, ev);
+        cellSet(e, dv + temp1);
+        cellSet(d, cv);
+        cellSet(c, bv);
+        cellSet(b, av);
+        cellSet(a, temp1 + temp2);
+        cellSet(r, idx + 1)
+    };
+
+    arraySet(st, 0, arrayGet(st, 0) + cellGet(a));
+    arraySet(st, 1, arrayGet(st, 1) + cellGet(b));
+    arraySet(st, 2, arrayGet(st, 2) + cellGet(c));
+    arraySet(st, 3, arrayGet(st, 3) + cellGet(d));
+    arraySet(st, 4, arrayGet(st, 4) + cellGet(e));
+    arraySet(st, 5, arrayGet(st, 5) + cellGet(f));
+    arraySet(st, 6, arrayGet(st, 6) + cellGet(g));
+    arraySet(st, 7, arrayGet(st, 7) + cellGet(h))
+}
+
+pub def sha256New(): Sha256 = {
+    let st = arrayNew(8, 0);
+    arraySet(st, 0, 1779033703);
+    arraySet(st, 1, -1150833019);
+    arraySet(st, 2, 1013904242);
+    arraySet(st, 3, -1521486534);
+    arraySet(st, 4, 1359893119);
+    arraySet(st, 5, -1694144372);
+    arraySet(st, 6, 528734635);
+    arraySet(st, 7, 1541459225);
+    MkSha256 {
+        shState: st,
+        shBlock: arrayNew(64, 0),
+        shBlockLen: cellNew(0),
+        shTotalBytes: cellNew(intToI64(0)),
+        shWBuf: arrayNew(64, 0),
+    }
+}
+
+pub def sha256UpdateByte(ctx: Sha256, byteVal: Int): Void = {
+    let bl = cellGet(ctx.shBlockLen);
+    arraySet(ctx.shBlock, bl, byteVal & 255);
+    cellSet(ctx.shTotalBytes, cellGet(ctx.shTotalBytes) + intToI64(1));
+    if (bl + 1 == 64) {
+        compressBlock(ctx.shState, ctx.shBlock, ctx.shWBuf);
+        cellSet(ctx.shBlockLen, 0)
+    } else {
+        cellSet(ctx.shBlockLen, bl + 1)
+    }
+}
+
+pub def sha256Update(ctx: Sha256, input: String): Void = {
+    let n = strLen(input);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        sha256UpdateByte(ctx, strByteAt(input, idx));
+        cellSet(i, idx + 1)
+    }
+}
+
+def hexLowerByte(nib: Int): Int =
+    if (nib < 10) 48 + nib else 87 + nib
+
+pub def sha256FinishHex(ctx: Sha256): String = {
+    let bitLen = cellGet(ctx.shTotalBytes) * intToI64(8);
+    let bl0 = cellGet(ctx.shBlockLen);
+    arraySet(ctx.shBlock, bl0, 128);
+    let bl = cellNew(bl0 + 1);
+
+    if (cellGet(bl) > 56) {
+        while (cellGet(bl) < 64) {
+            let p = cellGet(bl);
+            arraySet(ctx.shBlock, p, 0);
+            cellSet(bl, p + 1)
+        };
+        compressBlock(ctx.shState, ctx.shBlock, ctx.shWBuf);
+        cellSet(bl, 0)
+    } else ();
+
+    while (cellGet(bl) < 56) {
+        let p = cellGet(bl);
+        arraySet(ctx.shBlock, p, 0);
+        cellSet(bl, p + 1)
+    };
+
+    let mask8 = intToI64(255);
+    arraySet(ctx.shBlock, 56, i64ToInt((bitLen >>> 56) & mask8));
+    arraySet(ctx.shBlock, 57, i64ToInt((bitLen >>> 48) & mask8));
+    arraySet(ctx.shBlock, 58, i64ToInt((bitLen >>> 40) & mask8));
+    arraySet(ctx.shBlock, 59, i64ToInt((bitLen >>> 32) & mask8));
+    arraySet(ctx.shBlock, 60, i64ToInt((bitLen >>> 24) & mask8));
+    arraySet(ctx.shBlock, 61, i64ToInt((bitLen >>> 16) & mask8));
+    arraySet(ctx.shBlock, 62, i64ToInt((bitLen >>> 8) & mask8));
+    arraySet(ctx.shBlock, 63, i64ToInt(bitLen & mask8));
+    compressBlock(ctx.shState, ctx.shBlock, ctx.shWBuf);
+
+    let out = bufNew();
+    let wi = cellNew(0);
+    while (cellGet(wi) < 8) {
+        let w = arrayGet(ctx.shState, cellGet(wi));
+        let shift = cellNew(28);
+        while (cellGet(shift) >= 0) {
+            let s = cellGet(shift);
+            bufPushByte(out, hexLowerByte((w >>> s) & 15));
+            cellSet(shift, s - 4)
+        };
+        cellSet(wi, cellGet(wi) + 1)
+    };
+    bufToString(out)
+}
+
+pub def sha256Hex(input: String): String = {
+    let ctx = sha256New();
+    sha256Update(ctx, input);
+    sha256FinishHex(ctx)
+}

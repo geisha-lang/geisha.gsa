@@ -1,0 +1,2257 @@
+// Decentralized Zero-Server Package Manager & Build Driver (`pkg`).
+//
+// Architecture:
+// - `geisha.toml` declarative manifest + optional `geisha.local.toml` local path overrides
+// - Git URLs as canonical coordinates + optional static Git index (`$GEISHA_INDEX`)
+// - Minimal Version Selection (MVS) reading `git show <ref>:geisha.toml` from bare treeless clones
+// - Content-addressed global store (`~/.geisha/cache/p/<name>-<ver>-<sha256_12>/`) & `geisha.lock`
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend, listLen}
+use std.str.{
+    intToStr, strStartsWith, strEndsWith, strTrim, strSplitChar, strJoin,
+    strIndexOfByte, parseInt
+}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.path.{isAbsPath, pathJoin, pathDirname, pathBasename, pathStem}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.sha256.{sha256New, sha256Update, sha256FinishHex, sha256Hex}
+use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
+use std.toml.{parse as tomlParse, stringify as tomlStringify}
+use sys.env.{getEnv}
+use sys.fs.{fileExists, isDir, mkdirAll, readDir, readFile, writeFile, removeFile}
+use sys.io.eprintLn
+use sys.proc.shell
+use ast.{sortUniqueStrings, listContainsStr, addUniqueStr}
+use loader.{PkgSpec, MkPkgSpec}
+
+extern "getpid" def c_getpid(): Int
+extern "realpath" def c_realpath(path: String, resolved: Ptr): Ptr
+extern "free" def c_free(ptr: Ptr): Void
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+pub data DepDecl {
+    MkDepDecl {
+        depAlias: String,
+        depGit: Option String,
+        depVersion: Option String,
+        depRev: Option String,
+        depPath: Option String,
+        depSubdir: Option String,
+    },
+}
+
+pub data TargetCfg {
+    MkTargetCfg {
+        tcCSources: List String,
+        tcCFlags: List String,
+        tcLinkFlags: List String,
+        tcExports: List String,
+        tcWebAssets: List String,
+        tcOwnsMain: Bool,
+        tcBootSymbol: Option String,
+    },
+}
+
+pub data Manifest {
+    MkManifest {
+        mfName: String,
+        mfVersion: String,
+        mfEntry: Option String,
+        mfSrcDir: String,
+        mfTests: List String,
+        mfDeps: List DepDecl,
+        mfOverrides: List DepDecl,
+        mfNative: TargetCfg,
+        mfWasm: TargetCfg,
+    },
+}
+
+pub data LockEntry {
+    MkLockEntry {
+        leName: String,
+        leUrl: String,
+        leSubdir: String,
+        leVersion: String,
+        leRev: String,
+        leSha256: String,
+    },
+}
+
+pub data ResolvedPkg {
+    MkResolvedPkg {
+        rpId: String,
+        rpName: String,
+        rpUrl: String,
+        rpSubdir: String,
+        rpVersion: String,
+        rpRev: String,
+        rpSha256: String,
+        rpRootDir: String,
+        rpSrcDirs: List String,
+        rpDeps: List (String, String),
+        rpManifest: Manifest,
+        rpIsLocal: Bool,
+    },
+}
+
+pub data CompileCallbacks {
+    MkCompileCallbacks {
+        cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String) -> Result Void String,
+        cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
+        cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String) -> Result Void String,
+        cbEmitIr: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String) -> Result Void String,
+    },
+}
+
+def emptyTargetCfg(): TargetCfg = MkTargetCfg {
+    tcCSources: Nil,
+    tcCFlags: Nil,
+    tcLinkFlags: Nil,
+    tcExports: Nil,
+    tcWebAssets: Nil,
+    tcOwnsMain: false,
+    tcBootSymbol: None,
+}
+
+def emptyManifest(fallbackName: String): Manifest = MkManifest {
+    mfName: fallbackName,
+    mfVersion: "0.1.0",
+    mfEntry: None,
+    mfSrcDir: "src",
+    mfTests: Nil,
+    mfDeps: Nil,
+    mfOverrides: Nil,
+    mfNative: emptyTargetCfg(),
+    mfWasm: emptyTargetCfg(),
+}
+
+// ============================================================================
+// Shell, Path & Filesystem Utilities
+// ============================================================================
+
+def cmdSeqCounter: Cell Int = cellNew(0)
+
+pub def shellQuote(s: String): String = {
+    let b = bufNew();
+    bufPushByte(b, 39);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c == 39) bufPushStr(b, "'\\''")
+        else bufPushByte(b, c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 39);
+    bufToString(b)
+}
+
+pub def geishaHomeDir(): String = match getEnv("GEISHA_HOME") {
+    Some(h) if (strLen(h) > 0) -> h,
+    _ -> match getEnv("HOME") {
+        Some(home) if (strLen(home) > 0) -> pathJoin(home, ".geisha"),
+        _ -> "/tmp/.geisha",
+    },
+}
+
+pub def absPath(p: String): String = {
+    let rp = c_realpath(p, ptrNull());
+    if (ptrIsNull(rp)) {
+        let fullP =
+            if (isAbsPath(p)) p
+            else match getEnv("PWD") {
+                Some(pwd) -> pathJoin(pwd, p),
+                None -> p,
+            };
+        let parent = pathDirname(fullP);
+        let base = pathBasename(fullP);
+        if (parent != fullP && parent != "." && parent != "/") {
+            pathJoin(absPath(parent), base)
+        } else fullP
+    } else {
+        let b = bufNew();
+        bufPushStr(b, ptrToString(rp));
+        let res = bufToString(b);
+        c_free(rp);
+        res
+    }
+}
+
+def execCapture(cmd: String): Result String String = {
+    let tmpDir = pathJoin(geishaHomeDir(), "tmp");
+    let _ = mkdirAll(tmpDir);
+    let seq = cellGet(cmdSeqCounter) + 1;
+    cellSet(cmdSeqCounter, seq);
+    let prefix = pathJoin(tmpDir, "cmd_" + intToStr(c_getpid()) + "_" + intToStr(seq));
+    let outFile = prefix + ".out";
+    let errFile = prefix + ".err";
+    let fullCmd = "(" + cmd + ") > " + shellQuote(outFile) + " 2> " + shellQuote(errFile);
+    let rc = shell(fullCmd);
+    let outStr = match readFile(outFile) { Ok(s) -> s, Err(_) -> "" };
+    let errStr = match readFile(errFile) { Ok(s) -> s, Err(_) -> "" };
+    let _ = removeFile(outFile);
+    let _ = removeFile(errFile);
+    if (rc == 0) Ok(outStr)
+    else {
+        let detail = strTrim(if (strLen(errStr) > 0) errStr else outStr);
+        Err(if (strLen(detail) > 0) detail else "command failed (exit " + intToStr(rc) + "): " + cmd)
+    }
+}
+
+def copyFileBytes(srcPath: String, dstPath: String): Result Void String = {
+    let content = readFile(srcPath)?;
+    let parent = pathDirname(dstPath);
+    if (parent != "." && parent != "/" && !isDir(parent)) {
+        mkdirAll(parent)?
+    } else ();
+    writeFile(dstPath, content)
+}
+
+// ============================================================================
+// Content-Addressed Directory SHA-256 (`sha256Dir`)
+// ============================================================================
+
+def shouldSkipHashEntry(name: String): Bool =
+    name == "."
+    || name == ".."
+    || name == ".git"
+    || name == "build"
+    || name == ".DS_Store"
+    || name == "geisha.local.toml"
+    || name == ".geisha-ok"
+
+def collectDirFilesRec(baseDir: String, relPrefix: String, acc: Cell (List String)): Result Void String = {
+    let curDir = if (relPrefix == "") baseDir else pathJoin(baseDir, relPrefix);
+    let entries = readDir(curDir)?;
+    let cur = cellNew(entries);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(name, r) -> {
+                if (!shouldSkipHashEntry(name)) {
+                    let rel = if (relPrefix == "") name else relPrefix + "/" + name;
+                    let full = pathJoin(baseDir, rel);
+                    if (isDir(full)) {
+                        match collectDirFilesRec(baseDir, rel, acc) {
+                            Ok(_) -> (),
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                        }
+                    } else if (fileExists(full)) {
+                        cellSet(acc, Cons(rel, cellGet(acc)))
+                    } else ()
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
+pub def sha256Dir(rootDir: String): Result String String = {
+    let filesCell: Cell (List String) = cellNew(Nil);
+    collectDirFilesRec(rootDir, "", filesCell)?;
+    let sorted = sortUniqueStrings(cellGet(filesCell));
+    let ctx = sha256New();
+    sha256Update(ctx, "geisha-pkg-v1\n");
+    let cur = cellNew(sorted);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(rel, r) -> {
+                match readFile(pathJoin(rootDir, rel)) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(bytes) -> {
+                        sha256Update(ctx, "F " + rel + " " + intToStr(strLen(bytes)) + "\n");
+                        sha256Update(ctx, bytes);
+                        sha256Update(ctx, "\n")
+                    },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(sha256FinishHex(ctx)),
+    }
+}
+
+// ============================================================================
+// SemVer Parsing & Minimal Version Selection (MVS) Helpers
+// ============================================================================
+
+def stripLeadingV(ver: String): String = {
+    let s = strTrim(ver);
+    if (strLen(s) > 1 && (strByteAt(s, 0) == 118 || strByteAt(s, 0) == 86)) {
+        strSlice(s, 1, strLen(s))
+    } else s
+}
+
+pub def parseSemVerTuple(raw: String): Option (Int, Int, Int, String) = {
+    let clean = stripLeadingV(raw);
+    let (corePart, prePart) = match strIndexOfByte(clean, 45, 0) {
+        Some(idx) -> (strSlice(clean, 0, idx), strSlice(clean, idx + 1, strLen(clean))),
+        None -> (clean, ""),
+    };
+    let coreNoBuild = match strIndexOfByte(corePart, 43, 0) {
+        Some(idx) -> strSlice(corePart, 0, idx),
+        None -> corePart,
+    };
+    let segs = strSplitChar(coreNoBuild, '.');
+    match segs {
+        Cons(sMaj, Cons(sMin, Cons(sPat, Nil))) ->
+            match (parseInt(sMaj), parseInt(sMin), parseInt(sPat)) {
+                (Ok(maj), Ok(min), Ok(pat)) if (maj >= 0 && min >= 0 && pat >= 0) ->
+                    Some((maj, min, pat, prePart)),
+                _ -> None,
+            },
+        Cons(sMaj, Cons(sMin, Nil)) ->
+            match (parseInt(sMaj), parseInt(sMin)) {
+                (Ok(maj), Ok(min)) if (maj >= 0 && min >= 0) ->
+                    Some((maj, min, 0, prePart)),
+                _ -> None,
+            },
+        _ -> None,
+    }
+}
+
+pub def cmpSemVer(a: String, b: String): Int =
+    match (parseSemVerTuple(a), parseSemVerTuple(b)) {
+        (Some((ma1, mi1, pa1, pr1)), Some((ma2, mi2, pa2, pr2))) ->
+            if (ma1 != ma2) (if (ma1 > ma2) 1 else -1)
+            else if (mi1 != mi2) (if (mi1 > mi2) 1 else -1)
+            else if (pa1 != pa2) (if (pa1 > pa2) 1 else -1)
+            else if (pr1 == pr2) 0
+            else if (pr1 == "") 1
+            else if (pr2 == "") -1
+            else if (pr1 > pr2) 1
+            else -1,
+        _ ->
+            if (a == b) 0 else if (a > b) 1 else -1,
+    }
+
+def majorCompatLine(ver: String): String = match parseSemVerTuple(ver) {
+    Some((maj, _, _, _)) ->
+        if (maj <= 1) "v1" else "v" + intToStr(maj),
+    None -> "v1",
+}
+
+// ============================================================================
+// TOML Manifest (`geisha.toml`) & Lockfile (`geisha.lock`) Parsing / Encoding
+// ============================================================================
+
+def lookupVal(fs: List (String, Value), k: String): Option Value = match fs {
+    Nil -> None,
+    Cons((fk, fv), r) -> if (fk == k) Some(fv) else lookupVal(r, k),
+}
+
+def asStrOpt(vOpt: Option Value): Option String = match vOpt {
+    Some(VStr(s)) -> Some(s),
+    _ -> None,
+}
+
+def asBoolOr(vOpt: Option Value, fallback: Bool): Bool = match vOpt {
+    Some(VBool(b)) -> b,
+    _ -> fallback,
+}
+
+def asStrList(vOpt: Option Value): Result (List String) String = match vOpt {
+    None -> Ok(Nil),
+    Some(VStr(single)) -> Ok([single]),
+    Some(VArr(xs)) -> {
+        let acc = cellNew(Nil);
+        let cur = cellNew(xs);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(VStr(s), r) -> {
+                    cellSet(acc, Cons(s, cellGet(acc)));
+                    cellSet(cur, r)
+                },
+                Cons(_, _) -> cellSet(errOpt, Some("expected array of strings in geisha.toml")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(listRev(cellGet(acc))),
+        }
+    },
+    Some(_) -> Err("expected string array in geisha.toml"),
+}
+
+def optFieldAlt(fs: List (String, Value), kSnake: String, kKebab: String): Option Value =
+    match lookupVal(fs, kSnake) {
+        Some(v) -> Some(v),
+        None -> lookupVal(fs, kKebab),
+    }
+
+def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOpt {
+    None -> Ok(emptyTargetCfg()),
+    Some(VObj(fs)) -> {
+        let cSrcs = asStrList(optFieldAlt(fs, "c_sources", "c-sources"))?;
+        let cFlgs = asStrList(optFieldAlt(fs, "c_flags", "c-flags"))?;
+        let lFlgs = asStrList(optFieldAlt(fs, "link_flags", "link-flags"))?;
+        let exps = asStrList(lookupVal(fs, "exports"))?;
+        let webAs = asStrList(optFieldAlt(fs, "web_assets", "web-assets"))?;
+        let ownsM = asBoolOr(optFieldAlt(fs, "owns_main", "owns-main"), false);
+        let bootS = asStrOpt(optFieldAlt(fs, "boot_symbol", "boot-symbol"));
+        Ok(MkTargetCfg {
+            tcCSources: cSrcs,
+            tcCFlags: cFlgs,
+            tcLinkFlags: lFlgs,
+            tcExports: exps,
+            tcWebAssets: webAs,
+            tcOwnsMain: ownsM,
+            tcBootSymbol: bootS,
+        })
+    },
+    Some(_) -> Err("expected '[target.<name>]' to be a TOML table"),
+}
+
+def splitHashSubdir(rawUrl: String): (String, Option String) =
+    match strIndexOfByte(rawUrl, 35, 0) {
+        Some(idx) -> {
+            let base = strSlice(rawUrl, 0, idx);
+            let sub = strSlice(rawUrl, idx + 1, strLen(rawUrl));
+            (base, if (strLen(sub) > 0) Some(sub) else None)
+        },
+        None -> (rawUrl, None),
+    }
+
+def parseDepTable(vOpt: Option Value): Result (List DepDecl) String = match vOpt {
+    None -> Ok(Nil),
+    Some(VObj(fs)) -> {
+        let acc = cellNew(Nil);
+        let cur = cellNew(fs);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons((key, VStr(verStr)), r) -> {
+                    cellSet(acc, Cons(MkDepDecl {
+                        depAlias: key,
+                        depGit: None,
+                        depVersion: Some(stripLeadingV(verStr)),
+                        depRev: None,
+                        depPath: None,
+                        depSubdir: None,
+                    }, cellGet(acc)));
+                    cellSet(cur, r)
+                },
+                Cons((key, VObj(dfs)), r) -> {
+                    let rawGit = match lookupVal(dfs, "git") {
+                        Some(VStr(g)) -> Some(g),
+                        _ -> asStrOpt(lookupVal(dfs, "url")),
+                    };
+                    let (gitClean, hashSub) = match rawGit {
+                        Some(g) -> {
+                            let (b, hs) = splitHashSubdir(g);
+                            (Some(b), hs)
+                        },
+                        None -> (None, None),
+                    };
+                    let explicitSub = asStrOpt(lookupVal(dfs, "subdir"));
+                    let verOpt = match asStrOpt(lookupVal(dfs, "version")) {
+                        Some(v) -> Some(stripLeadingV(v)),
+                        None -> None,
+                    };
+                    let revOpt = match asStrOpt(lookupVal(dfs, "rev")) {
+                        Some(rv) -> Some(rv),
+                        None -> asStrOpt(lookupVal(dfs, "tag")),
+                    };
+                    let pathOpt = asStrOpt(lookupVal(dfs, "path"));
+                    let subOpt = match explicitSub { Some(_) -> explicitSub, None -> hashSub };
+                    cellSet(acc, Cons(MkDepDecl {
+                        depAlias: key,
+                        depGit: gitClean,
+                        depVersion: verOpt,
+                        depRev: revOpt,
+                        depPath: pathOpt,
+                        depSubdir: subOpt,
+                    }, cellGet(acc)));
+                    cellSet(cur, r)
+                },
+                Cons((key, _), _) ->
+                    cellSet(errOpt, Some("dependency '" + key + "' must be a version string or inline table")),
+                Nil -> (),
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(listRev(cellGet(acc))),
+        }
+    },
+    Some(_) -> Err("expected '[deps]' / '[overrides]' to be a TOML table"),
+}
+
+pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest String = {
+    let rootVal = tomlParse(raw)?;
+    match rootVal {
+        VObj(fs) -> {
+            // Also accept optional `[package]` table if someone writes one, though flat root keys are canonical!
+            let pkgSubFs = match lookupVal(fs, "package") {
+                Some(VObj(pfs)) -> pfs,
+                _ -> Nil,
+            };
+            let name = match asStrOpt(lookupVal(fs, "name")) {
+                Some(n) -> n,
+                None -> match asStrOpt(lookupVal(pkgSubFs, "name")) {
+                    Some(n2) -> n2,
+                    None -> fallbackName,
+                },
+            };
+            let ver = match asStrOpt(lookupVal(fs, "version")) {
+                Some(v) -> stripLeadingV(v),
+                None -> match asStrOpt(lookupVal(pkgSubFs, "version")) {
+                    Some(v2) -> stripLeadingV(v2),
+                    None -> "0.1.0",
+                },
+            };
+            let entryOpt = match asStrOpt(lookupVal(fs, "entry")) {
+                Some(e) -> Some(e),
+                None -> asStrOpt(lookupVal(fs, "main")),
+            };
+            let srcDir = match asStrOpt(optFieldAlt(fs, "src_dir", "src-dir")) {
+                Some(sd) -> sd,
+                None -> "src",
+            };
+            let tests1 = asStrList(lookupVal(fs, "tests"))?;
+            let tests2 = asStrList(lookupVal(fs, "test"))?;
+            let deps = parseDepTable(lookupVal(fs, "deps"))?;
+            let overrides = parseDepTable(lookupVal(fs, "overrides"))?;
+            let (nativeCfg, wasmCfg) = match lookupVal(fs, "target") {
+                Some(VObj(tfs)) -> {
+                    let nc = parseTargetCfgValue(lookupVal(tfs, "native"))?;
+                    let wc = parseTargetCfgValue(lookupVal(tfs, "wasm32"))?;
+                    (nc, wc)
+                },
+                None -> (emptyTargetCfg(), emptyTargetCfg()),
+                Some(_) -> returnManifestErr("expected '[target]' to be a TOML table")?,
+            };
+            Ok(MkManifest {
+                mfName: name,
+                mfVersion: ver,
+                mfEntry: entryOpt,
+                mfSrcDir: srcDir,
+                mfTests: listAppend(tests1, tests2),
+                mfDeps: deps,
+                mfOverrides: overrides,
+                mfNative: nativeCfg,
+                mfWasm: wasmCfg,
+            })
+        },
+        _ -> Err("expected TOML root object"),
+    }
+}
+
+def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg) String = Err(msg)
+
+pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
+    let rootVal = tomlParse(raw)?;
+    match rootVal {
+        VObj(fs) -> match lookupVal(fs, "pkg") {
+            None -> Ok(Nil),
+            Some(VArr(items)) -> {
+                let acc = cellNew(Nil);
+                let cur = cellNew(items);
+                let errOpt: Cell (Option String) = cellNew(None);
+                while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                    match cellGet(cur) {
+                        Cons(VObj(pfs), r) -> {
+                            let nm = match asStrOpt(lookupVal(pfs, "name")) { Some(s) -> s, None -> "" };
+                            let url = match asStrOpt(lookupVal(pfs, "url")) { Some(s) -> s, None -> "" };
+                            let sub = match asStrOpt(lookupVal(pfs, "subdir")) { Some(s) -> s, None -> "" };
+                            let ver = match asStrOpt(lookupVal(pfs, "version")) { Some(s) -> s, None -> "0.0.0" };
+                            let rev = match asStrOpt(lookupVal(pfs, "rev")) { Some(s) -> s, None -> "" };
+                            let sha = match asStrOpt(lookupVal(pfs, "sha256")) { Some(s) -> s, None -> "" };
+                            if (url == "" || rev == "" || sha == "") {
+                                cellSet(errOpt, Some("malformed [[pkg]] entry in geisha.lock"))
+                            } else {
+                                cellSet(acc, Cons(MkLockEntry {
+                                    leName: nm,
+                                    leUrl: url,
+                                    leSubdir: sub,
+                                    leVersion: ver,
+                                    leRev: rev,
+                                    leSha256: sha,
+                                }, cellGet(acc)))
+                            };
+                            cellSet(cur, r)
+                        },
+                        _ -> cellSet(errOpt, Some("expected [[pkg]] table array in geisha.lock")),
+                    }
+                };
+                match cellGet(errOpt) {
+                    Some(e) -> Err(e),
+                    None -> Ok(listRev(cellGet(acc))),
+                }
+            },
+            Some(_) -> Err("expected 'pkg' in geisha.lock to be [[pkg]] array of tables"),
+        },
+        _ -> Err("invalid geisha.lock"),
+    }
+}
+
+pub def formatLockfileToml(entries: List LockEntry): String = {
+    let items = cellNew(Nil);
+    let cur = cellNew(entries);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(e, r) -> {
+                let fs = cellNew([
+                    ("name", VStr(e.leName)),
+                    ("url", VStr(e.leUrl))
+                ]);
+                if (strLen(e.leSubdir) > 0) {
+                    cellSet(fs, listAppend(cellGet(fs), [("subdir", VStr(e.leSubdir))]))
+                } else ();
+                cellSet(fs, listAppend(cellGet(fs), [
+                    ("version", VStr(e.leVersion)),
+                    ("rev", VStr(e.leRev)),
+                    ("sha256", VStr(e.leSha256))
+                ]));
+                cellSet(items, listAppend(cellGet(items), [VObj(cellGet(fs))]));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let header = "# Auto-generated by geisha — DO NOT EDIT MANUALLY.\n";
+    let body = tomlStringify(VObj([
+        ("version", VInt(intToI64(1))),
+        ("pkg", VArr(cellGet(items)))
+    ]));
+    header + body
+}
+
+// ============================================================================
+// Git Coordinate Normalization & Static Git Index Lookup
+// ============================================================================
+
+def stripGitSuffix(s: String): String =
+    if (strEndsWith(s, ".git")) strSlice(s, 0, strLen(s) - 4) else s
+
+def sanitizeSlug(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        let isAlnum = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+        if (isAlnum || c == 45 || c == 95) bufPushByte(b, c)
+        else bufPushByte(b, 95);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def sanitizeIdentAlias(raw: String): String = {
+    let base = pathBasename(stripGitSuffix(raw));
+    let b = bufNew();
+    let n = strLen(base);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(base, cellGet(i));
+        if (c == 45 || c == 46) bufPushByte(b, 95)
+        else bufPushByte(b, c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+// Returns `(canonicalUrlKey, gitCloneUrl)`
+pub def normalizeGitSpec(rawSpec: String): Result (String, String) String = {
+    let s = strTrim(rawSpec);
+    if (strStartsWith(s, "file://")) {
+        let localP = strSlice(s, 7, strLen(s));
+        let ap = absPath(localP);
+        Ok(("file://" + ap, ap))
+    } else if (isAbsPath(s) || strStartsWith(s, "./") || strStartsWith(s, "../")) {
+        let ap = absPath(s);
+        Ok(("file://" + ap, ap))
+    } else if (strStartsWith(s, "git@")) {
+        // e.g. `git@github.com:geisha-lang/kagura.git`
+        let afterAt = strSlice(s, 4, strLen(s));
+        let canon = match strIndexOfByte(afterAt, 58, 0) {
+            Some(idx) ->
+                strSlice(afterAt, 0, idx) + "/" + stripGitSuffix(strSlice(afterAt, idx + 1, strLen(afterAt))),
+            None -> stripGitSuffix(afterAt),
+        };
+        Ok((canon, s))
+    } else if (strStartsWith(s, "ssh://") || strStartsWith(s, "git+ssh://")) {
+        let cleanUrl = if (strStartsWith(s, "git+")) strSlice(s, 4, strLen(s)) else s;
+        Ok((stripGitSuffix(cleanUrl), cleanUrl))
+    } else if (strStartsWith(s, "https://") || strStartsWith(s, "http://")) {
+        let protoLen = if (strStartsWith(s, "https://")) 8 else 7;
+        let hostAndPath = stripGitSuffix(strSlice(s, protoLen, strLen(s)));
+        let cloneUrl = if (strEndsWith(s, ".git")) s else s + ".git";
+        Ok((hostAndPath, cloneUrl))
+    } else if (strStartsWith(s, "gh:")) {
+        let ownerRepo = stripGitSuffix(strSlice(s, 3, strLen(s)));
+        let canon = "github.com/" + ownerRepo;
+        Ok((canon, "https://" + canon + ".git"))
+    } else {
+        // Check `host/owner/repo` vs `owner/repo` vs bare `name`
+        let slashSegs = strSplitChar(stripGitSuffix(s), '/');
+        let segCount = listLen(slashSegs);
+        if (segCount >= 3) {
+            let canon = stripGitSuffix(s);
+            Ok((canon, "https://" + canon + ".git"))
+        } else if (segCount == 2) {
+            let firstSeg = match slashSegs { Cons(h, _) -> h, Nil -> "" };
+            let hasDot = match strIndexOfByte(firstSeg, 46, 0) { Some(_) -> true, None -> false };
+            let canon = if (hasDot) stripGitSuffix(s) else "github.com/" + stripGitSuffix(s);
+            Ok((canon, "https://" + canon + ".git"))
+        } else {
+            resolveBareNameFromIndex(s)
+        }
+    }
+}
+
+def defaultIndexUrl(): String = match getEnv("GEISHA_INDEX") {
+    Some(u) if (strLen(u) > 0) -> u,
+    _ -> "https://github.com/geisha-lang/packages.git",
+}
+
+def resolveBareNameFromIndex(pkgName: String): Result (String, String) String = {
+    let idxUrl = defaultIndexUrl();
+    let idxHash = strSlice(sha256Hex(idxUrl), 0, 12);
+    let idxDir = pathJoin(pathJoin(geishaHomeDir(), "index"), "idx-" + idxHash);
+
+    let synced =
+        if (isDir(pathJoin(idxDir, ".git"))) {
+            match execCapture("git -C " + shellQuote(idxDir) + " pull --ff-only --quiet") {
+                Ok(_) -> true,
+                Err(_) -> true,
+            }
+        } else {
+            let _ = mkdirAll(pathDirname(idxDir));
+            match execCapture("git clone --depth=1 --quiet " + shellQuote(idxUrl) + " " + shellQuote(idxDir)) {
+                Ok(_) -> true,
+                Err(_) -> false,
+            }
+        };
+
+    let fromIndexOpt: Option (String, String) =
+        if (synced && strLen(pkgName) > 0) {
+            let firstCh = strSlice(pkgName, 0, 1);
+            let cand1 = pathJoin(idxDir, pathJoin("packages", pathJoin(firstCh, pkgName + ".toml")));
+            let cand2 = pathJoin(idxDir, pathJoin("packages", pkgName + ".toml"));
+            let idxFileOpt = if (fileExists(cand1)) Some(cand1) else if (fileExists(cand2)) Some(cand2) else None;
+            match idxFileOpt {
+                Some(fp) -> match readFile(fp) {
+                    Ok(raw) -> match tomlParse(raw) {
+                        Ok(VObj(fs)) -> match asStrOpt(lookupVal(fs, "git")) {
+                            Some(g) -> match normalizeGitSpec(g) { Ok(pair) -> Some(pair), Err(_) -> None },
+                            None -> match asStrOpt(lookupVal(fs, "url")) {
+                                Some(u) -> match normalizeGitSpec(u) { Ok(pair) -> Some(pair), Err(_) -> None },
+                                None -> None,
+                            },
+                        },
+                        _ -> None,
+                    },
+                    Err(_) -> None,
+                },
+                None -> None,
+            }
+        } else None;
+
+    match fromIndexOpt {
+        Some(pair) -> Ok(pair),
+        None -> {
+            // Fallback to official `github.com/geisha-lang/<pkgName>` if reachable!
+            let officialCanon = "github.com/geisha-lang/" + pkgName;
+            let officialClone = "https://" + officialCanon + ".git";
+            match execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote --heads " + shellQuote(officialClone)) {
+                Ok(_) -> Ok((officialCanon, officialClone)),
+                Err(_) -> Err(
+                    "Package '" + pkgName + "' not found in index (" + idxUrl
+                    + "); specify a Git URL such as 'github.com/<owner>/" + pkgName + "'"
+                ),
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Bare Git Object DB (`~/.geisha/git/db/`) & Content-Addressed Extraction
+// ============================================================================
+
+def ensureBareRepo(canonUrl: String, cloneUrl: String): Result String String = {
+    let slug = sanitizeSlug(canonUrl);
+    let h12 = strSlice(sha256Hex(canonUrl), 0, 12);
+    let dbDir = pathJoin(pathJoin(geishaHomeDir(), "git/db"), slug + "-" + h12 + ".git");
+    if (!isDir(dbDir)) {
+        mkdirAll(dbDir)?;
+        let _ = execCapture("git init --bare --quiet " + shellQuote(dbDir))?;
+        let _ = execCapture("git -C " + shellQuote(dbDir) + " remote add origin " + shellQuote(cloneUrl))?;
+        Ok(dbDir)
+    } else {
+        let _ = execCapture("git -C " + shellQuote(dbDir) + " remote set-url origin " + shellQuote(cloneUrl));
+        Ok(dbDir)
+    }
+}
+
+def bareHasCommit(dbDir: String, rev: String): Bool =
+    if (strLen(rev) < 7) false
+    else match execCapture("git -C " + shellQuote(dbDir) + " rev-parse --verify --quiet " + shellQuote(rev + "^{commit}")) {
+        Ok(_) -> true,
+        Err(_) -> false,
+    }
+
+def tryFetchSingleTag(dbDir: String, tagStr: String): Result String String = {
+    let _ = execCapture("GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(dbDir) + " fetch --filter=blob:none --depth=1 --force origin tag " + shellQuote(tagStr))?;
+    let out = execCapture("git -C " + shellQuote(dbDir) + " rev-parse FETCH_HEAD^{commit}")?;
+    Ok(strTrim(out))
+}
+
+def resolveTagRev(dbDir: String, ver: String): Result String String = {
+    let vTag = "v" + stripLeadingV(ver);
+    let rawTag = stripLeadingV(ver);
+    match tryFetchSingleTag(dbDir, vTag) {
+        Ok(sha) -> Ok(sha),
+        Err(_) -> match tryFetchSingleTag(dbDir, rawTag) {
+            Ok(sha2) -> Ok(sha2),
+            Err(e) -> Err("could not fetch version tag '" + vTag + "' (or '" + rawTag + "'): " + e),
+        },
+    }
+}
+
+def resolveExplicitRefRev(dbDir: String, refSpec: String): Result String String = {
+    if (strLen(refSpec) == 40 && bareHasCommit(dbDir, refSpec)) {
+        Ok(refSpec)
+    } else {
+        let _ = execCapture("GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(dbDir) + " fetch --filter=blob:none --depth=1 origin " + shellQuote(refSpec))?;
+        let out = execCapture("git -C " + shellQuote(dbDir) + " rev-parse FETCH_HEAD^{commit}")?;
+        Ok(strTrim(out))
+    }
+}
+
+def queryRemoteLatestTagOrHead(cloneUrl: String): Result (Option String, String) String = {
+    let tagsOut = execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs " + shellQuote(cloneUrl))?;
+    let lines = strSplitChar(tagsOut, '\n');
+    let bestVer: Cell (Option String) = cellNew(None);
+    let bestSha = cellNew("");
+    let cur = cellNew(lines);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(line, r) -> {
+                let trimmed = strTrim(line);
+                if (strLen(trimmed) > 0) {
+                    match strIndexOfByte(trimmed, 9, 0) {
+                        Some(tabIdx) -> {
+                            let sha = strSlice(trimmed, 0, tabIdx);
+                            let refName = strSlice(trimmed, tabIdx + 1, strLen(trimmed));
+                            if (strStartsWith(refName, "refs/tags/")) {
+                                let tname = strSlice(refName, 10, strLen(refName));
+                                let cleanVer = stripLeadingV(tname);
+                                match parseSemVerTuple(cleanVer) {
+                                    Some(_) -> {
+                                        let isBetter = match cellGet(bestVer) {
+                                            None -> true,
+                                            Some(prev) -> cmpSemVer(cleanVer, prev) > 0,
+                                        };
+                                        if (isBetter) {
+                                            cellSet(bestVer, Some(cleanVer));
+                                            cellSet(bestSha, sha)
+                                        } else ()
+                                    },
+                                    None -> (),
+                                }
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(bestVer) {
+        Some(v) -> Ok((Some(v), cellGet(bestSha))),
+        None -> {
+            let headOut = execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote " + shellQuote(cloneUrl) + " HEAD")?;
+            let firstLine = match strSplitChar(headOut, '\n') { Cons(h, _) -> strTrim(h), Nil -> "" };
+            match strIndexOfByte(firstLine, 9, 0) {
+                Some(idx) -> Ok((None, strSlice(firstLine, 0, idx))),
+                None -> Err("remote repository has no commits at HEAD: " + cloneUrl),
+            }
+        },
+    }
+}
+
+def readManifestFromBare(dbDir: String, rev: String, subdir: String, fallbackName: String): Result Manifest String = {
+    let relPath = if (strLen(subdir) > 0) subdir + "/geisha.toml" else "geisha.toml";
+    match execCapture("git -C " + shellQuote(dbDir) + " show " + shellQuote(rev + ":" + relPath)) {
+        Ok(rawToml) -> parseManifestToml(rawToml, fallbackName),
+        Err(_) -> Ok(emptyManifest(fallbackName)),
+    }
+}
+
+def findLockEntry(
+    locks: List LockEntry,
+    url: String,
+    subdir: String,
+    minVerOpt: Option String,
+    exactRevOpt: Option String
+): Option LockEntry = match locks {
+    Nil -> None,
+    Cons(le, rest) ->
+        if (le.leUrl == url && le.leSubdir == subdir) {
+            let okMatch = match exactRevOpt {
+                Some(rv) -> le.leRev == rv || strStartsWith(le.leRev, rv),
+                None -> match minVerOpt {
+                    Some(mv) ->
+                        majorCompatLine(le.leVersion) == majorCompatLine(mv)
+                        && cmpSemVer(le.leVersion, mv) >= 0,
+                    None -> true,
+                },
+            };
+            if (okMatch) Some(le) else findLockEntry(rest, url, subdir, minVerOpt, exactRevOpt)
+        } else findLockEntry(rest, url, subdir, minVerOpt, exactRevOpt),
+}
+
+def cacheDirNameFor(name: String, ver: String, rev: String, sha256Str: String): String = {
+    let verTag = if (ver != "" && ver != "0.0.0") ver else strSlice(rev, 0, 8);
+    sanitizeSlug(name) + "-" + sanitizeSlug(verTag) + "-" + strSlice(sha256Str, 0, 12)
+}
+
+def materializeCachedTree(
+    name: String,
+    canonUrl: String,
+    cloneUrl: String,
+    subdir: String,
+    ver: String,
+    rev: String,
+    expectedShaOpt: Option String
+): Result (String, String) String = {
+    let cacheBase = pathJoin(geishaHomeDir(), "cache/p");
+    mkdirAll(cacheBase)?;
+
+    // Fast offline hit if `expectedShaOpt` is known and directory exists on disk!
+    let fastHit: Option (Result (String, String) String) = match expectedShaOpt {
+        Some(expSha) if (strLen(expSha) >= 12) -> {
+            let targetDir = pathJoin(cacheBase, cacheDirNameFor(name, ver, rev, expSha));
+            let okMarker = pathJoin(targetDir, ".geisha-ok");
+            if (isDir(targetDir) && fileExists(okMarker)) {
+                Some(match sha256Dir(targetDir) {
+                    Err(e) -> Err(e),
+                    Ok(actualSha) ->
+                        if (actualSha == expSha) Ok((targetDir, actualSha))
+                        else Err(
+                            "Package cache integrity check failed for '" + name + "' (" + canonUrl + "):\n"
+                            + "  expected sha256: " + expSha + "\n"
+                            + "  actual sha256:   " + actualSha
+                        ),
+                })
+            } else None
+        },
+        _ -> None,
+    };
+
+    match fastHit {
+        Some(res) -> res,
+        None -> {
+            let dbDir = ensureBareRepo(canonUrl, cloneUrl)?;
+            if (!bareHasCommit(dbDir, rev)) {
+                let _ = resolveExplicitRefRev(dbDir, rev)?;
+                ()
+            } else ();
+
+            let seq = cellGet(cmdSeqCounter) + 1;
+            cellSet(cmdSeqCounter, seq);
+            let stageDir = pathJoin(pathJoin(geishaHomeDir(), "tmp"), "stage_" + intToStr(c_getpid()) + "_" + intToStr(seq));
+            let _ = shell("rm -rf " + shellQuote(stageDir));
+            mkdirAll(stageDir)?;
+
+            let treeSpec = if (strLen(subdir) > 0) rev + ":" + subdir else rev;
+            let archiveCmd =
+                "git -C " + shellQuote(dbDir) + " archive --format=tar " + shellQuote(treeSpec)
+                + " | tar -x -C " + shellQuote(stageDir);
+            match execCapture(archiveCmd) {
+                Err(e) -> {
+                    let _ = shell("rm -rf " + shellQuote(stageDir));
+                    Err("failed to extract '" + canonUrl + "' at " + treeSpec + ": " + e)
+                },
+                Ok(_) -> {
+                    let actualSha = match sha256Dir(stageDir) {
+                        Ok(s) -> s,
+                        Err(he) -> {
+                            let _ = shell("rm -rf " + shellQuote(stageDir));
+                            returnMatErr(he)?
+                        },
+                    };
+                    match expectedShaOpt {
+                        Some(expSha) if (strLen(expSha) > 0 && expSha != actualSha) -> {
+                            let _ = shell("rm -rf " + shellQuote(stageDir));
+                            Err(
+                                "Lockfile sha256 mismatch for '" + name + "' (" + canonUrl + " @ " + rev + "):\n"
+                                + "  geisha.lock sha256: " + expSha + "\n"
+                                + "  downloaded sha256:  " + actualSha
+                            )
+                        },
+                        _ -> {
+                            let finalDir = pathJoin(cacheBase, cacheDirNameFor(name, ver, rev, actualSha));
+                            if (isDir(finalDir) && fileExists(pathJoin(finalDir, ".geisha-ok"))) {
+                                let _ = shell("rm -rf " + shellQuote(stageDir));
+                                Ok((finalDir, actualSha))
+                            } else {
+                                let _ = shell("rm -rf " + shellQuote(finalDir));
+                                let mvRc = shell("mv " + shellQuote(stageDir) + " " + shellQuote(finalDir));
+                                if (mvRc != 0) {
+                                    let _ = shell("rm -rf " + shellQuote(stageDir));
+                                    Err("failed to move extracted package into cache: " + finalDir)
+                                } else {
+                                    writeFile(pathJoin(finalDir, ".geisha-ok"), actualSha + "\n")?;
+                                    Ok((finalDir, actualSha))
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+    }
+}
+
+def returnMatErr(msg: String): Result String String = Err(msg)
+
+// ============================================================================
+// Dependency Graph Resolution (MVS + Local Overrides + Lockfile Sync)
+// ============================================================================
+
+data MvsNode {
+    MkMvsNode {
+        mnKey: String,
+        mnName: String,
+        mnCanonUrl: String,
+        mnCloneUrl: String,
+        mnSubdir: String,
+        mnVersion: String,
+        mnRev: String,
+        mnExpectedSha: Option String,
+        mnLocalDir: Option String,
+        mnManifest: Manifest,
+    },
+}
+
+def findOverride(overrides: List DepDecl, alias: String, canonUrl: String): Option DepDecl = match overrides {
+    Nil -> None,
+    Cons(ov, r) ->
+        if (ov.depAlias == alias || (canonUrl != "" && ov.depAlias == canonUrl)) Some(ov)
+        else findOverride(r, alias, canonUrl),
+}
+
+def detectPkgSrcDirs(pkgRoot: String, mf: Manifest, fallbackAlias: String): List String = {
+    let explicitSrc = pathJoin(pkgRoot, mf.mfSrcDir);
+    let dirs = cellNew(Nil);
+    if (isDir(explicitSrc)) {
+        cellSet(dirs, addUniqueStr(cellGet(dirs), explicitSrc))
+    } else ();
+    let libNamed = pathJoin(pathJoin(pkgRoot, "lib"), if (mf.mfName != "") mf.mfName else fallbackAlias);
+    if (isDir(libNamed)) {
+        cellSet(dirs, addUniqueStr(cellGet(dirs), libNamed))
+    } else ();
+    let libDir = pathJoin(pkgRoot, "lib");
+    if (isDir(libDir)) {
+        cellSet(dirs, addUniqueStr(cellGet(dirs), libDir))
+    } else ();
+    match cellGet(dirs) {
+        Nil -> [pkgRoot],
+        ds -> ds,
+    }
+}
+
+def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List DepDecl, List LockEntry) String = {
+    let mfPath = pathJoin(projectDir, "geisha.toml");
+    let rawMf = readFile(mfPath)?;
+    let mf = parseManifestToml(rawMf, pathBasename(absPath(projectDir)))?;
+
+    let localMfPath = pathJoin(projectDir, "geisha.local.toml");
+    let localOverrides =
+        if (fileExists(localMfPath)) {
+            let rawLocal = readFile(localMfPath)?;
+            let lmf = parseManifestToml(rawLocal, mf.mfName)?;
+            lmf.mfOverrides
+        } else Nil;
+
+    let allOverrides = listAppend(localOverrides, mf.mfOverrides);
+
+    let lockPath = pathJoin(projectDir, "geisha.lock");
+    let locks =
+        if (fileExists(lockPath)) {
+            let rawLock = readFile(lockPath)?;
+            parseLockfileToml(rawLock)?
+        } else Nil;
+
+    Ok((mf, allOverrides, locks))
+}
+
+def resolveDepCoordinate(
+    ownerDir: String,
+    dep: DepDecl,
+    overrides: List DepDecl
+): Result (String, String, String, String, Option String, Option String, Option String) String = {
+    // Returns `(nodeBucketKey, canonUrl, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)`
+    let prelimCanon = match dep.depGit {
+        Some(g) -> match normalizeGitSpec(g) {
+            Ok((cu, _)) -> cu,
+            Err(_) -> "",
+        },
+        None -> "",
+    };
+    let effDep = match findOverride(overrides, dep.depAlias, prelimCanon) {
+        Some(ov) -> MkDepDecl {
+            depAlias: dep.depAlias,
+            depGit: match ov.depGit { Some(_) -> ov.depGit, None -> dep.depGit },
+            depVersion: match ov.depVersion { Some(_) -> ov.depVersion, None -> dep.depVersion },
+            depRev: match ov.depRev { Some(_) -> ov.depRev, None -> dep.depRev },
+            depPath: match ov.depPath { Some(_) -> ov.depPath, None -> dep.depPath },
+            depSubdir: match ov.depSubdir { Some(_) -> ov.depSubdir, None -> dep.depSubdir },
+        },
+        None -> dep,
+    };
+
+    match effDep.depPath {
+        Some(relOrAbs) -> {
+            let fullP = absPath(if (isAbsPath(relOrAbs)) relOrAbs else pathJoin(ownerDir, relOrAbs));
+            if (!isDir(fullP)) {
+                Err("local path dependency '" + dep.depAlias + "' not found at '" + fullP + "'")
+            } else {
+                let key = "local:" + fullP;
+                Ok((key, key, "", "", effDep.depVersion, None, Some(fullP)))
+            }
+        },
+        None -> {
+            let rawSpec = match effDep.depGit {
+                Some(g) -> g,
+                None -> dep.depAlias,
+            };
+            let (canonUrl, cloneUrl) = normalizeGitSpec(rawSpec)?;
+            let sub = match effDep.depSubdir { Some(s) -> s, None -> "" };
+            let bucket = match effDep.depVersion {
+                Some(v) -> majorCompatLine(v),
+                None -> "rev",
+            };
+            let nodeKey = canonUrl + (if (sub != "") "#" + sub else "") + "@" + bucket;
+            Ok((nodeKey, canonUrl, cloneUrl, sub, effDep.depVersion, effDep.depRev, None))
+        },
+    }
+}
+
+def resolveRemoteMvsCandidate(
+    lockMatch: Option LockEntry,
+    canonUrl: String,
+    cloneUrl: String,
+    subdir: String,
+    minVerOpt: Option String,
+    revOpt: Option String
+): Result (String, String, Option String, Manifest) String = match lockMatch {
+    Some(le) -> {
+        let fastCacheDir = pathJoin(
+            pathJoin(geishaHomeDir(), "cache/p"),
+            cacheDirNameFor(le.leName, le.leVersion, le.leRev, le.leSha256)
+        );
+        if (isDir(fastCacheDir) && fileExists(pathJoin(fastCacheDir, ".geisha-ok"))) {
+            let cmfPath = pathJoin(fastCacheDir, "geisha.toml");
+            let cmf =
+                if (fileExists(cmfPath)) {
+                    let raw = readFile(cmfPath)?;
+                    parseManifestToml(raw, le.leName)?
+                } else emptyManifest(le.leName);
+            Ok((le.leVersion, le.leRev, Some(le.leSha256), cmf))
+        } else {
+            let dbDir = ensureBareRepo(canonUrl, cloneUrl)?;
+            if (!bareHasCommit(dbDir, le.leRev)) {
+                let _ = resolveExplicitRefRev(dbDir, le.leRev)?;
+                ()
+            } else ();
+            let dmf = readManifestFromBare(dbDir, le.leRev, subdir, le.leName)?;
+            Ok((le.leVersion, le.leRev, Some(le.leSha256), dmf))
+        }
+    },
+    None -> {
+        let dbDir = ensureBareRepo(canonUrl, cloneUrl)?;
+        let (chosenVer, chosenRev) = match revOpt {
+            Some(explicitRev) -> {
+                let sha = resolveExplicitRefRev(dbDir, explicitRev)?;
+                let v = match minVerOpt { Some(mv) -> mv, None -> "0.0.0" };
+                (v, sha)
+            },
+            None -> match minVerOpt {
+                Some(mv) -> {
+                    let sha = resolveTagRev(dbDir, mv)?;
+                    (mv, sha)
+                },
+                None -> {
+                    let (vOpt, headSha) = queryRemoteLatestTagOrHead(cloneUrl)?;
+                    let _ = resolveExplicitRefRev(dbDir, headSha)?;
+                    let v = match vOpt { Some(sv) -> sv, None -> "0.0.0" };
+                    (v, headSha)
+                },
+            },
+        };
+        let dmf = readManifestFromBare(dbDir, chosenRev, subdir, sanitizeIdentAlias(canonUrl))?;
+        let finalVer = if (chosenVer == "0.0.0" && dmf.mfVersion != "") dmf.mfVersion else chosenVer;
+        Ok((finalVer, chosenRev, None, dmf))
+    },
+}
+
+def checkOptErr(errOpt: Option String): Result Void String = match errOpt {
+    Some(e) -> Err(e),
+    None -> Ok(()),
+}
+
+def ensureParentDirExists(outPath: String): Result Void String = {
+    let outParent = pathDirname(outPath);
+    if (outParent != "." && outParent != "/" && !isDir(outParent)) mkdirAll(outParent)
+    else Ok(())
+}
+
+def syncLockFileIfNeeded(
+    writeLockFile: Bool,
+    localOverrideFileExists: Bool,
+    lockPath: String,
+    newLocks: List LockEntry
+): Result Void String =
+    if (!writeLockFile || localOverrideFileExists) Ok(())
+    else match newLocks {
+        Nil -> Ok(()),
+        _ -> {
+            let lockText = formatLockfileToml(newLocks);
+            let shouldWrite = match readFile(lockPath) {
+                Ok(existingText) -> existingText != lockText,
+                Err(_) -> true,
+            };
+            if (shouldWrite) writeFile(lockPath, lockText) else Ok(())
+        },
+    }
+
+pub def resolveProjectGraph(
+    projectDir: String,
+    refreshRemote: Bool,
+    onlyUpdateAlias: Option String,
+    writeLockFile: Bool
+): Result (Manifest, PkgSpec, List ResolvedPkg) String = {
+    let (rootMf, overrides, existingLocks) = loadProjectManifestAndOverrides(projectDir)?;
+
+    let nodesMap: StrMap MvsNode = strMapNew();
+    let nodeOrder: Cell (List String) = cellNew(Nil);
+    // Queue of `(ownerDir, ownerNodeKeyOrEmpty, DepDecl)`
+    let queue: Cell (List (String, String, DepDecl)) = cellNew(Nil);
+    // Direct `(ownerNodeKey, alias -> targetNodeKey)` bindings
+    let edgeBindings: StrMap (List (String, String)) = strMapNew();
+
+    let pushRootDeps = cellNew(rootMf.mfDeps);
+    while (match cellGet(pushRootDeps) { Nil -> false, _ -> true }) {
+        match cellGet(pushRootDeps) {
+            Cons(d, r) -> {
+                cellSet(queue, listAppend(cellGet(queue), [(projectDir, "", d)]));
+                cellSet(pushRootDeps, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    while (match cellGet(queue) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(queue) {
+            Cons((ownerDir, ownerKey, dep), restQ) -> {
+                cellSet(queue, restQ);
+                match resolveDepCoordinate(ownerDir, dep, overrides) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok((nodeKey, canonUrl, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)) -> {
+                        // Record `ownerKey : dep.depAlias -> nodeKey`
+                        let prevEdges = match strMapGet(edgeBindings, ownerKey) { Some(es) -> es, None -> Nil };
+                        let filteredEdges = {
+                            let c = cellNew(prevEdges);
+                            let acc = cellNew(Nil);
+                            while (match cellGet(c) { Nil -> false, _ -> true }) {
+                                match cellGet(c) {
+                                    Cons((al, tk), re) -> {
+                                        if (al != dep.depAlias) cellSet(acc, listAppend(cellGet(acc), [(al, tk)])) else ();
+                                        cellSet(c, re)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            listAppend(cellGet(acc), [(dep.depAlias, nodeKey)])
+                        };
+                        strMapInsert(edgeBindings, ownerKey, filteredEdges);
+
+                        // Determine if we need to fetch/upgrade `nodeKey` under MVS
+                        let needResolve = match strMapGet(nodesMap, nodeKey) {
+                            None -> true,
+                            Some(existing) -> match (minVerOpt, localDirOpt) {
+                                (Some(reqVer), None) -> cmpSemVer(reqVer, existing.mnVersion) > 0,
+                                _ -> false,
+                            },
+                        };
+
+                        if (needResolve) {
+                            match localDirOpt {
+                                Some(localDir) -> {
+                                    let lmfPath = pathJoin(localDir, "geisha.toml");
+                                    let lmfRes =
+                                        if (fileExists(lmfPath)) {
+                                            match readFile(lmfPath) {
+                                                Ok(raw) -> parseManifestToml(raw, dep.depAlias),
+                                                Err(re) -> Err(re),
+                                            }
+                                        } else Ok(emptyManifest(dep.depAlias));
+                                    match lmfRes {
+                                        Err(me) -> cellSet(errOpt, Some(me)),
+                                        Ok(lmf) -> {
+                                            if (!strMapContains(nodesMap, nodeKey)) {
+                                                cellSet(nodeOrder, listAppend(cellGet(nodeOrder), [nodeKey]))
+                                            } else ();
+                                            strMapInsert(nodesMap, nodeKey, MkMvsNode {
+                                                mnKey: nodeKey,
+                                                mnName: if (lmf.mfName != "") lmf.mfName else dep.depAlias,
+                                                mnCanonUrl: canonUrl,
+                                                mnCloneUrl: "",
+                                                mnSubdir: "",
+                                                mnVersion: lmf.mfVersion,
+                                                mnRev: "local",
+                                                mnExpectedSha: None,
+                                                mnLocalDir: Some(localDir),
+                                                mnManifest: lmf,
+                                            });
+                                            let cd = cellNew(lmf.mfDeps);
+                                            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                                                match cellGet(cd) {
+                                                    Cons(subDep, rcd) -> {
+                                                        cellSet(queue, listAppend(cellGet(queue), [(localDir, nodeKey, subDep)]));
+                                                        cellSet(cd, rcd)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        },
+                                    }
+                                },
+                                None -> {
+                                    let skipLock =
+                                        refreshRemote && match onlyUpdateAlias {
+                                            None -> true,
+                                            Some(targetAl) -> targetAl == dep.depAlias,
+                                        };
+                                    let lockMatch =
+                                        if (skipLock) None
+                                        else findLockEntry(existingLocks, canonUrl, subdir, minVerOpt, revOpt);
+
+                                    let resolvedRevVerSha = resolveRemoteMvsCandidate(
+                                        lockMatch, canonUrl, cloneUrl, subdir, minVerOpt, revOpt
+                                    );
+
+                                    match resolvedRevVerSha {
+                                        Err(re) -> cellSet(errOpt, Some(re)),
+                                        Ok((rVer, rRev, expShaOpt, dmf)) -> {
+                                            if (!strMapContains(nodesMap, nodeKey)) {
+                                                cellSet(nodeOrder, listAppend(cellGet(nodeOrder), [nodeKey]))
+                                            } else ();
+                                            let pkgNm = if (dmf.mfName != "") dmf.mfName else sanitizeIdentAlias(canonUrl);
+                                            strMapInsert(nodesMap, nodeKey, MkMvsNode {
+                                                mnKey: nodeKey,
+                                                mnName: pkgNm,
+                                                mnCanonUrl: canonUrl,
+                                                mnCloneUrl: cloneUrl,
+                                                mnSubdir: subdir,
+                                                mnVersion: rVer,
+                                                mnRev: rRev,
+                                                mnExpectedSha: expShaOpt,
+                                                mnLocalDir: None,
+                                                mnManifest: dmf,
+                                            });
+                                            let cd = cellNew(dmf.mfDeps);
+                                            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                                                match cellGet(cd) {
+                                                    Cons(subDep, rcd) -> {
+                                                        cellSet(queue, listAppend(cellGet(queue), [(projectDir, nodeKey, subDep)]));
+                                                        cellSet(cd, rcd)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            }
+                                        },
+                                    }
+                                },
+                            }
+                        } else ()
+                    },
+                }
+            },
+            Nil -> (),
+        }
+    };
+
+    checkOptErr(cellGet(errOpt))?;
+
+    // Assign clean deterministic `pkgId`s (use `mnName` when unique, else `mnName + "_" + idx`)
+    let usedIds: StrMap Bool = strMapNew();
+    let nodeToPkgId: StrMap String = strMapNew();
+    let idSeq = cellNew(1);
+    let cn0 = cellNew(cellGet(nodeOrder));
+    while (match cellGet(cn0) { Nil -> false, _ -> true }) {
+        match cellGet(cn0) {
+            Cons(nk, r) -> {
+                match strMapGet(nodesMap, nk) {
+                    Some(mn) -> {
+                        let baseId = sanitizeIdentAlias(mn.mnName);
+                        let pid =
+                            if (!strMapContains(usedIds, baseId) && baseId != "" && baseId != "std" && baseId != "sys") baseId
+                            else {
+                                let n = cellGet(idSeq) + 1;
+                                cellSet(idSeq, n);
+                                baseId + "_" + intToStr(n)
+                            };
+                        strMapInsert(usedIds, pid, true);
+                        strMapInsert(nodeToPkgId, nk, pid)
+                    },
+                    None -> (),
+                };
+                cellSet(cn0, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let translateEdges = (rawEdges: List (String, String)) -> {
+        let out = cellNew(Nil);
+        let ce = cellNew(rawEdges);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) {
+                Cons((alias, targetNk), re) -> {
+                    match strMapGet(nodeToPkgId, targetNk) {
+                        Some(tPid) -> cellSet(out, listAppend(cellGet(out), [(alias, tPid)])),
+                        None -> (),
+                    };
+                    cellSet(ce, re)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(out)
+    };
+
+    // Materialize every remote node into `~/.geisha/cache/p/...` and assemble `List ResolvedPkg` + `List LockEntry`
+    let resolvedRev: Cell (List ResolvedPkg) = cellNew(Nil);
+    let newLocksRev: Cell (List LockEntry) = cellNew(Nil);
+    let hasLocalOverride = cellNew(false);
+    let cn1 = cellNew(cellGet(nodeOrder));
+
+    while (match cellGet(cn1) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cn1) {
+            Cons(nk, r) -> {
+                match strMapGet(nodesMap, nk) {
+                    Some(mn) -> {
+                        let pid = match strMapGet(nodeToPkgId, nk) { Some(p) -> p, None -> mn.mnName };
+                        let pkgDeps = match strMapGet(edgeBindings, nk) {
+                            Some(es) -> translateEdges(es),
+                            None -> Nil,
+                        };
+                        match mn.mnLocalDir {
+                            Some(ldir) -> {
+                                cellSet(hasLocalOverride, true);
+                                let sdirs = detectPkgSrcDirs(ldir, mn.mnManifest, mn.mnName);
+                                cellSet(resolvedRev, Cons(MkResolvedPkg {
+                                    rpId: pid,
+                                    rpName: mn.mnName,
+                                    rpUrl: mn.mnCanonUrl,
+                                    rpSubdir: "",
+                                    rpVersion: mn.mnVersion,
+                                    rpRev: "local",
+                                    rpSha256: "",
+                                    rpRootDir: ldir,
+                                    rpSrcDirs: sdirs,
+                                    rpDeps: pkgDeps,
+                                    rpManifest: mn.mnManifest,
+                                    rpIsLocal: true,
+                                }, cellGet(resolvedRev)))
+                            },
+                            None -> {
+                                match materializeCachedTree(
+                                    mn.mnName,
+                                    mn.mnCanonUrl,
+                                    mn.mnCloneUrl,
+                                    mn.mnSubdir,
+                                    mn.mnVersion,
+                                    mn.mnRev,
+                                    mn.mnExpectedSha
+                                ) {
+                                    Err(me) -> cellSet(errOpt, Some(me)),
+                                    Ok((cacheDir, actualSha)) -> {
+                                        let sdirs = detectPkgSrcDirs(cacheDir, mn.mnManifest, mn.mnName);
+                                        cellSet(resolvedRev, Cons(MkResolvedPkg {
+                                            rpId: pid,
+                                            rpName: mn.mnName,
+                                            rpUrl: mn.mnCanonUrl,
+                                            rpSubdir: mn.mnSubdir,
+                                            rpVersion: mn.mnVersion,
+                                            rpRev: mn.mnRev,
+                                            rpSha256: actualSha,
+                                            rpRootDir: cacheDir,
+                                            rpSrcDirs: sdirs,
+                                            rpDeps: pkgDeps,
+                                            rpManifest: mn.mnManifest,
+                                            rpIsLocal: false,
+                                        }, cellGet(resolvedRev)));
+                                        cellSet(newLocksRev, Cons(MkLockEntry {
+                                            leName: mn.mnName,
+                                            leUrl: mn.mnCanonUrl,
+                                            leSubdir: mn.mnSubdir,
+                                            leVersion: mn.mnVersion,
+                                            leRev: mn.mnRev,
+                                            leSha256: actualSha,
+                                        }, cellGet(newLocksRev)))
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(cn1, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    checkOptErr(cellGet(errOpt))?;
+
+    let newLocks = listRev(cellGet(newLocksRev));
+    let lockPath = pathJoin(projectDir, "geisha.lock");
+    let localOverrideFileExists = fileExists(pathJoin(projectDir, "geisha.local.toml"));
+    syncLockFileIfNeeded(writeLockFile, localOverrideFileExists, lockPath, newLocks)?;
+
+    let rootEdges = match strMapGet(edgeBindings, "") {
+        Some(es) -> translateEdges(es),
+        None -> Nil,
+    };
+    let rootSrcDirs = detectPkgSrcDirs(projectDir, rootMf, rootMf.mfName);
+    let rootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: rootMf.mfName,
+        srcRoots: rootSrcDirs,
+        deps: rootEdges,
+    };
+
+    Ok((rootMf, rootSpec, listRev(cellGet(resolvedRev))))
+}
+
+def returnGraphErr(msg: String): Result (Manifest, PkgSpec, List ResolvedPkg) String = Err(msg)
+
+// ============================================================================
+// Aggregating Transitive Target Configurations & Finding Project Root
+// ============================================================================
+
+pub def findProjectRoot(startDir: String): Option String = {
+    let cur = cellNew(absPath(startDir));
+    let found: Cell (Option String) = cellNew(None);
+    let searching = cellNew(true);
+    while (cellGet(searching)) {
+        let d = cellGet(cur);
+        if (fileExists(pathJoin(d, "geisha.toml"))) {
+            cellSet(found, Some(d));
+            cellSet(searching, false)
+        } else {
+            let parent = pathDirname(d);
+            if (parent == d || parent == "") {
+                cellSet(searching, false)
+            } else {
+                cellSet(cur, parent)
+            }
+        }
+    };
+    cellGet(found)
+}
+
+def resolveRelList(baseDir: String, rels: List String): List String = {
+    let out = cellNew(Nil);
+    let cur = cellNew(rels);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(r, rest) -> {
+                let full = if (isAbsPath(r)) r else pathJoin(baseDir, r);
+                cellSet(out, addUniqueStr(cellGet(out), full));
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(out)
+}
+
+def appendUniqueList(base: List String, extra: List String): List String = {
+    let acc = cellNew(base);
+    let cur = cellNew(extra);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, r) -> {
+                cellSet(acc, addUniqueStr(cellGet(acc), h));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(acc)
+}
+
+def mergeTargetConfigs(
+    projectDir: String,
+    rootMf: Manifest,
+    resolvedPkgs: List ResolvedPkg,
+    isWasm: Bool,
+    cliExports: List String,
+    cliNoMain: Bool,
+    cliBootSym: Option String
+): TargetCfg = {
+    let cSrcs = cellNew(Nil);
+    let cFlgs = cellNew(Nil);
+    let lFlgs = cellNew(Nil);
+    let exps = cellNew(Nil);
+    let webAs = cellNew(Nil);
+    let ownsM = cellNew(cliNoMain);
+    let bootS: Cell (Option String) = cellNew(cliBootSym);
+
+    let applyOne = (baseDir: String, tc: TargetCfg) -> {
+        cellSet(cSrcs, appendUniqueList(cellGet(cSrcs), resolveRelList(baseDir, tc.tcCSources)));
+        cellSet(cFlgs, appendUniqueList(cellGet(cFlgs), tc.tcCFlags));
+        // Preserve link flag order (e.g. `-framework Cocoa -framework QuartzCore` repeats `-framework`!)
+        cellSet(lFlgs, listAppend(cellGet(lFlgs), tc.tcLinkFlags));
+        cellSet(exps, appendUniqueList(cellGet(exps), tc.tcExports));
+        cellSet(webAs, appendUniqueList(cellGet(webAs), resolveRelList(baseDir, tc.tcWebAssets)));
+        if (tc.tcOwnsMain) cellSet(ownsM, true) else ();
+        match (cellGet(bootS), tc.tcBootSymbol) {
+            (None, Some(bs)) -> cellSet(bootS, Some(bs)),
+            _ -> (),
+        }
+    };
+
+    let cur = cellNew(resolvedPkgs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(rp, r) -> {
+                let tc = if (isWasm) rp.rpManifest.mfWasm else rp.rpManifest.mfNative;
+                applyOne(rp.rpRootDir, tc);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let rootTc = if (isWasm) rootMf.mfWasm else rootMf.mfNative;
+    applyOne(projectDir, rootTc);
+    cellSet(exps, appendUniqueList(cellGet(exps), cliExports));
+
+    MkTargetCfg {
+        tcCSources: cellGet(cSrcs),
+        tcCFlags: cellGet(cFlgs),
+        tcLinkFlags: cellGet(lFlgs),
+        tcExports: cellGet(exps),
+        tcWebAssets: cellGet(webAs),
+        tcOwnsMain: cellGet(ownsM),
+        tcBootSymbol: cellGet(bootS),
+    }
+}
+
+def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
+    let out = cellNew(Nil);
+    let cur = cellNew(resolved);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(rp, r) -> {
+                cellSet(out, listAppend(cellGet(out), [MkPkgSpec {
+                    pkgId: rp.rpId,
+                    pkgName: rp.rpName,
+                    srcRoots: rp.rpSrcDirs,
+                    deps: rp.rpDeps,
+                }]));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(out)
+}
+
+def resolveDefaultEntryFile(projectDir: String, mf: Manifest): Result String String =
+    match mf.mfEntry {
+        Some(rel) -> {
+            let p = if (isAbsPath(rel)) rel else pathJoin(projectDir, rel);
+            if (fileExists(p)) Ok(p)
+            else Err("entry file '" + rel + "' specified in geisha.toml does not exist")
+        },
+        None -> {
+            let srcDir = pathJoin(projectDir, mf.mfSrcDir);
+            let candMain = pathJoin(srcDir, "main.gsa");
+            let candNamed = pathJoin(srcDir, mf.mfName + ".gsa");
+            let candApp = pathJoin(srcDir, "app.gsa");
+            let candMod = pathJoin(srcDir, "mod.gsa");
+            if (fileExists(candMain)) Ok(candMain)
+            else if (fileExists(candNamed)) Ok(candNamed)
+            else if (fileExists(candApp)) Ok(candApp)
+            else if (fileExists(candMod)) Ok(candMod)
+            else Err("no entry file found under '" + mf.mfSrcDir + "/' (expected 'src/main.gsa' or set 'entry = \"...\"' in geisha.toml)")
+        },
+    }
+
+// ============================================================================
+// Subcommand Implementations (`init`, `add`, `remove`, `fetch`, `update`, `build`, `run`, `test`)
+// ============================================================================
+
+def writeFileIfMissing(path: String, content: String): Result Void String =
+    if (!fileExists(path)) writeFile(path, content) else Ok(())
+
+def mkdirIfMissing(raw: String): Result Void String =
+    if (!isDir(raw) && !fileExists(raw)) mkdirAll(raw) else Ok(())
+
+def scaffoldProjectFiles(projDir: String, srcDir: String, pkgName: String, isLib: Bool): Result Void String =
+    if (isLib) {
+        let libEntry = pathJoin(srcDir, pkgName + ".gsa");
+        writeFileIfMissing(libEntry, "// " + pkgName + " library root module\n\npub def hello(name: String): String =\n    \"Hello, \" + name + \"!\"\n")?;
+        let testsDir = pathJoin(projDir, "tests");
+        mkdirAll(testsDir)?;
+        let specPath = pathJoin(testsDir, "spec.gsa");
+        writeFileIfMissing(specPath, "use " + pkgName + ".hello\n\ndef main(): Void = {\n    if (hello(\"Geisha\") == \"Hello, Geisha!\") {\n        printLn(\"ok\")\n    } else {\n        sys.io.eprintLn(\"test failed\");\n        sys.proc.exit(1)\n    }\n}\n")
+    } else {
+        let mainEntry = pathJoin(srcDir, "main.gsa");
+        writeFileIfMissing(mainEntry, "def main(): Void =\n    printLn(\"Hello from " + pkgName + "!\")\n")
+    }
+
+pub def cmdInit(args: List String): Result Void String = {
+    let isLib = cellNew(false);
+    let targetArg: Cell (Option String) = cellNew(None);
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--lib") cellSet(isLib, true)
+                else if (!strStartsWith(a, "-")) cellSet(targetArg, Some(a))
+                else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let (projDir, pkgName) = match cellGet(targetArg) {
+        None -> (".", sanitizeIdentAlias(pathBasename(absPath(".")))),
+        Some(raw) -> {
+            mkdirIfMissing(raw)?;
+            (raw, sanitizeIdentAlias(pathBasename(absPath(raw))))
+        },
+    };
+
+    let mfPath = pathJoin(projDir, "geisha.toml");
+    if (fileExists(mfPath)) {
+        Err("geisha.toml already exists in '" + projDir + "'")
+    } else {
+        let srcDir = pathJoin(projDir, "src");
+        mkdirAll(srcDir)?;
+        let mfContent =
+            "name = \"" + pkgName + "\"\n"
+            + "version = \"0.1.0\"\n\n"
+            + "[deps]\n";
+        writeFile(mfPath, mfContent)?;
+        writeFileIfMissing(pathJoin(projDir, ".gitignore"), "build/\ngeisha.local.toml\n")?;
+        scaffoldProjectFiles(projDir, srcDir, pkgName, cellGet(isLib))?;
+        printLn("Initialized Geisha " + (if (cellGet(isLib)) "library" else "package") + " '" + pkgName + "' in " + mfPath);
+        Ok(())
+    }
+}
+
+pub def cmdAdd(args: List String): Result Void String = {
+    let projDir = match findProjectRoot(".") {
+        Some(d) -> d,
+        None -> returnMatErr("no geisha.toml found in current or parent directories (run 'geisha init' first)")?,
+    };
+
+    let specOpt: Cell (Option String) = cellNew(None);
+    let verOpt: Cell (Option String) = cellNew(None);
+    let revOpt: Cell (Option String) = cellNew(None);
+    let pathOpt: Cell (Option String) = cellNew(None);
+    let subdirOpt: Cell (Option String) = cellNew(None);
+    let aliasOpt: Cell (Option String) = cellNew(None);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--version" || a == "-v") {
+                    match r {
+                        Cons(v, r2) -> { cellSet(verOpt, Some(stripLeadingV(v))); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing value after '" + a + "'")),
+                    }
+                } else if (a == "--rev" || a == "--tag") {
+                    match r {
+                        Cons(rv, r2) -> { cellSet(revOpt, Some(rv)); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing value after '" + a + "'")),
+                    }
+                } else if (a == "--path") {
+                    match r {
+                        Cons(p, r2) -> { cellSet(pathOpt, Some(p)); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing directory after '--path'")),
+                    }
+                } else if (a == "--subdir") {
+                    match r {
+                        Cons(sd, r2) -> { cellSet(subdirOpt, Some(sd)); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing value after '--subdir'")),
+                    }
+                } else if (a == "--as") {
+                    match r {
+                        Cons(al, r2) -> { cellSet(aliasOpt, Some(al)); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing alias after '--as'")),
+                    }
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha add': " + a))
+                } else {
+                    cellSet(specOpt, Some(a));
+                    cellSet(cur, r)
+                }
+            },
+            Nil -> (),
+        }
+    };
+
+    checkOptErr(cellGet(errOpt))?;
+
+    let (depKey, depValObj) = buildAddedDepPair(
+        cellGet(pathOpt),
+        cellGet(aliasOpt),
+        cellGet(specOpt),
+        cellGet(subdirOpt),
+        cellGet(verOpt),
+        cellGet(revOpt)
+    )?;
+
+    let mfPath = pathJoin(projDir, "geisha.toml");
+    let rawToml = readFile(mfPath)?;
+    let rootVal = tomlParse(rawToml)?;
+    let updatedRoot = upsertDepInManifestVal(rootVal, depKey, depValObj)?;
+    writeFile(mfPath, tomlStringify(updatedRoot))?;
+
+    let (_, _, resolved) = resolveProjectGraph(projDir, false, None, true)?;
+    printLn("Added '" + depKey + "' to geisha.toml (" + intToStr(listLen(resolved)) + " package(s) resolved)");
+    Ok(())
+}
+
+def buildAddedDepPair(
+    pathOpt: Option String,
+    aliasOpt: Option String,
+    specOpt: Option String,
+    subdirOpt: Option String,
+    verOpt: Option String,
+    revOpt: Option String
+): Result (String, Value) String = match pathOpt {
+    Some(localP) -> {
+        let alias = match aliasOpt {
+            Some(al) -> al,
+            None -> match specOpt {
+                Some(sp) -> sanitizeIdentAlias(sp),
+                None -> sanitizeIdentAlias(localP),
+            },
+        };
+        Ok((alias, VObj([("path", VStr(localP))])))
+    },
+    None -> {
+        let rawSpec = match specOpt {
+            Some(s) -> s,
+            None -> returnMatErr("Usage: geisha add <pkg-or-git-url> [--version <ver>] [--rev <rev>] [--path <dir>] [--as <alias>]")?,
+        };
+        let (baseSpec, hashSub) = splitHashSubdir(rawSpec);
+        let finalSub = match subdirOpt { Some(_) -> subdirOpt, None -> hashSub };
+        let (canonUrl, cloneUrl) = normalizeGitSpec(baseSpec)?;
+        let alias = match aliasOpt {
+            Some(al) -> al,
+            None -> match finalSub {
+                Some(sd) -> sanitizeIdentAlias(sd),
+                None -> sanitizeIdentAlias(canonUrl),
+            },
+        };
+
+        let (chosenVerOpt, chosenRevOpt) = match (verOpt, revOpt) {
+            (Some(v), rO) -> (Some(v), rO),
+            (None, Some(rv)) -> (None, Some(rv)),
+            (None, None) -> {
+                let (latestVerOpt, headOrTagSha) = queryRemoteLatestTagOrHead(cloneUrl)?;
+                match latestVerOpt {
+                    Some(lv) -> (Some(lv), None),
+                    None -> (None, Some(headOrTagSha)),
+                }
+            },
+        };
+
+        let fields = cellNew([("git", VStr(canonUrl))]);
+        match finalSub {
+            Some(sd) -> cellSet(fields, listAppend(cellGet(fields), [("subdir", VStr(sd))])),
+            None -> (),
+        };
+        match chosenVerOpt {
+            Some(v) -> cellSet(fields, listAppend(cellGet(fields), [("version", VStr(v))])),
+            None -> (),
+        };
+        match chosenRevOpt {
+            Some(rv) -> cellSet(fields, listAppend(cellGet(fields), [("rev", VStr(rv))])),
+            None -> (),
+        };
+        Ok((alias, VObj(cellGet(fields))))
+    },
+}
+
+def upsertDepInManifestVal(rootVal: Value, depKey: String, depVal: Value): Result Value String = match rootVal {
+    VObj(fs) -> {
+        let sawDeps = cellNew(false);
+        let outFs = cellNew(Nil);
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(("deps", VObj(dfs)), r) -> {
+                    cellSet(sawDeps, true);
+                    let updatedDfs = upsertFieldPair(dfs, depKey, depVal);
+                    cellSet(outFs, listAppend(cellGet(outFs), [("deps", VObj(updatedDfs))]));
+                    cellSet(cur, r)
+                },
+                Cons(pair, r) -> {
+                    cellSet(outFs, listAppend(cellGet(outFs), [pair]));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (!cellGet(sawDeps)) {
+            cellSet(outFs, listAppend(cellGet(outFs), [("deps", VObj([(depKey, depVal)]))]))
+        } else ();
+        Ok(VObj(cellGet(outFs)))
+    },
+    _ -> Err("invalid geisha.toml root"),
+}
+
+def upsertFieldPair(fs: List (String, Value), key: String, val: Value): List (String, Value) = {
+    let found = cellNew(false);
+    let out = cellNew(Nil);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), r) -> {
+                if (k == key) {
+                    cellSet(found, true);
+                    cellSet(out, listAppend(cellGet(out), [(key, val)]))
+                } else {
+                    cellSet(out, listAppend(cellGet(out), [(k, v)]))
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    if (!cellGet(found)) listAppend(cellGet(out), [(key, val)]) else cellGet(out)
+}
+
+pub def cmdRemove(args: List String): Result Void String = {
+    let projDir = match findProjectRoot(".") {
+        Some(d) -> d,
+        None -> returnMatErr("no geisha.toml found in current or parent directories")?,
+    };
+    let targetAlias = match args {
+        Cons(a, _) -> a,
+        Nil -> returnMatErr("Usage: geisha remove <dep-alias>")?,
+    };
+    let mfPath = pathJoin(projDir, "geisha.toml");
+    let rawToml = readFile(mfPath)?;
+    let rootVal = tomlParse(rawToml)?;
+    match rootVal {
+        VObj(fs) -> {
+            let outFs = cellNew(Nil);
+            let cur = cellNew(fs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(("deps", VObj(dfs)), r) -> {
+                        let kept = cellNew(Nil);
+                        let cd = cellNew(dfs);
+                        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                            match cellGet(cd) {
+                                Cons((k, v), rd) -> {
+                                    if (k != targetAlias) cellSet(kept, listAppend(cellGet(kept), [(k, v)])) else ();
+                                    cellSet(cd, rd)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellSet(outFs, listAppend(cellGet(outFs), [("deps", VObj(cellGet(kept)))]));
+                        cellSet(cur, r)
+                    },
+                    Cons(pair, r) -> {
+                        cellSet(outFs, listAppend(cellGet(outFs), [pair]));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            writeFile(mfPath, tomlStringify(VObj(cellGet(outFs))))?;
+            let _ = resolveProjectGraph(projDir, false, None, true)?;
+            printLn("Removed '" + targetAlias + "' from geisha.toml");
+            Ok(())
+        },
+        _ -> Err("invalid geisha.toml"),
+    }
+}
+
+pub def cmdFetch(refreshRemote: Bool, args: List String): Result Void String = {
+    let projDir = match findProjectRoot(".") {
+        Some(d) -> d,
+        None -> returnMatErr("no geisha.toml found in current or parent directories")?,
+    };
+    let targetAlias = match args {
+        Cons(a, _) if (!strStartsWith(a, "-")) -> Some(a),
+        _ -> None,
+    };
+    let (_, _, resolved) = resolveProjectGraph(projDir, refreshRemote, targetAlias, true)?;
+    printLn(
+        (if (refreshRemote) "Updated " else "Fetched ")
+        + intToStr(listLen(resolved))
+        + " package(s) into "
+        + pathJoin(geishaHomeDir(), "cache/p")
+    );
+    Ok(())
+}
+
+def copyWebAssetsRec(assets: List String, outParent: String): Result Void String = match assets {
+    Nil -> Ok(()),
+    Cons(assetSrc, rest) -> {
+        let dstAsset = pathJoin(outParent, pathBasename(assetSrc));
+        if (absPath(assetSrc) != absPath(dstAsset)) {
+            copyFileBytes(assetSrc, dstAsset)?
+        } else ();
+        copyWebAssetsRec(rest, outParent)
+    },
+}
+
+pub def cmdBuildProject(
+    projectDir: String,
+    target: String,
+    emitIr: Bool,
+    compileOnly: Bool,
+    outPathOpt: Option String,
+    dumpCoreOpt: Option String,
+    rtOverrideOpt: Option String,
+    cliExports: List String,
+    cliNoMain: Bool,
+    cliBootSym: Option String,
+    entryOverrideOpt: Option String,
+    cbs: CompileCallbacks
+): Result String String = {
+    let (rootMf, rootSpec, resolvedPkgs) = resolveProjectGraph(projectDir, false, None, true)?;
+    let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
+    let isWasm = target == "wasm32";
+    let mergedTc = mergeTargetConfigs(projectDir, rootMf, resolvedPkgs, isWasm, cliExports, cliNoMain, cliBootSym);
+    let entryFile = match entryOverrideOpt {
+        Some(ef) -> ef,
+        None -> resolveDefaultEntryFile(projectDir, rootMf)?,
+    };
+
+    let buildDir = pathJoin(projectDir, "build");
+    let needBuildDir = match outPathOpt { None -> !emitIr, Some(_) -> false };
+    let _ = if (needBuildDir) mkdirAll(buildDir)? else ();
+
+    if (emitIr) {
+        cbs.cbEmitIr(entryFile, rootSpec, extSpecs, mergedTc, isWasm, outPathOpt, dumpCoreOpt)?;
+        Ok(match outPathOpt { Some(p) -> p, None -> "<stdout>" })
+    } else if (isWasm) {
+        let defaultOut = pathJoin(buildDir, rootMf.mfName + (if (compileOnly) ".o" else ".wasm"));
+        let outWasm = match outPathOpt { Some(p) -> p, None -> defaultOut };
+        ensureParentDirExists(outWasm)?;
+        cbs.cbCompileWasm(entryFile, rootSpec, extSpecs, mergedTc, compileOnly, Some(outWasm), dumpCoreOpt, rtOverrideOpt)?;
+        let _ = if (!compileOnly) copyWebAssetsRec(mergedTc.tcWebAssets, pathDirname(outWasm))? else ();
+        Ok(outWasm)
+    } else if (compileOnly) {
+        let defaultObj = pathJoin(buildDir, rootMf.mfName + ".o");
+        let outObj = match outPathOpt { Some(p) -> p, None -> defaultObj };
+        ensureParentDirExists(outObj)?;
+        cbs.cbCompileNativeObj(entryFile, rootSpec, extSpecs, mergedTc, Some(outObj), dumpCoreOpt)?;
+        Ok(outObj)
+    } else {
+        let defaultBin = pathJoin(buildDir, rootMf.mfName);
+        let outBin = match outPathOpt { Some(p) -> p, None -> defaultBin };
+        ensureParentDirExists(outBin)?;
+        cbs.cbCompileNativeExe(entryFile, rootSpec, extSpecs, mergedTc, Some(outBin), dumpCoreOpt, rtOverrideOpt)?;
+        Ok(outBin)
+    }
+}
+
+pub def cmdRun(
+    appArgs: List String,
+    singleFileOpt: Option String,
+    rtOverrideOpt: Option String,
+    cbs: CompileCallbacks
+): Result Int String = {
+    let binPath = match singleFileOpt {
+        Some(gsaFile) -> {
+            let tmpDir = pathJoin(geishaHomeDir(), "tmp");
+            mkdirAll(tmpDir)?;
+            let outBin = pathJoin(tmpDir, "run_" + intToStr(c_getpid()) + "_" + pathStem(gsaFile));
+            let rootSpec = MkPkgSpec {
+                pkgId: "",
+                pkgName: "",
+                srcRoots: [pathDirname(gsaFile)],
+                deps: Nil,
+            };
+            cbs.cbCompileNativeExe(gsaFile, rootSpec, Nil, emptyTargetCfg(), Some(outBin), None, rtOverrideOpt)?;
+            outBin
+        },
+        None -> {
+            let projDir = match findProjectRoot(".") {
+                Some(d) -> d,
+                None -> returnMatErr("no geisha.toml found in current or parent directories")?,
+            };
+            cmdBuildProject(projDir, "native", false, false, None, None, rtOverrideOpt, Nil, false, None, None, cbs)?
+        },
+    };
+
+    let cmdBuf = bufNew();
+    bufPushStr(cmdBuf, shellQuote(binPath));
+    let cur = cellNew(appArgs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                bufPushByte(cmdBuf, 32);
+                bufPushStr(cmdBuf, shellQuote(a));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let rc = shell(bufToString(cmdBuf));
+    match singleFileOpt {
+        Some(_) -> { let _ = removeFile(binPath); () },
+        None -> (),
+    };
+    Ok(if (rc == 0) 0 else 1)
+}
+
+def discoverTestFiles(projectDir: String, mf: Manifest): Result (List String) String =
+    match mf.mfTests {
+        Cons(_, _) -> Ok(resolveRelList(projectDir, mf.mfTests)),
+        Nil -> {
+            let testsDir = pathJoin(projectDir, "tests");
+            if (!isDir(testsDir)) {
+                Err("no 'tests/' directory or 'tests = [...]' entry in geisha.toml")
+            } else {
+                let candSpec = pathJoin(testsDir, "spec.gsa");
+                let candMain = pathJoin(testsDir, "main.gsa");
+                if (fileExists(candSpec)) Ok([candSpec])
+                else if (fileExists(candMain)) Ok([candMain])
+                else {
+                    let entries = readDir(testsDir)?;
+                    let gsaFiles = cellNew(Nil);
+                    let cur = cellNew(sortUniqueStrings(entries));
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(nm, r) -> {
+                                if (strEndsWith(nm, ".gsa")) {
+                                    cellSet(gsaFiles, listAppend(cellGet(gsaFiles), [pathJoin(testsDir, nm)]))
+                                } else ();
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    match cellGet(gsaFiles) {
+                        Nil -> Err("no .gsa test files found under '" + testsDir + "'"),
+                        fs -> Ok(fs),
+                    }
+                }
+            }
+        },
+    }
+
+pub def cmdTest(rtOverrideOpt: Option String, cbs: CompileCallbacks): Result Void String = {
+    let projDir = match findProjectRoot(".") {
+        Some(d) -> d,
+        None -> returnMatErr("no geisha.toml found in current or parent directories")?,
+    };
+    let (rootMf, rootSpec0, resolvedPkgs) = resolveProjectGraph(projDir, false, None, true)?;
+    let testFiles = discoverTestFiles(projDir, rootMf)?;
+    let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
+
+    // Expose the project itself as an importable package `<rootMf.mfName>` to its own `tests/*.gsa`,
+    // AND allow `tests/` helper modules to be imported directly!
+    let selfPkgId = "__self_" + sanitizeIdentAlias(rootMf.mfName);
+    let selfPkgSpec = MkPkgSpec {
+        pkgId: selfPkgId,
+        pkgName: rootMf.mfName,
+        srcRoots: rootSpec0.srcRoots,
+        deps: rootSpec0.deps,
+    };
+    let testRootDeps =
+        if (rootMf.mfName != "") listAppend(rootSpec0.deps, [(rootMf.mfName, selfPkgId)])
+        else rootSpec0.deps;
+    let testsDir = pathJoin(projDir, "tests");
+    let testSrcRoots =
+        if (isDir(testsDir)) listAppend([testsDir], rootSpec0.srcRoots)
+        else rootSpec0.srcRoots;
+    let testRootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: "",
+        srcRoots: testSrcRoots,
+        deps: testRootDeps,
+    };
+    let allExtSpecs = Cons(selfPkgSpec, extSpecs0);
+
+    // Note: for unit/spec executables we always want a normal CLI `main()` entry (not GUI `owns_main`)!
+    let mergedNative = mergeTargetConfigs(projDir, rootMf, resolvedPkgs, false, Nil, false, None);
+    let testTc = MkTargetCfg {
+        tcCSources: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcCSources,
+        tcCFlags: mergedNative.tcCFlags,
+        tcLinkFlags: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcLinkFlags,
+        tcExports: Nil,
+        tcWebAssets: Nil,
+        tcOwnsMain: false,
+        tcBootSymbol: None,
+    };
+
+    let buildDir = pathJoin(projDir, "build/tests");
+    mkdirAll(buildDir)?;
+
+    let count = runTestFilesRec(testFiles, projDir, buildDir, testRootSpec, allExtSpecs, testTc, rtOverrideOpt, cbs, 0)?;
+    printLn("All " + intToStr(count) + " test target(s) passed.");
+    Ok(())
+}
+
+def runTestFilesRec(
+    files: List String,
+    projDir: String,
+    buildDir: String,
+    testRootSpec: PkgSpec,
+    allExtSpecs: List PkgSpec,
+    testTc: TargetCfg,
+    rtOverrideOpt: Option String,
+    cbs: CompileCallbacks,
+    acc: Int
+): Result Int String = match files {
+    Nil -> Ok(acc),
+    Cons(tf, rest) -> {
+        let stem = pathStem(tf);
+        let outBin = pathJoin(buildDir, "test_" + stem);
+        cbs.cbCompileNativeExe(tf, testRootSpec, allExtSpecs, testTc, Some(outBin), None, rtOverrideOpt)?;
+        let rc = shell("cd " + shellQuote(projDir) + " && " + shellQuote(outBin));
+        if (rc != 0) Err("test suite failed: " + tf)
+        else runTestFilesRec(rest, projDir, buildDir, testRootSpec, allExtSpecs, testTc, rtOverrideOpt, cbs, acc + 1)
+    },
+}
+
+def returnVoidErr(msg: String): Result Void String = Err(msg)
+def returnIntErr(msg: String): Result Int String = Err(msg)

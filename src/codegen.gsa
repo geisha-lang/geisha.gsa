@@ -446,10 +446,13 @@ def isDefaultWasmExport(fnName: String): Bool = {
     }
 }
 
-def shouldExportWasm(mctx: ModEmitCtx, fnName: String): Bool =
-    if (!mctx.mcIsWasm) false
-    else if (mctx.mcHasExplicitExports) strMapContains(mctx.mcWasmExports, fnName)
-    else isDefaultWasmExport(fnName)
+def shouldExportSymbol(mctx: ModEmitCtx, fnName: String): Bool =
+    if (mctx.mcIsWasm) {
+        if (mctx.mcHasExplicitExports) strMapContains(mctx.mcWasmExports, fnName)
+        else isDefaultWasmExport(fnName)
+    } else {
+        strMapContains(mctx.mcWasmExports, fnName)
+    }
 
 def newFnEmitCtx(fnName: String): FnEmitCtx = {
     let blks: Vec BasicBlockBuf = vecNew();
@@ -548,8 +551,10 @@ def emitGep(fctx: FnEmitCtx, elemTy: String, basePtr: String, idx64Val: String):
 def emitLoad(fctx: FnEmitCtx, llvmTy: String, ptrVal: String): String =
     emitAssign(fctx, "load " + llvmTy + ", ptr " + ptrVal)
 
-def emitStore(fctx: FnEmitCtx, llvmTy: String, val: String, ptrVal: String): Void =
-    emitLine(fctx, "store " + llvmTy + " " + val + ", ptr " + ptrVal)
+def emitStore(fctx: FnEmitCtx, llvmTy: String, val: String, ptrVal: String): Void = {
+    let normVal = if (llvmTy == "ptr" && val == "0") "null" else val;
+    emitLine(fctx, "store " + llvmTy + " " + normVal + ", ptr " + ptrVal)
+}
 
 def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = {
     bufPushStr(out, header);
@@ -1969,7 +1974,8 @@ def formatTypedArgs(argTys: List String, argVals: List String): String = {
     while (match (cellGet(ct), cellGet(cv)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
         match (cellGet(ct), cellGet(cv)) {
             (Cons(t, rt), Cons(v, rv)) -> {
-                cellSet(pairsRev, Cons(t + " " + v, cellGet(pairsRev)));
+                let normV = if (t == "ptr" && v == "0") "null" else v;
+                cellSet(pairsRev, Cons(t + " " + normV, cellGet(pairsRev)));
                 cellSet(ct, rt);
                 cellSet(cv, rv)
             },
@@ -2636,10 +2642,10 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
-    let isWasmExp = shouldExportWasm(mctx, fd.fnName);
-    let linkage = if (isWasmExp) "" else "internal ";
+    let isExp = shouldExportSymbol(mctx, fd.fnName);
+    let linkage = if (isExp) "" else "internal ";
     let exportAttr =
-        if (isWasmExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
+        if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
         else "";
     let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ") nounwind" + exportAttr;
     flushFunctionToBuf(out, header, fctx)
@@ -2850,7 +2856,62 @@ def emitUserExternDeclares(
     bufPushByte(out, 10)
 }
 
-pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: List String): String = {
+def emitNativeCustomBootFunctions(
+    out: StringBuf,
+    mctx: ModEmitCtx,
+    mainOpt: Option FunDef,
+    globals: List GlobalValDef,
+    bootSymOpt: Option String
+): Void = {
+    let fctx = newFnEmitCtx("__geisha_init");
+    let cg = cellNew(globals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(g, r) -> {
+                match strMapGet(mctx.mcGlobalSlots, g.gvName) {
+                    Some(slot) -> {
+                        if (isGcPointerType(g.gvTy)) {
+                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
+                        } else ();
+                        cellSet(fctx.fcPendingLet, None);
+                        let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
+                        emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                    },
+                    None -> (),
+                };
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+    match mainOpt {
+        Some(mainFd) -> {
+            let _ = genExpr(mctx, fctx, mainFd.fnBody, Nil, false);
+            ()
+        },
+        None -> (),
+    };
+    if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
+    flushFunctionToBuf(out, "define void @__geisha_init() nounwind", fctx);
+
+    match bootSymOpt {
+        Some(bsym) ->
+            if (strLen(bsym) > 0 && bsym != "__geisha_init") {
+                bufPushStr(out, "define void " + llvmSym(bsym) + "() nounwind {\nentry:\n");
+                bufPushStr(out, "  call void @__geisha_init()\n");
+                bufPushStr(out, "  ret void\n}\n\n")
+            } else (),
+        None -> (),
+    }
+}
+
+pub def emitProgramLlvmIrOpts(
+    prog: CoreProgram,
+    isWasm: Bool,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): String = {
     let globalSlots: StrMap VarSlot = strMapNew();
     let globalsBuf = bufNew();
 
@@ -2869,8 +2930,8 @@ pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: Li
     } else ();
 
     let exportMap: StrMap Bool = strMapNew();
-    let hasExplicit = match wasmExports { Nil -> false, _ -> true };
-    let ce = cellNew(wasmExports);
+    let hasExplicit = match exports { Nil -> false, _ -> true };
+    let ce = cellNew(exports);
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
             Cons(en, r) -> {
@@ -2922,6 +2983,8 @@ pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: Li
     let fnsBuf = bufNew();
     if (isWasm) {
         emitWasmInitFunction(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals)
+    } else if (noMain) {
+        emitNativeCustomBootFunctions(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals, bootSymOpt)
     } else {
         match strMapGet(prog.coreFns, "main") {
             Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals),
@@ -2963,6 +3026,9 @@ pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: Li
     bufPushBuf(out, fnsBuf);
     bufToString(out)
 }
+
+pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: List String): String =
+    emitProgramLlvmIrOpts(prog, isWasm, wasmExports, false, None)
 
 pub def emitProgramLlvmIr(prog: CoreProgram): String =
     emitProgramLlvmIrTarget(prog, false, Nil)

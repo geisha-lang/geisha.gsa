@@ -1,0 +1,1048 @@
+// Pure-Geisha TOML v1.0 parser and canonical serializer (`std.toml`),
+// bridging directly into `std.codec.Value` and `std.codec.Decoder`.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{intToStr, i64ToStr, floatToStr, parseInt64, parseFloat, strJoin}
+use std.list.{listRev, listAppend, listLen}
+use std.codec.{
+    Value, VNull, VBool, VInt, VFloat, VStr, VArr, VObj,
+    DecodeErr, makeErr, Decoder, run, Encode, encode
+}
+
+data TomlParser {
+    MkTomlParser { tpSrc: String, tpLen: Int, tpPos: Cell Int, tpLine: Cell Int },
+}
+
+def newTomlParser(src: String): TomlParser =
+    MkTomlParser { tpSrc: src, tpLen: strLen(src), tpPos: cellNew(0), tpLine: cellNew(1) }
+
+def peek(p: TomlParser): Int = {
+    let i = cellGet(p.tpPos);
+    if (i >= p.tpLen) -1 else strByteAt(p.tpSrc, i)
+}
+
+def peekAt(p: TomlParser, off: Int): Int = {
+    let i = cellGet(p.tpPos) + off;
+    if (i < 0 || i >= p.tpLen) -1 else strByteAt(p.tpSrc, i)
+}
+
+def bump(p: TomlParser): Int = {
+    let i = cellGet(p.tpPos);
+    if (i >= p.tpLen) -1
+    else {
+        let b = strByteAt(p.tpSrc, i);
+        cellSet(p.tpPos, i + 1);
+        if (b == 10) cellSet(p.tpLine, cellGet(p.tpLine) + 1) else ();
+        b
+    }
+}
+
+def tomlErr(p: TomlParser, msg: String): String =
+    "TOML error at line " + intToStr(cellGet(p.tpLine)) + ": " + msg
+
+def isHorizWs(b: Int): Bool = b == 32 || b == 9
+
+def skipInlineWs(p: TomlParser): Void = {
+    while (isHorizWs(peek(p))) {
+        let _ = bump(p);
+        ()
+    }
+}
+
+def skipComment(p: TomlParser): Void = {
+    if (peek(p) == 35) {
+        while ({
+            let c = peek(p);
+            c >= 0 && c != 10
+        }) {
+            let _ = bump(p);
+            ()
+        }
+    } else ()
+}
+
+def skipWsAndComments(p: TomlParser): Void = {
+    let going = cellNew(true);
+    while (cellGet(going)) {
+        let c = peek(p);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            let _ = bump(p);
+            ()
+        } else if (c == 35) {
+            skipComment(p)
+        } else {
+            cellSet(going, false)
+        }
+    }
+}
+
+def expectLineEndOrEof(p: TomlParser): Result Void String = {
+    skipInlineWs(p);
+    skipComment(p);
+    let c = peek(p);
+    if (c < 0) Ok(())
+    else if (c == 10) {
+        let _ = bump(p);
+        Ok(())
+    } else if (c == 13 && peekAt(p, 1) == 10) {
+        let _ = bump(p);
+        let _ = bump(p);
+        Ok(())
+    } else {
+        Err(tomlErr(p, "expected newline or end of file"))
+    }
+}
+
+def isBareKeyByte(b: Int): Bool =
+    (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || (b >= 48 && b <= 57)
+    || b == 95
+    || b == 45
+
+def hexVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def readHexN(p: TomlParser, count: Int): Result Int String = {
+    let acc = cellNew(0);
+    let i = cellNew(0);
+    let ok = cellNew(true);
+    while (cellGet(i) < count && cellGet(ok)) {
+        let hv = hexVal(bump(p));
+        if (hv < 0) cellSet(ok, false)
+        else {
+            cellSet(acc, (cellGet(acc) << 4) | hv);
+            cellSet(i, cellGet(i) + 1)
+        }
+    };
+    if (cellGet(ok)) Ok(cellGet(acc))
+    else Err(tomlErr(p, "invalid Unicode hex escape"))
+}
+
+def pushUtf8(buf: StringBuf, cp: Int): Void =
+    if (cp < 128) {
+        bufPushByte(buf, cp)
+    } else if (cp < 2048) {
+        bufPushByte(buf, 192 | (cp >>> 6));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else if (cp < 65536) {
+        bufPushByte(buf, 224 | (cp >>> 12));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else {
+        bufPushByte(buf, 240 | (cp >>> 18));
+        bufPushByte(buf, 128 | ((cp >>> 12) & 63));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    }
+
+def decodeEscape(p: TomlParser, out: StringBuf, allowMultilineTrim: Bool): Result Void String = {
+    let esc = bump(p);
+    if (esc == 34) { bufPushByte(out, 34); Ok(()) }
+    else if (esc == 92) { bufPushByte(out, 92); Ok(()) }
+    else if (esc == 98) { bufPushByte(out, 8); Ok(()) }
+    else if (esc == 102) { bufPushByte(out, 12); Ok(()) }
+    else if (esc == 110) { bufPushByte(out, 10); Ok(()) }
+    else if (esc == 114) { bufPushByte(out, 13); Ok(()) }
+    else if (esc == 116) { bufPushByte(out, 9); Ok(()) }
+    else if (esc == 117) {
+        let cp = readHexN(p, 4)?;
+        pushUtf8(out, cp);
+        Ok(())
+    } else if (esc == 85) {
+        let cp = readHexN(p, 8)?;
+        pushUtf8(out, cp);
+        Ok(())
+    } else if (allowMultilineTrim && (esc == 32 || esc == 9 || esc == 10 || esc == 13)) {
+        let sawNl = cellNew(esc == 10);
+        if (esc == 13 && peek(p) == 10) {
+            let _ = bump(p);
+            cellSet(sawNl, true)
+        } else ();
+        while (!cellGet(sawNl) && isHorizWs(peek(p))) {
+            let _ = bump(p);
+            ()
+        };
+        if (!cellGet(sawNl)) {
+            if (peek(p) == 10) {
+                let _ = bump(p);
+                cellSet(sawNl, true)
+            } else if (peek(p) == 13 && peekAt(p, 1) == 10) {
+                let _ = bump(p);
+                let _ = bump(p);
+                cellSet(sawNl, true)
+            } else ()
+        } else ();
+        if (!cellGet(sawNl)) Err(tomlErr(p, "invalid line-ending backslash in multiline string"))
+        else {
+            while ({
+                let c = peek(p);
+                c == 32 || c == 9 || c == 10 || c == 13
+            }) {
+                let _ = bump(p);
+                ()
+            };
+            Ok(())
+        }
+    } else {
+        Err(tomlErr(p, "invalid string escape sequence"))
+    }
+}
+
+def parseBasicString(p: TomlParser): Result String String = {
+    if (peek(p) == 34 && peekAt(p, 1) == 34 && peekAt(p, 2) == 34) {
+        let _ = bump(p);
+        let _ = bump(p);
+        let _ = bump(p);
+        if (peek(p) == 10) { let _ = bump(p); () }
+        else if (peek(p) == 13 && peekAt(p, 1) == 10) { let _ = bump(p); let _ = bump(p); () }
+        else ();
+        let out = bufNew();
+        let done = cellNew(false);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (!cellGet(done) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+            let c = peek(p);
+            if (c < 0) {
+                cellSet(errOpt, Some(tomlErr(p, "unterminated multiline basic string")))
+            } else if (c == 34 && peekAt(p, 1) == 34 && peekAt(p, 2) == 34) {
+                let _ = bump(p);
+                let _ = bump(p);
+                let _ = bump(p);
+                while (peek(p) == 34 && !(peekAt(p, 1) == 34 && peekAt(p, 2) == 34)) {
+                    let _ = bump(p);
+                    bufPushByte(out, 34)
+                };
+                cellSet(done, true)
+            } else if (c == 92) {
+                let _ = bump(p);
+                match decodeEscape(p, out, true) {
+                    Ok(_) -> (),
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                }
+            } else {
+                bufPushByte(out, bump(p))
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(bufToString(out)),
+        }
+    } else {
+        let _ = bump(p);
+        let out = bufNew();
+        let done = cellNew(false);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (!cellGet(done) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+            let c = peek(p);
+            if (c < 0 || c == 10 || c == 13) {
+                cellSet(errOpt, Some(tomlErr(p, "unterminated basic string")))
+            } else if (c == 34) {
+                let _ = bump(p);
+                cellSet(done, true)
+            } else if (c == 92) {
+                let _ = bump(p);
+                match decodeEscape(p, out, false) {
+                    Ok(_) -> (),
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                }
+            } else {
+                bufPushByte(out, bump(p))
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(bufToString(out)),
+        }
+    }
+}
+
+def parseLiteralString(p: TomlParser): Result String String = {
+    if (peek(p) == 39 && peekAt(p, 1) == 39 && peekAt(p, 2) == 39) {
+        let _ = bump(p);
+        let _ = bump(p);
+        let _ = bump(p);
+        if (peek(p) == 10) { let _ = bump(p); () }
+        else if (peek(p) == 13 && peekAt(p, 1) == 10) { let _ = bump(p); let _ = bump(p); () }
+        else ();
+        let out = bufNew();
+        let done = cellNew(false);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (!cellGet(done) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+            let c = peek(p);
+            if (c < 0) {
+                cellSet(errOpt, Some(tomlErr(p, "unterminated multiline literal string")))
+            } else if (c == 39 && peekAt(p, 1) == 39 && peekAt(p, 2) == 39) {
+                let _ = bump(p);
+                let _ = bump(p);
+                let _ = bump(p);
+                while (peek(p) == 39 && !(peekAt(p, 1) == 39 && peekAt(p, 2) == 39)) {
+                    let _ = bump(p);
+                    bufPushByte(out, 39)
+                };
+                cellSet(done, true)
+            } else {
+                bufPushByte(out, bump(p))
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(bufToString(out)),
+        }
+    } else {
+        let _ = bump(p);
+        let start = cellGet(p.tpPos);
+        while ({
+            let c = peek(p);
+            c >= 0 && c != 39 && c != 10 && c != 13
+        }) {
+            let _ = bump(p);
+            ()
+        };
+        if (peek(p) != 39) Err(tomlErr(p, "unterminated literal string"))
+        else {
+            let end = cellGet(p.tpPos);
+            let _ = bump(p);
+            Ok(ptrSliceFromStr(p.tpSrc, start, end - start))
+        }
+    }
+}
+
+def parseKeySegment(p: TomlParser): Result String String = {
+    skipInlineWs(p);
+    let c = peek(p);
+    if (c == 34) {
+        if (peekAt(p, 1) == 34 && peekAt(p, 2) == 34) {
+            Err(tomlErr(p, "multiline strings cannot be used as TOML keys"))
+        } else parseBasicString(p)
+    } else if (c == 39) {
+        if (peekAt(p, 1) == 39 && peekAt(p, 2) == 39) {
+            Err(tomlErr(p, "multiline strings cannot be used as TOML keys"))
+        } else parseLiteralString(p)
+    } else if (isBareKeyByte(c)) {
+        let start = cellGet(p.tpPos);
+        while (isBareKeyByte(peek(p))) {
+            let _ = bump(p);
+            ()
+        };
+        Ok(ptrSliceFromStr(p.tpSrc, start, cellGet(p.tpPos) - start))
+    } else {
+        Err(tomlErr(p, "expected key identifier or quoted key"))
+    }
+}
+
+def parseDottedKey(p: TomlParser): Result (List String) String = {
+    let first = parseKeySegment(p)?;
+    let segs = cellNew([first]);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while ({
+        skipInlineWs(p);
+        peek(p) == 46 && match cellGet(errOpt) { None -> true, Some(_) -> false }
+    }) {
+        let _ = bump(p);
+        match parseKeySegment(p) {
+            Ok(s) -> cellSet(segs, listAppend(cellGet(segs), [s])),
+            Err(e) -> cellSet(errOpt, Some(e)),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(cellGet(segs)),
+    }
+}
+
+def stripUnderscores(raw: String): String = {
+    let n = strLen(raw);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(raw, cellGet(i));
+        if (c != 95) bufPushByte(b, c) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def parseRadixInt64(digits: String, radix: Int): Result Int64 String = {
+    let n = strLen(digits);
+    if (n == 0) Err("empty radix integer")
+    else {
+        let acc = cellNew(intToI64(0));
+        let rad64 = intToI64(radix);
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let hv = hexVal(strByteAt(digits, cellGet(i)));
+            if (hv < 0 || hv >= radix) cellSet(ok, false)
+            else {
+                cellSet(acc, cellGet(acc) * rad64 + intToI64(hv));
+                cellSet(i, cellGet(i) + 1)
+            }
+        };
+        if (cellGet(ok)) Ok(cellGet(acc))
+        else Err("invalid radix integer: " + digits)
+    }
+}
+
+def isScalarStopByte(c: Int): Bool =
+    c < 0 || c == 32 || c == 9 || c == 10 || c == 13 || c == 35 || c == 44 || c == 93 || c == 125
+
+def parseBareValue(p: TomlParser): Result Value String = {
+    let start = cellGet(p.tpPos);
+    while (!isScalarStopByte(peek(p))) {
+        let _ = bump(p);
+        ()
+    };
+    let raw = ptrSliceFromStr(p.tpSrc, start, cellGet(p.tpPos) - start);
+    if (strLen(raw) == 0) {
+        Err(tomlErr(p, "expected value"))
+    } else if (raw == "true") {
+        Ok(VBool(true))
+    } else if (raw == "false") {
+        Ok(VBool(false))
+    } else {
+        let clean = stripUnderscores(raw);
+        let clen = strLen(clean);
+        if (clen >= 3 && strByteAt(clean, 0) == 48 && (strByteAt(clean, 1) == 120 || strByteAt(clean, 1) == 88)) {
+            match parseRadixInt64(strSlice(clean, 2, clen), 16) {
+                Ok(v) -> Ok(VInt(v)),
+                Err(e) -> Err(tomlErr(p, e)),
+            }
+        } else if (clen >= 3 && strByteAt(clean, 0) == 48 && (strByteAt(clean, 1) == 111 || strByteAt(clean, 1) == 79)) {
+            match parseRadixInt64(strSlice(clean, 2, clen), 8) {
+                Ok(v) -> Ok(VInt(v)),
+                Err(e) -> Err(tomlErr(p, e)),
+            }
+        } else if (clen >= 3 && strByteAt(clean, 0) == 48 && (strByteAt(clean, 1) == 98 || strByteAt(clean, 1) == 66)) {
+            match parseRadixInt64(strSlice(clean, 2, clen), 2) {
+                Ok(v) -> Ok(VInt(v)),
+                Err(e) -> Err(tomlErr(p, e)),
+            }
+        } else if (clean == "inf" || clean == "+inf") {
+            Ok(VFloat(1.0 / 0.0))
+        } else if (clean == "-inf") {
+            Ok(VFloat(-1.0 / 0.0))
+        } else if (clean == "nan" || clean == "+nan" || clean == "-nan") {
+            Ok(VFloat(0.0 / 0.0))
+        } else {
+            let hasFloatMarker = {
+                let i = cellNew(0);
+                let found = cellNew(false);
+                while (cellGet(i) < clen && !cellGet(found)) {
+                    let b = strByteAt(clean, cellGet(i));
+                    if (b == 46 || b == 101 || b == 69) cellSet(found, true) else ();
+                    cellSet(i, cellGet(i) + 1)
+                };
+                cellGet(found)
+            };
+            let hasDateDashOrColon = {
+                let i = cellNew(1);
+                let found = cellNew(false);
+                while (cellGet(i) < clen && !cellGet(found)) {
+                    let b = strByteAt(clean, cellGet(i));
+                    if (b == 58 || (b == 45 && strByteAt(clean, cellGet(i) - 1) != 101 && strByteAt(clean, cellGet(i) - 1) != 69)) {
+                        cellSet(found, true)
+                    } else ();
+                    cellSet(i, cellGet(i) + 1)
+                };
+                cellGet(found)
+            };
+            if (hasDateDashOrColon) {
+                Ok(VStr(raw))
+            } else if (hasFloatMarker) {
+                match parseFloat(clean) {
+                    Ok(f) -> Ok(VFloat(f)),
+                    Err(_) -> Err(tomlErr(p, "invalid float value '" + raw + "'")),
+                }
+            } else {
+                match parseInt64(clean) {
+                    Ok(n) -> Ok(VInt(n)),
+                    Err(_) -> Err(tomlErr(p, "invalid value '" + raw + "'")),
+                }
+            }
+        }
+    }
+}
+
+// ---- Functional Value Tree Insertion Helpers ----
+
+def objGet(fields: List (String, Value), key: String): Option Value = match fields {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else objGet(r, key),
+}
+
+def objSet(fields: List (String, Value), key: String, val: Value): List (String, Value) = match fields {
+    Nil -> [(key, val)],
+    Cons((k, v), r) ->
+        if (k == key) Cons((key, val), r)
+        else Cons((k, v), objSet(r, key, val)),
+}
+
+def replaceLastValue(xs: List Value, newLast: Value): List Value = match xs {
+    Nil -> [newLast],
+    Cons(_, Nil) -> [newLast],
+    Cons(h, t) -> Cons(h, replaceLastValue(t, newLast)),
+}
+
+def lastObjFields(xs: List Value): Option (List (String, Value)) = match xs {
+    Nil -> None,
+    Cons(VObj(fs), Nil) -> Some(fs),
+    Cons(_, Nil) -> None,
+    Cons(_, t) -> lastObjFields(t),
+}
+
+def insertAtPath(
+    fields: List (String, Value),
+    path: List String,
+    leafVal: Value
+): Result (List (String, Value)) String = match path {
+    Nil -> Err("empty key path"),
+    Cons(k, Nil) -> match objGet(fields, k) {
+        Some(_) -> Err("duplicate key '" + k + "'"),
+        None -> Ok(objSet(fields, k, leafVal)),
+    },
+    Cons(k, rest) -> match objGet(fields, k) {
+        None -> {
+            let sub = insertAtPath(Nil, rest, leafVal)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VObj(subFields)) -> {
+            let sub = insertAtPath(subFields, rest, leafVal)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VArr(items)) -> match lastObjFields(items) {
+            Some(lastFs) -> {
+                let updatedLast = insertAtPath(lastFs, rest, leafVal)?;
+                Ok(objSet(fields, k, VArr(replaceLastValue(items, VObj(updatedLast)))))
+            },
+            None -> Err("key '" + k + "' conflicts with existing array"),
+        },
+        Some(_) -> Err("key '" + k + "' conflicts with existing scalar value"),
+    },
+}
+
+def ensureTablePath(
+    fields: List (String, Value),
+    path: List String
+): Result (List (String, Value)) String = match path {
+    Nil -> Ok(fields),
+    Cons(k, rest) -> match objGet(fields, k) {
+        None -> {
+            let sub = ensureTablePath(Nil, rest)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VObj(subFields)) -> {
+            let sub = ensureTablePath(subFields, rest)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VArr(items)) -> match rest {
+            Nil -> Err("table '[" + k + "]' conflicts with array of tables"),
+            _ -> match lastObjFields(items) {
+                Some(lastFs) -> {
+                    let sub = ensureTablePath(lastFs, rest)?;
+                    Ok(objSet(fields, k, VArr(replaceLastValue(items, VObj(sub)))))
+                },
+                None -> Err("key '" + k + "' is an array, not a table"),
+            },
+        },
+        Some(_) -> Err("table key '" + k + "' conflicts with existing scalar"),
+    },
+}
+
+def appendArrayTablePath(
+    fields: List (String, Value),
+    path: List String
+): Result (List (String, Value)) String = match path {
+    Nil -> Err("empty array-of-tables header"),
+    Cons(k, Nil) -> match objGet(fields, k) {
+        None -> Ok(objSet(fields, k, VArr([VObj(Nil)]))),
+        Some(VArr(items)) -> Ok(objSet(fields, k, VArr(listAppend(items, [VObj(Nil)])))),
+        Some(_) -> Err("array-of-tables '[[" + k + "]]' conflicts with existing non-array key"),
+    },
+    Cons(k, rest) -> match objGet(fields, k) {
+        None -> {
+            let sub = appendArrayTablePath(Nil, rest)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VObj(subFields)) -> {
+            let sub = appendArrayTablePath(subFields, rest)?;
+            Ok(objSet(fields, k, VObj(sub)))
+        },
+        Some(VArr(items)) -> match lastObjFields(items) {
+            Some(lastFs) -> {
+                let sub = appendArrayTablePath(lastFs, rest)?;
+                Ok(objSet(fields, k, VArr(replaceLastValue(items, VObj(sub)))))
+            },
+            None -> Err("key '" + k + "' conflicts with non-table array"),
+        },
+        Some(_) -> Err("key '" + k + "' conflicts with existing scalar"),
+    },
+}
+
+def parseTomlValue(p: TomlParser): Result Value String = {
+    skipInlineWs(p);
+    let c = peek(p);
+    if (c == 34) {
+        Ok(VStr(parseBasicString(p)?))
+    } else if (c == 39) {
+        Ok(VStr(parseLiteralString(p)?))
+    } else if (c == 91) {
+        let _ = bump(p);
+        let elems = cellNew(Nil);
+        let done = cellNew(false);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (!cellGet(done) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+            skipWsAndComments(p);
+            if (peek(p) == 93) {
+                let _ = bump(p);
+                cellSet(done, true)
+            } else {
+                match parseTomlValue(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(v) -> {
+                        cellSet(elems, Cons(v, cellGet(elems)));
+                        skipWsAndComments(p);
+                        if (peek(p) == 44) {
+                            let _ = bump(p);
+                            ()
+                        } else if (peek(p) == 93) {
+                            let _ = bump(p);
+                            cellSet(done, true)
+                        } else {
+                            cellSet(errOpt, Some(tomlErr(p, "expected ',' or ']' in array")))
+                        }
+                    },
+                }
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(VArr(listRev(cellGet(elems)))),
+        }
+    } else if (c == 123) {
+        let _ = bump(p);
+        let fields = cellNew(Nil);
+        let done = cellNew(false);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (!cellGet(done) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+            skipWsAndComments(p);
+            if (peek(p) == 125) {
+                let _ = bump(p);
+                cellSet(done, true)
+            } else {
+                match parseDottedKey(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(kpath) -> {
+                        skipInlineWs(p);
+                        if (peek(p) != 61) {
+                            cellSet(errOpt, Some(tomlErr(p, "expected '=' in inline table")))
+                        } else {
+                            let _ = bump(p);
+                            match parseTomlValue(p) {
+                                Err(e2) -> cellSet(errOpt, Some(e2)),
+                                Ok(val) -> match insertAtPath(cellGet(fields), kpath, val) {
+                                    Err(ie) -> cellSet(errOpt, Some(tomlErr(p, ie))),
+                                    Ok(nf) -> {
+                                        cellSet(fields, nf);
+                                        skipWsAndComments(p);
+                                        if (peek(p) == 44) {
+                                            let _ = bump(p);
+                                            ()
+                                        } else if (peek(p) == 125) {
+                                            let _ = bump(p);
+                                            cellSet(done, true)
+                                        } else {
+                                            cellSet(errOpt, Some(tomlErr(p, "expected ',' or '}' in inline table")))
+                                        }
+                                    },
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        };
+        match cellGet(errOpt) {
+            Some(e) -> Err(e),
+            None -> Ok(VObj(cellGet(fields))),
+        }
+    } else {
+        parseBareValue(p)
+    }
+}
+
+pub def parse(raw: String): Result Value String = {
+    let p = newTomlParser(raw);
+    if (p.tpLen >= 3 && strByteAt(raw, 0) == 239 && strByteAt(raw, 1) == 187 && strByteAt(raw, 2) == 191) {
+        cellSet(p.tpPos, 3)
+    } else ();
+
+    let rootFields: Cell (List (String, Value)) = cellNew(Nil);
+    let curPrefix: Cell (List String) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    while ({
+        skipWsAndComments(p);
+        peek(p) >= 0 && match cellGet(errOpt) { None -> true, Some(_) -> false }
+    }) {
+        if (peek(p) == 91) {
+            if (peekAt(p, 1) == 91) {
+                let _ = bump(p);
+                let _ = bump(p);
+                match parseDottedKey(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(hdr) -> {
+                        skipInlineWs(p);
+                        if (peek(p) == 93 && peekAt(p, 1) == 93) {
+                            let _ = bump(p);
+                            let _ = bump(p);
+                            match expectLineEndOrEof(p) {
+                                Err(le) -> cellSet(errOpt, Some(le)),
+                                Ok(_) -> match appendArrayTablePath(cellGet(rootFields), hdr) {
+                                    Err(ae) -> cellSet(errOpt, Some(tomlErr(p, ae))),
+                                    Ok(nf) -> {
+                                        cellSet(rootFields, nf);
+                                        cellSet(curPrefix, hdr)
+                                    },
+                                },
+                            }
+                        } else {
+                            cellSet(errOpt, Some(tomlErr(p, "expected ']]' after array-of-tables header")))
+                        }
+                    },
+                }
+            } else {
+                let _ = bump(p);
+                match parseDottedKey(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(hdr) -> {
+                        skipInlineWs(p);
+                        if (peek(p) == 93) {
+                            let _ = bump(p);
+                            match expectLineEndOrEof(p) {
+                                Err(le) -> cellSet(errOpt, Some(le)),
+                                Ok(_) -> match ensureTablePath(cellGet(rootFields), hdr) {
+                                    Err(te) -> cellSet(errOpt, Some(tomlErr(p, te))),
+                                    Ok(nf) -> {
+                                        cellSet(rootFields, nf);
+                                        cellSet(curPrefix, hdr)
+                                    },
+                                },
+                            }
+                        } else {
+                            cellSet(errOpt, Some(tomlErr(p, "expected ']' after table header")))
+                        }
+                    },
+                }
+            }
+        } else {
+            match parseDottedKey(p) {
+                Err(e) -> cellSet(errOpt, Some(e)),
+                Ok(relKey) -> {
+                    skipInlineWs(p);
+                    if (peek(p) != 61) {
+                        cellSet(errOpt, Some(tomlErr(p, "expected '=' after key")))
+                    } else {
+                        let _ = bump(p);
+                        match parseTomlValue(p) {
+                            Err(ve) -> cellSet(errOpt, Some(ve)),
+                            Ok(val) -> match expectLineEndOrEof(p) {
+                                Err(le) -> cellSet(errOpt, Some(le)),
+                                Ok(_) -> {
+                                    let fullPath = listAppend(cellGet(curPrefix), relKey);
+                                    match insertAtPath(cellGet(rootFields), fullPath, val) {
+                                        Err(ie) -> cellSet(errOpt, Some(tomlErr(p, ie))),
+                                        Ok(nf) -> cellSet(rootFields, nf),
+                                    }
+                                },
+                            },
+                        }
+                    }
+                },
+            }
+        }
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(VObj(cellGet(rootFields))),
+    }
+}
+
+pub def decodeString(dec: Decoder a, raw: String): Result a DecodeErr =
+    match parse(raw) {
+        Err(msg) -> Err(makeErr("$", msg)),
+        Ok(v) -> run(dec, v),
+    }
+
+// ---- Canonical TOML Serializer ----
+
+def isValidBareKey(k: String): Bool = {
+    let n = strLen(k);
+    if (n == 0) false
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            if (!isBareKeyByte(strByteAt(k, cellGet(i)))) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+def hexUpperByte(nib: Int): Int =
+    if (nib < 10) 48 + nib else 55 + nib
+
+def emitTomlString(b: StringBuf, s: String): Void = {
+    bufPushByte(b, 34);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 34) bufPushStr(b, "\\\"")
+        else if (c == 92) bufPushStr(b, "\\\\")
+        else if (c == 8) bufPushStr(b, "\\b")
+        else if (c == 12) bufPushStr(b, "\\f")
+        else if (c == 10) bufPushStr(b, "\\n")
+        else if (c == 13) bufPushStr(b, "\\r")
+        else if (c == 9) bufPushStr(b, "\\t")
+        else if (c < 32) {
+            bufPushStr(b, "\\u00");
+            bufPushByte(b, hexUpperByte((c >>> 4) & 15));
+            bufPushByte(b, hexUpperByte(c & 15))
+        } else {
+            bufPushByte(b, c)
+        };
+        cellSet(i, idx + 1)
+    };
+    bufPushByte(b, 34)
+}
+
+def formatTomlKey(k: String): String =
+    if (isValidBareKey(k)) k
+    else {
+        let b = bufNew();
+        emitTomlString(b, k);
+        bufToString(b)
+    }
+
+def formatKeyPath(path: List String): String = {
+    let parts = cellNew(Nil);
+    let cur = cellNew(path);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, t) -> {
+                cellSet(parts, listAppend(cellGet(parts), [formatTomlKey(h)]));
+                cellSet(cur, t)
+            },
+            Nil -> (),
+        }
+    };
+    strJoin(cellGet(parts), ".")
+}
+
+def isArrayOfNonEmptyObjs(xs: List Value): Bool = match xs {
+    Nil -> false,
+    _ -> {
+        let cur = cellNew(xs);
+        let allObj = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> cellGet(allObj) }) {
+            match cellGet(cur) {
+                Cons(VObj(_), r) -> cellSet(cur, r),
+                _ -> cellSet(allObj, false),
+            }
+        };
+        cellGet(allObj)
+    },
+}
+
+def emitInlineValue(b: StringBuf, v: Value): Void = match v {
+    VNull -> bufPushStr(b, "\"\""),
+    VBool(true) -> bufPushStr(b, "true"),
+    VBool(false) -> bufPushStr(b, "false"),
+    VInt(n) -> bufPushStr(b, i64ToStr(n)),
+    VFloat(f) -> bufPushStr(b, floatToStr(f)),
+    VStr(s) -> emitTomlString(b, s),
+    VArr(xs) -> {
+        bufPushByte(b, 91);
+        let cur = cellNew(xs);
+        let first = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, t) -> {
+                    if (!cellGet(first)) bufPushStr(b, ", ") else cellSet(first, false);
+                    emitInlineValue(b, h);
+                    cellSet(cur, t)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushByte(b, 93)
+    },
+    VObj(fs) -> {
+        bufPushStr(b, "{ ");
+        let cur = cellNew(fs);
+        let first = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((k, val), t) -> {
+                    match val {
+                        VNull -> (),
+                        _ -> {
+                            if (!cellGet(first)) bufPushStr(b, ", ") else cellSet(first, false);
+                            bufPushStr(b, formatTomlKey(k));
+                            bufPushStr(b, " = ");
+                            emitInlineValue(b, val)
+                        },
+                    };
+                    cellSet(cur, t)
+                },
+                Nil -> (),
+            }
+        };
+        bufPushStr(b, " }")
+    },
+}
+
+def isInlineLeaf(v: Value): Bool = match v {
+    VNull -> false,
+    VObj(_) -> false,
+    VArr(xs) -> !isArrayOfNonEmptyObjs(xs),
+    _ -> true,
+}
+
+def objHasNestedTables(fs: List (String, Value)): Bool = match fs {
+    Nil -> false,
+    Cons((_, VObj(_)), _) -> true,
+    Cons((_, VArr(xs)), r) -> if (isArrayOfNonEmptyObjs(xs)) true else objHasNestedTables(r),
+    Cons(_, r) -> objHasNestedTables(r),
+}
+
+def isCompactInlineTableParent(prefix: List String): Bool = match listRev(prefix) {
+    Cons(lastSeg, _) -> lastSeg == "deps" || lastSeg == "overrides",
+    Nil -> false,
+}
+
+def isInlineInTable(prefix: List String, v: Value): Bool = match v {
+    VNull -> false,
+    VObj(subFs) -> isCompactInlineTableParent(prefix) && !objHasNestedTables(subFs),
+    VArr(xs) -> !isArrayOfNonEmptyObjs(xs),
+    _ -> true,
+}
+
+def emitTableBody(b: StringBuf, prefix: List String, fields: List (String, Value), needBlank: Cell Bool): Void = {
+    let hasInline = {
+        let c = cellNew(fields);
+        let found = cellNew(false);
+        while (match cellGet(c) { Nil -> false, _ -> !cellGet(found) }) {
+            match cellGet(c) {
+                Cons((_, val), r) -> {
+                    if (isInlineInTable(prefix, val)) cellSet(found, true) else ();
+                    cellSet(c, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    };
+
+    let isEmptyTable = match fields { Nil -> true, _ -> false };
+    if (listLen(prefix) > 0 && (hasInline || isEmptyTable)) {
+        if (cellGet(needBlank)) bufPushByte(b, 10) else ();
+        bufPushByte(b, 91);
+        bufPushStr(b, formatKeyPath(prefix));
+        bufPushStr(b, "]\n");
+        cellSet(needBlank, true)
+    } else ();
+
+    let c1 = cellNew(fields);
+    while (match cellGet(c1) { Nil -> false, _ -> true }) {
+        match cellGet(c1) {
+            Cons((k, val), r) -> {
+                if (isInlineInTable(prefix, val)) {
+                    bufPushStr(b, formatTomlKey(k));
+                    bufPushStr(b, " = ");
+                    emitInlineValue(b, val);
+                    bufPushByte(b, 10);
+                    cellSet(needBlank, true)
+                } else ();
+                cellSet(c1, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let c2 = cellNew(fields);
+    while (match cellGet(c2) { Nil -> false, _ -> true }) {
+        match cellGet(c2) {
+            Cons((k, VObj(subFs)), r) -> {
+                if (!isInlineInTable(prefix, VObj(subFs))) {
+                    emitTableBody(b, listAppend(prefix, [k]), subFs, needBlank)
+                } else ();
+                cellSet(c2, r)
+            },
+            Cons((k, VArr(xs)), r) -> {
+                if (isArrayOfNonEmptyObjs(xs)) {
+                    let hdrPath = listAppend(prefix, [k]);
+                    let ci = cellNew(xs);
+                    while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                        match cellGet(ci) {
+                            Cons(VObj(itemFs), ri) -> {
+                                if (cellGet(needBlank)) bufPushByte(b, 10) else ();
+                                bufPushStr(b, "[[");
+                                bufPushStr(b, formatKeyPath(hdrPath));
+                                bufPushStr(b, "]]\n");
+                                cellSet(needBlank, true);
+                                let cf = cellNew(itemFs);
+                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons((ik, iv), rf) -> {
+                                            match iv {
+                                                VNull -> (),
+                                                _ -> {
+                                                    bufPushStr(b, formatTomlKey(ik));
+                                                    bufPushStr(b, " = ");
+                                                    emitInlineValue(b, iv);
+                                                    bufPushByte(b, 10)
+                                                },
+                                            };
+                                            cellSet(cf, rf)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                cellSet(ci, ri)
+                            },
+                            Cons(_, ri) -> cellSet(ci, ri),
+                            Nil -> (),
+                        }
+                    }
+                } else ();
+                cellSet(c2, r)
+            },
+            Cons(_, r) -> cellSet(c2, r),
+            Nil -> (),
+        }
+    }
+}
+
+pub def stringify(v: Value): String = {
+    let b = bufNew();
+    match v {
+        VObj(fs) -> emitTableBody(b, Nil, fs, cellNew(false)),
+        _ -> {
+            emitInlineValue(b, v);
+            bufPushByte(b, 10)
+        },
+    };
+    bufToString(b)
+}
+
+pub def toToml(x): forall a. (Encode a) => a -> String =
+    stringify(encode(x))

@@ -8,9 +8,10 @@ RUNTIME_LIB := $(BUILD_DIR)/libgeisha_runtime.a
 WASM_RT_OBJ := $(BUILD_DIR)/wasm_rt.o
 WASM_CC     ?= /opt/homebrew/opt/llvm@20/bin/clang
 WASM_FLAGS  ?= --target=wasm32 -O2 -flto -mbulk-memory -mnontrapping-fptoint
-ENTRY       := src/mod.gsa
+ENTRY       := src/geisha.gsa
+PREFIX      ?= $(HOME)/.geisha
 
-.PHONY: all runtime wasm-runtime stdlib-bundle stage1 stage2 stage3 bootstrap test verify-core clean
+.PHONY: all runtime wasm-runtime stdlib-bundle stage1 stage2 stage3 bootstrap install test verify-core clean
 
 all: stage2
 
@@ -58,6 +59,14 @@ $(BUILD_DIR)/geisha3: $(BUILD_DIR)/stage3.ll $(RUNTIME_LIB)
 bootstrap: $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll $(BUILD_DIR)/geisha3
 	diff -u $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll
 	@echo "Fixed-point verified: stage2.ll and stage3.ll are byte-for-byte identical."
+
+install: $(BUILD_DIR)/geisha3 $(RUNTIME_LIB) $(WASM_RT_OBJ)
+	@mkdir -p "$(PREFIX)/bin" "$(PREFIX)/lib"
+	cp $(BUILD_DIR)/geisha3 "$(PREFIX)/bin/geisha"
+	cp $(RUNTIME_LIB) "$(PREFIX)/lib/libgeisha_runtime.a"
+	cp $(WASM_RT_OBJ) "$(PREFIX)/lib/wasm_rt.o"
+	@if [ -d "$(HOME)/.local/bin" ]; then ln -sf "$(PREFIX)/bin/geisha" "$(HOME)/.local/bin/geisha"; fi
+	@echo "Installed geisha toolchain to $(PREFIX)/bin/geisha"
 
 test: $(BUILD_DIR)/geisha2
 	GEISHA_BIN=$(BUILD_DIR)/geisha2 GEISHA_RUNTIME=$(RUNTIME_LIB) sh tests/run_tests.sh

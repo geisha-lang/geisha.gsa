@@ -1,11 +1,19 @@
-// Multi-file + Inline Module Loader, Topological Sort, and Qualified Name Rewriter (`loader`)
+// Multi-file, Demand-Driven Path Module, and Package-Scoped Loader (`loader`).
+//
+// Supports:
+// 1. Path-as-module on-demand loading via `use` / `open` (no `mod.gsa` or `mod foo` needed),
+//    including sibling umbrella modules (`stage.gsa` + `stage/*.gsa`).
+// 2. Hermetic package-scoped dependency graphs (`PkgSpec`: explicit `[deps]` aliases,
+//    own-package `use <pkg>.<sub>` & relative `use <sub>`, phantom-dependency blocking).
+// 3. Cross-package Concept/Instance Orphan Rule enforcement on library packages.
+// 4. Full backward compatibility with inline `mod Name { ... }`, `mod foo`, `mod.gsa`, and `-L`.
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend, listLen}
 use std.control.{fmap}
 use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
-use std.path.{pathJoin, pathStem}
+use std.path.{pathJoin, pathStem, pathDirname}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use sys.fs.{fileExists, readFile}
@@ -26,15 +34,25 @@ use ast.{
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     Def, MkDef, UseSpec, useSpecLocalName,
     UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
-    ModuleItem, ModDef, ModUse, ModSub, ModDecl, FileModule,
+    ModuleItem, ModDef, ModUse, ModSub, ModDecl,
     listContainsStr, addUniqueStr
 }
 use parser.{parseFileModule, defContainsTry, desugarTryInDef}
 use stdlib_bundle.builtinModuleSource
 
+pub data PkgSpec {
+    MkPkgSpec {
+        pkgId: String,
+        pkgName: String,
+        srcRoots: List String,
+        deps: List (String, String),
+    },
+}
+
 pub data LoadedMod {
     MkLoadedMod {
         key: String,
+        pkgOwner: String,
         modPath: List String,
         defs: List (Visibility, Def),
         imports: List (Visibility, UseItem),
@@ -44,6 +62,18 @@ pub data LoadedMod {
 
 pub data NameInfo {
     MkNameInfo { qualifiedName: String, isPublic: Bool, definedInMod: String },
+}
+
+def defaultRootPkg(srcRoots: List String): PkgSpec = MkPkgSpec {
+    pkgId: "",
+    pkgName: "",
+    srcRoots: srcRoots,
+    deps: Nil,
+}
+
+def lookupAssocStr(pairs: List (String, String), key: String): Option String = match pairs {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else lookupAssocStr(r, key),
 }
 
 def listInit(xs: List String): List String = match xs {
@@ -58,14 +88,13 @@ def listLastOr(xs: List String, fallback: String): String = match xs {
     Cons(_, t) -> listLastOr(t, fallback),
 }
 
-def importTargetModuleKey(u: UseItem): String = match u {
-    UseSingle(p) -> strJoin(listInit(p), "."),
-    UseAlias(p, _) -> strJoin(listInit(p), "."),
-    UseMulti(p, _) -> strJoin(p, "."),
-    UseGlob(p) -> strJoin(p, "."),
-}
+def joinKeyPrefix(prefix: String, suffix: String): String =
+    if (prefix == "") suffix
+    else if (suffix == "") prefix
+    else prefix + "." + suffix
 
 def extractModuleItems(
+    pkgOwner: String,
     modPath: List String,
     items: List ModuleItem,
     inlineOut: Cell (List LoadedMod)
@@ -87,16 +116,17 @@ def extractModuleItems(
                 cellSet(cur, r)
             },
             Cons(ModDecl(_, childName), r) -> {
-                let childKey = if (curKey == "") childName else curKey + "." + childName;
+                let childKey = joinKeyPrefix(curKey, childName);
                 cellSet(subs, addUniqueStr(cellGet(subs), childKey));
                 cellSet(cur, r)
             },
             Cons(ModSub(_, subName, subItems, _), r) -> {
                 let subPath = listAppend(modPath, [subName]);
                 let subKey = strJoin(subPath, ".");
-                let (sDefs, sImps, sSubs) = extractModuleItems(subPath, subItems, inlineOut);
+                let (sDefs, sImps, sSubs) = extractModuleItems(pkgOwner, subPath, subItems, inlineOut);
                 let subLoaded = MkLoadedMod {
                     key: subKey,
+                    pkgOwner: pkgOwner,
                     modPath: subPath,
                     defs: sDefs,
                     imports: sImps,
@@ -112,76 +142,123 @@ def extractModuleItems(
     (cellGet(defs), cellGet(imps), cellGet(subs))
 }
 
-def resolveModFilePath(srcRoot: String, segs: List String): Option String = {
-    let cur = cellNew(segs);
-    let p = cellNew(srcRoot);
-    while (match cellGet(cur) { Nil -> false, _ -> true }) {
-        match cellGet(cur) {
-            Cons(s, r) -> {
-                cellSet(p, pathJoin(cellGet(p), s));
-                cellSet(cur, r)
-            },
-            Nil -> (),
-        }
-    };
-    let directFile = cellGet(p) + ".gsa";
-    if (fileExists(directFile)) Some(directFile)
-    else {
-        let modFile = pathJoin(cellGet(p), "mod.gsa");
+def resolveModFilePathInDir(srcRoot: String, segs: List String): Option String = match segs {
+    Nil -> {
+        let modFile = pathJoin(srcRoot, "mod.gsa");
         if (fileExists(modFile)) Some(modFile) else None
-    }
+    },
+    _ -> {
+        let cur = cellNew(segs);
+        let p = cellNew(srcRoot);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(s, r) -> {
+                    cellSet(p, pathJoin(cellGet(p), s));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let directFile = cellGet(p) + ".gsa";
+        if (fileExists(directFile)) Some(directFile)
+        else {
+            let modFile = pathJoin(cellGet(p), "mod.gsa");
+            if (fileExists(modFile)) Some(modFile) else None
+        }
+    },
 }
 
-def loadFileModuleRec(
-    srcRoot: String,
-    segs: List String,
+def resolveModFilePathInDirs(roots: List String, segs: List String): Option String = match roots {
+    Nil -> None,
+    Cons(r, rest) -> match resolveModFilePathInDir(r, segs) {
+        Some(fp) -> Some(fp),
+        None -> resolveModFilePathInDirs(rest, segs),
+    },
+}
+
+def resolvePkgRelModFile(pkg: PkgSpec, relSegs: List String): Option String = match relSegs {
+    Nil -> {
+        let namedOpt = if (pkg.pkgName != "") resolveModFilePathInDirs(pkg.srcRoots, [pkg.pkgName]) else None;
+        match namedOpt {
+            Some(fp) -> Some(fp),
+            None -> resolveModFilePathInDirs(pkg.srcRoots, Nil),
+        }
+    },
+    _ -> match resolveModFilePathInDirs(pkg.srcRoots, relSegs) {
+        Some(fp) -> Some(fp),
+        None ->
+            if (pkg.pkgName != "") resolveModFilePathInDirs(pkg.srcRoots, Cons(pkg.pkgName, relSegs))
+            else None,
+    },
+}
+
+def findLibRootForMod(libPaths: List String, segs: List String): Option String = match libPaths {
+    Nil -> None,
+    Cons(root, rest) -> match resolveModFilePathInDir(root, segs) {
+        Some(_) -> Some(root),
+        None -> findLibRootForMod(rest, segs),
+    },
+}
+
+def stripPkgPrefixSegs(pkgId: String, fullKey: String): List String =
+    if (pkgId == "") {
+        if (fullKey == "") Nil else strSplitChar(fullKey, '.')
+    } else if (fullKey == pkgId) {
+        Nil
+    } else if (strStartsWith(fullKey, pkgId + ".")) {
+        strSplitChar(strSlice(fullKey, strLen(pkgId) + 1, strLen(fullKey)), '.')
+    } else {
+        strSplitChar(fullKey, '.')
+    }
+
+def loadCanonicalFileModRec(
+    pkg: PkgSpec,
+    canonicalKey: String,
+    fpath: String,
+    pkgMap: StrMap PkgSpec,
     cache: StrMap LoadedMod,
     orderKeys: Vec String,
     loadingStack: List String
-): Result Void String = {
-    let key = strJoin(segs, ".");
-    if (strMapContains(cache, key)) Ok(())
-    else if (listContainsStr(loadingStack, key)) {
-        Err("Circular module dependency involving '" + key + "'")
+): Result Void String =
+    if (strMapContains(cache, canonicalKey)) Ok(())
+    else if (listContainsStr(loadingStack, canonicalKey)) {
+        Err("Circular module dependency involving '" + canonicalKey + "'")
     } else {
-        match resolveModFilePath(srcRoot, segs) {
-            None -> Err("Module '" + key + "' not found under '" + srcRoot + "'"),
-            Some(fpath) -> {
-                let src = readFile(fpath)?;
-                let fm = parseFileModule(src, segs)?;
-                let inlines: Cell (List LoadedMod) = cellNew(Nil);
-                let (defs, imps, subs) = extractModuleItems(segs, fm.items, inlines);
-                let loaded = MkLoadedMod {
-                    key: key,
-                    modPath: segs,
-                    defs: defs,
-                    imports: imps,
-                    submodules: subs,
-                };
-                strMapInsert(cache, key, loaded);
-                vecPush(orderKeys, key);
+        let src = readFile(fpath)?;
+        let keySegs = if (canonicalKey == "") Nil else strSplitChar(canonicalKey, '.');
+        let fm = parseFileModule(src, keySegs)?;
+        let inlines: Cell (List LoadedMod) = cellNew(Nil);
+        let (defs, imps, subs) = extractModuleItems(pkg.pkgId, keySegs, fm.items, inlines);
+        let loaded = MkLoadedMod {
+            key: canonicalKey,
+            pkgOwner: pkg.pkgId,
+            modPath: keySegs,
+            defs: defs,
+            imports: imps,
+            submodules: subs,
+        };
+        strMapInsert(cache, canonicalKey, loaded);
+        vecPush(orderKeys, canonicalKey);
 
-                let curInl = cellNew(cellGet(inlines));
-                while (match cellGet(curInl) { Nil -> false, _ -> true }) {
-                    match cellGet(curInl) {
-                        Cons(im, r) -> {
-                            strMapInsert(cache, im.key, im);
-                            vecPush(orderKeys, im.key);
-                            cellSet(curInl, r)
-                        },
-                        Nil -> (),
-                    }
-                };
+        let curInl = cellNew(cellGet(inlines));
+        while (match cellGet(curInl) { Nil -> false, _ -> true }) {
+            match cellGet(curInl) {
+                Cons(im, r) -> {
+                    strMapInsert(cache, im.key, im);
+                    vecPush(orderKeys, im.key);
+                    cellSet(curInl, r)
+                },
+                Nil -> (),
+            }
+        };
 
-                loadSubmoduleList(srcRoot, subs, cache, orderKeys, Cons(key, loadingStack))
-            },
-        }
+        loadExplicitSubmodules(pkg, subs, pkgMap, cache, orderKeys, Cons(canonicalKey, loadingStack))
     }
-}
 
-def loadSubmoduleList(
-    srcRoot: String,
+def loadExplicitSubmodules(
+    pkg: PkgSpec,
     subs: List String,
+    pkgMap: StrMap PkgSpec,
     cache: StrMap LoadedMod,
     orderKeys: Vec String,
     loadingStack: List String
@@ -189,61 +266,377 @@ def loadSubmoduleList(
     Nil -> Ok(()),
     Cons(childKey, rest) -> {
         if (!strMapContains(cache, childKey)) {
-            let childSegs = strSplitChar(childKey, '.');
-            loadFileModuleRec(srcRoot, childSegs, cache, orderKeys, loadingStack)?;
-            loadSubmoduleList(srcRoot, rest, cache, orderKeys, loadingStack)
-        } else loadSubmoduleList(srcRoot, rest, cache, orderKeys, loadingStack)
+            let relSegs = stripPkgPrefixSegs(pkg.pkgId, childKey);
+            match resolvePkgRelModFile(pkg, relSegs) {
+                Some(fp) -> loadCanonicalFileModRec(pkg, childKey, fp, pkgMap, cache, orderKeys, loadingStack)?,
+                None -> returnLoadErr("Module '" + childKey + "' not found for package '" + (if (pkg.pkgName == "") "<root>" else pkg.pkgName) + "'")?,
+            };
+            loadExplicitSubmodules(pkg, rest, pkgMap, cache, orderKeys, loadingStack)
+        } else {
+            loadExplicitSubmodules(pkg, rest, pkgMap, cache, orderKeys, loadingStack)
+        }
     },
 }
+
+def returnLoadErr(msg: String): Result Void String = Err(msg)
 
 def moduleUsesTry(defs: List (Visibility, Def)): Bool = match defs {
     Nil -> false,
     Cons((_, d), r) -> if (defContainsTry(d)) true else moduleUsesTry(r),
 }
 
-def findLibRootForMod(libPaths: List String, segs: List String): Option String = match libPaths {
-    Nil -> None,
-    Cons(root, rest) -> match resolveModFilePath(root, segs) {
-        Some(_) -> Some(root),
-        None -> findLibRootForMod(rest, segs),
+def collectExprChainsInForm(f: Form, bound: List String, out: Cell (List (List String))): Void = match f.node {
+    ExField(base, fname) -> match flattenFieldChainPlain(base) {
+        Some((root, segs0)) -> {
+            if (!listContainsStr(bound, root)) {
+                let fullChain = Cons(root, listAppend(segs0, [fname]));
+                let modPrefix = listInit(fullChain);
+                match modPrefix {
+                    Nil -> (),
+                    _ -> cellSet(out, Cons(modPrefix, cellGet(out))),
+                }
+            } else ()
+        },
+        None -> collectExprChainsInForm(base, bound, out),
+    },
+    ExTuple(es) -> collectExprChainsInList(es, bound, out),
+    ExList(es) -> collectExprChainsInList(es, bound, out),
+    ExBlock(es) -> collectExprChainsInList(es, bound, out),
+    ExStructInit(_, fs) -> {
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, vf), r) -> { collectExprChainsInForm(vf, bound, out); cellSet(cur, r) },
+                Nil -> (),
+            }
+        }
+    },
+    ExApply(c, args) -> {
+        collectExprChainsInForm(c, bound, out);
+        collectExprChainsInList(args, bound, out)
+    },
+    ExBin(_, l, r) -> {
+        collectExprChainsInForm(l, bound, out);
+        collectExprChainsInForm(r, bound, out)
+    },
+    ExUn(_, e) -> collectExprChainsInForm(e, bound, out),
+    ExTry(e) -> collectExprChainsInForm(e, bound, out),
+    ExIf(c, t, e) -> {
+        collectExprChainsInForm(c, bound, out);
+        collectExprChainsInForm(t, bound, out);
+        collectExprChainsInForm(e, bound, out)
+    },
+    ExWhile(c, b) -> {
+        collectExprChainsInForm(c, bound, out);
+        collectExprChainsInForm(b, bound, out)
+    },
+    ExAbs(ps, _, body) -> {
+        let nb = cellNew(bound);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(vd, r) -> { cellSet(nb, addUniqueStr(cellGet(nb), vd.vname)); cellSet(cur, r) },
+                Nil -> (),
+            }
+        };
+        collectExprChainsInForm(body, cellGet(nb), out)
+    },
+    ExLet(vd, val, body) -> {
+        collectExprChainsInForm(val, bound, out);
+        collectExprChainsInForm(body, addUniqueStr(bound, vd.vname), out)
+    },
+    ExMatch(scrut, arms) -> {
+        collectExprChainsInForm(scrut, bound, out);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let ab = cellNew(bound);
+                    collectPatVars(a.pat, ab);
+                    match a.guard {
+                        Some(g) -> collectExprChainsInForm(g, cellGet(ab), out),
+                        None -> (),
+                    };
+                    collectExprChainsInForm(a.body, cellGet(ab), out);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    _ -> (),
+}
+
+def collectExprChainsInList(es: List Form, bound: List String, out: Cell (List (List String))): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectExprChainsInForm(h, bound, out);
+        collectExprChainsInList(t, bound, out)
     },
 }
 
-def loadBuiltinAndLibImports(
+def collectPatVars(p: Pattern, bound: Cell (List String)): Void = match p {
+    PatVar(v) -> cellSet(bound, addUniqueStr(cellGet(bound), v)),
+    PatTuple(ps) -> {
+        let c = cellNew(ps);
+        while (match cellGet(c) { Nil -> false, _ -> true }) {
+            match cellGet(c) { Cons(h, r) -> { collectPatVars(h, bound); cellSet(c, r) }, Nil -> () }
+        }
+    },
+    PatCtor(_, ps) -> {
+        let c = cellNew(ps);
+        while (match cellGet(c) { Nil -> false, _ -> true }) {
+            match cellGet(c) { Cons(h, r) -> { collectPatVars(h, bound); cellSet(c, r) }, Nil -> () }
+        }
+    },
+    PatStruct(_, fs) -> {
+        let c = cellNew(fs);
+        while (match cellGet(c) { Nil -> false, _ -> true }) {
+            match cellGet(c) { Cons((_, sp), r) -> { collectPatVars(sp, bound); cellSet(c, r) }, Nil -> () }
+        }
+    },
+    _ -> (),
+}
+
+def flattenFieldChainPlain(f: Form): Option (String, List String) = match f.node {
+    ExVar(root) -> Some((root, Nil)),
+    ExField(inner, fname) -> match flattenFieldChainPlain(inner) {
+        Some((root, segs)) -> Some((root, listAppend(segs, [fname]))),
+        None -> None,
+    },
+    _ -> None,
+}
+
+def collectCandidateModPathsFromMod(m: LoadedMod): List (List String) = {
+    let seen: StrMap Bool = strMapNew();
+    let acc: Cell (List (List String)) = cellNew(Nil);
+
+    let pushCand = (segs: List String) -> match segs {
+        Nil -> (),
+        _ -> {
+            let k = strJoin(segs, ".");
+            if (!strMapContains(seen, k)) {
+                strMapInsert(seen, k, true);
+                cellSet(acc, Cons(segs, cellGet(acc)))
+            } else ()
+        },
+    };
+
+    let curImp = cellNew(m.imports);
+    while (match cellGet(curImp) { Nil -> false, _ -> true }) {
+        match cellGet(curImp) {
+            Cons((_, u), r) -> {
+                match u {
+                    UseMulti(p, _) -> pushCand(p),
+                    UseGlob(p) -> pushCand(p),
+                    UseSingle(p) -> {
+                        if (listLen(p) >= 2) pushCand(listInit(p)) else ();
+                        pushCand(p)
+                    },
+                    UseAlias(p, _) -> {
+                        if (listLen(p) >= 2) pushCand(listInit(p)) else ();
+                        pushCand(p)
+                    },
+                };
+                cellSet(curImp, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let exprChains: Cell (List (List String)) = cellNew(Nil);
+    let curDef = cellNew(m.defs);
+    while (match cellGet(curDef) { Nil -> false, _ -> true }) {
+        match cellGet(curDef) {
+            Cons((_, d), r) -> {
+                match d.item {
+                    ItForm(f) -> collectExprChainsInForm(f, Nil, exprChains),
+                    ItInstance(_, _, _, ms) -> {
+                        let cm = cellNew(ms);
+                        while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                            match cellGet(cm) {
+                                Cons(mi, rm) -> { collectExprChainsInForm(mi.implBody, Nil, exprChains); cellSet(cm, rm) },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    _ -> (),
+                };
+                cellSet(curDef, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let curCh = cellNew(cellGet(exprChains));
+    while (match cellGet(curCh) { Nil -> false, _ -> true }) {
+        match cellGet(curCh) {
+            Cons(segs, r) -> {
+                let pre = cellNew(Nil);
+                let cs = cellNew(segs);
+                while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                    match cellGet(cs) {
+                        Cons(s, rs) -> {
+                            let nextPre = listAppend(cellGet(pre), [s]);
+                            cellSet(pre, nextPre);
+                            pushCand(nextPre);
+                            cellSet(cs, rs)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(curCh, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    listRev(cellGet(acc))
+}
+
+data PendingLoad {
+    LoadBuiltin(String),
+    LoadPkgFile(PkgSpec, String, String),
+    LoadLegacyLib(String, List String, String),
+}
+
+def resolveDemandImportForPkg(
+    curPkg: PkgSpec,
+    curModKey: String,
+    segs: List String,
+    pkgMap: StrMap PkgSpec,
+    cache: StrMap LoadedMod,
+    libPaths: List String
+): Option PendingLoad = match segs {
+    Nil -> None,
+    Cons(s0, rest) -> {
+        let joined = strJoin(segs, ".");
+        if (s0 == "std" || s0 == "sys") {
+            if (strMapContains(cache, joined)) None
+            else match builtinModuleSource(joined) {
+                Some(_) -> Some(LoadBuiltin(joined)),
+                None -> None,
+            }
+        } else {
+            match lookupAssocStr(curPkg.deps, s0) {
+                Some(targetPkgId) -> match strMapGet(pkgMap, targetPkgId) {
+                    Some(targetPkg) -> {
+                        let targetKey = joinKeyPrefix(targetPkg.pkgId, strJoin(rest, "."));
+                        if (strMapContains(cache, targetKey)) None
+                        else match resolvePkgRelModFile(targetPkg, rest) {
+                            Some(fp) -> Some(LoadPkgFile(targetPkg, targetKey, fp)),
+                            None -> None,
+                        }
+                    },
+                    None -> None,
+                },
+                None -> {
+                    let ownExplicitOpt: Option PendingLoad =
+                        if (curPkg.pkgName != "" && s0 == curPkg.pkgName) {
+                            let ownKey = joinKeyPrefix(curPkg.pkgId, strJoin(rest, "."));
+                            if (strMapContains(cache, ownKey)) None
+                            else match resolvePkgRelModFile(curPkg, rest) {
+                                Some(fp) -> Some(LoadPkgFile(curPkg, ownKey, fp)),
+                                None -> None,
+                            }
+                        } else None;
+
+                    match ownExplicitOpt {
+                        Some(pl) -> Some(pl),
+                        None -> {
+                            let childKey = joinKeyPrefix(curModKey, joined);
+                            let relChildSegs = stripPkgPrefixSegs(curPkg.pkgId, childKey);
+                            let childOpt: Option PendingLoad =
+                                if (curModKey != "" && curModKey != curPkg.pkgId && !strMapContains(cache, childKey)) {
+                                    match resolvePkgRelModFile(curPkg, relChildSegs) {
+                                        Some(fp) -> Some(LoadPkgFile(curPkg, childKey, fp)),
+                                        None -> None,
+                                    }
+                                } else None;
+
+                            match childOpt {
+                                Some(pl) -> Some(pl),
+                                None -> {
+                                    let pkgRelKey = joinKeyPrefix(curPkg.pkgId, joined);
+                                    if (strMapContains(cache, pkgRelKey)) None
+                                    else match resolvePkgRelModFile(curPkg, segs) {
+                                        Some(fp) -> Some(LoadPkgFile(curPkg, pkgRelKey, fp)),
+                                        None -> {
+                                            if (!strMapContains(cache, joined)) {
+                                                match findLibRootForMod(libPaths, segs) {
+                                                    Some(lroot) -> Some(LoadLegacyLib(joined, segs, lroot)),
+                                                    None -> None,
+                                                }
+                                            } else None
+                                        },
+                                    }
+                                },
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    },
+}
+
+def loadAllReachableModules(
+    pkgMap: StrMap PkgSpec,
     cache: StrMap LoadedMod,
     orderKeys: Vec String,
-    libPaths: List String
+    libPaths: List String,
+    legacyLibRoots: StrMap Bool
 ): Result Void String = {
     let keepGoing = cellNew(true);
     let errCell: Cell (Option String) = cellNew(None);
+    let fallbackRoot = match strMapGet(pkgMap, "") {
+        Some(rp) -> rp,
+        None -> defaultRootPkg(Nil),
+    };
 
     while (cellGet(keepGoing) && match cellGet(errCell) { None -> true, Some(_) -> false }) {
-        let neededBuiltins = cellNew(Nil);
-        let neededLibs = cellNew(Nil);
+        let pendingRev: Cell (List PendingLoad) = cellNew(Nil);
+        let queuedKeys: StrMap Bool = strMapNew();
         let n = vecLen(orderKeys);
         let i = cellNew(0);
+
         while (cellGet(i) < n) {
             let k = vecGetOr(orderKeys, cellGet(i), "");
             match strMapGet(cache, k) {
                 Some(m) -> {
-                    if (!strMapContains(cache, "std.result") && moduleUsesTry(m.defs)) {
-                        cellSet(neededBuiltins, addUniqueStr(cellGet(neededBuiltins), "std.result"))
+                    if (!strMapContains(cache, "std.result") && !strMapContains(queuedKeys, "std.result") && moduleUsesTry(m.defs)) {
+                        strMapInsert(queuedKeys, "std.result", true);
+                        cellSet(pendingRev, Cons(LoadBuiltin("std.result"), cellGet(pendingRev)))
                     } else ();
-                    let curImp = cellNew(m.imports);
-                    while (match cellGet(curImp) { Nil -> false, _ -> true }) {
-                        match cellGet(curImp) {
-                            Cons((_, u), r) -> {
-                                let target = importTargetModuleKey(u);
-                                if (target != "" && !strMapContains(cache, target)) {
-                                    match builtinModuleSource(target) {
-                                        Some(_) -> cellSet(neededBuiltins, addUniqueStr(cellGet(neededBuiltins), target)),
-                                        None -> match findLibRootForMod(libPaths, strSplitChar(target, '.')) {
-                                            Some(_) -> cellSet(neededLibs, addUniqueStr(cellGet(neededLibs), target)),
-                                            None -> (),
-                                        },
-                                    }
-                                } else ();
-                                cellSet(curImp, r)
+
+                    let curPkg = match strMapGet(pkgMap, m.pkgOwner) {
+                        Some(p) -> p,
+                        None -> fallbackRoot,
+                    };
+                    let cands = collectCandidateModPathsFromMod(m);
+                    let cc = cellNew(cands);
+                    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                        match cellGet(cc) {
+                            Cons(segs, rc) -> {
+                                match resolveDemandImportForPkg(curPkg, m.key, segs, pkgMap, cache, libPaths) {
+                                    Some(LoadBuiltin(bk)) ->
+                                        if (!strMapContains(queuedKeys, bk)) {
+                                            strMapInsert(queuedKeys, bk, true);
+                                            cellSet(pendingRev, Cons(LoadBuiltin(bk), cellGet(pendingRev)))
+                                        } else (),
+                                    Some(LoadPkgFile(tp, tk, fp)) ->
+                                        if (!strMapContains(queuedKeys, tk)) {
+                                            strMapInsert(queuedKeys, tk, true);
+                                            cellSet(pendingRev, Cons(LoadPkgFile(tp, tk, fp), cellGet(pendingRev)))
+                                        } else (),
+                                    Some(LoadLegacyLib(lk, lsegs, lroot)) ->
+                                        if (!strMapContains(queuedKeys, lk)) {
+                                            strMapInsert(queuedKeys, lk, true);
+                                            cellSet(pendingRev, Cons(LoadLegacyLib(lk, lsegs, lroot), cellGet(pendingRev)))
+                                        } else (),
+                                    None -> (),
+                                };
+                                cellSet(cc, rc)
                             },
                             Nil -> (),
                         }
@@ -254,63 +647,80 @@ def loadBuiltinAndLibImports(
             cellSet(i, cellGet(i) + 1)
         };
 
-        let bReqs = cellGet(neededBuiltins);
-        let lReqs = cellGet(neededLibs);
-        let hasAny = match (bReqs, lReqs) {
-            (Nil, Nil) -> false,
-            _ -> true,
-        };
-        if (!hasAny) {
-            cellSet(keepGoing, false)
-        } else {
-            let curReq = cellNew(bReqs);
-            while (match cellGet(curReq) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
-                match cellGet(curReq) {
-                    Cons(bkey, r) -> {
-                        match builtinModuleSource(bkey) {
-                            Some(bsrc) -> {
-                                let bsegs = strSplitChar(bkey, '.');
-                                match parseFileModule(bsrc, bsegs) {
-                                    Ok(fm) -> {
-                                        let inlines: Cell (List LoadedMod) = cellNew(Nil);
-                                        let (defs, imps, subs) = extractModuleItems(bsegs, fm.items, inlines);
-                                        strMapInsert(cache, bkey, MkLoadedMod {
-                                            key: bkey,
-                                            modPath: bsegs,
-                                            defs: defs,
-                                            imports: imps,
-                                            submodules: subs,
-                                        });
-                                        vecPush(orderKeys, bkey)
+        let pending = listRev(cellGet(pendingRev));
+        match pending {
+            Nil -> cellSet(keepGoing, false),
+            _ -> {
+                let cp = cellNew(pending);
+                while (match cellGet(cp) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                    match cellGet(cp) {
+                        Cons(LoadBuiltin(bkey), rp) -> {
+                            if (!strMapContains(cache, bkey)) {
+                                match builtinModuleSource(bkey) {
+                                    Some(bsrc) -> {
+                                        let bsegs = strSplitChar(bkey, '.');
+                                        match parseFileModule(bsrc, bsegs) {
+                                            Ok(fm) -> {
+                                                let inlines: Cell (List LoadedMod) = cellNew(Nil);
+                                                let (defs, imps, subs) = extractModuleItems("__stdlib", bsegs, fm.items, inlines);
+                                                strMapInsert(cache, bkey, MkLoadedMod {
+                                                    key: bkey,
+                                                    pkgOwner: "__stdlib",
+                                                    modPath: bsegs,
+                                                    defs: defs,
+                                                    imports: imps,
+                                                    submodules: subs,
+                                                });
+                                                vecPush(orderKeys, bkey);
+                                                let ci = cellNew(cellGet(inlines));
+                                                while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                                                    match cellGet(ci) {
+                                                        Cons(im, ri) -> {
+                                                            strMapInsert(cache, im.key, im);
+                                                            vecPush(orderKeys, im.key);
+                                                            cellSet(ci, ri)
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                }
+                                            },
+                                            Err(e) -> cellSet(errCell, Some("Stdlib '" + bkey + "': " + e)),
+                                        }
                                     },
-                                    Err(e) -> cellSet(errCell, Some("Stdlib '" + bkey + "': " + e)),
+                                    None -> (),
                                 }
-                            },
-                            None -> (),
-                        };
-                        cellSet(curReq, r)
-                    },
-                    Nil -> (),
-                }
-            };
-
-            let curLib = cellNew(lReqs);
-            while (match cellGet(curLib) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
-                match cellGet(curLib) {
-                    Cons(lkey, r) -> {
-                        let lsegs = strSplitChar(lkey, '.');
-                        match findLibRootForMod(libPaths, lsegs) {
-                            Some(lroot) -> match loadFileModuleRec(lroot, lsegs, cache, orderKeys, Nil) {
+                            } else ();
+                            cellSet(cp, rp)
+                        },
+                        Cons(LoadPkgFile(tpkg, tkey, fp), rp) -> {
+                            match loadCanonicalFileModRec(tpkg, tkey, fp, pkgMap, cache, orderKeys, Nil) {
                                 Ok(_) -> (),
                                 Err(e) -> cellSet(errCell, Some(e)),
-                            },
-                            None -> (),
-                        };
-                        cellSet(curLib, r)
-                    },
-                    Nil -> (),
+                            };
+                            cellSet(cp, rp)
+                        },
+                        Cons(LoadLegacyLib(lkey, lsegs, lroot), rp) -> {
+                            let rootSeg = match lsegs { Cons(h, _) -> h, Nil -> lkey };
+                            strMapInsert(legacyLibRoots, rootSeg, true);
+                            let legacyPkg = MkPkgSpec {
+                                pkgId: "",
+                                pkgName: "",
+                                srcRoots: [lroot],
+                                deps: Nil,
+                            };
+                            match resolveModFilePathInDir(lroot, lsegs) {
+                                Some(fp) -> match loadCanonicalFileModRec(legacyPkg, lkey, fp, pkgMap, cache, orderKeys, Nil) {
+                                    Ok(_) -> (),
+                                    Err(e) -> cellSet(errCell, Some(e)),
+                                },
+                                None -> (),
+                            };
+                            cellSet(cp, rp)
+                        },
+                        Nil -> (),
+                    }
                 }
-            }
+            },
         }
     };
 
@@ -320,31 +730,78 @@ def loadBuiltinAndLibImports(
     }
 }
 
-def entryPathToSegments(entryFile: String, srcRoot: String): List String = {
-    let normRoot = if (srcRoot == ".") "" else if (strEndsWith(srcRoot, "/")) srcRoot else srcRoot + "/";
-    let rel0 = if (strStartsWith(entryFile, "./")) strSlice(entryFile, 2, strLen(entryFile)) else entryFile;
-    let rel = if (normRoot != "" && strStartsWith(rel0, normRoot)) {
-        strSlice(rel0, strLen(normRoot), strLen(rel0))
-    } else rel0;
-
-    let withoutGsa = if (strEndsWith(rel, ".gsa")) strSlice(rel, 0, strLen(rel) - 4) else rel;
-    let rawSegs = strSplitChar(withoutGsa, '/');
-    let stripped = if (listLastOr(rawSegs, "") == "mod") listInit(rawSegs) else rawSegs;
-    match stripped {
-        Nil -> [pathStem(entryFile)],
-        _ -> stripped,
+def cacheModOwnedBy(cache: StrMap LoadedMod, key: String, expectedOwner: String): Bool =
+    match strMapGet(cache, key) {
+        Some(m) -> m.pkgOwner == expectedOwner,
+        None -> false,
     }
+
+def translateModSegsForPkg(
+    curPkg: PkgSpec,
+    curModKey: String,
+    segs: List String,
+    cache: StrMap LoadedMod,
+    legacyLibRoots: StrMap Bool
+): Option String = match segs {
+    Nil -> if (strMapContains(cache, curModKey)) Some(curModKey) else None,
+    Cons(s0, rest) -> {
+        let joined = strJoin(segs, ".");
+        let relChild = joinKeyPrefix(curModKey, joined);
+        if (curModKey != "" && cacheModOwnedBy(cache, relChild, curPkg.pkgId)) {
+            Some(relChild)
+        } else if (s0 == "std" || s0 == "sys") {
+            if (strMapContains(cache, joined)) Some(joined) else None
+        } else {
+            match lookupAssocStr(curPkg.deps, s0) {
+                Some(targetPkgId) -> {
+                    let depKey = joinKeyPrefix(targetPkgId, strJoin(rest, "."));
+                    if (cacheModOwnedBy(cache, depKey, targetPkgId)) Some(depKey) else None
+                },
+                None -> {
+                    let ownExplicit: Option String =
+                        if (curPkg.pkgName != "" && s0 == curPkg.pkgName) {
+                            let ok1 = joinKeyPrefix(curPkg.pkgId, strJoin(rest, "."));
+                            if (cacheModOwnedBy(cache, ok1, curPkg.pkgId)) Some(ok1) else None
+                        } else None;
+                    match ownExplicit {
+                        Some(k) -> Some(k),
+                        None -> {
+                            let pkgRel = joinKeyPrefix(curPkg.pkgId, joined);
+                            if (cacheModOwnedBy(cache, pkgRel, curPkg.pkgId)) Some(pkgRel)
+                            else if (strMapContains(legacyLibRoots, s0) && cacheModOwnedBy(cache, joined, "")) {
+                                Some(joined)
+                            } else None
+                        },
+                    }
+                },
+            }
+        }
+    },
 }
 
-def relativeModulePrefix(modKey: String, entryKey: String): String =
-    if (modKey == entryKey) ""
-    else if (entryKey != "" && strStartsWith(modKey, entryKey + ".")) {
-        strSlice(modKey, strLen(entryKey) + 1, strLen(modKey))
-    } else modKey
-
-// ============================================================================
-// Topological Sort & Qualified Module AST Rewriting
-// ============================================================================
+def lookupScopedItem(
+    curPkg: PkgSpec,
+    curModKey: String,
+    modSegs: List String,
+    itemName: String,
+    cache: StrMap LoadedMod,
+    legacyLibRoots: StrMap Bool,
+    avail: StrMap NameInfo
+): Option NameInfo = match modSegs {
+    Nil -> {
+        let localKey = joinKeyPrefix(curModKey, itemName);
+        match strMapGet(avail, localKey) {
+            Some(info) -> Some(info),
+            None ->
+                if (curPkg.pkgId == "") strMapGet(avail, itemName)
+                else strMapGet(avail, joinKeyPrefix(curPkg.pkgId, itemName)),
+        }
+    },
+    _ -> match translateModSegsForPkg(curPkg, curModKey, modSegs, cache, legacyLibRoots) {
+        Some(canonMod) -> strMapGet(avail, joinKeyPrefix(canonMod, itemName)),
+        None -> None,
+    },
+}
 
 def topoVisit(
     key: String,
@@ -378,118 +835,123 @@ def topoVisitList(
     },
 }
 
-def lookupCandidate(rawTarget: String, curMod: String, avail: StrMap NameInfo): Option NameInfo =
-    if (curMod != "") {
-        match strMapGet(avail, curMod + "." + rawTarget) {
-            Some(info) -> Some(info),
-            None -> strMapGet(avail, rawTarget),
-        }
-    } else strMapGet(avail, rawTarget)
-
 def resolveModuleImports(
     imports: List (Visibility, UseItem),
+    curPkg: PkgSpec,
     curMod: String,
+    cache: StrMap LoadedMod,
+    legacyLibRoots: StrMap Bool,
     avail: StrMap NameInfo,
     allExportKeys: Vec String
-): Result (List (String, String)) String = {
+): Result (List (String, String), List (String, String)) String = {
     let mappings: Cell (List (String, String)) = cellNew(Nil);
+    let modAliases: Cell (List (String, String)) = cellNew(Nil);
     let errCell: Cell (Option String) = cellNew(None);
     let cur = cellNew(imports);
 
     while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
         match cellGet(cur) {
             Cons((_, UseSingle(path)), r) -> {
-                let fullPath = strJoin(path, ".");
-                let modStr = strJoin(listInit(path), ".");
+                let modSegs = listInit(path);
                 let itemName = listLastOr(path, "");
-                match lookupCandidate(fullPath, curMod, avail) {
+                let modStr = strJoin(modSegs, ".");
+                match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
                             cellSet(mappings, listAppend(cellGet(mappings), [(itemName, info.qualifiedName)]))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
-                    None -> cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                    None -> {
+                        match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
+                            Some(canonMod) ->
+                                cellSet(modAliases, listAppend(cellGet(modAliases), [(itemName, canonMod)])),
+                            None ->
+                                cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                        }
+                    },
                 };
                 cellSet(cur, r)
             },
             Cons((_, UseAlias(path, alias)), r) -> {
-                let fullPath = strJoin(path, ".");
-                let modStr = strJoin(listInit(path), ".");
+                let modSegs = listInit(path);
                 let itemName = listLastOr(path, "");
-                match lookupCandidate(fullPath, curMod, avail) {
+                let modStr = strJoin(modSegs, ".");
+                match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
                             cellSet(mappings, listAppend(cellGet(mappings), [(alias, info.qualifiedName)]))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
-                    None -> cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                    None -> {
+                        match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
+                            Some(canonMod) ->
+                                cellSet(modAliases, listAppend(cellGet(modAliases), [(alias, canonMod)])),
+                            None ->
+                                cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
+                        }
+                    },
                 };
                 cellSet(cur, r)
             },
             Cons((_, UseMulti(basePath, specs)), r) -> {
                 let baseStr = strJoin(basePath, ".");
-                let curSp = cellNew(specs);
-                while (match cellGet(curSp) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
-                    match cellGet(curSp) {
-                        Cons(sp, sr) -> {
-                            let fullPath = if (baseStr == "") sp.orig else baseStr + "." + sp.orig;
-                            match lookupCandidate(fullPath, curMod, avail) {
-                                Some(info) ->
-                                    if (info.isPublic || info.definedInMod == curMod) {
-                                        cellSet(mappings, listAppend(cellGet(mappings), [(useSpecLocalName(sp), info.qualifiedName)]))
-                                    } else cellSet(errCell, Some("cannot import private item '" + sp.orig + "' from module '" + baseStr + "'")),
-                                None -> cellSet(errCell, Some("item '" + sp.orig + "' not found in module '" + baseStr + "'")),
-                            };
-                            cellSet(curSp, sr)
-                        },
-                        Nil -> (),
-                    }
+                match translateModSegsForPkg(curPkg, curMod, basePath, cache, legacyLibRoots) {
+                    None -> cellSet(errCell, Some("module '" + baseStr + "' not found or not declared in [deps]")),
+                    Some(canonBase) -> {
+                        let curSp = cellNew(specs);
+                        while (match cellGet(curSp) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                            match cellGet(curSp) {
+                                Cons(sp, sr) -> {
+                                    let fullKey = joinKeyPrefix(canonBase, sp.orig);
+                                    match strMapGet(avail, fullKey) {
+                                        Some(info) ->
+                                            if (info.isPublic || info.definedInMod == curMod) {
+                                                cellSet(mappings, listAppend(cellGet(mappings), [(useSpecLocalName(sp), info.qualifiedName)]))
+                                            } else cellSet(errCell, Some("cannot import private item '" + sp.orig + "' from module '" + baseStr + "'")),
+                                        None -> cellSet(errCell, Some("item '" + sp.orig + "' not found in module '" + baseStr + "'")),
+                                    };
+                                    cellSet(curSp, sr)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
                 };
                 cellSet(cur, r)
             },
             Cons((_, UseGlob(basePath)), r) -> {
                 let baseStr = strJoin(basePath, ".");
-                let pref1 = if (curMod != "") curMod + "." + baseStr + "." else "";
-                let pref2 = if (baseStr == "") "" else baseStr + ".";
-                let matched1 = cellNew(false);
-                if (pref1 != "") {
-                    let i = cellNew(0);
-                    while (cellGet(i) < vecLen(allExportKeys)) {
-                        let k = vecGetOr(allExportKeys, cellGet(i), "");
-                        if (strStartsWith(k, pref1)) {
-                            let rem = strSlice(k, strLen(pref1), strLen(k));
-                            if (rem != "" && listLen(strSplitChar(rem, '.')) == 1) {
-                                match strMapGet(avail, k) {
-                                    Some(info) ->
-                                        if (info.isPublic) {
-                                            cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]));
-                                            cellSet(matched1, true)
-                                        } else (),
-                                    None -> (),
-                                }
-                            } else ()
-                        } else ();
-                        cellSet(i, cellGet(i) + 1)
-                    }
-                } else ();
-
-                if (!cellGet(matched1)) {
-                    let i = cellNew(0);
-                    while (cellGet(i) < vecLen(allExportKeys)) {
-                        let k = vecGetOr(allExportKeys, cellGet(i), "");
-                        if (strStartsWith(k, pref2)) {
-                            let rem = strSlice(k, strLen(pref2), strLen(k));
-                            if (rem != "" && listLen(strSplitChar(rem, '.')) == 1) {
-                                match strMapGet(avail, k) {
-                                    Some(info) ->
-                                        if (info.isPublic) {
-                                            cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]))
-                                        } else (),
-                                    None -> (),
-                                }
-                            } else ()
-                        } else ();
-                        cellSet(i, cellGet(i) + 1)
-                    }
-                } else ();
+                match translateModSegsForPkg(curPkg, curMod, basePath, cache, legacyLibRoots) {
+                    None -> cellSet(errCell, Some("module '" + baseStr + "' not found or not declared in [deps]")),
+                    Some(canonBase) -> {
+                        let pref = if (canonBase == "") "" else canonBase + ".";
+                        let i = cellNew(0);
+                        while (cellGet(i) < vecLen(allExportKeys)) {
+                            let k = vecGetOr(allExportKeys, cellGet(i), "");
+                            if (pref == "") {
+                                if (listLen(strSplitChar(k, '.')) == 1) {
+                                    match strMapGet(avail, k) {
+                                        Some(info) ->
+                                            if (info.isPublic && info.definedInMod == "") {
+                                                cellSet(mappings, listAppend(cellGet(mappings), [(k, info.qualifiedName)]))
+                                            } else (),
+                                        None -> (),
+                                    }
+                                } else ()
+                            } else if (strStartsWith(k, pref)) {
+                                let rem = strSlice(k, strLen(pref), strLen(k));
+                                if (rem != "" && listLen(strSplitChar(rem, '.')) == 1) {
+                                    match strMapGet(avail, k) {
+                                        Some(info) ->
+                                            if (info.isPublic) {
+                                                cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]))
+                                            } else (),
+                                        None -> (),
+                                    }
+                                } else ()
+                            } else ();
+                            cellSet(i, cellGet(i) + 1)
+                        }
+                    },
+                };
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -498,16 +960,20 @@ def resolveModuleImports(
 
     match cellGet(errCell) {
         Some(e) -> Err(e),
-        None -> Ok(cellGet(mappings)),
+        None -> Ok((cellGet(mappings), cellGet(modAliases))),
     }
 }
 
 data ModRewriteCtx {
     MkModRewriteCtx {
+        curPkg: PkgSpec,
         curPrefix: String,
         valMap: StrMap String,
         tyMap: StrMap String,
         ctorMap: StrMap String,
+        modAliasMap: StrMap String,
+        cache: StrMap LoadedMod,
+        legacyLibRoots: StrMap Bool,
         avail: StrMap NameInfo,
         allExportKeys: Vec String,
         errors: Cell (List String),
@@ -590,16 +1056,6 @@ def flattenFieldChain(f: Form): Option (String, List (Span, String)) = match f.n
     _ -> None,
 }
 
-def hasKnownModulePrefix(allKeys: Vec String, modDot: String): Bool = {
-    let i = cellNew(0);
-    let found = cellNew(false);
-    while (cellGet(i) < vecLen(allKeys) && !cellGet(found)) {
-        if (strStartsWith(vecGetOr(allKeys, cellGet(i), ""), modDot)) cellSet(found, true)
-        else cellSet(i, cellGet(i) + 1)
-    };
-    cellGet(found)
-}
-
 def rewriteFormListInMod(ctx: ModRewriteCtx, es: List Form, bound: List String): List Form = match es {
     Nil -> Nil,
     Cons(h, t) -> Cons(rewriteFormInMod(ctx, h, bound), rewriteFormListInMod(ctx, t, bound)),
@@ -609,6 +1065,72 @@ def rewriteNamedFormsInMod(ctx: ModRewriteCtx, fs: List (String, Form), bound: L
     Nil -> Nil,
     Cons((k, v), t) -> Cons((k, rewriteFormInMod(ctx, v, bound)), rewriteNamedFormsInMod(ctx, t, bound)),
 }
+
+def resolveChainInMod(
+    ctx: ModRewriteCtx,
+    root: String,
+    segVec: Vec (Span, String),
+    k: Int,
+    fallbackPos: Span
+): Option NameInfo = {
+    let (_, itemName) = vecGetOr(segVec, k, (fallbackPos, ""));
+    match strMapGet(ctx.modAliasMap, root) {
+        Some(aliasedMod) -> {
+            let subModParts = cellNew(strSplitChar(aliasedMod, '.'));
+            let j = cellNew(0);
+            while (cellGet(j) < k) {
+                let (_, sn) = vecGetOr(segVec, cellGet(j), (fallbackPos, ""));
+                cellSet(subModParts, listAppend(cellGet(subModParts), [sn]));
+                cellSet(j, cellGet(j) + 1)
+            };
+            let canonMod = strJoin(cellGet(subModParts), ".");
+            if (strMapContains(ctx.cache, canonMod)) {
+                strMapGet(ctx.avail, joinKeyPrefix(canonMod, itemName))
+            } else None
+        },
+        None -> {
+            let modSegs = cellNew([root]);
+            let j = cellNew(0);
+            while (cellGet(j) < k) {
+                let (_, sn) = vecGetOr(segVec, cellGet(j), (fallbackPos, ""));
+                cellSet(modSegs, listAppend(cellGet(modSegs), [sn]));
+                cellSet(j, cellGet(j) + 1)
+            };
+            lookupScopedItem(ctx.curPkg, ctx.curPrefix, cellGet(modSegs), itemName, ctx.cache, ctx.legacyLibRoots, ctx.avail)
+        },
+    }
+}
+
+def resolveChainModKeyInMod(
+    ctx: ModRewriteCtx,
+    root: String,
+    segVec: Vec (Span, String),
+    modSegCount: Int,
+    fallbackPos: Span
+): Option String =
+    match strMapGet(ctx.modAliasMap, root) {
+        Some(aliasedMod) -> {
+            let subParts = cellNew(strSplitChar(aliasedMod, '.'));
+            let j = cellNew(0);
+            while (cellGet(j) < modSegCount) {
+                let (_, sn) = vecGetOr(segVec, cellGet(j), (fallbackPos, ""));
+                cellSet(subParts, listAppend(cellGet(subParts), [sn]));
+                cellSet(j, cellGet(j) + 1)
+            };
+            let cm = strJoin(cellGet(subParts), ".");
+            if (strMapContains(ctx.cache, cm)) Some(cm) else None
+        },
+        None -> {
+            let modSegs = cellNew([root]);
+            let j = cellNew(0);
+            while (cellGet(j) < modSegCount) {
+                let (_, sn) = vecGetOr(segVec, cellGet(j), (fallbackPos, ""));
+                cellSet(modSegs, listAppend(cellGet(modSegs), [sn]));
+                cellSet(j, cellGet(j) + 1)
+            };
+            translateModSegsForPkg(ctx.curPkg, ctx.curPrefix, cellGet(modSegs), ctx.cache, ctx.legacyLibRoots)
+        },
+    }
 
 def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
     let newAnn = match f.annot {
@@ -627,10 +1149,13 @@ def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
             let resolvedChain: Option Expr = match flattenFieldChain(base) {
                 Some((root, segs0)) -> {
                     let segs = listAppend(segs0, [(f.pos, fname)]);
-                    if (listContainsStr(bound, root) || strMapContains(ctx.valMap, root) || strMapContains(ctx.avail, root)) {
+                    let rootIsVal =
+                        listContainsStr(bound, root)
+                        || strMapContains(ctx.valMap, root)
+                        || (ctx.curPrefix == "" && strMapContains(ctx.avail, root));
+                    if (rootIsVal) {
                         None
                     } else {
-                        // Try longest prefix `root.s0...sk` in `ctx.avail`
                         let segVec: Vec (Span, String) = vecNew();
                         let curS = cellNew(segs);
                         while (match cellGet(curS) { Nil -> false, _ -> true }) {
@@ -644,15 +1169,7 @@ def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
                         let matchedInfo: Cell (Option NameInfo) = cellNew(None);
                         let k = cellNew(totalSegs - 1);
                         while (cellGet(k) >= 0 && cellGet(matchedK) < 0) {
-                            let parts = cellNew([root]);
-                            let j = cellNew(0);
-                            while (cellGet(j) <= cellGet(k)) {
-                                let (_, sn) = vecGetOr(segVec, cellGet(j), (f.pos, ""));
-                                cellSet(parts, listAppend(cellGet(parts), [sn]));
-                                cellSet(j, cellGet(j) + 1)
-                            };
-                            let cand = strJoin(cellGet(parts), ".");
-                            match lookupCandidate(cand, ctx.curPrefix, ctx.avail) {
+                            match resolveChainInMod(ctx, root, segVec, cellGet(k), f.pos) {
                                 Some(info) -> {
                                     cellSet(matchedK, cellGet(k));
                                     cellSet(matchedInfo, Some(info))
@@ -680,21 +1197,15 @@ def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
                                 Some(cellGet(rebuilt).node)
                             },
                             None -> {
-                                // Check missing module item error
-                                let modParts = cellNew([root]);
-                                let j = cellNew(0);
-                                while (cellGet(j) < totalSegs - 1) {
-                                    let (_, sn) = vecGetOr(segVec, cellGet(j), (f.pos, ""));
-                                    cellSet(modParts, listAppend(cellGet(modParts), [sn]));
-                                    cellSet(j, cellGet(j) + 1)
-                                };
-                                let modCand = strJoin(cellGet(modParts), ".");
-                                if (hasKnownModulePrefix(ctx.allExportKeys, modCand + ".")) {
-                                    cellSet(ctx.errors, listAppend(cellGet(ctx.errors), [
-                                        "item '" + fname + "' not found in module '" + modCand + "'"
-                                    ]));
-                                    Some(ExVar(fname))
-                                } else None
+                                match resolveChainModKeyInMod(ctx, root, segVec, totalSegs - 1, f.pos) {
+                                    Some(modCand) -> {
+                                        cellSet(ctx.errors, listAppend(cellGet(ctx.errors), [
+                                            "item '" + fname + "' not found in module '" + modCand + "'"
+                                        ]));
+                                        Some(ExVar(fname))
+                                    },
+                                    None -> None,
+                                }
                             },
                         }
                     }
@@ -857,6 +1368,87 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
     MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, item: newItem }
 }
 
+def collectTyConsExpanded(
+    ty: Type,
+    aliasBodies: StrMap Type,
+    depth: Int,
+    acc: Cell (List String)
+): Void = match ty {
+    TyVoid -> (),
+    TyVar(_) -> (),
+    TyCon(tn) -> {
+        if (depth < 8) {
+            match strMapGet(aliasBodies, tn) {
+                Some(bodyTy) -> collectTyConsExpanded(bodyTy, aliasBodies, depth + 1, acc),
+                None -> cellSet(acc, addUniqueStr(cellGet(acc), tn)),
+            }
+        } else cellSet(acc, addUniqueStr(cellGet(acc), tn))
+    },
+    TyArr(m, ps, r) -> {
+        collectTyConsExpanded(m, aliasBodies, depth, acc);
+        collectTyConsList(ps, aliasBodies, depth, acc);
+        collectTyConsExpanded(r, aliasBodies, depth, acc)
+    },
+    TyTuple(es) -> collectTyConsList(es, aliasBodies, depth, acc),
+    TyComp(b, a) -> {
+        collectTyConsExpanded(b, aliasBodies, depth, acc);
+        collectTyConsExpanded(a, aliasBodies, depth, acc)
+    },
+}
+
+def collectTyConsList(
+    ts: List Type,
+    aliasBodies: StrMap Type,
+    depth: Int,
+    acc: Cell (List String)
+): Void = match ts {
+    Nil -> (),
+    Cons(h, r) -> {
+        collectTyConsExpanded(h, aliasBodies, depth, acc);
+        collectTyConsList(r, aliasBodies, depth, acc)
+    },
+}
+
+def checkOrphanInstance(
+    pkgOwner: String,
+    conceptName: String,
+    typeArgs: List Type,
+    conceptOwners: StrMap String,
+    typeOwners: StrMap String,
+    aliasBodies: StrMap Type
+): Option String =
+    if (pkgOwner == "" || pkgOwner == "__stdlib") None
+    else {
+        let ownsConcept = match strMapGet(conceptOwners, conceptName) {
+            Some(co) -> co == pkgOwner,
+            None -> false,
+        };
+        if (ownsConcept) None
+        else {
+            let tyCons: Cell (List String) = cellNew(Nil);
+            collectTyConsList(typeArgs, aliasBodies, 0, tyCons);
+            let cur = cellNew(cellGet(tyCons));
+            let ownsAnyType = cellNew(false);
+            while (match cellGet(cur) { Nil -> false, _ -> !cellGet(ownsAnyType) }) {
+                match cellGet(cur) {
+                    Cons(tn, r) -> {
+                        match strMapGet(typeOwners, tn) {
+                            Some(to) -> if (to == pkgOwner) cellSet(ownsAnyType, true) else (),
+                            None -> (),
+                        };
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(ownsAnyType)) None
+            else Some(
+                "Orphan instance in package '" + pkgOwner + "': cannot implement foreign concept '"
+                + conceptName + "' for foreign types (define the instance in the package owning the concept or one of its target types)"
+            )
+        }
+    }
+
 def registerExport(
     avail: StrMap NameInfo,
     allExportKeys: Vec String,
@@ -868,31 +1460,32 @@ def registerExport(
 }
 
 def compileLoadedCache(
+    pkgMap: StrMap PkgSpec,
     cache: StrMap LoadedMod,
     orderKeys: Vec String,
-    entryKey: String
+    legacyLibRoots: StrMap Bool
 ): Result (List Def) String = {
-    // 1. Build prefix -> key map & dependency graph
-    let prefixToKey: StrMap String = strMapNew();
-    let totalMods = vecLen(orderKeys);
-    let i0 = cellNew(0);
-    while (cellGet(i0) < totalMods) {
-        let mk = vecGetOr(orderKeys, cellGet(i0), "");
-        strMapInsert(prefixToKey, relativeModulePrefix(mk, entryKey), mk);
-        cellSet(i0, cellGet(i0) + 1)
+    let fallbackRoot = match strMapGet(pkgMap, "") {
+        Some(rp) -> rp,
+        None -> defaultRootPkg(Nil),
     };
+    let totalMods = vecLen(orderKeys);
 
     let depsMap: StrMap (List String) = strMapNew();
     let i1 = cellNew(0);
     while (cellGet(i1) < totalMods) {
         let mk = vecGetOr(orderKeys, cellGet(i1), "");
-        let mPref = relativeModulePrefix(mk, entryKey);
         let deps = cellNew(Nil);
         match strMapGet(cache, mk) {
             Some(m) -> {
+                let curPkg = match strMapGet(pkgMap, m.pkgOwner) {
+                    Some(p) -> p,
+                    None -> fallbackRoot,
+                };
                 if (strMapContains(cache, "std.result") && mk != "std.result" && moduleUsesTry(m.defs)) {
                     cellSet(deps, addUniqueStr(cellGet(deps), "std.result"))
                 } else ();
+
                 let curSub = cellNew(m.submodules);
                 while (match cellGet(curSub) { Nil -> false, _ -> true }) {
                     match cellGet(curSub) {
@@ -903,23 +1496,17 @@ def compileLoadedCache(
                         Nil -> (),
                     }
                 };
-                let curImp = cellNew(m.imports);
-                while (match cellGet(curImp) { Nil -> false, _ -> true }) {
-                    match cellGet(curImp) {
-                        Cons((_, u), r) -> {
-                            let rawMod = importTargetModuleKey(u);
-                            if (rawMod != "") {
-                                let relCand = if (mPref == "") rawMod else mPref + "." + rawMod;
-                                let tkOpt = match strMapGet(prefixToKey, relCand) {
-                                    Some(tk) -> Some(tk),
-                                    None -> strMapGet(prefixToKey, rawMod),
-                                };
-                                match tkOpt {
-                                    Some(tk) -> if (tk != mk) cellSet(deps, addUniqueStr(cellGet(deps), tk)) else (),
-                                    None -> (),
-                                }
-                            } else ();
-                            cellSet(curImp, r)
+
+                let cands = collectCandidateModPathsFromMod(m);
+                let cc = cellNew(cands);
+                while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                    match cellGet(cc) {
+                        Cons(segs, rc) -> {
+                            match translateModSegsForPkg(curPkg, mk, segs, cache, legacyLibRoots) {
+                                Some(tk) -> if (tk != mk) cellSet(deps, addUniqueStr(cellGet(deps), tk)) else (),
+                                None -> (),
+                            };
+                            cellSet(cc, rc)
                         },
                         Nil -> (),
                     }
@@ -942,18 +1529,20 @@ def compileLoadedCache(
     topoVisitList(cellGet(allKeyList), depsMap, stateMap, topoOut)?;
     let topoKeys = cellGet(topoOut);
 
-    // 2. Register module exports & own renames
     let avail: StrMap NameInfo = strMapNew();
     let allExportKeys: Vec String = vecNew();
     let modOwnVals: StrMap (List (String, String)) = strMapNew();
     let modOwnTys: StrMap (List (String, String)) = strMapNew();
     let modOwnCtors: StrMap (List (String, String)) = strMapNew();
+    let conceptOwners: StrMap String = strMapNew();
+    let typeOwners: StrMap String = strMapNew();
+    let aliasBodies: StrMap Type = strMapNew();
 
     let curT = cellNew(topoKeys);
     while (match cellGet(curT) { Nil -> false, _ -> true }) {
         match cellGet(curT) {
             Cons(mk, rT) -> {
-                let pref = relativeModulePrefix(mk, entryKey);
+                let pref = mk;
                 let ownV = cellNew(Nil);
                 let ownT = cellNew(Nil);
                 let ownC = cellNew(Nil);
@@ -964,12 +1553,17 @@ def compileLoadedCache(
                             match cellGet(curD) {
                                 Cons((vis, d), rD) -> {
                                     let orig = d.ident;
-                                    let qname = if (pref == "") orig else pref + "." + orig;
+                                    let qname = joinKeyPrefix(pref, orig);
                                     registerExport(avail, allExportKeys, qname, MkNameInfo {
                                         qualifiedName: qname,
                                         isPublic: isPublicVis(vis),
                                         definedInMod: pref,
                                     });
+                                    match d.item {
+                                        ItAlg(_, _) -> strMapInsert(typeOwners, qname, m.pkgOwner),
+                                        ItConcept(_, _, _, _) -> strMapInsert(conceptOwners, qname, m.pkgOwner),
+                                        _ -> (),
+                                    };
                                     if (pref != "") {
                                         cellSet(ownV, listAppend(cellGet(ownV), [(orig, qname)]));
                                         match d.item {
@@ -986,7 +1580,7 @@ def compileLoadedCache(
                                             while (match cellGet(curV) { Nil -> false, _ -> true }) {
                                                 match cellGet(curV) {
                                                     Cons(vd, rV) -> {
-                                                        let qctor = if (pref == "") vd.vname else pref + "." + vd.vname;
+                                                        let qctor = joinKeyPrefix(pref, vd.vname);
                                                         registerExport(avail, allExportKeys, qctor, MkNameInfo {
                                                             qualifiedName: qctor,
                                                             isPublic: isPublicVis(vis),
@@ -1007,7 +1601,7 @@ def compileLoadedCache(
                                             while (match cellGet(curM) { Nil -> false, _ -> true }) {
                                                 match cellGet(curM) {
                                                     Cons(md, rM) -> {
-                                                        let qm = if (pref == "") md.mname else pref + "." + md.mname;
+                                                        let qm = joinKeyPrefix(pref, md.mname);
                                                         registerExport(avail, allExportKeys, qm, MkNameInfo {
                                                             qualifiedName: qm,
                                                             isPublic: isPublicVis(vis),
@@ -1041,7 +1635,6 @@ def compileLoadedCache(
         }
     };
 
-    // Built-in concurrent handle exports from std.{sync,task,actor}
     if (strMapContains(cache, "std.sync")) {
         registerExport(avail, allExportKeys, "std.sync.AtomicInt", MkNameInfo { qualifiedName: "AtomicInt", isPublic: true, definedInMod: "std.sync" });
         registerExport(avail, allExportKeys, "std.sync.MVar", MkNameInfo { qualifiedName: "MVar", isPublic: true, definedInMod: "std.sync" });
@@ -1054,7 +1647,6 @@ def compileLoadedCache(
         registerExport(avail, allExportKeys, "std.actor.Actor", MkNameInfo { qualifiedName: "Actor", isPublic: true, definedInMod: "std.actor" })
     } else ();
 
-    // 3. Resolve imports per module in topological order, handle `pub use`, desugar `?`, and rewrite AST!
     let outDefs: Cell (List Def) = cellNew(Nil);
     let curM2 = cellNew(topoKeys);
     let errFinal: Cell (Option String) = cellNew(None);
@@ -1064,10 +1656,14 @@ def compileLoadedCache(
             Cons(mk, rM2) -> {
                 match strMapGet(cache, mk) {
                     Some(m) -> {
-                        let pref = relativeModulePrefix(mk, entryKey);
-                        match resolveModuleImports(m.imports, pref, avail, allExportKeys) {
+                        let pref = mk;
+                        let curPkg = match strMapGet(pkgMap, m.pkgOwner) {
+                            Some(p) -> p,
+                            None -> fallbackRoot,
+                        };
+                        match resolveModuleImports(m.imports, curPkg, pref, cache, legacyLibRoots, avail, allExportKeys) {
                             Err(e) -> cellSet(errFinal, Some(e)),
-                            Ok(impPairs) -> {
+                            Ok((impPairs, modAliasPairs)) -> {
                                 let imapLookup: StrMap String = strMapNew();
                                 let curIP = cellNew(impPairs);
                                 while (match cellGet(curIP) { Nil -> false, _ -> true }) {
@@ -1080,7 +1676,6 @@ def compileLoadedCache(
                                     }
                                 };
 
-                                // Handle `pub use` re-exports
                                 let curPU = cellNew(m.imports);
                                 while (match cellGet(curPU) { Nil -> false, _ -> true }) {
                                     match cellGet(curPU) {
@@ -1090,7 +1685,7 @@ def compileLoadedCache(
                                                     let nm = listLastOr(p, "");
                                                     match strMapGet(imapLookup, nm) {
                                                         Some(tq) -> {
-                                                            let ek = if (pref == "") nm else pref + "." + nm;
+                                                            let ek = joinKeyPrefix(pref, nm);
                                                             registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
                                                         },
                                                         None -> (),
@@ -1098,7 +1693,7 @@ def compileLoadedCache(
                                                 },
                                                 UseAlias(_, al) -> match strMapGet(imapLookup, al) {
                                                     Some(tq) -> {
-                                                        let ek = if (pref == "") al else pref + "." + al;
+                                                        let ek = joinKeyPrefix(pref, al);
                                                         registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
                                                     },
                                                     None -> (),
@@ -1111,7 +1706,7 @@ def compileLoadedCache(
                                                                 let ln = useSpecLocalName(sp);
                                                                 match strMapGet(imapLookup, ln) {
                                                                     Some(tq) -> {
-                                                                        let ek = if (pref == "") ln else pref + "." + ln;
+                                                                        let ek = joinKeyPrefix(pref, ln);
                                                                         registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
                                                                     },
                                                                     None -> (),
@@ -1127,7 +1722,7 @@ def compileLoadedCache(
                                                     while (match cellGet(curG) { Nil -> false, _ -> true }) {
                                                         match cellGet(curG) {
                                                             Cons((ln, tq), rG) -> {
-                                                                let ek = if (pref == "") ln else pref + "." + ln;
+                                                                let ek = joinKeyPrefix(pref, ln);
                                                                 if (!strMapContains(avail, ek)) {
                                                                     registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
                                                                 } else ();
@@ -1148,6 +1743,18 @@ def compileLoadedCache(
                                 let valMap: StrMap String = strMapNew();
                                 let tyMap: StrMap String = strMapNew();
                                 let ctorMap: StrMap String = strMapNew();
+                                let modAliasMap: StrMap String = strMapNew();
+
+                                let curMA = cellNew(modAliasPairs);
+                                while (match cellGet(curMA) { Nil -> false, _ -> true }) {
+                                    match cellGet(curMA) {
+                                        Cons((al, cm), rMA) -> {
+                                            strMapInsert(modAliasMap, al, cm);
+                                            cellSet(curMA, rMA)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
 
                                 let curP = cellNew(impPairs);
                                 while (match cellGet(curP) { Nil -> false, _ -> true }) {
@@ -1203,10 +1810,14 @@ def compileLoadedCache(
 
                                 let errsCell: Cell (List String) = cellNew(Nil);
                                 let rctx = MkModRewriteCtx {
+                                    curPkg: curPkg,
                                     curPrefix: pref,
                                     valMap: valMap,
                                     tyMap: tyMap,
                                     ctorMap: ctorMap,
+                                    modAliasMap: modAliasMap,
+                                    cache: cache,
+                                    legacyLibRoots: legacyLibRoots,
                                     avail: avail,
                                     allExportKeys: allExportKeys,
                                     errors: errsCell,
@@ -1218,6 +1829,17 @@ def compileLoadedCache(
                                         Cons((_, rawDef), rDef) -> {
                                             let desugared = desugarTryInDef(rawDef, okCtor, errCtor);
                                             let rw = rewriteDefInMod(rctx, desugared);
+                                            match rw.item {
+                                                ItAlias(_, ScmMono(bodyTy)) -> strMapInsert(aliasBodies, rw.ident, bodyTy),
+                                                ItAlias(_, ScmPoly(_, bodyTy)) -> strMapInsert(aliasBodies, rw.ident, bodyTy),
+                                                ItInstance(qcn, qtargs, _, _) -> {
+                                                    match checkOrphanInstance(m.pkgOwner, qcn, qtargs, conceptOwners, typeOwners, aliasBodies) {
+                                                        Some(oerr) -> cellSet(errsCell, listAppend(cellGet(errsCell), [oerr])),
+                                                        None -> (),
+                                                    }
+                                                },
+                                                _ -> (),
+                                            };
                                             cellSet(outDefs, listAppend(cellGet(outDefs), [rw]));
                                             cellSet(curDefs, rDef)
                                         },
@@ -1246,20 +1868,61 @@ def compileLoadedCache(
     }
 }
 
-pub def loadSingleSourceProgramWithLibs(src: String, libPaths: List String): Result (List Def) String = {
+def buildPkgMap(rootPkg: PkgSpec, extPkgs: List PkgSpec): StrMap PkgSpec = {
+    let mp: StrMap PkgSpec = strMapNew();
+    strMapInsert(mp, "", rootPkg);
+    let cur = cellNew(extPkgs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                strMapInsert(mp, p.pkgId, p);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    mp
+}
+
+def computeRootSrcDirs(entryFile: String, srcRoot: String): List String = {
+    let entryDir = pathDirname(entryFile);
+    let dirs = cellNew(Nil);
+    if (entryDir != "" && entryDir != ".") {
+        cellSet(dirs, addUniqueStr(cellGet(dirs), entryDir))
+    } else ();
+    if (srcRoot != "") {
+        cellSet(dirs, addUniqueStr(cellGet(dirs), srcRoot))
+    } else ();
+    match cellGet(dirs) {
+        Nil -> ["."],
+        ds -> ds,
+    }
+}
+
+pub def loadSingleSourceProgramWithPkgs(
+    src: String,
+    rootPkg: PkgSpec,
+    extPkgs: List PkgSpec,
+    libPaths: List String
+): Result (List Def) String = {
+    let pkgMap = buildPkgMap(rootPkg, extPkgs);
     let cache: StrMap LoadedMod = strMapNew();
     let orderKeys: Vec String = vecNew();
+    let legacyLibRoots: StrMap Bool = strMapNew();
+
     let fm = parseFileModule(src, Nil)?;
     let inlines: Cell (List LoadedMod) = cellNew(Nil);
-    let (defs, imps, subs) = extractModuleItems(Nil, fm.items, inlines);
+    let (defs, imps, subs) = extractModuleItems("", Nil, fm.items, inlines);
     strMapInsert(cache, "", MkLoadedMod {
         key: "",
+        pkgOwner: "",
         modPath: Nil,
         defs: defs,
         imports: imps,
         submodules: subs,
     });
     vecPush(orderKeys, "");
+
     let curInl = cellNew(cellGet(inlines));
     while (match cellGet(curInl) { Nil -> false, _ -> true }) {
         match cellGet(curInl) {
@@ -1271,21 +1934,37 @@ pub def loadSingleSourceProgramWithLibs(src: String, libPaths: List String): Res
             Nil -> (),
         }
     };
-    loadBuiltinAndLibImports(cache, orderKeys, libPaths)?;
-    compileLoadedCache(cache, orderKeys, "")
+
+    loadExplicitSubmodules(rootPkg, subs, pkgMap, cache, orderKeys, [""])?;
+    loadAllReachableModules(pkgMap, cache, orderKeys, libPaths, legacyLibRoots)?;
+    compileLoadedCache(pkgMap, cache, orderKeys, legacyLibRoots)
 }
+
+pub def loadProjectProgramWithPkgs(
+    entryFile: String,
+    rootPkg: PkgSpec,
+    extPkgs: List PkgSpec,
+    libPaths: List String
+): Result (List Def) String = {
+    let pkgMap = buildPkgMap(rootPkg, extPkgs);
+    let cache: StrMap LoadedMod = strMapNew();
+    let orderKeys: Vec String = vecNew();
+    let legacyLibRoots: StrMap Bool = strMapNew();
+
+    loadCanonicalFileModRec(rootPkg, "", entryFile, pkgMap, cache, orderKeys, Nil)?;
+    loadAllReachableModules(pkgMap, cache, orderKeys, libPaths, legacyLibRoots)?;
+    compileLoadedCache(pkgMap, cache, orderKeys, legacyLibRoots)
+}
+
+pub def loadSingleSourceProgramWithLibs(src: String, libPaths: List String): Result (List Def) String =
+    loadSingleSourceProgramWithPkgs(src, defaultRootPkg(Nil), Nil, libPaths)
 
 pub def loadSingleSourceProgram(src: String): Result (List Def) String =
     loadSingleSourceProgramWithLibs(src, Nil)
 
 pub def loadProjectProgramWithLibs(entryFile: String, srcRoot: String, libPaths: List String): Result (List Def) String = {
-    let cache: StrMap LoadedMod = strMapNew();
-    let orderKeys: Vec String = vecNew();
-    let entrySegs = entryPathToSegments(entryFile, srcRoot);
-    let entryKey = strJoin(entrySegs, ".");
-    loadFileModuleRec(srcRoot, entrySegs, cache, orderKeys, Nil)?;
-    loadBuiltinAndLibImports(cache, orderKeys, libPaths)?;
-    compileLoadedCache(cache, orderKeys, entryKey)
+    let rootDirs = computeRootSrcDirs(entryFile, srcRoot);
+    loadProjectProgramWithPkgs(entryFile, defaultRootPkg(rootDirs), Nil, libPaths)
 }
 
 pub def loadProjectProgram(entryFile: String, srcRoot: String): Result (List Def) String =

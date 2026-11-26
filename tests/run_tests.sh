@@ -974,4 +974,308 @@ EOF
 "$GEISHA_BIN" --lib-path "$TMP_DIR/extlib" --src-root "$TMP_DIR/extapp" -o "$TMP_DIR/t15_proj_lib" "$TMP_DIR/extapp/src/mod.gsa"
 assert_eq "lib_path_project_mode" "(100,220)" "$("$TMP_DIR/t15_proj_lib")"
 
+# 16. Standard library `std.sha256` (NIST FIPS 180-4 vectors) & `std.toml` v1.0 + `std.codec` roundtrip
+cat > "$TMP_DIR/t16_toml_sha.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use std.sha256.{sha256New, sha256Update, sha256FinishHex, sha256Hex}
+use std.toml.{parse, stringify, decodeString}
+use std.codec.{succeed, (|>), req, at, str, int, bool, list, map, formatErr}
+use std.str.intToStr
+
+data ManifestSample {
+    MkManifestSample {
+        msName: String,
+        msPort: Int,
+        msDepUrl: String,
+        msOwnsMain: Bool,
+        msExports: List String,
+        msLockSha: String,
+    },
+}
+
+def main(): Void = {
+    let hEmpty = sha256Hex("");
+    let hAbc = sha256Hex("abc");
+    let hMulti = sha256Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    let sctx = sha256New();
+    sha256Update(sctx, "abcdbcdecdefdefgefghfghighij");
+    sha256Update(sctx, "hijkijkljklmklmnlmnomnopnopq");
+    let hStream = sha256FinishHex(sctx);
+
+    let shaOk =
+        hEmpty == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        && hAbc == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        && hMulti == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        && hStream == hMulti;
+
+    let doc = "# Sample TOML v1.0\nname = \"kagura\"\nport = 0x1f_90\n\n[deps]\n\"github.com/geisha-lang/codec\" = { git = 'github.com/geisha-lang/codec', version = \"0.2.0\" }\n\n[target.native]\nowns_main = true\nexports = [\n  \"kagura_init\", # inline comment\n  \"kagura_step\",\n]\n\n[[pkg]]\nname = \"codec\"\nsha256 = \"9f86d081\"\n";
+
+    let dec = succeed((nm) -> (pt) -> (du) -> (om) -> (ex) -> (ls) -> MkManifestSample {
+        msName: nm, msPort: pt, msDepUrl: du, msOwnsMain: om, msExports: ex, msLockSha: ls
+    })
+        |> req("name", str)
+        |> req("port", int)
+        |> req("deps", at("github.com/geisha-lang/codec", at("git", str)))
+        |> req("target", at("native", at("owns_main", bool)))
+        |> req("target", at("native", at("exports", list(str))))
+        |> req("pkg", map((xs) -> match xs { Cons(h, _) -> h, Nil -> "" }, list(at("sha256", str))));
+
+    match parse(doc) {
+        Err(pe) -> printLn("parse-err:" + pe),
+        Ok(val) -> {
+            let rt = stringify(val);
+            match decodeString(dec, rt) {
+                Err(de) -> printLn("decode-err:" + formatErr(de)),
+                Ok(ms) -> printLn(
+                    (if (shaOk) "sha-ok" else "sha-bad")
+                    + "|" + ms.msName
+                    + "|" + intToStr(ms.msPort)
+                    + "|" + ms.msDepUrl
+                    + "|" + ms.msLockSha
+                ),
+            }
+        },
+    }
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t16_toml_sha" "$TMP_DIR/t16_toml_sha.gsa"
+assert_eq "stdlib_sha256_and_toml_roundtrip" "sha-ok|kagura|8080|github.com/geisha-lang/codec|9f86d081" "$("$TMP_DIR/t16_toml_sha")"
+
+# 17. `mod`-free demand-driven module loader + sibling umbrella (`stage.gsa` + `stage/ik.gsa`) + module aliasing + dead-file skip
+mkdir -p "$TMP_DIR/modfree/src/stage"
+cat > "$TMP_DIR/modfree/src/stage/ik.gsa" << 'EOF'
+pub def solveReach(a: Int, b: Int): Int = a + b
+EOF
+cat > "$TMP_DIR/modfree/src/stage.gsa" << 'EOF'
+pub open stage.ik
+pub def stageScale(v: Int): Int = v * 3
+EOF
+# Unreferenced broken file must NOT be loaded under demand-driven `use` resolution!
+cat > "$TMP_DIR/modfree/src/unused_dead.gsa" << 'EOF'
+this file has intentional syntax errors and is never imported! @@@
+EOF
+cat > "$TMP_DIR/modfree/src/main.gsa" << 'EOF'
+use stage.{solveReach, stageScale}
+use stage.ik as ikMod
+
+def main(): Void = {
+    let v = stageScale(solveReach(4, 6)) + ikMod.solveReach(1, 2);
+    printLn("modfree:" + std.str.intToStr(v))
+}
+EOF
+"$GEISHA_BIN" --src-root "$TMP_DIR/modfree/src" -o "$TMP_DIR/t17_modfree" "$TMP_DIR/modfree/src/main.gsa"
+assert_eq "mod_free_demand_loader_and_sibling_umbrella" "modfree:33" "$("$TMP_DIR/t17_modfree")"
+
+# 18. Decentralized Package Manager (`geisha init/add/fetch/build/run/test`, MVS, static Git index, C host, lockfile tamper check, overrides & Orphan Rule)
+export GEISHA_HOME="$TMP_DIR/ghome"
+export GEISHA_INDEX="$TMP_DIR/pkg_index.git"
+
+# 18a. Create Git repo `core_math` with tags `v0.1.0` (scale=10) and `v0.2.0` (scale=100)
+mkdir -p "$TMP_DIR/repos/core_math_work/src"
+cat > "$TMP_DIR/repos/core_math_work/geisha.toml" << 'EOF'
+name = "core_math"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/repos/core_math_work/src/vec.gsa" << 'EOF'
+pub data Vec2 {
+    MkVec2 { vx: Int, vy: Int },
+}
+pub def scaleSum(v: Vec2): Int = (v.vx + v.vy) * 10
+EOF
+cat > "$TMP_DIR/repos/core_math_work/src/core_math.gsa" << 'EOF'
+pub open core_math.vec
+EOF
+git -C "$TMP_DIR/repos/core_math_work" init -q
+git -C "$TMP_DIR/repos/core_math_work" config user.email "test@geisha.local"
+git -C "$TMP_DIR/repos/core_math_work" config user.name "Geisha Test"
+git -C "$TMP_DIR/repos/core_math_work" add .
+git -C "$TMP_DIR/repos/core_math_work" commit -q -m "release v0.1.0"
+git -C "$TMP_DIR/repos/core_math_work" tag v0.1.0
+
+cat > "$TMP_DIR/repos/core_math_work/geisha.toml" << 'EOF'
+name = "core_math"
+version = "0.2.0"
+EOF
+cat > "$TMP_DIR/repos/core_math_work/src/vec.gsa" << 'EOF'
+pub data Vec2 {
+    MkVec2 { vx: Int, vy: Int },
+}
+pub def scaleSum(v: Vec2): Int = (v.vx + v.vy) * 100
+EOF
+git -C "$TMP_DIR/repos/core_math_work" add .
+git -C "$TMP_DIR/repos/core_math_work" commit -q -m "release v0.2.0"
+git -C "$TMP_DIR/repos/core_math_work" tag v0.2.0
+git clone --bare -q "$TMP_DIR/repos/core_math_work" "$TMP_DIR/repos/core_math.git"
+
+# 18b. Create Git repo `ui_kit` depending on `core_math` 0.2.0 + custom C `main()` host + exported Geisha callback!
+mkdir -p "$TMP_DIR/repos/ui_kit_work/src" "$TMP_DIR/repos/ui_kit_work/host"
+cat > "$TMP_DIR/repos/ui_kit_work/geisha.toml" << EOF
+name = "ui_kit"
+version = "0.1.0"
+
+[deps]
+core_math = { git = "file://$TMP_DIR/repos/core_math.git", version = "0.2.0" }
+
+[target.native]
+c_sources = ["host/bridge.c"]
+exports = ["ui_render_frame"]
+owns_main = true
+boot_symbol = "__geisha_ui_boot"
+EOF
+cat > "$TMP_DIR/repos/ui_kit_work/src/widget.gsa" << 'EOF'
+use core_math.{MkVec2, scaleSum}
+pub def computeLayout(n: Int): Int = scaleSum(MkVec2 { vx: n, vy: 0 })
+EOF
+cat > "$TMP_DIR/repos/ui_kit_work/host/bridge.c" << 'EOF'
+#include <stdio.h>
+#include <stdint.h>
+extern void gc_init_with_stack(int64_t heap_words, void *stack_anchor);
+extern void gc_enable_generational(void);
+extern void __geisha_ui_boot(void);
+extern int32_t ui_render_frame(int32_t input, void *fv);
+
+int main(void) {
+    int64_t anchor = 0;
+    gc_init_with_stack(65536, &anchor);
+    gc_enable_generational();
+    __geisha_ui_boot();
+    int32_t out = ui_render_frame(7, (void *)0);
+    printf("native-host:%d\n", out);
+    return 0;
+}
+EOF
+git -C "$TMP_DIR/repos/ui_kit_work" init -q
+git -C "$TMP_DIR/repos/ui_kit_work" config user.email "test@geisha.local"
+git -C "$TMP_DIR/repos/ui_kit_work" config user.name "Geisha Test"
+git -C "$TMP_DIR/repos/ui_kit_work" add .
+git -C "$TMP_DIR/repos/ui_kit_work" commit -q -m "release v0.1.0"
+git -C "$TMP_DIR/repos/ui_kit_work" tag v0.1.0
+git clone --bare -q "$TMP_DIR/repos/ui_kit_work" "$TMP_DIR/repos/ui_kit.git"
+
+# 18c. Create Static Git Index repo (`$GEISHA_INDEX`)
+mkdir -p "$TMP_DIR/repos/index_work/packages/c" "$TMP_DIR/repos/index_work/packages/u"
+cat > "$TMP_DIR/repos/index_work/packages/c/core_math.toml" << EOF
+git = "file://$TMP_DIR/repos/core_math.git"
+EOF
+cat > "$TMP_DIR/repos/index_work/packages/u/ui_kit.toml" << EOF
+git = "file://$TMP_DIR/repos/ui_kit.git"
+EOF
+git -C "$TMP_DIR/repos/index_work" init -q
+git -C "$TMP_DIR/repos/index_work" config user.email "test@geisha.local"
+git -C "$TMP_DIR/repos/index_work" config user.name "Geisha Test"
+git -C "$TMP_DIR/repos/index_work" add .
+git -C "$TMP_DIR/repos/index_work" commit -q -m "init static index"
+git clone --bare -q "$TMP_DIR/repos/index_work" "$GEISHA_INDEX"
+
+# 18d. Scaffold `demo_app` with `geisha init`, add `core_math@0.1.0` + `ui_kit` (MVS upgrades `core_math` to `0.2.0`!)
+ABS_GEISHA="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RUNTIME="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+export GEISHA_RUNTIME="$ABS_RUNTIME"
+
+"$ABS_GEISHA" init "$TMP_DIR/demo_app" >/dev/null
+(
+    cd "$TMP_DIR/demo_app"
+    "$ABS_GEISHA" add core_math --version 0.1.0 >/dev/null
+    "$ABS_GEISHA" add ui_kit >/dev/null
+)
+cat > "$TMP_DIR/demo_app/src/main.gsa" << 'EOF'
+use core_math.{MkVec2, scaleSum}
+use ui_kit.widget.computeLayout
+
+def bootBias: Cell Int = cellNew(0)
+
+def main(): Void = cellSet(bootBias, 5)
+
+pub def ui_render_frame(n: Int): Int =
+    computeLayout(n) + scaleSum(MkVec2 { vx: 0, vy: 1 }) + cellGet(bootBias)
+EOF
+
+APP_OUT="$(cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" run)"
+assert_eq "pkg_mvs_upgrade_and_native_host" "native-host:805" "$APP_OUT"
+
+# 18e. Delete ALL Git remotes & bare git DBs — verify 100% offline build from content-addressed cache + `geisha.lock`!
+rm -rf "$TMP_DIR/repos" "$GEISHA_HOME/git" "$TMP_DIR/demo_app/build"
+OFFLINE_OUT="$(cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" run)"
+assert_eq "pkg_offline_content_addressed_build" "native-host:805" "$OFFLINE_OUT"
+
+# 18f. Tamper 1 file inside content-addressed cache -> must fail SHA-256 integrity check!
+CACHED_VEC="$(find "$GEISHA_HOME/cache/p" -path "*0_2_0*" -name "vec.gsa" | head -n 1)"
+cp "$CACHED_VEC" "$TMP_DIR/vec.gsa.bak"
+printf "\n// tampered\n" >> "$CACHED_VEC"
+rm -rf "$TMP_DIR/demo_app/build"
+if (cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" build >/dev/null 2>&1); then
+    echo "FAIL [pkg_lockfile_tamper_rejected]: tampered cache was accepted!" >&2
+    exit 1
+fi
+echo "PASS [pkg_lockfile_tamper_rejected]: rejected tampered cache via geisha.lock sha256"
+PASS=$((PASS + 1))
+mv "$TMP_DIR/vec.gsa.bak" "$CACHED_VEC"
+
+# 18g. Local development override via `geisha.local.toml` (`[overrides]`) without modifying `geisha.lock`!
+mkdir -p "$TMP_DIR/local_math/src"
+cat > "$TMP_DIR/local_math/geisha.toml" << 'EOF'
+name = "core_math"
+version = "0.3.0-dev"
+EOF
+cat > "$TMP_DIR/local_math/src/vec.gsa" << 'EOF'
+pub data Vec2 {
+    MkVec2 { vx: Int, vy: Int },
+}
+pub def scaleSum(v: Vec2): Int = (v.vx + v.vy) * 1000
+EOF
+cat > "$TMP_DIR/local_math/src/core_math.gsa" << 'EOF'
+pub open core_math.vec
+EOF
+LOCK_BEFORE="$(cat "$TMP_DIR/demo_app/geisha.lock")"
+cat > "$TMP_DIR/demo_app/geisha.local.toml" << EOF
+[overrides]
+core_math = { path = "$TMP_DIR/local_math" }
+EOF
+OVERRIDE_OUT="$(cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" run)"
+LOCK_AFTER="$(cat "$TMP_DIR/demo_app/geisha.lock")"
+assert_eq "pkg_local_toml_override" "native-host:8005" "$OVERRIDE_OUT"
+assert_eq "pkg_local_override_preserves_lockfile" "$LOCK_BEFORE" "$LOCK_AFTER"
+rm -f "$TMP_DIR/demo_app/geisha.local.toml"
+
+# 18h. `geisha init --lib` + `geisha test`
+"$ABS_GEISHA" init --lib "$TMP_DIR/sample_lib" >/dev/null
+LIB_TEST_OUT="$(cd "$TMP_DIR/sample_lib" && "$ABS_GEISHA" test | tail -n 1)"
+assert_eq "pkg_init_lib_and_test" "All 1 test target(s) passed." "$LIB_TEST_OUT"
+
+# 18i. Hermetic phantom dependency rejection (`demo_app` drops `core_math` from `[deps]` while `ui_kit` still depends on it)
+(cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" remove core_math >/dev/null)
+if (cd "$TMP_DIR/demo_app" && "$ABS_GEISHA" build >/dev/null 2>&1); then
+    echo "FAIL [pkg_phantom_dep_rejected]: undeclared transitive import was accepted!" >&2
+    exit 1
+fi
+echo "PASS [pkg_phantom_dep_rejected]: blocked undeclared transitive dependency import"
+PASS=$((PASS + 1))
+
+# 18j. Cross-package Orphan Instance Rule rejection
+mkdir -p "$TMP_DIR/rogue_lib/src" "$TMP_DIR/orphan_app/src"
+cat > "$TMP_DIR/rogue_lib/src/bad.gsa" << 'EOF'
+use std.codec.{Encode, VInt}
+use core_math.Vec2
+
+// Neither `Encode` (stdlib) nor `Vec2` (`core_math`) belongs to `rogue_lib`!
+instance Encode Vec2 {
+    def encode(v) = VInt(intToI64(v.vx))
+}
+pub def touch(): Int = 1
+EOF
+cat > "$TMP_DIR/orphan_app/src/main.gsa" << 'EOF'
+use rogue_lib.bad.touch
+def main(): Void = printLn(std.str.intToStr(touch()))
+EOF
+if "$ABS_GEISHA" --src-root "$TMP_DIR/orphan_app/src" \
+    --pkg "core_math=$TMP_DIR/local_math/src" \
+    --pkg "rogue_lib=$TMP_DIR/rogue_lib/src" \
+    --dep "rogue_lib:core_math=core_math" \
+    -o "$TMP_DIR/orphan_bin" "$TMP_DIR/orphan_app/src/main.gsa" 2>/dev/null; then
+    echo "FAIL [pkg_orphan_instance_rejected]: foreign orphan instance was accepted!" >&2
+    exit 1
+fi
+echo "PASS [pkg_orphan_instance_rejected]: rejected cross-package orphan instance"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

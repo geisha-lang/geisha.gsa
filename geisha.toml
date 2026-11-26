@@ -1,0 +1,4 @@
+# Self-hosting Geisha compiler & decentralized package manager
+name = "geisha"
+version = "0.2.0"
+entry = "src/geisha.gsa"
