@@ -26,6 +26,12 @@
 #define THR_RUNNING      0
 #define THR_BLOCKED      1
 #define THR_PARKED       2
+#define THR_IDLE         3
+
+#define GC_NURSERY_SIZE       (256u * 1024u)
+#define GC_NURSERY_SLOTS      (GC_NURSERY_SIZE >> 3)
+#define GC_NURSERY_BMAP_WORDS (GC_NURSERY_SLOTS >> 6)
+#define GC_NURSERY_MAX_BYTES  512u
 
 #define PAGE_LIST_NONE    0
 #define PAGE_LIST_UNSWEPT 1
@@ -56,11 +62,26 @@ static uint8_t _words_to_class[513];
 static uint32_t _class_inv_mul[GC_NUM_CLASSES];
 static bool _tables_inited = false;
 
+typedef struct gc_nursery_t {
+    struct gc_nursery_t *next;
+    struct gc_nursery_t *prev;
+    uintptr_t base;
+    uintptr_t cur;
+    uintptr_t end;
+    uint32_t live_count;
+    bool owned;
+    uint64_t alloc_bits[GC_NURSERY_BMAP_WORDS];
+    uint64_t mark_bits[GC_NURSERY_BMAP_WORDS];
+} gc_nursery_t;
+
 typedef struct gc_thread_t {
     uintptr_t root_start;
     uintptr_t safepoint_sp;
     jmp_buf safepoint_regs;
-    int32_t state; /* atomic: THR_RUNNING / THR_BLOCKED / THR_PARKED */
+    int32_t state; /* atomic: THR_RUNNING / THR_BLOCKED / THR_PARKED / THR_IDLE */
+
+    /* Thread-local 256 KB contiguous bump-pointer nursery (3-instr fast alloc + O(1) reset) */
+    gc_nursery_t *nursery;
 
     /* Thread-local active slab page per size class (100% lock-free allocation fast path) */
     gc_page_t *local_pages[GC_NUM_CLASSES];
@@ -81,6 +102,17 @@ static bool _stw_in_progress = false;
 
 static _Thread_local gc_thread_t *_tls_thread = NULL;
 static gc_thread_t *_threads_head = NULL;
+static pthread_key_t _host_thr_key;
+static pthread_once_t _host_key_once = PTHREAD_ONCE_INIT;
+
+/* Non-moving 256 KB aligned bump-pointer nurseries + O(1) hash table */
+static gc_nursery_t *_nurseries_head = NULL;
+static gc_nursery_t **_nursery_table = NULL;
+static size_t _nursery_table_cap = 0;
+static size_t _nursery_table_mask = 0;
+static size_t _nursery_count = 0;
+static uintptr_t _min_nursery_addr = UINTPTR_MAX;
+static uintptr_t _max_nursery_addr = 0;
 
 /* Aligned 4 MB chunks + O(1) open-addressing hash table */
 static gc_chunk_t *_chunks_head = NULL;
@@ -260,6 +292,175 @@ static void chunk_table_insert_locked(gc_chunk_t *c)
     _chunk_count++;
     if (c->base < _min_chunk_addr) _min_chunk_addr = c->base;
     if (c->base + GC_CHUNK_SIZE > _max_chunk_addr) _max_chunk_addr = c->base + GC_CHUNK_SIZE;
+}
+
+static void chunk_table_remove_locked(gc_chunk_t *c)
+{
+    if (_chunk_table == NULL || _chunk_count == 0) return;
+    size_t mask = _chunk_table_mask;
+    size_t h = chunk_hash(c->base, mask);
+    while (_chunk_table[h] != NULL) {
+        if (_chunk_table[h] == c) {
+            _chunk_table[h] = NULL;
+            _chunk_count--;
+            /* Backward-shift deletion to preserve open-addressing probe chains */
+            size_t next = (h + 1) & mask;
+            while (_chunk_table[next] != NULL) {
+                gc_chunk_t *cur = _chunk_table[next];
+                size_t ideal = chunk_hash(cur->base, mask);
+                if (((next - ideal) & mask) >= ((next - h) & mask)) {
+                    _chunk_table[h] = cur;
+                    _chunk_table[next] = NULL;
+                    h = next;
+                }
+                next = (next + 1) & mask;
+            }
+            return;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+static void reclaim_empty_chunks_locked(size_t keep_min_chunks)
+{
+    gc_chunk_t **pp = &_chunks_head;
+    while (*pp != NULL && _chunk_count > keep_min_chunks) {
+        gc_chunk_t *ch = *pp;
+        bool all_free = true;
+        for (size_t i = ch->first_data_page; i < GC_PAGES_PER_CHUNK; i++) {
+            if (ch->pages[i].state != GC_PAGE_FREE) {
+                all_free = false;
+                break;
+            }
+        }
+        if (all_free) {
+            for (size_t i = ch->first_data_page; i < GC_PAGES_PER_CHUNK; i++) {
+                gc_page_t *p = &ch->pages[i];
+                if (p->list_kind == PAGE_LIST_FREE) {
+                    page_list_remove(&_free_pages, p);
+                    _free_page_count--;
+                }
+            }
+            *pp = ch->next;
+            chunk_table_remove_locked(ch);
+            munmap((void *)ch->base, GC_CHUNK_SIZE);
+        } else {
+            pp = &ch->next;
+        }
+    }
+}
+
+/* ---- O(1) 256 KB-Aligned Bump-Pointer Nursery Hash Table ---- */
+#define GC_NURSERY_SHIFT 18u /* 1 << 18 = 256 KB */
+
+static inline size_t nursery_hash(uintptr_t nbase, size_t mask)
+{
+    return (size_t)((nbase >> GC_NURSERY_SHIFT) * 11400714819323198485ULL) & mask;
+}
+
+static void nursery_table_grow_locked(void)
+{
+    size_t new_cap = (_nursery_table_cap == 0) ? 256 : (_nursery_table_cap * 2);
+    size_t new_mask = new_cap - 1;
+    gc_nursery_t **nt = (gc_nursery_t **)calloc(new_cap, sizeof(gc_nursery_t *));
+    if (nt == NULL) abort();
+    for (size_t i = 0; i < _nursery_table_cap; i++) {
+        gc_nursery_t *n = _nursery_table[i];
+        if (n != NULL) {
+            size_t h = nursery_hash(n->base, new_mask);
+            while (nt[h] != NULL) h = (h + 1) & new_mask;
+            nt[h] = n;
+        }
+    }
+    free(_nursery_table);
+    _nursery_table = nt;
+    _nursery_table_cap = new_cap;
+    _nursery_table_mask = new_mask;
+}
+
+static void nursery_table_insert_locked(gc_nursery_t *n)
+{
+    if (_nursery_count * 2 >= _nursery_table_cap) {
+        nursery_table_grow_locked();
+    }
+    size_t h = nursery_hash(n->base, _nursery_table_mask);
+    while (_nursery_table[h] != NULL) h = (h + 1) & _nursery_table_mask;
+    _nursery_table[h] = n;
+    _nursery_count++;
+    if (n->base < _min_nursery_addr) _min_nursery_addr = n->base;
+    if (n->end > _max_nursery_addr) _max_nursery_addr = n->end;
+}
+
+static void nursery_table_remove_locked(gc_nursery_t *n)
+{
+    if (_nursery_table == NULL || _nursery_count == 0) return;
+    size_t mask = _nursery_table_mask;
+    size_t h = nursery_hash(n->base, mask);
+    while (_nursery_table[h] != NULL) {
+        if (_nursery_table[h] == n) {
+            _nursery_table[h] = NULL;
+            _nursery_count--;
+            size_t next = (h + 1) & mask;
+            while (_nursery_table[next] != NULL) {
+                gc_nursery_t *cur = _nursery_table[next];
+                size_t ideal = nursery_hash(cur->base, mask);
+                if (((next - ideal) & mask) >= ((next - h) & mask)) {
+                    _nursery_table[h] = cur;
+                    _nursery_table[next] = NULL;
+                    h = next;
+                }
+                next = (next + 1) & mask;
+            }
+            return;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+static inline gc_nursery_t *find_nursery(uintptr_t addr)
+{
+    if (_nursery_count == 0 || addr < _min_nursery_addr || addr >= _max_nursery_addr || _nursery_table == NULL) {
+        return NULL;
+    }
+    uintptr_t nbase = addr & ~(uintptr_t)(GC_NURSERY_SIZE - 1);
+    size_t mask = _nursery_table_mask;
+    size_t h = nursery_hash(nbase, mask);
+    for (;;) {
+        gc_nursery_t *n = _nursery_table[h];
+        if (n == NULL) return NULL;
+        if (n->base == nbase) return n;
+        h = (h + 1) & mask;
+    }
+}
+
+static gc_nursery_t *alloc_nursery_locked(void)
+{
+    void *raw = mmap(NULL, GC_NURSERY_SIZE * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (raw == MAP_FAILED) return NULL;
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t aligned = (raw_addr + GC_NURSERY_SIZE - 1) & ~(uintptr_t)(GC_NURSERY_SIZE - 1);
+    size_t lead = aligned - raw_addr;
+    size_t tail = (raw_addr + GC_NURSERY_SIZE * 2) - (aligned + GC_NURSERY_SIZE);
+    if (lead > 0) munmap(raw, lead);
+    if (tail > 0) munmap((void *)(aligned + GC_NURSERY_SIZE), tail);
+
+    gc_nursery_t *n = (gc_nursery_t *)calloc(1, sizeof(gc_nursery_t));
+    if (n == NULL) {
+        munmap((void *)aligned, GC_NURSERY_SIZE);
+        return NULL;
+    }
+    n->base = aligned;
+    n->cur = aligned;
+    n->end = aligned + GC_NURSERY_SIZE;
+    n->live_count = 0;
+    n->owned = true;
+    n->prev = NULL;
+    n->next = _nurseries_head;
+    if (_nurseries_head != NULL) _nurseries_head->prev = n;
+    _nurseries_head = n;
+    nursery_table_insert_locked(n);
+    _bytes_alloc_since_gc += GC_NURSERY_SIZE;
+    return n;
 }
 
 static inline gc_chunk_t *find_chunk(uintptr_t addr)
@@ -589,6 +790,10 @@ void gc_thread_detach(void)
         return;
     }
     pthread_mutex_lock(&_gc_mu);
+    if (thr->nursery != NULL) {
+        thr->nursery->owned = false;
+        thr->nursery = NULL;
+    }
     retire_thread_local_pages_locked(thr);
     if (thr->remset_len > 0) {
         size_t need = _orphan_remset_len + thr->remset_len;
@@ -703,19 +908,13 @@ void gc_write_barrier(void *container_ptr)
         return;
     }
 
-    /* Fast check: is it a small slab object? */
-    gc_chunk_t *chunk = find_chunk(addr);
-    if (__builtin_expect(chunk != NULL, 1)) {
-        size_t pidx = (addr - chunk->base) >> GC_PAGE_SHIFT;
-        if (pidx < chunk->first_data_page) return;
-        gc_page_t *page = &chunk->pages[pidx];
-        if (page->state != GC_PAGE_INUSE) return;
+    /* Fast check: is it a nursery object? */
+    gc_nursery_t *nurs = find_nursery(addr);
+    if (nurs != NULL) {
         uintptr_t hdr_addr = addr - Header_size;
-        if (hdr_addr < page->base) return;
-        size_t off = hdr_addr - page->base;
-        size_t slot_idx = off / page->slot_size;
-        /* Only record if container is in Old generation (`mark_bit == 1`) */
-        if ((page->mark_bits[slot_idx >> 6] & (1ULL << (slot_idx & 63u))) == 0) {
+        if (hdr_addr < nurs->base || hdr_addr >= nurs->cur) return;
+        size_t slot = (hdr_addr - nurs->base) >> 3;
+        if ((nurs->mark_bits[slot >> 6] & (1ULL << (slot & 63u))) == 0) {
             return;
         }
         header_t *hp = (header_t *)hdr_addr;
@@ -724,16 +923,38 @@ void gc_write_barrier(void *container_ptr)
         }
         *hp |= HEADER_REMEMBERED_BIT;
     } else {
-        /* Large object check (e.g. large MutArray of pointers) */
-        gc_large_t *lo = find_large_obj(addr);
-        if (lo == NULL || !lo->marked) {
-            return;
+        /* Fast check: is it a small slab object? */
+        gc_chunk_t *chunk = find_chunk(addr);
+        if (__builtin_expect(chunk != NULL, 1)) {
+            size_t pidx = (addr - chunk->base) >> GC_PAGE_SHIFT;
+            if (pidx < chunk->first_data_page) return;
+            gc_page_t *page = &chunk->pages[pidx];
+            if (page->state != GC_PAGE_INUSE) return;
+            uintptr_t hdr_addr = addr - Header_size;
+            if (hdr_addr < page->base) return;
+            size_t off = hdr_addr - page->base;
+            size_t slot_idx = off / page->slot_size;
+            /* Only record if container is in Old generation (`mark_bit == 1`) */
+            if ((page->mark_bits[slot_idx >> 6] & (1ULL << (slot_idx & 63u))) == 0) {
+                return;
+            }
+            header_t *hp = (header_t *)hdr_addr;
+            if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
+                return;
+            }
+            *hp |= HEADER_REMEMBERED_BIT;
+        } else {
+            /* Large object check (e.g. large MutArray of pointers) */
+            gc_large_t *lo = find_large_obj(addr);
+            if (lo == NULL || !lo->marked) {
+                return;
+            }
+            header_t *hp = (header_t *)(addr - Header_size);
+            if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
+                return;
+            }
+            *hp |= HEADER_REMEMBERED_BIT;
         }
-        header_t *hp = (header_t *)(addr - Header_size);
-        if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
-            return;
-        }
-        *hp |= HEADER_REMEMBERED_BIT;
     }
 
     /* Append to thread-local remembered set */
@@ -1020,6 +1241,81 @@ __attribute__((noinline)) static void *alloc_small_slow(
     return payload;
 }
 
+__attribute__((noinline)) static void *alloc_nursery_slow(
+    size_t size_bytes, size_t payload_words,
+    bool noscan, bool zero_init, bool has_mask, uint64_t ptr_mask)
+{
+    gc_thread_t *self = _tls_thread;
+    jmp_buf regs;
+    bool regs_saved = false;
+    volatile uintptr_t sp_marker = 0;
+    size_t total_bytes = (payload_words + 1) * WORD_SIZE;
+
+    pthread_mutex_lock(&_gc_mu);
+    while (_stw_in_progress) {
+        if (self != NULL) {
+            if (!regs_saved) {
+                _setjmp(regs);
+                regs_saved = true;
+            }
+            memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
+            self->safepoint_sp = (uintptr_t)&sp_marker;
+            __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
+            if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
+        }
+        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        if (self != NULL) __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
+    }
+
+    if (_bytes_alloc_since_gc >= _gc_threshold_bytes) {
+        if (self != NULL) {
+            if (!regs_saved) {
+                _setjmp(regs);
+                regs_saved = true;
+            }
+            memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
+            self->safepoint_sp = (uintptr_t)&sp_marker;
+        }
+        gc_collect_locked(self, false);
+    }
+
+    gc_nursery_t *n = (self != NULL) ? self->nursery : NULL;
+    if (n != NULL && n->cur + total_bytes > n->end) {
+        n->owned = false;
+        self->nursery = NULL;
+        n = NULL;
+    }
+    if (n == NULL) {
+        n = alloc_nursery_locked();
+        if (n == NULL) {
+            pthread_mutex_unlock(&_gc_mu);
+            size_t cls = _words_to_class[payload_words + 1];
+            return alloc_small_slow(size_bytes, payload_words, cls, noscan, zero_init, has_mask, ptr_mask);
+        }
+        if (self != NULL) {
+            self->nursery = n;
+        } else {
+            n->owned = false;
+        }
+    }
+
+    uintptr_t cur = n->cur;
+    n->cur = cur + total_bytes;
+    size_t slot = (cur - n->base) >> 3;
+    n->alloc_bits[slot >> 6] |= (1ULL << (slot & 63u));
+    header_t *hdr = (header_t *)cur;
+    *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
+    pthread_mutex_unlock(&_gc_mu);
+
+    void *payload = (void *)(hdr + 1);
+    if (has_mask) {
+        zero_masked_words(payload, ptr_mask);
+    } else if (zero_init) {
+        zero_payload_words(payload, payload_words);
+    }
+    return payload;
+}
+
 static inline void *gc_alloc_inline(
     size_t size_bytes, bool noscan, bool zero_init, bool has_mask, uint64_t ptr_mask)
 {
@@ -1031,8 +1327,38 @@ static inline void *gc_alloc_inline(
         return alloc_large_object(size_bytes, payload_words, noscan, zero_init, has_mask, ptr_mask);
     }
 
-    size_t cls = _words_to_class[total_words];
     gc_thread_t *self = _tls_thread;
+    /* Fast 3-instruction Bump-Pointer Nursery path for small objects (<= 512 B) */
+    if (__builtin_expect(
+            total_words <= (GC_NURSERY_MAX_BYTES / WORD_SIZE) &&
+            self != NULL &&
+            __atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_RELAXED) == 0,
+            1)) {
+        gc_nursery_t *n = self->nursery;
+        if (__builtin_expect(n != NULL, 1)) {
+            size_t total_bytes = total_words * WORD_SIZE;
+            uintptr_t cur = n->cur;
+            uintptr_t next = cur + total_bytes;
+            if (__builtin_expect(next <= n->end, 1)) {
+                n->cur = next;
+                size_t slot = (cur - n->base) >> 3;
+                n->alloc_bits[slot >> 6] |= (1ULL << (slot & 63u));
+                header_t *hdr = (header_t *)cur;
+                *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
+
+                void *payload = (void *)(hdr + 1);
+                if (has_mask) {
+                    zero_masked_words(payload, ptr_mask);
+                } else if (zero_init) {
+                    zero_payload_words(payload, payload_words);
+                }
+                return payload;
+            }
+        }
+        return alloc_nursery_slow(size_bytes, payload_words, noscan, zero_init, has_mask, ptr_mask);
+    }
+
+    size_t cls = _words_to_class[total_words];
     if (__builtin_expect(
             self != NULL &&
             __atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_RELAXED) == 0,
@@ -1113,6 +1439,26 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
 {
     if (payload_ptr == 0 || (payload_ptr & (WORD_SIZE - 1)) != 0) {
         return false;
+    }
+
+    gc_nursery_t *nurs = find_nursery(payload_ptr);
+    if (nurs != NULL) {
+        uintptr_t hdr_addr = payload_ptr - Header_size;
+        if (hdr_addr < nurs->base || hdr_addr >= nurs->cur) return false;
+        size_t slot = (hdr_addr - nurs->base) >> 3;
+        size_t widx = slot >> 6;
+        uint64_t bit = 1ULL << (slot & 63u);
+        if ((nurs->alloc_bits[widx] & bit) == 0) return false;
+        if ((nurs->mark_bits[widx] & bit) != 0) return false;
+
+        nurs->mark_bits[widx] |= bit;
+        nurs->live_count++;
+        header_t hdr = *(const header_t *)hdr_addr;
+        if (!Is_noscan_hdr(hdr)) {
+            __builtin_prefetch((const void *)payload_ptr, 0, 1);
+            mark_stack_push(hdr_addr, 0, sp);
+        }
+        return true;
     }
 
     gc_chunk_t *chunk = find_chunk(payload_ptr);
@@ -1238,6 +1584,14 @@ bool gc_is_obj_marked(const void *payload_ptr)
     uintptr_t addr = (uintptr_t)payload_ptr;
     if (addr == 0 || (addr & (WORD_SIZE - 1)) != 0) return false;
 
+    gc_nursery_t *nurs = find_nursery(addr);
+    if (nurs != NULL) {
+        uintptr_t hdr_addr = addr - Header_size;
+        if (hdr_addr < nurs->base || hdr_addr >= nurs->cur) return false;
+        size_t slot = (hdr_addr - nurs->base) >> 3;
+        return (nurs->mark_bits[slot >> 6] & (1ULL << (slot & 63u))) != 0;
+    }
+
     gc_chunk_t *chunk = find_chunk(addr);
     if (chunk != NULL) {
         size_t pidx = (addr - chunk->base) >> GC_PAGE_SHIFT;
@@ -1315,6 +1669,10 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                 }
             }
         }
+        for (gc_nursery_t *n = _nurseries_head; n != NULL; n = n->next) {
+            memset(n->mark_bits, 0, sizeof(n->mark_bits));
+            n->live_count = 0;
+        }
         for (gc_large_t *lo = _large_head; lo != NULL; lo = lo->next) {
             lo->marked = false;
         }
@@ -1333,8 +1691,11 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         _orphan_remset_len = 0;
     }
 
-    /* 1. Mark roots across all registered threads (saved registers + stack ranges) */
+    /* 1. Mark roots across all active registered threads (skip THR_IDLE foreign host threads) */
     for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
+        if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == THR_IDLE) {
+            continue;
+        }
         const uintptr_t *reg_words = (const uintptr_t *)&t->safepoint_regs;
         size_t reg_count = sizeof(jmp_buf) / sizeof(uintptr_t);
         size_t sp = 0;
@@ -1431,6 +1792,46 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         }
     }
 
+    /* 6b. Sweep & O(1)-reset bump-pointer nurseries; munmap dead retired nurseries */
+    {
+        gc_nursery_t *n = _nurseries_head;
+        while (n != NULL) {
+            gc_nursery_t *next = n->next;
+            if (n->live_count == 0) {
+                if (n->owned) {
+                    /* All young objects in this nursery died: O(1) Arena reset! */
+                    n->cur = n->base;
+                    memset(n->alloc_bits, 0, sizeof(n->alloc_bits));
+                    memset(n->mark_bits, 0, sizeof(n->mark_bits));
+                } else {
+                    if (n->prev != NULL) n->prev->next = n->next;
+                    else _nurseries_head = n->next;
+                    if (n->next != NULL) n->next->prev = n->prev;
+                    nursery_table_remove_locked(n);
+                    munmap((void *)n->base, GC_NURSERY_SIZE);
+                    free(n);
+                }
+            } else {
+                total_live_bytes += (size_t)n->live_count * 32u;
+                if (n->owned && (n->end - n->cur) < 16384u) {
+                    /* Detach nearly-full nursery with survivors so thread gets a fresh one */
+                    for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
+                        if (t->nursery == n) {
+                            t->nursery = NULL;
+                        }
+                    }
+                    n->owned = false;
+                }
+            }
+            n = next;
+        }
+    }
+
+    /* 6c. Reclaim completely empty 4 MB chunks back to OS on major GC */
+    if (is_major) {
+        reclaim_empty_chunks_locked(1);
+    }
+
     /* 7. Sweep large objects (munmap dead large objects immediately back to OS!) */
     gc_large_t *lo = _large_head;
     while (lo != NULL) {
@@ -1517,25 +1918,63 @@ void geisha_rt_init(void)
     pthread_mutex_unlock(&_gc_mu);
 }
 
+static void host_thread_destructor(void *ptr)
+{
+    gc_thread_t *thr = (gc_thread_t *)ptr;
+    if (thr != NULL) {
+        _tls_thread = thr;
+        gc_thread_detach();
+    }
+}
+
+static void init_host_thr_key(void)
+{
+    pthread_key_create(&_host_thr_key, host_thread_destructor);
+}
+
 int64_t gc_host_enter(void *stack_anchor)
 {
     gc_thread_t *self = _tls_thread;
-    if (self != NULL) {
+    if (__builtin_expect(self != NULL, 1)) {
         int32_t prev = __atomic_load_n(&self->state, __ATOMIC_ACQUIRE);
+        if (prev == THR_IDLE) {
+            self->root_start = (uintptr_t)stack_anchor;
+            __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
+            if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_ACQUIRE) != 0, 0)) {
+                gc_safepoint_slow();
+            }
+            return 3;
+        }
         if (prev == THR_BLOCKED) {
             gc_leave_blocking();
             return 2;
         }
         return 1;
     }
+    pthread_once(&_host_key_once, init_host_thr_key);
     geisha_rt_init();
     gc_thread_attach(stack_anchor);
-    return 0;
+    pthread_setspecific(_host_thr_key, _tls_thread);
+    return 3;
 }
 
 void gc_host_leave(int64_t token)
 {
-    if (token == 0) {
+    if (__builtin_expect(token == 3, 1)) {
+        gc_thread_t *self = _tls_thread;
+        if (self != NULL) {
+            self->root_start = 0;
+            self->safepoint_sp = 0;
+            __atomic_store_n(&self->state, THR_IDLE, __ATOMIC_SEQ_CST);
+            if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_ACQUIRE) != 0, 0)) {
+                pthread_mutex_lock(&_gc_mu);
+                if (_stw_in_progress && all_threads_parked_locked()) {
+                    pthread_cond_signal(&_stw_park_cv);
+                }
+                pthread_mutex_unlock(&_gc_mu);
+            }
+        }
+    } else if (token == 0) {
         gc_thread_detach();
     } else if (token == 2) {
         gc_thread_t *self = _tls_thread;
@@ -1623,6 +2062,7 @@ void gc_trim(void)
     geisha_rt_init();
     gc_collect_major();
     pthread_mutex_lock(&_gc_mu);
+    reclaim_empty_chunks_locked(1);
     for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
 #if defined(MADV_FREE_REUSABLE)
         madvise((void *)p->base, GC_PAGE_SIZE, MADV_FREE_REUSABLE);

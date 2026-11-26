@@ -1457,4 +1457,65 @@ if [ -f "./build/libgeisha_runtime_ios.a" ] && [ -f "./build/libgeisha_runtime_i
     assert_eq "ios_sim_static_lib_platform" "7" "$SIM_PLAT"
 fi
 
+# 23. Transparent Value-Type ADT Unboxing (Zero-Alloc `BytesView` + Flat `Vec Candidate` + IR Check)
+cat > "$TMP_DIR/t23_unbox.gsa" << 'EOF'
+use std.vec.{Vec, vecNew, vecPush, vecGetOr, vecLen}
+use std.str.intToStr
+
+data BytesView {
+    MkView { base: Ptr, off: Int, len: Int },
+}
+
+data Candidate {
+    MkCand { text: String, score: Float, code: Int },
+}
+
+def makeView(p: Ptr, off: Int, len: Int): BytesView =
+    MkView { base: p, off: off, len: len }
+
+def viewByteSum(v: BytesView): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < v.len) {
+        let idx = cellGet(i);
+        cellSet(acc, cellGet(acc) + ptrByteAt(v.base, v.off + idx));
+        cellSet(i, idx + 1)
+    };
+    cellGet(acc)
+}
+
+def main(): Void = {
+    let raw = ptrAllocBytes(8);
+    ptrSetByte(raw, 2, 10);
+    ptrSetByte(raw, 3, 20);
+    ptrSetByte(raw, 4, 12);
+    let v = makeView(raw, 2, 3);
+    let sum = viewByteSum(v);
+
+    let cands: Vec Candidate = vecNew();
+    let k = cellNew(0);
+    while (cellGet(k) < 100) {
+        let idx = cellGet(k);
+        vecPush(cands, MkCand { text: "cand-" + intToStr(idx), score: intToFloat(idx) * 1.5, code: idx });
+        cellSet(k, idx + 1)
+    };
+    gcTrim();
+    let c42 = vecGetOr(cands, 42, MkCand { text: "", score: 0.0, code: -1 });
+    printLn(intToStr(sum) + "|" + intToStr(vecLen(cands)) + "|" + c42.text + "|" + intToStr(floatToInt(c42.score)))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t23_unbox.ll" "$TMP_DIR/t23_unbox.gsa"
+if awk '/define .*@makeView\(/,/^}/' "$TMP_DIR/t23_unbox.ll" | grep -q "gc_alloc"; then
+    echo "FAIL [transparent_adt_unbox_ir]: makeView should not call gc_alloc for small non-recursive ADT" >&2
+    exit 1
+fi
+if ! awk '/define .*@makeView\(/,/^}/' "$TMP_DIR/t23_unbox.ll" | grep -q "insertvalue { ptr, i32, i32 }"; then
+    echo "FAIL [transparent_adt_unbox_ir]: expected flat LLVM struct { ptr, i32, i32 } for BytesView" >&2
+    exit 1
+fi
+echo "PASS [transparent_adt_unbox_ir]: BytesView compiled to zero-alloc flat { ptr, i32, i32 }"
+PASS=$((PASS + 1))
+"$GEISHA_BIN" -o "$TMP_DIR/t23_unbox" "$TMP_DIR/t23_unbox.gsa"
+assert_eq "transparent_adt_unbox_exec" "42|100|cand-42|63" "$("$TMP_DIR/t23_unbox")"
+
 echo "All $PASS end-to-end test suites passed!"

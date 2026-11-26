@@ -132,11 +132,106 @@ def isAdtGeishaType(ty: Type): Bool = match ty {
     _ -> false,
 }
 
+def gActiveAdtReg: Cell (StrMap AdtInfo) = cellNew(strMapNew())
+def gActiveEscape: Cell (Option EscapeInfo) = cellNew(None)
+def gActivePtrSize: Cell Int = cellNew(8)
+def gUnboxMemo: Cell (StrMap (Option (List Type))) = cellNew(strMapNew())
+
+def typeHasTyVar(ty: Type): Bool = match ty {
+    TyVar(_) -> true,
+    TyTuple(es) -> typeListHasTyVar(es),
+    TyComp(b, a) -> typeHasTyVar(b) || typeHasTyVar(a),
+    TyArr(e, ps, r) -> typeHasTyVar(e) || typeListHasTyVar(ps) || typeHasTyVar(r),
+    _ -> false,
+}
+
+def typeListHasTyVar(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> typeHasTyVar(h) || typeListHasTyVar(t),
+}
+
+def unboxTypeKey(ty: Type): String = match ty {
+    TyVoid -> "V",
+    TyVar(v) -> "?" + v,
+    TyCon(n) -> n,
+    TyComp(b, a) -> "(" + unboxTypeKey(b) + " " + unboxTypeKey(a) + ")",
+    TyTuple(es) -> "{" + unboxTypeListKey(es) + "}",
+    TyArr(_, _, _) -> "Fn",
+}
+
+def unboxTypeListKey(ts: List Type): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> unboxTypeKey(h),
+    Cons(h, t) -> unboxTypeKey(h) + "," + unboxTypeListKey(t),
+}
+
+def listContainsStr(xs: List String, target: String): Bool = match xs {
+    Nil -> false,
+    Cons(h, t) -> if (h == target) true else listContainsStr(t, target),
+}
+
+// Transparent value-type unboxing for small, non-recursive, single-constructor ADTs (<= 64 bytes).
+// Memoized in `gUnboxMemo` with explicit cycle guard `visiting` so mutual recursion is O(1) and safe.
+def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (List Type) =
+    if (depth > 3 || !isAdtGeishaType(ty)) None
+    else match cellGet(gActiveEscape) {
+        None -> None,
+        Some(esc) -> {
+            let key = unboxTypeKey(ty);
+            let memo = cellGet(gUnboxMemo);
+            match strMapGet(memo, key) {
+                Some(cached) -> cached,
+                None ->
+                    if (listContainsStr(visiting, key)) None
+                    else {
+                        let adtReg = cellGet(gActiveAdtReg);
+                        let (adtName, typeArgs) = match ty {
+                            TyCon(n) -> (n, Nil),
+                            TyComp(_, _) -> (getCompBaseName(ty), extractTypeArgs(ty)),
+                            _ -> ("", Nil),
+                        };
+                        let res =
+                            if (strLen(adtName) == 0 || isRecursiveAdt(esc, adtName)) None
+                            else match strMapGet(adtReg, adtName) {
+                                None -> None,
+                                Some(ainfo) -> match ainfo.variants {
+                                    Cons(vinfo, Nil) -> match vinfo.fieldTypes {
+                                        Nil -> None,
+                                        _ -> {
+                                            let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                                            let concreteFields = substTypeList(vinfo.fieldTypes, sub);
+                                            if (typeListHasTyVar(concreteFields)) None
+                                            else {
+                                                let nextVis = Cons(key, visiting);
+                                                let (sz, _) = structSizeAndAlignRec(concreteFields, cellGet(gActivePtrSize), nextVis, depth + 1);
+                                                if (sz > 0 && sz <= 64) Some(concreteFields) else None
+                                            }
+                                        },
+                                    },
+                                    _ -> None,
+                                },
+                            };
+                        strMapInsert(memo, key, res);
+                        res
+                    },
+            }
+        },
+    }
+
+pub def unboxedAdtFields(ty: Type): Option (List Type) = unboxedAdtFieldsRec(ty, Nil, 0)
+
 pub def isNoscanElemType(ty: Type): Bool = match ty {
     TyVoid -> true,
     TyCon(n) ->
-        n == "Int" || n == "Int64" || n == "Float" || n == "Char"
-        || n == "Bool" || n == "Void",
+        if (n == "Int" || n == "Int64" || n == "Float" || n == "Char" || n == "Bool" || n == "Void") true
+        else match unboxedAdtFields(ty) {
+            Some(fs) -> isNoscanList(fs),
+            None -> false,
+        },
+    TyComp(_, _) -> match unboxedAdtFields(ty) {
+        Some(fs) -> isNoscanList(fs),
+        None -> false,
+    },
     TyTuple(es) -> isNoscanList(es),
     _ -> false,
 }
@@ -148,12 +243,16 @@ def isNoscanList(ts: List Type): Bool = match ts {
 
 pub def isGcPointerType(ty: Type): Bool = match ty {
     TyArr(_, _, _) -> true,
-    TyCon(n) -> n == "String" || n == "AtomicInt" || isAdtGeishaType(ty),
+    TyCon(n) ->
+        if (n == "String" || n == "AtomicInt") true
+        else if (isAdtGeishaType(ty)) match unboxedAdtFields(ty) { Some(_) -> false, None -> true }
+        else false,
     TyComp(_, _) -> {
         let base = getCompBaseName(ty);
-        base == "Cell" || base == "MutArray" || base == "MVar"
-        || base == "Chan" || base == "Task" || base == "Actor"
-        || isAdtGeishaType(ty)
+        if (base == "Cell" || base == "MutArray" || base == "MVar"
+            || base == "Chan" || base == "Task" || base == "Actor") true
+        else if (isAdtGeishaType(ty)) match unboxedAdtFields(ty) { Some(_) -> false, None -> true }
+        else false
     },
     _ -> false,
 }
@@ -167,9 +266,15 @@ pub def getValLlvmType(ty: Type): String = match ty {
         else if (n == "Char") "i8"
         else if (n == "Bool") "i1"
         else if (n == "Void") "i8"
-        else "ptr",
+        else match unboxedAdtFields(ty) {
+            Some(fs) -> formatLlvmStructType(mapValLlvmTypes(fs)),
+            None -> "ptr",
+        },
     TyArr(_, _, _) -> "ptr",
-    TyComp(_, _) -> "ptr",
+    TyComp(_, _) -> match unboxedAdtFields(ty) {
+        Some(fs) -> formatLlvmStructType(mapValLlvmTypes(fs)),
+        None -> "ptr",
+    },
     TyTuple(elems) -> formatLlvmStructType(mapValLlvmTypes(elems)),
     TyVar(_) -> "i64",
 }
@@ -212,21 +317,27 @@ def alignUp(offset: Int, align: Int): Int =
     }
 
 // Returns `(byteSize, abiAlign)` for target pointer size (`8` on LP64, `4` on wasm32)
-pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int) = match ty {
+def typeSizeAndAlignRec(ty: Type, ptrSize: Int, visiting: List String, depth: Int): (Int, Int) = match ty {
     TyVoid -> (1, 1),
     TyCon(n) ->
         if (n == "Int") (4, 4)
         else if (n == "Int64") (8, 8)
         else if (n == "Float") (8, 8)
         else if (n == "Char" || n == "Bool" || n == "Void") (1, 1)
-        else (ptrSize, ptrSize),
+        else match unboxedAdtFieldsRec(ty, visiting, depth) {
+            Some(fs) -> structSizeAndAlignRec(fs, ptrSize, Cons(unboxTypeKey(ty), visiting), depth + 1),
+            None -> (ptrSize, ptrSize),
+        },
     TyArr(_, _, _) -> (ptrSize, ptrSize),
-    TyComp(_, _) -> (ptrSize, ptrSize),
+    TyComp(_, _) -> match unboxedAdtFieldsRec(ty, visiting, depth) {
+        Some(fs) -> structSizeAndAlignRec(fs, ptrSize, Cons(unboxTypeKey(ty), visiting), depth + 1),
+        None -> (ptrSize, ptrSize),
+    },
     TyVar(_) -> (8, 8),
-    TyTuple(elems) -> structSizeAndAlignFor(elems, ptrSize),
+    TyTuple(elems) -> structSizeAndAlignRec(elems, ptrSize, visiting, depth),
 }
 
-pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = match elems {
+def structSizeAndAlignRec(elems: List Type, ptrSize: Int, visiting: List String, depth: Int): (Int, Int) = match elems {
     Nil -> (0, 1),
     _ -> {
         let off = cellNew(0);
@@ -235,7 +346,7 @@ pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = matc
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(el, r) -> {
-                    let (sz, al) = typeSizeAndAlignFor(el, ptrSize);
+                    let (sz, al) = typeSizeAndAlignRec(el, ptrSize, visiting, depth);
                     let aligned = alignUp(cellGet(off), al);
                     cellSet(off, aligned + sz);
                     if (al > cellGet(maxAl)) cellSet(maxAl, al) else ();
@@ -249,6 +360,10 @@ pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = matc
     },
 }
 
+pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int) = typeSizeAndAlignRec(ty, ptrSize, Nil, 0)
+
+pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = structSizeAndAlignRec(elems, ptrSize, Nil, 0)
+
 pub def typeSizeAndAlign(ty: Type): (Int, Int) = typeSizeAndAlignFor(ty, 8)
 
 pub def structSizeAndAlign(elems: List Type): (Int, Int) = structSizeAndAlignFor(elems, 8)
@@ -259,13 +374,16 @@ def accumPtrMaskType(ty: Type, baseOff: Int, maskAcc: Int64): Option Int64 = mat
     TyVoid -> Some(maskAcc),
     TyVar(_) -> None,
     TyTuple(es) -> accumPtrMaskFields(es, baseOff, maskAcc),
-    _ ->
-        if (isNoscanElemType(ty)) Some(maskAcc)
-        else {
-            let wordIdx = baseOff / 8;
-            if (baseOff % 8 != 0 || wordIdx < 0 || wordIdx >= 40) None
-            else Some(maskAcc | (intToI64(1) << wordIdx))
-        },
+    _ -> match unboxedAdtFields(ty) {
+        Some(fs) -> accumPtrMaskFields(fs, baseOff, maskAcc),
+        None ->
+            if (isNoscanElemType(ty)) Some(maskAcc)
+            else {
+                let wordIdx = baseOff / 8;
+                if (baseOff % 8 != 0 || wordIdx < 0 || wordIdx >= 40) None
+                else Some(maskAcc | (intToI64(1) << wordIdx))
+            },
+    },
 }
 
 def accumPtrMaskFields(ts: List Type, startOff: Int, initMask: Int64): Option Int64 = {
@@ -1830,59 +1948,85 @@ def emitPatternCheck(
             }
         }
     },
-    PatCtor(ctorName, subPats) -> {
-        let (adtName, typeArgs) = extractAdtNameAndArgs(mctx.mcAdtReg, valTy, ctorName);
-        match strMapGet(mctx.mcAdtReg, adtName) {
-            None -> (),
-            Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+    PatCtor(ctorName, subPats) -> match unboxedAdtFields(valTy) {
+        Some(concreteFieldTys) -> {
+            let structLlvm = getValLlvmType(valTy);
+            let idx = cellNew(0);
+            let cp = cellNew(subPats);
+            let cgt = cellNew(concreteFieldTys);
+            while (match (cellGet(cp), cellGet(cgt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                match (cellGet(cp), cellGet(cgt)) {
+                    (Cons(sp, rp), Cons(gt, rgt)) -> {
+                        let i = cellGet(idx);
+                        match sp {
+                            PatWild -> (),
+                            _ -> {
+                                let fVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(i));
+                                emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
+                            },
+                        };
+                        cellSet(idx, i + 1);
+                        cellSet(cp, rp);
+                        cellSet(cgt, rgt)
+                    },
+                    _ -> (),
+                }
+            }
+        },
+        None -> {
+            let (adtName, typeArgs) = extractAdtNameAndArgs(mctx.mcAdtReg, valTy, ctorName);
+            match strMapGet(mctx.mcAdtReg, adtName) {
                 None -> (),
-                Some(vinfo) -> {
-                    let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
-                    let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 0);
-                    let actualTag = emitLoad(fctx, "i32", tagPtr);
-                    let tagEq = emitAssign(fctx, "icmp eq i32 " + actualTag + ", " + intToStr(vinfo.tag));
-                    let tagOkBlk = appendBlock(fctx, "pat.ctor.ok");
-                    emitCondBr(fctx, tagEq, tagOkBlk, failBlk);
-                    setInsertBlock(fctx, tagOkBlk);
+                Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+                    None -> (),
+                    Some(vinfo) -> {
+                        let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
+                        let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 0);
+                        let actualTag = emitLoad(fctx, "i32", tagPtr);
+                        let tagEq = emitAssign(fctx, "icmp eq i32 " + actualTag + ", " + intToStr(vinfo.tag));
+                        let tagOkBlk = appendBlock(fctx, "pat.ctor.ok");
+                        emitCondBr(fctx, tagEq, tagOkBlk, failBlk);
+                        setInsertBlock(fctx, tagOkBlk);
 
-                    match subPats {
-                        Nil -> (),
-                        _ -> {
-                            let sub = buildPairMap(ainfo.typeParams, typeArgs);
-                            let concreteFieldTys = substTypeList(vinfo.fieldTypes, sub);
-                            let fieldLlvmTys = mapValLlvmTypes(concreteFieldTys);
-                            let payloadStructTy = formatLlvmStructType(fieldLlvmTys);
-                            let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 1);
+                        match subPats {
+                            Nil -> (),
+                            _ -> {
+                                let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                                let concreteFieldTys = substTypeList(vinfo.fieldTypes, sub);
+                                let fieldLlvmTys = mapValLlvmTypes(concreteFieldTys);
+                                let payloadStructTy = formatLlvmStructType(fieldLlvmTys);
+                                let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, val, 1);
 
-                            let idx = cellNew(0);
-                            let cp = cellNew(subPats);
-                            let cgt = cellNew(concreteFieldTys);
-                            let clt = cellNew(fieldLlvmTys);
-                            while (match (cellGet(cp), cellGet(cgt), cellGet(clt)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                                match (cellGet(cp), cellGet(cgt), cellGet(clt)) {
-                                    (Cons(sp, rp), Cons(gt, rgt), Cons(lt, rlt)) -> {
-                                        let i = cellGet(idx);
-                                        match sp {
-                                            PatWild -> (),
-                                            _ -> {
-                                                let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                                                let fVal = emitLoad(fctx, lt, fPtr);
-                                                emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
-                                            },
-                                        };
-                                        cellSet(idx, i + 1);
-                                        cellSet(cp, rp);
-                                        cellSet(cgt, rgt);
-                                        cellSet(clt, rlt)
-                                    },
-                                    _ -> (),
+                                let idx = cellNew(0);
+                                let cp = cellNew(subPats);
+                                let cgt = cellNew(concreteFieldTys);
+                                let clt = cellNew(fieldLlvmTys);
+                                while (match (cellGet(cp), cellGet(cgt), cellGet(clt)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                    match (cellGet(cp), cellGet(cgt), cellGet(clt)) {
+                                        (Cons(sp, rp), Cons(gt, rgt), Cons(lt, rlt)) -> {
+                                            let i = cellGet(idx);
+                                            match sp {
+                                                PatWild -> (),
+                                                _ -> {
+                                                    let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
+                                                    let fVal = emitLoad(fctx, lt, fPtr);
+                                                    emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
+                                                },
+                                            };
+                                            cellSet(idx, i + 1);
+                                            cellSet(cp, rp);
+                                            cellSet(cgt, rgt);
+                                            cellSet(clt, rlt)
+                                        },
+                                        _ -> (),
+                                    }
                                 }
-                            }
-                        },
-                    }
+                            },
+                        }
+                    },
                 },
-            },
-        }
+            }
+        },
     },
     PatStruct(_, _) -> (),
 }
@@ -2512,47 +2656,82 @@ def genExpr(
                     }
                 };
                 let fieldVals = listRev(cellGet(fvalsRev));
-                let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
-                let useStack =
-                    if (isRecursiveAdt(mctx.mcEscape, adtName)) false
-                    else match directLetVar {
-                        Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
-                        None -> false,
-                    };
-                let adtPtr =
-                    if (useStack) emitEntryAlloca(fctx, adtStorageTy)
-                    else emitGcAllocForFields(mctx, fctx, adtByteSz, fieldTys, 8);
+                let resTy = schemeBody(tm.tscm);
+                match unboxedAdtFields(resTy) {
+                    Some(_) -> {
+                        let structLlvm = getValLlvmType(resTy);
+                        let fLlvmTys = mapValLlvmTypes(fieldTys);
+                        let agg = cellNew("undef");
+                        let idx = cellNew(0);
+                        let cv = cellNew(fieldVals);
+                        let ct = cellNew(fLlvmTys);
+                        while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                            match (cellGet(cv), cellGet(ct)) {
+                                (Cons(fv, rv), Cons(flt, rt)) -> {
+                                    let i = cellGet(idx);
+                                    cellSet(agg, emitAssign(fctx, "insertvalue " + structLlvm + " " + cellGet(agg) + ", " + flt + " " + fv + ", " + intToStr(i)));
+                                    cellSet(idx, i + 1);
+                                    cellSet(cv, rv);
+                                    cellSet(ct, rt)
+                                },
+                                _ -> (),
+                            }
+                        };
+                        cellGet(agg)
+                    },
+                    None -> {
+                        let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
+                        let useStack =
+                            if (isRecursiveAdt(mctx.mcEscape, adtName)) false
+                            else match directLetVar {
+                                Some(bindName) -> isStackAlloc(mctx.mcEscape, fctx.fcName, bindName),
+                                None -> false,
+                            };
+                        let adtPtr =
+                            if (useStack) emitEntryAlloca(fctx, adtStorageTy)
+                            else emitGcAllocForFields(mctx, fctx, adtByteSz, fieldTys, 8);
 
-                let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
-                emitStore(fctx, "i32", intToStr(tag), tagPtr);
+                        let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 0);
+                        emitStore(fctx, "i32", intToStr(tag), tagPtr);
 
-                let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 1);
-                let fLlvmTys = mapValLlvmTypes(fieldTys);
-                let payloadStructTy = formatLlvmStructType(fLlvmTys);
-                let idx = cellNew(0);
-                let cv = cellNew(fieldVals);
-                let ct = cellNew(fLlvmTys);
-                while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                    match (cellGet(cv), cellGet(ct)) {
-                        (Cons(fv, rv), Cons(flt, rt)) -> {
-                            let i = cellGet(idx);
-                            let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                            emitStore(fctx, flt, fv, fPtr);
-                            cellSet(idx, i + 1);
-                            cellSet(cv, rv);
-                            cellSet(ct, rt)
-                        },
-                        _ -> (),
-                    }
-                };
-                adtPtr
+                        let payloadPtr = emitStructFieldPtr(fctx, adtStorageTy, adtPtr, 1);
+                        let fLlvmTys = mapValLlvmTypes(fieldTys);
+                        let payloadStructTy = formatLlvmStructType(fLlvmTys);
+                        let idx = cellNew(0);
+                        let cv = cellNew(fieldVals);
+                        let ct = cellNew(fLlvmTys);
+                        while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                            match (cellGet(cv), cellGet(ct)) {
+                                (Cons(fv, rv), Cons(flt, rt)) -> {
+                                    let i = cellGet(idx);
+                                    let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
+                                    emitStore(fctx, flt, fv, fPtr);
+                                    cellSet(idx, i + 1);
+                                    cellSet(cv, rv);
+                                    cellSet(ct, rt)
+                                },
+                                _ -> (),
+                            }
+                        };
+                        adtPtr
+                    },
+                }
             },
         },
 
         TmGetTag(node) -> {
-            let adtPtr = genExpr(mctx, fctx, node, locals, false);
-            let tagPtr = emitStructFieldPtr(fctx, "{ i32 }", adtPtr, 0);
-            emitLoad(fctx, "i32", tagPtr)
+            let nodeTy = schemeBody(node.tscm);
+            match unboxedAdtFields(nodeTy) {
+                Some(_) -> {
+                    let _ = genExpr(mctx, fctx, node, locals, false);
+                    "0"
+                },
+                None -> {
+                    let adtPtr = genExpr(mctx, fctx, node, locals, false);
+                    let tagPtr = emitStructFieldPtr(fctx, "{ i32 }", adtPtr, 0);
+                    emitLoad(fctx, "i32", tagPtr)
+                },
+            }
         },
 
         TmMatch(scrut, arms) -> {
@@ -2802,6 +2981,37 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     }
 }
 
+def emitRegisterGlobalRoots(fctx: FnEmitCtx, ty: Type, basePtr: String): Void =
+    if (isGcPointerType(ty)) {
+        emitLine(fctx, "call void @gc_register_root(ptr " + basePtr + ")")
+    } else match ty {
+        TyTuple(es) -> emitRegisterStructFieldRoots(fctx, es, basePtr),
+        _ -> match unboxedAdtFields(ty) {
+            Some(fs) -> emitRegisterStructFieldRoots(fctx, fs, basePtr),
+            None -> (),
+        },
+    }
+
+def emitRegisterStructFieldRoots(fctx: FnEmitCtx, fields: List Type, basePtr: String): Void = {
+    let structTy = formatLlvmStructType(mapValLlvmTypes(fields));
+    let idx = cellNew(0);
+    let cur = cellNew(fields);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ft, r) -> {
+                let i = cellGet(idx);
+                if (!isNoscanElemType(ft)) {
+                    let fp = emitStructFieldPtr(fctx, structTy, basePtr, i);
+                    emitRegisterGlobalRoots(fctx, ft, fp)
+                } else ();
+                cellSet(idx, i + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
 def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDef, globals: List GlobalValDef): Void = {
     let fctx = newFnEmitCtx("__geisha_init");
     let cg = cellNew(globals);
@@ -2810,9 +3020,7 @@ def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDe
             Cons(g, r) -> {
                 match strMapGet(mctx.mcGlobalSlots, g.gvName) {
                     Some(slot) -> {
-                        if (isGcPointerType(g.gvTy)) {
-                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
-                        } else ();
+                        emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
                         cellSet(fctx.fcPendingLet, None);
                         let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
                         emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
@@ -2843,9 +3051,7 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
             Cons(g, r) -> {
                 match strMapGet(mctx.mcGlobalSlots, g.gvName) {
                     Some(slot) -> {
-                        if (isGcPointerType(g.gvTy)) {
-                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
-                        } else ();
+                        emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
                         cellSet(fctx.fcPendingLet, None);
                         let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
                         emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
@@ -3038,9 +3244,7 @@ def emitNativeCustomBootFunctions(
             Cons(g, r) -> {
                 match strMapGet(mctx.mcGlobalSlots, g.gvName) {
                     Some(slot) -> {
-                        if (isGcPointerType(g.gvTy)) {
-                            emitLine(fctx, "call void @gc_register_root(ptr " + slot.vsPtr + ")")
-                        } else ();
+                        emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
                         cellSet(fctx.fcPendingLet, None);
                         let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
                         emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
@@ -3083,6 +3287,10 @@ pub def emitProgramLlvmIrOpts(
     noMain: Bool,
     bootSymOpt: Option String
 ): String = {
+    cellSet(gActiveAdtReg, prog.coreAdtReg);
+    cellSet(gActiveEscape, Some(prog.coreEscape));
+    cellSet(gActivePtrSize, if (isWasm) 4 else 8);
+    cellSet(gUnboxMemo, strMapNew());
     let globalSlots: StrMap VarSlot = strMapNew();
     let globalsBuf = bufNew();
 
