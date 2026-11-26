@@ -985,11 +985,11 @@ def initInferCtx(): InferCtx = {
         adtName: "Unit",
         typeParams: Nil,
         variants: [
-            MkVariantInfo { vname: "MkUnit", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: mkUnitScm },
+            MkVariantInfo { vname: "Unit", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: mkUnitScm },
         ],
     });
     vecPush(ctx.adtNames, "Unit");
-    strMapInsert(ctx.ctorToAdt, "MkUnit", "Unit");
+    strMapInsert(ctx.ctorToAdt, "Unit", "Unit");
 
     let namedTy = TyComp(TyCon("Named"), tvA);
     let mkNamedScm = ScmPoly([".$m_named", "a"], TyArr(TyVar(".$m_named"), [TyCon("String"), tvA], namedTy));
@@ -997,11 +997,11 @@ def initInferCtx(): InferCtx = {
         adtName: "Named",
         typeParams: ["a"],
         variants: [
-            MkVariantInfo { vname: "MkNamed", tag: 0, fieldNames: None, fieldTypes: [TyCon("String"), tvA], ctorScm: mkNamedScm },
+            MkVariantInfo { vname: "Named", tag: 0, fieldNames: None, fieldTypes: [TyCon("String"), tvA], ctorScm: mkNamedScm },
         ],
     });
     vecPush(ctx.adtNames, "Named");
-    strMapInsert(ctx.ctorToAdt, "MkNamed", "Named");
+    strMapInsert(ctx.ctorToAdt, "Named", "Named");
 
     let prodTy = TyComp(TyComp(TyCon("Prod"), tvA), tvB);
     let mkProdScm = ScmPoly([".$m_prod", "a", "b"], TyArr(TyVar(".$m_prod"), [tvA, tvB], prodTy));
@@ -1009,11 +1009,11 @@ def initInferCtx(): InferCtx = {
         adtName: "Prod",
         typeParams: ["a", "b"],
         variants: [
-            MkVariantInfo { vname: "MkProd", tag: 0, fieldNames: None, fieldTypes: [tvA, tvB], ctorScm: mkProdScm },
+            MkVariantInfo { vname: "Prod", tag: 0, fieldNames: None, fieldTypes: [tvA, tvB], ctorScm: mkProdScm },
         ],
     });
     vecPush(ctx.adtNames, "Prod");
-    strMapInsert(ctx.ctorToAdt, "MkProd", "Prod");
+    strMapInsert(ctx.ctorToAdt, "Prod", "Prod");
 
     let sumTy = TyComp(TyComp(TyCon("Sum"), tvA), tvB);
     let inLScm = ScmPoly([".$m_inl", "a", "b"], TyArr(TyVar(".$m_inl"), [tvA], sumTy));
@@ -4247,26 +4247,26 @@ def variantFieldLabel(v: VariantInfo, idx: Int): String = match v.fieldNames {
 }
 
 def buildFieldProdExpr(v: VariantInfo, idx: Int, total: Int, sp: Span): Form =
-    if (total <= 0) mkSynthForm(sp, ExVar("MkUnit"))
+    if (total <= 0) mkSynthForm(sp, ExVar("Unit"))
     else {
         let lbl = variantFieldLabel(v, idx);
         let named = mkSynthForm(sp, ExApply(
-            mkSynthForm(sp, ExVar("MkNamed")),
+            mkSynthForm(sp, ExVar("Named")),
             [mkSynthForm(sp, ExLit(LitStr(lbl))), mkSynthForm(sp, ExVar("$df" + intToStr(idx)))]
         ));
         if (idx + 1 >= total) named
         else mkSynthForm(sp, ExApply(
-            mkSynthForm(sp, ExVar("MkProd")),
+            mkSynthForm(sp, ExVar("Prod")),
             [named, buildFieldProdExpr(v, idx + 1, total, sp)]
         ))
     }
 
 def buildFieldProdPat(idx: Int, total: Int): Pattern =
-    if (total <= 0) PatCtor("MkUnit", Nil)
+    if (total <= 0) PatCtor("Unit", Nil)
     else {
-        let namedPat = PatCtor("MkNamed", [PatWild, PatVar("$df" + intToStr(idx))]);
+        let namedPat = PatCtor("Named", [PatWild, PatVar("$df" + intToStr(idx))]);
         if (idx + 1 >= total) namedPat
-        else PatCtor("MkProd", [namedPat, buildFieldProdPat(idx + 1, total)])
+        else PatCtor("Prod", [namedPat, buildFieldProdPat(idx + 1, total)])
     }
 
 def buildVariantCtorPat(v: VariantInfo): Pattern = {
@@ -4330,7 +4330,7 @@ def buildAdtToRepForm(ainfo: AdtInfo, scrut: Form, sp: Span): Form = {
                     if (numVars == 1) fieldsExpr
                     else {
                         let namedVar = mkSynthForm(sp, ExApply(
-                            mkSynthForm(sp, ExVar("MkNamed")),
+                            mkSynthForm(sp, ExVar("Named")),
                             [mkSynthForm(sp, ExLit(LitStr(v.vname))), fieldsExpr]
                         ));
                         wrapInSumExpr(namedVar, idx, idx + 1 >= numVars, sp)
@@ -4358,7 +4358,7 @@ def buildAdtFromRepForm(ainfo: AdtInfo, scrut: Form, sp: Span): Form = {
                 let armPat =
                     if (numVars == 1) fieldsPat
                     else {
-                        let namedPat = PatCtor("MkNamed", [PatWild, fieldsPat]);
+                        let namedPat = PatCtor("Named", [PatWild, fieldsPat]);
                         wrapInSumPat(namedPat, idx, idx + 1 >= numVars)
                     };
                 let bodyExpr = buildVariantCtorExpr(v, sp);

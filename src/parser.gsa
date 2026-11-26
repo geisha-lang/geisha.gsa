@@ -1540,20 +1540,77 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                             cellSet(derivedConcepts, listAppend(cellGet(derivedConcepts), [cn]))
                         }
                     } else ();
-                    let _ = expectLBrace(p)?;
                     let variants = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRBrace -> cellSet(more, false),
-                            _ -> {
-                                let v = parseDataVariant(p)?;
-                                cellSet(variants, listAppend(cellGet(variants), [v]));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
+                    let closeSp = match peekTok(p).kind {
+                        TkLParen -> {
+                            // Tuple / newtype shorthand: `data Box a (a)` or `data Box a : Eq (a)` or `data Box a (a) : Eq`
+                            let _ = bumpTok(p);
+                            let fs = cellNew(Nil);
+                            let more = cellNew(true);
+                            while (cellGet(more)) {
+                                match peekTok(p).kind {
+                                    TkRParen -> cellSet(more, false),
+                                    _ -> {
+                                        let ft = parseTypeExpr(p)?;
+                                        cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: None, fty: ft }]));
+                                        if (!eatComma(p)) cellSet(more, false) else ()
+                                    },
+                                }
+                            };
+                            let spClose = expectRParen(p)?;
+                            cellSet(variants, [MkVariantDef { vname: dname, vbody: VarTuple(cellGet(fs)) }]);
+                            if (match cellGet(derivedConcepts) { Nil -> eatSym(p, ":"), _ -> false }) {
+                                let c0 = parseUpperIdent(p)?;
+                                cellSet(derivedConcepts, [c0]);
+                                while (eatComma(p)) {
+                                    let cn = parseUpperIdent(p)?;
+                                    cellSet(derivedConcepts, listAppend(cellGet(derivedConcepts), [cn]))
+                                }
+                            } else ();
+                            spClose
+                        },
+                        _ -> {
+                            let _ = expectLBrace(p)?;
+                            let isRecordShorthand = match peekTok(p).kind {
+                                TkIdent(s) -> strLen(s) > 0 && isLowerByte(strByteAt(s, 0)) && match peekAt(p, 1).kind {
+                                    TkSym(sym) -> sym == ":",
+                                    _ -> false,
+                                },
+                                _ -> false,
+                            };
+                            if (isRecordShorthand) {
+                                // Record struct shorthand: `data Linear : Params { w: Tensor, b: Tensor }`
+                                let fs = cellNew(Nil);
+                                let more = cellNew(true);
+                                while (cellGet(more)) {
+                                    match peekTok(p).kind {
+                                        TkRBrace -> cellSet(more, false),
+                                        _ -> {
+                                            let fnm = parseIdent(p)?;
+                                            let _ = expectSym(p, ":")?;
+                                            let ft = parseTypeExpr(p)?;
+                                            cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: Some(fnm), fty: ft }]));
+                                            if (!eatComma(p)) cellSet(more, false) else ()
+                                        },
+                                    }
+                                };
+                                cellSet(variants, [MkVariantDef { vname: dname, vbody: VarStruct(cellGet(fs)) }])
+                            } else {
+                                let more = cellNew(true);
+                                while (cellGet(more)) {
+                                    match peekTok(p).kind {
+                                        TkRBrace -> cellSet(more, false),
+                                        _ -> {
+                                            let v = parseDataVariant(p)?;
+                                            cellSet(variants, listAppend(cellGet(variants), [v]));
+                                            if (!eatComma(p)) cellSet(more, false) else ()
+                                        },
+                                    }
+                                }
+                            };
+                            expectRBrace(p)?
+                        },
                     };
-                    let closeSp = expectRBrace(p)?;
                     let fullSp = unionSpan(startSp, closeSp);
                     // Desugar `data T a : C1, C2 { ... }` into bodyless `instance (C1 a) => C1 (T a)` items
                     let cd = cellNew(cellGet(derivedConcepts));

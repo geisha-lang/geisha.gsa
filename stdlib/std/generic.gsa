@@ -8,13 +8,13 @@ instance Eq Unit {
 
 instance (Eq a) => Eq (Named a) {
     def eq(x, y) = match (x, y) {
-        (MkNamed(_, a), MkNamed(_, b)) -> eq(a, b),
+        (Named(_, a), Named(_, b)) -> eq(a, b),
     }
 }
 
 instance (Eq a, Eq b) => Eq (Prod a b) {
     def eq(x, y) = match (x, y) {
-        (MkProd(a1, b1), MkProd(a2, b2)) -> eq(a1, a2) && eq(b1, b2),
+        (Prod(a1, b1), Prod(a2, b2)) -> eq(a1, a2) && eq(b1, b2),
     }
 }
 
@@ -32,13 +32,13 @@ instance Ord Unit {
 
 instance (Ord a) => Ord (Named a) {
     def compare(x, y) = match (x, y) {
-        (MkNamed(_, a), MkNamed(_, b)) -> compare(a, b),
+        (Named(_, a), Named(_, b)) -> compare(a, b),
     }
 }
 
 instance (Ord a, Ord b) => Ord (Prod a b) {
     def compare(x, y) = match (x, y) {
-        (MkProd(a1, b1), MkProd(a2, b2)) -> {
+        (Prod(a1, b1), Prod(a2, b2)) -> {
             let c = compare(a1, a2);
             if (c != 0) c else compare(b1, b2)
         },

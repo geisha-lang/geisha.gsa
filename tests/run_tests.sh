@@ -1819,15 +1819,15 @@ instance Params Unit {
     def zipParams(_, u, _) = u
 }
 instance (Params a) => Params (Named a) {
-    def mapParams(f, x) = match x { MkNamed(k, v) -> MkNamed(k, mapParams(f, v)) }
+    def mapParams(f, x) = match x { Named(k, v) -> Named(k, mapParams(f, v)) }
     def zipParams(f, x, y) = match (x, y) {
-        (MkNamed(k, a), MkNamed(_, b)) -> MkNamed(k, zipParams(f, a, b)),
+        (Named(k, a), Named(_, b)) -> Named(k, zipParams(f, a, b)),
     }
 }
 instance (Params a, Params b) => Params (Prod a b) {
-    def mapParams(f, x) = match x { MkProd(a, b) -> MkProd(mapParams(f, a), mapParams(f, b)) }
+    def mapParams(f, x) = match x { Prod(a, b) -> Prod(mapParams(f, a), mapParams(f, b)) }
     def zipParams(f, x, y) = match (x, y) {
-        (MkProd(a1, b1), MkProd(a2, b2)) -> MkProd(zipParams(f, a1, a2), zipParams(f, b1, b2)),
+        (Prod(a1, b1), Prod(a2, b2)) -> Prod(zipParams(f, a1, a2), zipParams(f, b1, b2)),
     }
 }
 
@@ -1837,19 +1837,21 @@ concept FieldList a {
 instance FieldList Int { def fieldNamesOf(_) = "" }
 instance FieldList Unit { def fieldNamesOf(_) = "" }
 instance (FieldList a) => FieldList (Named a) {
-    def fieldNamesOf(x) = match x { MkNamed(k, _) -> k }
+    def fieldNamesOf(x) = match x { Named(k, _) -> k }
 }
 instance (FieldList a, FieldList b) => FieldList (Prod a b) {
-    def fieldNamesOf(x) = match x { MkProd(a, b) -> fieldNamesOf(a) + "," + fieldNamesOf(b) }
+    def fieldNamesOf(x) = match x { Prod(a, b) -> fieldNamesOf(a) + "," + fieldNamesOf(b) }
 }
 
-// Header-colon zero-keyword deriving!
+// Header-colon zero-keyword deriving + record-struct shorthand (no `Mk*`!)
 data Linear : Params, Eq, FieldList {
-    MkLinear { w: Int, b: Int },
+    w: Int,
+    b: Int,
 }
 
 data MLP : Params, Eq {
-    MkMLP { l1: Linear, l2: Linear },
+    l1: Linear,
+    l2: Linear,
 }
 
 // Multi-constructor sum ADT deriving `Eq`!
@@ -1859,19 +1861,21 @@ data Act : Eq {
     SwiGLU(Int),
 }
 
-// Polymorphic ADT with bodyless standalone `instance`!
-data Box a {
-    MkBox(a),
-}
+// Polymorphic tuple/newtype shorthand + standalone bodyless `instance`!
+data Box a (a)
 instance (Eq a) => Eq (Box a)
 
+// Tuple shorthand with inline `: Eq` deriving (both before and after parens)
+data Pair2 a b (a, b) : Eq
+data Tag : Eq (Int)
+
 def main(): Void = {
-    let m1 = MkMLP { l1: MkLinear { w: 2, b: 3 }, l2: MkLinear { w: 4, b: 5 } };
+    let m1 = MLP { l1: Linear { w: 2, b: 3 }, l2: Linear { w: 4, b: 5 } };
     let m2 = mapParams((x) -> x * 10, m1);
     let m3 = zipParams((a, b) -> a + b, m1, m2);
     let eqM = if (m1 == m1 && !(m1 == m2)) 1 else 0;
     let eqSum = if (ReLU == ReLU && !(ReLU == GELU) && SwiGLU(7) == SwiGLU(7) && !(SwiGLU(7) == SwiGLU(8))) 1 else 0;
-    let eqBox = if (MkBox(42) == MkBox(42) && !(MkBox(42) == MkBox(99))) 1 else 0;
+    let eqBox = if (Box(42) == Box(42) && !(Box(42) == Box(99)) && Pair2(1, 2) == Pair2(1, 2) && Tag(7) == Tag(7)) 1 else 0;
     let fnames = fieldNamesOf(m1.l1);
     printLn(
         intToStr(m3.l1.w) + "|" + intToStr(m3.l2.b) + "|"
