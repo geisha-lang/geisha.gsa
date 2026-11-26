@@ -173,7 +173,7 @@ def listContainsStr(xs: List String, target: String): Bool = match xs {
 // Transparent value-type unboxing for small, non-recursive, single-constructor ADTs (<= 64 bytes).
 // Memoized in `gUnboxMemo` with explicit cycle guard `visiting` so mutual recursion is O(1) and safe.
 def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (List Type) =
-    if (depth > 3 || !isAdtGeishaType(ty)) None
+    if (depth > 32 || !isAdtGeishaType(ty)) None
     else match cellGet(gActiveEscape) {
         None -> None,
         Some(esc) -> {
