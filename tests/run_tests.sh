@@ -2,9 +2,24 @@
 # End-to-end test suite for the self-hosted Geisha compiler (`geisha.gsa`)
 set -eu
 
+CC="${CC:-clang}"
 GEISHA_BIN="${GEISHA_BIN:-./build/geisha2}"
 GEISHA_RUNTIME="${GEISHA_RUNTIME:-./build/libgeisha_runtime.a}"
 export GEISHA_RUNTIME
+
+UNAME_S="$(uname -s)"
+UNAME_M="$(uname -m)"
+HOST_CC_TARGET=""
+HOST_CC_LIBS=""
+if [ "$UNAME_S" = "Darwin" ]; then
+    export MACOSX_DEPLOYMENT_TARGET=14.0
+    case "$UNAME_M" in
+        arm64|aarch64) HOST_CC_TARGET="-target arm64-apple-macosx14.0" ;;
+        x86_64|amd64)  HOST_CC_TARGET="-target x86_64-apple-macosx14.0" ;;
+    esac
+else
+    HOST_CC_LIBS="-lm"
+fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/geisha_gsa_tests.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -1343,8 +1358,8 @@ if ! grep -q "declare i32 @dot_i8_kernel(ptr, ptr, i32) nounwind" "$TMP_DIR/t20_
 fi
 echo "PASS [extern_noalloc_ir]: zero blocking-section overhead verified in LLVM IR"
 PASS=$((PASS + 1))
-MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -Wno-override-module -pthread \
-    -x ir "$TMP_DIR/t20_noalloc.ll" -x c "$TMP_DIR/t20_kernel.c" -x none "$GEISHA_RUNTIME" \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+    -x ir "$TMP_DIR/t20_noalloc.ll" -x c "$TMP_DIR/t20_kernel.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
     -o "$TMP_DIR/t20_noalloc"
 assert_eq "extern_noalloc_exec" "38" "$("$TMP_DIR/t20_noalloc")"
 
@@ -1429,8 +1444,8 @@ int main(void) {
     return 0;
 }
 EOF
-MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -pthread \
-    "$TMP_DIR/t21_host.c" "$TMP_DIR/libt21_embed.a" -o "$TMP_DIR/t21_host"
+"$CC" $HOST_CC_TARGET -O2 -pthread \
+    "$TMP_DIR/t21_host.c" "$TMP_DIR/libt21_embed.a" $HOST_CC_LIBS -o "$TMP_DIR/t21_host"
 assert_eq "embedded_static_lib_handles_and_threads" "25|30|9" "$("$TMP_DIR/t21_host")"
 
 # 22. iOS & iOS Simulator Cross-Compilation Static Libraries (`--target ios` & `--target ios-sim`)
@@ -1793,8 +1808,8 @@ if ! awk '/define .*@runAxpy\(/,/^}/' "$TMP_DIR/t29_ffi_borrow.ll" | grep -q "as
 fi
 echo "PASS [ffi_auto_borrow_ir]: ForeignPtr auto-unwrap + keep-alive barrier verified in LLVM IR"
 PASS=$((PASS + 1))
-MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -Wno-override-module -pthread \
-    -x ir "$TMP_DIR/t29_ffi_borrow.ll" -x c "$TMP_DIR/t29_ffi_kernel.c" -x none "$GEISHA_RUNTIME" \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+    -x ir "$TMP_DIR/t29_ffi_borrow.ll" -x c "$TMP_DIR/t29_ffi_kernel.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
     -o "$TMP_DIR/t29_ffi_borrow"
 # (2*10+1) + (3*10+1) + (4*10+1) + (5*10+1) = 21 + 31 + 41 + 51 = 144
 assert_eq "ffi_auto_borrow_exec" "144" "$("$TMP_DIR/t29_ffi_borrow")"

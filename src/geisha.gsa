@@ -683,11 +683,19 @@ def emitStaticLibFromIr(
     let rtArchive = resolveRuntimeArchiveForTarget(target, rtOverrideOpt)?;
     let tmpObj = outArchive + ".gsa.tmp.o";
     emitTargetObjFromIr(llText, tmpObj, target)?;
-    let cmd = "libtool -static -o " + shellQuote(outArchive) + " " + shellQuote(tmpObj) + " " + shellQuote(rtArchive);
+    let cmd =
+        if (currentHostOs() == "macos") {
+            "libtool -static -o " + shellQuote(outArchive) + " " + shellQuote(tmpObj) + " " + shellQuote(rtArchive)
+        } else {
+            "rm -f " + shellQuote(outArchive)
+            + " && printf 'CREATE %s\\nADDLIB %s\\nADDMOD %s\\nSAVE\\nEND\\n' "
+            + shellQuote(outArchive) + " " + shellQuote(rtArchive) + " " + shellQuote(tmpObj)
+            + " | ar -M"
+        };
     let rc = shell(cmd);
     let _ = removeFile(tmpObj);
     if (rc == 0) Ok(())
-    else Err("libtool failed while creating static library '" + outArchive + "'")
+    else Err("archiver failed while creating static library '" + outArchive + "'")
 }
 
 def emitWasmFromIr(
