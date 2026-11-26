@@ -8,7 +8,7 @@
 
 use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
-use std.buf.{bufNew, bufPushStr, bufToString}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.Span
 
@@ -51,7 +51,47 @@ def trimWsSlice(src: String, start: Int, end: Int): String = {
     strSlice(src, cellGet(s), cellGet(e))
 }
 
-pub def formatDiagAtWithHint(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String, hintOpt: Option String): String = {
+pub def diagSpanTerm(sp: Span): Option String =
+    match diagGetFile(sp.fileId) {
+        None -> None,
+        Some(sf) -> {
+            let src = sf.sfContent;
+            let n = strLen(src);
+            let s = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
+            let e = if (sp.end < s) s else if (sp.end > n) n else sp.end;
+            if (e <= s) None
+            else {
+                let raw = trimWsSlice(src, s, e);
+                let rn = strLen(raw);
+                if (rn == 0) None
+                else {
+                    let b = bufNew();
+                    let i = cellNew(0);
+                    let prevSpace = cellNew(false);
+                    let outLen = cellNew(0);
+                    while (cellGet(i) < rn && cellGet(outLen) < 50) {
+                        let ch = strByteAt(raw, cellGet(i));
+                        if (ch == 10 || ch == 13 || ch == 9 || ch == 32) {
+                            if (!cellGet(prevSpace)) {
+                                bufPushByte(b, 32);
+                                cellSet(outLen, cellGet(outLen) + 1);
+                                cellSet(prevSpace, true)
+                            } else ()
+                        } else {
+                            bufPushByte(b, ch);
+                            cellSet(outLen, cellGet(outLen) + 1);
+                            cellSet(prevSpace, false)
+                        };
+                        cellSet(i, cellGet(i) + 1)
+                    };
+                    if (cellGet(i) < rn) bufPushStr(b, "...") else ();
+                    Some(bufToString(b))
+                }
+            }
+        },
+    }
+
+def formatDiagInternal(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String, hintOpt: Option String, showNear: Bool): String = {
     let tag = shortDiagKind(kind);
     let hintSuffix = match hintOpt {
         Some(h) -> "\n  hint: " + h,
@@ -94,7 +134,7 @@ pub def formatDiagAtWithHint(kind: String, fileId: Int, startByte: Int, endByte:
             let rawEnd = if (endByte > pos) endByte else pos;
             let clampedEnd = if (rawEnd < lineEnd) rawEnd else lineEnd;
             let spanText =
-                if (clampedEnd > pos && clampedEnd - pos <= 80) trimWsSlice(src, pos, clampedEnd)
+                if (showNear && clampedEnd > pos && clampedEnd - pos <= 80) trimWsSlice(src, pos, clampedEnd)
                 else "";
 
             let lineStr = intToStr(cellGet(line));
@@ -125,14 +165,20 @@ pub def formatDiagAtWithHint(kind: String, fileId: Int, startByte: Int, endByte:
     }
 }
 
+pub def formatDiagAtWithHint(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String, hintOpt: Option String): String =
+    formatDiagInternal(kind, fileId, startByte, endByte, msg, hintOpt, true)
+
 pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String): String =
-    formatDiagAtWithHint(kind, fileId, startByte, endByte, msg, None)
+    formatDiagInternal(kind, fileId, startByte, endByte, msg, None, true)
 
 pub def formatSpanDiag(kind: String, sp: Span, msg: String): String =
-    formatDiagAtWithHint(kind, sp.fileId, sp.start, sp.end, msg, None)
+    formatDiagInternal(kind, sp.fileId, sp.start, sp.end, msg, None, true)
+
+pub def formatSpanDiagNoNear(kind: String, sp: Span, msg: String): String =
+    formatDiagInternal(kind, sp.fileId, sp.start, sp.end, msg, None, false)
 
 pub def formatSpanDiagHint(kind: String, sp: Span, msg: String, hint: String): String =
-    formatDiagAtWithHint(kind, sp.fileId, sp.start, sp.end, msg, Some(hint))
+    formatDiagInternal(kind, sp.fileId, sp.start, sp.end, msg, Some(hint), true)
 
 pub def isFormattedDiag(s: String): Bool = {
     let n = strLen(s);

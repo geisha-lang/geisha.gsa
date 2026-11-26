@@ -33,7 +33,7 @@ use ast.{
     Def, MkDef
 }
 use parser.parseTypeSchemeFromStr
-use diag.{formatSpanDiag, formatSpanDiagHint}
+use diag.{formatSpanDiag, formatSpanDiagNoNear, formatSpanDiagHint, diagSpanTerm}
 
 pub data VariantInfo {
     MkVariantInfo {
@@ -210,6 +210,12 @@ def typeErr(sp: Span, msg: String): String =
 
 def typeErrHint(sp: Span, msg: String, hint: String): String =
     formatSpanDiagHint("Type error", sp, msg, hint)
+
+def typeMismatchErr(sp: Span, expected: String, found: String): String =
+    match diagSpanTerm(sp) {
+        Some(term) -> formatSpanDiagNoNear("Type error", sp, "`" + term + "` has type `" + found + "`, expected `" + expected + "`"),
+        None -> typeErr(sp, "expected `" + expected + "`, found `" + found + "`"),
+    }
 
 def pitfallNameHint(name: String): Option String =
     if (name == "Some" || name == "None") Some("import with `use std.option.{Option, Some, None}`")
@@ -395,8 +401,8 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
     let b = zonkType(subst, b0);
     match (a, b) {
         (TyVoid, TyVoid) -> Ok(()),
-        (TyCon(voidA), TyVoid) -> if (voidA == "Void") Ok(()) else Err(typeErr(sp, "expected `" + voidA + "`, found `Void`")),
-        (TyVoid, TyCon(voidB)) -> if (voidB == "Void") Ok(()) else Err(typeErr(sp, "expected `Void`, found `" + voidB + "`")),
+        (TyCon(voidA), TyVoid) -> if (voidA == "Void") Ok(()) else Err(typeMismatchErr(sp, voidA, "Void")),
+        (TyVoid, TyCon(voidB)) -> if (voidB == "Void") Ok(()) else Err(typeMismatchErr(sp, "Void", voidB)),
         (TyCon(na), TyCon(nb)) ->
             if (na == nb) Ok(())
             else if ((na == "$Local" && nb == "$Shared") || (na == "$Shared" && nb == "$Local")) {
@@ -405,7 +411,7 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
                 Err(typeErr(sp, "cannot pass scoped closure (captures ScopedPtr/Arena) where a thread-safe `Send` function is required"))
             } else if ((na == "$Scoped" && nb == "$Local") || (na == "$Local" && nb == "$Scoped")) {
                 Err(typeErr(sp, "cannot pass scoped closure (captures ScopedPtr/Arena) where an escaping closure is required"))
-            } else Err(typeErr(sp, "expected `" + na + "`, found `" + nb + "`")),
+            } else Err(typeMismatchErr(sp, na, nb)),
         (TyVar(va), TyVar(vb)) ->
             if (va == vb) Ok(())
             else if (strLen(va) > 0 && strByteAt(va, 0) != 46 && strLen(vb) > 0 && strByteAt(vb, 0) == 46) {
@@ -433,7 +439,7 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
             unifyTypes(subst, b1, b2, sp)?;
             unifyTypes(subst, a1, a2, sp)
         },
-        _ -> Err(typeErr(sp, "expected `" + typeToString(a) + "`, found `" + typeToString(b) + "`")),
+        _ -> Err(typeMismatchErr(sp, typeToString(a), typeToString(b))),
     }
 }
 
@@ -2554,7 +2560,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 match cellGet(cur) {
                     Cons(el, r) -> {
                         let iel = inferForm(ctx, env, el)?;
-                        unifyTypes(ctx.subst, schemeBody(iel.ty), elemTy, iel.pos)?;
+                        unifyTypes(ctx.subst, elemTy, schemeBody(iel.ty), iel.pos)?;
                         cellSet(newElems, listAppend(cellGet(newElems), [iel]));
                         cellSet(cur, r)
                     },
@@ -2596,7 +2602,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                                                         None -> returnPatErr(sp, "Variant '" + cname + "' has no field '" + fnm + "'")?,
                                                         Some(idx) -> {
                                                             let infVal = inferForm(ctx, env, fexpr)?;
-                                                            unifyTypes(ctx.subst, schemeBody(infVal.ty), listNthType(expectedTys, idx), infVal.pos)?;
+                                                            unifyTypes(ctx.subst, listNthType(expectedTys, idx), schemeBody(infVal.ty), infVal.pos)?;
                                                             cellSet(newFs, listAppend(cellGet(newFs), [(fnm, infVal)]))
                                                         },
                                                     };
@@ -2642,7 +2648,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             let newRetAnn = match retAnnOpt {
                 Some(rt) -> {
                     let ert = expandType(ctx, rt, sp)?;
-                    unifyTypes(ctx.subst, schemeBody(infBody.ty), ert, infBody.pos)?;
+                    unifyTypes(ctx.subst, ert, schemeBody(infBody.ty), infBody.pos)?;
                     Some(ert)
                 },
                 None -> None,
@@ -2710,7 +2716,27 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                         _ -> cellGet(argTys),
                     }
                 } else cellGet(argTys);
-            unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, unifyArgTys, retVar), sp)?;
+            match zonkType(ctx.subst, schemeBody(ic.ty)) {
+                TyArr(fnMode, fnParamTys, fnRetTy) if (listLen(fnParamTys) == listLen(unifyArgTys)) -> {
+                    unifyTypes(ctx.subst, fnMode, callMode, sp)?;
+                    let cp = cellNew(fnParamTys);
+                    let ca = cellNew(unifyArgTys);
+                    let cf = cellNew(cellGet(iargs));
+                    while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(cp), cellGet(ca), cellGet(cf)) {
+                            (Cons(pt, rp), Cons(at, ra), Cons(af, rf)) -> {
+                                unifyTypes(ctx.subst, pt, at, af.pos)?;
+                                cellSet(cp, rp);
+                                cellSet(ca, ra);
+                                cellSet(cf, rf)
+                            },
+                            _ -> { cellSet(cp, Nil); cellSet(ca, Nil) },
+                        }
+                    };
+                    unifyTypes(ctx.subst, fnRetTy, retVar, sp)?
+                },
+                _ -> unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, unifyArgTys, retVar), sp)?,
+            };
             let resZ = zonkType(ctx.subst, retVar);
             match ic.node {
                 ExVar(fnNm) -> {
@@ -3032,15 +3058,15 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             let ic = inferForm(ctx, env, cond)?;
             let it = inferForm(ctx, env, thenE)?;
             let ie = inferForm(ctx, env, elseE)?;
-            unifyTypes(ctx.subst, schemeBody(ic.ty), TyCon("Bool"), ic.pos)?;
-            unifyTypes(ctx.subst, schemeBody(it.ty), schemeBody(ie.ty), it.pos)?;
+            unifyTypes(ctx.subst, TyCon("Bool"), schemeBody(ic.ty), ic.pos)?;
+            unifyTypes(ctx.subst, schemeBody(it.ty), schemeBody(ie.ty), ie.pos)?;
             Ok(MkForm { pos: sp, ty: ScmMono(zonkType(ctx.subst, schemeBody(it.ty))), annot: f.annot, node: ExIf(ic, it, ie) })
         },
         ExWhile(cond, body) -> {
             let ic = inferForm(ctx, env, cond)?;
             let ib = inferForm(ctx, env, body)?;
-            unifyTypes(ctx.subst, schemeBody(ic.ty), TyCon("Bool"), ic.pos)?;
-            unifyTypes(ctx.subst, schemeBody(ib.ty), TyVoid, ib.pos)?;
+            unifyTypes(ctx.subst, TyCon("Bool"), schemeBody(ic.ty), ic.pos)?;
+            unifyTypes(ctx.subst, TyVoid, schemeBody(ib.ty), ib.pos)?;
             Ok(MkForm { pos: sp, ty: ScmMono(TyVoid), annot: f.annot, node: ExWhile(ic, ib) })
         },
         ExBlock(items) -> {
@@ -3055,7 +3081,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                         let i = cellGet(idx);
                         let infIt = inferForm(ctx, env, it)?;
                         if (i + 1 < total) {
-                            unifyTypes(ctx.subst, schemeBody(infIt.ty), TyVoid, infIt.pos)?
+                            unifyTypes(ctx.subst, TyVoid, schemeBody(infIt.ty), infIt.pos)?
                         } else {
                             cellSet(lastTy, zonkType(ctx.subst, schemeBody(infIt.ty)))
                         };

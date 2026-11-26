@@ -1959,12 +1959,29 @@ if [ "$CHK_BAD_RC" -eq 0 ] || [ "$CHK_BAD_JSON_RC" -eq 0 ]; then
     echo "FAIL [geisha_check_bad_rc]: expected non-zero exit code on type error" >&2
     exit 1
 fi
-if ! printf '%s' "$CHK_BAD" | grep -q 't31_bad_type.gsa:2:18: error\[type\]: expected `Int`, found `String`' || ! printf '%s' "$CHK_BAD" | grep -q 'near: "wrong"' || ! printf '%s' "$CHK_BAD" | grep -q 'line 2: let x: Int = "wrong";'; then
-    echo "FAIL [geisha_diag_1d]: expected 1D file:line:col + near + line output, got: $CHK_BAD" >&2
+if ! printf '%s' "$CHK_BAD" | grep -q 't31_bad_type.gsa:2:18: error\[type\]: `"wrong"` has type `String`, expected `Int`' || ! printf '%s' "$CHK_BAD" | grep -q 'line 2: let x: Int = "wrong";'; then
+    echo "FAIL [geisha_diag_1d]: expected inline term + expected/found + line output, got: $CHK_BAD" >&2
     exit 1
 fi
 if ! printf '%s' "$CHK_BAD_JSON" | grep -q '"ok":false' || ! printf '%s' "$CHK_BAD_JSON" | grep -q 't31_bad_type.gsa:2:18'; then
     echo "FAIL [geisha_check_bad_json]: expected ok:false json with line:col, got: $CHK_BAD_JSON" >&2
+    exit 1
+fi
+
+# Verify per-argument term pinpointing on function calls
+cat > "$TMP_DIR/t31_bad_call.gsa" << 'EOF'
+def add2(a: Int, b: Int): Int = a + b
+def main(): Void = {
+    let _ = add2(1, "oops");
+    ()
+}
+EOF
+set +e
+CHK_CALL="$("$GEISHA_BIN" check "$TMP_DIR/t31_bad_call.gsa" 2>&1)"
+CHK_CALL_RC=$?
+set -e
+if [ "$CHK_CALL_RC" -eq 0 ] || ! printf '%s' "$CHK_CALL" | grep -q 't31_bad_call.gsa:3:21: error\[type\]: `"oops"` has type `String`, expected `Int`'; then
+    echo "FAIL [geisha_diag_call_arg]: expected exact argument term pinpointing, got: $CHK_CALL" >&2
     exit 1
 fi
 
