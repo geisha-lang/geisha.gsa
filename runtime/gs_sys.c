@@ -1,7 +1,12 @@
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -20,6 +25,63 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+/* ---- Host platform & executable path discovery (`sys.env`) ---- */
+
+const char *gs_sys_host_os(void)
+{
+#if defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "posix";
+#endif
+}
+
+const char *gs_sys_host_arch(void)
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#else
+    return "unknown";
+#endif
+}
+
+const char *gs_sys_exe_path(void)
+{
+    static char resolved_buf[4096];
+    static int initialized = 0;
+    if (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE) == 1) {
+        return resolved_buf[0] != '\0' ? resolved_buf : NULL;
+    }
+    char tmp[4096];
+    tmp[0] = '\0';
+#if defined(__APPLE__)
+    uint32_t sz = (uint32_t)sizeof(tmp);
+    if (_NSGetExecutablePath(tmp, &sz) == 0) {
+        char real_tmp[4096];
+        if (realpath(tmp, real_tmp) != NULL) {
+            snprintf(resolved_buf, sizeof(resolved_buf), "%s", real_tmp);
+        } else {
+            snprintf(resolved_buf, sizeof(resolved_buf), "%s", tmp);
+        }
+    }
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", tmp, sizeof(tmp) - 1);
+    if (n > 0) {
+        tmp[n] = '\0';
+        snprintf(resolved_buf, sizeof(resolved_buf), "%s", tmp);
+    }
+#endif
+    __atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+    return resolved_buf[0] != '\0' ? resolved_buf : NULL;
+}
 
 /* ---- Filesystem helpers (`sys.fs`) ---- */
 

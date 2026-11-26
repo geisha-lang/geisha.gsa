@@ -29,6 +29,26 @@ use pkg.{
     cmdInit, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
 }
 
+extern "gs_sys_host_os" def c_host_os(): Ptr
+extern "gs_sys_host_arch" def c_host_arch(): Ptr
+extern "gs_sys_exe_path" def c_exe_path(): Ptr
+
+def currentHostOs(): String = {
+    let p = c_host_os();
+    if (ptrIsNull(p)) "posix" else ptrToString(p)
+}
+
+def currentHostArch(): String = {
+    let p = c_host_arch();
+    if (ptrIsNull(p)) "unknown" else ptrToString(p)
+}
+
+def currentExeDir(): String = {
+    let p = c_exe_path();
+    if (ptrIsNull(p)) pathDirname(argAt(0))
+    else pathDirname(ptrToString(p))
+}
+
 data CliOpts {
     MkCliOpts {
         optSubcmd: Option String,
@@ -305,11 +325,11 @@ def resolveWasmRuntimeObj(explicitOpt: Option String): Result String String =
                 if (fileExists(envP)) Ok(envP)
                 else Err("GEISHA_WASM_RUNTIME object not found at '" + envP + "'"),
             None -> {
-                let exeDir = pathDirname(argAt(0));
+                let exeDir = currentExeDir();
                 let cand1 = pathJoin(exeDir, "wasm_rt.o");
-                let cand2 = "build/wasm_rt.o";
+                let cand2 = pathJoin(pathDirname(exeDir), "lib/wasm_rt.o");
                 let cand3 = pathJoin(pathDirname(exeDir), "build/wasm_rt.o");
-                let cand4 = pathJoin(pathDirname(exeDir), "lib/wasm_rt.o");
+                let cand4 = "build/wasm_rt.o";
                 let cand5 = pathJoin(geishaHomeDir(), "lib/wasm_rt.o");
                 if (fileExists(cand1)) Ok(cand1)
                 else if (fileExists(cand2)) Ok(cand2)
@@ -323,21 +343,53 @@ def resolveWasmRuntimeObj(explicitOpt: Option String): Result String String =
 
 def resolveWasmCc(): String =
     match getEnv("WASM_CC") {
-        Some(c) -> c,
-        None ->
+        Some(c) if (strLen(c) > 0) -> c,
+        _ ->
             if (fileExists("/opt/homebrew/opt/llvm@20/bin/clang")) "/opt/homebrew/opt/llvm@20/bin/clang"
             else if (fileExists("/opt/homebrew/opt/llvm/bin/clang")) "/opt/homebrew/opt/llvm/bin/clang"
+            else if (fileExists("/usr/local/opt/llvm@20/bin/clang")) "/usr/local/opt/llvm@20/bin/clang"
+            else if (fileExists("/usr/local/opt/llvm/bin/clang")) "/usr/local/opt/llvm/bin/clang"
+            else if (fileExists("/usr/lib/llvm-20/bin/clang")) "/usr/lib/llvm-20/bin/clang"
+            else if (fileExists("/usr/bin/clang-20")) "/usr/bin/clang-20"
             else "clang",
     }
 
 def resolveWasmLdFlag(): String =
     match getEnv("WASM_LD") {
-        Some(l) -> " -fuse-ld=" + shellQuote(l),
-        None ->
+        Some(l) if (strLen(l) > 0) -> " -fuse-ld=" + shellQuote(l),
+        _ ->
             if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"
             else if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"
+            else if (fileExists("/usr/local/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld@20/bin/wasm-ld"
+            else if (fileExists("/usr/local/opt/lld/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld/bin/wasm-ld"
+            else if (fileExists("/usr/lib/llvm-20/bin/wasm-ld")) " -fuse-ld=/usr/lib/llvm-20/bin/wasm-ld"
             else "",
     }
+
+def resolveNativeCc(): String =
+    match getEnv("CC") {
+        Some(c) if (strLen(c) > 0) -> c,
+        _ -> "clang",
+    }
+
+def nativeEnvPrefix(): String =
+    if (currentHostOs() == "macos") "MACOSX_DEPLOYMENT_TARGET=14.0 " else ""
+
+def nativeTargetFlag(): String =
+    if (currentHostOs() == "macos") {
+        let arch = currentHostArch();
+        if (arch == "arm64") " -target arm64-apple-macosx14.0"
+        else if (arch == "x86_64") " -target x86_64-apple-macosx14.0"
+        else ""
+    } else ""
+
+def nativeLtoFlag(): String =
+    if (currentHostOs() == "macos") " -flto=thin"
+    else if (fileExists("/usr/bin/ld.lld") || fileExists("/usr/local/bin/ld.lld") || fileExists("/usr/lib/llvm-20/bin/ld.lld") || fileExists("/usr/lib/llvm-18/bin/ld.lld")) " -flto=thin -fuse-ld=lld"
+    else ""
+
+def nativeSysLibs(): String =
+    if (currentHostOs() == "macos") "" else " -lm"
 
 def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
     match explicitOpt {
@@ -349,11 +401,11 @@ def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
                 if (fileExists(envP)) Ok(envP)
                 else Err("GEISHA_RUNTIME archive not found at '" + envP + "'"),
             None -> {
-                let exeDir = pathDirname(argAt(0));
+                let exeDir = currentExeDir();
                 let cand1 = pathJoin(exeDir, "libgeisha_runtime.a");
-                let cand2 = "build/libgeisha_runtime.a";
+                let cand2 = pathJoin(pathDirname(exeDir), "lib/libgeisha_runtime.a");
                 let cand3 = pathJoin(pathDirname(exeDir), "build/libgeisha_runtime.a");
-                let cand4 = pathJoin(pathDirname(exeDir), "lib/libgeisha_runtime.a");
+                let cand4 = "build/libgeisha_runtime.a";
                 let cand5 = pathJoin(geishaHomeDir(), "lib/libgeisha_runtime.a");
                 if (fileExists(cand1)) Ok(cand1)
                 else if (fileExists(cand2)) Ok(cand2)
@@ -521,18 +573,22 @@ def emitNativeExecutableFromIr(
     rtOverrideOpt: Option String
 ): Result Void String = {
     let rtArchive = resolveRuntimeArchive(rtOverrideOpt)?;
-    let ccBin = match getEnv("CC") { Some(c) -> c, None -> "cc" };
-    let targetArchFlag = " -target arm64-apple-macosx14.0";
+    let ccBin = shellQuote(resolveNativeCc());
+    let envPfx = nativeEnvPrefix();
+    let targetArchFlag = nativeTargetFlag();
+    let ltoFlag = nativeLtoFlag();
+    let sysLibs = nativeSysLibs();
     let tmpLl = outBin + ".tmp.ll";
     writeFile(tmpLl, llText)?;
 
     match tc.tcCSources {
         Nil -> {
             let cmd =
-                "MACOSX_DEPLOYMENT_TARGET=14.0 " + ccBin + targetArchFlag
-                + " -O2 -flto=thin -Wno-override-module -pthread -x ir "
+                envPfx + ccBin + targetArchFlag
+                + " -O2" + ltoFlag + " -Wno-override-module -pthread -x ir "
                 + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
                 + shellQuoteArgs(tc.tcLinkFlags)
+                + sysLibs
                 + " -o " + shellQuote(outBin);
             let rc = shell(cmd);
             let _ = removeFile(tmpLl);
@@ -543,7 +599,7 @@ def emitNativeExecutableFromIr(
             // Compile IR to `.o` first so Objective-C / C host files compile cleanly without `-flto=thin` ObjC clashes
             let tmpObj = outBin + ".gsa.tmp.o";
             let cmdIr =
-                "MACOSX_DEPLOYMENT_TARGET=14.0 " + ccBin + targetArchFlag
+                envPfx + ccBin + targetArchFlag
                 + " -O2 -Wno-override-module -x ir -c "
                 + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
             let rc1 = shell(cmdIr);
@@ -553,13 +609,14 @@ def emitNativeExecutableFromIr(
                 Err("C/LLVM backend failed while compiling Geisha IR object for '" + outBin + "'")
             } else {
                 let cmdLink =
-                    "MACOSX_DEPLOYMENT_TARGET=14.0 " + ccBin + targetArchFlag
+                    envPfx + ccBin + targetArchFlag
                     + " -O2 -pthread"
                     + shellQuoteArgs(tc.tcCFlags)
                     + shellQuoteArgs(cSrcs)
                     + " " + shellQuote(tmpObj)
                     + " " + shellQuote(rtArchive)
                     + shellQuoteArgs(tc.tcLinkFlags)
+                    + sysLibs
                     + " -o " + shellQuote(outBin);
                 let rc2 = shell(cmdLink);
                 let _ = removeFile(tmpObj);
@@ -573,9 +630,10 @@ def emitNativeExecutableFromIr(
 def emitNativeObjFromIr(llText: String, outObj: String): Result Void String = {
     let tmpLl = outObj + ".tmp.ll";
     writeFile(tmpLl, llText)?;
-    let ccBin = match getEnv("CC") { Some(c) -> c, None -> "cc" };
+    let ccBin = shellQuote(resolveNativeCc());
     let cmd =
-        "MACOSX_DEPLOYMENT_TARGET=14.0 " + ccBin + " -target arm64-apple-macosx14.0 -O2 -Wno-override-module -x ir -c "
+        nativeEnvPrefix() + ccBin + nativeTargetFlag()
+        + " -O2 -Wno-override-module -x ir -c "
         + shellQuote(tmpLl) + " -o " + shellQuote(outObj);
     let rc = shell(cmd);
     let _ = removeFile(tmpLl);

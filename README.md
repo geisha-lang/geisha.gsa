@@ -21,10 +21,22 @@ Self-hosting compiler and decentralized package manager for the **Geisha** progr
 
 ## Bootstrapping & Fixed-Point Verification
 
-Run the 3-stage bootstrap and verify the fixed point (`stage2.ll == stage3.ll`):
+Run the 3-stage bootstrap and verify the fixed point (`stage2.ll == stage3.ll`). When `STAGE0` is omitted, `Makefile` automatically compiles `bootstrap/stage0.ll.xz` (portable LP64 LLVM IR seed) into `build/geisha0` first:
+
+```sh
+make runtime wasm-runtime bootstrap
+```
+
+Or bootstrap from an existing installed `geisha` binary:
 
 ```sh
 make bootstrap STAGE0=/path/to/previous/geisha
+```
+
+Package a self-contained relocatable release archive (`dist/geisha-<version>-<os>-<arch>.tar.gz`):
+
+```sh
+make dist VERSION=v0.1.0
 ```
 
 Install the self-hosted toolchain (`geisha`, `libgeisha_runtime.a`, `wasm_rt.o`) to `~/.geisha`:

@@ -1,3 +1,13 @@
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../include/gc_bitmap.h"
 #include "../include/gs_conc.h"
 
@@ -7,6 +17,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+
+#ifndef MAP_ANON
+#define MAP_ANON MAP_ANONYMOUS
+#endif
 
 #define MAX_GLOBAL_ROOTS 4096
 #define THR_RUNNING      0

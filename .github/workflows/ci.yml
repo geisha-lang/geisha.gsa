@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  bootstrap-and-test:
+    name: Bootstrap & Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-24.04
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+          - label: darwin-arm64
+            os: macos-14
+            cross_x64: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LLVM/Clang & Wasm32 toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld xz-utils
+
+      - name: Install LLVM/Wasm32 toolchain (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install llvm lld xz
+
+      - name: Set up Node.js (for wasm32 E2E test suite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 3-stage self-hosting bootstrap & fixed-point check
+        run: make runtime wasm-runtime bootstrap
+
+      - name: Run full end-to-end language, GC, wasm32 & package manager tests
+        run: make test
+
+      - name: Verify relocatable release tarball packaging & zero-env smoke test
+        env:
+          PACKAGE_DARWIN_X86_64: ${{ matrix.cross_x64 || '0' }}
+        run: |
+          make dist VERSION=ci
+          SMOKE_DIR="$(mktemp -d)"
+          tar -xzf dist/geisha-ci-${{ matrix.label }}.tar.gz -C "$SMOKE_DIR"
+          export PATH="$SMOKE_DIR/geisha-ci-${{ matrix.label }}/bin:$PATH"
+          cd "$SMOKE_DIR"
+          geisha init smoke_app
+          (cd smoke_app && geisha run)
+          geisha init --lib smoke_lib
+          (cd smoke_lib && geisha test)
+
+  formal-verification:
+    name: Lean 4 Formal Proofs & Translation Validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang & build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld xz-utils curl python3
+
+      - name: Cache Lean 4 / Lake build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            formal/.lake
+          key: lean4-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain', 'formal/lakefile.lean', 'formal/CoreGeisha.lean', 'formal/Main.lean', 'formal/CoreGeisha/*.lean') }}
+          restore-keys: |
+            lean4-${{ runner.os }}-${{ hashFiles('formal/lean-toolchain') }}-
+
+      - name: Install elan & Lean 4 toolchain
+        run: |
+          if [ ! -x "$HOME/.elan/bin/lake" ]; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" show
+
+      - name: Build Stage-2 Geisha compiler
+        run: make stage2
+
+      - name: Verify zero sorry/custom axioms & run Core Geisha translation validation
+        run: |
+          python3 -c '
+          import glob, re, sys
+          bad = []
+          for p in sorted(glob.glob("formal/**/*.lean", recursive=True)):
+              if "/.lake/" in p:
+                  continue
+              src = open(p, encoding="utf-8").read()
+              stripped = re.sub(r"/-.*?-/", lambda m: "\n" * m.group(0).count("\n"), src, flags=re.S)
+              for i, line in enumerate(stripped.splitlines(), 1):
+                  code = line.split("--")[0]
+                  if re.search(r"\b(sorry|admit|axiom)\b", code):
+                      bad.append(f"{p}:{i}: {line.rstrip()}")
+          if bad:
+              print("\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("Verified zero sorry / admit / custom axiom across all Lean files.")
+          '
+          make verify-core

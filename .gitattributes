@@ -1,4 +1,5 @@
 # Geisha source files (.gsa)
 src/stdlib_bundle.gsa linguist-generated=true
+bootstrap/*.xz binary linguist-generated=true
 # Uncomment below for temporary Scala-based syntax highlighting on GitHub Web before Linguist adds Geisha:
 # *.gsa linguist-language=Scala
