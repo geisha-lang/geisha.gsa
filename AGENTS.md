@@ -39,4 +39,4 @@ You **MUST** in the same commit / PR:
 ## Compiler Diagnostics Convention
 
 - Never introduce raw `at byte N` error messages in `lexer.gsa`, `parser.gsa`, or `infer.gsa`.
-- Always route span-bearing errors through `diag.formatDiagAt` / `diag.formatSpanDiag` so errors include `file:line:col`, the source line, and a `^~~~` caret.
+- Always route span-bearing errors through `diag.formatDiagAt` / `diag.formatSpanDiag` / `diag.formatSpanDiagHint` so errors emit compact 1D `file:line:col: error[kind]: ...` + `near:` + `line N:` + optional `hint:` (no 2D ASCII-art caret padding).

@@ -7,7 +7,7 @@ use std.list.{listRev, listAppend, listLen}
 use std.control.{fmap}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
-use std.str.intToStr
+use std.str.{intToStr, strJoin}
 use ast.{
     Span, emptySpan,
     Visibility, VisPublic,
@@ -33,7 +33,7 @@ use ast.{
     Def, MkDef
 }
 use parser.parseTypeSchemeFromStr
-use diag.formatSpanDiag
+use diag.{formatSpanDiag, formatSpanDiagHint}
 
 pub data VariantInfo {
     MkVariantInfo {
@@ -207,6 +207,17 @@ def freshModeVar(ctx: InferCtx): Type = {
 
 def typeErr(sp: Span, msg: String): String =
     formatSpanDiag("Type error", sp, msg)
+
+def typeErrHint(sp: Span, msg: String, hint: String): String =
+    formatSpanDiagHint("Type error", sp, msg, hint)
+
+def pitfallNameHint(name: String): Option String =
+    if (name == "Some" || name == "None") Some("import with `use std.option.{Option, Some, None}`")
+    else if (name == "Ok" || name == "Err") Some("import with `use std.result.{Result, Ok, Err}`")
+    else if (name == "println" || name == "print_ln") Some("use `printLn` (capital L)")
+    else if (name == "len") Some("use `strLen`, `listLen`, `vecLen`, or `arrayLen`")
+    else if (name == "mut") Some("Geisha uses `cellNew` / `cellGet` / `cellSet` instead of `mut`")
+    else None
 
 // ============================================================================
 // Union-Find Style Type Substitution (`zonkType` / `unifyTypes`)
@@ -384,17 +395,17 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
     let b = zonkType(subst, b0);
     match (a, b) {
         (TyVoid, TyVoid) -> Ok(()),
-        (TyCon(voidA), TyVoid) -> if (voidA == "Void") Ok(()) else Err(typeErr(sp, "Type mismatch: expected '" + voidA + "', got 'Void'")),
-        (TyVoid, TyCon(voidB)) -> if (voidB == "Void") Ok(()) else Err(typeErr(sp, "Type mismatch: expected 'Void', got '" + voidB + "'")),
+        (TyCon(voidA), TyVoid) -> if (voidA == "Void") Ok(()) else Err(typeErr(sp, "expected `" + voidA + "`, found `Void`")),
+        (TyVoid, TyCon(voidB)) -> if (voidB == "Void") Ok(()) else Err(typeErr(sp, "expected `Void`, found `" + voidB + "`")),
         (TyCon(na), TyCon(nb)) ->
             if (na == nb) Ok(())
             else if ((na == "$Local" && nb == "$Shared") || (na == "$Shared" && nb == "$Local")) {
-                Err(typeErr(sp, "Cannot pass non-Send closure (captures local mutable state) where a thread-safe 'Send' function is required"))
+                Err(typeErr(sp, "cannot pass non-Send closure (captures local mutable state) where a thread-safe `Send` function is required"))
             } else if ((na == "$Scoped" && nb == "$Shared") || (na == "$Shared" && nb == "$Scoped")) {
-                Err(typeErr(sp, "Cannot pass scoped closure (captures ScopedPtr/Arena) where a thread-safe 'Send' function is required"))
+                Err(typeErr(sp, "cannot pass scoped closure (captures ScopedPtr/Arena) where a thread-safe `Send` function is required"))
             } else if ((na == "$Scoped" && nb == "$Local") || (na == "$Local" && nb == "$Scoped")) {
-                Err(typeErr(sp, "Cannot pass scoped closure (captures ScopedPtr/Arena) where an escaping closure is required"))
-            } else Err(typeErr(sp, "Type mismatch: '" + na + "' vs '" + nb + "'")),
+                Err(typeErr(sp, "cannot pass scoped closure (captures ScopedPtr/Arena) where an escaping closure is required"))
+            } else Err(typeErr(sp, "expected `" + na + "`, found `" + nb + "`")),
         (TyVar(va), TyVar(vb)) ->
             if (va == vb) Ok(())
             else if (strLen(va) > 0 && strByteAt(va, 0) != 46 && strLen(vb) > 0 && strByteAt(vb, 0) == 46) {
@@ -406,7 +417,7 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
         (_, TyVar(vb)) -> bindTypeVar(subst, vb, a, sp),
         (TyArr(m1, ps1, r1), TyArr(m2, ps2, r2)) -> {
             if (listLen(ps1) != listLen(ps2)) {
-                Err(typeErr(sp, "Function parameter count mismatch: expected " + intToStr(listLen(ps1)) + ", got " + intToStr(listLen(ps2))))
+                Err(typeErr(sp, "expected " + intToStr(listLen(ps1)) + " argument(s), found " + intToStr(listLen(ps2))))
             } else {
                 unifyTypes(subst, m1, m2, sp)?;
                 unifyTypeLists(subst, ps1, ps2, sp)?;
@@ -415,14 +426,14 @@ def unifyTypes(subst: StrMap Type, a0: Type, b0: Type, sp: Span): Result Void St
         },
         (TyTuple(es1), TyTuple(es2)) -> {
             if (listLen(es1) != listLen(es2)) {
-                Err(typeErr(sp, "Tuple element count mismatch"))
+                Err(typeErr(sp, "tuple has " + intToStr(listLen(es2)) + " element(s), expected " + intToStr(listLen(es1))))
             } else unifyTypeLists(subst, es1, es2, sp)
         },
         (TyComp(b1, a1), TyComp(b2, a2)) -> {
             unifyTypes(subst, b1, b2, sp)?;
             unifyTypes(subst, a1, a2, sp)
         },
-        _ -> Err(typeErr(sp, "Type mismatch: '" + typeToString(a) + "' vs '" + typeToString(b) + "'")),
+        _ -> Err(typeErr(sp, "expected `" + typeToString(a) + "`, found `" + typeToString(b) + "`")),
     }
 }
 
@@ -2513,7 +2524,10 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 let instTy = instantiateScheme(ctx, scm, sp);
                 Ok(MkForm { pos: sp, ty: ScmMono(instTy), annot: f.annot, node: ExVar(name) })
             },
-            None -> Err(typeErr(sp, "Not in scope: '" + name + "'")),
+            None -> match pitfallNameHint(name) {
+                Some(h) -> Err(typeErrHint(sp, "undefined name `" + name + "`", h)),
+                None -> Err(typeErr(sp, "undefined name `" + name + "`")),
+            },
         },
         ExTuple(elems) -> {
             let newElems = cellNew(Nil);
@@ -2560,7 +2574,11 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                         None -> Err(typeErr(sp, "Variant '" + cname + "' is not a struct variant")),
                         Some(declNames) -> {
                             if (listLen(fieldInits) != listLen(declNames)) {
-                                Err(typeErr(sp, "Struct '" + cname + "' field count mismatch"))
+                                Err(typeErrHint(
+                                    sp,
+                                    "struct `" + cname + "` expects " + intToStr(listLen(declNames)) + " field(s), found " + intToStr(listLen(fieldInits)),
+                                    "expected fields: " + strJoin(declNames, ", ")
+                                ))
                             } else {
                                 let ctorTy = instantiateScheme(ctx, vinfo.ctorScm, sp);
                                 match ctorTy {
@@ -2897,7 +2915,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                             Cons(vinfo, _) -> match vinfo.fieldNames {
                                 None -> Err(typeErr(sp, "Type '" + adtName + "' is not a struct variant")),
                                 Some(declNames) -> match listIndexStr(declNames, fieldName, 0) {
-                                    None -> Err(typeErr(sp, "Struct '" + adtName + "' has no field '" + fieldName + "'")),
+                                    None -> Err(typeErrHint(sp, "struct `" + adtName + "` has no field `" + fieldName + "`", "available fields: " + strJoin(declNames, ", "))),
                                     Some(idx) -> {
                                         let sub = buildPairMap(ainfo.typeParams, typeArgs);
                                         let fty = zonkType(ctx.subst, applyExplicitSubst(listNthType(vinfo.fieldTypes, idx), sub));

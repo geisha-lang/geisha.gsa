@@ -1,8 +1,14 @@
-// Source-mapped diagnostics (`diag`): `file:line:col` + source snippet + caret underline.
+// Source-mapped diagnostics (`diag`): compact 1D format built for both Agents and humans.
+//
+// Example:
+//   foo.gsa:2:18: error[type]: expected `Int`, found `String`
+//     near: "oops"
+//     line 2: let x: Int = "oops";
+//     hint: ...
 
 use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
-use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.buf.{bufNew, bufPushStr, bufToString}
 use std.str.intToStr
 use ast.Span
 
@@ -27,19 +33,32 @@ pub def diagGetFile(fileId: Int): Option SourceFile = {
     else Some(vecGetOr(fs, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
 }
 
-def repeatChar(ch: Int, n: Int): String = {
-    let b = bufNew();
-    let i = cellNew(0);
-    while (cellGet(i) < n) {
-        bufPushByte(b, ch);
-        cellSet(i, cellGet(i) + 1)
+def shortDiagKind(kind: String): String =
+    if (kind == "Type error") "type"
+    else if (kind == "Parse error") "syntax"
+    else if (kind == "Lex error") "lex"
+    else kind
+
+def trimWsSlice(src: String, start: Int, end: Int): String = {
+    let s = cellNew(start);
+    let e = cellNew(end);
+    while (cellGet(s) < cellGet(e) && (strByteAt(src, cellGet(s)) == 32 || strByteAt(src, cellGet(s)) == 9)) {
+        cellSet(s, cellGet(s) + 1)
     };
-    bufToString(b)
+    while (cellGet(e) > cellGet(s) && (strByteAt(src, cellGet(e) - 1) == 32 || strByteAt(src, cellGet(e) - 1) == 9 || strByteAt(src, cellGet(e) - 1) == 13)) {
+        cellSet(e, cellGet(e) - 1)
+    };
+    strSlice(src, cellGet(s), cellGet(e))
 }
 
-pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String): String =
+pub def formatDiagAtWithHint(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String, hintOpt: Option String): String = {
+    let tag = shortDiagKind(kind);
+    let hintSuffix = match hintOpt {
+        Some(h) -> "\n  hint: " + h,
+        None -> "",
+    };
     match diagGetFile(fileId) {
-        None -> kind + " at byte " + intToStr(startByte) + ": " + msg,
+        None -> "error[" + tag + "]: " + msg + hintSuffix,
         Some(sf) -> {
             let src = sf.sfContent;
             let n = strLen(src);
@@ -70,26 +89,15 @@ pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, ms
                 else lineEndRaw;
 
             let col = (pos - ls) + 1;
-            let lineText = strSlice(src, ls, lineEnd);
+            let lineText = trimWsSlice(src, ls, lineEnd);
 
-            // Preserve tabs in leading indentation before caret
-            let indentBuf = bufNew();
-            let k = cellNew(ls);
-            while (cellGet(k) < pos && cellGet(k) < lineEnd) {
-                let b = strByteAt(src, cellGet(k));
-                if (b == 9) bufPushByte(indentBuf, 9) else bufPushByte(indentBuf, 32);
-                cellSet(k, cellGet(k) + 1)
-            };
-            let colPad = bufToString(indentBuf);
-
-            let rawEnd = if (endByte > pos) endByte else pos + 1;
-            let maxEnd = if (lineEnd > pos) lineEnd else pos + 1;
-            let clampedEnd = if (rawEnd < maxEnd) rawEnd else maxEnd;
-            let uLen = if (clampedEnd > pos) clampedEnd - pos else 1;
-            let caret = "^" + repeatChar(126, if (uLen > 1) uLen - 1 else 0);
+            let rawEnd = if (endByte > pos) endByte else pos;
+            let clampedEnd = if (rawEnd < lineEnd) rawEnd else lineEnd;
+            let spanText =
+                if (clampedEnd > pos && clampedEnd - pos <= 80) trimWsSlice(src, pos, clampedEnd)
+                else "";
 
             let lineStr = intToStr(cellGet(line));
-            let gutterPad = repeatChar(32, strLen(lineStr));
 
             let out = bufNew();
             bufPushStr(out, sf.sfPath);
@@ -97,22 +105,45 @@ pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, ms
             bufPushStr(out, lineStr);
             bufPushStr(out, ":");
             bufPushStr(out, intToStr(col));
-            bufPushStr(out, ": ");
-            bufPushStr(out, kind);
-            bufPushStr(out, ": ");
+            bufPushStr(out, ": error[");
+            bufPushStr(out, tag);
+            bufPushStr(out, "]: ");
             bufPushStr(out, msg);
-            bufPushStr(out, "\n ");
-            bufPushStr(out, lineStr);
-            bufPushStr(out, " | ");
-            bufPushStr(out, lineText);
-            bufPushStr(out, "\n ");
-            bufPushStr(out, gutterPad);
-            bufPushStr(out, " | ");
-            bufPushStr(out, colPad);
-            bufPushStr(out, caret);
+            if (strLen(spanText) > 0 && spanText != lineText) {
+                bufPushStr(out, "\n  near: ");
+                bufPushStr(out, spanText)
+            } else ();
+            if (strLen(lineText) > 0) {
+                bufPushStr(out, "\n  line ");
+                bufPushStr(out, lineStr);
+                bufPushStr(out, ": ");
+                bufPushStr(out, lineText)
+            } else ();
+            bufPushStr(out, hintSuffix);
             bufToString(out)
         },
     }
+}
+
+pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String): String =
+    formatDiagAtWithHint(kind, fileId, startByte, endByte, msg, None)
 
 pub def formatSpanDiag(kind: String, sp: Span, msg: String): String =
-    formatDiagAt(kind, sp.fileId, sp.start, sp.end, msg)
+    formatDiagAtWithHint(kind, sp.fileId, sp.start, sp.end, msg, None)
+
+pub def formatSpanDiagHint(kind: String, sp: Span, msg: String, hint: String): String =
+    formatDiagAtWithHint(kind, sp.fileId, sp.start, sp.end, msg, Some(hint))
+
+pub def isFormattedDiag(s: String): Bool = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) + 6 <= n && !cellGet(found) && strByteAt(s, cellGet(i)) != 10) {
+        let p = cellGet(i);
+        if (strByteAt(s, p) == 101 && strByteAt(s, p + 1) == 114 && strByteAt(s, p + 2) == 114 && strByteAt(s, p + 3) == 111 && strByteAt(s, p + 4) == 114 && (strByteAt(s, p + 5) == 91 || strByteAt(s, p + 5) == 58)) {
+            cellSet(found, true)
+        } else ();
+        cellSet(i, p + 1)
+    };
+    cellGet(found)
+}

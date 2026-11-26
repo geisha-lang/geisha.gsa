@@ -24,6 +24,7 @@ use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.emitProgramLlvmIrOpts
 use doc.cmdDoc
+use diag.isFormattedDiag
 use guide_bundle.embeddedAgentGuide
 use pkg.{
     NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
@@ -1105,7 +1106,11 @@ def returnDriverErr(msg: String): Result String String = Err(msg)
 def main(): Void = match runDriver() {
     Ok(code) -> if (code != 0) exit(code) else (),
     Err(msg) -> {
-        eprintLn("Compiling error:\n" + msg);
+        if (isFormattedDiag(msg)) {
+            eprintLn(msg)
+        } else {
+            eprintLn("error: " + msg)
+        };
         exit(1)
     },
 }

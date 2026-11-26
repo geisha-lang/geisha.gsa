@@ -38,7 +38,7 @@ use lexer.{
     TkTrue, TkFalse, TkVoid, TkEof,
     Token, MkToken, tokenizeInFile
 }
-use diag.formatSpanDiag
+use diag.{formatSpanDiag, formatSpanDiagHint}
 
 pub data Parser {
     MkParser {
@@ -110,6 +110,9 @@ def peekAt(p: Parser, offset: Int): Token =
 
 def parseErr(p: Parser, msg: String): String =
     formatSpanDiag("Parse error", peekTok(p).span, msg)
+
+def parseErrHint(p: Parser, msg: String, hint: String): String =
+    formatSpanDiagHint("Parse error", peekTok(p).span, msg, hint)
 
 def isEof(p: Parser): Bool = match peekTok(p).kind {
     TkEof -> true,
@@ -963,7 +966,10 @@ def parseAtomExpr(p: Parser): Result Form String = {
     match t.kind {
         TkIf -> {
             let _ = bumpTok(p);
-            let _ = expectLParen(p)?;
+            let _ = match peekTok(p).kind {
+                TkLParen -> Ok(bumpTok(p).span),
+                _ -> Err(parseErrHint(p, "expected `(` after `if`", "conditions require parentheses, e.g. `if (cond) ... else ...`")),
+            }?;
             let cond = parseExpr(p)?;
             let _ = expectRParen(p)?;
             let thenE = parseExpr(p)?;
@@ -973,12 +979,15 @@ def parseAtomExpr(p: Parser): Result Form String = {
                     let elseE = parseExpr(p)?;
                     Ok(mkForm(unionSpan(t.span, elseE.pos), ExIf(cond, thenE, elseE)))
                 },
-                _ -> Err(parseErr(p, "expected 'else' in if expression")),
+                _ -> Err(parseErrHint(p, "missing `else` branch in `if` expression", "add `else ()` if no value is needed")),
             }
         },
         TkWhile -> {
             let _ = bumpTok(p);
-            let _ = expectLParen(p)?;
+            let _ = match peekTok(p).kind {
+                TkLParen -> Ok(bumpTok(p).span),
+                _ -> Err(parseErrHint(p, "expected `(` after `while`", "conditions require parentheses, e.g. `while (cond) { ... }`")),
+            }?;
             let cond = parseExpr(p)?;
             let _ = expectRParen(p)?;
             let body = parseExpr(p)?;
@@ -1021,7 +1030,11 @@ def parseAtomExpr(p: Parser): Result Form String = {
                             },
                             _ -> None,
                         };
-                        let _ = expectSym(p, "->")?;
+                        let _ = match peekTok(p).kind {
+                            TkSym(s) if (s == "->") -> Ok(bumpTok(p).span),
+                            TkSym(s) if (s == "=>") -> Err(parseErrHint(p, "expected `->` in match arm, found `=>`", "Geisha uses `->` (not `=>`) in match arms")),
+                            _ -> expectSym(p, "->"),
+                        }?;
                         let armBody = parseExpr(p)?;
                         cellSet(arms, listAppend(cellGet(arms), [MkMatchArm { pat: pat, guard: guardOpt, body: armBody }]));
                         if (!eatComma(p)) cellSet(more, false) else ()
