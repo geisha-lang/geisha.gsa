@@ -5,6 +5,7 @@ import CoreGeisha.Soundness
 import CoreGeisha.Concurrency
 import CoreGeisha.Exhaustive
 import CoreGeisha.Escape
+import CoreGeisha.Scoped
 import CoreGeisha.GC
 import CoreGeisha.Checker
 import CoreGeisha.Parser
