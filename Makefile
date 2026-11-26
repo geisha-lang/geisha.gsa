@@ -6,15 +6,19 @@ UNAME_M := $(shell uname -m)
 ifeq ($(origin CC),default)
   CC := clang
 endif
-CC             ?= clang
-BUILD_DIR      := build
-DIST_DIR       ?= dist
-VERSION        ?= dev
-RUNTIME_LIB    := $(BUILD_DIR)/libgeisha_runtime.a
-WASM_RT_OBJ    := $(BUILD_DIR)/wasm_rt.o
-BOOTSTRAP_SEED := bootstrap/stage0.ll.xz
-ENTRY          := src/geisha.gsa
-PREFIX         ?= $(HOME)/.geisha
+CC                  ?= clang
+BUILD_DIR           := build
+DIST_DIR            ?= dist
+VERSION             ?= dev
+RUNTIME_LIB         := $(BUILD_DIR)/libgeisha_runtime.a
+RUNTIME_IOS_LIB     := $(BUILD_DIR)/libgeisha_runtime_ios.a
+RUNTIME_IOS_SIM_LIB := $(BUILD_DIR)/libgeisha_runtime_ios_sim.a
+WASM_RT_OBJ         := $(BUILD_DIR)/wasm_rt.o
+BOOTSTRAP_SEED      := bootstrap/stage0.ll.xz
+ENTRY               := src/geisha.gsa
+PREFIX              ?= $(HOME)/.geisha
+XCODE_DEV           ?= /Applications/Xcode.app/Contents/Developer
+IOS_CFLAGS          ?= -O2 -Wall -Wextra -Iruntime/include
 
 ifeq ($(UNAME_S),Darwin)
   HOST_OS     := darwin
@@ -48,7 +52,7 @@ else
   STAGE0_DEP :=
 endif
 
-.PHONY: all runtime wasm-runtime stdlib-bundle stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test verify-core clean
+.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test verify-core clean
 
 all: stage2
 
@@ -68,6 +72,24 @@ $(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runt
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/gc_bitmap.o
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/gs_conc.o
 	ar rcs $(RUNTIME_LIB) $(BUILD_DIR)/base.o $(BUILD_DIR)/gs_sys.o $(BUILD_DIR)/gc_bitmap.o $(BUILD_DIR)/gs_conc.o
+
+runtime-ios: $(RUNTIME_IOS_LIB)
+
+$(RUNTIME_IOS_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/ios_base.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/ios_gs_sys.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/ios_gc_bitmap.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/ios_gs_conc.o
+	ar rcs $(RUNTIME_IOS_LIB) $(BUILD_DIR)/ios_base.o $(BUILD_DIR)/ios_gs_sys.o $(BUILD_DIR)/ios_gc_bitmap.o $(BUILD_DIR)/ios_gs_conc.o
+
+runtime-ios-sim: $(RUNTIME_IOS_SIM_LIB)
+
+$(RUNTIME_IOS_SIM_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/iossim_base.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/iossim_gs_sys.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/iossim_gc_bitmap.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/iossim_gs_conc.o
+	ar rcs $(RUNTIME_IOS_SIM_LIB) $(BUILD_DIR)/iossim_base.o $(BUILD_DIR)/iossim_gs_sys.o $(BUILD_DIR)/iossim_gc_bitmap.o $(BUILD_DIR)/iossim_gs_conc.o
 
 stdlib-bundle:
 	python3 scripts/gen_stdlib.py
@@ -118,6 +140,8 @@ install: $(BUILD_DIR)/geisha3 $(RUNTIME_LIB) $(WASM_RT_OBJ)
 	cp $(BUILD_DIR)/geisha3 "$(PREFIX)/bin/geisha"
 	cp $(RUNTIME_LIB) "$(PREFIX)/lib/libgeisha_runtime.a"
 	cp $(WASM_RT_OBJ) "$(PREFIX)/lib/wasm_rt.o"
+	@if [ -f "$(RUNTIME_IOS_LIB)" ]; then cp "$(RUNTIME_IOS_LIB)" "$(PREFIX)/lib/libgeisha_runtime_ios.a"; fi
+	@if [ -f "$(RUNTIME_IOS_SIM_LIB)" ]; then cp "$(RUNTIME_IOS_SIM_LIB)" "$(PREFIX)/lib/libgeisha_runtime_ios_sim.a"; fi
 	@if [ -d "$(HOME)/.local/bin" ]; then ln -sf "$(PREFIX)/bin/geisha" "$(HOME)/.local/bin/geisha"; fi
 	@echo "Installed geisha toolchain to $(PREFIX)/bin/geisha"
 

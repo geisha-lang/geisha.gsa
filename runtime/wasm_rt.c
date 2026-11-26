@@ -58,6 +58,12 @@ static uint32_t gs_total_seg_bytes = 0;
 static void **gs_roots[MAX_WASM_ROOTS];
 static uint32_t gs_root_count = 0;
 
+#define MAX_WASM_HANDLES 4096u
+static void *gs_handle_slots[MAX_WASM_HANDLES];
+static uint32_t gs_handle_used = 0;
+static uint32_t gs_handle_free[MAX_WASM_HANDLES];
+static uint32_t gs_handle_free_len = 0;
+
 static uint32_t gs_mark_stack[MARK_STACK_CAP];
 
 static inline uint32_t align8(uint32_t n)
@@ -389,6 +395,16 @@ int32_t gs_wasm_gc_collect(void)
             mark_from_hdr(hdr_addr, &overflowed);
         }
     }
+    /* 1a. Mark pinned StableHandle entries */
+    for (uint32_t i = 1; i <= gs_handle_used; i++) {
+        uint32_t ptr_val = (uint32_t)(uintptr_t)gs_handle_slots[i];
+        if (ptr_val != 0u) {
+            uint32_t hdr_addr = find_allocated_hdr(ptr_val);
+            if (hdr_addr != 0u) {
+                mark_from_hdr(hdr_addr, &overflowed);
+            }
+        }
+    }
 
     /* 1b. Handle rare mark-stack overflow by rescanning marked objects to a fixed point */
     while (overflowed) {
@@ -714,4 +730,53 @@ __attribute__((export_name("gs_wasm_heap_live")))
 int32_t gs_wasm_heap_live(void)
 {
     return (int32_t)gs_live_bytes;
+}
+
+int64_t gc_handle_new(void *obj)
+{
+    if (obj == NULL) return 0;
+    uint32_t idx = 0;
+    if (gs_handle_free_len > 0u) {
+        idx = gs_handle_free[--gs_handle_free_len];
+    } else if (gs_handle_used + 1u < MAX_WASM_HANDLES) {
+        idx = ++gs_handle_used;
+    } else {
+        __builtin_trap();
+    }
+    gs_handle_slots[idx] = obj;
+    return (int64_t)idx;
+}
+
+void *gc_handle_get(int64_t handle)
+{
+    if (handle <= 0 || (uint32_t)handle > gs_handle_used) return NULL;
+    return gs_handle_slots[(uint32_t)handle];
+}
+
+void gc_handle_free(int64_t handle)
+{
+    if (handle <= 0 || (uint32_t)handle > gs_handle_used) return;
+    uint32_t idx = (uint32_t)handle;
+    if (gs_handle_slots[idx] != NULL) {
+        gs_handle_slots[idx] = NULL;
+        if (gs_handle_free_len < MAX_WASM_HANDLES) {
+            gs_handle_free[gs_handle_free_len++] = idx;
+        }
+    }
+}
+
+void gc_trim(void)
+{
+    (void)gs_wasm_gc_collect();
+}
+
+void gc_set_thresholds(int64_t minor_bytes, int64_t major_bytes)
+{
+    (void)minor_bytes;
+    (void)major_bytes;
+}
+
+int64_t gc_heap_live_bytes(void)
+{
+    return (int64_t)gs_live_bytes;
 }

@@ -1023,6 +1023,8 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("i64ToInt", "Int64 -> Int"),
         ("floatToBits64", "Float -> Int64"),
         ("bits64ToFloat", "Int64 -> Float"),
+        ("floatToBits32", "Float -> Int"),
+        ("bits32ToFloat", "Int -> Float"),
         ("intToFloat", "Int -> Float"),
         ("floatToInt", "Float -> Int"),
         ("strLen", "String -> Int"),
@@ -1032,14 +1034,33 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("strFromBytes", "(MutArray Int, Int) -> String"),
         ("ptrNull", "() -> Ptr"),
         ("ptrIsNull", "Ptr -> Bool"),
+        ("ptrOffset", "(Ptr, Int) -> Ptr"),
+        ("ptrOffset64", "(Ptr, Int64) -> Ptr"),
         ("ptrAllocBytes", "Int -> Ptr"),
         ("ptrByteAt", "(Ptr, Int) -> Int"),
         ("ptrSetByte", "(Ptr, Int, Int) -> Void"),
+        ("ptrReadI8", "(Ptr, Int) -> Int"),
+        ("ptrReadU16Le", "(Ptr, Int) -> Int"),
+        ("ptrReadU32Le", "(Ptr, Int) -> Int"),
+        ("ptrReadI64Le", "(Ptr, Int) -> Int64"),
+        ("ptrReadF32Le", "(Ptr, Int) -> Float"),
+        ("ptrReadF64Le", "(Ptr, Int) -> Float"),
+        ("ptrWriteU16Le", "(Ptr, Int, Int) -> Void"),
+        ("ptrWriteU32Le", "(Ptr, Int, Int) -> Void"),
+        ("ptrWriteI64Le", "(Ptr, Int, Int64) -> Void"),
+        ("ptrWriteF32Le", "(Ptr, Int, Float) -> Void"),
+        ("ptrWriteF64Le", "(Ptr, Int, Float) -> Void"),
         ("ptrCopyBytes", "(Ptr, Int, Ptr, Int, Int) -> Void"),
         ("ptrCopyFromStr", "(Ptr, Int, String, Int) -> Void"),
         ("ptrSliceFromStr", "(String, Int, Int) -> String"),
         ("ptrSliceToString", "(Ptr, Int) -> String"),
         ("ptrToString", "Ptr -> String"),
+        ("gcHandleNew", "forall a. a -> Int64"),
+        ("gcHandleGet", "forall a. Int64 -> a"),
+        ("gcHandleFree", "Int64 -> Void"),
+        ("gcTrim", "() -> Void"),
+        ("gcSetThresholds", "(Int64, Int64) -> Void"),
+        ("gcHeapLiveBytes", "() -> Int64"),
         ("sysArgc", "() -> Int"),
         ("sysArgv", "Int -> String"),
         ("__concAtomicNew", "Int -> AtomicInt"),
@@ -4239,7 +4260,7 @@ def eraseInferOutput(ctx: InferCtx, rawOutDefs: List Def): InferOutput = {
     let mset = ctx.modeAdtSet;
     let edefs = fmap((d: Def) -> match d.item {
         ItForm(f) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItForm(eraseFormModes(mset, f)) },
-        ItExtern(lnk, scm) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItExtern(lnk, eraseSchemeModes(mset, scm)) },
+        ItExtern(lnk, scm, noAlloc) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItExtern(lnk, eraseSchemeModes(mset, scm), noAlloc) },
         _ -> d,
     }, rawOutDefs);
 
@@ -4422,7 +4443,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                             },
                         }
                     },
-                    ItExtern(_, scm) -> {
+                    ItExtern(_, scm, _) -> {
                         let expScm = expandPolyScheme(ctx, scm, d.dpos)?;
                         checkSchemeKinds(ctx, expScm, d.dpos)?;
                         strMapInsert(baseMap, d.ident, expScm)

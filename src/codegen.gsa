@@ -1251,6 +1251,14 @@ def tryEmitIntrinsic(
     } else if (name == "bits64ToFloat") {
         let b = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "bitcast i64 " + b + " to double"))
+    } else if (name == "floatToBits32") {
+        let f = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let f32 = emitAssign(fctx, "fptrunc double " + f + " to float");
+        Some(emitAssign(fctx, "bitcast float " + f32 + " to i32"))
+    } else if (name == "bits32ToFloat") {
+        let b = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let f32 = emitAssign(fctx, "bitcast i32 " + b + " to float");
+        Some(emitAssign(fctx, "fpext float " + f32 + " to double"))
     } else if (name == "intToFloat") {
         let n = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "sitofp i32 " + n + " to double"))
@@ -1262,6 +1270,15 @@ def tryEmitIntrinsic(
     } else if (name == "ptrIsNull") {
         let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "icmp eq ptr " + p + ", null"))
+    } else if (name == "ptrOffset") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let off32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let off64 = emitAssign(fctx, "sext i32 " + off32 + " to i64");
+        Some(emitGep(fctx, "i8", p, off64))
+    } else if (name == "ptrOffset64") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let off64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        Some(emitGep(fctx, "i8", p, off64))
     } else if (name == "ptrAllocBytes") {
         let n32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
@@ -1282,6 +1299,112 @@ def tryEmitIntrinsic(
         let bp = emitGep(fctx, "i8", p, idx64);
         emitStore(fctx, "i8", val8, bp);
         Some("0")
+    } else if (name == "ptrReadI8") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        let b8 = emitAssign(fctx, "load i8, ptr " + bp + ", align 1");
+        Some(emitAssign(fctx, "sext i8 " + b8 + " to i32"))
+    } else if (name == "ptrReadU16Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        let v16 = emitAssign(fctx, "load i16, ptr " + bp + ", align 1");
+        Some(emitAssign(fctx, "zext i16 " + v16 + " to i32"))
+    } else if (name == "ptrReadU32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load i32, ptr " + bp + ", align 1"))
+    } else if (name == "ptrReadI64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load i64, ptr " + bp + ", align 1"))
+    } else if (name == "ptrReadF32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        let f32 = emitAssign(fctx, "load float, ptr " + bp + ", align 1");
+        Some(emitAssign(fctx, "fpext float " + f32 + " to double"))
+    } else if (name == "ptrReadF64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        Some(emitAssign(fctx, "load double, ptr " + bp + ", align 1"))
+    } else if (name == "ptrWriteU16Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let v16 = emitAssign(fctx, "trunc i32 " + val32 + " to i16");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store i16 " + v16 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrWriteU32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store i32 " + val32 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrWriteI64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let val64 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store i64 " + val64 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrWriteF32Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let f32 = emitAssign(fctx, "fptrunc double " + valF + " to float");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store float " + f32 + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "ptrWriteF64Le") {
+        let p = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let valF = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+        let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
+        let bp = emitGep(fctx, "i8", p, idx64);
+        emitLine(fctx, "store double " + valF + ", ptr " + bp + ", align 1");
+        Some("0")
+    } else if (name == "gcHandleNew") {
+        let argTerm = nthArgTerm(args, 0);
+        let argTy = schemeBody(argTerm.tscm);
+        let v = genExpr(mctx, fctx, argTerm, locals, false);
+        let rawPtr = if (isGcPointerType(argTy)) v else boxGeishaValue(mctx, fctx, v, argTy);
+        Some(emitAssign(fctx, "call i64 @gc_handle_new(ptr " + rawPtr + ")"))
+    } else if (name == "gcHandleGet") {
+        let h = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let rawPtr = emitAssign(fctx, "call ptr @gc_handle_get(i64 " + h + ")");
+        if (isGcPointerType(retTy)) Some(rawPtr)
+        else Some(unboxGeishaValue(fctx, rawPtr, retTy))
+    } else if (name == "gcHandleFree") {
+        let h = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        emitLine(fctx, "call void @gc_handle_free(i64 " + h + ")");
+        Some("0")
+    } else if (name == "gcTrim") {
+        emitLine(fctx, "call void @gc_trim()");
+        Some("0")
+    } else if (name == "gcSetThresholds") {
+        let minB = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let majB = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        emitLine(fctx, "call void @gc_set_thresholds(i64 " + minB + ", i64 " + majB + ")");
+        Some("0")
+    } else if (name == "gcHeapLiveBytes") {
+        Some(emitAssign(fctx, "call i64 @gc_heap_live_bytes()"))
     } else if (name == "ptrCopyBytes") {
         let dst = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let dstOff32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
@@ -2177,7 +2300,8 @@ def genExpr(
                             }
                         };
                         let typedArgsStr = formatTypedArgs(listRev(cellGet(argTysRev)), listRev(cellGet(argValsRev)));
-                        if (!mctx.mcIsWasm) {
+                        let useBlocking = !mctx.mcIsWasm && !extDef.extNoAlloc;
+                        if (useBlocking) {
                             let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
                             emitLine(fctx, "call i32 @_setjmp(ptr " + jbPtr + ")");
                             emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")")
@@ -2196,7 +2320,7 @@ def genExpr(
                             } else {
                                 emitAssign(fctx, "call " + retLlvm + " " + cSym + "(" + typedArgsStr + ")")
                             };
-                        if (!mctx.mcIsWasm) emitLine(fctx, "call void @gc_leave_blocking()") else ();
+                        if (useBlocking) emitLine(fctx, "call void @gc_leave_blocking()") else ();
                         cRes
                     },
                     None -> {
@@ -2535,9 +2659,15 @@ def isPureBuiltinIntrinsic(name: String): Bool =
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
     || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
-    || name == "floatToBits64" || name == "bits64ToFloat" || name == "intToFloat" || name == "floatToInt"
-    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrAllocBytes"
-    || name == "ptrByteAt" || name == "ptrSetByte" || name == "ptrCopyBytes"
+    || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
+    || name == "intToFloat" || name == "floatToInt"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "ptrAllocBytes"
+    || name == "ptrByteAt" || name == "ptrSetByte"
+    || name == "ptrReadI8" || name == "ptrReadU16Le" || name == "ptrReadU32Le"
+    || name == "ptrReadI64Le" || name == "ptrReadF32Le" || name == "ptrReadF64Le"
+    || name == "ptrWriteU16Le" || name == "ptrWriteU32Le"
+    || name == "ptrWriteI64Le" || name == "ptrWriteF32Le" || name == "ptrWriteF64Le"
+    || name == "ptrCopyBytes"
     || name == "ptrCopyFromStr" || name == "ptrSliceFromStr" || name == "ptrSliceToString" || name == "ptrToString"
     || name == "strLen" || name == "strByteAt" || name == "strSlice"
     || name == "strConcat" || name == "strFromBytes" || name == "sysArgc" || name == "sysArgv"
@@ -2643,12 +2773,33 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     } else ();
 
     let isExp = shouldExportSymbol(mctx, fd.fnName);
-    let linkage = if (isExp) "" else "internal ";
-    let exportAttr =
-        if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
-        else "";
-    let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + strJoin(listRev(cellGet(paramSigPartsRev)), ", ") + ") nounwind" + exportAttr;
-    flushFunctionToBuf(out, header, fctx)
+    let paramSigStr = strJoin(listRev(cellGet(paramSigPartsRev)), ", ");
+    if (!mctx.mcIsWasm && isExp) {
+        let implSym = llvmSym("__gs_exp_" + fd.fnName);
+        let implHeader = "define internal " + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind";
+        flushFunctionToBuf(out, implHeader, fctx);
+        // Emit thread-safe C/Swift host entry trampoline for exported native symbol
+        bufPushStr(out, "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind {\nentry:\n");
+        bufPushStr(out, "  %anchor = alloca i64, align 8\n");
+        bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
+        bufPushStr(out, "  %tok = call i64 @gc_host_enter(ptr %anchor)\n");
+        if (retLlvm == "void") {
+            bufPushStr(out, "  call void " + implSym + "(" + paramSigStr + ")\n");
+            bufPushStr(out, "  call void @gc_host_leave(i64 %tok)\n");
+            bufPushStr(out, "  ret void\n}\n\n")
+        } else {
+            bufPushStr(out, "  %res = call " + retLlvm + " " + implSym + "(" + paramSigStr + ")\n");
+            bufPushStr(out, "  call void @gc_host_leave(i64 %tok)\n");
+            bufPushStr(out, "  ret " + retLlvm + " %res\n}\n\n")
+        }
+    } else {
+        let linkage = if (isExp) "" else "internal ";
+        let exportAttr =
+            if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
+            else "";
+        let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind" + exportAttr;
+        flushFunctionToBuf(out, header, fctx)
+    }
 }
 
 def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDef, globals: List GlobalValDef): Void = {
@@ -2727,6 +2878,12 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
     let decls = if (isWasm) [
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
+        ("gc_handle_new", "declare i64 @gc_handle_new(ptr) nounwind"),
+        ("gc_handle_get", "declare ptr @gc_handle_get(i64) nounwind"),
+        ("gc_handle_free", "declare void @gc_handle_free(i64) nounwind"),
+        ("gc_trim", "declare void @gc_trim() nounwind"),
+        ("gc_set_thresholds", "declare void @gc_set_thresholds(i64, i64) nounwind"),
+        ("gc_heap_live_bytes", "declare i64 @gc_heap_live_bytes() nounwind"),
         ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
         ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
         ("gc_alloc_atomic_uninit", "declare noalias nonnull ptr @gc_alloc_atomic_uninit(i64) nounwind"),
@@ -2748,6 +2905,14 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
         ("gc_enable_generational", "declare void @gc_enable_generational() nounwind"),
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
+        ("gc_host_enter", "declare i64 @gc_host_enter(ptr) nounwind"),
+        ("gc_host_leave", "declare void @gc_host_leave(i64) nounwind"),
+        ("gc_handle_new", "declare i64 @gc_handle_new(ptr) nounwind"),
+        ("gc_handle_get", "declare ptr @gc_handle_get(i64) nounwind"),
+        ("gc_handle_free", "declare void @gc_handle_free(i64) nounwind"),
+        ("gc_trim", "declare void @gc_trim() nounwind"),
+        ("gc_set_thresholds", "declare void @gc_set_thresholds(i64, i64) nounwind"),
+        ("gc_heap_live_bytes", "declare i64 @gc_heap_live_bytes() nounwind"),
         ("gc_alloc", "declare noalias nonnull ptr @gc_alloc(i64) nounwind"),
         ("gc_alloc_atomic", "declare noalias nonnull ptr @gc_alloc_atomic(i64) nounwind"),
         ("gc_alloc_atomic_uninit", "declare noalias nonnull ptr @gc_alloc_atomic_uninit(i64) nounwind"),
@@ -2840,7 +3005,7 @@ def emitUserExternDeclares(
                                     bufPushStr(out, llvmSym(ed.extLink));
                                     bufPushByte(out, 40);
                                     bufPushStr(out, strJoin(pTys, ", "));
-                                    bufPushStr(out, ")\n")
+                                    bufPushStr(out, if (ed.extNoAlloc) ") nounwind\n" else ")\n")
                                 },
                                 _ -> (),
                             }
@@ -2864,6 +3029,9 @@ def emitNativeCustomBootFunctions(
     bootSymOpt: Option String
 ): Void = {
     let fctx = newFnEmitCtx("__geisha_init");
+    let anchor = emitEntryAlloca(fctx, "i64");
+    emitLine(fctx, "store i64 0, ptr " + anchor + ", align 8");
+    let tokReg = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
     let cg = cellNew(globals);
     while (match cellGet(cg) { Nil -> false, _ -> true }) {
         match cellGet(cg) {
@@ -2891,7 +3059,10 @@ def emitNativeCustomBootFunctions(
         },
         None -> (),
     };
-    if (!curBlockHasTerm(fctx)) emitTermLine(fctx, "ret void") else ();
+    if (!curBlockHasTerm(fctx)) {
+        emitLine(fctx, "call void @gc_host_leave(i64 " + tokReg + ")");
+        emitTermLine(fctx, "ret void")
+    } else ();
     flushFunctionToBuf(out, "define void @__geisha_init() nounwind", fctx);
 
     match bootSymOpt {

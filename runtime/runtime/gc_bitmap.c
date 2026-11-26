@@ -123,6 +123,14 @@ static size_t _init_threshold_bytes = MIN_GC_THRESHOLD_BYTES;
 static void **_global_roots[MAX_GLOBAL_ROOTS];
 static size_t _global_roots_count = 0;
 
+/* StableHandle table (1-based indices; 0 = invalid/null handle, always traced as GC roots) */
+static void **_handle_slots = NULL;
+static size_t _handle_cap = 0;
+static size_t _handle_used = 0;
+static size_t *_handle_free = NULL;
+static size_t _handle_free_len = 0;
+static size_t _handle_free_cap = 0;
+
 /* Orphaned remset entries from detached threads */
 static uintptr_t *_orphan_remset = NULL;
 static size_t _orphan_remset_len = 0;
@@ -1353,6 +1361,13 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                 try_mark_ptr_push(candidate, &sp);
             }
         }
+        /* 2b. Mark pinned StableHandle table entries (both minor & major GC) */
+        for (size_t i = 1; i <= _handle_used; i++) {
+            uintptr_t candidate = (uintptr_t)_handle_slots[i];
+            if (candidate != 0) {
+                try_mark_ptr_push(candidate, &sp);
+            }
+        }
         if (sp > 0) drain_mark_stack(&sp);
     }
 
@@ -1484,5 +1499,138 @@ void gc_collect_major(void)
         self->safepoint_sp = (uintptr_t)&sp_marker;
     }
     gc_collect_locked(self, true);
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void geisha_rt_init(void)
+{
+    init_size_tables();
+    pthread_mutex_lock(&_gc_mu);
+    if (_chunks_head == NULL) {
+        if (!alloc_chunk_locked()) {
+            pthread_mutex_unlock(&_gc_mu);
+            fprintf(stderr, "GC initial chunk allocation failed\n");
+            abort();
+        }
+        _generational_enabled = true;
+    }
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+int64_t gc_host_enter(void *stack_anchor)
+{
+    gc_thread_t *self = _tls_thread;
+    if (self != NULL) {
+        int32_t prev = __atomic_load_n(&self->state, __ATOMIC_ACQUIRE);
+        if (prev == THR_BLOCKED) {
+            gc_leave_blocking();
+            return 2;
+        }
+        return 1;
+    }
+    geisha_rt_init();
+    gc_thread_attach(stack_anchor);
+    return 0;
+}
+
+void gc_host_leave(int64_t token)
+{
+    if (token == 0) {
+        gc_thread_detach();
+    } else if (token == 2) {
+        gc_thread_t *self = _tls_thread;
+        if (self != NULL) {
+            __atomic_store_n(&self->state, THR_BLOCKED, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+int64_t gc_handle_new(void *obj)
+{
+    if (obj == NULL) return 0;
+    pthread_mutex_lock(&_gc_mu);
+    size_t idx = 0;
+    if (_handle_free_len > 0) {
+        idx = _handle_free[--_handle_free_len];
+    } else {
+        size_t next = _handle_used + 1;
+        if (next >= _handle_cap) {
+            size_t ncap = (_handle_cap == 0) ? 64u : (_handle_cap * 2u);
+            while (ncap <= next) ncap *= 2u;
+            void **ns = (void **)realloc(_handle_slots, ncap * sizeof(void *));
+            if (ns == NULL) {
+                pthread_mutex_unlock(&_gc_mu);
+                abort();
+            }
+            if (_handle_cap == 0) ns[0] = NULL;
+            _handle_slots = ns;
+            _handle_cap = ncap;
+        }
+        _handle_used = next;
+        idx = next;
+    }
+    _handle_slots[idx] = obj;
+    pthread_mutex_unlock(&_gc_mu);
+    return (int64_t)idx;
+}
+
+void *gc_handle_get(int64_t handle)
+{
+    if (handle <= 0) return NULL;
+    pthread_mutex_lock(&_gc_mu);
+    void *res = NULL;
+    if ((size_t)handle <= _handle_used) {
+        res = _handle_slots[(size_t)handle];
+    }
+    pthread_mutex_unlock(&_gc_mu);
+    return res;
+}
+
+void gc_handle_free(int64_t handle)
+{
+    if (handle <= 0) return;
+    pthread_mutex_lock(&_gc_mu);
+    if ((size_t)handle <= _handle_used && _handle_slots[(size_t)handle] != NULL) {
+        _handle_slots[(size_t)handle] = NULL;
+        if (_handle_free_len >= _handle_free_cap) {
+            size_t ncap = (_handle_free_cap == 0) ? 64u : (_handle_free_cap * 2u);
+            size_t *nf = (size_t *)realloc(_handle_free, ncap * sizeof(size_t));
+            if (nf == NULL) {
+                pthread_mutex_unlock(&_gc_mu);
+                abort();
+            }
+            _handle_free = nf;
+            _handle_free_cap = ncap;
+        }
+        _handle_free[_handle_free_len++] = (size_t)handle;
+    }
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_set_thresholds(size_t minor_bytes, size_t major_bytes)
+{
+    if (minor_bytes < 64u * 1024u) minor_bytes = 64u * 1024u;
+    if (major_bytes < minor_bytes * 2u) major_bytes = minor_bytes * 2u;
+    pthread_mutex_lock(&_gc_mu);
+    _init_threshold_bytes = minor_bytes;
+    _gc_threshold_bytes = minor_bytes;
+    _major_threshold_bytes = major_bytes;
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_trim(void)
+{
+    geisha_rt_init();
+    gc_collect_major();
+    pthread_mutex_lock(&_gc_mu);
+    for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
+#if defined(MADV_FREE_REUSABLE)
+        madvise((void *)p->base, GC_PAGE_SIZE, MADV_FREE_REUSABLE);
+#elif defined(MADV_FREE)
+        madvise((void *)p->base, GC_PAGE_SIZE, MADV_FREE);
+#else
+        madvise((void *)p->base, GC_PAGE_SIZE, MADV_DONTNEED);
+#endif
+    }
     pthread_mutex_unlock(&_gc_mu);
 }

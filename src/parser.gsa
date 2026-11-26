@@ -1467,6 +1467,10 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                 TkDef -> parseFormDefBody(p, vis, startSp),
                 TkExtern -> {
                     let _ = bumpTok(p);
+                    let isNoAlloc = match peekTok(p).kind {
+                        TkIdent(w) if (w == "noalloc") -> { let _ = bumpTok(p); true },
+                        _ -> false,
+                    };
                     let linkOpt: Option String = match peekTok(p).kind {
                         TkStr(s) -> { let _ = bumpTok(p); Some(s) },
                         _ -> None,
@@ -1500,7 +1504,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         ident: fnName,
                         dpos: unionSpan(startSp, closeSp),
                         vis: vis,
-                        item: ItExtern(linkSym, ScmMono(fnTy)),
+                        item: ItExtern(linkSym, ScmMono(fnTy), isNoAlloc),
                     })
                 },
                 TkType -> {

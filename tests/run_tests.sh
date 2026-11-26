@@ -1278,4 +1278,183 @@ fi
 echo "PASS [pkg_orphan_instance_rejected]: rejected cross-package orphan instance"
 PASS=$((PASS + 1))
 
+# 19. Zero-Copy Binary `Ptr` Read/Write + `floatToBits32` / `bits32ToFloat` + `ptrOffset`
+cat > "$TMP_DIR/t19_ptr_bin.gsa" << 'EOF'
+use std.str.{intToStr, i64ToStr}
+
+def main(): Void = {
+    let buf = ptrAllocBytes(64);
+    ptrSetByte(buf, 0, 251); // -5 as signed i8
+    ptrWriteU16Le(buf, 1, 51321); // unaligned offset 1
+    ptrWriteU32Le(buf, 3, 305419896); // 0x12345678 at unaligned offset 3
+    ptrWriteI64Le(buf, 7, (intToI64(1) << 40) | intToI64(255)); // unaligned offset 7
+    ptrWriteF32Le(buf, 15, 1.5);
+    ptrWriteF64Le(buf, 19, 3.25);
+
+    let i8v = ptrReadI8(buf, 0);
+    let u16v = ptrReadU16Le(buf, 1);
+    let u32v = ptrReadU32Le(buf, 3);
+    let i64v = ptrReadI64Le(buf, 7);
+    let f32v = floatToInt(ptrReadF32Le(buf, 15) * 10.0);
+    let f64v = floatToInt(ptrReadF64Le(buf, 19) * 100.0);
+    let offPtr = ptrOffset(buf, 3);
+    let u32ViaOff = ptrReadU32Le(offPtr, 0);
+    let b32 = floatToBits32(1.5);
+    let rt32 = floatToInt(bits32ToFloat(b32) * 10.0);
+    printLn(
+        intToStr(i8v) + "|" +
+        intToStr(u16v) + "|" +
+        intToStr(u32v) + "|" +
+        intToStr(u32ViaOff) + "|" +
+        i64ToStr(i64v) + "|" +
+        intToStr(f32v) + "|" +
+        intToStr(f64v) + "|" +
+        intToStr(rt32)
+    )
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t19_ptr_bin" "$TMP_DIR/t19_ptr_bin.gsa"
+assert_eq "ptr_binary_le_and_f32" "-5|51321|305419896|305419896|1099511628031|15|325|15" "$("$TMP_DIR/t19_ptr_bin")"
+
+# 20. Zero-Overhead `extern noalloc` (no `_setjmp` / `gc_enter_blocking`) + C SIMD-style kernel
+cat > "$TMP_DIR/t20_kernel.c" << 'EOF'
+#include <stdint.h>
+int32_t dot_i8_kernel(const int8_t *a, const int8_t *b, int32_t n) {
+    int32_t acc = 0;
+    for (int32_t i = 0; i < n; i++) {
+        acc += (int32_t)a[i] * (int32_t)b[i];
+    }
+    return acc;
+}
+EOF
+cat > "$TMP_DIR/t20_noalloc.gsa" << 'EOF'
+use std.str.intToStr
+
+extern noalloc "dot_i8_kernel" def c_dot_i8(a: Ptr, b: Ptr, n: Int): Int
+
+def runDot(): Int = {
+    let a = ptrAllocBytes(4);
+    let b = ptrAllocBytes(4);
+    ptrSetByte(a, 0, 3);  ptrSetByte(a, 1, 254); // 3, -2
+    ptrSetByte(a, 2, 5);  ptrSetByte(a, 3, 4);
+    ptrSetByte(b, 0, 10); ptrSetByte(b, 1, 7);   // 30 - 14 + 10 + 12 = 38
+    ptrSetByte(b, 2, 2);  ptrSetByte(b, 3, 3);
+    c_dot_i8(a, b, 4)
+}
+
+def main(): Void = printLn(intToStr(runDot()))
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t20_noalloc.ll" "$TMP_DIR/t20_noalloc.gsa"
+if awk '/define .*@runDot\(/,/^}/' "$TMP_DIR/t20_noalloc.ll" | grep -q "gc_enter_blocking"; then
+    echo "FAIL [extern_noalloc_ir]: gc_enter_blocking should not be emitted inside runDot for extern noalloc" >&2
+    exit 1
+fi
+if ! grep -q "declare i32 @dot_i8_kernel(ptr, ptr, i32) nounwind" "$TMP_DIR/t20_noalloc.ll"; then
+    echo "FAIL [extern_noalloc_ir]: expected nounwind attribute on extern noalloc declaration" >&2
+    exit 1
+fi
+echo "PASS [extern_noalloc_ir]: zero blocking-section overhead verified in LLVM IR"
+PASS=$((PASS + 1))
+MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -Wno-override-module -pthread \
+    -x ir "$TMP_DIR/t20_noalloc.ll" -x c "$TMP_DIR/t20_kernel.c" -x none "$GEISHA_RUNTIME" \
+    -o "$TMP_DIR/t20_noalloc"
+assert_eq "extern_noalloc_exec" "38" "$("$TMP_DIR/t20_noalloc")"
+
+# 21. Embedded Static Library (`--no-main --export ... -o libembed.a`) + StableHandle + Multi-Thread C Host + `gcTrim`
+cat > "$TMP_DIR/t21_embed.gsa" << 'EOF'
+data EngineState {
+    MkEngine { counter: Cell Int, label: String },
+}
+
+pub def eng_new(initVal: Int, name: String): Int64 = {
+    gcSetThresholds(intToI64(262144), intToI64(1048576));
+    let st = MkEngine { counter: cellNew(initVal), label: name };
+    gcHandleNew(st)
+}
+
+pub def eng_add(h: Int64, delta: Int): Int = {
+    // Churn temporary allocations to exercise GC while handle stays pinned
+    let i = cellNew(0);
+    while (cellGet(i) < 200) {
+        let _ = ptrAllocBytes(256);
+        cellSet(i, cellGet(i) + 1)
+    };
+    let st: EngineState = gcHandleGet(h);
+    let next = cellGet(st.counter) + delta;
+    cellSet(st.counter, next);
+    next
+}
+
+pub def eng_label_len(h: Int64): Int = {
+    let st: EngineState = gcHandleGet(h);
+    strLen(st.label)
+}
+
+pub def eng_trim(): Int64 = {
+    gcTrim();
+    gcHeapLiveBytes()
+}
+
+pub def eng_free(h: Int64): Void = gcHandleFree(h)
+EOF
+"$GEISHA_BIN" --no-main \
+    --export eng_new --export eng_add --export eng_label_len --export eng_trim --export eng_free \
+    -o "$TMP_DIR/libt21_embed.a" "$TMP_DIR/t21_embed.gsa"
+cat > "$TMP_DIR/t21_host.c" << 'EOF'
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
+extern void __geisha_init(void);
+extern int64_t eng_new(int32_t init_val, const char *name, void *fv);
+extern int32_t eng_add(int64_t h, int32_t delta, void *fv);
+extern int32_t eng_label_len(int64_t h, void *fv);
+extern int64_t eng_trim(void *fv);
+extern void eng_free(int64_t h, void *fv);
+
+typedef struct { int64_t handle; int32_t out; } WorkerArg;
+
+static void *worker_fn(void *arg) {
+    WorkerArg *wa = (WorkerArg *)arg;
+    int32_t v = 0;
+    for (int i = 0; i < 5; i++) {
+        v = eng_add(wa->handle, 3, NULL);
+    }
+    (void)eng_trim(NULL);
+    wa->out = v;
+    return NULL;
+}
+
+int main(void) {
+    /* Deliberately NO gc_init_with_stack / gc_thread_attach from host! */
+    __geisha_init();
+    int64_t h = eng_new(10, "juxu-core", NULL);
+    WorkerArg wa = { .handle = h, .out = 0 };
+    pthread_t tid;
+    pthread_create(&tid, NULL, worker_fn, &wa);
+    pthread_join(tid, NULL);
+    int32_t final_val = eng_add(h, 5, NULL);
+    int32_t llen = eng_label_len(h, NULL);
+    eng_free(h, NULL);
+    (void)eng_trim(NULL);
+    printf("%d|%d|%d\n", wa.out, final_val, llen);
+    return 0;
+}
+EOF
+MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -pthread \
+    "$TMP_DIR/t21_host.c" "$TMP_DIR/libt21_embed.a" -o "$TMP_DIR/t21_host"
+assert_eq "embedded_static_lib_handles_and_threads" "25|30|9" "$("$TMP_DIR/t21_host")"
+
+# 22. iOS & iOS Simulator Cross-Compilation Static Libraries (`--target ios` & `--target ios-sim`)
+if [ -f "./build/libgeisha_runtime_ios.a" ] && [ -f "./build/libgeisha_runtime_ios_sim.a" ]; then
+    "$GEISHA_BIN" --target ios --no-main --export eng_new --export eng_add --export eng_free \
+        -o "$TMP_DIR/libt22_ios.a" "$TMP_DIR/t21_embed.gsa"
+    "$GEISHA_BIN" --target ios-sim --no-main --export eng_new --export eng_add --export eng_free \
+        -o "$TMP_DIR/libt22_iossim.a" "$TMP_DIR/t21_embed.gsa"
+    IOS_PLAT="$(otool -l "$TMP_DIR/libt22_ios.a" | grep -m1 'platform ' | awk '{print $2}')"
+    SIM_PLAT="$(otool -l "$TMP_DIR/libt22_iossim.a" | grep -m1 'platform ' | awk '{print $2}')"
+    assert_eq "ios_static_lib_platform" "2" "$IOS_PLAT"
+    assert_eq "ios_sim_static_lib_platform" "7" "$SIM_PLAT"
+fi
+
 echo "All $PASS end-to-end test suites passed!"

@@ -83,7 +83,7 @@ pub data GlobalValDef {
 }
 
 pub data ExternDef {
-    MkExternDef { extName: String, extLink: String, extTy: Type },
+    MkExternDef { extName: String, extLink: String, extTy: Type, extNoAlloc: Bool },
 }
 
 pub data EscapeInfo {
@@ -3525,12 +3525,13 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
                         if (!strMapContains(globalValSet, d.ident)) {
                             strMapInsert(ctx.kTopDirect, d.ident, d.ident)
                         } else (),
-                    ItExtern(linkName, scm) -> {
+                    ItExtern(linkName, scm, noAlloc) -> {
                         strMapInsert(ctx.kTopDirect, d.ident, d.ident);
                         strMapInsert(ctx.kExterns, d.ident, MkExternDef {
                             extName: d.ident,
                             extLink: linkName,
                             extTy: schemeBody(scm),
+                            extNoAlloc: noAlloc,
                         });
                         cellSet(ctx.kExternNamesRev, Cons(d.ident, cellGet(ctx.kExternNamesRev)))
                     },

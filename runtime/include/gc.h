@@ -35,10 +35,20 @@ void gc_write_barrier(void *container_ptr);
 
 /* Diagnostics & explicit collection */
 void gc_collect_major(void);
+void gc_trim(void);
+void gc_set_thresholds(size_t minor_bytes, size_t major_bytes);
 size_t gc_collection_count(void);
 size_t gc_minor_collection_count(void);
 size_t gc_major_collection_count(void);
 size_t gc_heap_live_bytes(void);
+
+/* Embedded C/Swift host lifecycle & StableHandle table (GC-rooted opaque handles) */
+void geisha_rt_init(void);
+int64_t gc_host_enter(void *stack_anchor);
+void gc_host_leave(int64_t token);
+int64_t gc_handle_new(void *obj);
+void *gc_handle_get(int64_t handle);
+void gc_handle_free(int64_t handle);
 
 /* STW hooks used by `gs_conc.c` to trace in-flight concurrent containers & finalize dead handles */
 bool gc_is_obj_marked(const void *payload_ptr);

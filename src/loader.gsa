@@ -1294,7 +1294,7 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
     };
     let newItem = match d.item {
         ItForm(f) -> ItForm(rewriteFormInMod(ctx, f, Nil)),
-        ItExtern(sym, scm) -> ItExtern(sym, rewriteSchemeInMod(ctx, scm)),
+        ItExtern(sym, scm, noAlloc) -> ItExtern(sym, rewriteSchemeInMod(ctx, scm), noAlloc),
         ItAlias(ps, scm) -> ItAlias(ps, rewriteSchemeInMod(ctx, scm)),
         ItAlg(ps, vs) -> {
             let newVs = cellNew(Nil);

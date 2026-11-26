@@ -326,7 +326,7 @@ pub data MethodImpl {
 
 pub data Item {
     ItForm(Form),
-    ItExtern(String, Scheme),
+    ItExtern(String, Scheme, Bool),
     ItAlias(List String, Scheme),
     ItAlg(List String, List VariantDef),
     ItConcept(List String, List ConstraintSpec, List FunDep, List MethodDecl),
