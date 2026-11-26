@@ -21,27 +21,25 @@ ifeq ($(UNAME_S),Darwin)
   HOST_ARCH   := $(if $(filter arm64 aarch64,$(UNAME_M)),arm64,x86_64)
   HOST_ENV    := MACOSX_DEPLOYMENT_TARGET=14.0
   HOST_TARGET := -target $(HOST_ARCH)-apple-macosx14.0
-  HOST_LTO    := -flto=thin
   HOST_LIBS   :=
 else
   HOST_OS     := linux
   HOST_ARCH   := $(if $(filter aarch64 arm64,$(UNAME_M)),arm64,x86_64)
   HOST_ENV    :=
   HOST_TARGET :=
-  HOST_LTO    := $(if $(shell command -v ld.lld 2>/dev/null),-flto=thin -fuse-ld=lld,)
   HOST_LIBS   := -lm
 endif
 
-CFLAGS ?= $(HOST_TARGET) -O2 $(HOST_LTO) -Wall -Wextra -Iruntime/include
+CFLAGS ?= $(HOST_TARGET) -O2 -Wall -Wextra -Iruntime/include
 
 WASM_CC ?= $(shell \
-	if [ -x /opt/homebrew/opt/llvm@20/bin/clang ]; then echo /opt/homebrew/opt/llvm@20/bin/clang; \
-	elif [ -x /opt/homebrew/opt/llvm/bin/clang ]; then echo /opt/homebrew/opt/llvm/bin/clang; \
-	elif [ -x /usr/local/opt/llvm@20/bin/clang ]; then echo /usr/local/opt/llvm@20/bin/clang; \
+	if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then echo /opt/homebrew/opt/llvm/bin/clang; \
+	elif [ -x /opt/homebrew/opt/llvm@20/bin/clang ]; then echo /opt/homebrew/opt/llvm@20/bin/clang; \
 	elif [ -x /usr/local/opt/llvm/bin/clang ]; then echo /usr/local/opt/llvm/bin/clang; \
+	elif [ -x /usr/local/opt/llvm@20/bin/clang ]; then echo /usr/local/opt/llvm@20/bin/clang; \
 	elif command -v clang-20 >/dev/null 2>&1; then command -v clang-20; \
 	else echo clang; fi)
-WASM_FLAGS ?= --target=wasm32 -O2 -flto -mbulk-memory -mnontrapping-fptoint
+WASM_FLAGS ?= --target=wasm32 -O2 -mbulk-memory -mnontrapping-fptoint
 
 ifeq ($(origin STAGE0),undefined)
   STAGE0     := $(BUILD_DIR)/geisha0
@@ -93,7 +91,7 @@ $(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1 src/*.gsa
 	$(BUILD_DIR)/geisha1 --src-root . -e -o $(BUILD_DIR)/stage2.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha2: $(BUILD_DIR)/stage2.ll $(RUNTIME_LIB)
-	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 $(HOST_LTO) -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage2.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha2
+	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage2.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha2
 
 stage3: $(BUILD_DIR)/geisha3
 
@@ -101,7 +99,7 @@ $(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2 src/*.gsa
 	$(BUILD_DIR)/geisha2 --src-root . -e -o $(BUILD_DIR)/stage3.ll $(ENTRY)
 
 $(BUILD_DIR)/geisha3: $(BUILD_DIR)/stage3.ll $(RUNTIME_LIB)
-	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 $(HOST_LTO) -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage3.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha3
+	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 -Wno-override-module -pthread -x ir $(BUILD_DIR)/stage3.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha3
 
 bootstrap: $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll $(BUILD_DIR)/geisha3
 	diff -u $(BUILD_DIR)/stage2.ll $(BUILD_DIR)/stage3.ll

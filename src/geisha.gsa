@@ -345,10 +345,10 @@ def resolveWasmCc(): String =
     match getEnv("WASM_CC") {
         Some(c) if (strLen(c) > 0) -> c,
         _ ->
-            if (fileExists("/opt/homebrew/opt/llvm@20/bin/clang")) "/opt/homebrew/opt/llvm@20/bin/clang"
-            else if (fileExists("/opt/homebrew/opt/llvm/bin/clang")) "/opt/homebrew/opt/llvm/bin/clang"
-            else if (fileExists("/usr/local/opt/llvm@20/bin/clang")) "/usr/local/opt/llvm@20/bin/clang"
+            if (fileExists("/opt/homebrew/opt/llvm/bin/clang")) "/opt/homebrew/opt/llvm/bin/clang"
+            else if (fileExists("/opt/homebrew/opt/llvm@20/bin/clang")) "/opt/homebrew/opt/llvm@20/bin/clang"
             else if (fileExists("/usr/local/opt/llvm/bin/clang")) "/usr/local/opt/llvm/bin/clang"
+            else if (fileExists("/usr/local/opt/llvm@20/bin/clang")) "/usr/local/opt/llvm@20/bin/clang"
             else if (fileExists("/usr/lib/llvm-20/bin/clang")) "/usr/lib/llvm-20/bin/clang"
             else if (fileExists("/usr/bin/clang-20")) "/usr/bin/clang-20"
             else "clang",
@@ -358,10 +358,10 @@ def resolveWasmLdFlag(): String =
     match getEnv("WASM_LD") {
         Some(l) if (strLen(l) > 0) -> " -fuse-ld=" + shellQuote(l),
         _ ->
-            if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"
-            else if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"
-            else if (fileExists("/usr/local/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld@20/bin/wasm-ld"
+            if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"
+            else if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"
             else if (fileExists("/usr/local/opt/lld/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld/bin/wasm-ld"
+            else if (fileExists("/usr/local/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld@20/bin/wasm-ld"
             else if (fileExists("/usr/lib/llvm-20/bin/wasm-ld")) " -fuse-ld=/usr/lib/llvm-20/bin/wasm-ld"
             else "",
     }
@@ -382,11 +382,6 @@ def nativeTargetFlag(): String =
         else if (arch == "x86_64") " -target x86_64-apple-macosx14.0"
         else ""
     } else ""
-
-def nativeLtoFlag(): String =
-    if (currentHostOs() == "macos") " -flto=thin"
-    else if (fileExists("/usr/bin/ld.lld") || fileExists("/usr/local/bin/ld.lld") || fileExists("/usr/lib/llvm-20/bin/ld.lld") || fileExists("/usr/lib/llvm-18/bin/ld.lld")) " -flto=thin -fuse-ld=lld"
-    else ""
 
 def nativeSysLibs(): String =
     if (currentHostOs() == "macos") "" else " -lm"
@@ -576,7 +571,6 @@ def emitNativeExecutableFromIr(
     let ccBin = shellQuote(resolveNativeCc());
     let envPfx = nativeEnvPrefix();
     let targetArchFlag = nativeTargetFlag();
-    let ltoFlag = nativeLtoFlag();
     let sysLibs = nativeSysLibs();
     let tmpLl = outBin + ".tmp.ll";
     writeFile(tmpLl, llText)?;
@@ -585,7 +579,7 @@ def emitNativeExecutableFromIr(
         Nil -> {
             let cmd =
                 envPfx + ccBin + targetArchFlag
-                + " -O2" + ltoFlag + " -Wno-override-module -pthread -x ir "
+                + " -O2 -Wno-override-module -pthread -x ir "
                 + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
                 + shellQuoteArgs(tc.tcLinkFlags)
                 + sysLibs
@@ -665,7 +659,7 @@ def emitWasmFromIr(
         writeFile(tmpLl, llText)?;
         let cmd =
             shellQuote(wasmCc)
-            + " --target=wasm32 -O2 -flto -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
+            + " --target=wasm32 -O2 -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
             + resolveWasmLdFlag()
             + shellQuoteArgs(tc.tcCFlags)
             + " -x ir " + shellQuote(tmpLl) + " -x none " + shellQuote(wasmRt)
