@@ -2820,14 +2820,33 @@ def genExpr(
                 Some(intrinVal) -> intrinVal,
                 None -> match strMapGet(mctx.mcExterns, calleeName) {
                     Some(extDef) -> {
+                        let extParamTys = match extDef.extTy {
+                            TyArr(_, ps, _) -> ps,
+                            _ -> Nil,
+                        };
                         let argValsRev = cellNew(Nil);
                         let argTysRev = cellNew(Nil);
+                        let keepAliveFpsRev = cellNew(Nil);
                         let cur = cellNew(args);
+                        let curP = cellNew(extParamTys);
                         while (match cellGet(cur) { Nil -> false, _ -> true }) {
                             match cellGet(cur) {
                                 Cons(a, r) -> {
-                                    cellSet(argValsRev, Cons(genExpr(mctx, fctx, a, locals, false), cellGet(argValsRev)));
-                                    cellSet(argTysRev, Cons(getValLlvmType(schemeBody(a.tscm)), cellGet(argTysRev)));
+                                    let actualTy = schemeBody(a.tscm);
+                                    let expectedTy = match cellGet(curP) {
+                                        Cons(pt, rp) -> { cellSet(curP, rp); pt },
+                                        Nil -> actualTy,
+                                    };
+                                    let rawVal = genExpr(mctx, fctx, a, locals, false);
+                                    let passVal = match (expectedTy, actualTy) {
+                                        (TyCon("ScopedPtr"), TyCon("ForeignPtr")) -> {
+                                            cellSet(keepAliveFpsRev, Cons(rawVal, cellGet(keepAliveFpsRev)));
+                                            emitAssign(fctx, "call ptr @gc_foreign_ptr_get(ptr " + rawVal + ")")
+                                        },
+                                        _ -> rawVal,
+                                    };
+                                    cellSet(argValsRev, Cons(passVal, cellGet(argValsRev)));
+                                    cellSet(argTysRev, Cons(getValLlvmType(expectedTy), cellGet(argTysRev)));
                                     cellSet(cur, r)
                                 },
                                 Nil -> (),
@@ -2855,6 +2874,18 @@ def genExpr(
                                 emitAssign(fctx, "call " + retLlvm + " " + cSym + "(" + typedArgsStr + ")")
                             };
                         if (useBlocking) emitLine(fctx, "call void @gc_leave_blocking()") else ();
+                        if (!mctx.mcIsWasm) {
+                            let ck = cellNew(listRev(cellGet(keepAliveFpsRev)));
+                            while (match cellGet(ck) { Nil -> false, _ -> true }) {
+                                match cellGet(ck) {
+                                    Cons(fpReg, rk) -> {
+                                        emitLine(fctx, "call void asm sideeffect \"\", \"r,~{memory}\"(ptr " + fpReg + ")");
+                                        cellSet(ck, rk)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        } else ();
                         cRes
                     },
                     None -> {

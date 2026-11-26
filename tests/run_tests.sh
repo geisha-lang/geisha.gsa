@@ -1740,4 +1740,63 @@ EOF
 "$GEISHA_BIN" -o "$TMP_DIR/t28_imm_par" "$TMP_DIR/t28_imm_par.gsa"
 assert_eq "imm_array_and_par_tabulate" "1000|999000" "$("$TMP_DIR/t28_imm_par")"
 
+# 29. FFI Auto-Borrow (`ForeignPtr` -> `ScopedPtr` at `extern` boundary + mixed `ForeignPtr`/`Arena` `ScopedPtr` + keep-alive IR)
+cat > "$TMP_DIR/t29_ffi_kernel.c" << 'EOF'
+#include <stdint.h>
+void vec_axpy_f32(const float *w, const float *x, float *out, int32_t n) {
+    for (int32_t i = 0; i < n; i++) {
+        out[i] = w[i] * x[i] + 1.0f;
+    }
+}
+EOF
+cat > "$TMP_DIR/t29_ffi_borrow.gsa" << 'EOF'
+use std.str.intToStr
+
+extern noalloc "vec_axpy_f32" def c_axpy(w: ScopedPtr, x: ScopedPtr, out: ScopedPtr, n: Int): Void
+
+def runAxpy(): Int = {
+    let w = foreignPtrAlloc(intToI64(16));
+    let out = foreignPtrAlloc(intToI64(16));
+    withForeignPtr(w, (pw) -> {
+        scopedPtrWriteF32Le(pw, 0, floatToF32(2.0));
+        scopedPtrWriteF32Le(pw, 4, floatToF32(3.0));
+        scopedPtrWriteF32Le(pw, 8, floatToF32(4.0));
+        scopedPtrWriteF32Le(pw, 12, floatToF32(5.0))
+    });
+    withArena((a) -> {
+        let x = arenaAlloc(a, intToI64(16));
+        scopedPtrWriteF32Le(x, 0, floatToF32(10.0));
+        scopedPtrWriteF32Le(x, 4, floatToF32(10.0));
+        scopedPtrWriteF32Le(x, 8, floatToF32(10.0));
+        scopedPtrWriteF32Le(x, 12, floatToF32(10.0));
+        // Mix ForeignPtr (`w`, `out`) and Arena ScopedPtr (`x`) directly in one flat extern call!
+        c_axpy(w, x, out, 4)
+    });
+    withForeignPtr(out, (po) ->
+        f32ToInt(
+            scopedPtrReadF32Le(po, 0) + scopedPtrReadF32Le(po, 4)
+            + scopedPtrReadF32Le(po, 8) + scopedPtrReadF32Le(po, 12)
+        )
+    )
+}
+
+def main(): Void = printLn(intToStr(runAxpy()))
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t29_ffi_borrow.ll" "$TMP_DIR/t29_ffi_borrow.gsa"
+if ! awk '/define .*@runAxpy\(/,/^}/' "$TMP_DIR/t29_ffi_borrow.ll" | grep -q "gc_foreign_ptr_get"; then
+    echo "FAIL [ffi_auto_borrow_ir]: expected gc_foreign_ptr_get auto-unwrap in runAxpy" >&2
+    exit 1
+fi
+if ! awk '/define .*@runAxpy\(/,/^}/' "$TMP_DIR/t29_ffi_borrow.ll" | grep -q "asm sideeffect"; then
+    echo "FAIL [ffi_auto_borrow_ir]: expected keep-alive asm barrier after extern call in runAxpy" >&2
+    exit 1
+fi
+echo "PASS [ffi_auto_borrow_ir]: ForeignPtr auto-unwrap + keep-alive barrier verified in LLVM IR"
+PASS=$((PASS + 1))
+MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -Wno-override-module -pthread \
+    -x ir "$TMP_DIR/t29_ffi_borrow.ll" -x c "$TMP_DIR/t29_ffi_kernel.c" -x none "$GEISHA_RUNTIME" \
+    -o "$TMP_DIR/t29_ffi_borrow"
+# (2*10+1) + (3*10+1) + (4*10+1) + (5*10+1) = 21 + 31 + 41 + 51 = 144
+assert_eq "ffi_auto_borrow_exec" "144" "$("$TMP_DIR/t29_ffi_borrow")"
+
 echo "All $PASS end-to-end test suites passed!"

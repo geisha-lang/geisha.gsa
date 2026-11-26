@@ -109,6 +109,7 @@ data InferCtx {
         modeAdtSet: StrMap Bool,
         taintedTopSet: StrMap Bool,
         globalValSet: StrMap Bool,
+        externSet: StrMap Bool,
         conceptReg: StrMap ConceptInfo,
         instanceReg: Cell (List InstanceInfo),
         conceptMethods: StrMap (String, Int),
@@ -896,6 +897,7 @@ def initInferCtx(): InferCtx = {
         modeAdtSet: strMapNew(),
         taintedTopSet: strMapNew(),
         globalValSet: strMapNew(),
+        externSet: strMapNew(),
         conceptReg: strMapNew(),
         instanceReg: cellNew(Nil),
         conceptMethods: strMapNew(),
@@ -2601,7 +2603,40 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             };
             let callMode = freshModeVar(ctx);
             let retVar = freshVar(ctx);
-            unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, cellGet(argTys), retVar), sp)?;
+            let isExtCall = match ic.node {
+                ExVar(fnNm) -> strMapContains(ctx.externSet, fnNm),
+                _ -> false,
+            };
+            let unifyArgTys =
+                if (isExtCall) {
+                    match zonkType(ctx.subst, schemeBody(ic.ty)) {
+                        TyArr(_, extPs, _) ->
+                            if (listLen(extPs) == listLen(cellGet(argTys))) {
+                                let outRev = cellNew(Nil);
+                                let cp = cellNew(extPs);
+                                let ca = cellNew(cellGet(argTys));
+                                while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                    match (cellGet(cp), cellGet(ca)) {
+                                        (Cons(ep, rp), Cons(at, ra)) -> {
+                                            let zep = zonkType(ctx.subst, ep);
+                                            let zat = zonkType(ctx.subst, at);
+                                            let adj = match (zep, zat) {
+                                                (TyCon("ScopedPtr"), TyCon("ForeignPtr")) -> TyCon("ScopedPtr"),
+                                                _ -> at,
+                                            };
+                                            cellSet(outRev, Cons(adj, cellGet(outRev)));
+                                            cellSet(cp, rp);
+                                            cellSet(ca, ra)
+                                        },
+                                        _ -> (),
+                                    }
+                                };
+                                listRev(cellGet(outRev))
+                            } else cellGet(argTys),
+                        _ -> cellGet(argTys),
+                    }
+                } else cellGet(argTys);
+            unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, unifyArgTys, retVar), sp)?;
             let resZ = zonkType(ctx.subst, retVar);
             match ic.node {
                 ExVar(fnNm) -> {
@@ -4858,6 +4893,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                     ItExtern(_, scm, _) -> {
                         let expScm = expandPolyScheme(ctx, scm, d.dpos)?;
                         checkSchemeKinds(ctx, expScm, d.dpos)?;
+                        strMapInsert(ctx.externSet, d.ident, true);
                         strMapInsert(baseMap, d.ident, expScm)
                     },
                     _ -> (),
