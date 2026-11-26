@@ -3,15 +3,21 @@ import CoreGeisha.Typing
 import CoreGeisha.Semantics
 import CoreGeisha.Soundness
 import CoreGeisha.Concurrency
+import CoreGeisha.Exhaustive
+import CoreGeisha.Escape
+import CoreGeisha.GC
 
 /-!
-# Core Geisha: Verified Executable Type & Concurrency Checker
+# Core Geisha: Unified Verified Executable Checker
 
-An executable checker `checkProgram` / `checkExpr` with machine-checked
-soundness proofs linking concrete `.gscore` Core IR programs directly to:
-- `verified_program_safety` (sequential `¬ IsStuck`)
-- `verified_concurrent_program_safety` (concurrent multi-task `¬ IsStuck`)
-- `verified_program_data_race_freedom` (concurrent `¬ HasDataRace`)
+An executable whole-program verifier `checkProgram` combining all 4 formal pillars
+with machine-checked soundness proofs linking concrete `.gscore` Core IR programs
+directly to:
+1. `verified_program_safety` & `verified_concurrent_program_safety` (`¬ IsStuck` across `Task`s & `Actor`s)
+2. `verified_program_no_match_failure` & `verified_concurrent_no_match_failure` (Maranget exhaustiveness eliminating `Trap.matchFailure`)
+3. `verified_program_data_race_freedom` (`¬ HasDataRace pool` across `Task` / `MVar` / `Chan` / `!Send`-state `Actor`)
+4. `verified_program_gc_mask_sound` (40-bit exact object pointer masks & scalar false-pointer immunity)
+5. `verified_program_no_dangling_stack` & `verified_program_stack_simulates_heap` (stack-frame region safety & heap simulation)
 -/
 
 namespace CoreGeisha
@@ -46,6 +52,9 @@ def tyEq : Ty → Ty → Bool
   | .adt n1, .adt n2 => n1 == n2
   | .cell t1, .cell t2 => tyEq t1 t2
   | .task t1, .task t2 => tyEq t1 t2
+  | .mvar t1, .mvar t2 => tyEq t1 t2
+  | .chan t1, .chan t2 => tyEq t1 t2
+  | .actor t1, .actor t2 => tyEq t1 t2
   | _, _ => false
 
 def tyListEq : List Ty → List Ty → Bool
@@ -68,6 +77,9 @@ theorem tyEq_sound {t1 t2 : Ty} (h : tyEq t1 t2 = true) : t1 = t2 := by
     rw [h]
   · rw [tyEq_sound h]
   · rw [tyEq_sound h]
+  · rw [tyEq_sound h]
+  · rw [tyEq_sound h]
+  · rw [tyEq_sound h]
 
 theorem tyListEq_sound {ts1 ts2 : List Ty} (h : tyListEq ts1 ts2 = true) : ts1 = ts2 := by
   cases ts1 <;> cases ts2 <;> simp only [tyListEq] at h <;> try cases h
@@ -88,6 +100,9 @@ def tySub : Ty → Ty → Bool
   | .adt n1, .adt n2 => n1 == n2
   | .cell t1, .cell t2 => tyEq t1 t2
   | .task t1, .task t2 => tySub t1 t2
+  | .mvar t1, .mvar t2 => tyEq t1 t2
+  | .chan t1, .chan t2 => tyEq t1 t2
+  | .actor t1, .actor t2 => tyEq t1 t2
   | _, _ => false
 termination_by t1 t2 => sizeOf t1 + sizeOf t2
 
@@ -112,6 +127,9 @@ theorem tySub_sound {t1 t2 : Ty} (h : tySub t1 t2 = true) : TySub t1 t2 := by
     subst h; exact .adt _
   · rw [tyEq_sound h]; exact .cell _
   · exact .task (tySub_sound h)
+  · rw [tyEq_sound h]; exact .mvar _
+  · rw [tyEq_sound h]; exact .chan _
+  · rw [tyEq_sound h]; exact .actor _
 termination_by sizeOf t1 + sizeOf t2
 
 theorem tyListSub_sound {ts1 ts2 : List Ty} (h : tyListSub ts1 ts2 = true) : TyListSub ts1 ts2 := by
@@ -136,6 +154,9 @@ def tySendInList (sendAdts : List Ident) : Ty → Bool
   | .adt n => sendAdts.contains n
   | .cell _ => false
   | .task t => tySendInList sendAdts t
+  | .mvar t => tySendInList sendAdts t
+  | .chan t => tySendInList sendAdts t
+  | .actor _ => true
 
 def tyListSendInList (sendAdts : List Ident) : List Ty → Bool
   | [] => true
@@ -180,6 +201,9 @@ theorem tySendInList_sound {sendAdts : List Ident} {τ : Ty}
     exact .adt (List.contains_iff_mem.mp h)
   | cell _ => simp [tySendInList] at h
   | task t => exact .task (tySendInList_sound h)
+  | mvar t => exact .mvar (tySendInList_sound h)
+  | chan t => exact .chan (tySendInList_sound h)
+  | actor s => exact .actor s
 
 theorem tyListSendInList_sound {sendAdts : List Ident} {ts : List Ty}
     (h : tyListSendInList sendAdts ts = true) :
@@ -239,6 +263,259 @@ theorem checkSharedFvs_sound {Δ : AdtEnv} {sendAdts : List Ident} {Γ : Ctx} {f
         · exact ⟨τy, hy, checkIsSend_sound hcl hsend⟩
         · exact ih h x hrest
       · cases h
+
+/-! ## Concurrency Primitive (`MVar` / `Chan` / `Actor`) Checker & Soundness -/
+
+def checkConcPrim (Δ : AdtEnv) (sendAdts : List Ident) (op : ConcPrim) (argTys : List Ty) :
+    Except String (List Ty × Ty) :=
+  match op, argTys with
+  | .mvarNew, [τ] =>
+    if tySendInList sendAdts τ then .ok ([τ], .mvar τ)
+    else .error s!"mvarNew payload type {repr τ} is not Send"
+  | .mvarEmpty τ, [] =>
+    if tySendInList sendAdts τ then .ok ([], .mvar τ)
+    else .error s!"mvarEmpty payload type {repr τ} is not Send"
+  | .mvarTake, [.mvar τ] =>
+    if tySendInList sendAdts τ then .ok ([.mvar τ], τ)
+    else .error s!"mvarTake payload type {repr τ} is not Send"
+  | .mvarPut, [.mvar τ, τv] =>
+    if tySendInList sendAdts τ && tySub τv τ then .ok ([.mvar τ, τ], .void)
+    else .error s!"mvarPut ill-typed for ({repr τ}, {repr τv})"
+  | .chanNew τ, [.int] =>
+    if tySendInList sendAdts τ then .ok ([.int], .chan τ)
+    else .error s!"chanNew payload type {repr τ} is not Send"
+  | .chanSend, [.chan τ, τv] =>
+    if tySendInList sendAdts τ && tySub τv τ then .ok ([.chan τ, τ], .bool)
+    else .error s!"chanSend ill-typed for ({repr τ}, {repr τv})"
+  | .chanRecv optAdt, [.chan τ] =>
+    match lookupVariant Δ optAdt 0, lookupVariant Δ optAdt 1 with
+    | some [], some [τopt] =>
+      if tyEq τ τopt && tySendInList sendAdts τ then
+        .ok ([.chan τ], .adt optAdt)
+      else .error s!"chanRecv Option type mismatch for {optAdt} vs {repr τ}"
+    | _, _ => .error s!"chanRecv target ADT '{optAdt}' is not Option-shaped"
+  | .chanClose, [.chan τ] =>
+    .ok ([.chan τ], .void)
+  | .actorSpawn, [.fn .shared [] σ_ty] =>
+    .ok ([.fn .shared [] σ_ty], .actor σ_ty)
+  | .actorCall, [.actor σ_ty, .fn .shared [p_ty] r_ty] =>
+    if tySub σ_ty p_ty && tySendInList sendAdts r_ty then
+      .ok ([.actor σ_ty, .fn .shared [σ_ty] r_ty], .task r_ty)
+    else .error s!"actorCall ill-typed or non-Send reply {repr r_ty}"
+  | .actorSend, [.actor σ_ty, .fn .shared [p_ty] .void] =>
+    if tySub σ_ty p_ty then
+      .ok ([.actor σ_ty, .fn .shared [σ_ty] .void], .void)
+    else .error s!"actorSend handler parameter mismatch for actor state {repr σ_ty}"
+  | _, _ => .error s!"concurrency primitive {repr op} ill-typed for arguments {repr argTys}"
+
+theorem checkConcPrim_sound {Δ : AdtEnv} {sendAdts : List Ident}
+    {op : ConcPrim} {argTys expectedTys : List Ty} {retTy : Ty}
+    (hcl : checkSendAdtsClosed Δ sendAdts = true)
+    (h : checkConcPrim Δ sendAdts op argTys = .ok (expectedTys, retTy)) :
+    TyListSub argTys expectedTys ∧ ConcPrimHasType Δ op expectedTys retTy := by
+  cases op with
+  | mvarNew =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons τ rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        simp only [checkConcPrim] at h
+        split at h
+        · rename_i hsend
+          cases h
+          exact ⟨TyListSub.refl _, .mvarNew (checkIsSend_sound hcl hsend)⟩
+        · cases h
+  | mvarEmpty τ =>
+    cases argTys with
+    | cons _ _ => simp [checkConcPrim] at h
+    | nil =>
+      simp only [checkConcPrim] at h
+      split at h
+      · rename_i hsend
+        cases h
+        exact ⟨.nil, .mvarEmpty (checkIsSend_sound hcl hsend)⟩
+      · cases h
+  | mvarTake =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+        rename_i τ
+        split at h
+        · rename_i hsend
+          cases h
+          exact ⟨TyListSub.refl _, .mvarTake (checkIsSend_sound hcl hsend)⟩
+        · cases h
+  | mvarPut =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 r1 =>
+      cases r1 with
+      | nil => simp [checkConcPrim] at h
+      | cons τv r2 =>
+        cases r2 with
+        | cons _ _ => simp [checkConcPrim] at h
+        | nil =>
+          cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+          rename_i τ
+          split at h
+          · rename_i hcond
+            simp only [Bool.and_eq_true] at hcond
+            cases h
+            exact ⟨.cons (.refl _) (.cons (tySub_sound hcond.2) .nil),
+              .mvarPut (checkIsSend_sound hcl hcond.1)⟩
+          · cases h
+  | chanNew τ =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+        split at h
+        · rename_i hsend
+          cases h
+          exact ⟨TyListSub.refl _, .chanNew (checkIsSend_sound hcl hsend)⟩
+        · cases h
+  | chanSend =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 r1 =>
+      cases r1 with
+      | nil => simp [checkConcPrim] at h
+      | cons τv r2 =>
+        cases r2 with
+        | cons _ _ => simp [checkConcPrim] at h
+        | nil =>
+          cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+          rename_i τ
+          split at h
+          · rename_i hcond
+            simp only [Bool.and_eq_true] at hcond
+            cases h
+            exact ⟨.cons (.refl _) (.cons (tySub_sound hcond.2) .nil),
+              .chanSend (checkIsSend_sound hcl hcond.1)⟩
+          · cases h
+  | chanRecv optAdt =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+        rename_i τ
+        cases hv0 : lookupVariant Δ optAdt 0 with
+        | none => simp [hv0] at h
+        | some f0 =>
+          cases f0 with
+          | cons _ _ => simp [hv0] at h
+          | nil =>
+            cases hv1 : lookupVariant Δ optAdt 1 with
+            | none => simp [hv0, hv1] at h
+            | some f1 =>
+              cases f1 with
+              | nil => simp [hv0, hv1] at h
+              | cons τopt f1rest =>
+                cases f1rest with
+                | cons _ _ => simp [hv0, hv1] at h
+                | nil =>
+                  simp only [hv0, hv1] at h
+                  split at h
+                  · rename_i hcond
+                    simp only [Bool.and_eq_true] at hcond
+                    have heq := tyEq_sound hcond.1
+                    subst heq
+                    cases h
+                    exact ⟨TyListSub.refl _, .chanRecv (checkIsSend_sound hcl hcond.2) hv0 hv1⟩
+                  · cases h
+  | chanClose =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+        exact ⟨TyListSub.refl _, .chanClose⟩
+  | actorSpawn =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 rest =>
+      cases rest with
+      | cons _ _ => simp [checkConcPrim] at h
+      | nil =>
+        cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+        rename_i m ps σ_ty
+        cases m <;> cases ps <;> simp at h
+        rcases h with ⟨rfl, rfl⟩
+        exact ⟨TyListSub.refl _, .actorSpawn⟩
+  | actorCall =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 r1 =>
+      cases r1 with
+      | nil => simp [checkConcPrim] at h
+      | cons a1 r2 =>
+        cases r2 with
+        | cons _ _ => simp [checkConcPrim] at h
+        | nil =>
+          cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+          rename_i σ_ty
+          cases a1 <;> try cases h
+          rename_i m ps r_ty
+          cases m
+          · cases h
+          · cases ps with
+            | nil => cases h
+            | cons p_ty psRest =>
+              cases psRest with
+              | cons _ _ => cases h
+              | nil =>
+                dsimp only at h
+                split at h
+                · rename_i hcond
+                  simp only [Bool.and_eq_true] at hcond
+                  cases h
+                  refine ⟨.cons (.refl _) (.cons (.fn (.refl .shared) (.cons (tySub_sound hcond.1) .nil) (.refl _)) .nil),
+                    .actorCall (checkIsSend_sound hcl hcond.2)⟩
+                · cases h
+  | actorSend =>
+    cases argTys with
+    | nil => simp [checkConcPrim] at h
+    | cons a0 r1 =>
+      cases r1 with
+      | nil => simp [checkConcPrim] at h
+      | cons a1 r2 =>
+        cases r2 with
+        | cons _ _ => simp [checkConcPrim] at h
+        | nil =>
+          cases a0 <;> simp only [checkConcPrim] at h <;> try cases h
+          rename_i σ_ty
+          cases a1 <;> try cases h
+          rename_i m ps r_ty
+          cases m
+          · cases h
+          · cases ps with
+            | nil => cases h
+            | cons p_ty psRest =>
+              cases psRest with
+              | cons _ _ => cases h
+              | nil =>
+                cases r_ty <;> try cases h
+                dsimp only at h
+                split at h
+                · rename_i hsub
+                  cases h
+                  exact ⟨.cons (.refl _) (.cons (.fn (.refl .shared) (.cons (tySub_sound hsub) .nil) .void) .nil),
+                    .actorSend⟩
+                · cases h
 
 /-! ## Literal & Operator Checkers -/
 
@@ -380,6 +657,7 @@ def checkExpr (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) (Γ : Ctx) :
     | none => .error s!"unbound variable '{x}'"
   | .loc l => .error s!"runtime location #{l} not allowed in static Core IR"
   | .taskRef tid => .error s!"runtime taskRef #{tid} not allowed in static Core IR"
+  | .syncRef k id => .error s!"runtime syncRef {repr k}#{id} not allowed in static Core IR"
   | .tuple es =>
     match checkExprList Δ Φ sendAdts Γ es with
     | .ok τs => .ok (.tuple τs)
@@ -523,6 +801,13 @@ def checkExpr (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) (Γ : Ctx) :
       if tySendInList sendAdts τ then .ok τ
       else .error s!"await task payload type {repr τ} is not Send"
     | .ok other => .error s!"await expects Task, got {repr other}"
+  | .concPrim op args =>
+    match checkExprList Δ Φ sendAdts Γ args with
+    | .error err => .error err
+    | .ok argTys =>
+      match checkConcPrim Δ sendAdts op argTys with
+      | .error err => .error err
+      | .ok (_, retTy) => .ok retTy
   | .trap t => .error s!"runtime trap {repr t} not allowed in static Core IR"
 
 def checkExprList (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) (Γ : Ctx) :
@@ -556,7 +841,7 @@ mutual
 theorem checkExpr_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ : Ctx}
     {e : Expr} {τ : Ty}
     (hcl : checkSendAdtsClosed Δ sendAdts = true)
-    (h : checkExpr Δ Φ sendAdts Γ e = .ok τ) : HasType Δ Φ [] [] Γ e τ := by
+    (h : checkExpr Δ Φ sendAdts Γ e = .ok τ) : HasType Δ Φ [] emptyTaskTy Γ e τ := by
   cases e with
   | lit l =>
     simp only [checkExpr, Except.ok.injEq] at h
@@ -568,6 +853,7 @@ theorem checkExpr_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ 
     | some τ0 => simp only [hx] at h; cases h; exact .var hx (TySub.refl _)
   | loc _ => simp [checkExpr] at h
   | taskRef _ => simp [checkExpr] at h
+  | syncRef _ _ => simp [checkExpr] at h
   | tuple es =>
     simp only [checkExpr] at h
     cases hts : checkExprList Δ Φ sendAdts Γ es with
@@ -598,7 +884,7 @@ theorem checkExpr_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ 
       split at h
       · rename_i hsub
         have hbody0 := checkExpr_sound hcl hb
-        have hbody : HasType Δ Φ [] [] (extendMany Γ ps) body ret :=
+        have hbody : HasType Δ Φ [] emptyTaskTy (extendMany Γ ps) body ret :=
           typing_sub (tySub_sound hsub) hbody0
         cases m
         · dsimp only at h
@@ -826,13 +1112,29 @@ theorem checkExpr_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ 
         cases h
         exact .await (checkExpr_sound hcl h1) (checkIsSend_sound hcl hsend) (TySub.refl _)
       · cases h
+  | concPrim op args =>
+    unfold checkExpr at h
+    cases hargs : checkExprList Δ Φ sendAdts Γ args with
+    | error _ => rw [hargs] at h; cases h
+    | ok argTys =>
+      rw [hargs] at h
+      dsimp only at h
+      cases hcp : checkConcPrim Δ sendAdts op argTys with
+      | error _ => rw [hcp] at h; cases h
+      | ok pair =>
+        rcases pair with ⟨expectedTys, retTy⟩
+        rw [hcp] at h
+        dsimp only at h
+        cases h
+        rcases checkConcPrim_sound hcl hcp with ⟨hsub, hprim⟩
+        exact .concPrim hprim (typingList_sub hsub (checkExprList_sound hcl hargs)) (TySub.refl _)
   | trap _ => simp [checkExpr] at h
 termination_by sizeOf e
 
 theorem checkExprList_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ : Ctx}
     {es : List Expr} {τs : List Ty}
     (hcl : checkSendAdtsClosed Δ sendAdts = true)
-    (h : checkExprList Δ Φ sendAdts Γ es = .ok τs) : HasTypes Δ Φ [] [] Γ es τs := by
+    (h : checkExprList Δ Φ sendAdts Γ es = .ok τs) : HasTypes Δ Φ [] emptyTaskTy Γ es τs := by
   cases es with
   | nil => simp only [checkExprList, Except.ok.injEq] at h; subst h; exact .nil
   | cons e rest =>
@@ -851,7 +1153,7 @@ termination_by sizeOf es
 theorem checkArms_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ : Ctx} {τs τr : Ty}
     {arms : List (Pat × Expr)}
     (hcl : checkSendAdtsClosed Δ sendAdts = true)
-    (h : checkArms Δ Φ sendAdts Γ τs τr arms = .ok ()) : ArmsHaveType Δ Φ [] [] Γ τs arms τr := by
+    (h : checkArms Δ Φ sendAdts Γ τs τr arms = .ok ()) : ArmsHaveType Δ Φ [] emptyTaskTy Γ τs arms τr := by
   cases arms with
   | nil => exact .nil
   | cons arm rest =>
@@ -875,12 +1177,13 @@ theorem checkArms_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {Γ 
 termination_by sizeOf arms
 end
 
-/-! ## Whole-Program Checker & End-to-End Safety + Data-Race Freedom Theorems -/
+/-! ## Whole-Program Verifier & Unified Safety Theorems -/
 
 /-- A concrete Core Geisha program as exported by `geisha.gsa --dump-core`. -/
 structure Program where
-  adts : List AdtDef
-  funs : List FunDef
+  adts        : List AdtDef
+  funs        : List FunDef
+  stackAllocs : List FnStackSpec := []
   deriving Repr
 
 def Program.toAdtEnv (p : Program) : AdtEnv :=
@@ -905,19 +1208,34 @@ def checkFunList (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) :
     | .error err => .error err
     | .ok () => checkFunList Δ Φ sendAdts rest
 
+/-- Whole-program verifier checking:
+    1. Types, closure capture modes (`local`/`shared`), and `Task`/`MVar`/`Chan`/`Actor` concurrency
+    2. Maranget pattern-matrix exhaustiveness (`checkProgramExhaustive`)
+    3. Intraprocedural & frame stack-allocation escape safety (`checkProgramEscape`)
+    4. Exact 40-bit GC pointer-mask layouts (`checkProgramGcLayouts`) -/
 def checkProgram (prog : Program) : Except String Unit :=
   let Δ := prog.toAdtEnv
   let Φ := prog.toFunEnv
   let sendAdts := computeSendAdts prog.adts
   if checkSendAdtsClosed Δ sendAdts then
-    checkFunList Δ Φ sendAdts prog.funs
+    match checkFunList Δ Φ sendAdts prog.funs with
+    | .error err => .error err
+    | .ok () =>
+      match checkProgramExhaustive Δ prog.funs with
+      | .error err => .error err
+      | .ok () =>
+        match checkProgramEscape prog.funs prog.stackAllocs with
+        | .error err => .error err
+        | .ok () =>
+          if checkProgramGcLayouts prog.adts then .ok ()
+          else .error "GC pointer-mask layout verification failed"
   else
     .error "internal error: computed Send ADT set is not closed"
 
 theorem checkFunDef_sound {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident} {fd : FunDef}
     (hcl : checkSendAdtsClosed Δ sendAdts = true)
     (h : checkFunDef Δ Φ sendAdts fd = .ok ()) :
-    HasType Δ Φ [] [] (extendMany emptyCtx fd.params) fd.body fd.retTy := by
+    HasType Δ Φ [] emptyTaskTy (extendMany emptyCtx fd.params) fd.body fd.retTy := by
   simp only [checkFunDef] at h
   cases hb : checkExpr Δ Φ sendAdts (extendMany emptyCtx fd.params) fd.body with
   | error _ => simp only [hb] at h; cases h
@@ -932,7 +1250,7 @@ theorem checkFunList_mem {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident}
     {fds : List FunDef} {fd : FunDef}
     (hcl : checkSendAdtsClosed Δ sendAdts = true)
     (h : checkFunList Δ Φ sendAdts fds = .ok ()) (hmem : fd ∈ fds) :
-    HasType Δ Φ [] [] (extendMany emptyCtx fd.params) fd.body fd.retTy := by
+    HasType Δ Φ [] emptyTaskTy (extendMany emptyCtx fd.params) fd.body fd.retTy := by
   induction fds with
   | nil => cases hmem
   | cons f rest ih =>
@@ -945,15 +1263,41 @@ theorem checkFunList_mem {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident}
       · exact checkFunDef_sound hcl hf
       · exact ih h hrest
 
-theorem checkProgram_sound {prog : Program} (h : checkProgram prog = .ok ()) :
-    FunEnvTyped prog.toAdtEnv prog.toFunEnv := by
-  simp only [checkProgram] at h
+theorem checkProgram_components {prog : Program} (h : checkProgram prog = .ok ()) :
+    FunEnvTyped prog.toAdtEnv prog.toFunEnv ∧
+    FunEnvExhSafe prog.toAdtEnv prog.toFunEnv ∧
+    checkProgramEscape prog.funs prog.stackAllocs = .ok () ∧
+    checkProgramGcLayouts prog.adts = true := by
+  unfold checkProgram at h
+  dsimp only at h
   split at h
   · rename_i hcl
-    intro name fd hfd
-    have hmem : fd ∈ prog.funs := List.mem_of_find?_eq_some hfd
-    exact checkFunList_mem hcl h hmem
+    cases hfl : checkFunList prog.toAdtEnv prog.toFunEnv (computeSendAdts prog.adts) prog.funs with
+    | error _ => rw [hfl] at h; cases h
+    | ok u1 =>
+      rw [hfl] at h; dsimp only at h
+      cases hexh : checkProgramExhaustive prog.toAdtEnv prog.funs with
+      | error _ => rw [hexh] at h; cases h
+      | ok u2 =>
+        rw [hexh] at h; dsimp only at h
+        cases hesc : checkProgramEscape prog.funs prog.stackAllocs with
+        | error _ => rw [hesc] at h; cases h
+        | ok u3 =>
+          rw [hesc] at h; dsimp only at h
+          split at h
+          · rename_i hgc
+            cases u3
+            refine ⟨?_, ?_, rfl, hgc⟩
+            · intro name fd hfd
+              exact checkFunList_mem hcl hfl (List.mem_of_find?_eq_some hfd)
+            · exact checkProgramExhaustive_sound
+                (fun _ _ hfd => List.mem_of_find?_eq_some hfd) hexh
+          · cases h
   · cases h
+
+theorem checkProgram_sound {prog : Program} (h : checkProgram prog = .ok ()) :
+    FunEnvTyped prog.toAdtEnv prog.toFunEnv :=
+  (checkProgram_components h).1
 
 /-- End-to-end Sequential Type Safety Theorem:
     Any Core Geisha program accepted by `checkProgram` never gets stuck in
@@ -963,47 +1307,121 @@ theorem verified_program_safety (prog : Program) (hchk : checkProgram prog = .ok
     (hnoargs : fd.params = [])
     (e' : Expr) (σ' : Store)
     (hsteps : Steps prog.toAdtEnv prog.toFunEnv fd.body [] e' σ') :
-    ¬ IsStuck prog.toAdtEnv prog.toFunEnv [] e' σ' := by
-  have hΦ : FunEnvTyped prog.toAdtEnv prog.toFunEnv := checkProgram_sound hchk
-  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] [] emptyCtx fd.body fd.retTy := by
+    ¬ IsStuck prog.toAdtEnv prog.toFunEnv emptyPool e' σ' := by
+  have hΦ := checkProgram_sound hchk
+  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] emptyTaskTy emptyCtx fd.body fd.retTy := by
     have h1 := hΦ entry fd hfd
     rw [hnoargs] at h1
     exact h1
-  have hσ0 : StoreTyped prog.toAdtEnv prog.toFunEnv [] [] [] :=
+  have hσ0 : StoreTyped prog.toAdtEnv prog.toFunEnv [] emptyTaskTy [] :=
     ⟨rfl, fun _ _ h => by simp at h⟩
   exact type_safety hΦ hbody hσ0 hsteps
 
-/-- End-to-end Concurrent Type Safety Theorem:
-    Across arbitrary interleavings of `spawn`ed tasks (`ConcSteps`), no task
-    in any Core Geisha program accepted by `checkProgram` ever gets stuck. -/
-theorem verified_concurrent_program_safety (prog : Program) (hchk : checkProgram prog = .ok ())
+/-- End-to-end Sequential Exhaustiveness Theorem:
+    Any Core Geisha program accepted by `checkProgram` never terminates with
+    `Trap.matchFailure` in sequential execution. -/
+theorem verified_program_no_match_failure (prog : Program) (hchk : checkProgram prog = .ok ())
     (entry : Ident) (fd : FunDef) (hfd : prog.toFunEnv entry = some fd)
     (hnoargs : fd.params = [])
-    (tasks : List Expr) (σ : Store)
-    (hsteps : ConcSteps prog.toAdtEnv prog.toFunEnv [fd.body] [] tasks σ) :
-    ∀ (tid : Nat) (e : Expr), tasks[tid]? = some e → ¬ IsStuck prog.toAdtEnv prog.toFunEnv tasks e σ := by
-  have hΦ : FunEnvTyped prog.toAdtEnv prog.toFunEnv := checkProgram_sound hchk
-  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] [] emptyCtx fd.body fd.retTy := by
+    (e' : Expr) (σ' : Store)
+    (hsteps : Steps prog.toAdtEnv prog.toFunEnv fd.body [] e' σ') :
+    e' ≠ .trap .matchFailure := by
+  rcases checkProgram_components hchk with ⟨hΦ, hΦ_exh, _, _⟩
+  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] emptyTaskTy emptyCtx fd.body fd.retTy := by
     have h1 := hΦ entry fd hfd
     rw [hnoargs] at h1
+    exact h1
+  exact exhaustive_no_match_failure hΦ hΦ_exh hbody (hΦ_exh entry fd hfd) hsteps
+
+/-- End-to-end Concurrent Type Safety Theorem (`Task` + `MVar` + `Chan` + `Actor`):
+    Across arbitrary interleavings (`ConcSteps`), no active `Task` or `Actor`
+    thread ever enters an undefined/stuck state (`¬ IsStuck`). -/
+theorem verified_concurrent_program_safety (prog : Program) (hchk : checkProgram prog = .ok ())
+    (entry : Ident) (fd : FunDef) (hfd : prog.toFunEnv entry = some fd)
+    (hnoargs : fd.params = []) (hret : fd.retTy = .void)
+    (pool : ConcPool) (σ : Store)
+    (hsteps : ConcSteps prog.toAdtEnv prog.toFunEnv (initPool fd.body) [] pool σ) :
+    ∀ (th : ThreadId) (e : Expr),
+      activeThreadExpr pool th = some e → ¬ IsStuck prog.toAdtEnv prog.toFunEnv pool e σ := by
+  have hΦ := checkProgram_sound hchk
+  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] emptyTaskTy emptyCtx fd.body .void := by
+    have h1 := hΦ entry fd hfd
+    rw [hnoargs, hret] at h1
     exact h1
   exact conc_type_safety hΦ hbody hsteps
 
-/-- End-to-end Verified Data-Race Freedom Theorem:
-    Any Core Geisha program accepted by `checkProgram` is guaranteed by Lean 4's
-    kernel to be completely free of `Cell` data races (`¬ HasDataRace tasks`)
-    across all concurrent task interleavings. -/
+/-- End-to-end Verified Data-Race Freedom Theorem (`Task` + `MVar` + `Chan` + `Actor`):
+    Any Core Geisha program accepted by `checkProgram` is completely free of
+    `Cell` data races (`¬ HasDataRace pool`) across all Task-Task, Task-Actor,
+    and Actor-Actor interleavings. -/
 theorem verified_program_data_race_freedom (prog : Program) (hchk : checkProgram prog = .ok ())
     (entry : Ident) (fd : FunDef) (hfd : prog.toFunEnv entry = some fd)
-    (hnoargs : fd.params = [])
-    (tasks : List Expr) (σ : Store)
-    (hsteps : ConcSteps prog.toAdtEnv prog.toFunEnv [fd.body] [] tasks σ) :
-    ¬ HasDataRace tasks := by
-  have hΦ : FunEnvTyped prog.toAdtEnv prog.toFunEnv := checkProgram_sound hchk
-  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] [] emptyCtx fd.body fd.retTy := by
+    (hnoargs : fd.params = []) (hret : fd.retTy = .void)
+    (pool : ConcPool) (σ : Store)
+    (hsteps : ConcSteps prog.toAdtEnv prog.toFunEnv (initPool fd.body) [] pool σ) :
+    ¬ HasDataRace pool := by
+  have hΦ := checkProgram_sound hchk
+  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] emptyTaskTy emptyCtx fd.body .void := by
     have h1 := hΦ entry fd hfd
-    rw [hnoargs] at h1
+    rw [hnoargs, hret] at h1
     exact h1
   exact conc_data_race_freedom hΦ hbody hsteps
+
+/-- End-to-end Concurrent Exhaustiveness Theorem:
+    Across arbitrary concurrent `Task` and `Actor` interleavings, no running
+    `Task` and no `Actor` ever fails with `Trap.matchFailure`. -/
+theorem verified_concurrent_no_match_failure (prog : Program) (hchk : checkProgram prog = .ok ())
+    (entry : Ident) (fd : FunDef) (hfd : prog.toFunEnv entry = some fd)
+    (hnoargs : fd.params = []) (hret : fd.retTy = .void)
+    (pool : ConcPool) (σ : Store)
+    (hsteps : ConcSteps prog.toAdtEnv prog.toFunEnv (initPool fd.body) [] pool σ) :
+    (∀ (tid : TaskId) (e : Expr), pool.tasks[tid]? = some (.running e) → e ≠ .trap .matchFailure) ∧
+    (∀ (aid : Nat) (act : ActorState), pool.actors[aid]? = some act → act.phase ≠ .failed .matchFailure) := by
+  rcases checkProgram_components hchk with ⟨hΦ, hΦ_exh, _, _⟩
+  have hbody : HasType prog.toAdtEnv prog.toFunEnv [] emptyTaskTy emptyCtx fd.body .void := by
+    have h1 := hΦ entry fd hfd
+    rw [hnoargs, hret] at h1
+    exact h1
+  exact conc_exhaustive_no_match_failure hΦ hΦ_exh hbody (hΦ_exh entry fd hfd) hsteps
+
+/-- End-to-end Verified GC Pointer-Mask Soundness Theorem:
+    Every ADT variant in any Core Geisha program accepted by `checkProgram` has a
+    sound 40-bit pointer word mask (`ObjMaskSound`) that scans every pointer word
+    and never misidentifies scalar fields as heap pointers. -/
+theorem verified_program_gc_mask_sound (prog : Program) (hchk : checkProgram prog = .ok ())
+    {adt : AdtDef} (hAdt : adt ∈ prog.adts) {v : VariantDef} (hVar : v ∈ adt.variants)
+    (tagBits : UInt64) (words : List Word)
+    (hLayout : WordsMatchLayout words (flattenTyListWords v.fields)) :
+    let obj : HeapObj := { hdrMask := adtVariantPtrMask v, mutable := false, words := .scalar tagBits :: words }
+    ObjMaskSound obj ∧
+    (∀ (m idx : Nat) (bits : UInt64), adtVariantPtrMask v = some m → obj.words[idx]? = some (.scalar bits) → m.testBit idx = false) :=
+  checkProgramGcLayouts_sound (checkProgram_components hchk).2.2.2 hAdt hVar tagBits words hLayout
+
+/-- End-to-end Verified Stack-Region Memory Safety Theorem:
+    Any Core Geisha program accepted by `checkProgram` never dereferences a
+    popped/deallocated stack-frame slot (`¬ IsDanglingAccess`) across arbitrarily
+    nested and recursive calls. -/
+theorem verified_program_no_dangling_stack (prog : Program) (hchk : checkProgram prog = .ok ())
+    (entry : Ident) (fd : FunDef) (hfd : prog.toFunEnv entry = some fd)
+    (hnoargs : fd.params = [])
+    {re' : RExpr} {ρ' : RStore} {n' : RegionId}
+    (hsteps : RSteps prog.toFunEnv prog.stackAllocs
+      (.frame 0 (compileExpr (lookupStackVars prog.stackAllocs entry) 0 fd.body)) [] 1 re' ρ' n') :
+    ¬ IsDanglingAccess re' ρ' :=
+  escape_no_dangling_pointers_gen (fun _ => rfl) (checkProgram_components hchk).2.2.1 hfd hnoargs hsteps
+
+/-- End-to-end Verified Stack-vs-Heap Observational Simulation Theorem:
+    Stack-promoted execution of `main` in any program accepted by `checkProgram`
+    is simulated step-for-step by standard heap semantics (`Steps`). -/
+theorem verified_program_stack_simulates_heap (prog : Program) (hchk : checkProgram prog = .ok ())
+    (fdMain : FunDef) (hmain : prog.toFunEnv "main" = some fdMain)
+    (hnoargs : fdMain.params = [])
+    {re' : RExpr} {ρ' : RStore} {n' : RegionId}
+    (hsteps : RSteps prog.toFunEnv prog.stackAllocs
+      (.frame 0 (compileExpr (lookupStackVars prog.stackAllocs "main") 0 fdMain.body)) [] 1 re' ρ' n') :
+    ∃ σ' : Store,
+      Steps prog.toAdtEnv prog.toFunEnv fdMain.body [] (eraseRExpr re') σ' ∧ RStoreMatches ρ' σ' :=
+  stack_alloc_simulates_heap prog.toAdtEnv (fun _ => rfl) (checkProgram_components hchk).2.2.1
+    hmain hnoargs hsteps
 
 end CoreGeisha

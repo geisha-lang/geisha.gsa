@@ -1,12 +1,15 @@
 import CoreGeisha.Syntax
+import CoreGeisha.Escape
 import CoreGeisha.Checker
 
 /-!
 # Core Geisha: `.gscore` S-Expression Parser
 
 Parses the serialized Core IR emitted by `geisha.gsa --dump-core <file>` into
-`CoreGeisha.Program` (including closure capture modes `local`/`shared` and
-concurrent `task`/`spawn`/`await`) for verified checking by `CoreGeisha.checkProgram`.
+`CoreGeisha.Program` (including closure capture modes `local`/`shared`,
+concurrent `Task`/`MVar`/`Chan`/`Actor` types & primitives, and
+`(stack-allocs ...)` escape annotations) for verified checking by
+`CoreGeisha.checkProgram`.
 -/
 
 namespace CoreGeisha.Parser
@@ -128,7 +131,30 @@ private partial def parseTy : SExpr → Except String Ty
   | .list [.atom "task", t] => do
     let t' ← parseTy t
     pure (.task t')
+  | .list [.atom "mvar", t] => do
+    let t' ← parseTy t
+    pure (.mvar t')
+  | .list [.atom "chan", t] => do
+    let t' ← parseTy t
+    pure (.chan t')
+  | .list [.atom "actor", t] => do
+    let t' ← parseTy t
+    pure (.actor t')
   | other => .error s!"invalid type: {repr other}"
+
+private def parseConcPrim : SExpr → Except String ConcPrim
+  | .atom "mvar-new" => .ok .mvarNew
+  | .list [.atom "mvar-empty", t] => do pure (.mvarEmpty (← parseTy t))
+  | .atom "mvar-take" => .ok .mvarTake
+  | .atom "mvar-put" => .ok .mvarPut
+  | .list [.atom "chan-new", t] => do pure (.chanNew (← parseTy t))
+  | .atom "chan-send" => .ok .chanSend
+  | .list [.atom "chan-recv", optAdt] => do pure (.chanRecv (← expectStr optAdt))
+  | .atom "chan-close" => .ok .chanClose
+  | .atom "actor-spawn" => .ok .actorSpawn
+  | .atom "actor-call" => .ok .actorCall
+  | .atom "actor-send" => .ok .actorSend
+  | other => .error s!"invalid conc-prim operator: {repr other}"
 
 private def parseUnOp : String → Except String UnOp
   | "not" => .ok .not
@@ -230,6 +256,8 @@ private partial def parseExpr : SExpr → Except String Expr
   | .list [.atom "cell-set", e1, e2] => do pure (.cellSet (← parseExpr e1) (← parseExpr e2))
   | .list [.atom "spawn", e] => do pure (.spawn (← parseExpr e))
   | .list [.atom "await", e] => do pure (.await (← parseExpr e))
+  | .list (.atom "conc-prim" :: prim :: args) => do
+    pure (.concPrim (← parseConcPrim prim) (← args.mapM parseExpr))
   | other => .error s!"invalid expr: {repr other}"
 
 private def parseVariant : SExpr → Except String VariantDef
@@ -252,6 +280,14 @@ private def parseFun : SExpr → Except String FunDef
     }
   | other => .error s!"invalid fun: {repr other}"
 
+private def parseStackSpec : SExpr → Except String FnStackSpec
+  | .list (.atom "fn-stack" :: fnName :: vars) => do
+    pure {
+      fnName := ← expectStr fnName
+      vars := ← vars.mapM expectStr
+    }
+  | other => .error s!"invalid fn-stack entry: {repr other}"
+
 def parseProgram (src : String) : Except String Program := do
   let (sexpr, rest) ← parseSExpr src.toList
   match skipWs rest with
@@ -260,8 +296,13 @@ def parseProgram (src : String) : Except String Program := do
     | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs)] => do
       let adts' ← adts.mapM parseAdt
       let funs' ← funs.mapM parseFun
-      pure { adts := adts', funs := funs' }
-    | other => .error s!"expected (program (adts ...) (funs ...)), got {repr other}"
+      pure { adts := adts', funs := funs', stackAllocs := [] }
+    | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs), .list (.atom "stack-allocs" :: specs)] => do
+      let adts' ← adts.mapM parseAdt
+      let funs' ← funs.mapM parseFun
+      let specs' ← specs.mapM parseStackSpec
+      pure { adts := adts', funs := funs', stackAllocs := specs' }
+    | other => .error s!"expected (program (adts ...) (funs ...) [(stack-allocs ...)]), got {repr other}"
   | _ => .error "trailing tokens after top-level program"
 
 end CoreGeisha.Parser

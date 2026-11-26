@@ -19,19 +19,35 @@ namespace CoreGeisha
 
 /-! ## Store, Task & Context Auxiliary Lemmas -/
 
-theorem StoreExtends.refl (Ψ : StoreTy) : StoreExtends Ψ Ψ :=
+theorem ListExtends.refl (xs : List Ty) : ListExtends xs xs :=
   ⟨Nat.le_refl _, fun _ _ h => h⟩
+
+theorem ListExtends.trans {xs ys zs : List Ty}
+    (h12 : ListExtends xs ys) (h23 : ListExtends ys zs) : ListExtends xs zs :=
+  ⟨Nat.le_trans h12.1 h23.1, fun i τ h => h23.2 i τ (h12.2 i τ h)⟩
+
+theorem ListExtends.empty (xs : List Ty) : ListExtends [] xs :=
+  ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
+
+theorem StoreExtends.refl (Ψ : StoreTy) : StoreExtends Ψ Ψ :=
+  ListExtends.refl Ψ
 
 theorem StoreExtends.trans {Ψ1 Ψ2 Ψ3 : StoreTy}
     (h12 : StoreExtends Ψ1 Ψ2) (h23 : StoreExtends Ψ2 Ψ3) : StoreExtends Ψ1 Ψ3 :=
-  ⟨Nat.le_trans h12.1 h23.1, fun l τ h => h23.2 l τ (h12.2 l τ h)⟩
+  ListExtends.trans h12 h23
 
 theorem TaskExtends.refl (Θ : TaskTy) : TaskExtends Θ Θ :=
-  ⟨Nat.le_refl _, fun _ _ h => h⟩
+  ⟨ListExtends.refl _, ListExtends.refl _, ListExtends.refl _, ListExtends.refl _⟩
 
 theorem TaskExtends.trans {Θ1 Θ2 Θ3 : TaskTy}
     (h12 : TaskExtends Θ1 Θ2) (h23 : TaskExtends Θ2 Θ3) : TaskExtends Θ1 Θ3 :=
-  ⟨Nat.le_trans h12.1 h23.1, fun tid τ h => h23.2 tid τ (h12.2 tid τ h)⟩
+  ⟨ListExtends.trans h12.tasks h23.tasks,
+   ListExtends.trans h12.mvars h23.mvars,
+   ListExtends.trans h12.chans h23.chans,
+   ListExtends.trans h12.actors h23.actors⟩
+
+theorem TaskExtends.empty (Θ : TaskTy) : TaskExtends emptyTaskTy Θ :=
+  ⟨ListExtends.empty _, ListExtends.empty _, ListExtends.empty _, ListExtends.empty _⟩
 
 theorem lt_length_of_getElem?_eq_some {α : Type} {xs : List α} {l : Nat} {a : α}
     (h : xs[l]? = some a) : l < xs.length := by
@@ -41,17 +57,30 @@ theorem lt_length_of_getElem?_eq_some {α : Type} {xs : List α} {l : Nat} {a : 
     rw [List.getElem?_eq_none hge] at h
     cases h
 
-theorem StoreExtends.append (Ψ : StoreTy) (τ : Ty) : StoreExtends Ψ (Ψ ++ [τ]) := by
+theorem ListExtends.append (xs : List Ty) (τ : Ty) : ListExtends xs (xs ++ [τ]) := by
   refine ⟨by simp, fun l t h => ?_⟩
-  have hlt : l < Ψ.length := lt_length_of_getElem?_eq_some h
+  have hlt : l < xs.length := lt_length_of_getElem?_eq_some h
   rw [List.getElem?_append_left hlt]
   exact h
 
-theorem TaskExtends.append (Θ : TaskTy) (τ : Ty) : TaskExtends Θ (Θ ++ [τ]) := by
-  refine ⟨by simp, fun tid t h => ?_⟩
-  have hlt : tid < Θ.length := lt_length_of_getElem?_eq_some h
-  rw [List.getElem?_append_left hlt]
-  exact h
+theorem StoreExtends.append (Ψ : StoreTy) (τ : Ty) : StoreExtends Ψ (Ψ ++ [τ]) :=
+  ListExtends.append Ψ τ
+
+theorem TaskExtends.appendTask (Θ : TaskTy) (τ : Ty) :
+    TaskExtends Θ { Θ with tasks := Θ.tasks ++ [τ] } :=
+  ⟨ListExtends.append Θ.tasks τ, ListExtends.refl _, ListExtends.refl _, ListExtends.refl _⟩
+
+theorem TaskExtends.appendMVar (Θ : TaskTy) (τ : Ty) :
+    TaskExtends Θ { Θ with mvars := Θ.mvars ++ [τ] } :=
+  ⟨ListExtends.refl _, ListExtends.append Θ.mvars τ, ListExtends.refl _, ListExtends.refl _⟩
+
+theorem TaskExtends.appendChan (Θ : TaskTy) (τ : Ty) :
+    TaskExtends Θ { Θ with chans := Θ.chans ++ [τ] } :=
+  ⟨ListExtends.refl _, ListExtends.refl _, ListExtends.append Θ.chans τ, ListExtends.refl _⟩
+
+theorem TaskExtends.appendActor (Θ : TaskTy) (τ : Ty) :
+    TaskExtends Θ { Θ with actors := Θ.actors ++ [τ] } :=
+  ⟨ListExtends.refl _, ListExtends.refl _, ListExtends.refl _, ListExtends.append Θ.actors τ⟩
 
 theorem extendMany_append (Γ : Ctx) (bs1 bs2 : List (Ident × Ty)) :
     extendMany Γ (bs1 ++ bs2) = extendMany (extendMany Γ bs2) bs1 := by
@@ -143,6 +172,9 @@ theorem TySub.refl : (t : Ty) → TySub t t
   | .adt n => .adt n
   | .cell t => .cell t
   | .task t => .task (TySub.refl t)
+  | .mvar t => .mvar t
+  | .chan t => .chan t
+  | .actor t => .actor t
 
 theorem TyListSub.refl : (ts : List Ty) → TyListSub ts ts
   | [] => .nil
@@ -175,6 +207,9 @@ theorem TySub.trans {t1 t2 t3 : Ty} (h12 : TySub t1 t2) (h23 : TySub t2 t3) :
     | task hs12 =>
       cases h23 with
       | task hs23 => exact .task (TySub.trans hs12 hs23)
+  | mvar t => cases h12; cases h23; exact .mvar t
+  | chan t => cases h12; cases h23; exact .chan t
+  | actor t => cases h12; cases h23; exact .actor t
 termination_by sizeOf t2
 
 theorem TyListSub.trans {ts1 ts2 ts3 : List Ty}
@@ -210,6 +245,11 @@ theorem typing_sub {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ 
   | taskRef htid hsend hs0 =>
     cases hsub with
     | task hs => exact .taskRef htid hsend (TySub.trans hs0 hs)
+  | syncRef hsr =>
+    cases hsr with
+    | mvar hm hsend => cases hsub; exact .syncRef (.mvar hm hsend)
+    | chan hc hsend => cases hsub; exact .syncRef (.chan hc hsend)
+    | actor ha => cases hsub; exact .syncRef (.actor ha)
   | tuple hts =>
     cases hsub with
     | tuple htsub => exact .tuple (typingList_sub htsub hts)
@@ -260,6 +300,8 @@ theorem typing_sub {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {Γ 
     | task hs => exact .spawn h1 hsend (TySub.trans hs0 hs)
   | await h1 hsend hs0 =>
     exact .await h1 hsend (TySub.trans hs0 hsub)
+  | concPrim hop hargs hs0 =>
+    exact .concPrim hop hargs (TySub.trans hs0 hsub)
   | trap t _ => exact .trap t τ2
 termination_by sizeOf e
 
@@ -313,6 +355,9 @@ theorem tySendIn_of_tySub {S : Ident → Prop} {τ0 τ : Ty}
   | task ht =>
     cases hsend with
     | task hs => exact .task (tySendIn_of_tySub ht hs)
+  | mvar _ => exact hsend
+  | chan _ => exact hsend
+  | actor _ => exact hsend
 
 theorem tyListSendIn_of_tyListSub {S : Ident → Prop} {ts0 ts : List Ty}
     (hsub : TyListSub ts0 ts) (hsend : TyListSendIn S ts) : TyListSendIn S ts0 := by
@@ -398,6 +443,7 @@ theorem exprLocs_empty_of_empty_store {Δ : AdtEnv} {Φ : FunEnv} {Θ : TaskTy} 
   | var _ _ => rfl
   | loc hl => simp at hl
   | taskRef _ _ _ => rfl
+  | syncRef _ => rfl
   | tuple hts => simp only [exprLocs]; exact exprLocsList_empty_of_empty_store hts
   | blockEmpty => rfl
   | blockSingle he =>
@@ -440,6 +486,8 @@ theorem exprLocs_empty_of_empty_store {Δ : AdtEnv} {Φ : FunEnv} {Θ : TaskTy} 
     simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
   | await h1 _ _ =>
     simp only [exprLocs]; exact exprLocs_empty_of_empty_store h1
+  | concPrim _ hargs _ =>
+    simp only [exprLocs]; exact exprLocsList_empty_of_empty_store hargs
   | trap _ _ => rfl
 termination_by sizeOf e
 
@@ -475,6 +523,7 @@ theorem exprLocs_empty_of_isValue_isSend {Δ : AdtEnv} {Φ : FunEnv} {Ψ : Store
   | var hx _ => simp [emptyCtx] at hx
   | loc _ => exact absurd hsend isSend_cell_false
   | taskRef _ _ _ => rfl
+  | syncRef _ => rfl
   | tuple hts =>
     cases hv with
     | tuple hvs =>
@@ -509,6 +558,7 @@ theorem exprLocs_empty_of_isValue_isSend {Δ : AdtEnv} {Φ : FunEnv} {Ψ : Store
   | cellSet _ _ => cases hv
   | spawn _ _ _ => cases hv
   | await _ _ _ => cases hv
+  | concPrim _ _ _ => cases hv
   | trap _ _ => cases hv
 termination_by sizeOf v
 
@@ -565,6 +615,7 @@ theorem freeVars_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} 
     subst hz; exact ⟨_, hx⟩
   | loc _ => intro _ h; cases h
   | taskRef _ _ _ => intro _ h; cases h
+  | syncRef _ => intro _ h; cases h
   | tuple hts => simp only [freeVars]; exact freeVarsList_typed hts
   | blockEmpty => intro _ h; cases h
   | blockSingle he =>
@@ -649,6 +700,7 @@ theorem freeVars_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} 
     · exact freeVars_typed h2 z hz2
   | spawn h1 _ _ => simp only [freeVars]; exact freeVars_typed h1
   | await h1 _ _ => simp only [freeVars]; exact freeVars_typed h1
+  | concPrim _ hargs _ => simp only [freeVars]; exact freeVarsList_typed hargs
   | trap _ _ => intro _ h; cases h
 termination_by sizeOf e
 
@@ -701,6 +753,7 @@ theorem subst_not_mem_freeVars {x : Ident} {v : Expr} :
     simp [subst, hyx]
   | .loc _, _ => rfl
   | .taskRef _, _ => rfl
+  | .syncRef _ _, _ => rfl
   | .tuple es, hnot => by
     simp only [subst, substList_not_mem_freeVars es hnot]
   | .block es, hnot => by
@@ -764,6 +817,8 @@ theorem subst_not_mem_freeVars {x : Ident} {v : Expr} :
     simp [subst, subst_not_mem_freeVars e1 hnot]
   | .await e1, hnot => by
     simp [subst, subst_not_mem_freeVars e1 hnot]
+  | .concPrim _ args, hnot => by
+    simp [subst, substList_not_mem_freeVars args hnot]
   | .trap _, _ => rfl
 
 theorem substList_not_mem_freeVars {x : Ident} {v : Expr} :
@@ -807,6 +862,7 @@ theorem mem_freeVars_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ free
       exact ⟨fun h => hyx (beq_iff_eq.mpr h), List.mem_singleton.mpr rfl⟩
   | .loc _, h => by cases h
   | .taskRef _, h => by cases h
+  | .syncRef _ _, h => by cases h
   | .tuple es, h => mem_freeVarsList_subst hclosed es h
   | .block es, h => mem_freeVarsList_subst hclosed es h
   | .lam m ps ret body, h => by
@@ -882,6 +938,7 @@ theorem mem_freeVars_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ free
     · rcases mem_freeVars_subst hclosed e2 h2 with ⟨hne, hm⟩; exact ⟨hne, Or.inr hm⟩
   | .spawn e1, h => mem_freeVars_subst hclosed e1 h
   | .await e1, h => mem_freeVars_subst hclosed e1 h
+  | .concPrim _ args, h => mem_freeVarsList_subst hclosed args h
   | .trap _, h => by cases h
 
 theorem mem_freeVarsList_subst {x z : Ident} {v : Expr} (hclosed : ∀ w, w ∉ freeVars v) :
@@ -924,6 +981,7 @@ theorem mem_exprLocs_subst {x : Ident} {v : Expr} {l : Loc} :
     · cases h
   | .loc _, h => Or.inl h
   | .taskRef _, h => by cases h
+  | .syncRef _ _, h => by cases h
   | .tuple es, h => mem_exprLocsList_subst es h
   | .block es, h => mem_exprLocsList_subst es h
   | .lam m ps ret body, h => by
@@ -981,6 +1039,7 @@ theorem mem_exprLocs_subst {x : Ident} {v : Expr} {l : Loc} :
     · exact (mem_exprLocs_subst e2 h2).imp Or.inr id
   | .spawn e1, h => mem_exprLocs_subst e1 h
   | .await e1, h => mem_exprLocs_subst e1 h
+  | .concPrim _ args, h => mem_exprLocsList_subst args h
   | .trap _, h => by cases h
 
 theorem mem_exprLocsList_subst {x : Ident} {v : Expr} {l : Loc} :
@@ -1040,6 +1099,7 @@ theorem typing_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskT
   | var hx hs => exact .var (hsub _ _ hx) hs
   | loc hl => exact .loc hl
   | taskRef htid hsend hs => exact .taskRef htid hsend hs
+  | syncRef hsr => exact .syncRef hsr
   | tuple hts => exact .tuple (typingList_ctx_weaken hsub hts)
   | blockEmpty => exact .blockEmpty
   | blockSingle he => exact .blockSingle (typing_ctx_weaken hsub he)
@@ -1068,6 +1128,7 @@ theorem typing_ctx_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskT
   | cellSet h1 h2 => exact .cellSet (typing_ctx_weaken hsub h1) (typing_ctx_weaken hsub h2)
   | spawn h1 hsend hs => exact .spawn (typing_ctx_weaken hsub h1) hsend hs
   | await h1 hsend hs => exact .await (typing_ctx_weaken hsub h1) hsend hs
+  | concPrim hop hargs hr => exact .concPrim hop (typingList_ctx_weaken hsub hargs) hr
   | trap t τ => exact .trap t τ
 termination_by sizeOf e
 
@@ -1105,7 +1166,12 @@ theorem typing_env_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Θ Θ'
   | lit hl => exact .lit hl
   | var hx hsub => exact .var hx hsub
   | loc hl => exact .loc (hs.2 _ _ hl)
-  | taskRef htid hsend hsub => exact .taskRef (htk.2 _ _ htid) hsend hsub
+  | taskRef htid hsend hsub => exact .taskRef (htk.tasks.2 _ _ htid) hsend hsub
+  | syncRef hsr =>
+    cases hsr with
+    | mvar hm hsend => exact .syncRef (.mvar (htk.mvars.2 _ _ hm) hsend)
+    | chan hc hsend => exact .syncRef (.chan (htk.chans.2 _ _ hc) hsend)
+    | actor ha => exact .syncRef (.actor (htk.actors.2 _ _ ha))
   | tuple hts => exact .tuple (typingList_env_weaken hs htk hts)
   | blockEmpty => exact .blockEmpty
   | blockSingle he => exact .blockSingle (typing_env_weaken hs htk he)
@@ -1129,6 +1195,7 @@ theorem typing_env_weaken {Δ : AdtEnv} {Φ : FunEnv} {Ψ Ψ' : StoreTy} {Θ Θ'
   | cellSet h1 h2 => exact .cellSet (typing_env_weaken hs htk h1) (typing_env_weaken hs htk h2)
   | spawn h1 hsend hsub => exact .spawn (typing_env_weaken hs htk h1) hsend hsub
   | await h1 hsend hsub => exact .await (typing_env_weaken hs htk h1) hsend hsub
+  | concPrim hop hargs hr => exact .concPrim hop (typingList_env_weaken hs htk hargs) hr
   | trap t τ => exact .trap t τ
 termination_by sizeOf e
 
@@ -1176,6 +1243,7 @@ theorem subst_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {�
       exact .var hy hsub
   | loc hl => exact .loc hl
   | taskRef htid hsend hsub => exact .taskRef htid hsend hsub
+  | syncRef hsr => exact .syncRef hsr
   | tuple hts => exact .tuple (substList_typing hts hvVal hv)
   | blockEmpty => exact .blockEmpty
   | blockSingle h1 => exact .blockSingle (subst_typing h1 hvVal hv)
@@ -1262,6 +1330,7 @@ theorem subst_typing {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {�
   | cellSet h1 h2 => exact .cellSet (subst_typing h1 hvVal hv) (subst_typing h2 hvVal hv)
   | spawn h1 hsend hs => exact .spawn (subst_typing h1 hvVal hv) hsend hs
   | await h1 hsend hs => exact .await (subst_typing h1 hvVal hv) hsend hs
+  | concPrim hop hargs hr => exact .concPrim hop (substList_typing hargs hvVal hv) hr
   | trap t τ => exact .trap t τ
 termination_by sizeOf e
 
@@ -1488,6 +1557,7 @@ theorem canonical_bool {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} 
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
@@ -1499,6 +1569,7 @@ theorem canonical_int {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
@@ -1510,6 +1581,7 @@ theorem canonical_str {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {
   | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
   | loc _ => cases ht
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
@@ -1526,6 +1598,7 @@ theorem canonical_fn {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v
   | lit _ => cases ht with | lit hl => cases hl
   | loc _ => cases ht
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam m0 ps ret0 body =>
     cases ht with
     | lam hm hps hr _ _ => exact ⟨m0, ps, ret0, body, rfl, hm, hps, hr⟩
@@ -1539,6 +1612,7 @@ theorem canonical_adt {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {
   | lit _ => cases ht with | lit hl => cases hl
   | loc _ => cases ht
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ tag hvs =>
@@ -1552,19 +1626,69 @@ theorem canonical_cell {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} 
   | lit _ => cases ht with | lit hl => cases hl
   | loc l => cases ht with | loc hl => exact ⟨l, rfl, hl⟩
   | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
 theorem canonical_task {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {τ : Ty}
     (ht : HasType Δ Φ Ψ Θ emptyCtx v (.task τ)) (hv : IsValue v) :
-    ∃ tid τ0, v = .taskRef tid ∧ Θ[tid]? = some τ0 ∧ IsSend Δ τ0 ∧ TySub τ0 τ := by
+    ∃ tid τ0, v = .taskRef tid ∧ Θ.tasks[tid]? = some τ0 ∧ IsSend Δ τ0 ∧ TySub τ0 τ := by
   cases hv with
   | lit _ => cases ht with | lit hl => cases hl
   | loc _ => cases ht
   | taskRef tid =>
     cases ht with
     | taskRef htid hsend hs => exact ⟨tid, _, rfl, htid, hsend, hs⟩
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_mvar {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.mvar τ)) (hv : IsValue v) :
+    ∃ mid, v = .syncRef .mvar mid ∧ Θ.mvars[mid]? = some τ ∧ IsSend Δ τ := by
+  cases hv with
+  | lit _ => cases ht with | lit hl => cases hl
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef k id =>
+    cases ht with
+    | syncRef hsr =>
+      cases hsr with
+      | mvar hm hsend => exact ⟨id, rfl, hm, hsend⟩
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_chan {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {τ : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.chan τ)) (hv : IsValue v) :
+    ∃ cid, v = .syncRef .chan cid ∧ Θ.chans[cid]? = some τ ∧ IsSend Δ τ := by
+  cases hv with
+  | lit _ => cases ht with | lit hl => cases hl
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef k id =>
+    cases ht with
+    | syncRef hsr =>
+      cases hsr with
+      | chan hc hsend => exact ⟨id, rfl, hc, hsend⟩
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_actor {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr} {σ_ty : Ty}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v (.actor σ_ty)) (hv : IsValue v) :
+    ∃ aid, v = .syncRef .actor aid ∧ Θ.actors[aid]? = some σ_ty := by
+  cases hv with
+  | lit _ => cases ht with | lit hl => cases hl
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef k id =>
+    cases ht with
+    | syncRef hsr =>
+      cases hsr with
+      | actor ha => exact ⟨id, rfl, ha⟩
   | lam _ _ _ _ => cases ht
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
@@ -1588,281 +1712,422 @@ theorem evalBinOp_sound {op : BinOp} {l1 l2 l' : Lit} {τ1 τ2 τr : Ty}
 
 mutual
 theorem progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
-    {tasks : List Expr} {σ : Store} {e : Expr} {τ : Ty}
+    {pool : ConcPool} {σ : Store} {e : Expr} {τ : Ty}
     (hΦ : FunEnvTyped Δ Φ)
     (ht : HasType Δ Φ Ψ Θ emptyCtx e τ)
     (hσ : StoreTyped Δ Φ Ψ Θ σ)
-    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
-    IsTerminal e ∨ BlockedOnTask tasks e ∨ ∃ e' σ' sp, Step Δ Φ tasks e σ e' σ' sp := by
+    (hpool : PoolTyped Δ Φ Ψ Θ pool) :
+    IsTerminal e ∨ BlockedOnTask pool e ∨ ∃ e' σ' eff, Step Δ Φ pool e σ e' σ' eff := by
   cases ht with
   | lit _ => exact Or.inl (Or.inl (.lit _))
   | var hx _ => simp [emptyCtx] at hx
   | loc _ => exact Or.inl (Or.inl (.loc _))
   | taskRef _ _ _ => exact Or.inl (Or.inl (.taskRef _))
+  | syncRef _ => exact Or.inl (Or.inl (.syncRef _ _))
   | tuple hts =>
-    rcases progressList hΦ hts hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', sp, hstep⟩
+    rcases progressList hΦ hts hσ hpool with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', eff, hstep⟩
     · exact Or.inl (Or.inl (.tuple hvals))
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .tupleTrap htrap⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .tupleTrap htrap⟩)
     · exact Or.inr (Or.inl (.tuple hblk))
-    · exact Or.inr (Or.inr ⟨.tuple es', σ', sp, .tupleStep hstep⟩)
-  | blockEmpty => exact Or.inr (Or.inr ⟨.lit .unit, σ, none, .blockEmpty⟩)
-  | blockSingle _ => exact Or.inr (Or.inr ⟨_, σ, none, .blockSingle⟩)
+    · exact Or.inr (Or.inr ⟨.tuple es', σ', eff, .tupleStep hstep⟩)
+  | blockEmpty => exact Or.inr (Or.inr ⟨.lit .unit, σ, .none, .blockEmpty⟩)
+  | blockSingle _ => exact Or.inr (Or.inr ⟨_, σ, .none, .blockSingle⟩)
   | blockCons h1 _ =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
-    · exact Or.inr (Or.inr ⟨_, σ, none, .blockConsVal hv1⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .blockConsTrap⟩)
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', eff, hs1⟩
+    · exact Or.inr (Or.inr ⟨_, σ, .none, .blockConsVal hv1⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .blockConsTrap⟩)
     · exact Or.inr (Or.inl (.blockCons hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .blockConsStep hs1⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .blockConsStep hs1⟩)
   | lam _ _ _ _ _ => exact Or.inl (Or.inl (.lam _ _ _ _))
   | apply hfn hargs _ =>
-    rcases progress hΦ hfn hσ htasks with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', sp, hsfn⟩
-    · rcases progressList hΦ hargs hσ htasks with hvals | ⟨t, htrap⟩ | hblkArgs | ⟨args', σ', sp, hsargs⟩
+    rcases progress hΦ hfn hσ hpool with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', eff, hsfn⟩
+    · rcases progressList hΦ hargs hσ hpool with hvals | ⟨t, htrap⟩ | hblkArgs | ⟨args', σ', eff, hsargs⟩
       · rcases canonical_fn hfn hvfn with ⟨_, ps, _, _, rfl, _, hpsSub, _⟩
         have hlen1 := hasTypes_length hargs
         have hlen2 := tyListSub_length hpsSub
         rw [hlen2, List.length_map] at hlen1
-        exact Or.inr (Or.inr ⟨_, σ, none, .applyBeta hvals hlen1⟩)
-      · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyArgsTrap hvfn htrap⟩)
+        exact Or.inr (Or.inr ⟨_, σ, .none, .applyBeta hvals hlen1⟩)
+      · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .applyArgsTrap hvfn htrap⟩)
       · exact Or.inr (Or.inl (.applyArgs hvfn hblkArgs))
-      · exact Or.inr (Or.inr ⟨_, σ', sp, .applyArgs hvfn hsargs⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyFnTrap⟩)
+      · exact Or.inr (Or.inr ⟨_, σ', eff, .applyArgs hvfn hsargs⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .applyFnTrap⟩)
     · exact Or.inr (Or.inl (.applyFn hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .applyFn hsfn⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .applyFn hsfn⟩)
   | applyDir hf hargs _ =>
-    rcases progressList hΦ hargs hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨args', σ', sp, hsargs⟩
+    rcases progressList hΦ hargs hσ hpool with hvals | ⟨t, htrap⟩ | hblk | ⟨args', σ', eff, hsargs⟩
     · have hlen := hasTypes_length hargs
       rw [List.length_map] at hlen
-      exact Or.inr (Or.inr ⟨_, σ, none, .applyDirBeta hf hvals hlen⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .applyDirTrap htrap⟩)
+      exact Or.inr (Or.inr ⟨_, σ, .none, .applyDirBeta hf hvals hlen⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .applyDirTrap htrap⟩)
     · exact Or.inr (Or.inl (.applyDirArgs hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .applyDirArgs hsargs⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .applyDirArgs hsargs⟩)
   | bin hop h1 h2 =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', eff, hs1⟩
     · cases hop with
       | and =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
         cases b
-        · exact Or.inr (Or.inr ⟨_, σ, none, .binAndFalse⟩)
-        · exact Or.inr (Or.inr ⟨_, σ, none, .binAndTrue⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, .none, .binAndFalse⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, .none, .binAndTrue⟩)
       | or =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
         cases b
-        · exact Or.inr (Or.inr ⟨_, σ, none, .binOrFalse⟩)
-        · exact Or.inr (Or.inr ⟨_, σ, none, .binOrTrue⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrFalse⟩)
+        · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrTrue⟩)
       | div =>
-        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
         · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
           rcases canonical_int h2 hv2 with ⟨b, rfl⟩
           by_cases hb : (b == 0) = true
-          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, none, .binTrap (by simp [evalBinOp, hb])⟩)
+          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩)
           · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-            exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩)
-        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+            exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩)
+        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
         · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
+        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
       | rem =>
-        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
         · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
           rcases canonical_int h2 hv2 with ⟨b, rfl⟩
           by_cases hb : (b == 0) = true
-          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, none, .binTrap (by simp [evalBinOp, hb])⟩)
+          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩)
           · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-            exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩)
-        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+            exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩)
+        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
         · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
+        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
       | _ =>
-        rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
         · first
           | (rcases canonical_int h1 hv1 with ⟨a, rfl⟩
              rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
+             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
           | (rcases canonical_bool h1 hv1 with ⟨a, rfl⟩
              rcases canonical_bool h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
+             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
           | (rcases canonical_str h1 hv1 with ⟨a, rfl⟩
              rcases canonical_str h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, none, .binVal (l' := _) rfl⟩))
-        · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binRightTrap (by decide) (by decide) hv1⟩)
+             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
+        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
         · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', sp, .binRight (by decide) (by decide) hv1 hs2⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .binLeftTrap⟩)
+        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binLeftTrap⟩)
     · exact Or.inr (Or.inl (.binLeft hblk1))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .binLeft hs1⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .binLeft hs1⟩)
   | un hop h1 =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', eff, hs1⟩
     · cases hop with
       | not =>
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .bool (!b)) rfl⟩)
+        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .bool (!b)) rfl⟩)
       | neg =>
         rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .int (-n)) rfl⟩)
+        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .int (-n)) rfl⟩)
       | bitNot =>
         rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, none, .unVal (l' := .int (~~~n)) rfl⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .unTrap⟩)
+        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .int (~~~n)) rfl⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .unTrap⟩)
     · exact Or.inr (Or.inl (.un hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .unStep hs1⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .unStep hs1⟩)
   | let_ h1 _ =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', sp, hs1⟩
-    · exact Or.inr (Or.inr ⟨_, σ, none, .letVal hv1⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .letTrap⟩)
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', eff, hs1⟩
+    · exact Or.inr (Or.inr ⟨_, σ, .none, .letVal hv1⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .letTrap⟩)
     · exact Or.inr (Or.inl (.let_ hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .letStep hs1⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .letStep hs1⟩)
   | if_ hc _ _ =>
-    rcases progress hΦ hc hσ htasks with (hvc | ⟨t, rfl⟩) | hblk | ⟨c', σ', sp, hsc⟩
+    rcases progress hΦ hc hσ hpool with (hvc | ⟨t, rfl⟩) | hblk | ⟨c', σ', eff, hsc⟩
     · rcases canonical_bool hc hvc with ⟨b, rfl⟩
       cases b
-      · exact Or.inr (Or.inr ⟨_, σ, none, .ifFalse⟩)
-      · exact Or.inr (Or.inr ⟨_, σ, none, .ifTrue⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .ifTrap⟩)
+      · exact Or.inr (Or.inr ⟨_, σ, .none, .ifFalse⟩)
+      · exact Or.inr (Or.inr ⟨_, σ, .none, .ifTrue⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .ifTrap⟩)
     · exact Or.inr (Or.inl (.if_ hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .ifStep hsc⟩)
-  | while_ _ _ => exact Or.inr (Or.inr ⟨_, σ, none, .whileUnfold⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .ifStep hsc⟩)
+  | while_ _ _ => exact Or.inr (Or.inr ⟨_, σ, .none, .whileUnfold⟩)
   | @match_ _ scrut arms _ _ hs _ =>
-    rcases progress hΦ hs hσ htasks with (hvs | ⟨t, rfl⟩) | hblk | ⟨s', σ', sp, hss⟩
+    rcases progress hΦ hs hσ hpool with (hvs | ⟨t, rfl⟩) | hblk | ⟨s', σ', eff, hss⟩
     · cases arms with
-      | nil => exact Or.inr (Or.inr ⟨.trap .matchFailure, σ, none, .matchEmpty hvs⟩)
+      | nil => exact Or.inr (Or.inr ⟨.trap .matchFailure, σ, .none, .matchEmpty hvs⟩)
       | cons arm rest =>
         cases arm with
         | mk p body =>
           cases hm : matchPat p scrut with
-          | none => exact Or.inr (Or.inr ⟨_, σ, none, .matchMiss hvs hm⟩)
-          | some env => exact Or.inr (Or.inr ⟨_, σ, none, .matchHit hvs hm⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .matchScrutTrap⟩)
+          | none => exact Or.inr (Or.inr ⟨_, σ, .none, .matchMiss hvs hm⟩)
+          | some env => exact Or.inr (Or.inr ⟨_, σ, .none, .matchHit hvs hm⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .matchScrutTrap⟩)
     · exact Or.inr (Or.inl (.match_ hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .matchScrut hss⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .matchScrut hss⟩)
   | makeData _ hts =>
-    rcases progressList hΦ hts hσ htasks with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', sp, hstep⟩
+    rcases progressList hΦ hts hσ hpool with hvals | ⟨t, htrap⟩ | hblk | ⟨es', σ', eff, hstep⟩
     · exact Or.inl (Or.inl (.makeData _ _ hvals))
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .makeDataTrap htrap⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .makeDataTrap htrap⟩)
     · exact Or.inr (Or.inl (.makeData hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .makeDataStep hstep⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .makeDataStep hstep⟩)
   | getTag he =>
-    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
+    rcases progress hΦ he hσ hpool with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', eff, hse⟩
     · rcases canonical_adt he hv with ⟨tag, vs, rfl, hvs⟩
-      exact Or.inr (Or.inr ⟨_, σ, none, .getTagVal hvs⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .getTagTrap⟩)
+      exact Or.inr (Or.inr ⟨_, σ, .none, .getTagVal hvs⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .getTagTrap⟩)
     · exact Or.inr (Or.inl (.getTag hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .getTagStep hse⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .getTagStep hse⟩)
   | cellNew he =>
-    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
-    · exact Or.inr (Or.inr ⟨_, _, none, .cellNewVal hv⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellNewTrap⟩)
+    rcases progress hΦ he hσ hpool with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', eff, hse⟩
+    · exact Or.inr (Or.inr ⟨_, _, .none, .cellNewVal hv⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .cellNewTrap⟩)
     · exact Or.inr (Or.inl (.cellNew hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellNewStep hse⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .cellNewStep hse⟩)
   | cellGet he _ =>
-    rcases progress hΦ he hσ htasks with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
+    rcases progress hΦ he hσ hpool with (hv | ⟨t, rfl⟩) | hblk | ⟨e', σ', eff, hse⟩
     · rcases canonical_cell he hv with ⟨l, rfl, hl⟩
       rcases hσ.2 l _ hl with ⟨v, hvσ, _, _⟩
-      exact Or.inr (Or.inr ⟨v, σ, none, .cellGetVal hvσ⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellGetTrap⟩)
+      exact Or.inr (Or.inr ⟨v, σ, .none, .cellGetVal hvσ⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .cellGetTrap⟩)
     · exact Or.inr (Or.inl (.cellGet hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellGetStep hse⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .cellGetStep hse⟩)
   | cellSet h1 h2 =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
-    · rcases progress hΦ h2 hσ htasks with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', sp, hs2⟩
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', eff, hs1⟩
+    · rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
       · rcases canonical_cell h1 hv1 with ⟨l, rfl, hl⟩
         have hltΨ : l < Ψ.length := lt_length_of_getElem?_eq_some hl
         have hltσ : l < σ.length := hσ.1 ▸ hltΨ
-        exact Or.inr (Or.inr ⟨_, _, none, .cellSetVal hltσ hv2⟩)
-      · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellSetRightTrap hv1⟩)
+        exact Or.inr (Or.inr ⟨_, _, .none, .cellSetVal hltσ hv2⟩)
+      · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .cellSetRightTrap hv1⟩)
       · exact Or.inr (Or.inl (.cellSetRight hv1 hblk2))
-      · exact Or.inr (Or.inr ⟨_, σ', sp, .cellSetRight hv1 hs2⟩)
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .cellSetLeftTrap⟩)
+      · exact Or.inr (Or.inr ⟨_, σ', eff, .cellSetRight hv1 hs2⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .cellSetLeftTrap⟩)
     · exact Or.inr (Or.inl (.cellSetLeft hblk1))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .cellSetLeft hs1⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .cellSetLeft hs1⟩)
   | spawn hfn _ _ =>
-    rcases progress hΦ hfn hσ htasks with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', sp, hsfn⟩
+    rcases progress hΦ hfn hσ hpool with (hvfn | ⟨t, rfl⟩) | hblk | ⟨fn', σ', eff, hsfn⟩
     · rcases canonical_fn hfn hvfn with ⟨_, ps, _, body, rfl, hmSub, hpsSub, _⟩
       cases hmSub with
       | refl =>
         cases hps : ps with
-        | nil => exact Or.inr (Or.inr ⟨_, σ, some body, .spawnBeta⟩)
+        | nil => exact Or.inr (Or.inr ⟨_, σ, .spawnTask body, .spawnBeta⟩)
         | cons _ _ => rw [hps] at hpsSub; cases hpsSub
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .spawnTrap⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .spawnTrap⟩)
     · exact Or.inr (Or.inl (.spawn hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .spawnStep hsfn⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .spawnStep hsfn⟩)
   | await he _ _ =>
-    rcases progress hΦ he hσ htasks with (hve | ⟨t, rfl⟩) | hblk | ⟨e', σ', sp, hse⟩
+    rcases progress hΦ he hσ hpool with (hve | ⟨t, rfl⟩) | hblk | ⟨e', σ', eff, hse⟩
     · rcases canonical_task he hve with ⟨tid, τ0, rfl, htid, _, _⟩
-      rcases htasks.2 tid τ0 htid with ⟨et, het, _⟩
-      by_cases hterm : IsTerminal et
-      · rcases hterm with hval | ⟨tr, rfl⟩
-        · exact Or.inr (Or.inr ⟨et, σ, none, .awaitVal het hval⟩)
-        · exact Or.inr (Or.inr ⟨.trap tr, σ, none, .awaitTaskTrap het⟩)
-      · exact Or.inr (Or.inl (.awaitWait het hterm))
-    · exact Or.inr (Or.inr ⟨.trap t, σ, none, .awaitTrap⟩)
+      rcases hpool.tasks_ty tid τ0 htid with ⟨_, te, hte, _⟩
+      cases te with
+      | pendingReply => exact Or.inr (Or.inl (.awaitPending hte))
+      | running et =>
+        by_cases hterm : IsTerminal et
+        · rcases hterm with hval | ⟨tr, rfl⟩
+          · exact Or.inr (Or.inr ⟨et, σ, .none, .awaitVal hte hval⟩)
+          · exact Or.inr (Or.inr ⟨.trap tr, σ, .none, .awaitTaskTrap hte⟩)
+        · exact Or.inr (Or.inl (.awaitRunning hte hterm))
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .awaitTrap⟩)
     · exact Or.inr (Or.inl (.awaitStep hblk))
-    · exact Or.inr (Or.inr ⟨_, σ', sp, .awaitStep hse⟩)
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .awaitStep hse⟩)
+  | concPrim hop hargs _ =>
+    rcases progressList hΦ hargs hσ hpool with hvals | ⟨t, htrap⟩ | hblk | ⟨args', σ', eff, hsargs⟩
+    · cases hop with
+      | mvarNew _ =>
+        cases hargs with
+        | cons _ hnil =>
+          cases hnil
+          exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.mvarNew (hvals _ (List.mem_cons_self ..)))⟩)
+      | @mvarEmpty τm _ =>
+        cases hargs
+        exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.mvarEmpty τm)⟩)
+      | mvarTake _ =>
+        cases hargs with
+        | cons h1 hnil =>
+          cases hnil
+          rcases canonical_mvar h1 (hvals _ (List.mem_cons_self ..)) with ⟨mid, rfl, hmid, _⟩
+          rcases hpool.mvars_ty mid _ hmid with ⟨_, slot, hslot, _⟩
+          cases slot with
+          | none => exact Or.inr (Or.inl (.mvarTakeWait hslot))
+          | some v => exact Or.inr (Or.inr ⟨v, σ, _, .concPrimVal (.mvarTake hslot)⟩)
+      | mvarPut _ =>
+        cases hargs with
+        | cons h1 hrest =>
+          cases hrest with
+          | cons h2 hnil =>
+            cases hnil
+            have hv1 := hvals _ (List.mem_cons_self ..)
+            have hv2 := hvals _ (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+            rcases canonical_mvar h1 hv1 with ⟨mid, rfl, hmid, _⟩
+            rcases hpool.mvars_ty mid _ hmid with ⟨_, slot, hslot, _⟩
+            cases slot with
+            | none => exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.mvarPut hslot hv2)⟩)
+            | some old => exact Or.inr (Or.inl (.mvarPutWait hslot hv2))
+      | @chanNew τc _ =>
+        cases hargs with
+        | cons h1 hnil =>
+          cases hnil
+          rcases canonical_int h1 (hvals _ (List.mem_cons_self ..)) with ⟨n, rfl⟩
+          exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanNew τc n)⟩)
+      | chanSend _ =>
+        cases hargs with
+        | cons h1 hrest =>
+          cases hrest with
+          | cons h2 hnil =>
+            cases hnil
+            have hv1 := hvals _ (List.mem_cons_self ..)
+            have hv2 := hvals _ (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+            rcases canonical_chan h1 hv1 with ⟨cid, rfl, hcid, _⟩
+            rcases hpool.chans_ty cid _ hcid with ⟨_, ch, hch, _⟩
+            cases hcl : ch.closed
+            · by_cases hroom : ch.cap = 0 ∨ ch.buf.length < ch.cap
+              · exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanSendOpen hch hcl hroom hv2)⟩)
+              · exact Or.inr (Or.inl (.chanSendWait hch hcl hroom hv2))
+            · exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanSendClosed hch hcl hv2)⟩)
+      | chanRecv optAdt =>
+        cases hargs with
+        | cons h1 hnil =>
+          cases hnil
+          rcases canonical_chan h1 (hvals _ (List.mem_cons_self ..)) with ⟨cid, rfl, hcid, _⟩
+          rcases hpool.chans_ty cid _ hcid with ⟨_, ch, hch, _⟩
+          cases hbuf : ch.buf with
+          | cons v rest =>
+            exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanRecvVal hch hbuf)⟩)
+          | nil =>
+            cases hcl : ch.closed
+            · exact Or.inr (Or.inl (.chanRecvWait hch hbuf hcl))
+            · exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanRecvClosed hch hbuf hcl)⟩)
+      | chanClose =>
+        cases hargs with
+        | cons h1 hnil =>
+          cases hnil
+          rcases canonical_chan h1 (hvals _ (List.mem_cons_self ..)) with ⟨cid, rfl, hcid, _⟩
+          rcases hpool.chans_ty cid _ hcid with ⟨_, ch, hch, _⟩
+          exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.chanClose hch)⟩)
+      | actorSpawn =>
+        cases hargs with
+        | cons _ hnil =>
+          cases hnil
+          exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.actorSpawn (hvals _ (List.mem_cons_self ..)))⟩)
+      | actorCall _ =>
+        cases hargs with
+        | cons h1 hrest =>
+          cases hrest with
+          | cons _ hnil =>
+            cases hnil
+            have hv1 := hvals _ (List.mem_cons_self ..)
+            have hv2 := hvals _ (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+            rcases canonical_actor h1 hv1 with ⟨aid, rfl, haid⟩
+            rcases hpool.actors_ty aid _ haid with ⟨act, hact, _, _⟩
+            exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.actorCall hact hv2)⟩)
+      | actorSend =>
+        cases hargs with
+        | cons h1 hrest =>
+          cases hrest with
+          | cons _ hnil =>
+            cases hnil
+            have hv1 := hvals _ (List.mem_cons_self ..)
+            have hv2 := hvals _ (List.mem_cons_of_mem _ (List.mem_cons_self ..))
+            rcases canonical_actor h1 hv1 with ⟨aid, rfl, haid⟩
+            rcases hpool.actors_ty aid _ haid with ⟨act, hact, _, _⟩
+            exact Or.inr (Or.inr ⟨_, σ, _, .concPrimVal (.actorSend hact hv2)⟩)
+    · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .concPrimTrap htrap⟩)
+    · exact Or.inr (Or.inl (.concPrimArgs hblk))
+    · exact Or.inr (Or.inr ⟨_, σ', eff, .concPrimArgs hsargs⟩)
   | trap t _ => exact Or.inl (Or.inr ⟨t, rfl⟩)
 termination_by sizeOf e
 
 theorem progressList {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
-    {tasks : List Expr} {σ : Store} {es : List Expr} {τs : List Ty}
+    {pool : ConcPool} {σ : Store} {es : List Expr} {τs : List Ty}
     (hΦ : FunEnvTyped Δ Φ)
     (hts : HasTypes Δ Φ Ψ Θ emptyCtx es τs)
     (hσ : StoreTyped Δ Φ Ψ Θ σ)
-    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    (hpool : PoolTyped Δ Φ Ψ Θ pool) :
     (∀ e ∈ es, IsValue e) ∨
     (∃ t, ListFirstTrap es t) ∨
-    BlockedOnTaskList tasks es ∨
-    (∃ es' σ' sp, StepList Δ Φ tasks es σ es' σ' sp) := by
+    BlockedOnTaskList pool es ∨
+    (∃ es' σ' eff, StepList Δ Φ pool es σ es' σ' eff) := by
   cases hts with
   | nil => exact Or.inl (fun _ h => by cases h)
   | cons h1 hrest =>
-    rcases progress hΦ h1 hσ htasks with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', sp, hs1⟩
-    · rcases progressList hΦ hrest hσ htasks with hvals | ⟨t, htrap⟩ | hblkr | ⟨es', σ', sp, hss⟩
+    rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', eff, hs1⟩
+    · rcases progressList hΦ hrest hσ hpool with hvals | ⟨t, htrap⟩ | hblkr | ⟨es', σ', eff, hss⟩
       · exact Or.inl (fun u hu => by
           rcases List.mem_cons.mp hu with rfl | hu'
           · exact hv1
           · exact hvals u hu')
       · exact Or.inr (Or.inl ⟨t, .tail hv1 htrap⟩)
       · exact Or.inr (Or.inr (Or.inl (.tail hv1 hblkr)))
-      · exact Or.inr (Or.inr (Or.inr ⟨_, σ', sp, .tail hv1 hss⟩))
+      · exact Or.inr (Or.inr (Or.inr ⟨_, σ', eff, .tail hv1 hss⟩))
     · exact Or.inr (Or.inl ⟨t, .head t _⟩)
     · exact Or.inr (Or.inr (Or.inl (.head hblk1)))
-    · exact Or.inr (Or.inr (Or.inr ⟨_, σ', sp, .head hs1⟩))
+    · exact Or.inr (Or.inr (Or.inr ⟨_, σ', eff, .head hs1⟩))
 termination_by sizeOf es
 end
 
 /-! ## Preservation Theorem (Subject Reduction) -/
 
-/-- Characterization of task-typing evolution across a single `Step`. -/
-def SpawnTyped (Δ : AdtEnv) (Φ : FunEnv) (Ψ' : StoreTy) (Θ Θ' : TaskTy) :
-    Option Expr → Prop
-  | none => Θ' = Θ
-  | some body =>
-    ∃ τsp, Θ' = Θ ++ [τsp] ∧ IsSend Δ τsp ∧ HasType Δ Φ Ψ' Θ' emptyCtx body τsp
+/-- Characterization of concurrent pool typing evolution across a single `Step`. -/
+def EffTyped (Δ : AdtEnv) (Φ : FunEnv) (Ψ' : StoreTy) (Θ Θ' : TaskTy) :
+    ConcEff → Prop
+  | .none => Θ' = Θ
+  | .spawnTask body =>
+    ∃ τsp, Θ' = { Θ with tasks := Θ.tasks ++ [τsp] } ∧
+      IsSend Δ τsp ∧ HasType Δ Φ Ψ' Θ' emptyCtx body τsp
+  | .allocMVar init =>
+    ∃ τm, Θ' = { Θ with mvars := Θ.mvars ++ [τm] } ∧
+      IsSend Δ τm ∧ (∀ v, init = some v → IsValue v ∧ HasType Δ Φ Ψ' Θ' emptyCtx v τm)
+  | .takeMVar _ => Θ' = Θ
+  | .putMVar mid val =>
+    ∃ τm, Θ' = Θ ∧ Θ.mvars[mid]? = some τm ∧
+      IsSend Δ τm ∧ IsValue val ∧ HasType Δ Φ Ψ' Θ' emptyCtx val τm
+  | .allocChan _ =>
+    ∃ τc, Θ' = { Θ with chans := Θ.chans ++ [τc] } ∧ IsSend Δ τc
+  | .sendChan cid val =>
+    ∃ τc, Θ' = Θ ∧ Θ.chans[cid]? = some τc ∧
+      IsSend Δ τc ∧ IsValue val ∧ HasType Δ Φ Ψ' Θ' emptyCtx val τc
+  | .recvChan _ => Θ' = Θ
+  | .closeChan _ => Θ' = Θ
+  | .spawnActor initExpr =>
+    ∃ σ_ty, Θ' = { Θ with actors := Θ.actors ++ [σ_ty] } ∧
+      HasType Δ Φ Ψ' Θ' emptyCtx initExpr σ_ty
+  | .callActor aid handler =>
+    ∃ σ_ty r_ty, Θ' = { Θ with tasks := Θ.tasks ++ [r_ty] } ∧
+      Θ.actors[aid]? = some σ_ty ∧ IsSend Δ r_ty ∧ IsValue handler ∧
+      HasType Δ Φ Ψ' Θ' emptyCtx handler (.fn .shared [σ_ty] r_ty)
+  | .sendActor aid handler =>
+    ∃ σ_ty, Θ' = Θ ∧ Θ.actors[aid]? = some σ_ty ∧ IsValue handler ∧
+      HasType Δ Φ Ψ' Θ' emptyCtx handler (.fn .shared [σ_ty] .void)
 
-theorem spawnTyped_extends {Δ : AdtEnv} {Φ : FunEnv} {Ψ' : StoreTy} {Θ Θ' : TaskTy}
-    {sp : Option Expr} (hsp : SpawnTyped Δ Φ Ψ' Θ Θ' sp) : TaskExtends Θ Θ' := by
-  cases sp with
-  | none => simp only [SpawnTyped] at hsp; subst hsp; exact TaskExtends.refl _
-  | some _ =>
-    rcases hsp with ⟨τsp, rfl, _, _⟩
-    exact TaskExtends.append Θ τsp
+theorem effTyped_extends {Δ : AdtEnv} {Φ : FunEnv} {Ψ' : StoreTy} {Θ Θ' : TaskTy}
+    {eff : ConcEff} (heff : EffTyped Δ Φ Ψ' Θ Θ' eff) : TaskExtends Θ Θ' := by
+  cases eff with
+  | none => simp only [EffTyped] at heff; subst heff; exact TaskExtends.refl _
+  | spawnTask _ => rcases heff with ⟨τsp, rfl, _, _⟩; exact TaskExtends.appendTask Θ τsp
+  | allocMVar _ => rcases heff with ⟨τm, rfl, _, _⟩; exact TaskExtends.appendMVar Θ τm
+  | takeMVar _ => simp only [EffTyped] at heff; subst heff; exact TaskExtends.refl _
+  | putMVar _ _ => rcases heff with ⟨_, rfl, _, _, _, _⟩; exact TaskExtends.refl _
+  | allocChan _ => rcases heff with ⟨τc, rfl, _⟩; exact TaskExtends.appendChan Θ τc
+  | sendChan _ _ => rcases heff with ⟨_, rfl, _, _, _, _⟩; exact TaskExtends.refl _
+  | recvChan _ => simp only [EffTyped] at heff; subst heff; exact TaskExtends.refl _
+  | closeChan _ => simp only [EffTyped] at heff; subst heff; exact TaskExtends.refl _
+  | spawnActor _ => rcases heff with ⟨σ_ty, rfl, _⟩; exact TaskExtends.appendActor Θ σ_ty
+  | callActor _ _ => rcases heff with ⟨_, r_ty, rfl, _, _, _, _⟩; exact TaskExtends.appendTask Θ r_ty
+  | sendActor _ _ => rcases heff with ⟨_, rfl, _, _, _⟩; exact TaskExtends.refl _
 
 mutual
 theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
-    {Ψ : StoreTy} {Θ : TaskTy} {tasks : List Expr}
-    {e : Expr} {σ : Store} {e' : Expr} {σ' : Store} {sp : Option Expr} {τ : Ty}
+    {Ψ : StoreTy} {Θ : TaskTy} {pool : ConcPool}
+    {e : Expr} {σ : Store} {e' : Expr} {σ' : Store} {eff : ConcEff} {τ : Ty}
     (ht : HasType Δ Φ Ψ Θ emptyCtx e τ)
-    (hstep : Step Δ Φ tasks e σ e' σ' sp)
+    (hstep : Step Δ Φ pool e σ e' σ' eff)
     (hσ : StoreTyped Δ Φ Ψ Θ σ)
-    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    (hpool : PoolTyped Δ Φ Ψ Θ pool) :
     ∃ Ψ' Θ',
       StoreExtends Ψ Ψ' ∧
-      SpawnTyped Δ Φ Ψ' Θ Θ' sp ∧
+      EffTyped Δ Φ Ψ' Θ Θ' eff ∧
       HasType Δ Φ Ψ' Θ' emptyCtx e' τ ∧
       StoreTyped Δ Φ Ψ' Θ' σ' := by
   cases hstep with
   | tupleStep hs =>
     cases ht with
     | tuple hts =>
-      rcases preservationList hΦ hts hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hts', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .tuple hts', hσ'⟩
+      rcases preservationList hΦ hts hs hσ hpool with ⟨Ψ', Θ', hext, heff, hts', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .tuple hts', hσ'⟩
   | tupleTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | blockEmpty =>
     cases ht
@@ -1873,9 +2138,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | blockConsStep hs =>
     cases ht with
     | blockCons h1 h2 =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .blockCons h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .blockCons h1' (typing_env_weaken hext (effTyped_extends heff) h2), hσ'⟩
   | blockConsVal _ =>
     cases ht with
     | blockCons _ h2 => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, h2, hσ⟩
@@ -1883,16 +2148,16 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | applyFn hs =>
     cases ht with
     | apply hfn hargs hr =>
-      rcases preservation hΦ hfn hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hfn', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .apply hfn' (typingList_env_weaken hext (spawnTyped_extends hsp) hargs) hr, hσ'⟩
+      rcases preservation hΦ hfn hs hσ hpool with ⟨Ψ', Θ', hext, heff, hfn', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .apply hfn' (typingList_env_weaken hext (effTyped_extends heff) hargs) hr, hσ'⟩
   | applyFnTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyArgs _ hs =>
     cases ht with
     | apply hfn hargs hr =>
-      rcases preservationList hΦ hargs hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hargs', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .apply (typing_env_weaken hext (spawnTyped_extends hsp) hfn) hargs' hr, hσ'⟩
+      rcases preservationList hΦ hargs hs hσ hpool with ⟨Ψ', Θ', hext, heff, hargs', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .apply (typing_env_weaken hext (effTyped_extends heff) hfn) hargs' hr, hσ'⟩
   | applyArgsTrap _ _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyBeta hvals _ =>
     cases ht with
@@ -1906,25 +2171,23 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | applyDirArgs hs =>
     cases ht with
     | applyDir hf hargs hr =>
-      rcases preservationList hΦ hargs hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hargs', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .applyDir hf hargs' hr, hσ'⟩
+      rcases preservationList hΦ hargs hs hσ hpool with ⟨Ψ', Θ', hext, heff, hargs', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .applyDir hf hargs' hr, hσ'⟩
   | applyDirTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | applyDirBeta hf' hvals _ =>
     cases ht with
     | applyDir hf hargs hr =>
       rw [hf] at hf'; cases hf'
       have hbody0 := hΦ _ _ hf
-      have hextS : StoreExtends [] Ψ := ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
-      have hextT : TaskExtends [] Θ := ⟨Nat.zero_le _, fun _ _ h => by simp at h⟩
-      have hbody := typing_env_weaken hextS hextT hbody0
+      have hbody := typing_env_weaken (ListExtends.empty Ψ) (TaskExtends.empty Θ) hbody0
       have hmatch := zipParams_match hargs hvals
       exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
         typing_sub hr (substMany_typing hmatch hbody), hσ⟩
   | unStep hs =>
     cases ht with
     | un hop h1 =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .un hop h1', hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .un hop h1', hσ'⟩
   | unTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | unVal he =>
     cases ht with
@@ -1934,9 +2197,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | binLeft hs =>
     cases ht with
     | bin hop h1 h2 =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .bin hop h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .bin hop h1' (typing_env_weaken hext (effTyped_extends heff) h2), hσ'⟩
   | binLeftTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | binAndFalse =>
     cases ht with
@@ -1953,9 +2216,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | binRight _ _ _ hs =>
     cases ht with
     | bin hop h1 h2 =>
-      rcases preservation hΦ h2 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h2', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .bin hop (typing_env_weaken hext (spawnTyped_extends hsp) h1) h2', hσ'⟩
+      rcases preservation hΦ h2 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h2', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .bin hop (typing_env_weaken hext (effTyped_extends heff) h1) h2', hσ'⟩
   | binRightTrap _ _ _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | binVal he =>
     cases ht with
@@ -1969,9 +2232,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | letStep hs =>
     cases ht with
     | let_ h1 h2 =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .let_ h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .let_ h1' (typing_env_weaken hext (effTyped_extends heff) h2), hσ'⟩
   | letTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | letVal hv1 =>
     cases ht with
@@ -1980,9 +2243,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | ifStep hs =>
     cases ht with
     | if_ hc h1 h2 =>
-      rcases preservation hΦ hc hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hc', hσ'⟩
-      have htk := spawnTyped_extends hsp
-      exact ⟨Ψ', Θ', hext, hsp,
+      rcases preservation hΦ hc hs hσ hpool with ⟨Ψ', Θ', hext, heff, hc', hσ'⟩
+      have htk := effTyped_extends heff
+      exact ⟨Ψ', Θ', hext, heff,
         .if_ hc' (typing_env_weaken hext htk h1) (typing_env_weaken hext htk h2), hσ'⟩
   | ifTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | ifTrue =>
@@ -1999,9 +2262,9 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | matchScrut hs =>
     cases ht with
     | match_ hscr harms =>
-      rcases preservation hΦ hscr hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hscr', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .match_ hscr' (typingArms_env_weaken hext (spawnTyped_extends hsp) harms), hσ'⟩
+      rcases preservation hΦ hscr hs hσ hpool with ⟨Ψ', Θ', hext, heff, hscr', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .match_ hscr' (typingArms_env_weaken hext (effTyped_extends heff) harms), hσ'⟩
   | matchScrutTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | matchEmpty _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap .matchFailure τ, hσ⟩
   | matchHit hv hm =>
@@ -2019,14 +2282,14 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | makeDataStep hs =>
     cases ht with
     | makeData hlv hts =>
-      rcases preservationList hΦ hts hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hts', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .makeData hlv hts', hσ'⟩
+      rcases preservationList hΦ hts hs hσ hpool with ⟨Ψ', Θ', hext, heff, hts', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .makeData hlv hts', hσ'⟩
   | makeDataTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | getTagStep hs =>
     cases ht with
     | getTag he =>
-      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .getTag he', hσ'⟩
+      rcases preservation hΦ he hs hσ hpool with ⟨Ψ', Θ', hext, heff, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .getTag he', hσ'⟩
   | getTagTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | getTagVal _ =>
     cases ht with
@@ -2034,8 +2297,8 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | cellNewStep hs =>
     cases ht with
     | cellNew he =>
-      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .cellNew he', hσ'⟩
+      rcases preservation hΦ he hs hσ hpool with ⟨Ψ', Θ', hext, heff, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .cellNew he', hσ'⟩
   | cellNewTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellNewVal hv =>
     cases ht with
@@ -2046,8 +2309,8 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | cellGetStep hs =>
     cases ht with
     | cellGet he hsub =>
-      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .cellGet he' hsub, hσ'⟩
+      rcases preservation hΦ he hs hσ hpool with ⟨Ψ', Θ', hext, heff, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .cellGet he' hsub, hσ'⟩
   | cellGetTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellGetVal hvσ =>
     cases ht with
@@ -2060,16 +2323,16 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | cellSetLeft hs =>
     cases ht with
     | cellSet h1 h2 =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .cellSet h1' (typing_env_weaken hext (spawnTyped_extends hsp) h2), hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .cellSet h1' (typing_env_weaken hext (effTyped_extends heff) h2), hσ'⟩
   | cellSetLeftTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellSetRight _ hs =>
     cases ht with
     | cellSet h1 h2 =>
-      rcases preservation hΦ h2 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h2', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .cellSet (typing_env_weaken hext (spawnTyped_extends hsp) h1) h2', hσ'⟩
+      rcases preservation hΦ h2 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h2', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .cellSet (typing_env_weaken hext (effTyped_extends heff) h1) h2', hσ'⟩
   | cellSetRightTrap _ => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | cellSetVal _ hv =>
     cases ht with
@@ -2080,91 +2343,272 @@ theorem preservation {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
   | spawnStep hs =>
     cases ht with
     | spawn hfn hsend hsub =>
-      rcases preservation hΦ hfn hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hfn', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .spawn hfn' hsend hsub, hσ'⟩
+      rcases preservation hΦ hfn hs hσ hpool with ⟨Ψ', Θ', hext, heff, hfn', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .spawn hfn' hsend hsub, hσ'⟩
   | spawnTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | spawnBeta =>
     cases ht with
     | @spawn _ _ τ0 _ hfn hsend hsub =>
       cases hfn with
       | lam _ _ hrSub hbody _ =>
+        let Θ' : TaskTy := { Θ with tasks := Θ.tasks ++ [τ0] }
         have hbodyτ : HasType Δ Φ Ψ Θ emptyCtx _ τ0 := typing_sub hrSub hbody
-        have htkExt : TaskExtends Θ (Θ ++ [τ0]) := TaskExtends.append Θ τ0
-        have hbody' : HasType Δ Φ Ψ (Θ ++ [τ0]) emptyCtx _ τ0 :=
+        have htkExt : TaskExtends Θ Θ' := TaskExtends.appendTask Θ τ0
+        have hbody' : HasType Δ Φ Ψ Θ' emptyCtx _ τ0 :=
           typing_env_weaken (StoreExtends.refl Ψ) htkExt hbodyτ
-        have htid : (Θ ++ [τ0])[tasks.length]? = some τ0 := by rw [htasks.1]; simp
-        exact ⟨Ψ, Θ ++ [τ0], StoreExtends.refl Ψ,
+        have htid : Θ'.tasks[pool.tasks.length]? = some τ0 := by
+          simp [Θ', hpool.tasks_len]
+        exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
           ⟨τ0, rfl, hsend, hbody'⟩,
           .taskRef htid hsend hsub,
           store_typed_task_weaken htkExt hσ⟩
   | awaitStep hs =>
     cases ht with
     | await he hsend hsub =>
-      rcases preservation hΦ he hs hσ htasks with ⟨Ψ', Θ', hext, hsp, he', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp, .await he' hsend hsub, hσ'⟩
+      rcases preservation hΦ he hs hσ hpool with ⟨Ψ', Θ', hext, heff, he', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .await he' hsend hsub, hσ'⟩
   | awaitTrap => exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
   | awaitVal het _ =>
     cases ht with
     | await href _ hsub =>
       cases href with
       | taskRef htid _ hs0 =>
-        rcases htasks.2 _ _ htid with ⟨et', het', hetTy⟩
-        rw [het] at het'; cases het'
+        rcases hpool.tasks_ty _ _ htid with ⟨_, te, hte, hrun⟩
+        rw [het] at hte; cases hte
         exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
-          typing_sub (TySub.trans hs0 hsub) hetTy, hσ⟩
+          typing_sub (TySub.trans hs0 hsub) (hrun _ rfl), hσ⟩
   | awaitTaskTrap _ =>
     exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | concPrimArgs hs =>
+    cases ht with
+    | concPrim hop hargs hr =>
+      rcases preservationList hΦ hargs hs hσ hpool with ⟨Ψ', Θ', hext, heff, hargs', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff, .concPrim hop hargs' hr, hσ'⟩
+  | concPrimTrap _ =>
+    exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, .trap _ τ, hσ⟩
+  | concPrimVal hprim =>
+    cases ht with
+    | concPrim hop hargs hr =>
+      cases hprim with
+      | mvarNew hv =>
+        cases hop with
+        | @mvarNew τm hsend =>
+          cases hargs with
+          | cons hvTy hnil =>
+            cases hnil
+            let Θ' : TaskTy := { Θ with mvars := Θ.mvars ++ [τm] }
+            have htkExt : TaskExtends Θ Θ' := TaskExtends.appendMVar Θ τm
+            have hm : Θ'.mvars[pool.mvars.length]? = some τm := by
+              simp [Θ', hpool.mvars_len]
+            exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
+              ⟨τm, rfl, hsend, fun u hu => by
+                cases hu
+                exact ⟨hv, typing_env_weaken (StoreExtends.refl Ψ) htkExt hvTy⟩⟩,
+              typing_sub hr (.syncRef (.mvar hm hsend)),
+              store_typed_task_weaken htkExt hσ⟩
+      | mvarEmpty τm =>
+        cases hop with
+        | mvarEmpty hsend =>
+          let Θ' : TaskTy := { Θ with mvars := Θ.mvars ++ [τm] }
+          have htkExt : TaskExtends Θ Θ' := TaskExtends.appendMVar Θ τm
+          have hm : Θ'.mvars[pool.mvars.length]? = some τm := by
+            simp [Θ', hpool.mvars_len]
+          exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
+            ⟨τm, rfl, hsend, fun _ hu => nomatch hu⟩,
+            typing_sub hr (.syncRef (.mvar hm hsend)),
+            store_typed_task_weaken htkExt hσ⟩
+      | mvarTake hslot =>
+        cases hop with
+        | mvarTake _ =>
+          cases hargs with
+          | cons href hnil =>
+            cases hnil
+            cases href with
+            | syncRef hsr =>
+              cases hsr with
+              | mvar hmid _ =>
+                rcases hpool.mvars_ty _ _ hmid with ⟨_, slot, hslot', hval⟩
+                rw [hslot] at hslot'; cases hslot'
+                exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, typing_sub hr (hval _ rfl).2, hσ⟩
+      | mvarPut _ hv =>
+        cases hop with
+        | @mvarPut τm hsend =>
+          cases hargs with
+          | cons href hrest =>
+            cases hrest with
+            | cons hvTy hnil =>
+              cases hnil
+              cases href with
+              | syncRef hsr =>
+                cases hsr with
+                | mvar hmid _ =>
+                  exact ⟨Ψ, Θ, StoreExtends.refl Ψ,
+                    ⟨τm, rfl, hmid, hsend, hv, hvTy⟩,
+                    typing_sub hr (.lit .unit), hσ⟩
+      | chanNew τc _ =>
+        cases hop with
+        | chanNew hsend =>
+          let Θ' : TaskTy := { Θ with chans := Θ.chans ++ [τc] }
+          have htkExt : TaskExtends Θ Θ' := TaskExtends.appendChan Θ τc
+          have hc : Θ'.chans[pool.chans.length]? = some τc := by
+            simp [Θ', hpool.chans_len]
+          exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
+            ⟨τc, rfl, hsend⟩,
+            typing_sub hr (.syncRef (.chan hc hsend)),
+            store_typed_task_weaken htkExt hσ⟩
+      | chanSendClosed _ _ _ =>
+        cases hop
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, typing_sub hr (.lit (.bool false)), hσ⟩
+      | chanSendOpen _ _ _ hv =>
+        cases hop with
+        | @chanSend τc hsend =>
+          cases hargs with
+          | cons href hrest =>
+            cases hrest with
+            | cons hvTy hnil =>
+              cases hnil
+              cases href with
+              | syncRef hsr =>
+                cases hsr with
+                | chan hcid _ =>
+                  exact ⟨Ψ, Θ, StoreExtends.refl Ψ,
+                    ⟨τc, rfl, hcid, hsend, hv, hvTy⟩,
+                    typing_sub hr (.lit (.bool true)), hσ⟩
+      | chanRecvVal hch hbuf =>
+        cases hop with
+        | chanRecv _ _ hlv1 =>
+          cases hargs with
+          | cons href hnil =>
+            cases hnil
+            cases href with
+            | syncRef hsr =>
+              cases hsr with
+              | chan hcid _ =>
+                rcases hpool.chans_ty _ _ hcid with ⟨_, ch', hch', hbufTy⟩
+                rw [hch] at hch'; cases hch'
+                have hvTy := (hbufTy _ (by rw [hbuf]; exact List.mem_cons_self ..)).2
+                exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
+                  typing_sub hr (.makeData hlv1 (.cons hvTy .nil)), hσ⟩
+      | chanRecvClosed _ _ _ =>
+        cases hop with
+        | chanRecv _ hlv0 _ =>
+          exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl,
+            typing_sub hr (.makeData hlv0 .nil), hσ⟩
+      | chanClose _ =>
+        cases hop
+        exact ⟨Ψ, Θ, StoreExtends.refl Ψ, rfl, typing_sub hr (.lit .unit), hσ⟩
+      | actorSpawn _ =>
+        cases hop with
+        | @actorSpawn σ_ty =>
+          cases hargs with
+          | cons hfn hnil =>
+            cases hnil
+            let Θ' : TaskTy := { Θ with actors := Θ.actors ++ [σ_ty] }
+            have htkExt : TaskExtends Θ Θ' := TaskExtends.appendActor Θ σ_ty
+            have ha : Θ'.actors[pool.actors.length]? = some σ_ty := by
+              simp [Θ', hpool.actors_len]
+            have hinit : HasType Δ Φ Ψ Θ' emptyCtx (.apply _ []) σ_ty :=
+              .apply (typing_env_weaken (StoreExtends.refl Ψ) htkExt hfn) .nil (TySub.refl _)
+            exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
+              ⟨σ_ty, rfl, hinit⟩,
+              typing_sub hr (.syncRef (.actor ha)),
+              store_typed_task_weaken htkExt hσ⟩
+      | actorCall _ hv =>
+        cases hop with
+        | @actorCall σ_ty r_ty hsend =>
+          cases hargs with
+          | cons href hrest =>
+            cases hrest with
+            | cons hfn hnil =>
+              cases hnil
+              cases href with
+              | syncRef hsr =>
+                cases hsr with
+                | actor haid =>
+                  let Θ' : TaskTy := { Θ with tasks := Θ.tasks ++ [r_ty] }
+                  have htkExt : TaskExtends Θ Θ' := TaskExtends.appendTask Θ r_ty
+                  have htid : Θ'.tasks[pool.tasks.length]? = some r_ty := by
+                    simp [Θ', hpool.tasks_len]
+                  exact ⟨Ψ, Θ', StoreExtends.refl Ψ,
+                    ⟨σ_ty, r_ty, rfl, haid, hsend, hv,
+                      typing_env_weaken (StoreExtends.refl Ψ) htkExt hfn⟩,
+                    typing_sub hr (.taskRef htid hsend (TySub.refl _)),
+                    store_typed_task_weaken htkExt hσ⟩
+      | actorSend _ hv =>
+        cases hop with
+        | @actorSend σ_ty =>
+          cases hargs with
+          | cons href hrest =>
+            cases hrest with
+            | cons hfn hnil =>
+              cases hnil
+              cases href with
+              | syncRef hsr =>
+                cases hsr with
+                | actor haid =>
+                  exact ⟨Ψ, Θ, StoreExtends.refl Ψ,
+                    ⟨σ_ty, rfl, haid, hv, hfn⟩,
+                    typing_sub hr (.lit .unit), hσ⟩
 termination_by sizeOf e
 
 theorem preservationList {Δ : AdtEnv} {Φ : FunEnv} (hΦ : FunEnvTyped Δ Φ)
-    {Ψ : StoreTy} {Θ : TaskTy} {tasks : List Expr}
-    {es : List Expr} {σ : Store} {es' : List Expr} {σ' : Store} {sp : Option Expr} {τs : List Ty}
+    {Ψ : StoreTy} {Θ : TaskTy} {pool : ConcPool}
+    {es : List Expr} {σ : Store} {es' : List Expr} {σ' : Store} {eff : ConcEff} {τs : List Ty}
     (hts : HasTypes Δ Φ Ψ Θ emptyCtx es τs)
-    (hstep : StepList Δ Φ tasks es σ es' σ' sp)
+    (hstep : StepList Δ Φ pool es σ es' σ' eff)
     (hσ : StoreTyped Δ Φ Ψ Θ σ)
-    (htasks : TasksTyped Δ Φ Ψ Θ tasks) :
+    (hpool : PoolTyped Δ Φ Ψ Θ pool) :
     ∃ Ψ' Θ',
       StoreExtends Ψ Ψ' ∧
-      SpawnTyped Δ Φ Ψ' Θ Θ' sp ∧
+      EffTyped Δ Φ Ψ' Θ Θ' eff ∧
       HasTypes Δ Φ Ψ' Θ' emptyCtx es' τs ∧
       StoreTyped Δ Φ Ψ' Θ' σ' := by
   cases hstep with
   | head hs =>
     cases hts with
     | cons h1 hrest =>
-      rcases preservation hΦ h1 hs hσ htasks with ⟨Ψ', Θ', hext, hsp, h1', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .cons h1' (typingList_env_weaken hext (spawnTyped_extends hsp) hrest), hσ'⟩
+      rcases preservation hΦ h1 hs hσ hpool with ⟨Ψ', Θ', hext, heff, h1', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .cons h1' (typingList_env_weaken hext (effTyped_extends heff) hrest), hσ'⟩
   | tail _ hs =>
     cases hts with
     | cons h1 hrest =>
-      rcases preservationList hΦ hrest hs hσ htasks with ⟨Ψ', Θ', hext, hsp, hrest', hσ'⟩
-      exact ⟨Ψ', Θ', hext, hsp,
-        .cons (typing_env_weaken hext (spawnTyped_extends hsp) h1) hrest', hσ'⟩
+      rcases preservationList hΦ hrest hs hσ hpool with ⟨Ψ', Θ', hext, heff, hrest', hσ'⟩
+      exact ⟨Ψ', Θ', hext, heff,
+        .cons (typing_env_weaken hext (effTyped_extends heff) h1) hrest', hσ'⟩
 termination_by sizeOf es
 end
 
 /-! ## Sequential Multi-Step Type Safety Corollary -/
 
+theorem emptyPool_typed {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} :
+    PoolTyped Δ Φ Ψ emptyTaskTy emptyPool :=
+  { tasks_len  := rfl
+    tasks_ty   := fun _ _ h => by simp [emptyTaskTy] at h
+    mvars_len  := rfl
+    mvars_ty   := fun _ _ h => by simp [emptyTaskTy] at h
+    chans_len  := rfl
+    chans_ty   := fun _ _ h => by simp [emptyTaskTy] at h
+    actors_len := rfl
+    actors_ty  := fun _ _ h => by simp [emptyTaskTy] at h }
+
 theorem type_safety {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {σ σ' : Store} {e e' : Expr} {τ : Ty}
     (hΦ : FunEnvTyped Δ Φ)
-    (ht : HasType Δ Φ Ψ [] emptyCtx e τ)
-    (hσ : StoreTyped Δ Φ Ψ [] σ)
+    (ht : HasType Δ Φ Ψ emptyTaskTy emptyCtx e τ)
+    (hσ : StoreTyped Δ Φ Ψ emptyTaskTy σ)
     (hsteps : Steps Δ Φ e σ e' σ') :
-    ¬ IsStuck Δ Φ [] e' σ' := by
+    ¬ IsStuck Δ Φ emptyPool e' σ' := by
   induction hsteps generalizing Ψ with
   | refl =>
     intro ⟨hnt, hnblk, hns⟩
-    have htasks : TasksTyped Δ Φ Ψ [] [] := ⟨rfl, fun _ _ h => by simp at h⟩
-    rcases progress hΦ ht hσ htasks with ht' | hblk | hs'
+    rcases progress hΦ ht hσ emptyPool_typed with ht' | hblk | hs'
     · exact hnt ht'
     · exact hnblk hblk
     · exact hns hs'
   | trans hstep _ ih =>
-    have htasks : TasksTyped Δ Φ Ψ [] [] := ⟨rfl, fun _ _ h => by simp at h⟩
-    rcases preservation hΦ ht hstep hσ htasks with ⟨Ψ', Θ', _, hsp, ht', hσ'⟩
-    simp only [SpawnTyped] at hsp
-    subst hsp
+    rcases preservation hΦ ht hstep hσ emptyPool_typed with ⟨Ψ', Θ', _, heff, ht', hσ'⟩
+    simp only [EffTyped] at heff
+    subst heff
     exact ih ht' hσ'
 
 end CoreGeisha

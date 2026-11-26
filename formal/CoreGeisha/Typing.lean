@@ -1,15 +1,16 @@
 import CoreGeisha.Syntax
 
 /-!
-# Core Geisha: Declarative Static Semantics, Capture Modes, and `IsSend`
+# Core Geisha: Declarative Static Semantics, Capture Modes, `IsSend`, and Concurrency Primitives
 
 Independent, syntax-directed typing rules `HasType Δ Φ Ψ Θ Γ e τ` for Core Geisha
 (with admissible subsumption `typing_sub` proved in `Soundness.lean`), including:
-- Coinductive thread-shareability `IsSend Δ τ` (supporting recursive ADTs while
-  rejecting `Cell τ` and `local` closures)
-- Capture-mode subtyping `ModeSub` / `TySub` (`shared <: local`, invariant `Cell`)
+- Coinductive thread-shareability `IsSend Δ τ` (supporting recursive ADTs, `MVar τ`,
+  `Chan τ`, and `Actor σ_ty` encapsulating `!Send` state `σ_ty`, while rejecting
+  `Cell τ` and `local` closures)
+- Capture-mode subtyping `ModeSub` / `TySub` (`shared <: local`, invariant `Cell`/`MVar`/`Chan`/`Actor`)
 - Lexical capture checking on `shared` closures (`HasType.lam`)
-- Concurrent `Task` typing (`taskRef`, `spawn`, `await`)
+- Concurrent `Task`, `MVar`, `Chan`, and sequential `Actor` typing
 -/
 
 namespace CoreGeisha
@@ -30,19 +31,34 @@ def extendMany (Γ : Ctx) : List (Ident × Ty) → Ctx
   | [] => Γ
   | (x, τ) :: rest => extendCtx (extendMany Γ rest) x τ
 
+/-- Monotone list-typing extension (`ys` extends `xs`). -/
+def ListExtends (xs ys : List Ty) : Prop :=
+  xs.length ≤ ys.length ∧ ∀ (i : Nat) (τ : Ty), xs[i]? = some τ → ys[i]? = some τ
+
 /-- Store typing `Ψ : List Ty` assigning a type to each allocated `Cell` location. -/
 abbrev StoreTy := List Ty
 
 /-- Store typing extension: `Ψ'` extends `Ψ` (monotone heap growth). -/
-def StoreExtends (Ψ Ψ' : StoreTy) : Prop :=
-  Ψ.length ≤ Ψ'.length ∧ ∀ (l : Loc) (τ : Ty), Ψ[l]? = some τ → Ψ'[l]? = some τ
+abbrev StoreExtends (Ψ Ψ' : StoreTy) : Prop := ListExtends Ψ Ψ'
 
-/-- Task typing `Θ : List Ty` assigning a result type to each spawned `TaskId`. -/
-abbrev TaskTy := List Ty
+/-- Concurrent pool typing `Θ`: assigns payload/state types to allocated `Task`,
+    `MVar`, `Chan`, and `Actor` handles. -/
+structure TaskTy where
+  tasks  : List Ty := []
+  mvars  : List Ty := []
+  chans  : List Ty := []
+  actors : List Ty := []
+  deriving Repr
 
-/-- Task typing extension: `Θ'` extends `Θ` (monotone task pool growth). -/
-def TaskExtends (Θ Θ' : TaskTy) : Prop :=
-  Θ.length ≤ Θ'.length ∧ ∀ (tid : TaskId) (τ : Ty), Θ[tid]? = some τ → Θ'[tid]? = some τ
+/-- Empty concurrent pool typing. -/
+def emptyTaskTy : TaskTy := {}
+
+/-- Monotone growth of concurrent pool typing `Θ`. -/
+structure TaskExtends (Θ Θ' : TaskTy) : Prop where
+  tasks  : ListExtends Θ.tasks Θ'.tasks
+  mvars  : ListExtends Θ.mvars Θ'.mvars
+  chans  : ListExtends Θ.chans Θ'.chans
+  actors : ListExtends Θ.actors Θ'.actors
 
 /-! ## Capture-Mode Subtyping (`shared <: local`) -/
 
@@ -53,8 +69,9 @@ inductive ModeSub : Mode → Mode → Prop where
   | sharedToLocal : ModeSub .shared .local
 
 /- Structural subtyping induced by `ModeSub`.
-   `Cell` and nominal `ADT` types are invariant; functions are covariant in
-   capture mode and return type, and contravariant in parameter types. -/
+   `Cell`, `MVar`, `Chan`, `Actor`, and nominal `ADT` types are invariant;
+   functions are covariant in capture mode and return type, and contravariant
+   in parameter types; `Task` is covariant in its immutable result type. -/
 mutual
 inductive TySub : Ty → Ty → Prop where
   | void : TySub .void .void
@@ -70,6 +87,9 @@ inductive TySub : Ty → Ty → Prop where
   | adt (n : Ident) : TySub (.adt n) (.adt n)
   | cell (t : Ty) : TySub (.cell t) (.cell t)
   | task {t1 t2 : Ty} : TySub t1 t2 → TySub (.task t1) (.task t2)
+  | mvar (t : Ty) : TySub (.mvar t) (.mvar t)
+  | chan (t : Ty) : TySub (.chan t) (.chan t)
+  | actor (t : Ty) : TySub (.actor t) (.actor t)
 
 inductive TyListSub : List Ty → List Ty → Prop where
   | nil : TyListSub [] []
@@ -79,10 +99,13 @@ inductive TyListSub : List Ty → List Ty → Prop where
       TyListSub (t1 :: ts1) (t2 :: ts2)
 end
 
-/-! ## Coinductive `IsSend` Predicate (Supporting Recursive ADTs) -/
+/-! ## Coinductive `IsSend` Predicate (Supporting Recursive ADTs & `!Send`-State Actors) -/
 
 /- One-step `Send` membership relative to a candidate set `S` of `Send` ADTs.
-   Notably, `Ty.cell _` and `Ty.fn .local _ _` have NO constructors here. -/
+   - `Ty.cell _` and `Ty.fn .local _ _` have NO constructors (`!Send`).
+   - `Ty.mvar t` and `Ty.chan t` require `TySendIn S t`.
+   - `Ty.actor s` is unconditionally `Send` even when `s` is `!Send` (e.g. `Cell`!),
+     because `s` never leaves the actor's dedicated sequential thread. -/
 mutual
 inductive TySendIn (S : Ident → Prop) : Ty → Prop where
   | void : TySendIn S .void
@@ -93,6 +116,9 @@ inductive TySendIn (S : Ident → Prop) : Ty → Prop where
   | fnShared (ps : List Ty) (ret : Ty) : TySendIn S (.fn .shared ps ret)
   | adt {name : Ident} : S name → TySendIn S (.adt name)
   | task {t : Ty} : TySendIn S t → TySendIn S (.task t)
+  | mvar {t : Ty} : TySendIn S t → TySendIn S (.mvar t)
+  | chan {t : Ty} : TySendIn S t → TySendIn S (.chan t)
+  | actor (s : Ty) : TySendIn S (.actor s)
 
 inductive TyListSendIn (S : Ident → Prop) : List Ty → Prop where
   | nil : TyListSendIn S []
@@ -113,7 +139,7 @@ def AdtSendClosed (Δ : AdtEnv) (S : Ident → Prop) : Prop :=
 def IsSend (Δ : AdtEnv) (τ : Ty) : Prop :=
   ∃ S : Ident → Prop, AdtSendClosed Δ S ∧ TySendIn S τ
 
-/-! ## Operators, Literals, and Patterns -/
+/-! ## Operators, Literals, Concurrency Handles/Primitives, and Patterns -/
 
 /-- Literal typing judgment. -/
 inductive LitHasType : Lit → Ty → Prop where
@@ -149,6 +175,59 @@ inductive BinOpHasType : BinOp → Ty → Ty → Ty → Prop where
   | strConcat : BinOpHasType .strConcat .str .str .str
   | and : BinOpHasType .and .bool .bool .bool
   | or : BinOpHasType .or .bool .bool .bool
+
+/-- Runtime `MVar` / `Chan` / `Actor` handle typing judgment. -/
+inductive SyncRefHasType (Δ : AdtEnv) (Θ : TaskTy) : SyncKind → Nat → Ty → Prop where
+  | mvar {mid : Nat} {τ : Ty} :
+      Θ.mvars[mid]? = some τ →
+      IsSend Δ τ →
+      SyncRefHasType Δ Θ .mvar mid (.mvar τ)
+  | chan {cid : Nat} {τ : Ty} :
+      Θ.chans[cid]? = some τ →
+      IsSend Δ τ →
+      SyncRefHasType Δ Θ .chan cid (.chan τ)
+  | actor {aid : Nat} {σ_ty : Ty} :
+      Θ.actors[aid]? = some σ_ty →
+      SyncRefHasType Δ Θ .actor aid (.actor σ_ty)
+
+/-- Typing rules for `MVar`, `Chan`, and sequential `Actor` primitives (`std.sync`, `std.actor`).
+    Crucially:
+    - `actorSpawn` requires a `shared` initializer `() => s`, while `s` need NOT be `IsSend`.
+    - `actorCall` requires a `shared` handler `s => r` and `IsSend Δ r`, while `s` need NOT be `IsSend`.
+    - `actorSend` requires a `shared` handler `s => Void`, while `s` need NOT be `IsSend`. -/
+inductive ConcPrimHasType (Δ : AdtEnv) : ConcPrim → List Ty → Ty → Prop where
+  | mvarNew {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ .mvarNew [τ] (.mvar τ)
+  | mvarEmpty {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ (.mvarEmpty τ) [] (.mvar τ)
+  | mvarTake {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ .mvarTake [.mvar τ] τ
+  | mvarPut {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ .mvarPut [.mvar τ, τ] .void
+  | chanNew {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ (.chanNew τ) [.int] (.chan τ)
+  | chanSend {τ : Ty} :
+      IsSend Δ τ →
+      ConcPrimHasType Δ .chanSend [.chan τ, τ] .bool
+  | chanRecv {optAdt : Ident} {τ : Ty} :
+      IsSend Δ τ →
+      lookupVariant Δ optAdt 0 = some [] →
+      lookupVariant Δ optAdt 1 = some [τ] →
+      ConcPrimHasType Δ (.chanRecv optAdt) [.chan τ] (.adt optAdt)
+  | chanClose {τ : Ty} :
+      ConcPrimHasType Δ .chanClose [.chan τ] .void
+  | actorSpawn {σ_ty : Ty} :
+      ConcPrimHasType Δ .actorSpawn [.fn .shared [] σ_ty] (.actor σ_ty)
+  | actorCall {σ_ty r_ty : Ty} :
+      IsSend Δ r_ty →
+      ConcPrimHasType Δ .actorCall [.actor σ_ty, .fn .shared [σ_ty] r_ty] (.task r_ty)
+  | actorSend {σ_ty : Ty} :
+      ConcPrimHasType Δ .actorSend [.actor σ_ty, .fn .shared [σ_ty] .void] .void
 
 /- Pattern typing judgment: `PatHasType Δ p τ bs` checks that pattern `p`
    matches values of type `τ` and binds variables `bs`. -/
@@ -189,10 +268,13 @@ inductive HasType (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) :
       Ψ[l]? = some τ →
       HasType Δ Φ Ψ Θ Γ (.loc l) (.cell τ)
   | taskRef {Γ : Ctx} {tid : TaskId} {τ0 τ : Ty} :
-      Θ[tid]? = some τ0 →
+      Θ.tasks[tid]? = some τ0 →
       IsSend Δ τ0 →
       TySub τ0 τ →
       HasType Δ Φ Ψ Θ Γ (.taskRef tid) (.task τ)
+  | syncRef {Γ : Ctx} {k : SyncKind} {id : Nat} {τ : Ty} :
+      SyncRefHasType Δ Θ k id τ →
+      HasType Δ Φ Ψ Θ Γ (.syncRef k id) τ
   | tuple {Γ : Ctx} {es : List Expr} {τs : List Ty} :
       HasTypes Δ Φ Ψ Θ Γ es τs →
       HasType Δ Φ Ψ Θ Γ (.tuple es) (.tuple τs)
@@ -280,6 +362,12 @@ inductive HasType (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) :
       IsSend Δ τ0 →
       TySub τ0 τ →
       HasType Δ Φ Ψ Θ Γ (.await e) τ
+  | concPrim {Γ : Ctx} {op : ConcPrim} {args : List Expr}
+      {argTys : List Ty} {ret0 ret : Ty} :
+      ConcPrimHasType Δ op argTys ret0 →
+      HasTypes Δ Φ Ψ Θ Γ args argTys →
+      TySub ret0 ret →
+      HasType Δ Φ Ψ Θ Γ (.concPrim op args) ret
   | trap {Γ : Ctx} (t : Trap) (τ : Ty) :
       HasType Δ Φ Ψ Θ Γ (.trap t) τ
 
@@ -304,10 +392,10 @@ inductive ArmsHaveType (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) 
 end
 
 /-- Top-level function table well-typedness: every function body is well-typed
-    under its declared parameters and empty store/task typings (closed static defs). -/
+    under its declared parameters and empty store/pool typings (closed static defs). -/
 def FunEnvTyped (Δ : AdtEnv) (Φ : FunEnv) : Prop :=
   ∀ name fd, Φ name = some fd →
-    HasType Δ Φ [] [] (extendMany emptyCtx fd.params) fd.body fd.retTy
+    HasType Δ Φ [] emptyTaskTy (extendMany emptyCtx fd.params) fd.body fd.retTy
 
 /-- Store well-typedness: `σ` and `Ψ` have equal length, and every cell holds a
     closed value of its declared type. -/
@@ -315,12 +403,5 @@ def StoreTyped (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) (σ : St
   σ.length = Ψ.length ∧
   ∀ (l : Loc) (τ : Ty), Ψ[l]? = some τ →
     ∃ v, σ[l]? = some v ∧ IsValue v ∧ HasType Δ Φ Ψ Θ emptyCtx v τ
-
-/-- Task pool well-typedness: `tasks` and `Θ` have equal length, and every
-    task holds a closed expression of its declared result type. -/
-def TasksTyped (Δ : AdtEnv) (Φ : FunEnv) (Ψ : StoreTy) (Θ : TaskTy) (tasks : List Expr) : Prop :=
-  tasks.length = Θ.length ∧
-  ∀ (tid : TaskId) (τ : Ty), Θ[tid]? = some τ →
-    ∃ e, tasks[tid]? = some e ∧ HasType Δ Φ Ψ Θ emptyCtx e τ
 
 end CoreGeisha

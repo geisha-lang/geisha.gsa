@@ -2591,15 +2591,11 @@ def collectVarsInCoreTerm(tm: TaggedTerm, seen: StrMap Bool, out: Cell (List Str
         collectVarsInCoreTerm(c, seen, out);
         collectVarsInCoreList(args, seen, out)
     },
-    TmIf(c, t, e) -> {
-        collectVarsInCoreTerm(c, seen, out);
+    TmIf(_, t, e) -> {
         collectVarsInCoreTerm(t, seen, out);
         collectVarsInCoreTerm(e, seen, out)
     },
-    TmWhile(c, b) -> {
-        collectVarsInCoreTerm(c, seen, out);
-        collectVarsInCoreTerm(b, seen, out)
-    },
+    TmWhile(_, _) -> (),
     TmMatch(s, arms) -> {
         collectVarsInCoreTerm(s, seen, out);
         let cur = cellNew(arms);
@@ -2634,12 +2630,9 @@ def collectVarsInCoreTerm(tm: TaggedTerm, seen: StrMap Bool, out: Cell (List Str
         };
         collectVarsInCoreTerm(b, seen, out)
     },
-    TmUn(_, e) -> collectVarsInCoreTerm(e, seen, out),
-    TmGetTag(e) -> collectVarsInCoreTerm(e, seen, out),
-    TmBin(_, l, r) -> {
-        collectVarsInCoreTerm(l, seen, out);
-        collectVarsInCoreTerm(r, seen, out)
-    },
+    TmUn(_, _) -> (),
+    TmGetTag(_) -> (),
+    TmBin(_, _, _) -> (),
     _ -> (),
 }
 

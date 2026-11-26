@@ -1,52 +1,40 @@
-# Core Geisha Formal Semantics Specification
+# Core Geisha Formal Semantics & Machine-Checked Metatheory
 
-This directory contains the machine-checked formal semantics of **Core Geisha** in **Lean 4**, corresponding to the post-monomorphization Core IR (`src/core.gsa`) of the self-hosted compiler `geisha.gsa`.
+This directory contains the complete machine-checked formal semantics and safety proofs of **Core Geisha** in **Lean 4** (`v4.36.0`), corresponding to the post-monomorphization Core IR (`src/core.gsa`), codegen layout (`src/codegen.gsa`), generational bitmap GC (`runtime/runtime/gc_bitmap.c`), and concurrency runtime (`runtime/runtime/gs_conc.c`) of the self-hosted compiler `geisha.gsa`.
 
 ## 1. Module Overview
 
 | File | Contents |
 | --- | --- |
-| `CoreGeisha/Syntax.lean` | Monomorphic types `Ty`, closure capture modes `Mode` (`local` / `shared`), `Task` handles, literals `Lit`, operators `UnOp`/`BinOp`, patterns `Pat`, expressions `Expr` (including `spawn`/`await`), runtime traps `Trap`, values `IsValue`, heap `Store`, `freeVars`, `exprLocs`, and closed-value substitution `subst`/`substMany`. |
-| `CoreGeisha/Typing.lean` | Independent declarative static semantics (`HasType`, `HasTypes`, `PatHasType`, `ArmsHaveType`), capture-mode subtyping (`ModeSub`, `TySub` with `shared <: local` and invariant `Cell`), coinductive `IsSend` (Park greatest fixed point supporting recursive ADTs), and lexical `shared` closure capture checking. |
-| `CoreGeisha/Semantics.lean` | Strict left-to-right small-step operational semantics (`Step`, `StepList`), interleaved concurrent task-pool semantics (`ConcStep`, `ConcSteps`), legitimate task-join waiting (`BlockedOnTask`), and active cell memory-access characterization (`ActiveCellAccess`, `HasDataRace`). |
-| `CoreGeisha/Soundness.lean` | Zero-`sorry` machine-checked proofs of **Subtyping Transitivity**, **Coinductive `IsSend` Unfolding**, **Zero-Location Lemma** (`exprLocs_empty_of_isValue_isSend`), **Weakening**, **Substitution**, **Canonical Forms**, **Progress**, and **Preservation**. |
-| `CoreGeisha/Concurrency.lean` | Zero-`sorry` machine-checked proofs of **Global Heap Ownership Partition** (`HeapOwned`), **Concurrent Type Safety** (`conc_type_safety`), **Cross-Thread Heap Disjointness** (`conc_heap_disjoint`), and **Compile-Time Data-Race Freedom** (`conc_data_race_freedom`). |
-| `CoreGeisha/Checker.lean` | Verified executable type & concurrency checker (`checkProgram`, greatest-fixed-point `computeSendAdts`/`checkSendAdtsClosed`) linked end-to-end to `verified_concurrent_program_safety` and `verified_program_data_race_freedom`. |
-| `CoreGeisha/Parser.lean` | `.gscore` S-expression parser for `--dump-core` translation validation. |
+| `CoreGeisha/Syntax.lean` | Monomorphic types `Ty` (including `Cell`, `Task`, `MVar`, `Chan`, `Actor`), closure capture modes `Mode` (`local` / `shared`), synchronization/actor primitives `ConcPrim`, literals `Lit`, operators `UnOp`/`BinOp`, patterns `Pat`, expressions `Expr`, runtime traps `Trap`, values `IsValue`, heap `Store`, `freeVars`, `exprLocs`, and substitution `subst`/`substMany`. |
+| `CoreGeisha/Typing.lean` | Declarative static semantics (`HasType`, `ConcPrimHasType`), capture-mode subtyping (`ModeSub`, `TySub` with `shared <: local` and invariant `Cell`/`MVar`/`Chan`/`Actor`), coinductive `IsSend` (Park greatest fixed point supporting recursive ADTs, `MVar`/`Chan`, and unconditionally `Send` `Actor s` encapsulating `!Send` state `s`), and lexical `shared` closure capture checking. |
+| `CoreGeisha/Semantics.lean` | Strict left-to-right small-step operational semantics (`Step`, `StepConcPrim`), interleaved concurrent pool semantics (`ConcPool`, `ConcStep`, `ConcSteps`) modeling `Task`s, synchronized `MVar`s, bounded/unbounded MPMC `Chan`s, and sequential thread-pinned `Actor`s (`init` / `idle` / `busy` / `failed` + FIFO mailbox), legitimate synchronization blocking (`BlockedOnTask`), and active cell race detection (`ActiveCellAccess`, `HasDataRace`). |
+| `CoreGeisha/Soundness.lean` | Zero-`sorry` proofs of **Subtyping Transitivity & Admissibility**, **Coinductive `IsSend` Unfolding**, **Zero-Location Lemma** (`exprLocs_empty_of_isValue_isSend`), **Weakening**, **Substitution**, **Canonical Forms**, **Progress**, **Preservation**, and **Sequential Type Safety**. |
+| `CoreGeisha/Concurrency.lean` | Zero-`sorry` proofs of **Global Heap Ownership Partition** (`HeapOwned` across `ThreadId.task` and `ThreadId.actor`), **Concurrent Type Safety** (`conc_type_safety`), **Pairwise Heap Disjointness** (`conc_heap_disjoint` across Task-Task, Task-Actor, and Actor-Actor), and **Compile-Time Data-Race Freedom** (`conc_data_race_freedom`). |
+| `CoreGeisha/Exhaustive.lean` | Executable **Maranget Pattern-Matrix Exhaustiveness Checker** (`checkPatsExhaustive`, `checkProgramExhaustive`) and zero-`sorry` proofs of matrix specialization soundness (`checkArmsExhaustive_sound`), dynamic match-coverage preservation (`step_preserves_exhSafe`), and **Complete Elimination of `Trap.matchFailure`** (`exhaustive_no_match_failure`, `conc_exhaustive_no_match_failure`). |
+| `CoreGeisha/Escape.lean` | Executable **Escape Analysis Verifier** (`checkProgramEscape`), explicit **Stack-Frame Region Operational Semantics** (`RExpr`, `RStore`, `popRegion`, `IsDanglingAccess`), non-vacuity counterexample (`dangling_access_nonvacuous`), **Zero Use-After-Return / No Dangling Stack Pointers** (`escape_no_dangling_pointers`), and **Stack-vs-Heap Observational Simulation** (`stack_alloc_simulates_heap`). |
+| `CoreGeisha/GC.lean` | Formalization of **40-Bit Exact Object Pointer Masks** (`computePtrMask_sound`, `adtVariantPtrMask_sound` with scalar false-pointer immunity) and **Sticky-Mark Generational GC & Write Barrier** (`GenHeapInv`, `gcAllocImmutable_preserves_inv`, `gcWriteBarrierStore_preserves_inv`, UAF counterexample `missing_write_barrier_unsound`, `minorGc_sound`, `majorGc_sound`, and `majorGc_complete`). |
+| `CoreGeisha/Checker.lean` | Unified verified executable checker (`checkProgram`) combining type/mode/concurrency checking, Maranget exhaustiveness, stack-escape checking, and GC layout checking, linked directly to end-to-end safety theorems. |
+| `CoreGeisha/Parser.lean` | `.gscore` S-expression parser for `--dump-core` translation validation (`adts`, `funs`, `stack-allocs`). |
 
-## 2. Explicit Semantic Decisions
+## 2. Key Machine-Checked Guarantees
 
-1. **Evaluation Order**:
-   - Strict call-by-value, **left-to-right** for tuples, multi-arg closure/direct calls (`callee` first, then `arg_1, …, arg_n`), ADT constructor fields, `cellSet(e1, e2)`, and non-short-circuiting binary operators.
-   - `&&` and `||` are **short-circuiting** on the left operand.
-   - `while c b` unfolds to `if c { b; while c b } else ()`.
+1. **Sequential & Concurrent Type Safety (`¬ IsStuck`)**:
+   Every active `Task` and `Actor` thread either terminates (as a value or defined `divByZero` trap), legitimately blocks on an unfulfilled `Task`/`MVar`/`Chan` synchronization primitive (`BlockedOnTask`), or takes a deterministic step.
+2. **Elimination of `Trap.matchFailure` (`Exhaustive.lean`)**:
+   Programs passing `checkProgramExhaustive` never evaluate to `Trap.matchFailure` (nor put any `Actor` into `.failed .matchFailure`) across arbitrary sequential or concurrent interleavings.
+3. **Compile-Time Data-Race Freedom with `!Send`-State Actors (`Concurrency.lean`)**:
+   `Actor s` is unconditionally `IsSend` even when `s` is `!Send` (`Cell τ` or `local` closures), because `actorSpawn` requires a `shared` `() => s` initializer (`exprLocs = []`), `actorCall`/`actorSend` require `shared` `s => r` handlers (`IsSend r`), and each actor processes its mailbox sequentially on a dedicated `ThreadId.actor aid`, preserving `¬ HasDataRace pool`.
+4. **Stack-Frame Region Safety & Heap Refinement (`Escape.lean`)**:
+   Stack-promoted `Cell` allocations freed eagerly upon function return (`popRegion`) never produce dangling stack dereferences (`¬ IsDanglingAccess`) and are simulated lockstep by heap semantics (`stack_alloc_simulates_heap`).
+5. **Exact 40-Bit Pointer Masks & Sticky Generational Write Barrier (`GC.lean`)**:
+   Immutable young allocations require zero write barriers; mutating heap containers with `gcWriteBarrierStore` preserves `GenHeapInv`; `minorGcCollect` preserves all reachable objects (`minorGc_sound`, whereas omitting the write barrier sweeps a live object in `missing_write_barrier_unsound`); `majorGcCollect` reclaims unreachable cyclic old-generation islands (`majorGc_complete`).
 
-2. **Arithmetic & Traps vs. Undefined Behavior**:
-   - `Int` (`Int32`) arithmetic (`+`, `-`, `*`, unary `-`, bitwise) uses **two's-complement wrapping** semantics (never UB).
-   - Division (`/`) and remainder (`%`) by `0` produce `Trap.divByZero`; falling off `match` arms produces `Trap.matchFailure`.
-   - Traps propagate strictly through all evaluation contexts and across `await` boundaries (`awaitTaskTrap`).
-
-3. **Capture-Mode `Send` Discipline & Compile-Time Data-Race Freedom**:
-   - Mutable state is isolated to `Cell τ` (`¬ IsSend`), while ADTs, tuples, primitives, and `Task τ` (for `IsSend τ`) are immutable/thread-safe values.
-   - Closures carry capture modes: `Mode.local` (may capture `Cell` or `local` closures; `¬ IsSend`) vs. `Mode.shared` (every free lexical variable must satisfy `IsSend`; `IsSend` holds).
-   - Capture-mode subtyping (`Mode.shared <: Mode.local`) allows `shared` closures to be passed wherever `local` closures are expected without monomorphization duplication, while `Cell τ` remains invariant.
-   - `conc_heap_disjoint` and `conc_data_race_freedom` prove that across all nondeterministic thread interleavings (`ConcSteps`), distinct tasks hold pairwise disjoint sets of `Cell` heap locations (`¬ HasDataRace tasks`).
-
-## 3. Alignment with `geisha.gsa` and Next Extensions
-
-| Layer | Current Status | Next Step |
-| --- | --- | --- |
-| Monomorphic Core IR (`src/core.gsa`) | **Formalized & Type-Soundness Proved (Lean 4)** | Add `MutArray` (bounds-checked trap) & `Float`/`Int64` |
-| Concurrency, Capture Modes & `Send` (`Task`, `Cell`) | **Formalized & Data-Race Freedom Proved (Lean 4)** | Extend with blocking channels (`MVar`/`Chan`) & `Actor` |
-| Surface HM + Open Concepts (`src/infer.gsa`) | Algorithm in `infer.gsa` | Formalize declarative HM + `SendIf` constraint solving |
-| Pattern Exhaustiveness (Maranget in `src/infer.gsa`) | Algorithm in `infer.gsa` | Prove exhaustive `match` never produces `Trap.matchFailure` |
-| Escape Analysis (`src/core.gsa`) | 2-phase fixed-point in `core.gsa` | Add region/stack store semantics and prove stack-allocation refinement |
-
-## 4. Verification
+## 3. Verification
 
 ```sh
-cd formal
-lake build
+cd formal && lake build
+make verify-core
 ```
 
-All theorems compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`** and no external library dependencies.
+All 10 modules compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`**, **zero custom axioms**, and **zero external library dependencies**.

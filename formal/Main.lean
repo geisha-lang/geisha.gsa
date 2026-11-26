@@ -13,10 +13,11 @@ def main (args : List String) : IO UInt32 := do
     | .ok prog =>
       match checkProgram prog with
       | .error err =>
-        IO.eprintln s!"TYPE ERROR ({path}): {err}"
+        IO.eprintln s!"VERIFICATION ERROR ({path}): {err}"
         return 1
       | .ok () =>
-        IO.println s!"VERIFIED OK: {path} ({prog.adts.length} ADTs, {prog.funs.length} functions — guaranteed ¬IsStuck & ¬HasDataRace by CoreGeisha.verified_concurrent_program_safety + verified_program_data_race_freedom)"
+        let stackVarCount := prog.stackAllocs.foldl (fun acc s => acc + s.vars.length) 0
+        IO.println s!"VERIFIED OK: {path} ({prog.adts.length} ADTs, {prog.funs.length} functions, {stackVarCount} stack-promoted cells — guaranteed ¬IsStuck, ¬MatchFailure, ¬HasDataRace across Task/MVar/Chan/Actor, ¬DanglingStackAccess, & exact 40-bit GC pointer masks)"
         return 0
   | _ =>
     IO.eprintln "Usage: geisha-check <program.gscore>"

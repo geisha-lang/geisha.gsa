@@ -28,7 +28,7 @@ use core.{
     ClosureSpec, TaggedTerm, MkTerm, CoreArm, Term,
     TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
     TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
-    FunDef, CoreProgram, extractTypeArgs
+    FunDef, EscapeInfo, CoreProgram, extractTypeArgs
 }
 
 data DumpCtx {
@@ -274,6 +274,18 @@ def requireTermSend(
     _ -> (),
 }
 
+def isChanRecvWrapper(prog: CoreProgram, name: String): Bool =
+    match strMapGet(prog.coreFns, name) {
+        Some(fd) -> match fd.fnBody.tnode {
+            TmMatch(scrut, _) -> match scrut.tnode {
+                TmApplyDir(ivd, _) -> ivd.vname == "__concChanRecv",
+                _ -> false,
+            },
+            _ -> false,
+        },
+        None -> false,
+    }
+
 def scanSendDemandsInTerm(
     prog: CoreProgram,
     fnName: String,
@@ -311,7 +323,7 @@ def scanSendDemandsInTerm(
         )
     },
     TmApplyDir(vd, args) -> {
-        if (vd.vname == "__concTaskSpawn") {
+        if (vd.vname == "__concTaskSpawn" || vd.vname == "__concActorSpawn" || vd.vname == "__concMVarNew") {
             match args {
                 Cons(a0, _) -> {
                     let vset: StrMap Bool = strMapNew();
@@ -322,7 +334,18 @@ def scanSendDemandsInTerm(
                 },
                 Nil -> (),
             }
-        } else {
+        } else if (vd.vname == "__concMVarPut" || vd.vname == "__concChanSend" || vd.vname == "__concActorCall" || vd.vname == "__concActorSend") {
+            match args {
+                Cons(_, Cons(a1, _)) -> {
+                    let vset: StrMap Bool = strMapNew();
+                    requireTermSend(
+                        fnName, a1, paramSet, letRhs, localCls, vset,
+                        paramShared, clsReqShared, retReqShared, changed
+                    )
+                },
+                _ -> (),
+            }
+        } else if (!isChanRecvWrapper(prog, vd.vname)) {
             match strMapGet(prog.coreFns, vd.vname) {
                 Some(calleeFd) -> {
                     let cp = cellNew(calleeFd.fnParams);
@@ -346,7 +369,7 @@ def scanSendDemandsInTerm(
                 },
                 None -> (),
             }
-        };
+        } else ();
         let cur = cellNew(args);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
@@ -481,6 +504,7 @@ def isTypeNonSendInDump(adtLocal: StrMap Bool, ty: Type, fnMode: String): Bool =
         let base = compBaseName(ty);
         let targs = extractTypeArgs(ty);
         if (base == "Cell" || base == "MutArray") true
+        else if (base == "Actor") false
         else if (strMapContains(adtLocal, base)) true
         else {
             let bad = cellNew(false);
@@ -940,6 +964,42 @@ def emitCoreTyWithMode(ctx: DumpCtx, b: StringBuf, ty: Type, fnMode: String): Vo
                     bufPushStr(b, "void")
                 },
             }
+        } else if (base == "MVar") {
+            match targs {
+                Cons(elemTy, Nil) -> {
+                    bufPushStr(b, "(mvar ");
+                    emitCoreTyWithMode(ctx, b, elemTy, "shared");
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "Invalid MVar type application");
+                    bufPushStr(b, "void")
+                },
+            }
+        } else if (base == "Chan") {
+            match targs {
+                Cons(elemTy, Nil) -> {
+                    bufPushStr(b, "(chan ");
+                    emitCoreTyWithMode(ctx, b, elemTy, "shared");
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "Invalid Chan type application");
+                    bufPushStr(b, "void")
+                },
+            }
+        } else if (base == "Actor") {
+            match targs {
+                Cons(stateTy, Nil) -> {
+                    bufPushStr(b, "(actor ");
+                    emitCoreTyWithMode(ctx, b, stateTy, "local");
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "Invalid Actor type application");
+                    bufPushStr(b, "void")
+                },
+            }
         } else if (strMapContains(ctx.dcProg.coreAdtReg, base)) {
             let m = registerCoreAdt(ctx, base, targs);
             bufPushStr(b, "(adt ");
@@ -1274,6 +1334,154 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     bufPushStr(b, "(lit-unit)")
                 },
             }
+        } else if (vd.vname == "__concMVarNew") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(conc-prim mvar-new ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concMVarNew expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concMVarEmpty") {
+            let retTy = schemeBody(tm.tscm);
+            match extractTypeArgs(retTy) {
+                Cons(elemTy, Nil) -> {
+                    bufPushStr(b, "(conc-prim (mvar-empty ");
+                    emitCoreTyWithMode(ctx, b, elemTy, "shared");
+                    bufPushStr(b, "))")
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concMVarEmpty return type must be MVar");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concMVarTake") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(conc-prim mvar-take ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concMVarTake expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concMVarPut") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> {
+                    bufPushStr(b, "(conc-prim mvar-put ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a1);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concMVarPut expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concChanNew") {
+            let retTy = schemeBody(tm.tscm);
+            match (args, extractTypeArgs(retTy)) {
+                (Cons(a0, Nil), Cons(elemTy, Nil)) -> {
+                    bufPushStr(b, "(conc-prim (chan-new ");
+                    emitCoreTyWithMode(ctx, b, elemTy, "shared");
+                    bufPushStr(b, ") ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concChanNew invalid arguments or return type");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concChanSend") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> {
+                    bufPushStr(b, "(conc-prim chan-send ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a1);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concChanSend expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (isChanRecvWrapper(ctx.dcProg, vd.vname)) {
+            let retTy = schemeBody(tm.tscm);
+            let optMangled = registerCoreAdt(ctx, compBaseName(retTy), extractTypeArgs(retTy));
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(conc-prim (chan-recv ");
+                    pushQuotedStr(b, optMangled);
+                    bufPushStr(b, ") ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "chanRecv expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concChanClose") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(conc-prim chan-close ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concChanClose expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concActorSpawn") {
+            match args {
+                Cons(a0, Nil) -> {
+                    bufPushStr(b, "(conc-prim actor-spawn ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concActorSpawn expects 1 argument");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concActorCall") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> {
+                    bufPushStr(b, "(conc-prim actor-call ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a1);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concActorCall expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
+        } else if (vd.vname == "__concActorSend") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> {
+                    bufPushStr(b, "(conc-prim actor-send ");
+                    emitCoreTerm(ctx, b, a0);
+                    bufPushByte(b, 32);
+                    emitCoreTerm(ctx, b, a1);
+                    bufPushByte(b, 41)
+                },
+                _ -> {
+                    setDumpErr(ctx, "__concActorSend expects 2 arguments");
+                    bufPushStr(b, "(lit-unit)")
+                },
+            }
         } else if (strMapContains(ctx.dcProg.coreFns, vd.vname)) {
             bufPushStr(b, "(apply-dir ");
             pushQuotedStr(b, vd.vname);
@@ -1456,7 +1664,9 @@ def scanReachTerm(
         scanReachTermList(prog, allReach, dirReach, wl, args)
     },
     TmApplyDir(vd, args) -> {
-        markReachFn(prog, allReach, dirReach, wl, vd.vname, true);
+        if (!isChanRecvWrapper(prog, vd.vname)) {
+            markReachFn(prog, allReach, dirReach, wl, vd.vname, true)
+        } else ();
         scanReachTermList(prog, allReach, dirReach, wl, args)
     },
     TmBin(_, e1, e2) -> {
@@ -1547,6 +1757,332 @@ def collectReachableCoreFns(
         listRev(cellGet(revAcc))
     }
 
+def listContainsStrDump(xs: List String, target: String): Bool = match xs {
+    Nil -> false,
+    Cons(h, t) -> if (h == target) true else listContainsStrDump(t, target),
+}
+
+def patBindsNameDump(pat: Pattern, target: String): Bool = match pat {
+    PatWild -> false,
+    PatLit(_) -> false,
+    PatVar(x) -> x == target,
+    PatTuple(ps) -> patListBindsNameDump(ps, target),
+    PatCtor(_, ps) -> patListBindsNameDump(ps, target),
+    PatStruct(_, _) -> false,
+}
+
+def patListBindsNameDump(ps: List Pattern, target: String): Bool = match ps {
+    Nil -> false,
+    Cons(p, r) -> if (patBindsNameDump(p, target)) true else patListBindsNameDump(r, target),
+}
+
+def termMentionsVarDump(prog: CoreProgram, tm: TaggedTerm, x: String): Bool = match tm.tnode {
+    TmLit(_) -> false,
+    TmVar(y) -> y == x,
+    TmGlobalVar(_) -> false,
+    TmTuple(es) -> termListMentionsVarDump(prog, es, x),
+    TmBlock(es) -> termListMentionsVarDump(prog, es, x),
+    TmMakeCls(vd, cls, body) ->
+        vd.vname == x
+        || listContainsStrDump(cls.clsFvs, x)
+        || (match strMapGet(prog.coreFns, cls.clsEntry) {
+            Some(cfd) -> termMentionsVarDump(prog, cfd.fnBody, x),
+            None -> false,
+        })
+        || termMentionsVarDump(prog, body, x),
+    TmApplyCls(fnTm, args) ->
+        termMentionsVarDump(prog, fnTm, x) || termListMentionsVarDump(prog, args, x),
+    TmApplyDir(_, args) -> termListMentionsVarDump(prog, args, x),
+    TmBin(_, e1, e2) ->
+        termMentionsVarDump(prog, e1, x) || termMentionsVarDump(prog, e2, x),
+    TmUn(_, e1) -> termMentionsVarDump(prog, e1, x),
+    TmLet(vd, e1, e2) ->
+        vd.vname == x || termMentionsVarDump(prog, e1, x) || termMentionsVarDump(prog, e2, x),
+    TmIf(c, t, e) ->
+        termMentionsVarDump(prog, c, x) || termMentionsVarDump(prog, t, x) || termMentionsVarDump(prog, e, x),
+    TmWhile(c, b) ->
+        termMentionsVarDump(prog, c, x) || termMentionsVarDump(prog, b, x),
+    TmMatch(s, arms) -> {
+        if (termMentionsVarDump(prog, s, x)) true
+        else {
+            let hit = cellNew(false);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> !cellGet(hit) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        if (patBindsNameDump(a.caPat, x) || termMentionsVarDump(prog, a.caBody, x)) {
+                            cellSet(hit, true)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> termListMentionsVarDump(prog, args, x),
+    TmGetTag(e1) -> termMentionsVarDump(prog, e1, x),
+}
+
+def termListMentionsVarDump(prog: CoreProgram, es: List TaggedTerm, x: String): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> if (termMentionsVarDump(prog, h, x)) true else termListMentionsVarDump(prog, t, x),
+}
+
+def onlyDirectCellOpsDump(prog: CoreProgram, tm: TaggedTerm, x: String): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(y) -> y != x,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> onlyDirectCellOpsListDump(prog, es, x),
+    TmBlock(es) -> onlyDirectCellOpsListDump(prog, es, x),
+    TmMakeCls(vd, cls, body) ->
+        vd.vname != x
+        && !listContainsStrDump(cls.clsFvs, x)
+        && (match strMapGet(prog.coreFns, cls.clsEntry) {
+            Some(cfd) ->
+                !listContainsStrDump(
+                    {
+                        let rev = cellNew(Nil);
+                        let cp = cellNew(cfd.fnParams);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(pvd, pr) -> {
+                                    cellSet(rev, Cons(pvd.vname, cellGet(rev)));
+                                    cellSet(cp, pr)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellGet(rev)
+                    },
+                    x
+                ) && !termMentionsVarDump(prog, cfd.fnBody, x),
+            None -> false,
+        })
+        && onlyDirectCellOpsDump(prog, body, x),
+    TmApplyCls(fnTm, args) ->
+        onlyDirectCellOpsDump(prog, fnTm, x) && onlyDirectCellOpsListDump(prog, args, x),
+    TmApplyDir(vd, args) ->
+        if (vd.vname == "cellGet") {
+            match args {
+                Cons(a0, Nil) -> match a0.tnode {
+                    TmVar(y) -> if (y == x) true else onlyDirectCellOpsDump(prog, a0, x),
+                    _ -> onlyDirectCellOpsDump(prog, a0, x),
+                },
+                _ -> false,
+            }
+        } else if (vd.vname == "cellSet") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> match a0.tnode {
+                    TmVar(y) ->
+                        if (y == x) onlyDirectCellOpsDump(prog, a1, x)
+                        else onlyDirectCellOpsDump(prog, a0, x) && onlyDirectCellOpsDump(prog, a1, x),
+                    _ -> onlyDirectCellOpsDump(prog, a0, x) && onlyDirectCellOpsDump(prog, a1, x),
+                },
+                _ -> false,
+            }
+        } else onlyDirectCellOpsListDump(prog, args, x),
+    TmBin(_, e1, e2) ->
+        onlyDirectCellOpsDump(prog, e1, x) && onlyDirectCellOpsDump(prog, e2, x),
+    TmUn(_, e1) -> onlyDirectCellOpsDump(prog, e1, x),
+    TmLet(vd, e1, e2) ->
+        vd.vname != x && onlyDirectCellOpsDump(prog, e1, x) && onlyDirectCellOpsDump(prog, e2, x),
+    TmIf(c, t, e) ->
+        onlyDirectCellOpsDump(prog, c, x) && onlyDirectCellOpsDump(prog, t, x) && onlyDirectCellOpsDump(prog, e, x),
+    TmWhile(c, b) ->
+        onlyDirectCellOpsDump(prog, c, x) && onlyDirectCellOpsDump(prog, b, x),
+    TmMatch(s, arms) -> {
+        if (!onlyDirectCellOpsDump(prog, s, x)) false
+        else {
+            let ok = cellNew(true);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        if (patBindsNameDump(a.caPat, x) || !onlyDirectCellOpsDump(prog, a.caBody, x)) {
+                            cellSet(ok, false)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(ok)
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> onlyDirectCellOpsListDump(prog, args, x),
+    TmGetTag(e1) -> onlyDirectCellOpsDump(prog, e1, x),
+}
+
+def onlyDirectCellOpsListDump(prog: CoreProgram, es: List TaggedTerm, x: String): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> if (onlyDirectCellOpsDump(prog, h, x)) onlyDirectCellOpsListDump(prog, t, x) else false,
+}
+
+def checkStackVarInCoreDump(prog: CoreProgram, tm: TaggedTerm, x: String): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(y) -> y != x,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> checkStackVarInCoreListDump(prog, es, x),
+    TmBlock(es) -> checkStackVarInCoreListDump(prog, es, x),
+    TmMakeCls(vd, cls, body) ->
+        vd.vname != x
+        && !listContainsStrDump(cls.clsFvs, x)
+        && (match strMapGet(prog.coreFns, cls.clsEntry) {
+            Some(cfd) -> !termMentionsVarDump(prog, cfd.fnBody, x),
+            None -> false,
+        })
+        && checkStackVarInCoreDump(prog, body, x),
+    TmApplyCls(fnTm, args) ->
+        checkStackVarInCoreDump(prog, fnTm, x) && checkStackVarInCoreListDump(prog, args, x),
+    TmApplyDir(_, args) -> checkStackVarInCoreListDump(prog, args, x),
+    TmBin(_, e1, e2) ->
+        checkStackVarInCoreDump(prog, e1, x) && checkStackVarInCoreDump(prog, e2, x),
+    TmUn(_, e1) -> checkStackVarInCoreDump(prog, e1, x),
+    TmLet(vd, e1, e2) ->
+        if (vd.vname == x) {
+            match e1.tnode {
+                TmApplyDir(fvd, Cons(init, Nil)) ->
+                    fvd.vname == "cellNew"
+                    && !termMentionsVarDump(prog, init, x)
+                    && onlyDirectCellOpsDump(prog, e2, x),
+                _ -> false,
+            }
+        } else {
+            checkStackVarInCoreDump(prog, e1, x) && checkStackVarInCoreDump(prog, e2, x)
+        },
+    TmIf(c, t, e) ->
+        checkStackVarInCoreDump(prog, c, x) && checkStackVarInCoreDump(prog, t, x) && checkStackVarInCoreDump(prog, e, x),
+    TmWhile(c, b) ->
+        checkStackVarInCoreDump(prog, c, x) && checkStackVarInCoreDump(prog, b, x),
+    TmMatch(s, arms) -> {
+        if (!checkStackVarInCoreDump(prog, s, x)) false
+        else {
+            let ok = cellNew(true);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        if (patBindsNameDump(a.caPat, x) || !checkStackVarInCoreDump(prog, a.caBody, x)) {
+                            cellSet(ok, false)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(ok)
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> checkStackVarInCoreListDump(prog, args, x),
+    TmGetTag(e1) -> checkStackVarInCoreDump(prog, e1, x),
+}
+
+def checkStackVarInCoreListDump(prog: CoreProgram, es: List TaggedTerm, x: String): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> if (checkStackVarInCoreDump(prog, h, x)) checkStackVarInCoreListDump(prog, t, x) else false,
+}
+
+def collectLetCellNewCandidates(tm: TaggedTerm, seen: StrMap Bool, revOut: Cell (List String)): Void = match tm.tnode {
+    TmLet(vd, e1, e2) -> {
+        match e1.tnode {
+            TmApplyDir(fvd, Cons(_, Nil)) ->
+                if (fvd.vname == "cellNew" && !strMapContains(seen, vd.vname)) {
+                    strMapInsert(seen, vd.vname, true);
+                    cellSet(revOut, Cons(vd.vname, cellGet(revOut)))
+                } else (),
+            _ -> (),
+        };
+        collectLetCellNewCandidates(e1, seen, revOut);
+        collectLetCellNewCandidates(e2, seen, revOut)
+    },
+    TmMakeCls(_, _, body) -> collectLetCellNewCandidates(body, seen, revOut),
+    TmTuple(es) -> collectLetCellNewList(es, seen, revOut),
+    TmBlock(es) -> collectLetCellNewList(es, seen, revOut),
+    TmApplyCls(c, args) -> {
+        collectLetCellNewCandidates(c, seen, revOut);
+        collectLetCellNewList(args, seen, revOut)
+    },
+    TmApplyDir(_, args) -> collectLetCellNewList(args, seen, revOut),
+    TmBin(_, e1, e2) -> {
+        collectLetCellNewCandidates(e1, seen, revOut);
+        collectLetCellNewCandidates(e2, seen, revOut)
+    },
+    TmUn(_, e1) -> collectLetCellNewCandidates(e1, seen, revOut),
+    TmIf(c, t, e) -> {
+        collectLetCellNewCandidates(c, seen, revOut);
+        collectLetCellNewCandidates(t, seen, revOut);
+        collectLetCellNewCandidates(e, seen, revOut)
+    },
+    TmWhile(c, b) -> {
+        collectLetCellNewCandidates(c, seen, revOut);
+        collectLetCellNewCandidates(b, seen, revOut)
+    },
+    TmMatch(s, arms) -> {
+        collectLetCellNewCandidates(s, seen, revOut);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    collectLetCellNewCandidates(a.caBody, seen, revOut);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> collectLetCellNewList(args, seen, revOut),
+    TmGetTag(e1) -> collectLetCellNewCandidates(e1, seen, revOut),
+    _ -> (),
+}
+
+def collectLetCellNewList(es: List TaggedTerm, seen: StrMap Bool, revOut: Cell (List String)): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectLetCellNewCandidates(h, seen, revOut);
+        collectLetCellNewList(t, seen, revOut)
+    },
+}
+
+def collectVerifiedStackVarsForFn(prog: CoreProgram, fd: FunDef): List String =
+    match strMapGet(prog.coreEscape.escFnStackVars, fd.fnName) {
+        None -> Nil,
+        Some(stackSet) -> {
+            let paramNames: StrMap Bool = strMapNew();
+            let cp = cellNew(fd.fnParams);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(pvd, pr) -> {
+                        strMapInsert(paramNames, pvd.vname, true);
+                        cellSet(cp, pr)
+                    },
+                    Nil -> (),
+                }
+            };
+            let seen: StrMap Bool = strMapNew();
+            let revCand: Cell (List String) = cellNew(Nil);
+            collectLetCellNewCandidates(fd.fnBody, seen, revCand);
+            let cands = listRev(cellGet(revCand));
+            let revOk: Cell (List String) = cellNew(Nil);
+            let cc = cellNew(cands);
+            while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                match cellGet(cc) {
+                    Cons(vname, r) -> {
+                        if (strMapContains(stackSet, vname)
+                            && !strMapContains(paramNames, vname)
+                            && checkStackVarInCoreDump(prog, fd.fnBody, vname)) {
+                            cellSet(revOk, Cons(vname, cellGet(revOk)))
+                        } else ();
+                        cellSet(cc, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(revOk))
+        },
+    }
+
 pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
     let allReach: StrMap Bool = strMapNew();
     let dirReach: StrMap Bool = strMapNew();
@@ -1570,6 +2106,7 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
     };
 
     let funsBuf = bufNew();
+    let stackBuf = bufNew();
     let cf = cellNew(activeFnNames);
     while (match cellGet(cf) { Nil -> false, _ -> true }) {
         match cellGet(cf) {
@@ -1592,7 +2129,27 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
                                 emitCoreTyWithMode(ctx, funsBuf, retTy, rMode);
                                 bufPushByte(funsBuf, 32);
                                 emitCoreTerm(ctx, funsBuf, fd.fnBody);
-                                bufPushStr(funsBuf, ")\n")
+                                bufPushStr(funsBuf, ")\n");
+                                let svars = collectVerifiedStackVarsForFn(prog, fd);
+                                match svars {
+                                    Nil -> (),
+                                    _ -> {
+                                        bufPushStr(stackBuf, "    (fn-stack ");
+                                        pushQuotedStr(stackBuf, fd.fnName);
+                                        let cs = cellNew(svars);
+                                        while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                            match cellGet(cs) {
+                                                Cons(sv, sr) -> {
+                                                    bufPushByte(stackBuf, 32);
+                                                    pushQuotedStr(stackBuf, sv);
+                                                    cellSet(cs, sr)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        bufPushStr(stackBuf, ")\n")
+                                    },
+                                }
                             } else ()
                         },
                         None -> (),
@@ -1662,6 +2219,8 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
             bufPushStr(out, bufToString(adtsBuf));
             bufPushStr(out, "  )\n  (funs\n");
             bufPushStr(out, bufToString(funsBuf));
+            bufPushStr(out, "  )\n  (stack-allocs\n");
+            bufPushStr(out, bufToString(stackBuf));
             bufPushStr(out, "  )\n)\n");
             Ok(bufToString(out))
         },

@@ -1,11 +1,11 @@
 /-!
-# Core Geisha: Abstract Syntax, Types, Modes, Values, and Store
+# Core Geisha: Abstract Syntax, Types, Modes, Concurrency Handles, Values, and Store
 
 This module defines the formal abstract syntax of **Core Geisha**, closely
 mirroring `src/core.gsa` (`Term`, `Type`, `Pattern`, `AdtInfo`, `FunDef`) in the
 self-hosted Geisha compiler (`geisha.gsa`), while making closure capture modes
-(`Mode`), concurrent `Task` handles, mutable store locations (`Cell`), and
-runtime traps explicit.
+(`Mode`), concurrent `Task` / `MVar` / `Chan` / `Actor` handles and primitives,
+mutable store locations (`Cell`), and runtime traps explicit.
 
 ## Alignment with `src/core.gsa`
 
@@ -17,12 +17,14 @@ runtime traps explicit.
 | `TyCon adtName` | `Ty.adt name` | Monomorphized ADTs |
 | `TyComp (TyCon "Cell") t` | `Ty.cell t` | Thread-local mutable heap cells (`!Send`) |
 | `TyComp (TyCon "Task") t` | `Ty.task t` | Concurrent task handles (`Send` iff `t : Send`) |
+| `TyComp (TyCon "MVar"/"Chan"/"Actor") t` | `Ty.mvar t`, `Ty.chan t`, `Ty.actor t` | Synchronized boxes, MPMC channels, sequential actors |
 | `TmLit`, `TmVar`, `TmTuple`, `TmBlock` | `Expr.lit`, `Expr.var`, `Expr.tuple`, `Expr.block` | Core expressions |
 | `TmMakeCls`, `TmApplyCls`, `TmApplyDir` | `Expr.lam`, `Expr.apply`, `Expr.applyDir` | Strict multi-arg closures & direct calls |
 | `TmBin`, `TmUn`, `TmLet`, `TmIf`, `TmWhile` | `Expr.bin`, `Expr.un`, `Expr.let_`, `Expr.if_`, `Expr.while_` | Control flow & ops |
 | `TmMatch`, `TmMakeData`, `TmGetTag` | `Expr.match_`, `Expr.makeData`, `Expr.getTag` | ADT construction & pattern matching |
 | `cellNew`, `cellGet`, `cellSet` | `Expr.cellNew`, `Expr.cellGet`, `Expr.cellSet` | Explicit mutable store ops |
 | `__concTaskSpawn`, `__concTaskAwait` | `Expr.spawn`, `Expr.await` | Concurrent task fork/join |
+| `__concMVar*`, `__concChan*`, `__concActor*` | `Expr.concPrim` | `MVar`, `Chan`, and thread-pinned `Actor` primitives |
 -/
 
 namespace CoreGeisha
@@ -35,6 +37,13 @@ abbrev Loc := Nat
 
 /-- Runtime task identifiers for concurrent `Task` values. -/
 abbrev TaskId := Nat
+
+/-- Runtime handle kind for `MVar`, `Chan`, and `Actor` values. -/
+inductive SyncKind where
+  | mvar : SyncKind
+  | chan : SyncKind
+  | actor : SyncKind
+  deriving Repr, BEq, DecidableEq
 
 /-- Closure capture mode:
     - `local`: may capture thread-local `!Send` state (`Cell`, `local` closures); cannot cross threads.
@@ -55,6 +64,24 @@ inductive Ty where
   | adt : Ident → Ty
   | cell : Ty → Ty
   | task : Ty → Ty
+  | mvar : Ty → Ty
+  | chan : Ty → Ty
+  | actor : Ty → Ty
+  deriving Repr, BEq
+
+/-- Built-in synchronization and sequential actor operations (`std.sync`, `std.actor`). -/
+inductive ConcPrim where
+  | mvarNew : ConcPrim
+  | mvarEmpty : Ty → ConcPrim
+  | mvarTake : ConcPrim
+  | mvarPut : ConcPrim
+  | chanNew : Ty → ConcPrim
+  | chanSend : ConcPrim
+  | chanRecv : Ident → ConcPrim
+  | chanClose : ConcPrim
+  | actorSpawn : ConcPrim
+  | actorCall : ConcPrim
+  | actorSend : ConcPrim
   deriving Repr, BEq
 
 /-- Core literals (`Lit` in `src/ast.gsa`). -/
@@ -111,12 +138,13 @@ inductive Trap where
   deriving Repr, BEq, DecidableEq
 
 /-- Core Geisha expressions, mirroring `Term` in `src/core.gsa` plus runtime
-    locations, task handles, `spawn`/`await`, and traps. -/
+    locations, concurrency handles, `spawn`/`await`, `concPrim`, and traps. -/
 inductive Expr where
   | lit : Lit → Expr
   | var : Ident → Expr
   | loc : Loc → Expr
   | taskRef : TaskId → Expr
+  | syncRef : SyncKind → Nat → Expr
   | tuple : List Expr → Expr
   | block : List Expr → Expr
   | lam : Mode → List (Ident × Ty) → Ty → Expr → Expr
@@ -135,6 +163,7 @@ inductive Expr where
   | cellSet : Expr → Expr → Expr
   | spawn : Expr → Expr
   | await : Expr → Expr
+  | concPrim : ConcPrim → List Expr → Expr
   | trap : Trap → Expr
   deriving Repr
 
@@ -178,6 +207,7 @@ inductive IsValue : Expr → Prop where
   | lit (l : Lit) : IsValue (.lit l)
   | loc (l : Loc) : IsValue (.loc l)
   | taskRef (tid : TaskId) : IsValue (.taskRef tid)
+  | syncRef (k : SyncKind) (id : Nat) : IsValue (.syncRef k id)
   | lam (m : Mode) (ps : List (Ident × Ty)) (ret : Ty) (body : Expr) :
       IsValue (.lam m ps ret body)
   | tuple {es : List Expr} : (∀ e ∈ es, IsValue e) → IsValue (.tuple es)
@@ -202,6 +232,7 @@ def freeVars : Expr → List Ident
   | .var x => [x]
   | .loc _ => []
   | .taskRef _ => []
+  | .syncRef _ _ => []
   | .tuple es => freeVarsList es
   | .block es => freeVarsList es
   | .lam _ ps _ body => (freeVars body).filter (fun z => !(ps.any (fun p => p.1 == z)))
@@ -220,6 +251,7 @@ def freeVars : Expr → List Ident
   | .cellSet e1 e2 => freeVars e1 ++ freeVars e2
   | .spawn e => freeVars e
   | .await e => freeVars e
+  | .concPrim _ args => freeVarsList args
   | .trap _ => []
 
 def freeVarsList : List Expr → List Ident
@@ -240,6 +272,7 @@ def exprLocs : Expr → List Loc
   | .var _ => []
   | .loc l => [l]
   | .taskRef _ => []
+  | .syncRef _ _ => []
   | .tuple es => exprLocsList es
   | .block es => exprLocsList es
   | .lam _ _ _ body => exprLocs body
@@ -258,6 +291,7 @@ def exprLocs : Expr → List Loc
   | .cellSet e1 e2 => exprLocs e1 ++ exprLocs e2
   | .spawn e => exprLocs e
   | .await e => exprLocs e
+  | .concPrim _ args => exprLocsList args
   | .trap _ => []
 
 def exprLocsList : List Expr → List Loc
@@ -278,6 +312,7 @@ def subst (x : Ident) (v : Expr) : Expr → Expr
   | .var y => if y == x then v else .var y
   | .loc l => .loc l
   | .taskRef tid => .taskRef tid
+  | .syncRef k id => .syncRef k id
   | .tuple es => .tuple (substList x v es)
   | .block es => .block (substList x v es)
   | .lam m ps ret body =>
@@ -304,6 +339,7 @@ def subst (x : Ident) (v : Expr) : Expr → Expr
   | .cellSet e1 e2 => .cellSet (subst x v e1) (subst x v e2)
   | .spawn e => .spawn (subst x v e)
   | .await e => .await (subst x v e)
+  | .concPrim op args => .concPrim op (substList x v args)
   | .trap t => .trap t
 
 def substList (x : Ident) (v : Expr) : List Expr → List Expr
