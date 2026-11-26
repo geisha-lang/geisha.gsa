@@ -33,6 +33,7 @@ use ast.{
     Def, MkDef
 }
 use parser.parseTypeSchemeFromStr
+use diag.formatSpanDiag
 
 pub data VariantInfo {
     MkVariantInfo {
@@ -205,7 +206,7 @@ def freshModeVar(ctx: InferCtx): Type = {
 }
 
 def typeErr(sp: Span, msg: String): String =
-    "Type error at byte " + intToStr(sp.start) + ": " + msg
+    formatSpanDiag("Type error", sp, msg)
 
 // ============================================================================
 // Union-Find Style Type Substitution (`zonkType` / `unifyTypes`)

@@ -52,7 +52,7 @@ else
   STAGE0_DEP :=
 endif
 
-.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test verify-core clean
+.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle check-docs stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test verify-core clean
 
 all: stage2
 
@@ -93,6 +93,9 @@ $(RUNTIME_IOS_SIM_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitma
 
 stdlib-bundle:
 	python3 scripts/gen_stdlib.py
+
+check-docs:
+	python3 scripts/check_agent_docs.py
 
 stage0: $(BUILD_DIR)/geisha0
 
@@ -145,7 +148,7 @@ install: $(BUILD_DIR)/geisha3 $(RUNTIME_LIB) $(WASM_RT_OBJ)
 	@if [ -d "$(HOME)/.local/bin" ]; then ln -sf "$(PREFIX)/bin/geisha" "$(HOME)/.local/bin/geisha"; fi
 	@echo "Installed geisha toolchain to $(PREFIX)/bin/geisha"
 
-test: $(BUILD_DIR)/geisha2
+test: check-docs $(BUILD_DIR)/geisha2
 	CC="$(CC)" GEISHA_BIN=$(BUILD_DIR)/geisha2 GEISHA_RUNTIME=$(RUNTIME_LIB) sh tests/run_tests.sh
 
 verify-core: $(BUILD_DIR)/geisha2

@@ -50,6 +50,14 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Check Agent docs, bundles & language-change sync
+        run: |
+          make check-docs
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=50 origin "${{ github.event.pull_request.base.sha }}" || true
+            python3 scripts/check_agent_docs.py --diff "${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+          fi
+
       - name: 3-stage self-hosting bootstrap & fixed-point check
         run: make runtime wasm-runtime bootstrap
 
@@ -65,10 +73,12 @@ jobs:
           tar -xzf dist/geisha-ci-${{ matrix.label }}.tar.gz -C "$SMOKE_DIR"
           export PATH="$SMOKE_DIR/geisha-ci-${{ matrix.label }}/bin:$PATH"
           cd "$SMOKE_DIR"
+          geisha guide >/dev/null
+          geisha doc std.str >/dev/null
           geisha init smoke_app
-          (cd smoke_app && geisha run)
+          (cd smoke_app && geisha check && geisha run)
           geisha init --lib smoke_lib
-          (cd smoke_lib && geisha test)
+          (cd smoke_lib && geisha check && geisha test)
 
   formal-verification:
     name: Lean 4 Formal Proofs & Translation Validation

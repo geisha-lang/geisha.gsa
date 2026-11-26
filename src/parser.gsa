@@ -36,8 +36,9 @@ use lexer.{
     TkDef, TkExtern, TkIf, TkElse, TkWhile, TkLet, TkIn, TkType, TkData,
     TkMatch, TkConcept, TkInstance, TkForall, TkPub, TkUse, TkMod, TkOpen, TkAs,
     TkTrue, TkFalse, TkVoid, TkEof,
-    Token, MkToken, tokenize
+    Token, MkToken, tokenizeInFile
 }
+use diag.formatSpanDiag
 
 pub data Parser {
     MkParser {
@@ -108,7 +109,7 @@ def peekAt(p: Parser, offset: Int): Token =
     }
 
 def parseErr(p: Parser, msg: String): String =
-    "Parse error at byte " + intToStr(peekTok(p).span.start) + ": " + msg
+    formatSpanDiag("Parse error", peekTok(p).span, msg)
 
 def isEof(p: Parser): Bool = match peekTok(p).kind {
     TkEof -> true,
@@ -611,7 +612,7 @@ pub def parseTypeScheme(p: Parser): Result Scheme String = match peekTok(p).kind
     },
 }
 
-pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenize(src) {
+pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 0) {
     Err(_) -> ScmMono(TyVoid),
     Ok(toks) -> {
         let p = newParser(toks);
@@ -1221,7 +1222,7 @@ def consumePrefixChar(p: Parser, sym: String, tokSp: Span): Void = {
     let _ = bumpTok(p);
     if (strLen(sym) > 1) {
         let rem = strSlice(sym, 1, strLen(sym));
-        let remSp = MkSpan { start: tokSp.start + 1, end: tokSp.end };
+        let remSp = MkSpan { fileId: tokSp.fileId, start: tokSp.start + 1, end: tokSp.end };
         cellSet(p.pushedSym, Some(MkToken { kind: TkSym(rem), span: remSp, hadNewline: false }))
     } else ()
 }
@@ -1867,8 +1868,11 @@ def parseModuleItem(p: Parser): Result ModuleItem String = {
     }
 }
 
-pub def parseFileModule(src: String, modPath: List String): Result FileModule String = {
-    let toks = tokenize(src)?;
+pub def parseFileModule(src: String, modPath: List String): Result FileModule String =
+    parseFileModuleInFile(src, modPath, 0)
+
+pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): Result FileModule String = {
+    let toks = tokenizeInFile(src, fileId)?;
     let p = newParser(toks);
     let items = cellNew(Nil);
     skipSemis(p);

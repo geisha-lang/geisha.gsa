@@ -2,6 +2,36 @@
 
 use std.option.{Option, Some, None}
 
+pub def builtinModuleKeys(): List String = [
+    "std.option",
+    "std.result",
+    "std.list",
+    "std.control",
+    "std.bits",
+    "std.path",
+    "std.char",
+    "std.buf",
+    "std.str",
+    "std.vec",
+    "std.map",
+    "std.sync",
+    "std.task",
+    "std.actor",
+    "std.rand",
+    "std.math",
+    "std.generic",
+    "std.codec",
+    "std.json",
+    "std.toml",
+    "std.sha256",
+    "sys.io",
+    "sys.fs",
+    "sys.env",
+    "sys.proc",
+    "sys.time",
+    "sys.net",
+]
+
 pub def builtinModuleSource(key: String): Option String =
     if (key == "std.option") Some("// Optional value container (`std.option`)\n\npub data Option a {\n    None,\n    Some(a),\n}\n\npub def isSome(opt: Option a): Bool = match opt {\n    Some(_) -> true,\n    None -> false,\n}\n\npub def isNone(opt: Option a): Bool = match opt {\n    None -> true,\n    Some(_) -> false,\n}\n\npub def unwrapOr(opt: Option a, fallback: a): a = match opt {\n    Some(v) -> v,\n    None -> fallback,\n}\n\npub def mapOption(opt: Option a, f: a -> b): Option b = match opt {\n    Some(v) -> Some(f(v)),\n    None -> None,\n}\n\npub def andThenOption(opt: Option a, f: a -> Option b): Option b = match opt {\n    Some(v) -> f(v),\n    None -> None,\n}\n")
     else if (key == "std.result") Some("// Fallible computation result (`std.result`)\n\npub data Result a e {\n    Ok(a),\n    Err(e),\n}\n\npub def isOk(res: Result a e): Bool = match res {\n    Ok(_) -> true,\n    Err(_) -> false,\n}\n\npub def isErr(res: Result a e): Bool = match res {\n    Err(_) -> true,\n    Ok(_) -> false,\n}\n\npub def unwrapResultOr(res: Result a e, fallback: a): a = match res {\n    Ok(v) -> v,\n    Err(_) -> fallback,\n}\n\npub def mapResult(res: Result a e, f: a -> b): Result b e = match res {\n    Ok(v) -> Ok(f(v)),\n    Err(err) -> Err(err),\n}\n\npub def mapErr(res: Result a e, f: e -> e2): Result a e2 = match res {\n    Ok(v) -> Ok(v),\n    Err(err) -> Err(f(err)),\n}\n\npub def andThenResult(res: Result a e, f: a -> Result b e): Result b e = match res {\n    Ok(v) -> f(v),\n    Err(err) -> Err(err),\n}\n")

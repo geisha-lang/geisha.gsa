@@ -1,0 +1,118 @@
+// Source-mapped diagnostics (`diag`): `file:line:col` + source snippet + caret underline.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.str.intToStr
+use ast.Span
+
+pub data SourceFile {
+    MkSourceFile { sfPath: String, sfContent: String },
+}
+
+def gDiagFiles: Cell (Vec SourceFile) = cellNew(vecNew())
+
+pub def diagReset(): Void =
+    cellSet(gDiagFiles, vecNew())
+
+pub def diagRegisterFile(path: String, src: String): Int = {
+    let fs = cellGet(gDiagFiles);
+    vecPush(fs, MkSourceFile { sfPath: path, sfContent: src });
+    vecLen(fs)
+}
+
+pub def diagGetFile(fileId: Int): Option SourceFile = {
+    let fs = cellGet(gDiagFiles);
+    if (fileId <= 0 || fileId > vecLen(fs)) None
+    else Some(vecGetOr(fs, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
+}
+
+def repeatChar(ch: Int, n: Int): String = {
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        bufPushByte(b, ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+pub def formatDiagAt(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String): String =
+    match diagGetFile(fileId) {
+        None -> kind + " at byte " + intToStr(startByte) + ": " + msg,
+        Some(sf) -> {
+            let src = sf.sfContent;
+            let n = strLen(src);
+            let pos = if (startByte < 0) 0 else if (startByte > n) n else startByte;
+
+            // Compute 1-based line number and lineStart byte offset
+            let line = cellNew(1);
+            let lineStart = cellNew(0);
+            let i = cellNew(0);
+            while (cellGet(i) < pos) {
+                let idx = cellGet(i);
+                if (strByteAt(src, idx) == 10) {
+                    cellSet(line, cellGet(line) + 1);
+                    cellSet(lineStart, idx + 1)
+                } else ();
+                cellSet(i, idx + 1)
+            };
+
+            // Find end of current line
+            let ls = cellGet(lineStart);
+            let le = cellNew(pos);
+            while (cellGet(le) < n && strByteAt(src, cellGet(le)) != 10) {
+                cellSet(le, cellGet(le) + 1)
+            };
+            let lineEndRaw = cellGet(le);
+            let lineEnd =
+                if (lineEndRaw > ls && strByteAt(src, lineEndRaw - 1) == 13) lineEndRaw - 1
+                else lineEndRaw;
+
+            let col = (pos - ls) + 1;
+            let lineText = strSlice(src, ls, lineEnd);
+
+            // Preserve tabs in leading indentation before caret
+            let indentBuf = bufNew();
+            let k = cellNew(ls);
+            while (cellGet(k) < pos && cellGet(k) < lineEnd) {
+                let b = strByteAt(src, cellGet(k));
+                if (b == 9) bufPushByte(indentBuf, 9) else bufPushByte(indentBuf, 32);
+                cellSet(k, cellGet(k) + 1)
+            };
+            let colPad = bufToString(indentBuf);
+
+            let rawEnd = if (endByte > pos) endByte else pos + 1;
+            let maxEnd = if (lineEnd > pos) lineEnd else pos + 1;
+            let clampedEnd = if (rawEnd < maxEnd) rawEnd else maxEnd;
+            let uLen = if (clampedEnd > pos) clampedEnd - pos else 1;
+            let caret = "^" + repeatChar(126, if (uLen > 1) uLen - 1 else 0);
+
+            let lineStr = intToStr(cellGet(line));
+            let gutterPad = repeatChar(32, strLen(lineStr));
+
+            let out = bufNew();
+            bufPushStr(out, sf.sfPath);
+            bufPushStr(out, ":");
+            bufPushStr(out, lineStr);
+            bufPushStr(out, ":");
+            bufPushStr(out, intToStr(col));
+            bufPushStr(out, ": ");
+            bufPushStr(out, kind);
+            bufPushStr(out, ": ");
+            bufPushStr(out, msg);
+            bufPushStr(out, "\n ");
+            bufPushStr(out, lineStr);
+            bufPushStr(out, " | ");
+            bufPushStr(out, lineText);
+            bufPushStr(out, "\n ");
+            bufPushStr(out, gutterPad);
+            bufPushStr(out, " | ");
+            bufPushStr(out, colPad);
+            bufPushStr(out, caret);
+            bufToString(out)
+        },
+    }
+
+pub def formatSpanDiag(kind: String, sp: Span, msg: String): String =
+    formatDiagAt(kind, sp.fileId, sp.start, sp.end, msg)

@@ -5,15 +5,16 @@ use std.list.{listRev, listAppend, listLen}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 
 pub data Span {
-    MkSpan { start: Int, end: Int },
+    MkSpan { fileId: Int, start: Int, end: Int },
 }
 
-pub def emptySpan(): Span = MkSpan { start: 0, end: 0 }
+pub def emptySpan(): Span = MkSpan { fileId: 0, start: 0, end: 0 }
 
 pub def unionSpan(a: Span, b: Span): Span = {
+    let fid = if (a.fileId != 0) a.fileId else b.fileId;
     let s = if (a.start < b.start) a.start else b.start;
     let e = if (a.end > b.end) a.end else b.end;
-    MkSpan { start: s, end: e }
+    MkSpan { fileId: fid, start: s, end: e }
 }
 
 pub data Visibility {

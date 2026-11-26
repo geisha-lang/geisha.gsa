@@ -6,6 +6,7 @@ use std.vec.{Vec, vecNew, vecPush}
 use std.buf.{StringBuf, bufNew, bufClear, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.{Span, MkSpan}
+use diag.formatDiagAt
 
 pub data TokKind {
     TkIdent(String),
@@ -58,7 +59,7 @@ pub def isOpByte(b: Int): Bool =
     || b == 60 || b == 61 || b == 62 || b == 63 || b == 64
     || b == 92 || b == 94 || b == 124 || b == 126
 
-def unescapeByte(esc: Int, pos: Int): Result Int String =
+def unescapeByte(esc: Int, fileId: Int, pos: Int): Result Int String =
     if (esc == 110) Ok(10)
     else if (esc == 114) Ok(13)
     else if (esc == 116) Ok(9)
@@ -66,7 +67,7 @@ def unescapeByte(esc: Int, pos: Int): Result Int String =
     else if (esc == 92) Ok(92)
     else if (esc == 34) Ok(34)
     else if (esc == 39) Ok(39)
-    else Err("Invalid escape sequence at byte " + intToStr(pos))
+    else Err(formatDiagAt("Lex error", fileId, pos, pos + 2, "invalid escape sequence"))
 
 def classifyWord(w: String): TokKind =
     if (w == "def") TkDef
@@ -95,7 +96,10 @@ def classifyWord(w: String): TokKind =
 def sliceIntoBuf(buf: StringBuf, src: String, start: Int, end: Int): String =
     ptrSliceFromStr(src, start, end - start)
 
-pub def tokenize(src: String): Result (Vec Token) String = {
+pub def tokenize(src: String): Result (Vec Token) String =
+    tokenizeInFile(src, 0)
+
+pub def tokenizeInFile(src: String, fileId: Int): Result (Vec Token) String = {
     let len = strLen(src);
     let out: Vec Token = vecNew();
     let tokBuf = bufNew();
@@ -133,7 +137,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     }
                 };
                 if (!cellGet(closed)) {
-                    cellSet(errMsg, "Unterminated block comment at byte " + intToStr(p));
+                    cellSet(errMsg, formatDiagAt("Lex error", fileId, p, p + 2, "unterminated block comment"));
                     cellSet(failed, true)
                 } else ()
             } else {
@@ -148,31 +152,31 @@ pub def tokenize(src: String): Result (Vec Token) String = {
 
             if (b == 40) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkLParen, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkLParen, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 41) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkRParen, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkRParen, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 123) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkLBrace, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkLBrace, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 125) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkRBrace, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkRBrace, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 91) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkLBracket, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkLBracket, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 93) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkRBracket, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkRBracket, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 44) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkComma, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkComma, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 59) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkSemi, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkSemi, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (b == 46) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkDot, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkDot, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (isIdentStartByte(b)) {
                 cellSet(i, start + 1);
                 while (cellGet(i) < len && isIdentContByte(strByteAt(src, cellGet(i)))) {
@@ -180,7 +184,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                 };
                 let end = cellGet(i);
                 let word = sliceIntoBuf(tokBuf, src, start, end);
-                vecPush(out, MkToken { kind: classifyWord(word), span: MkSpan { start: start, end: end }, hadNewline: nl })
+                vecPush(out, MkToken { kind: classifyWord(word), span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
             } else if (isDigitByte(b)) {
                 cellSet(i, start + 1);
                 while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
@@ -212,7 +216,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                 let end = cellGet(i);
                 let rawNum = sliceIntoBuf(tokBuf, src, start, end);
                 let k = if (cellGet(isFloat)) TkFloat(rawNum) else TkInt(rawNum);
-                vecPush(out, MkToken { kind: k, span: MkSpan { start: start, end: end }, hadNewline: nl })
+                vecPush(out, MkToken { kind: k, span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
             } else if (b == 34) {
                 // String literal `"..."`
                 cellSet(i, start + 1);
@@ -226,10 +230,10 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                         cellSet(doneStr, true)
                     } else if (ch == 92) {
                         if (cur + 1 >= len) {
-                            cellSet(errMsg, "Unterminated string escape at byte " + intToStr(cur));
+                            cellSet(errMsg, formatDiagAt("Lex error", fileId, cur, cur + 1, "unterminated string escape"));
                             cellSet(failed, true)
                         } else {
-                            match unescapeByte(strByteAt(src, cur + 1), cur) {
+                            match unescapeByte(strByteAt(src, cur + 1), fileId, cur) {
                                 Ok(ub) -> {
                                     bufPushByte(sbuf, ub);
                                     cellSet(i, cur + 2)
@@ -246,26 +250,26 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     }
                 };
                 if (!cellGet(failed) && !cellGet(doneStr)) {
-                    cellSet(errMsg, "Unterminated string literal at byte " + intToStr(start));
+                    cellSet(errMsg, formatDiagAt("Lex error", fileId, start, start + 1, "unterminated string literal"));
                     cellSet(failed, true)
                 } else if (!cellGet(failed)) {
                     let end = cellGet(i);
-                    vecPush(out, MkToken { kind: TkStr(bufToString(sbuf)), span: MkSpan { start: start, end: end }, hadNewline: nl })
+                    vecPush(out, MkToken { kind: TkStr(bufToString(sbuf)), span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
                 } else ()
             } else if (b == 39) {
                 // Char literal `'a'` or `'\n'`
                 if (start + 2 >= len) {
-                    cellSet(errMsg, "Unterminated char literal at byte " + intToStr(start));
+                    cellSet(errMsg, formatDiagAt("Lex error", fileId, start, start + 1, "unterminated char literal"));
                     cellSet(failed, true)
                 } else if (strByteAt(src, start + 1) == 92) {
                     if (start + 3 >= len || strByteAt(src, start + 3) != 39) {
-                        cellSet(errMsg, "Invalid escaped char literal at byte " + intToStr(start));
+                        cellSet(errMsg, formatDiagAt("Lex error", fileId, start, start + 2, "invalid escaped char literal"));
                         cellSet(failed, true)
                     } else {
-                        match unescapeByte(strByteAt(src, start + 2), start + 1) {
+                        match unescapeByte(strByteAt(src, start + 2), fileId, start + 1) {
                             Ok(cb) -> {
                                 cellSet(i, start + 4);
-                                vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { start: start, end: start + 4 }, hadNewline: nl })
+                                vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { fileId: fileId, start: start, end: start + 4 }, hadNewline: nl })
                             },
                             Err(e) -> {
                                 cellSet(errMsg, e);
@@ -276,14 +280,14 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                 } else if (strByteAt(src, start + 2) == 39) {
                     let cb = strByteAt(src, start + 1);
                     cellSet(i, start + 3);
-                    vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { start: start, end: start + 3 }, hadNewline: nl })
+                    vecPush(out, MkToken { kind: TkChar(cb), span: MkSpan { fileId: fileId, start: start, end: start + 3 }, hadNewline: nl })
                 } else {
-                    cellSet(errMsg, "Multi-byte or invalid char literal at byte " + intToStr(start));
+                    cellSet(errMsg, formatDiagAt("Lex error", fileId, start, start + 1, "multi-byte or invalid char literal"));
                     cellSet(failed, true)
                 }
             } else if (b == 63 && !(start + 1 < len && (strByteAt(src, start + 1) == 63 || strByteAt(src, start + 1) == 62 || strByteAt(src, start + 1) == 61 || strByteAt(src, start + 1) == 58))) {
                 cellSet(i, start + 1);
-                vecPush(out, MkToken { kind: TkQuestion, span: MkSpan { start: start, end: start + 1 }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkQuestion, span: MkSpan { fileId: fileId, start: start, end: start + 1 }, hadNewline: nl })
             } else if (isOpByte(b)) {
                 cellSet(i, start + 1);
                 let keepOp = cellNew(true);
@@ -300,9 +304,9 @@ pub def tokenize(src: String): Result (Vec Token) String = {
                     }
                 };
                 let end = cellGet(i);
-                vecPush(out, MkToken { kind: TkSym(sliceIntoBuf(tokBuf, src, start, end)), span: MkSpan { start: start, end: end }, hadNewline: nl })
+                vecPush(out, MkToken { kind: TkSym(sliceIntoBuf(tokBuf, src, start, end)), span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
             } else {
-                cellSet(errMsg, "Unexpected character (ASCII " + intToStr(b) + ") at byte " + intToStr(start));
+                cellSet(errMsg, formatDiagAt("Lex error", fileId, start, start + 1, "unexpected character (ASCII " + intToStr(b) + ")"));
                 cellSet(failed, true)
             }
         } else ()
@@ -310,7 +314,7 @@ pub def tokenize(src: String): Result (Vec Token) String = {
 
     if (cellGet(failed)) Err(cellGet(errMsg))
     else {
-        vecPush(out, MkToken { kind: TkEof, span: MkSpan { start: len, end: len }, hadNewline: true });
+        vecPush(out, MkToken { kind: TkEof, span: MkSpan { fileId: fileId, start: len, end: len }, hadNewline: true });
         Ok(out)
     }
 }

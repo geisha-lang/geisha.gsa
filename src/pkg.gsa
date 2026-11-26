@@ -1812,7 +1812,7 @@ def mergeTargetConfigs(
     }
 }
 
-def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
+pub def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
     let out = cellNew(Nil);
     let cur = cellNew(resolved);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -1832,7 +1832,7 @@ def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
     cellGet(out)
 }
 
-def resolveDefaultEntryFile(projectDir: String, mf: Manifest): Result String String =
+pub def resolveDefaultEntryFile(projectDir: String, mf: Manifest): Result String String =
     match mf.mfEntry {
         Some(rel) -> {
             let p = if (isAbsPath(rel)) rel else pathJoin(projectDir, rel);

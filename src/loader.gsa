@@ -37,7 +37,8 @@ use ast.{
     ModuleItem, ModDef, ModUse, ModSub, ModDecl,
     listContainsStr, addUniqueStr
 }
-use parser.{parseFileModule, defContainsTry, desugarTryInDef}
+use parser.{parseFileModuleInFile, defContainsTry, desugarTryInDef}
+use diag.diagRegisterFile
 use stdlib_bundle.builtinModuleSource
 
 pub data PkgSpec {
@@ -225,8 +226,9 @@ def loadCanonicalFileModRec(
         Err("Circular module dependency involving '" + canonicalKey + "'")
     } else {
         let src = readFile(fpath)?;
+        let fid = diagRegisterFile(fpath, src);
         let keySegs = if (canonicalKey == "") Nil else strSplitChar(canonicalKey, '.');
-        let fm = parseFileModule(src, keySegs)?;
+        let fm = parseFileModuleInFile(src, keySegs, fid)?;
         let inlines: Cell (List LoadedMod) = cellNew(Nil);
         let (defs, imps, subs) = extractModuleItems(pkg.pkgId, keySegs, fm.items, inlines);
         let loaded = MkLoadedMod {
@@ -658,8 +660,9 @@ def loadAllReachableModules(
                             if (!strMapContains(cache, bkey)) {
                                 match builtinModuleSource(bkey) {
                                     Some(bsrc) -> {
+                                        let bfid = diagRegisterFile("<builtin>/" + bkey, bsrc);
                                         let bsegs = strSplitChar(bkey, '.');
-                                        match parseFileModule(bsrc, bsegs) {
+                                        match parseFileModuleInFile(bsrc, bsegs, bfid) {
                                             Ok(fm) -> {
                                                 let inlines: Cell (List LoadedMod) = cellNew(Nil);
                                                 let (defs, imps, subs) = extractModuleItems("__stdlib", bsegs, fm.items, inlines);
@@ -1904,13 +1907,23 @@ pub def loadSingleSourceProgramWithPkgs(
     rootPkg: PkgSpec,
     extPkgs: List PkgSpec,
     libPaths: List String
+): Result (List Def) String =
+    loadSingleSourceProgramWithPkgsNamed("<input>", src, rootPkg, extPkgs, libPaths)
+
+pub def loadSingleSourceProgramWithPkgsNamed(
+    entryName: String,
+    src: String,
+    rootPkg: PkgSpec,
+    extPkgs: List PkgSpec,
+    libPaths: List String
 ): Result (List Def) String = {
     let pkgMap = buildPkgMap(rootPkg, extPkgs);
     let cache: StrMap LoadedMod = strMapNew();
     let orderKeys: Vec String = vecNew();
     let legacyLibRoots: StrMap Bool = strMapNew();
 
-    let fm = parseFileModule(src, Nil)?;
+    let fid = diagRegisterFile(entryName, src);
+    let fm = parseFileModuleInFile(src, Nil, fid)?;
     let inlines: Cell (List LoadedMod) = cellNew(Nil);
     let (defs, imps, subs) = extractModuleItems("", Nil, fm.items, inlines);
     strMapInsert(cache, "", MkLoadedMod {

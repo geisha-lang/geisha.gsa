@@ -7,6 +7,7 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.{strStartsWith, strIndexOfByte, strJoin, intToStr}
 use std.path.{pathStem, pathJoin, pathDirname}
 use sys.env.{argCount, argAt, getEnv}
@@ -16,16 +17,17 @@ use sys.proc.{exit, shell}
 use ast.addUniqueStr
 use loader.{
     PkgSpec, MkPkgSpec,
-    loadSingleSourceProgramWithPkgs, loadProjectProgramWithPkgs,
-    loadSingleSourceProgramWithLibs, loadProjectProgramWithLibs
+    loadSingleSourceProgramWithPkgsNamed, loadProjectProgramWithPkgs
 }
 use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.emitProgramLlvmIrOpts
+use doc.cmdDoc
+use guide_bundle.embeddedAgentGuide
 use pkg.{
     NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
-    shellQuote, geishaHomeDir, findProjectRoot,
+    shellQuote, geishaHomeDir, findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, resolveDefaultEntryFile,
     cmdInit, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
 }
 
@@ -67,6 +69,7 @@ data CliOpts {
         optDepFlags: List (String, String, String),
         optRuntime: Option String,
         optInput: Option String,
+        optJson: Bool,
         optHelp: Bool,
     },
 }
@@ -78,8 +81,11 @@ def isSubcommandWord(w: String): Bool =
     || w == "fetch"
     || w == "update"
     || w == "build"
+    || w == "check"
     || w == "run"
     || w == "test"
+    || w == "doc"
+    || w == "guide"
 
 def parsePkgFlagSpec(spec: String): Result (String, String) String =
     match strIndexOfByte(spec, 61, 0) {
@@ -115,8 +121,13 @@ def parseCliArgs(): Result CliOpts String = {
         let noMain = cellNew(false);
         let bootSym: Cell (Option String) = cellNew(None);
         let outPath: Cell (Option String) = cellNew(None);
+        let srcRoot: Cell (Option String) = cellNew(None);
+        let libPathsRev: Cell (List String) = cellNew(Nil);
+        let pkgFlagsRev: Cell (List (String, String)) = cellNew(Nil);
+        let depFlagsRev: Cell (List (String, String, String)) = cellNew(Nil);
         let rtPath: Cell (Option String) = cellNew(None);
         let inPath: Cell (Option String) = cellNew(None);
+        let jsonOut = cellNew(false);
         let showHelp = cellNew(false);
         let restArgsRev: Cell (List String) = cellNew(Nil);
         let afterDashDash = cellNew(false);
@@ -125,7 +136,7 @@ def parseCliArgs(): Result CliOpts String = {
         let i = cellNew(2);
         while (cellGet(i) < argc && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
             let a = argAt(cellGet(i));
-            if (cellGet(afterDashDash) || sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update") {
+            if (cellGet(afterDashDash) || sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "guide") {
                 if (!cellGet(afterDashDash) && (a == "-h" || a == "--help")) {
                     cellSet(showHelp, true)
                 } else {
@@ -137,6 +148,9 @@ def parseCliArgs(): Result CliOpts String = {
                 cellSet(i, cellGet(i) + 1)
             } else if (a == "-h" || a == "--help") {
                 cellSet(showHelp, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--json") {
+                cellSet(jsonOut, true);
                 cellSet(i, cellGet(i) + 1)
             } else if (a == "-e" || a == "--emit-llvm") {
                 cellSet(emitIr, true);
@@ -166,10 +180,37 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "-o" || a == "--output") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing argument after '" + a + "'"))
                 else { cellSet(outPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+            } else if (a == "--src-root") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing directory after '--src-root'"))
+                else { cellSet(srcRoot, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+            } else if (a == "-L" || a == "--lib-path") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing directory after '" + a + "'"))
+                else { cellSet(libPathsRev, Cons(argAt(cellGet(i) + 1), cellGet(libPathsRev))); cellSet(i, cellGet(i) + 2) }
+            } else if (strStartsWith(a, "-L") && strLen(a) > 2) {
+                cellSet(libPathsRev, Cons(strSlice(a, 2, strLen(a)), cellGet(libPathsRev)));
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--pkg") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing '<id>=<dir>' after '--pkg'"))
+                else {
+                    match parsePkgFlagSpec(argAt(cellGet(i) + 1)) {
+                        Ok(pair) -> cellSet(pkgFlagsRev, Cons(pair, cellGet(pkgFlagsRev))),
+                        Err(e) -> cellSet(errOpt, Some(e)),
+                    };
+                    cellSet(i, cellGet(i) + 2)
+                }
+            } else if (a == "--dep") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing '[from:]<alias>=<id>' after '--dep'"))
+                else {
+                    match parseDepFlagSpec(argAt(cellGet(i) + 1)) {
+                        Ok(triple) -> cellSet(depFlagsRev, Cons(triple, cellGet(depFlagsRev))),
+                        Err(e) -> cellSet(errOpt, Some(e)),
+                    };
+                    cellSet(i, cellGet(i) + 2)
+                }
             } else if (a == "--runtime") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing path after '--runtime'"))
                 else { cellSet(rtPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
-            } else if (sub == "run" && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
+            } else if ((sub == "run" || sub == "check") && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
                 cellSet(inPath, Some(a));
                 cellSet(i, cellGet(i) + 1)
             } else {
@@ -191,12 +232,13 @@ def parseCliArgs(): Result CliOpts String = {
                 optNoMain: cellGet(noMain),
                 optBootSym: cellGet(bootSym),
                 optOutPath: cellGet(outPath),
-                optSrcRoot: None,
-                optLibPaths: Nil,
-                optPkgFlags: Nil,
-                optDepFlags: Nil,
+                optSrcRoot: cellGet(srcRoot),
+                optLibPaths: listRev(cellGet(libPathsRev)),
+                optPkgFlags: listRev(cellGet(pkgFlagsRev)),
+                optDepFlags: listRev(cellGet(depFlagsRev)),
                 optRuntime: cellGet(rtPath),
                 optInput: cellGet(inPath),
+                optJson: cellGet(jsonOut),
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -309,6 +351,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optDepFlags: listRev(cellGet(depFlagsRev)),
                 optRuntime: cellGet(rtPath),
                 optInput: cellGet(inPath),
+                optJson: false,
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -556,9 +599,89 @@ def compileWithPkgSpecsToIr(
             loadProjectProgramWithPkgs(entryFile, rootSpec, extSpecs, libPaths)?
         } else {
             let src = readFile(entryFile)?;
-            loadSingleSourceProgramWithPkgs(src, rootSpec, extSpecs, libPaths)?
+            loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
     compileLoadedDefsToIr(rawDefs, dumpCoreOpt, isWasm, exports, noMain, bootSymOpt)
+}
+
+def jsonEscapeStr(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let ch = strByteAt(s, idx);
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else bufPushByte(b, ch);
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+def checkProgramFrontEnd(
+    entryFile: String,
+    useProjectLoader: Bool,
+    rootSpec: PkgSpec,
+    extSpecs: List PkgSpec,
+    libPaths: List String
+): Result Void String = {
+    let rawDefs =
+        if (useProjectLoader) {
+            loadProjectProgramWithPkgs(entryFile, rootSpec, extSpecs, libPaths)?
+        } else {
+            let src = readFile(entryFile)?;
+            loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
+        };
+    let inf = inferProgram(rawDefs)?;
+    let _ = lowerToCore(inf)?;
+    Ok(())
+}
+
+def runCheckSubcmd(opts: CliOpts): Result Int String = {
+    let (entryLabel, res) = match opts.optInput {
+        Some(inputFile) -> {
+            let useProjLoader = match opts.optSrcRoot { Some(_) -> true, None -> false };
+            let (rootSpec, extSpecs) = buildCliPkgGraph(inputFile, opts.optSrcRoot, opts.optPkgFlags, opts.optDepFlags);
+            (inputFile, checkProgramFrontEnd(inputFile, useProjLoader, rootSpec, extSpecs, opts.optLibPaths))
+        },
+        None -> match findProjectRoot(".") {
+            None -> ("<project>", Err("no geisha.toml found and no .gsa file specified (usage: geisha check [file.gsa] [--json])")),
+            Some(projDir) -> match resolveProjectGraph(projDir, false, None, true) {
+                Err(e) -> (projDir, Err(e)),
+                Ok((rootMf, rootSpec, resolvedPkgs)) -> match resolveDefaultEntryFile(projDir, rootMf) {
+                    Err(e) -> (projDir, Err(e)),
+                    Ok(entryFile) -> {
+                        let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
+                        (entryFile, checkProgramFrontEnd(entryFile, true, rootSpec, extSpecs, opts.optLibPaths))
+                    },
+                },
+            },
+        },
+    };
+    if (opts.optJson) {
+        match res {
+            Ok(_) -> {
+                printLn("{\"ok\":true,\"file\":\"" + jsonEscapeStr(entryLabel) + "\"}");
+                Ok(0)
+            },
+            Err(msg) -> {
+                printLn("{\"ok\":false,\"file\":\"" + jsonEscapeStr(entryLabel) + "\",\"error\":\"" + jsonEscapeStr(msg) + "\"}");
+                Ok(1)
+            },
+        }
+    } else {
+        match res {
+            Ok(_) -> {
+                printLn("OK: " + entryLabel);
+                Ok(0)
+            },
+            Err(msg) -> Err(msg),
+        }
+    }
 }
 
 def emitNativeExecutableFromIr(
@@ -842,8 +965,11 @@ def printUsage(): Void = {
     printLn("  geisha fetch                   Materialize dependencies into ~/.geisha/cache");
     printLn("  geisha update [alias]          Re-resolve remote tags/revs and update geisha.lock");
     printLn("  geisha build [options]         Compile current geisha.toml project");
+    printLn("  geisha check [file.gsa]        Fast frontend type/exhaustiveness/Send check (--json)");
     printLn("  geisha run [file.gsa] [-- ..]  Build & run current project or standalone .gsa file");
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
+    printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
+    printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
     printLn("");
     printLn("Direct Compiler Usage:");
     printLn("  geisha [options] <input.gsa>");
@@ -899,8 +1025,11 @@ def runDriver(): Result Int String = {
                 )?;
                 Ok(0)
             },
+            Some("check") -> runCheckSubcmd(opts),
             Some("run") -> cmdRun(opts.optSubArgs, opts.optInput, opts.optRuntime, cbs),
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
+            Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
+            Some("guide") -> { printLn(embeddedAgentGuide()); Ok(0) },
             Some(other) -> Err("unknown subcommand: " + other),
             None -> {
                 let inputFile = match opts.optInput {

@@ -1901,4 +1901,73 @@ EOF
 "$GEISHA_BIN" -o "$TMP_DIR/t30_generic_derive" "$TMP_DIR/t30_generic_derive.gsa"
 assert_eq "generic_zero_keyword_derive" "22|55|1|1|1|w,b" "$("$TMP_DIR/t30_generic_derive")"
 
+# 31. Agent Tooling: `geisha guide`, `geisha doc`, `geisha check` (--json), & `file:line:col` Caret Diagnostics
+GUIDE_OUT="$("$GEISHA_BIN" guide)"
+if ! printf '%s' "$GUIDE_OUT" | grep -q "Top LLM Pitfalls"; then
+    echo "FAIL [geisha_guide]: expected embedded Agent Guide output" >&2
+    exit 1
+fi
+DOC_LIST="$("$GEISHA_BIN" doc)"
+if ! printf '%s' "$DOC_LIST" | grep -q "std.option" || ! printf '%s' "$DOC_LIST" | grep -q "sys.fs"; then
+    echo "FAIL [geisha_doc_list]: expected std.option and sys.fs in module list" >&2
+    exit 1
+fi
+DOC_OPT="$("$GEISHA_BIN" doc std.option)"
+if ! printf '%s' "$DOC_OPT" | grep -q "pub def unwrapOr"; then
+    echo "FAIL [geisha_doc_builtin]: expected pub def unwrapOr in std.option" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t31_doc_sample.gsa" << 'EOF'
+/// Adds two integers together.
+pub def addNums(a: Int, b: Int): Int = a + b
+
+def secretHelper(x: Int): Int = x
+EOF
+DOC_FILE_PUB="$("$GEISHA_BIN" doc "$TMP_DIR/t31_doc_sample.gsa")"
+if ! printf '%s' "$DOC_FILE_PUB" | grep -q "/// Adds two integers together." || ! printf '%s' "$DOC_FILE_PUB" | grep -q "pub def addNums" || printf '%s' "$DOC_FILE_PUB" | grep -q "secretHelper"; then
+    echo "FAIL [geisha_doc_file]: expected doc comment + pub def only" >&2
+    exit 1
+fi
+DOC_FILE_ALL="$("$GEISHA_BIN" doc "$TMP_DIR/t31_doc_sample.gsa" --all)"
+if ! printf '%s' "$DOC_FILE_ALL" | grep -q "def secretHelper"; then
+    echo "FAIL [geisha_doc_all]: expected private def with --all" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/t31_ok.gsa" << 'EOF'
+def main(): Void = printLn("ok")
+EOF
+CHK_OK="$("$GEISHA_BIN" check --json "$TMP_DIR/t31_ok.gsa")"
+if ! printf '%s' "$CHK_OK" | grep -q '"ok":true'; then
+    echo "FAIL [geisha_check_ok]: expected ok:true json, got: $CHK_OK" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/t31_bad_type.gsa" << 'EOF'
+def main(): Void = {
+    let x: Int = "wrong";
+    ()
+}
+EOF
+set +e
+CHK_BAD="$("$GEISHA_BIN" check "$TMP_DIR/t31_bad_type.gsa" 2>&1)"
+CHK_BAD_RC=$?
+CHK_BAD_JSON="$("$GEISHA_BIN" check --json "$TMP_DIR/t31_bad_type.gsa")"
+CHK_BAD_JSON_RC=$?
+set -e
+if [ "$CHK_BAD_RC" -eq 0 ] || [ "$CHK_BAD_JSON_RC" -eq 0 ]; then
+    echo "FAIL [geisha_check_bad_rc]: expected non-zero exit code on type error" >&2
+    exit 1
+fi
+if ! printf '%s' "$CHK_BAD" | grep -q "t31_bad_type.gsa:2:18: Type error:" || ! printf '%s' "$CHK_BAD" | grep -q '\^~~~~~~'; then
+    echo "FAIL [geisha_diag_caret]: expected file:line:col + caret underline, got: $CHK_BAD" >&2
+    exit 1
+fi
+if ! printf '%s' "$CHK_BAD_JSON" | grep -q '"ok":false' || ! printf '%s' "$CHK_BAD_JSON" | grep -q 't31_bad_type.gsa:2:18'; then
+    echo "FAIL [geisha_check_bad_json]: expected ok:false json with line:col, got: $CHK_BAD_JSON" >&2
+    exit 1
+fi
+echo "PASS [agent_tooling_and_diagnostics]: geisha guide, doc, check (--json), and file:line:col caret diagnostics verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
