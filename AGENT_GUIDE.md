@@ -12,8 +12,10 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 3. **Fast typecheck loop (no LLVM/clang link)**:
    - `geisha check` — check current `geisha.toml` project
    - `geisha check file.gsa [--json]` — check a single file (optional `--json` output)
-4. **Run, test, build**:
-   - `geisha run [file.gsa] [-- args...]`
+4. **Run, script, test, build**:
+   - `geisha run [file.gsa] [args...]` — build & run project, or run a standalone `.gsa` script (content-hashed cache in `~/.geisha/cache/scripts/`; tracks local imports automatically; `--` before args is optional)
+   - `geisha eval '<code>' [args...]` — evaluate an inline Geisha snippet (cached)
+   - **Script mode**: standalone entry files support Unix shebang (`#!/usr/bin/env -S geisha run`) and top-level statements (`let` / expressions) without needing an explicit `def main()`
    - `geisha test`
    - `geisha build [--target native|wasm32|ios|ios-sim] [-o out]`
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`

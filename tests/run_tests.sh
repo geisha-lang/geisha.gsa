@@ -2002,4 +2002,82 @@ fi
 echo "PASS [agent_tooling_and_diagnostics]: geisha guide, doc, check (--json), and 1D file:line:col + near + hint diagnostics verified"
 PASS=$((PASS + 1))
 
+# ---- 32. Script Mode: shebang, top-level statements, cached `geisha run`, `geisha eval` ----
+SCRIPT_HOME="$TMP_DIR/script_home"
+mkdir -p "$SCRIPT_HOME"
+
+# 32a: Top-level script without `def main()` + helper def + `use` + direct arg passthrough + warm cache
+cat > "$TMP_DIR/t32_helper.gsa" << 'EOF'
+pub def tag(): String = "v1"
+EOF
+
+cat > "$TMP_DIR/t32_script.gsa" << 'EOF'
+#!/usr/bin/env -S geisha run
+use std.str.intToStr
+use sys.env.{argCount, argAt}
+use t32_helper.tag
+
+def twice(n: Int): Int = n * 2
+
+let n = 21
+let arg1 = if (argCount() > 1) argAt(1) else "none"
+printLn(tag() + ":" + intToStr(twice(n)) + ":" + arg1)
+n + 1
+EOF
+
+OUT_S1="$(HOME="$SCRIPT_HOME" "$GEISHA_BIN" run --runtime "$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --flag42)"
+if [ "$OUT_S1" != "v1:42:--flag42" ]; then
+    echo "FAIL [script_mode_cold]: expected 'v1:42:--flag42', got '$OUT_S1'" >&2
+    exit 1
+fi
+# Warm cache hit (with different arg)
+OUT_S2="$(HOME="$SCRIPT_HOME" "$GEISHA_BIN" run --runtime "$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --warm)"
+if [ "$OUT_S2" != "v1:42:--warm" ]; then
+    echo "FAIL [script_mode_warm]: expected 'v1:42:--warm', got '$OUT_S2'" >&2
+    exit 1
+fi
+# Direct executable shebang invocation (`./t32_script.gsa`)
+chmod +x "$TMP_DIR/t32_script.gsa"
+SCRIPT_BIN_DIR="$TMP_DIR/script_bin"
+mkdir -p "$SCRIPT_BIN_DIR"
+ln -sf "$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")" "$SCRIPT_BIN_DIR/geisha"
+OUT_SHEBANG="$(HOME="$SCRIPT_HOME" PATH="$SCRIPT_BIN_DIR:$PATH" GEISHA_RUNTIME="$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --shebang)"
+if [ "$OUT_SHEBANG" != "v1:42:--shebang" ]; then
+    echo "FAIL [script_mode_shebang]: expected 'v1:42:--shebang', got '$OUT_SHEBANG'" >&2
+    exit 1
+fi
+# Modify imported local dependency -> cache must automatically invalidate!
+cat > "$TMP_DIR/t32_helper.gsa" << 'EOF'
+pub def tag(): String = "v2"
+EOF
+OUT_S3="$(HOME="$SCRIPT_HOME" "$GEISHA_BIN" run --runtime "$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --after-edit)"
+if [ "$OUT_S3" != "v2:42:--after-edit" ]; then
+    echo "FAIL [script_mode_dep_invalidation]: expected 'v2:42:--after-edit', got '$OUT_S3'" >&2
+    exit 1
+fi
+
+# 32b: `geisha eval` inline snippet with args
+OUT_EVAL="$(HOME="$SCRIPT_HOME" "$GEISHA_BIN" eval --runtime "$GEISHA_RUNTIME" 'use sys.env.argAt; let x = "ok"; printLn(x + ":" + argAt(1))' hello)"
+if [ "$OUT_EVAL" != "ok:hello" ]; then
+    echo "FAIL [geisha_eval]: expected 'ok:hello', got '$OUT_EVAL'" >&2
+    exit 1
+fi
+
+# 32c: Mixing top-level script statements and explicit `def main()` must error cleanly
+cat > "$TMP_DIR/t32_mix_err.gsa" << 'EOF'
+printLn("top")
+def main(): Void = printLn("main")
+EOF
+set +e
+MIX_ERR="$("$GEISHA_BIN" check "$TMP_DIR/t32_mix_err.gsa" 2>&1)"
+MIX_RC=$?
+set -e
+if [ "$MIX_RC" -eq 0 ] || ! printf '%s' "$MIX_ERR" | grep -q 'cannot mix top-level script statements'; then
+    echo "FAIL [script_mode_mix_err]: expected error when mixing top-level stmts and def main, got: $MIX_ERR" >&2
+    exit 1
+fi
+
+echo "PASS [script_mode]: shebang, top-level statements, cached geisha run (+ dep invalidation), and geisha eval verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

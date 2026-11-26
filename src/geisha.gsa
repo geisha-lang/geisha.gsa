@@ -7,11 +7,13 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend}
+use std.vec.{vecLen, vecGetOr}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
-use std.str.{strStartsWith, strIndexOfByte, strJoin, intToStr}
+use std.str.{strStartsWith, strIndexOfByte, strSplitChar, strJoin, intToStr}
+use std.sha256.sha256Hex
 use std.path.{pathStem, pathJoin, pathDirname}
 use sys.env.{argCount, argAt, getEnv}
-use sys.fs.{readFile, writeFile, removeFile, fileExists}
+use sys.fs.{readFile, writeFile, removeFile, fileExists, mkdirAll}
 use sys.io.eprintLn
 use sys.proc.{exit, shell}
 use ast.addUniqueStr
@@ -24,7 +26,7 @@ use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.emitProgramLlvmIrOpts
 use doc.cmdDoc
-use diag.isFormattedDiag
+use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
     NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
@@ -35,6 +37,9 @@ use pkg.{
 extern "gs_sys_host_os" def c_host_os(): Ptr
 extern "gs_sys_host_arch" def c_host_arch(): Ptr
 extern "gs_sys_exe_path" def c_exe_path(): Ptr
+extern "gs_sys_file_size" def c_file_size(path: String): Int64
+extern "getpid" def c_getpid(): Int
+extern "rename" def c_rename(oldPath: String, newPath: String): Int
 
 def currentHostOs(): String = {
     let p = c_host_os();
@@ -84,6 +89,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "build"
     || w == "check"
     || w == "run"
+    || w == "eval"
     || w == "test"
     || w == "doc"
     || w == "guide"
@@ -137,8 +143,30 @@ def parseCliArgs(): Result CliOpts String = {
         let i = cellNew(2);
         while (cellGet(i) < argc && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
             let a = argAt(cellGet(i));
-            if (cellGet(afterDashDash) || sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "guide") {
-                if (!cellGet(afterDashDash) && (a == "-h" || a == "--help")) {
+            let hasRunInput = sub == "run" && match cellGet(inPath) { Some(_) -> true, None -> false };
+            if (cellGet(afterDashDash)) {
+                cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
+                cellSet(i, cellGet(i) + 1)
+            } else if (hasRunInput) {
+                if (a == "--" && match cellGet(restArgsRev) { Nil -> true, _ -> false }) {
+                    cellSet(afterDashDash, true)
+                } else {
+                    cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)))
+                };
+                cellSet(i, cellGet(i) + 1)
+            } else if (sub == "eval") {
+                if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && (a == "-h" || a == "--help")) {
+                    cellSet(showHelp, true);
+                    cellSet(i, cellGet(i) + 1)
+                } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && a == "--runtime") {
+                    if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing path after '--runtime'"))
+                    else { cellSet(rtPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+                } else {
+                    cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
+                    cellSet(i, cellGet(i) + 1)
+                }
+            } else if (sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "guide") {
+                if (a == "-h" || a == "--help") {
                     cellSet(showHelp, true)
                 } else {
                     cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)))
@@ -955,6 +983,164 @@ def makeCompileCallbacks(): CompileCallbacks = MkCompileCallbacks {
     },
 }
 
+def scriptCompilerFingerprint(rtArchive: String): String = {
+    let exePath = {
+        let p = c_exe_path();
+        if (ptrIsNull(p)) argAt(0) else ptrToString(p)
+    };
+    let exeSz = intToStr(i64ToInt(c_file_size(exePath)));
+    let rtSz = intToStr(i64ToInt(c_file_size(rtArchive)));
+    "geisha-script-v1|" + exePath + "|" + exeSz + "|" + rtArchive + "|" + rtSz
+}
+
+def verifyScriptDeps(depsPath: String): Bool = match readFile(depsPath) {
+    Err(_) -> false,
+    Ok(content) -> {
+        let lines = strSplitChar(content, '\n');
+        let cur = cellNew(lines);
+        let ok = cellNew(true);
+        while (cellGet(ok) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(line, rest) -> {
+                    if (strLen(line) > 0) {
+                        match strIndexOfByte(line, 9, 0) {
+                            Some(tabIdx) if (tabIdx > 0 && tabIdx + 1 < strLen(line)) -> {
+                                let expSha = strSlice(line, 0, tabIdx);
+                                let depPath = strSlice(line, tabIdx + 1, strLen(line));
+                                match readFile(depPath) {
+                                    Ok(depBytes) ->
+                                        if (sha256Hex(depBytes) != expSha) cellSet(ok, false) else (),
+                                    Err(_) -> cellSet(ok, false),
+                                }
+                            },
+                            _ -> cellSet(ok, false),
+                        }
+                    } else ();
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(ok)
+    },
+}
+
+def writeScriptDeps(depsPath: String, skipPath: String): Result Void String = {
+    let files = diagRegisteredFiles();
+    let n = vecLen(files);
+    let out = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let sf = vecGetOr(files, cellGet(i), MkSourceFile { sfPath: "", sfContent: "" });
+        if (sf.sfPath != skipPath && sf.sfPath != "<eval>" && strLen(sf.sfPath) > 0 && fileExists(sf.sfPath)) {
+            bufPushStr(out, sha256Hex(sf.sfContent));
+            bufPushByte(out, 9);
+            bufPushStr(out, sf.sfPath);
+            bufPushByte(out, 10)
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    writeFile(depsPath, bufToString(out))
+}
+
+def execCachedScriptBin(binPath: String, appArgs: List String): Int =
+    shell(shellQuote(binPath) + shellQuoteArgs(appArgs))
+
+def emptyPlainTargetCfg(): TargetCfg = MkTargetCfg {
+    tcCSources: Nil,
+    tcCFlags: Nil,
+    tcLinkFlags: Nil,
+    tcExtraUnits: Nil,
+    tcExports: Nil,
+    tcWebAssets: Nil,
+    tcOwnsMain: false,
+    tcBootSymbol: None,
+}
+
+def runCachedScriptFile(
+    gsaFile: String,
+    appArgs: List String,
+    rtOverrideOpt: Option String
+): Result Int String = {
+    let rtArchive = resolveRuntimeArchive(rtOverrideOpt)?;
+    let entrySrc = readFile(gsaFile)?;
+    let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
+    mkdirAll(cacheDir)?;
+    let key = strSlice(
+        sha256Hex("script\n" + scriptCompilerFingerprint(rtArchive) + "\n" + gsaFile + "\n" + entrySrc),
+        0,
+        24
+    );
+    let binPath = pathJoin(cacheDir, "s_" + key);
+    let depsPath = binPath + ".deps";
+    if (fileExists(binPath) && verifyScriptDeps(depsPath)) {
+        Ok(execCachedScriptBin(binPath, appArgs))
+    } else {
+        diagReset();
+        let rootSpec = MkPkgSpec {
+            pkgId: "",
+            pkgName: "",
+            srcRoots: [pathDirname(gsaFile)],
+            deps: Nil,
+        };
+        let llText = compileWithPkgSpecsToIr(
+            gsaFile, true, rootSpec, Nil, Nil, None, false, Nil, false, None
+        )?;
+        let tmpBin = binPath + ".tmp." + intToStr(c_getpid());
+        emitNativeExecutableFromIr(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt)?;
+        writeScriptDeps(depsPath, gsaFile)?;
+        if (c_rename(tmpBin, binPath) != 0) {
+            let _ = removeFile(tmpBin);
+            Err("failed to cache compiled script binary at '" + binPath + "'")
+        } else {
+            Ok(execCachedScriptBin(binPath, appArgs))
+        }
+    }
+}
+
+def runEvalSubcmd(rawArgs: List String, rtOverrideOpt: Option String): Result Int String =
+    match rawArgs {
+        Nil -> Err("missing code argument (usage: geisha eval '<code>' [args...])"),
+        Cons(code, rest0) -> {
+            let appArgs = match rest0 {
+                Cons("--", tail) -> tail,
+                other -> other,
+            };
+            let rtArchive = resolveRuntimeArchive(rtOverrideOpt)?;
+            let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
+            mkdirAll(cacheDir)?;
+            let key = strSlice(
+                sha256Hex("eval\n" + scriptCompilerFingerprint(rtArchive) + "\n" + code),
+                0,
+                24
+            );
+            let binPath = pathJoin(cacheDir, "e_" + key);
+            let depsPath = binPath + ".deps";
+            if (fileExists(binPath) && verifyScriptDeps(depsPath)) {
+                Ok(execCachedScriptBin(binPath, appArgs))
+            } else {
+                diagReset();
+                let rootSpec = MkPkgSpec {
+                    pkgId: "",
+                    pkgName: "",
+                    srcRoots: ["."],
+                    deps: Nil,
+                };
+                let rawDefs = loadSingleSourceProgramWithPkgsNamed("<eval>", code, rootSpec, Nil, Nil)?;
+                let llText = compileLoadedDefsToIr(rawDefs, None, false, Nil, false, None)?;
+                let tmpBin = binPath + ".tmp." + intToStr(c_getpid());
+                emitNativeExecutableFromIr(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt)?;
+                writeScriptDeps(depsPath, "<eval>")?;
+                if (c_rename(tmpBin, binPath) != 0) {
+                    let _ = removeFile(tmpBin);
+                    Err("failed to cache compiled eval binary at '" + binPath + "'")
+                } else {
+                    Ok(execCachedScriptBin(binPath, appArgs))
+                }
+            }
+        },
+    }
+
 def printUsage(): Void = {
     printLn("geisha — Self-hosting Geisha compiler & decentralized package manager");
     printLn("");
@@ -967,7 +1153,8 @@ def printUsage(): Void = {
     printLn("  geisha update [alias]          Re-resolve remote tags/revs and update geisha.lock");
     printLn("  geisha build [options]         Compile current geisha.toml project");
     printLn("  geisha check [file.gsa]        Fast frontend type/exhaustiveness/Send check (--json)");
-    printLn("  geisha run [file.gsa] [-- ..]  Build & run current project or standalone .gsa file");
+    printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
+    printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
     printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
     printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
@@ -1027,7 +1214,11 @@ def runDriver(): Result Int String = {
                 Ok(0)
             },
             Some("check") -> runCheckSubcmd(opts),
-            Some("run") -> cmdRun(opts.optSubArgs, opts.optInput, opts.optRuntime, cbs),
+            Some("run") -> match opts.optInput {
+                Some(gsaFile) -> runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime),
+                None -> cmdRun(opts.optSubArgs, None, opts.optRuntime, cbs),
+            },
+            Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
             Some("guide") -> { printLn(embeddedAgentGuide()); Ok(0) },

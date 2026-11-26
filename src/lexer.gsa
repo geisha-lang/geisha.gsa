@@ -107,6 +107,14 @@ pub def tokenizeInFile(src: String, fileId: Int): Result (Vec Token) String = {
     let errMsg = cellNew("");
     let failed = cellNew(false);
 
+    // Skip optional Unix shebang (`#!...`) on line 1 while preserving line numbers
+    if (len >= 2 && strByteAt(src, 0) == 35 && strByteAt(src, 1) == 33) {
+        cellSet(i, 2);
+        while (cellGet(i) < len && strByteAt(src, cellGet(i)) != 10) {
+            cellSet(i, cellGet(i) + 1)
+        }
+    } else ();
+
     while (cellGet(i) < len && !cellGet(failed)) {
         let sawNl = cellNew(false);
         let skipping = cellNew(true);

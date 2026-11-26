@@ -1881,6 +1881,103 @@ def parseModuleItem(p: Parser): Result ModuleItem String = {
     }
 }
 
+def isTopLevelModuleItemStart(p: Parser): Bool = match peekTok(p).kind {
+    TkPub -> true,
+    TkUse -> true,
+    TkOpen -> true,
+    TkMod -> true,
+    TkDef -> true,
+    TkExtern -> true,
+    TkData -> true,
+    TkType -> true,
+    TkConcept -> true,
+    TkInstance -> true,
+    TkIdent(_) -> {
+        let snap = savePos(p);
+        let hit = match tryParseForwardDecl(p) {
+            Some(_) -> true,
+            None -> false,
+        };
+        restorePos(p, snap);
+        hit
+    },
+    TkLParen -> {
+        let snap = savePos(p);
+        let hit = match tryParseForwardDecl(p) {
+            Some(_) -> true,
+            None -> false,
+        };
+        restorePos(p, snap);
+        hit
+    },
+    _ -> false,
+}
+
+def eatScriptStmtSep(p: Parser): Result Void String =
+    if (isEof(p)) Ok(())
+    else if (eatSemi(p) || peekTok(p).hadNewline) { skipSemis(p); Ok(()) }
+    else {
+        let _ = expectSym(p, ";")?;
+        Ok(())
+    }
+
+def parseTopLevelScriptStmt(p: Parser): Result BlockStmtItem String = match peekTok(p).kind {
+    TkLet -> {
+        let letSp = bumpTok(p).span;
+        let (isVar, vd, pat) = parseLetBindingHead(p)?;
+        let _ = expectSym(p, "=")?;
+        let val = parseExpr(p)?;
+        let res = match peekTok(p).kind {
+            TkIn -> {
+                let _ = bumpTok(p);
+                let body = parseExpr(p)?;
+                let fullSp = unionSpan(letSp, body.pos);
+                let eForm = if (isVar) mkForm(fullSp, ExLet(vd, val, body))
+                    else mkForm(fullSp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }]));
+                BsExpr(eForm)
+            },
+            _ -> {
+                let fullSp = unionSpan(letSp, val.pos);
+                if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val)
+            },
+        };
+        eatScriptStmtSep(p)?;
+        Ok(res)
+    },
+    _ -> {
+        let e = parseExpr(p)?;
+        eatScriptStmtSep(p)?;
+        Ok(BsExpr(e))
+    },
+}
+
+def findMainDefSpan(items: List ModuleItem): Option Span = match items {
+    Nil -> None,
+    Cons(ModDef(_, d), rest) ->
+        if (d.ident == "main") Some(d.dpos)
+        else findMainDefSpan(rest),
+    Cons(_, rest) -> findMainDefSpan(rest),
+}
+
+def normalizeScriptStmts(stmts: List BlockStmtItem): List BlockStmtItem = match listRev(stmts) {
+    Nil -> Nil,
+    Cons(lastItem, restRev) -> match lastItem {
+        BsExpr(lastE) -> {
+            let unitForm = mkForm(lastE.pos, ExLit(LitUnit));
+            let vd = MkVarDecl { vname: ".script_last", vscm: ScmSlot };
+            listRev(Cons(BsExpr(unitForm), Cons(BsLetVar(lastE.pos, vd, lastE), restRev)))
+        },
+        BsLetVar(sp, vd, val) -> {
+            let unitForm = mkForm(sp, ExLit(LitUnit));
+            listRev(Cons(BsExpr(unitForm), Cons(BsLetVar(sp, vd, val), restRev)))
+        },
+        BsLetPat(sp, pat, val) -> {
+            let unitForm = mkForm(sp, ExLit(LitUnit));
+            listRev(Cons(BsExpr(unitForm), Cons(BsLetPat(sp, pat, val), restRev)))
+        },
+    },
+}
+
 pub def parseFileModule(src: String, modPath: List String): Result FileModule String =
     parseFileModuleInFile(src, modPath, 0)
 
@@ -1888,16 +1985,43 @@ pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): R
     let toks = tokenizeInFile(src, fileId)?;
     let p = newParser(toks);
     let items = cellNew(Nil);
+    let scriptStmts: Cell (List BlockStmtItem) = cellNew(Nil);
+    let allowTopStmts = match modPath { Nil -> true, _ -> false };
     skipSemis(p);
     while (!isEof(p)) {
-        let item = parseModuleItem(p)?;
-        cellSet(items, listAppend(cellGet(items), [item]));
-        let pend = cellGet(p.pendingItems);
-        cellSet(p.pendingItems, Nil);
-        cellSet(items, listAppend(cellGet(items), pend));
-        skipSemis(p)
+        if (allowTopStmts && !isTopLevelModuleItemStart(p)) {
+            let st = parseTopLevelScriptStmt(p)?;
+            cellSet(scriptStmts, listAppend(cellGet(scriptStmts), [st]))
+        } else {
+            let item = parseModuleItem(p)?;
+            cellSet(items, listAppend(cellGet(items), [item]));
+            let pend = cellGet(p.pendingItems);
+            cellSet(p.pendingItems, Nil);
+            cellSet(items, listAppend(cellGet(items), pend));
+            skipSemis(p)
+        }
     };
-    Ok(MkFileModule { modPath: modPath, items: cellGet(items) })
+    match cellGet(scriptStmts) {
+        Nil -> Ok(MkFileModule { modPath: modPath, items: cellGet(items) }),
+        stmts -> match findMainDefSpan(cellGet(items)) {
+            Some(mainSp) -> Err(formatSpanDiag("Parse error", mainSp, "cannot mix top-level script statements with an explicit `def main`")),
+            None -> {
+                let normStmts = normalizeScriptStmts(stmts);
+                let bodyForm = foldBlockItems(normStmts)?;
+                let mainForm = mkForm(bodyForm.pos, ExAbs(Nil, Some(TyVoid), bodyForm));
+                let mainDef = MkDef {
+                    ident: "main",
+                    dpos: bodyForm.pos,
+                    vis: VisPrivate,
+                    item: ItForm(mainForm),
+                };
+                Ok(MkFileModule {
+                    modPath: modPath,
+                    items: listAppend(cellGet(items), [ModDef(VisPrivate, mainDef)]),
+                })
+            },
+        },
+    }
 }
 
 // ============================================================================

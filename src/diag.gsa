@@ -33,6 +33,9 @@ pub def diagGetFile(fileId: Int): Option SourceFile = {
     else Some(vecGetOr(fs, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
 }
 
+pub def diagRegisteredFiles(): Vec SourceFile =
+    cellGet(gDiagFiles)
+
 def shortDiagKind(kind: String): String =
     if (kind == "Type error") "type"
     else if (kind == "Parse error") "syntax"
