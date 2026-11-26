@@ -312,22 +312,15 @@ sed "s|TMP_FS_DIR_PLACEHOLDER|$TMP_DIR/fs_test|g" "$TMP_DIR/t8_sys_rand.gsa" > "
 "$GEISHA_BIN" -o "$TMP_DIR/t8_sys_rand" "$TMP_DIR/t8_sys_rand_run.gsa"
 assert_eq "sys_fs_time_and_std_rand" "1111" "$("$TMP_DIR/t8_sys_rand")"
 
-# 9. `sys.net` + `std.ws`: RFC 6455 Handshake & Concurrent Loopback WebSocket + JSON Echo
-cat > "$TMP_DIR/t9_ws_loopback.gsa" << 'EOF'
+# 9. `sys.net`: Concurrent Loopback TCP + JSON Echo
+cat > "$TMP_DIR/t9_tcp_loopback.gsa" << 'EOF'
 use std.result.{Ok, Err}
 use std.task.{spawn, await}
 use std.codec.{object, (:=), at, str}
 use std.json.{toJson, decodeString}
-use sys.net.{tcpListen, tcpLocalPort, tcpAccept, tcpCloseListener}
-use std.ws.{
-    WsText, WsClose, wsAcceptKey, wsAccept, wsConnect,
-    wsRecv, wsSendText, wsSendTextMasked, wsSendClose, wsClose
-}
+use sys.net.{tcpListen, tcpLocalPort, tcpAccept, tcpConnect, tcpRead, tcpWrite, tcpClose, tcpCloseListener}
 
 def main() = {
-    // RFC 6455 Section 1.3 official test vector
-    let keyCheck = wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ==");
-
     let listener = match tcpListen("127.0.0.1", 0) {
         Ok(l) -> l,
         Err(e) -> { printLn("LISTEN_ERR:" + e); l_fail() },
@@ -337,50 +330,45 @@ def main() = {
     let srv = spawn(() -> {
         let res = match tcpAccept(listener) {
             Err(e) -> "ACCEPT_ERR:" + e,
-            Ok(stream) -> match wsAccept(stream) {
-                Err(e) -> "WS_ACCEPT_ERR:" + e,
-                Ok(conn) -> {
-                    let out = match wsRecv(conn) {
-                        Ok(WsText(msg)) -> match decodeString(at("msg", str), msg) {
-                            Ok(word) -> {
-                                let reply = toJson(object(["echo" := word + "!"]));
-                                let _ = wsSendText(conn, reply);
-                                "srv-ok"
-                            },
-                            Err(_) -> "decode-err",
+            Ok(stream) -> {
+                let out = match tcpRead(stream, 4096) {
+                    Ok(msg) -> match decodeString(at("msg", str), msg) {
+                        Ok(word) -> {
+                            let reply = toJson(object(["echo" := word + "!"]));
+                            let _ = tcpWrite(stream, reply);
+                            "srv-ok"
                         },
-                        _ -> "recv-err",
-                    };
-                    let _ = wsRecv(conn);
-                    wsClose(conn);
-                    out
-                },
+                        Err(_) -> "decode-err",
+                    },
+                    Err(_) -> "recv-err",
+                };
+                tcpClose(stream);
+                out
             },
         };
         tcpCloseListener(listener);
         res
     });
 
-    let cliRes = match wsConnect("127.0.0.1", port, "/ws") {
+    let cliRes = match tcpConnect("127.0.0.1", port) {
         Err(e) -> "CLI_CONN_ERR:" + e,
         Ok(conn) -> {
             let payload = toJson(object(["msg" := "tingfeng"]));
-            let _ = wsSendTextMasked(conn, payload);
-            let got = match wsRecv(conn) {
-                Ok(WsText(reply)) -> match decodeString(at("echo", str), reply) {
+            let _ = tcpWrite(conn, payload);
+            let got = match tcpRead(conn, 4096) {
+                Ok(reply) -> match decodeString(at("echo", str), reply) {
                     Ok(v) -> v,
                     Err(_) -> "cli-decode-err",
                 },
-                _ -> "cli-recv-err",
+                Err(_) -> "cli-recv-err",
             };
-            let _ = wsSendClose(conn, 1000, "bye");
-            wsClose(conn);
+            tcpClose(conn);
             got
         },
     };
 
     let srvRes = await(srv);
-    printLn(keyCheck + "|" + srvRes + "|" + cliRes)
+    printLn(srvRes + "|" + cliRes)
 }
 
 def l_fail(): sys.net.TcpListener = {
@@ -388,8 +376,8 @@ def l_fail(): sys.net.TcpListener = {
     sys.net.TcpListener(-1)
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t9_ws_loopback" "$TMP_DIR/t9_ws_loopback.gsa"
-assert_eq "net_and_ws_json_loopback" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=|srv-ok|tingfeng!" "$("$TMP_DIR/t9_ws_loopback")"
+"$GEISHA_BIN" -o "$TMP_DIR/t9_tcp_loopback" "$TMP_DIR/t9_tcp_loopback.gsa"
+assert_eq "sys_net_tcp_json_loopback" "srv-ok|tingfeng!" "$("$TMP_DIR/t9_tcp_loopback")"
 
 # 10. Superclasses (`Functor -> Applicative -> Monad`), Multi-Param Concepts & FunDeps (`MonadState s m | m -> s`), and HKT Kinds
 cat > "$TMP_DIR/t10_mtl.gsa" << 'EOF'

@@ -28,7 +28,6 @@ MODULES = [
     ("std.json", "std/json.gsa"),
     ("std.toml", "std/toml.gsa"),
     ("std.sha256", "std/sha256.gsa"),
-    ("std.ws", "std/ws.gsa"),
     ("sys.io", "sys/io.gsa"),
     ("sys.fs", "sys/fs.gsa"),
     ("sys.env", "sys/env.gsa"),
