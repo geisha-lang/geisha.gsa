@@ -201,12 +201,25 @@ def moduleUsesTry(defs: List (Visibility, Def)): Bool = match defs {
     Cons((_, d), r) -> if (defContainsTry(d)) true else moduleUsesTry(r),
 }
 
-def loadBuiltinImports(cache: StrMap LoadedMod, orderKeys: Vec String): Result Void String = {
+def findLibRootForMod(libPaths: List String, segs: List String): Option String = match libPaths {
+    Nil -> None,
+    Cons(root, rest) -> match resolveModFilePath(root, segs) {
+        Some(_) -> Some(root),
+        None -> findLibRootForMod(rest, segs),
+    },
+}
+
+def loadBuiltinAndLibImports(
+    cache: StrMap LoadedMod,
+    orderKeys: Vec String,
+    libPaths: List String
+): Result Void String = {
     let keepGoing = cellNew(true);
     let errCell: Cell (Option String) = cellNew(None);
 
     while (cellGet(keepGoing) && match cellGet(errCell) { None -> true, Some(_) -> false }) {
-        let needed = cellNew(Nil);
+        let neededBuiltins = cellNew(Nil);
+        let neededLibs = cellNew(Nil);
         let n = vecLen(orderKeys);
         let i = cellNew(0);
         while (cellGet(i) < n) {
@@ -214,7 +227,7 @@ def loadBuiltinImports(cache: StrMap LoadedMod, orderKeys: Vec String): Result V
             match strMapGet(cache, k) {
                 Some(m) -> {
                     if (!strMapContains(cache, "std.result") && moduleUsesTry(m.defs)) {
-                        cellSet(needed, addUniqueStr(cellGet(needed), "std.result"))
+                        cellSet(neededBuiltins, addUniqueStr(cellGet(neededBuiltins), "std.result"))
                     } else ();
                     let curImp = cellNew(m.imports);
                     while (match cellGet(curImp) { Nil -> false, _ -> true }) {
@@ -223,8 +236,11 @@ def loadBuiltinImports(cache: StrMap LoadedMod, orderKeys: Vec String): Result V
                                 let target = importTargetModuleKey(u);
                                 if (target != "" && !strMapContains(cache, target)) {
                                     match builtinModuleSource(target) {
-                                        Some(_) -> cellSet(needed, addUniqueStr(cellGet(needed), target)),
-                                        None -> (),
+                                        Some(_) -> cellSet(neededBuiltins, addUniqueStr(cellGet(neededBuiltins), target)),
+                                        None -> match findLibRootForMod(libPaths, strSplitChar(target, '.')) {
+                                            Some(_) -> cellSet(neededLibs, addUniqueStr(cellGet(neededLibs), target)),
+                                            None -> (),
+                                        },
                                     }
                                 } else ();
                                 cellSet(curImp, r)
@@ -238,40 +254,63 @@ def loadBuiltinImports(cache: StrMap LoadedMod, orderKeys: Vec String): Result V
             cellSet(i, cellGet(i) + 1)
         };
 
-        match cellGet(needed) {
-            Nil -> cellSet(keepGoing, false),
-            reqList -> {
-                let curReq = cellNew(reqList);
-                while (match cellGet(curReq) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
-                    match cellGet(curReq) {
-                        Cons(bkey, r) -> {
-                            match builtinModuleSource(bkey) {
-                                Some(bsrc) -> {
-                                    let bsegs = strSplitChar(bkey, '.');
-                                    match parseFileModule(bsrc, bsegs) {
-                                        Ok(fm) -> {
-                                            let inlines: Cell (List LoadedMod) = cellNew(Nil);
-                                            let (defs, imps, subs) = extractModuleItems(bsegs, fm.items, inlines);
-                                            strMapInsert(cache, bkey, MkLoadedMod {
-                                                key: bkey,
-                                                modPath: bsegs,
-                                                defs: defs,
-                                                imports: imps,
-                                                submodules: subs,
-                                            });
-                                            vecPush(orderKeys, bkey)
-                                        },
-                                        Err(e) -> cellSet(errCell, Some("Stdlib '" + bkey + "': " + e)),
-                                    }
-                                },
-                                None -> (),
-                            };
-                            cellSet(curReq, r)
-                        },
-                        Nil -> (),
-                    }
+        let bReqs = cellGet(neededBuiltins);
+        let lReqs = cellGet(neededLibs);
+        let hasAny = match (bReqs, lReqs) {
+            (Nil, Nil) -> false,
+            _ -> true,
+        };
+        if (!hasAny) {
+            cellSet(keepGoing, false)
+        } else {
+            let curReq = cellNew(bReqs);
+            while (match cellGet(curReq) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                match cellGet(curReq) {
+                    Cons(bkey, r) -> {
+                        match builtinModuleSource(bkey) {
+                            Some(bsrc) -> {
+                                let bsegs = strSplitChar(bkey, '.');
+                                match parseFileModule(bsrc, bsegs) {
+                                    Ok(fm) -> {
+                                        let inlines: Cell (List LoadedMod) = cellNew(Nil);
+                                        let (defs, imps, subs) = extractModuleItems(bsegs, fm.items, inlines);
+                                        strMapInsert(cache, bkey, MkLoadedMod {
+                                            key: bkey,
+                                            modPath: bsegs,
+                                            defs: defs,
+                                            imports: imps,
+                                            submodules: subs,
+                                        });
+                                        vecPush(orderKeys, bkey)
+                                    },
+                                    Err(e) -> cellSet(errCell, Some("Stdlib '" + bkey + "': " + e)),
+                                }
+                            },
+                            None -> (),
+                        };
+                        cellSet(curReq, r)
+                    },
+                    Nil -> (),
                 }
-            },
+            };
+
+            let curLib = cellNew(lReqs);
+            while (match cellGet(curLib) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
+                match cellGet(curLib) {
+                    Cons(lkey, r) -> {
+                        let lsegs = strSplitChar(lkey, '.');
+                        match findLibRootForMod(libPaths, lsegs) {
+                            Some(lroot) -> match loadFileModuleRec(lroot, lsegs, cache, orderKeys, Nil) {
+                                Ok(_) -> (),
+                                Err(e) -> cellSet(errCell, Some(e)),
+                            },
+                            None -> (),
+                        };
+                        cellSet(curLib, r)
+                    },
+                    Nil -> (),
+                }
+            }
         }
     };
 
@@ -1207,7 +1246,7 @@ def compileLoadedCache(
     }
 }
 
-pub def loadSingleSourceProgram(src: String): Result (List Def) String = {
+pub def loadSingleSourceProgramWithLibs(src: String, libPaths: List String): Result (List Def) String = {
     let cache: StrMap LoadedMod = strMapNew();
     let orderKeys: Vec String = vecNew();
     let fm = parseFileModule(src, Nil)?;
@@ -1232,16 +1271,22 @@ pub def loadSingleSourceProgram(src: String): Result (List Def) String = {
             Nil -> (),
         }
     };
-    loadBuiltinImports(cache, orderKeys)?;
+    loadBuiltinAndLibImports(cache, orderKeys, libPaths)?;
     compileLoadedCache(cache, orderKeys, "")
 }
 
-pub def loadProjectProgram(entryFile: String, srcRoot: String): Result (List Def) String = {
+pub def loadSingleSourceProgram(src: String): Result (List Def) String =
+    loadSingleSourceProgramWithLibs(src, Nil)
+
+pub def loadProjectProgramWithLibs(entryFile: String, srcRoot: String, libPaths: List String): Result (List Def) String = {
     let cache: StrMap LoadedMod = strMapNew();
     let orderKeys: Vec String = vecNew();
     let entrySegs = entryPathToSegments(entryFile, srcRoot);
     let entryKey = strJoin(entrySegs, ".");
     loadFileModuleRec(srcRoot, entrySegs, cache, orderKeys, Nil)?;
-    loadBuiltinImports(cache, orderKeys)?;
+    loadBuiltinAndLibImports(cache, orderKeys, libPaths)?;
     compileLoadedCache(cache, orderKeys, entryKey)
 }
+
+pub def loadProjectProgram(entryFile: String, srcRoot: String): Result (List Def) String =
+    loadProjectProgramWithLibs(entryFile, srcRoot, Nil)

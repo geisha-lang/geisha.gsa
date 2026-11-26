@@ -936,4 +936,42 @@ EOF
 "$GEISHA_BIN" -o "$TMP_DIR/t14_gc_gen" "$TMP_DIR/t14_gc_gen.gsa"
 assert_eq "generational_gc_write_barrier_and_reclaim" "4096|y-39900|y-39900|87780|gen-ok" "$(GEISHA_GC_HEAP_WORDS=32768 "$TMP_DIR/t14_gc_gen")"
 
+# 15. External library search paths (`-L` / `--lib-path`) across single-file and `--src-root` projects
+mkdir -p "$TMP_DIR/extlib/acme" "$TMP_DIR/extapp/src"
+cat > "$TMP_DIR/extlib/acme/math2d.gsa" << 'EOF'
+pub data Vec2 {
+    MkVec2 { x: Int, y: Int },
+}
+pub def addVec(a: Vec2, b: Vec2): Vec2 = MkVec2 { x: a.x + b.x, y: a.y + b.y }
+EOF
+cat > "$TMP_DIR/extlib/acme/fmt.gsa" << 'EOF'
+use std.str.intToStr
+use acme.math2d.{Vec2, addVec}
+pub def describeSum(a: Vec2, b: Vec2): String = {
+    let s = addVec(a, b);
+    "(" + intToStr(s.x) + "," + intToStr(s.y) + ")"
+}
+EOF
+cat > "$TMP_DIR/t15_single_lib.gsa" << 'EOF'
+use acme.math2d.MkVec2
+use acme.fmt.describeSum
+def main(): Void = printLn(describeSum(MkVec2 { x: 3, y: 7 }, MkVec2 { x: 10, y: -2 }))
+EOF
+"$GEISHA_BIN" -L "$TMP_DIR/extlib" -o "$TMP_DIR/t15_single_lib" "$TMP_DIR/t15_single_lib.gsa"
+assert_eq "lib_path_single_file" "(13,5)" "$("$TMP_DIR/t15_single_lib")"
+
+cat > "$TMP_DIR/extapp/src/helper.gsa" << 'EOF'
+use acme.math2d.{Vec2, MkVec2}
+pub def originOffset(dx: Int, dy: Int): Vec2 = MkVec2 { x: 100 + dx, y: 200 + dy }
+EOF
+cat > "$TMP_DIR/extapp/src/mod.gsa" << 'EOF'
+mod helper
+use helper.originOffset
+use acme.math2d.MkVec2
+use acme.fmt.describeSum
+def main(): Void = printLn(describeSum(originOffset(4, 6), MkVec2 { x: -4, y: 14 }))
+EOF
+"$GEISHA_BIN" --lib-path "$TMP_DIR/extlib" --src-root "$TMP_DIR/extapp" -o "$TMP_DIR/t15_proj_lib" "$TMP_DIR/extapp/src/mod.gsa"
+assert_eq "lib_path_project_mode" "(100,220)" "$("$TMP_DIR/t15_proj_lib")"
+
 echo "All $PASS end-to-end test suites passed!"

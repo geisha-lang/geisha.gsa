@@ -23,13 +23,15 @@ mod codegen
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
+use std.list.listRev
+use std.str.strStartsWith
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.path.{pathStem, pathJoin, pathDirname}
 use sys.env.{argCount, argAt, getEnv}
 use sys.fs.{readFile, writeFile, removeFile, fileExists}
 use sys.io.eprintLn
 use sys.proc.{exit, shell}
-use loader.{loadSingleSourceProgram, loadProjectProgram}
+use loader.{loadSingleSourceProgramWithLibs, loadProjectProgramWithLibs}
 use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
@@ -44,6 +46,7 @@ data CliOpts {
         optExports: List String,
         optOutPath: Option String,
         optSrcRoot: Option String,
+        optLibPaths: List String,
         optRuntime: Option String,
         optInput: Option String,
         optHelp: Bool,
@@ -73,6 +76,7 @@ def parseCliArgs(): Result CliOpts String = {
     let exportsRev: Cell (List String) = cellNew(Nil);
     let outPath: Cell (Option String) = cellNew(None);
     let srcRoot: Cell (Option String) = cellNew(None);
+    let libPathsRev: Cell (List String) = cellNew(Nil);
     let rtPath: Cell (Option String) = cellNew(None);
     let inPath: Cell (Option String) = cellNew(None);
     let showHelp = cellNew(false);
@@ -131,6 +135,16 @@ def parseCliArgs(): Result CliOpts String = {
                 cellSet(srcRoot, Some(argAt(cellGet(i) + 1)));
                 cellSet(i, cellGet(i) + 2)
             }
+        } else if (a == "-L" || a == "--lib-path") {
+            if (cellGet(i) + 1 >= argc) {
+                cellSet(errOpt, Some("Missing directory after '" + a + "'"))
+            } else {
+                cellSet(libPathsRev, Cons(argAt(cellGet(i) + 1), cellGet(libPathsRev)));
+                cellSet(i, cellGet(i) + 2)
+            }
+        } else if (strStartsWith(a, "-L") && strLen(a) > 2) {
+            cellSet(libPathsRev, Cons(strSlice(a, 2, strLen(a)), cellGet(libPathsRev)));
+            cellSet(i, cellGet(i) + 1)
         } else if (a == "--runtime") {
             if (cellGet(i) + 1 >= argc) {
                 cellSet(errOpt, Some("Missing archive path after '--runtime'"))
@@ -156,6 +170,7 @@ def parseCliArgs(): Result CliOpts String = {
             optExports: cellGet(exportsRev),
             optOutPath: cellGet(outPath),
             optSrcRoot: cellGet(srcRoot),
+            optLibPaths: listRev(cellGet(libPathsRev)),
             optRuntime: cellGet(rtPath),
             optInput: cellGet(inPath),
             optHelp: cellGet(showHelp),
@@ -228,15 +243,16 @@ def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
 def compileInputToIr(
     inputFile: String,
     srcRootOpt: Option String,
+    libPaths: List String,
     dumpCoreOpt: Option String,
     isWasm: Bool,
     wasmExports: List String
 ): Result String String = {
     let rawDefs = match srcRootOpt {
-        Some(root) -> loadProjectProgram(inputFile, root)?,
+        Some(root) -> loadProjectProgramWithLibs(inputFile, root, libPaths)?,
         None -> {
             let src = readFile(inputFile)?;
-            loadSingleSourceProgram(src)?
+            loadSingleSourceProgramWithLibs(src, libPaths)?
         },
     };
     let inf = inferProgram(rawDefs)?;
@@ -264,6 +280,7 @@ def printUsage(): Void = {
     printLn("  -c, --compile-only     Compile to object file (.o) without linking");
     printLn("  -o <output>            Write output to <output>");
     printLn("  --src-root <dir>       Multi-file module source root directory");
+    printLn("  -L, --lib-path <dir>   External package/library search path (repeatable)");
     printLn("  --runtime <path>       Path to libgeisha_runtime.a or wasm_rt.o");
     printLn("  -h, --help             Show this help message")
 }
@@ -279,7 +296,7 @@ def runDriver(): Result Void String = {
             None -> returnErr("No input .gsa file specified (run with --help for usage)")?,
         };
         let isWasm = opts.optTarget == "wasm32";
-        let llText = compileInputToIr(inputFile, opts.optSrcRoot, opts.optDumpCore, isWasm, opts.optExports)?;
+        let llText = compileInputToIr(inputFile, opts.optSrcRoot, opts.optLibPaths, opts.optDumpCore, isWasm, opts.optExports)?;
 
         if (opts.optEmitIr) {
             match opts.optOutPath {
