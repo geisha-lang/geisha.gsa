@@ -28,7 +28,7 @@ use ast.{
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
-    VariantDef, MethodDecl, MethodImpl,
+    VariantDef, MethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     Def, MkDef
 }
@@ -902,7 +902,7 @@ def initInferCtx(): InferCtx = {
         instanceReg: cellNew(Nil),
         conceptMethods: strMapNew(),
     };
-    let kStarNames = ["Int", "Int64", "Float", "Float32", "Char", "String", "Bool", "Void", "Ptr", "ForeignPtr", "ScopedPtr", "Arena", "AtomicInt", "$Local", "$Shared", "$Scoped"];
+    let kStarNames = ["Int", "Int64", "Float", "Float32", "Char", "String", "Bool", "Void", "Ptr", "ForeignPtr", "ScopedPtr", "Arena", "AtomicInt", "Unit", "$Local", "$Shared", "$Scoped"];
     let ck0 = cellNew(kStarNames);
     while (match cellGet(ck0) { Nil -> false, _ -> true }) {
         match cellGet(ck0) {
@@ -910,7 +910,7 @@ def initInferCtx(): InferCtx = {
             Nil -> (),
         }
     };
-    let kUnaryNames = ["List", "Cell", "MutArray", "ImmArray", "MVar", "Chan", "Task", "Actor"];
+    let kUnaryNames = ["List", "Cell", "MutArray", "ImmArray", "MVar", "Chan", "Task", "Actor", "Named"];
     let ck1 = cellNew(kUnaryNames);
     while (match cellGet(ck1) { Nil -> false, _ -> true }) {
         match cellGet(ck1) {
@@ -918,6 +918,8 @@ def initInferCtx(): InferCtx = {
             Nil -> (),
         }
     };
+    strMapInsert(ctx.tyConKinds, "Prod", KArr(KStar, KArr(KStar, KStar)));
+    strMapInsert(ctx.tyConKinds, "Sum", KArr(KStar, KArr(KStar, KStar)));
     let tvA = TyVar("a");
     let tvM = TyVar(".$m_op");
     let binSame = TyArr(tvM, [tvA, tvA], tvA);
@@ -974,6 +976,59 @@ def initInferCtx(): InferCtx = {
     vecPush(ctx.adtNames, "List");
     strMapInsert(ctx.ctorToAdt, "Nil", "List");
     strMapInsert(ctx.ctorToAdt, "Cons", "List");
+
+    // Built-in structural Generic representation ADTs (`Unit`, `Named`, `Prod`, `Sum`)
+    let tvB = TyVar("b");
+    let unitTy = TyCon("Unit");
+    let mkUnitScm = ScmMono(unitTy);
+    strMapInsert(ctx.adtReg, "Unit", MkAdtInfo {
+        adtName: "Unit",
+        typeParams: Nil,
+        variants: [
+            MkVariantInfo { vname: "MkUnit", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: mkUnitScm },
+        ],
+    });
+    vecPush(ctx.adtNames, "Unit");
+    strMapInsert(ctx.ctorToAdt, "MkUnit", "Unit");
+
+    let namedTy = TyComp(TyCon("Named"), tvA);
+    let mkNamedScm = ScmPoly([".$m_named", "a"], TyArr(TyVar(".$m_named"), [TyCon("String"), tvA], namedTy));
+    strMapInsert(ctx.adtReg, "Named", MkAdtInfo {
+        adtName: "Named",
+        typeParams: ["a"],
+        variants: [
+            MkVariantInfo { vname: "MkNamed", tag: 0, fieldNames: None, fieldTypes: [TyCon("String"), tvA], ctorScm: mkNamedScm },
+        ],
+    });
+    vecPush(ctx.adtNames, "Named");
+    strMapInsert(ctx.ctorToAdt, "MkNamed", "Named");
+
+    let prodTy = TyComp(TyComp(TyCon("Prod"), tvA), tvB);
+    let mkProdScm = ScmPoly([".$m_prod", "a", "b"], TyArr(TyVar(".$m_prod"), [tvA, tvB], prodTy));
+    strMapInsert(ctx.adtReg, "Prod", MkAdtInfo {
+        adtName: "Prod",
+        typeParams: ["a", "b"],
+        variants: [
+            MkVariantInfo { vname: "MkProd", tag: 0, fieldNames: None, fieldTypes: [tvA, tvB], ctorScm: mkProdScm },
+        ],
+    });
+    vecPush(ctx.adtNames, "Prod");
+    strMapInsert(ctx.ctorToAdt, "MkProd", "Prod");
+
+    let sumTy = TyComp(TyComp(TyCon("Sum"), tvA), tvB);
+    let inLScm = ScmPoly([".$m_inl", "a", "b"], TyArr(TyVar(".$m_inl"), [tvA], sumTy));
+    let inRScm = ScmPoly([".$m_inr", "a", "b"], TyArr(TyVar(".$m_inr"), [tvB], sumTy));
+    strMapInsert(ctx.adtReg, "Sum", MkAdtInfo {
+        adtName: "Sum",
+        typeParams: ["a", "b"],
+        variants: [
+            MkVariantInfo { vname: "InL", tag: 0, fieldNames: None, fieldTypes: [tvA], ctorScm: inLScm },
+            MkVariantInfo { vname: "InR", tag: 1, fieldNames: None, fieldTypes: [tvB], ctorScm: inRScm },
+        ],
+    });
+    vecPush(ctx.adtNames, "Sum");
+    strMapInsert(ctx.ctorToAdt, "InL", "Sum");
+    strMapInsert(ctx.ctorToAdt, "InR", "Sum");
     ctx
 }
 
@@ -3814,18 +3869,27 @@ def inferPass1Aliases(ctx: InferCtx, rawDefs: List Def): Result Void String = {
 }
 
 def inferPass2Adts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Result Void String = {
-    // Seed default List constructors in baseMap
-    match strMapGet(ctx.adtReg, "List") {
-        Some(defList) -> {
-            let cv = cellNew(defList.variants);
-            while (match cellGet(cv) { Nil -> false, _ -> true }) {
-                match cellGet(cv) {
-                    Cons(vi, r) -> { strMapInsert(baseMap, vi.vname, vi.ctorScm); cellSet(cv, r) },
-                    Nil -> (),
-                }
-            }
-        },
-        None -> (),
+    // Seed default built-in ADT constructors (`List`, `Unit`, `Named`, `Prod`, `Sum`) in baseMap
+    let builtinAdts = cellNew(["List", "Unit", "Named", "Prod", "Sum"]);
+    while (match cellGet(builtinAdts) { Nil -> false, _ -> true }) {
+        match cellGet(builtinAdts) {
+            Cons(anm, ra) -> {
+                match strMapGet(ctx.adtReg, anm) {
+                    Some(defAdt) -> {
+                        let cv = cellNew(defAdt.variants);
+                        while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                            match cellGet(cv) {
+                                Cons(vi, r) -> { strMapInsert(baseMap, vi.vname, vi.ctorScm); cellSet(cv, r) },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(builtinAdts, ra)
+            },
+            Nil -> (),
+        }
     };
 
     // Compute which ADTs directly or transitively store function closures (`modeAdtSet`)
@@ -4169,6 +4233,210 @@ def inferPass3Concepts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def)
     Ok(())
 }
 
+def mkSynthForm(sp: Span, node: Expr): Form =
+    MkForm { pos: sp, ty: ScmSlot, annot: None, node: node }
+
+def nthStrOr(xs: List String, idx: Int, fallback: String): String = match xs {
+    Nil -> fallback,
+    Cons(h, t) -> if (idx == 0) h else nthStrOr(t, idx - 1, fallback),
+}
+
+def variantFieldLabel(v: VariantInfo, idx: Int): String = match v.fieldNames {
+    Some(ns) -> nthStrOr(ns, idx, intToStr(idx)),
+    None -> intToStr(idx),
+}
+
+def buildFieldProdExpr(v: VariantInfo, idx: Int, total: Int, sp: Span): Form =
+    if (total <= 0) mkSynthForm(sp, ExVar("MkUnit"))
+    else {
+        let lbl = variantFieldLabel(v, idx);
+        let named = mkSynthForm(sp, ExApply(
+            mkSynthForm(sp, ExVar("MkNamed")),
+            [mkSynthForm(sp, ExLit(LitStr(lbl))), mkSynthForm(sp, ExVar("$df" + intToStr(idx)))]
+        ));
+        if (idx + 1 >= total) named
+        else mkSynthForm(sp, ExApply(
+            mkSynthForm(sp, ExVar("MkProd")),
+            [named, buildFieldProdExpr(v, idx + 1, total, sp)]
+        ))
+    }
+
+def buildFieldProdPat(idx: Int, total: Int): Pattern =
+    if (total <= 0) PatCtor("MkUnit", Nil)
+    else {
+        let namedPat = PatCtor("MkNamed", [PatWild, PatVar("$df" + intToStr(idx))]);
+        if (idx + 1 >= total) namedPat
+        else PatCtor("MkProd", [namedPat, buildFieldProdPat(idx + 1, total)])
+    }
+
+def buildVariantCtorPat(v: VariantInfo): Pattern = {
+    let n = listLen(v.fieldTypes);
+    let psRev = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        cellSet(psRev, Cons(PatVar("$df" + intToStr(cellGet(i))), cellGet(psRev)));
+        cellSet(i, cellGet(i) + 1)
+    };
+    PatCtor(v.vname, listRev(cellGet(psRev)))
+}
+
+def buildVariantCtorExpr(v: VariantInfo, sp: Span): Form = {
+    let n = listLen(v.fieldTypes);
+    if (n <= 0) mkSynthForm(sp, ExVar(v.vname))
+    else {
+        let argsRev = cellNew(Nil);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            cellSet(argsRev, Cons(mkSynthForm(sp, ExVar("$df" + intToStr(cellGet(i)))), cellGet(argsRev)));
+            cellSet(i, cellGet(i) + 1)
+        };
+        mkSynthForm(sp, ExApply(mkSynthForm(sp, ExVar(v.vname)), listRev(cellGet(argsRev))))
+    }
+}
+
+def wrapInSumExpr(expr: Form, idx: Int, isLast: Bool, sp: Span): Form = {
+    let inner = if (isLast) expr else mkSynthForm(sp, ExApply(mkSynthForm(sp, ExVar("InL")), [expr]));
+    let cur = cellNew(inner);
+    let k = cellNew(0);
+    while (cellGet(k) < idx) {
+        cellSet(cur, mkSynthForm(sp, ExApply(mkSynthForm(sp, ExVar("InR")), [cellGet(cur)])));
+        cellSet(k, cellGet(k) + 1)
+    };
+    cellGet(cur)
+}
+
+def wrapInSumPat(pat: Pattern, idx: Int, isLast: Bool): Pattern = {
+    let inner = if (isLast) pat else PatCtor("InL", [pat]);
+    let cur = cellNew(inner);
+    let k = cellNew(0);
+    while (cellGet(k) < idx) {
+        cellSet(cur, PatCtor("InR", [cellGet(cur)]));
+        cellSet(k, cellGet(k) + 1)
+    };
+    cellGet(cur)
+}
+
+def buildAdtToRepForm(ainfo: AdtInfo, scrut: Form, sp: Span): Form = {
+    let numVars = listLen(ainfo.variants);
+    let armsRev = cellNew(Nil);
+    let cv = cellNew(ainfo.variants);
+    let vIdx = cellNew(0);
+    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+        match cellGet(cv) {
+            Cons(v, rv) -> {
+                let idx = cellGet(vIdx);
+                let fieldsExpr = buildFieldProdExpr(v, 0, listLen(v.fieldTypes), sp);
+                let bodyExpr =
+                    if (numVars == 1) fieldsExpr
+                    else {
+                        let namedVar = mkSynthForm(sp, ExApply(
+                            mkSynthForm(sp, ExVar("MkNamed")),
+                            [mkSynthForm(sp, ExLit(LitStr(v.vname))), fieldsExpr]
+                        ));
+                        wrapInSumExpr(namedVar, idx, idx + 1 >= numVars, sp)
+                    };
+                cellSet(armsRev, Cons(MkMatchArm { pat: buildVariantCtorPat(v), guard: None, body: bodyExpr }, cellGet(armsRev)));
+                cellSet(vIdx, idx + 1);
+                cellSet(cv, rv)
+            },
+            Nil -> (),
+        }
+    };
+    mkSynthForm(sp, ExMatch(scrut, listRev(cellGet(armsRev))))
+}
+
+def buildAdtFromRepForm(ainfo: AdtInfo, scrut: Form, sp: Span): Form = {
+    let numVars = listLen(ainfo.variants);
+    let armsRev = cellNew(Nil);
+    let cv = cellNew(ainfo.variants);
+    let vIdx = cellNew(0);
+    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+        match cellGet(cv) {
+            Cons(v, rv) -> {
+                let idx = cellGet(vIdx);
+                let fieldsPat = buildFieldProdPat(0, listLen(v.fieldTypes));
+                let armPat =
+                    if (numVars == 1) fieldsPat
+                    else {
+                        let namedPat = PatCtor("MkNamed", [PatWild, fieldsPat]);
+                        wrapInSumPat(namedPat, idx, idx + 1 >= numVars)
+                    };
+                let bodyExpr = buildVariantCtorExpr(v, sp);
+                cellSet(armsRev, Cons(MkMatchArm { pat: armPat, guard: None, body: bodyExpr }, cellGet(armsRev)));
+                cellSet(vIdx, idx + 1);
+                cellSet(cv, rv)
+            },
+            Nil -> (),
+        }
+    };
+    mkSynthForm(sp, ExMatch(scrut, listRev(cellGet(armsRev))))
+}
+
+def isSelfTypeParam(ty: Type, selfTv: String): Bool = match ty {
+    TyVar(v) -> v == selfTv,
+    _ -> false,
+}
+
+def synthesizeDerivedMethodImpls(
+    ctx: InferCtx,
+    cname: String,
+    cinfo: ConceptInfo,
+    expArgsFinal: List Type,
+    sp: Span
+): Result (List MethodImpl) String = match (cinfo.typeParams, expArgsFinal) {
+    (Cons(selfTv, Nil), Cons(targetTy, Nil)) -> match decomposeAdtType(ctx.adtReg, targetTy) {
+        None -> Err(typeErr(sp, "Cannot derive concept '" + cname + "' for non-ADT type '" + typeToString(targetTy) + "'")),
+        Some((adtName, _)) -> match strMapGet(ctx.adtReg, adtName) {
+            None -> Err(typeErr(sp, "Unknown ADT '" + adtName + "' when deriving '" + cname + "'")),
+            Some(ainfo) -> {
+                let implsRev = cellNew(Nil);
+                let cm = cellNew(cinfo.methods);
+                while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                    match cellGet(cm) {
+                        Cons((mname, mscm), rm) -> {
+                            match schemeBody(mscm) {
+                                TyArr(_, paramTys, retTy) -> {
+                                    let pDeclsRev = cellNew(Nil);
+                                    let callArgsRev = cellNew(Nil);
+                                    let cp = cellNew(paramTys);
+                                    let idx = cellNew(0);
+                                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                        match cellGet(cp) {
+                                            Cons(pt, rp) -> {
+                                                let pName = "$dp" + intToStr(cellGet(idx));
+                                                cellSet(pDeclsRev, Cons(MkVarDecl { vname: pName, vscm: ScmSlot }, cellGet(pDeclsRev)));
+                                                let pVar = mkSynthForm(sp, ExVar(pName));
+                                                let argExpr =
+                                                    if (isSelfTypeParam(pt, selfTv)) buildAdtToRepForm(ainfo, pVar, sp)
+                                                    else pVar;
+                                                cellSet(callArgsRev, Cons(argExpr, cellGet(callArgsRev)));
+                                                cellSet(idx, cellGet(idx) + 1);
+                                                cellSet(cp, rp)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    };
+                                    let callForm = mkSynthForm(sp, ExApply(mkSynthForm(sp, ExVar(mname)), listRev(cellGet(callArgsRev))));
+                                    let bodyForm =
+                                        if (isSelfTypeParam(retTy, selfTv)) buildAdtFromRepForm(ainfo, callForm, sp)
+                                        else callForm;
+                                    let lamForm = mkSynthForm(sp, ExAbs(listRev(cellGet(pDeclsRev)), None, bodyForm));
+                                    cellSet(implsRev, Cons(MkMethodImpl { implName: mname, implBody: lamForm }, cellGet(implsRev)))
+                                },
+                                _ -> (),
+                            };
+                            cellSet(cm, rm)
+                        },
+                        Nil -> (),
+                    }
+                };
+                Ok(listRev(cellGet(implsRev)))
+            },
+        },
+    },
+    _ -> Err(typeErr(sp, "Generic deriving currently supports single-parameter concepts, got '" + cname + "'")),
+}
+
 def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) String = {
     // Pass 4: Process Instance declarations & synthesize concrete/generic method `Def`s
     let synthDefs = cellNew(Nil);
@@ -4262,11 +4530,15 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
                             let paramSub = buildPairMap(cinfo.typeParams, expArgsFinal);
                             let implMap: StrMap String = strMapNew();
 
+                            let effectiveImpls = match impls {
+                                Nil -> synthesizeDerivedMethodImpls(ctx, cname, cinfo, expArgsFinal, d.dpos)?,
+                                _ -> impls,
+                            };
                             let cm = cellNew(cinfo.methods);
                             while (match cellGet(cm) { Nil -> false, _ -> true }) {
                                 match cellGet(cm) {
                                     Cons((expectedName, expectedScm), rm) -> {
-                                        match findMatchingMethodImpl(impls, expectedName) {
+                                        match findMatchingMethodImpl(effectiveImpls, expectedName) {
                                             None -> returnPatErr(d.dpos, "Instance of '" + cname + "' missing method '" + expectedName + "'")?,
                                             Some(mi) -> {
                                                 let mangledFn = "__inst_" + replaceDots(cname) + "_" + mangledArgs + "_" + expectedName;

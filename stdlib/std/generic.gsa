@@ -1,0 +1,55 @@
+// Built-in `Eq` and `Ord` instances over structural Generic representations
+// (`Unit`, `Named`, `Prod`, `Sum` are built-in ADTs in the prelude).
+// Importing `std.generic` enables zero-boilerplate `data T : Eq, Ord { ... }` deriving.
+
+instance Eq Unit {
+    def eq(_, _) = true
+}
+
+instance (Eq a) => Eq (Named a) {
+    def eq(x, y) = match (x, y) {
+        (MkNamed(_, a), MkNamed(_, b)) -> eq(a, b),
+    }
+}
+
+instance (Eq a, Eq b) => Eq (Prod a b) {
+    def eq(x, y) = match (x, y) {
+        (MkProd(a1, b1), MkProd(a2, b2)) -> eq(a1, a2) && eq(b1, b2),
+    }
+}
+
+instance (Eq a, Eq b) => Eq (Sum a b) {
+    def eq(x, y) = match (x, y) {
+        (InL(a1), InL(a2)) -> eq(a1, a2),
+        (InR(b1), InR(b2)) -> eq(b1, b2),
+        _ -> false,
+    }
+}
+
+instance Ord Unit {
+    def compare(_, _) = 0
+}
+
+instance (Ord a) => Ord (Named a) {
+    def compare(x, y) = match (x, y) {
+        (MkNamed(_, a), MkNamed(_, b)) -> compare(a, b),
+    }
+}
+
+instance (Ord a, Ord b) => Ord (Prod a b) {
+    def compare(x, y) = match (x, y) {
+        (MkProd(a1, b1), MkProd(a2, b2)) -> {
+            let c = compare(a1, a2);
+            if (c != 0) c else compare(b1, b2)
+        },
+    }
+}
+
+instance (Ord a, Ord b) => Ord (Sum a b) {
+    def compare(x, y) = match (x, y) {
+        (InL(a1), InL(a2)) -> compare(a1, a2),
+        (InL(_), InR(_)) -> -1,
+        (InR(_), InL(_)) -> 1,
+        (InR(b1), InR(b2)) -> compare(b1, b2),
+    }
+}

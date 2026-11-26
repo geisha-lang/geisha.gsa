@@ -24,6 +24,7 @@ MODULES = [
     ("std.actor", "std/actor.gsa"),
     ("std.rand", "std/rand.gsa"),
     ("std.math", "std/math.gsa"),
+    ("std.generic", "std/generic.gsa"),
     ("std.codec", "std/codec.gsa"),
     ("std.json", "std/json.gsa"),
     ("std.toml", "std/toml.gsa"),

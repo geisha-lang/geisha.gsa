@@ -40,14 +40,26 @@ use lexer.{
 }
 
 pub data Parser {
-    MkParser { tokens: Vec Token, idx: Cell Int, pushedSym: Cell (Option Token), eofTok: Token },
+    MkParser {
+        tokens: Vec Token,
+        idx: Cell Int,
+        pushedSym: Cell (Option Token),
+        eofTok: Token,
+        pendingItems: Cell (List ModuleItem),
+    },
 }
 
 def eofToken(): Token =
     MkToken { kind: TkEof, span: emptySpan(), hadNewline: true }
 
 def newParser(toks: Vec Token): Parser =
-    MkParser { tokens: toks, idx: cellNew(0), pushedSym: cellNew(None), eofTok: eofToken() }
+    MkParser {
+        tokens: toks,
+        idx: cellNew(0),
+        pushedSym: cellNew(None),
+        eofTok: eofToken(),
+        pendingItems: cellNew(Nil),
+    }
 
 def savePos(p: Parser): (Int, Option Token) =
     (cellGet(p.idx), cellGet(p.pushedSym))
@@ -1519,6 +1531,15 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                     let _ = bumpTok(p);
                     let dname = parseUpperIdent(p)?;
                     let tparams = parseInlineTypeParams(p)?;
+                    let derivedConcepts = cellNew(Nil);
+                    if (eatSym(p, ":")) {
+                        let c0 = parseUpperIdent(p)?;
+                        cellSet(derivedConcepts, [c0]);
+                        while (eatComma(p)) {
+                            let cn = parseUpperIdent(p)?;
+                            cellSet(derivedConcepts, listAppend(cellGet(derivedConcepts), [cn]))
+                        }
+                    } else ();
                     let _ = expectLBrace(p)?;
                     let variants = cellNew(Nil);
                     let more = cellNew(true);
@@ -1533,7 +1554,38 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         }
                     };
                     let closeSp = expectRBrace(p)?;
-                    Ok(MkDef { ident: dname, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItAlg(tparams, cellGet(variants)) })
+                    let fullSp = unionSpan(startSp, closeSp);
+                    // Desugar `data T a : C1, C2 { ... }` into bodyless `instance (C1 a) => C1 (T a)` items
+                    let cd = cellNew(cellGet(derivedConcepts));
+                    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                        match cellGet(cd) {
+                            Cons(cn, rcd) -> {
+                                let targetTy = cellNew(TyCon(dname));
+                                let autoCs = cellNew(Nil);
+                                let ctp = cellNew(tparams);
+                                while (match cellGet(ctp) { Nil -> false, _ -> true }) {
+                                    match cellGet(ctp) {
+                                        Cons(tp, rtp) -> {
+                                            cellSet(targetTy, TyComp(cellGet(targetTy), TyVar(tp)));
+                                            cellSet(autoCs, listAppend(cellGet(autoCs), [MkConstraint { conceptName: cn, typeArgs: [TyVar(tp)] }]));
+                                            cellSet(ctp, rtp)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let instDef = MkDef {
+                                    ident: "instance_" + cn,
+                                    dpos: fullSp,
+                                    vis: vis,
+                                    item: ItInstance(cn, [cellGet(targetTy)], cellGet(autoCs), Nil),
+                                };
+                                cellSet(p.pendingItems, listAppend(cellGet(p.pendingItems), [ModDef(vis, instDef)]));
+                                cellSet(cd, rcd)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    Ok(MkDef { ident: dname, dpos: fullSp, vis: vis, item: ItAlg(tparams, cellGet(variants)) })
                 },
                 TkConcept -> {
                     let _ = bumpTok(p);
@@ -1597,36 +1649,41 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         let ta = parseTypeAtom(p)?;
                         cellSet(targs, listAppend(cellGet(targs), [ta]))
                     };
-                    let _ = expectLBrace(p)?;
-                    let impls = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        skipSemis(p);
-                        match peekTok(p).kind {
-                            TkRBrace -> cellSet(more, false),
-                            TkDef -> {
-                                let mSp = bumpTok(p).span;
-                                let mname = parseCallableIdent(p)?;
-                                let _ = expectLParen(p)?;
-                                let mps = parseParamSeq(p)?;
-                                let _ = expectRParen(p)?;
-                                let mret = if (eatSym(p, ":")) Some(parseTypeExpr(p)?) else None;
-                                let _ = expectSym(p, "=")?;
-                                let mbody = parseExpr(p)?;
-                                let lam = mkForm(unionSpan(mSp, mbody.pos), ExAbs(mps, mret, mbody));
-                                cellSet(impls, listAppend(cellGet(impls), [MkMethodImpl { implName: mname, implBody: lam }]));
-                                let _ = eatComma(p);
-                                skipSemis(p)
-                            },
-                            _ -> {
-                                returnErrHelper(p)?;
-                                cellSet(more, false)
-                            },
-                        }
-                    };
-                    let closeSp = expectRBrace(p)?;
                     let instIdent = "instance_" + cname;
-                    Ok(MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItInstance(cname, cellGet(targs), cs, cellGet(impls)) })
+                    match peekTok(p).kind {
+                        TkLBrace -> {
+                            let _ = bumpTok(p);
+                            let impls = cellNew(Nil);
+                            let more = cellNew(true);
+                            while (cellGet(more)) {
+                                skipSemis(p);
+                                match peekTok(p).kind {
+                                    TkRBrace -> cellSet(more, false),
+                                    TkDef -> {
+                                        let mSp = bumpTok(p).span;
+                                        let mname = parseCallableIdent(p)?;
+                                        let _ = expectLParen(p)?;
+                                        let mps = parseParamSeq(p)?;
+                                        let _ = expectRParen(p)?;
+                                        let mret = if (eatSym(p, ":")) Some(parseTypeExpr(p)?) else None;
+                                        let _ = expectSym(p, "=")?;
+                                        let mbody = parseExpr(p)?;
+                                        let lam = mkForm(unionSpan(mSp, mbody.pos), ExAbs(mps, mret, mbody));
+                                        cellSet(impls, listAppend(cellGet(impls), [MkMethodImpl { implName: mname, implBody: lam }]));
+                                        let _ = eatComma(p);
+                                        skipSemis(p)
+                                    },
+                                    _ -> {
+                                        returnErrHelper(p)?;
+                                        cellSet(more, false)
+                                    },
+                                }
+                            };
+                            let closeSp = expectRBrace(p)?;
+                            Ok(MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItInstance(cname, cellGet(targs), cs, cellGet(impls)) })
+                        },
+                        _ -> Ok(MkDef { ident: instIdent, dpos: startSp, vis: vis, item: ItInstance(cname, cellGet(targs), cs, Nil) }),
+                    }
                 },
                 _ -> Err(parseErr(p, "expected top-level definition")),
             }
@@ -1735,6 +1792,9 @@ def parseModuleItem(p: Parser): Result ModuleItem String = {
                     while ({ skipSemis(p); match peekTok(p).kind { TkRBrace -> false, TkEof -> false, _ -> true } }) {
                         let it = parseModuleItem(p)?;
                         cellSet(subItems, listAppend(cellGet(subItems), [it]));
+                        let pend = cellGet(p.pendingItems);
+                        cellSet(p.pendingItems, Nil);
+                        cellSet(subItems, listAppend(cellGet(subItems), pend));
                         skipSemis(p)
                     };
                     let closeSp = expectRBrace(p)?;
@@ -1758,6 +1818,9 @@ pub def parseFileModule(src: String, modPath: List String): Result FileModule St
     while (!isEof(p)) {
         let item = parseModuleItem(p)?;
         cellSet(items, listAppend(cellGet(items), [item]));
+        let pend = cellGet(p.pendingItems);
+        cellSet(p.pendingItems, Nil);
+        cellSet(items, listAppend(cellGet(items), pend));
         skipSemis(p)
     };
     Ok(MkFileModule { modPath: modPath, items: cellGet(items) })

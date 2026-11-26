@@ -1799,4 +1799,87 @@ MACOSX_DEPLOYMENT_TARGET=14.0 cc -target arm64-apple-macosx14.0 -O2 -Wno-overrid
 # (2*10+1) + (3*10+1) + (4*10+1) + (5*10+1) = 21 + 31 + 41 + 51 = 144
 assert_eq "ffi_auto_borrow_exec" "144" "$("$TMP_DIR/t29_ffi_borrow")"
 
+# 30. Zero-Keyword Generic Deriving (`data T : C1, C2 { ... }` & bodyless `instance C T`)
+cat > "$TMP_DIR/t30_generic_derive.gsa" << 'EOF'
+open std.generic
+use std.str.intToStr
+
+// Custom user Concept: DL-style `Params` (mapParams + zipParams) + `Describe` (reads field names!)
+concept Params a {
+    def mapParams(f: Int -> Int, x: a): a,
+    def zipParams(f: (Int, Int) -> Int, x: a, y: a): a
+}
+
+instance Params Int {
+    def mapParams(f, x) = f(x)
+    def zipParams(f, x, y) = f(x, y)
+}
+instance Params Unit {
+    def mapParams(_, u) = u
+    def zipParams(_, u, _) = u
+}
+instance (Params a) => Params (Named a) {
+    def mapParams(f, x) = match x { MkNamed(k, v) -> MkNamed(k, mapParams(f, v)) }
+    def zipParams(f, x, y) = match (x, y) {
+        (MkNamed(k, a), MkNamed(_, b)) -> MkNamed(k, zipParams(f, a, b)),
+    }
+}
+instance (Params a, Params b) => Params (Prod a b) {
+    def mapParams(f, x) = match x { MkProd(a, b) -> MkProd(mapParams(f, a), mapParams(f, b)) }
+    def zipParams(f, x, y) = match (x, y) {
+        (MkProd(a1, b1), MkProd(a2, b2)) -> MkProd(zipParams(f, a1, a2), zipParams(f, b1, b2)),
+    }
+}
+
+concept FieldList a {
+    def fieldNamesOf(x: a): String
+}
+instance FieldList Int { def fieldNamesOf(_) = "" }
+instance FieldList Unit { def fieldNamesOf(_) = "" }
+instance (FieldList a) => FieldList (Named a) {
+    def fieldNamesOf(x) = match x { MkNamed(k, _) -> k }
+}
+instance (FieldList a, FieldList b) => FieldList (Prod a b) {
+    def fieldNamesOf(x) = match x { MkProd(a, b) -> fieldNamesOf(a) + "," + fieldNamesOf(b) }
+}
+
+// Header-colon zero-keyword deriving!
+data Linear : Params, Eq, FieldList {
+    MkLinear { w: Int, b: Int },
+}
+
+data MLP : Params, Eq {
+    MkMLP { l1: Linear, l2: Linear },
+}
+
+// Multi-constructor sum ADT deriving `Eq`!
+data Act : Eq {
+    ReLU,
+    GELU,
+    SwiGLU(Int),
+}
+
+// Polymorphic ADT with bodyless standalone `instance`!
+data Box a {
+    MkBox(a),
+}
+instance (Eq a) => Eq (Box a)
+
+def main(): Void = {
+    let m1 = MkMLP { l1: MkLinear { w: 2, b: 3 }, l2: MkLinear { w: 4, b: 5 } };
+    let m2 = mapParams((x) -> x * 10, m1);
+    let m3 = zipParams((a, b) -> a + b, m1, m2);
+    let eqM = if (m1 == m1 && !(m1 == m2)) 1 else 0;
+    let eqSum = if (ReLU == ReLU && !(ReLU == GELU) && SwiGLU(7) == SwiGLU(7) && !(SwiGLU(7) == SwiGLU(8))) 1 else 0;
+    let eqBox = if (MkBox(42) == MkBox(42) && !(MkBox(42) == MkBox(99))) 1 else 0;
+    let fnames = fieldNamesOf(m1.l1);
+    printLn(
+        intToStr(m3.l1.w) + "|" + intToStr(m3.l2.b) + "|"
+        + intToStr(eqM) + "|" + intToStr(eqSum) + "|" + intToStr(eqBox) + "|" + fnames
+    )
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t30_generic_derive" "$TMP_DIR/t30_generic_derive.gsa"
+assert_eq "generic_zero_keyword_derive" "22|55|1|1|1|w,b" "$("$TMP_DIR/t30_generic_derive")"
+
 echo "All $PASS end-to-end test suites passed!"
