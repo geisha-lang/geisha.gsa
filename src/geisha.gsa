@@ -7,7 +7,7 @@
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend}
-use std.str.{strStartsWith, strIndexOfByte, strJoin}
+use std.str.{strStartsWith, strIndexOfByte, strJoin, intToStr}
 use std.path.{pathStem, pathJoin, pathDirname}
 use sys.env.{argCount, argAt, getEnv}
 use sys.fs.{readFile, writeFile, removeFile, fileExists}
@@ -24,7 +24,7 @@ use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.emitProgramLlvmIrOpts
 use pkg.{
-    TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
+    NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
     shellQuote, geishaHomeDir, findProjectRoot,
     cmdInit, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
 }
@@ -575,48 +575,102 @@ def emitNativeExecutableFromIr(
     let tmpLl = outBin + ".tmp.ll";
     writeFile(tmpLl, llText)?;
 
-    match tc.tcCSources {
-        Nil -> {
-            let cmd =
-                envPfx + ccBin + targetArchFlag
-                + " -O2 -Wno-override-module -pthread -x ir "
-                + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
-                + shellQuoteArgs(tc.tcLinkFlags)
-                + sysLibs
-                + " -o " + shellQuote(outBin);
-            let rc = shell(cmd);
+    // Compile any extra native compiler units (e.g. `compiler = "nvcc"` from `[[target.native.when]]`)
+    let extraObjs: Cell (List String) = cellNew(Nil);
+    let extraErr: Cell (Option String) = cellNew(None);
+    let uIdx = cellNew(0);
+    let cu = cellNew(tc.tcExtraUnits);
+    while (match cellGet(extraErr) { None -> true, Some(_) -> false } && match cellGet(cu) { Nil -> false, _ -> true }) {
+        match cellGet(cu) {
+            Cons(u, ru) -> {
+                let cs = cellNew(u.nuSources);
+                while (match cellGet(extraErr) { None -> true, Some(_) -> false } && match cellGet(cs) { Nil -> false, _ -> true }) {
+                    match cellGet(cs) {
+                        Cons(srcPath, rs) -> {
+                            let objPath = outBin + ".unit" + intToStr(cellGet(uIdx)) + ".tmp.o";
+                            cellSet(uIdx, cellGet(uIdx) + 1);
+                            let cmdU =
+                                envPfx + shellQuote(u.nuCompiler)
+                                + shellQuoteArgs(u.nuFlags)
+                                + " -c " + shellQuote(srcPath)
+                                + " -o " + shellQuote(objPath);
+                            let rcu = shell(cmdU);
+                            if (rcu != 0) {
+                                cellSet(extraErr, Some("Native compiler '" + u.nuCompiler + "' failed on '" + srcPath + "'"))
+                            } else {
+                                cellSet(extraObjs, listAppend(cellGet(extraObjs), [objPath]))
+                            };
+                            cellSet(cs, rs)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cu, ru)
+            },
+            Nil -> (),
+        }
+    };
+    let cleanupExtraObjs = () -> {
+        let co = cellNew(cellGet(extraObjs));
+        while (match cellGet(co) { Nil -> false, _ -> true }) {
+            match cellGet(co) {
+                Cons(op, ro) -> { let _ = removeFile(op); cellSet(co, ro) },
+                Nil -> (),
+            }
+        }
+    };
+    match cellGet(extraErr) {
+        Some(emsg) -> {
             let _ = removeFile(tmpLl);
-            if (rc == 0) Ok(())
-            else Err("C/LLVM backend failed while linking executable '" + outBin + "'")
+            cleanupExtraObjs();
+            Err(emsg)
         },
-        cSrcs -> {
-            // Compile IR to `.o` first so Objective-C / C host files compile cleanly without `-flto=thin` ObjC clashes
-            let tmpObj = outBin + ".gsa.tmp.o";
-            let cmdIr =
-                envPfx + ccBin + targetArchFlag
-                + " -O2 -Wno-override-module -x ir -c "
-                + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
-            let rc1 = shell(cmdIr);
-            let _ = removeFile(tmpLl);
-            if (rc1 != 0) {
-                let _ = removeFile(tmpObj);
-                Err("C/LLVM backend failed while compiling Geisha IR object for '" + outBin + "'")
-            } else {
-                let cmdLink =
+        None -> match (tc.tcCSources, cellGet(extraObjs)) {
+            (Nil, Nil) -> {
+                let cmd =
                     envPfx + ccBin + targetArchFlag
-                    + " -O2 -pthread"
-                    + shellQuoteArgs(tc.tcCFlags)
-                    + shellQuoteArgs(cSrcs)
-                    + " " + shellQuote(tmpObj)
-                    + " " + shellQuote(rtArchive)
+                    + " -O2 -Wno-override-module -pthread -x ir "
+                    + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
                     + shellQuoteArgs(tc.tcLinkFlags)
                     + sysLibs
                     + " -o " + shellQuote(outBin);
-                let rc2 = shell(cmdLink);
-                let _ = removeFile(tmpObj);
-                if (rc2 == 0) Ok(())
-                else Err("C/LLVM backend failed while linking native host & executable '" + outBin + "'")
-            }
+                let rc = shell(cmd);
+                let _ = removeFile(tmpLl);
+                if (rc == 0) Ok(())
+                else Err("C/LLVM backend failed while linking executable '" + outBin + "'")
+            },
+            (cSrcs, eObjs) -> {
+                // Compile IR to `.o` first so Objective-C / C host files compile cleanly without `-flto=thin` ObjC clashes
+                let tmpObj = outBin + ".gsa.tmp.o";
+                let cmdIr =
+                    envPfx + ccBin + targetArchFlag
+                    + " -O2 -Wno-override-module -x ir -c "
+                    + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
+                let rc1 = shell(cmdIr);
+                let _ = removeFile(tmpLl);
+                if (rc1 != 0) {
+                    let _ = removeFile(tmpObj);
+                    cleanupExtraObjs();
+                    Err("C/LLVM backend failed while compiling Geisha IR object for '" + outBin + "'")
+                } else {
+                    let cmdLink =
+                        envPfx + ccBin + targetArchFlag
+                        + " -O2 -pthread"
+                        + shellQuoteArgs(tc.tcCFlags)
+                        + shellQuoteArgs(cSrcs)
+                        + shellQuoteArgs(eObjs)
+                        + " " + shellQuote(tmpObj)
+                        + " " + shellQuote(rtArchive)
+                        + shellQuoteArgs(tc.tcLinkFlags)
+                        + sysLibs
+                        + " -o " + shellQuote(outBin);
+                    let rc2 = shell(cmdLink);
+                    let _ = removeFile(tmpObj);
+                    cleanupExtraObjs();
+                    if (rc2 == 0) Ok(())
+                    else Err("C/LLVM backend failed while linking native host & executable '" + outBin + "'")
+                }
+            },
         },
     }
 }
@@ -872,6 +926,7 @@ def runDriver(): Result Int String = {
                     tcCSources: Nil,
                     tcCFlags: Nil,
                     tcLinkFlags: Nil,
+                    tcExtraUnits: Nil,
                     tcExports: opts.optExports,
                     tcWebAssets: Nil,
                     tcOwnsMain: opts.optNoMain,

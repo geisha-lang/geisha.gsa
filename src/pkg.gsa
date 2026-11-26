@@ -45,11 +45,20 @@ pub data DepDecl {
     },
 }
 
+pub data NativeUnit {
+    MkNativeUnit {
+        nuCompiler: String,
+        nuSources: List String,
+        nuFlags: List String,
+    },
+}
+
 pub data TargetCfg {
     MkTargetCfg {
         tcCSources: List String,
         tcCFlags: List String,
         tcLinkFlags: List String,
+        tcExtraUnits: List NativeUnit,
         tcExports: List String,
         tcWebAssets: List String,
         tcOwnsMain: Bool,
@@ -112,6 +121,7 @@ def emptyTargetCfg(): TargetCfg = MkTargetCfg {
     tcCSources: Nil,
     tcCFlags: Nil,
     tcLinkFlags: Nil,
+    tcExtraUnits: Nil,
     tcExports: Nil,
     tcWebAssets: Nil,
     tcOwnsMain: false,
@@ -396,20 +406,138 @@ def optFieldAlt(fs: List (String, Value), kSnake: String, kKebab: String): Optio
         None -> lookupVal(fs, kKebab),
     }
 
+extern "gs_sys_host_os" def c_pkg_host_os(): Ptr
+
+def pkgHostOs(): String = {
+    let p = c_pkg_host_os();
+    if (ptrIsNull(p)) "posix" else ptrToString(p)
+}
+
+def splitWsTokens(s: String): List String = {
+    let n = strLen(s);
+    let acc = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        while (cellGet(i) < n && (strByteAt(s, cellGet(i)) == 32 || strByteAt(s, cellGet(i)) == 9 || strByteAt(s, cellGet(i)) == 10 || strByteAt(s, cellGet(i)) == 13)) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        let start = cellGet(i);
+        while (cellGet(i) < n && strByteAt(s, cellGet(i)) != 32 && strByteAt(s, cellGet(i)) != 9 && strByteAt(s, cellGet(i)) != 10 && strByteAt(s, cellGet(i)) != 13) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        if (cellGet(i) > start) {
+            cellSet(acc, Cons(strSlice(s, start, cellGet(i)), cellGet(acc)))
+        } else ()
+    };
+    listRev(cellGet(acc))
+}
+
+def toolDisabledByEnv(toolName: String): Bool = match getEnv("GEISHA_DISABLE_TOOL") {
+    Some(v) -> v == toolName,
+    None -> false,
+}
+
+def evalWhenPredicates(rfs: List (String, Value)): Bool = {
+    let osOk = match asStrOpt(lookupVal(rfs, "os")) {
+        None -> true,
+        Some(wantOs) -> pkgHostOs() == wantOs,
+    };
+    let toolOk =
+        if (!osOk) false
+        else match asStrOpt(lookupVal(rfs, "tool")) {
+            None -> true,
+            Some(t) -> !toolDisabledByEnv(t) && shell("command -v " + shellQuote(t) + " >/dev/null 2>&1") == 0,
+        };
+    if (!toolOk) false
+    else match asStrOpt(optFieldAlt(rfs, "pkg_config", "pkg-config")) {
+        None -> true,
+        Some(pc) -> shell("pkg-config --exists " + shellQuote(pc) + " >/dev/null 2>&1") == 0,
+    }
+}
+
+def definesToFlags(defs: List String): List String = match defs {
+    Nil -> Nil,
+    Cons(d, r) -> Cons("-D" + d, definesToFlags(r)),
+}
+
 def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOpt {
     None -> Ok(emptyTargetCfg()),
     Some(VObj(fs)) -> {
-        let cSrcs = asStrList(optFieldAlt(fs, "c_sources", "c-sources"))?;
-        let cFlgs = asStrList(optFieldAlt(fs, "c_flags", "c-flags"))?;
-        let lFlgs = asStrList(optFieldAlt(fs, "link_flags", "link-flags"))?;
+        let cSrcs = cellNew(asStrList(optFieldAlt(fs, "c_sources", "c-sources"))?);
+        let cFlgs = cellNew(asStrList(optFieldAlt(fs, "c_flags", "c-flags"))?);
+        let lFlgs = cellNew(asStrList(optFieldAlt(fs, "link_flags", "link-flags"))?);
+        let extraUnits: Cell (List NativeUnit) = cellNew(Nil);
         let exps = asStrList(lookupVal(fs, "exports"))?;
         let webAs = asStrList(optFieldAlt(fs, "web_assets", "web-assets"))?;
         let ownsM = asBoolOr(optFieldAlt(fs, "owns_main", "owns-main"), false);
         let bootS = asStrOpt(optFieldAlt(fs, "boot_symbol", "boot-symbol"));
+
+        // Generic declarative `[[target.native.when]]` conditional blocks (`os`, `tool`, `pkg_config`, `compiler`, `defines`)
+        match lookupVal(fs, "when") {
+            Some(VArr(rules)) -> {
+                let cur = cellNew(rules);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(VObj(rfs), rr) -> {
+                            if (evalWhenPredicates(rfs)) {
+                                let rSrcs = asStrList(optFieldAlt(rfs, "c_sources", "c-sources"))?;
+                                let rCFlgs = asStrList(optFieldAlt(rfs, "c_flags", "c-flags"))?;
+                                let rLFlgs = asStrList(optFieldAlt(rfs, "link_flags", "link-flags"))?;
+                                let rDefs = definesToFlags(asStrList(lookupVal(rfs, "defines"))?);
+                                let pcCFlgs = cellNew(Nil);
+                                let pcLFlgs = cellNew(Nil);
+                                match asStrOpt(optFieldAlt(rfs, "pkg_config", "pkg-config")) {
+                                    Some(pc) -> {
+                                        match execCapture("pkg-config --cflags " + shellQuote(pc)) {
+                                            Ok(out) -> cellSet(pcCFlgs, splitWsTokens(out)),
+                                            Err(_) -> (),
+                                        };
+                                        match execCapture("pkg-config --libs " + shellQuote(pc)) {
+                                            Ok(out) -> cellSet(pcLFlgs, splitWsTokens(out)),
+                                            Err(_) -> (),
+                                        }
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(cFlgs, listAppend(cellGet(cFlgs), rDefs));
+                                cellSet(cFlgs, listAppend(cellGet(cFlgs), cellGet(pcCFlgs)));
+                                cellSet(lFlgs, listAppend(cellGet(lFlgs), cellGet(pcLFlgs)));
+                                cellSet(lFlgs, listAppend(cellGet(lFlgs), rLFlgs));
+                                match asStrOpt(lookupVal(rfs, "compiler")) {
+                                    Some(comp) -> {
+                                        match rSrcs {
+                                            Nil -> cellSet(cFlgs, listAppend(cellGet(cFlgs), rCFlgs)),
+                                            _ -> {
+                                                let uFlgs = listAppend(rDefs, rCFlgs);
+                                                cellSet(extraUnits, listAppend(cellGet(extraUnits), [MkNativeUnit {
+                                                    nuCompiler: comp,
+                                                    nuSources: rSrcs,
+                                                    nuFlags: uFlgs,
+                                                }]))
+                                            },
+                                        }
+                                    },
+                                    None -> {
+                                        cellSet(cSrcs, listAppend(cellGet(cSrcs), rSrcs));
+                                        cellSet(cFlgs, listAppend(cellGet(cFlgs), rCFlgs))
+                                    },
+                                }
+                            } else ();
+                            cellSet(cur, rr)
+                        },
+                        Cons(_, rr) -> cellSet(cur, rr),
+                        Nil -> (),
+                    }
+                }
+            },
+            _ -> (),
+        };
+
         Ok(MkTargetCfg {
-            tcCSources: cSrcs,
-            tcCFlags: cFlgs,
-            tcLinkFlags: lFlgs,
+            tcCSources: cellGet(cSrcs),
+            tcCFlags: cellGet(cFlgs),
+            tcLinkFlags: cellGet(lFlgs),
+            tcExtraUnits: cellGet(extraUnits),
             tcExports: exps,
             tcWebAssets: webAs,
             tcOwnsMain: ownsM,
@@ -1621,6 +1749,7 @@ def mergeTargetConfigs(
     let cSrcs = cellNew(Nil);
     let cFlgs = cellNew(Nil);
     let lFlgs = cellNew(Nil);
+    let extraUnits: Cell (List NativeUnit) = cellNew(Nil);
     let exps = cellNew(Nil);
     let webAs = cellNew(Nil);
     let ownsM = cellNew(cliNoMain);
@@ -1631,6 +1760,21 @@ def mergeTargetConfigs(
         cellSet(cFlgs, appendUniqueList(cellGet(cFlgs), tc.tcCFlags));
         // Preserve link flag order (e.g. `-framework Cocoa -framework QuartzCore` repeats `-framework`!)
         cellSet(lFlgs, listAppend(cellGet(lFlgs), tc.tcLinkFlags));
+        let cu = cellNew(tc.tcExtraUnits);
+        while (match cellGet(cu) { Nil -> false, _ -> true }) {
+            match cellGet(cu) {
+                Cons(u, ru) -> {
+                    let resolvedU = MkNativeUnit {
+                        nuCompiler: u.nuCompiler,
+                        nuSources: resolveRelList(baseDir, u.nuSources),
+                        nuFlags: u.nuFlags,
+                    };
+                    cellSet(extraUnits, listAppend(cellGet(extraUnits), [resolvedU]));
+                    cellSet(cu, ru)
+                },
+                Nil -> (),
+            }
+        };
         cellSet(exps, appendUniqueList(cellGet(exps), tc.tcExports));
         cellSet(webAs, appendUniqueList(cellGet(webAs), resolveRelList(baseDir, tc.tcWebAssets)));
         if (tc.tcOwnsMain) cellSet(ownsM, true) else ();
@@ -1660,6 +1804,7 @@ def mergeTargetConfigs(
         tcCSources: cellGet(cSrcs),
         tcCFlags: cellGet(cFlgs),
         tcLinkFlags: cellGet(lFlgs),
+        tcExtraUnits: cellGet(extraUnits),
         tcExports: cellGet(exps),
         tcWebAssets: cellGet(webAs),
         tcOwnsMain: cellGet(ownsM),
@@ -2217,6 +2362,7 @@ pub def cmdTest(rtOverrideOpt: Option String, cbs: CompileCallbacks): Result Voi
         tcCSources: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcCSources,
         tcCFlags: mergedNative.tcCFlags,
         tcLinkFlags: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcLinkFlags,
+        tcExtraUnits: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcExtraUnits,
         tcExports: Nil,
         tcWebAssets: Nil,
         tcOwnsMain: false,
