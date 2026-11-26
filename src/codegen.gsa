@@ -1204,7 +1204,11 @@ def tryEmitIntrinsic(
         let newVal = genExpr(mctx, fctx, a1, locals, false);
         let valTy = schemeBody(a1.tscm);
         emitStore(fctx, getValLlvmType(valTy), newVal, cellPtr);
-        if (!mctx.mcIsWasm && !isNoscanElemType(valTy)) {
+        let isStackCell = match a0.tnode {
+            TmVar(vn) -> isStackAlloc(mctx.mcEscape, fctx.fcName, vn),
+            _ -> false,
+        };
+        if (!mctx.mcIsWasm && !isStackCell && !isNoscanElemType(valTy)) {
             emitLine(fctx, "call void @gc_write_barrier(ptr " + cellPtr + ")")
         } else ();
         Some("0")

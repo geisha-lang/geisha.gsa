@@ -136,6 +136,17 @@ static gc_large_t **_large_table = NULL;
 static size_t _large_table_cap = 0;
 static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
+static size_t _large_total_bytes = 0;
+
+/* Small reuse cache for medium-large blocks (<= 256 KB) to avoid mmap/munmap churn */
+#define LARGE_CACHE_CAP 16u
+#define LARGE_CACHE_MAX_BYTES (256u * 1024u)
+typedef struct {
+    void *ptr;
+    size_t map_size;
+} gc_large_cache_entry_t;
+static gc_large_cache_entry_t _large_cache[LARGE_CACHE_CAP];
+static size_t _large_cache_len = 0;
 
 /* Two-phase GC Cleanup registry (non-resurrecting finalizers) & External Memory Pressure */
 typedef struct gc_cleanup_entry_t {
@@ -1165,7 +1176,21 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
         gc_collect_locked(self, false);
     }
 
-    void *raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *raw = NULL;
+    bool from_cache = false;
+    if (map_size <= LARGE_CACHE_MAX_BYTES) {
+        for (size_t i = 0; i < _large_cache_len; i++) {
+            if (_large_cache[i].map_size == map_size) {
+                raw = _large_cache[i].ptr;
+                _large_cache[i] = _large_cache[--_large_cache_len];
+                from_cache = true;
+                break;
+            }
+        }
+    }
+    if (raw == NULL) {
+        raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
     if (raw == MAP_FAILED) {
         if (self != NULL) {
             if (!regs_saved) {
@@ -1199,11 +1224,14 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
     _large_head = lo;
     large_table_insert_locked(lo);
 
+    _large_total_bytes += map_size;
     _bytes_alloc_since_gc += map_size;
     pthread_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 
-    (void)zero_init; /* Freshly mmap'd anonymous memory is already zeroed by the OS */
+    if (from_cache && zero_init) {
+        memset((void *)payload_ptr, 0, payload_words * WORD_SIZE);
+    }
     return (void *)payload_ptr;
 }
 
@@ -1692,7 +1720,8 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                  || !_generational_enabled
                  || (_major_collections == 0 && _minor_collections == 0)
                  || (_consecutive_minors >= MAX_CONSECUTIVE_MINORS)
-                 || (_last_live_bytes >= _major_threshold_bytes);
+                 || (_last_live_bytes >= _major_threshold_bytes)
+                 || (_large_total_bytes >= _major_threshold_bytes);
 
     /* Retire all thread-local slab caches (pages remain linked in `_active_pages[c]`) */
     for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
@@ -1907,7 +1936,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         reclaim_empty_chunks_locked(1);
     }
 
-    /* 7. Sweep large objects (munmap dead large objects immediately back to OS!) */
+    /* 7. Sweep large objects (reuse <=256 KB blocks in cache or munmap back to OS!) */
     gc_large_t *lo = _large_head;
     while (lo != NULL) {
         gc_large_t *next = lo->next;
@@ -1918,7 +1947,16 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
             else _large_head = lo->next;
             if (lo->next != NULL) lo->next->prev = lo->prev;
             large_table_remove_locked(lo);
-            munmap(lo, lo->map_size);
+            size_t msz = lo->map_size;
+            if (_large_total_bytes >= msz) _large_total_bytes -= msz;
+            else _large_total_bytes = 0;
+            if (!is_major && msz <= LARGE_CACHE_MAX_BYTES && _large_cache_len < LARGE_CACHE_CAP) {
+                _large_cache[_large_cache_len].ptr = (void *)lo;
+                _large_cache[_large_cache_len].map_size = msz;
+                _large_cache_len++;
+            } else {
+                munmap(lo, msz);
+            }
         }
         lo = next;
     }
@@ -2138,6 +2176,10 @@ void gc_trim(void)
     geisha_rt_init();
     gc_collect_major();
     pthread_mutex_lock(&_gc_mu);
+    for (size_t i = 0; i < _large_cache_len; i++) {
+        munmap(_large_cache[i].ptr, _large_cache[i].map_size);
+    }
+    _large_cache_len = 0;
     reclaim_empty_chunks_locked(1);
     for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
 #if defined(MADV_FREE_REUSABLE)
