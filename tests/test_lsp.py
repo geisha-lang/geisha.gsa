@@ -1836,6 +1836,88 @@ def main() -> int:
         res_u3 = subprocess.run([abs_geisha_bin, "run", str(run_u3_dir / "main.gsa")], cwd=str(run_u3_dir), env=run_env, capture_output=True, text=True, timeout=60)
         assert res_u3.returncode == 0 and res_u3.stdout.strip() == "7", f"u3 failed: rc={res_u3.returncode} stdout={res_u3.stdout!r} stderr={res_u3.stderr!r}"
 
+        # (v) Local rename initiated from arm body on shorthand struct pattern (`Point { x } -> x` & `let Point { x } = p; x`): expands to `Point { x: fresh } -> fresh` preserving field `x`, compiles & runs -> `14`
+        v_dir = root / "local_shorthand_rename_proj"
+        v_dir.mkdir(parents=True)
+        v_path = v_dir / "main.gsa"
+        v_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int } }\n"
+            "def fMatch(p: Point): Int = match p {\n"
+            "    Point { x } -> x,\n"
+            "}\n"
+            "def fLet(p: Point): Int = {\n"
+            "    let Point { x } = p;\n"
+            "    x\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(fMatch(Point { x: 7 }) + fLet(Point { x: 7 })))\n"
+        )
+        v_path.write_text(v_src, encoding="utf-8")
+        v_uri = path_to_uri(v_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": v_uri, "languageId": "geisha", "version": 1, "text": v_src}})
+        assert client.wait_diag_for(v_uri) == []
+        # Rename local `x` from `-> x` body in fMatch
+        ren_v1 = client.request("textDocument/rename", {
+            "textDocument": {"uri": v_uri},
+            "position": {"line": 3, "character": "    Point { x } -> x,".index("-> x") + 3},
+            "newName": "fresh",
+        })
+        assert "result" in ren_v1, f"expected body-initiated shorthand local rename to succeed: {ren_v1}"
+        new_v1 = apply_edits(v_src, ren_v1["result"]["changes"][v_uri])
+        assert "Point { x: fresh } -> fresh," in new_v1 and "data Point { Point { x: Int } }" in new_v1, f"unexpected v1 edits: {new_v1!r}"
+        # Also rename local `x` from `let Point { x } = p; x` body
+        ren_v2 = client.request("textDocument/rename", {
+            "textDocument": {"uri": v_uri},
+            "position": {"line": 7, "character": 4},
+            "newName": "freshLet",
+        })
+        assert "result" in ren_v2, f"expected let-shorthand local rename to succeed: {ren_v2}"
+        new_v2 = apply_edits(v_src, ren_v2["result"]["changes"][v_uri])
+        assert "let Point { x: freshLet } = p;\n    freshLet\n" in new_v2 and "data Point { Point { x: Int } }" in new_v2, f"unexpected v2 edits: {new_v2!r}"
+        run_v1_dir = root / "run_local_shorthand_match"
+        run_v1_dir.mkdir(parents=True)
+        (run_v1_dir / "main.gsa").write_text(new_v1, encoding="utf-8")
+        res_v1 = subprocess.run([abs_geisha_bin, "run", str(run_v1_dir / "main.gsa")], cwd=str(run_v1_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_v1.returncode == 0 and res_v1.stdout.strip() == "14", f"v1 failed: rc={res_v1.returncode} stdout={res_v1.stdout!r} stderr={res_v1.stderr!r}"
+        run_v2_dir = root / "run_local_shorthand_let"
+        run_v2_dir.mkdir(parents=True)
+        (run_v2_dir / "main.gsa").write_text(new_v2, encoding="utf-8")
+        res_v2 = subprocess.run([abs_geisha_bin, "run", str(run_v2_dir / "main.gsa")], cwd=str(run_v2_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_v2.returncode == 0 and res_v2.stdout.strip() == "14", f"v2 failed: rc={res_v2.returncode} stdout={res_v2.stdout!r} stderr={res_v2.stderr!r}"
+
+        # (w) Tuple pattern with preceding struct field of same name: `(Point { x: left }, x) -> left + x` -> rename local `x` from body edits ONLY tuple `PatVar("x")`, NOT `Point`'s `x:`, compiles & runs -> `10`
+        w_dir = root / "tuple_patvar_span_proj"
+        w_dir.mkdir(parents=True)
+        w_path = w_dir / "main.gsa"
+        w_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int } }\n"
+            "def addIt(p: Point, v: Int): Int = match (p, v) {\n"
+            "    (Point { x: left }, x) -> left + x,\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(addIt(Point { x: 7 }, 3)))\n"
+        )
+        w_path.write_text(w_src, encoding="utf-8")
+        w_uri = path_to_uri(w_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": w_uri, "languageId": "geisha", "version": 1, "text": w_src}})
+        assert client.wait_diag_for(w_uri) == []
+        w_line = "    (Point { x: left }, x) -> left + x,"
+        ren_w = client.request("textDocument/rename", {
+            "textDocument": {"uri": w_uri},
+            "position": {"line": 3, "character": w_line.index("left + x") + 7},
+            "newName": "fresh",
+        })
+        assert "result" in ren_w, f"expected tuple PatVar rename to succeed: {ren_w}"
+        new_w = apply_edits(w_src, ren_w["result"]["changes"][w_uri])
+        assert "(Point { x: left }, fresh) -> left + fresh," in new_w, f"Point.x label must NOT be renamed when renaming tuple PatVar `x`: {new_w!r}"
+        run_w_dir = root / "run_tuple_patvar"
+        run_w_dir.mkdir(parents=True)
+        (run_w_dir / "main.gsa").write_text(new_w, encoding="utf-8")
+        res_w = subprocess.run([abs_geisha_bin, "run", str(run_w_dir / "main.gsa")], cwd=str(run_w_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_w.returncode == 0 and res_w.stdout.strip() == "10", f"w failed: rc={res_w.returncode} stdout={res_w.stdout!r} stderr={res_w.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

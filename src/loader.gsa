@@ -464,7 +464,7 @@ def collectExprChainsInList(es: List Form, bound: List String, out: Cell (List (
 }
 
 def collectPatVars(p: Pattern, bound: Cell (List String)): Void = match p {
-    PatVar(v) -> cellSet(bound, addUniqueStr(cellGet(bound), v)),
+    PatVar(v, _) -> cellSet(bound, addUniqueStr(cellGet(bound), v)),
     PatTuple(ps) -> {
         let c = cellNew(ps);
         while (match cellGet(c) { Nil -> false, _ -> true }) {
@@ -1104,9 +1104,9 @@ def rewriteSchemeInMod(ctx: ModRewriteCtx, scm: Scheme): Scheme = match scm {
 }
 
 def rewritePatInMod(ctx: ModRewriteCtx, pat: Pattern, bound: Cell (List String)): Pattern = match pat {
-    PatVar(v) -> {
+    PatVar(v, sp) -> {
         cellSet(bound, addUniqueStr(cellGet(bound), v));
-        PatVar(v)
+        PatVar(v, sp)
     },
     PatWild -> PatWild,
     PatLit(_) -> pat,

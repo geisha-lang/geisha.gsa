@@ -1753,7 +1753,7 @@ def emitPatternCheckAndBind(
     let wm = fctx.fcMod;
     match pat {
         PatWild -> (),
-        PatVar(vname) -> {
+        PatVar(vname, _) -> {
             let wt = geishaTypeToWgc(wm, scrutTy);
             cellSet(localsCell, Cons((vname, scrutLocal, wt), cellGet(localsCell)))
         },

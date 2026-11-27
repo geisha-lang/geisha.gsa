@@ -262,7 +262,7 @@ pub data VarDecl {
 }
 
 pub data Pattern {
-    PatVar(String),
+    PatVar(String, Span),
     PatWild,
     PatLit(Lit),
     PatTuple(List Pattern),

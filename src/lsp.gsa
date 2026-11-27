@@ -925,87 +925,48 @@ def locateBinderSpan(src: String, fileId: Int, name: String, lo: Int, hi: Int): 
     MkSpan { fileId: fileId, start: s, end: e }
 }
 
-def findPatVarSpanInPat(pat: Pattern, src: String, fileId: Int, vn: String, lo: Int, hi: Int): Option Span = match pat {
-    PatVar(v) ->
-        if (v == vn) {
-            let (s1, e1) = findIdentInSpan(src, vn, lo, hi);
-            if (s1 < e1 && strSlice(src, s1, e1) == vn) Some(MkSpan { fileId: fileId, start: s1, end: e1 })
-            else None
-        } else None,
-    PatWild -> None,
-    PatLit(_) -> None,
+def collectPatVarBinds(pat: Pattern, acc: Cell (List (String, Span, Option String))): Void = match pat {
+    PatVar(v, sp) -> cellSet(acc, Cons((v, sp, None), cellGet(acc))),
+    PatWild -> (),
+    PatLit(_) -> (),
     PatTuple(ps) -> {
         let cur = cellNew(ps);
-        let found: Cell (Option Span) = cellNew(None);
-        while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
-                Cons(p, r) -> {
-                    match findPatVarSpanInPat(p, src, fileId, vn, lo, hi) {
-                        Some(sp) -> cellSet(found, Some(sp)),
-                        None -> (),
-                    };
-                    cellSet(cur, r)
-                },
+                Cons(p, r) -> { collectPatVarBinds(p, acc); cellSet(cur, r) },
                 Nil -> (),
             }
-        };
-        cellGet(found)
+        }
     },
     PatCtor(_, ps) -> {
         let cur = cellNew(ps);
-        let found: Cell (Option Span) = cellNew(None);
-        while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
-                Cons(p, r) -> {
-                    match findPatVarSpanInPat(p, src, fileId, vn, lo, hi) {
-                        Some(sp) -> cellSet(found, Some(sp)),
-                        None -> (),
-                    };
-                    cellSet(cur, r)
-                },
+                Cons(p, r) -> { collectPatVarBinds(p, acc); cellSet(cur, r) },
                 Nil -> (),
             }
-        };
-        cellGet(found)
+        }
     },
     PatStruct(_, fs) -> {
         let cur = cellNew(fs);
-        let found: Cell (Option Span) = cellNew(None);
-        while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons((fname, subPat, fSp, isShort), r) -> {
                     if (isShort) {
-                        if (fname == vn && fSp.fileId == fileId && fSp.end > fSp.start) {
-                            cellSet(found, Some(fSp))
-                        } else ()
+                        cellSet(acc, Cons((fname, fSp, Some(fname)), cellGet(acc)))
                     } else {
-                        let subLo = if (fSp.fileId == fileId && fSp.end > fSp.start) fSp.end else lo;
-                        let subHi = if (hi > subLo) hi else strLen(src);
-                        match findPatVarSpanInPat(subPat, src, fileId, vn, subLo, subHi) {
-                            Some(sp) -> cellSet(found, Some(sp)),
-                            None -> (),
-                        }
+                        collectPatVarBinds(subPat, acc)
                     };
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
-        };
-        cellGet(found)
+        }
     },
 }
 
-def locatePatVarSpan(pat: Pattern, src: String, fileId: Int, vn: String, patLo: Int, patHi: Int, fStart: Int, fEnd: Int): Span = {
-    let lo = if (patHi > patLo) patLo else fStart;
-    let hi = if (patHi > patLo) patHi else fEnd;
-    match findPatVarSpanInPat(pat, src, fileId, vn, lo, hi) {
-        Some(sp) -> sp,
-        None -> locateBinderSpan(src, fileId, vn, fStart, fEnd),
-    }
-}
-
 def collectPatVarNames(pat: Pattern, acc: Cell (List String)): Void = match pat {
-    PatVar(v) -> cellSet(acc, Cons(v, cellGet(acc))),
+    PatVar(v, _) -> cellSet(acc, Cons(v, cellGet(acc))),
     PatWild -> (),
     PatLit(_) -> (),
     PatTuple(ps) -> {
@@ -1129,16 +1090,14 @@ def searchFormAt(src: String, f: Form, fileId: Int, off: Int, locals: List Local
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
                     Cons(arm, r) -> {
-                        let patNames: Cell (List String) = cellNew(Nil);
-                        collectPatVarNames(arm.pat, patNames);
-                        let patLo = cellGet(prevArmEnd);
-                        let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
+                        let patBinds: Cell (List (String, Span, Option String)) = cellNew(Nil);
+                        collectPatVarBinds(arm.pat, patBinds);
                         let armLocals = cellNew(locals);
-                        let cn = cellNew(listRev(cellGet(patNames)));
+                        let cn = cellNew(listRev(cellGet(patBinds)));
                         while (match cellGet(cn) { Nil -> false, _ -> true }) {
                             match cellGet(cn) {
-                                Cons(vn, rn) -> {
-                                    let bsp = locatePatVarSpan(arm.pat, src, fileId, vn, patLo, patHi, f.pos.start, f.pos.end);
+                                Cons((vn, rawSp, _), rn) -> {
+                                    let bsp = if (rawSp.end > rawSp.start) rawSp else locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end);
                                     cellSet(armLocals, Cons(MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot }, cellGet(armLocals)));
                                     cellSet(cn, rn)
                                 },
@@ -2293,16 +2252,14 @@ def findLocalDeclInForm(src: String, f: Form, fileId: Int, off: Int, word: Strin
                     while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(ca) { Nil -> false, _ -> true }) {
                         match cellGet(ca) {
                             Cons(arm, r) -> {
-                                let patNames: Cell (List String) = cellNew(Nil);
-                                collectPatVarNames(arm.pat, patNames);
-                                let patLo = cellGet(prevArmEnd);
-                                let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
-                                let cn = cellNew(listRev(cellGet(patNames)));
+                                let patBinds: Cell (List (String, Span, Option String)) = cellNew(Nil);
+                                collectPatVarBinds(arm.pat, patBinds);
+                                let cn = cellNew(listRev(cellGet(patBinds)));
                                 while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cn) { Nil -> false, _ -> true }) {
                                     match cellGet(cn) {
-                                        Cons(vn, rn) -> {
+                                        Cons((vn, rawSp, _), rn) -> {
                                             if (vn == word) {
-                                                let bsp = locatePatVarSpan(arm.pat, src, fileId, vn, patLo, patHi, f.pos.start, f.pos.end);
+                                                let bsp = if (rawSp.end > rawSp.start) rawSp else locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end);
                                                 if (off >= bsp.start && off <= bsp.end) {
                                                     cellSet(found, Some(MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot }))
                                                 } else ()
@@ -3144,21 +3101,24 @@ def collectLocalOccsInForm(
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
                 match cellGet(ca) {
                     Cons(arm, r) -> {
-                        let patNames: Cell (List String) = cellNew(Nil);
-                        collectPatVarNames(arm.pat, patNames);
-                        let patLo = cellGet(prevArmEnd);
-                        let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
+                        let patBinds: Cell (List (String, Span, Option String)) = cellNew(Nil);
+                        collectPatVarBinds(arm.pat, patBinds);
                         let armLocals = cellNew(locals);
                         let targetInArm = cellNew(false);
                         let armNewBinds: Cell (List LocalBind) = cellNew(Nil);
-                        let cn = cellNew(listRev(cellGet(patNames)));
+                        let cn = cellNew(listRev(cellGet(patBinds)));
                         while (match cellGet(cn) { Nil -> false, _ -> true }) {
                             match cellGet(cn) {
-                                Cons(vn, rn) -> {
-                                    let bsp = locatePatVarSpan(arm.pat, src, fileId, vn, patLo, patHi, f.pos.start, f.pos.end);
+                                Cons((vn, rawSp, shortFieldOpt), rn) -> {
+                                    let bsp = if (rawSp.end > rawSp.start) rawSp else locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end);
                                     if (spanEq(bsp, targetDefSpan)) {
                                         cellSet(targetInArm, true);
-                                        if (includeDecl) pushOcc(seen, outRev, uri, src, bsp.start, bsp.end) else ()
+                                        if (includeDecl) {
+                                            match (shortFieldOpt, newNameOpt) {
+                                                (Some(fname), Some(nn)) -> pushOccReplace(seen, outRev, uri, src, bsp.start, bsp.end, fname + ": " + nn),
+                                                _ -> pushOcc(seen, outRev, uri, src, bsp.start, bsp.end),
+                                            }
+                                        } else ()
                                     } else ();
                                     let lb = MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot };
                                     cellSet(armNewBinds, Cons(lb, cellGet(armNewBinds)));
@@ -3575,7 +3535,7 @@ def collectPatFieldOccsFromAst(
     outRev: Cell (List OccSpan)
 ): Void = match pat {
     PatWild -> (),
-    PatVar(_) -> (),
+    PatVar(_, _) -> (),
     PatLit(_) -> (),
     PatTuple(ps) -> {
         let cp = cellNew(ps);
