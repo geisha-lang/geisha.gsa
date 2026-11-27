@@ -24,6 +24,12 @@ jobs:
           - label: darwin-arm64
             os: macos-15
             cross_x64: "1"
+          - label: windows-x86_64
+            os: windows-latest
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout repository
@@ -46,6 +52,23 @@ jobs:
           brew list lld >/dev/null 2>&1 || brew install lld
           command -v xz >/dev/null 2>&1 || brew install xz
 
+      - name: Set up LLVM/Clang & GNU Make (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if [ -d "/c/Program Files/LLVM/bin" ]; then
+            echo "/c/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+            export PATH="/c/Program Files/LLVM/bin:$PATH"
+          fi
+          if ! command -v make >/dev/null 2>&1; then
+            choco install -y make --no-progress
+            echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+            export PATH="/c/ProgramData/chocolatey/bin:$PATH"
+          fi
+          clang --version
+          llvm-ar --version
+          wasm-ld --version
+          make --version
+
       - name: Set up Node.js (for wasm32 E2E test suite)
         uses: actions/setup-node@v4
         with:
@@ -53,10 +76,11 @@ jobs:
 
       - name: Check Agent docs, bundles & language-change sync
         run: |
+          PYTHON="$(command -v python3 >/dev/null 2>&1 && echo python3 || echo python)"
           make check-docs
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git fetch --no-tags --depth=50 origin "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
-            python3 scripts/check_agent_docs.py --diff "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+            "$PYTHON" scripts/check_agent_docs.py --diff "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
           fi
 
       - name: 3-stage self-hosting bootstrap & fixed-point check
@@ -65,13 +89,19 @@ jobs:
       - name: Run full end-to-end language, GC, wasm32 & package manager tests
         run: make test
 
-      - name: Verify relocatable release tarball packaging & zero-env smoke test
+      - name: Verify relocatable release archive packaging & zero-env smoke test
         env:
           PACKAGE_DARWIN_X86_64: ${{ matrix.cross_x64 || '0' }}
         run: |
           make dist VERSION=ci
           SMOKE_DIR="$(mktemp -d)"
-          tar -xzf dist/geisha-ci-${{ matrix.label }}.tar.gz -C "$SMOKE_DIR"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            PYTHON="$(command -v python3 >/dev/null 2>&1 && echo python3 || echo python)"
+            "$PYTHON" -m zipfile -e "dist/geisha-ci-${{ matrix.label }}.zip" "$SMOKE_DIR"
+            (cd dist && sha256sum -c "geisha-ci-${{ matrix.label }}.zip.sha256")
+          else
+            tar -xzf "dist/geisha-ci-${{ matrix.label }}.tar.gz" -C "$SMOKE_DIR"
+          fi
           export PATH="$SMOKE_DIR/geisha-ci-${{ matrix.label }}/bin:$PATH"
           cd "$SMOKE_DIR"
           geisha guide >/dev/null

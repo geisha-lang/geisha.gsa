@@ -13,14 +13,33 @@ UNAME_M="$(uname -m)"
 case "$UNAME_S" in
     Darwin) OS_NAME="darwin" ;;
     Linux)  OS_NAME="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) OS_NAME="windows" ;;
     *)      OS_NAME="$(echo "$UNAME_S" | tr '[:upper:]' '[:lower:]')" ;;
 esac
+
+if [ "${OS:-}" = "Windows_NT" ]; then
+    OS_NAME="windows"
+fi
+
+EXE_EXT=""
+if [ "$OS_NAME" = "windows" ]; then
+    EXE_EXT=".exe"
+fi
 
 case "$UNAME_M" in
     arm64|aarch64) ARCH_NAME="arm64" ;;
     x86_64|amd64)  ARCH_NAME="x86_64" ;;
     *)             ARCH_NAME="$UNAME_M" ;;
 esac
+
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON="python3"
+    else
+        PYTHON="python"
+    fi
+fi
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -36,13 +55,18 @@ package_one() {
     bin_path="$3"
     rt_path="$4"
 
+    pkg_ext=""
+    if [ "$pkg_os" = "windows" ]; then
+        pkg_ext=".exe"
+    fi
+
     stem="geisha-${VERSION}-${pkg_os}-${pkg_arch}"
     stage_root="$DIST_DIR/$stem"
     rm -rf "$stage_root"
     mkdir -p "$stage_root/bin" "$stage_root/lib"
 
-    cp "$bin_path" "$stage_root/bin/geisha"
-    chmod 0755 "$stage_root/bin/geisha"
+    cp "$bin_path" "$stage_root/bin/geisha${pkg_ext}"
+    chmod 0755 "$stage_root/bin/geisha${pkg_ext}" || true
     cp "$rt_path" "$stage_root/lib/libgeisha_runtime.a"
     if [ -f "$BUILD_DIR/wasm_rt.o" ]; then
         cp "$BUILD_DIR/wasm_rt.o" "$stage_root/lib/wasm_rt.o"
@@ -52,17 +76,38 @@ package_one() {
     fi
     cp README.md "$stage_root/README.md"
 
-    tarball="$DIST_DIR/${stem}.tar.gz"
-    tar -C "$DIST_DIR" -czf "$tarball" "$stem"
-    rm -rf "$stage_root"
+    if [ "$pkg_os" = "windows" ]; then
+        archive="$DIST_DIR/${stem}.zip"
+        rm -f "$archive"
+        "$PYTHON" - "$DIST_DIR" "$stem" "$archive" << 'PY'
+import os, sys, zipfile
+dist_dir, stem, out_zip = sys.argv[1], sys.argv[2], sys.argv[3]
+root = os.path.join(dist_dir, stem)
+with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for base, dirs, files in os.walk(root):
+        dirs.sort()
+        for fn in sorted(files):
+            full = os.path.join(base, fn)
+            arc = os.path.relpath(full, dist_dir).replace("\\", "/")
+            zf.write(full, arc)
+PY
+        rm -rf "$stage_root"
+        sum="$(sha256_file "$archive")"
+        printf "%s  %s\n" "$sum" "${stem}.zip" > "${archive}.sha256"
+        echo "Packaged $archive ($sum)"
+    else
+        tarball="$DIST_DIR/${stem}.tar.gz"
+        tar -C "$DIST_DIR" -czf "$tarball" "$stem"
+        rm -rf "$stage_root"
 
-    sum="$(sha256_file "$tarball")"
-    printf "%s  %s\n" "$sum" "${stem}.tar.gz" > "${tarball}.sha256"
-    echo "Packaged $tarball ($sum)"
+        sum="$(sha256_file "$tarball")"
+        printf "%s  %s\n" "$sum" "${stem}.tar.gz" > "${tarball}.sha256"
+        echo "Packaged $tarball ($sum)"
+    fi
 }
 
 mkdir -p "$DIST_DIR"
-package_one "$OS_NAME" "$ARCH_NAME" "$BUILD_DIR/geisha3" "$BUILD_DIR/libgeisha_runtime.a"
+package_one "$OS_NAME" "$ARCH_NAME" "$BUILD_DIR/geisha3${EXE_EXT}" "$BUILD_DIR/libgeisha_runtime.a"
 
 # Optional cross-packaging of darwin-x86_64 on Apple Silicon macOS using the Universal SDK
 if [ "${PACKAGE_DARWIN_X86_64:-0}" = "1" ] && [ "$OS_NAME" = "darwin" ] && [ "$ARCH_NAME" = "arm64" ]; then

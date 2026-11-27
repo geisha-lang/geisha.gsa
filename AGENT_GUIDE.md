@@ -1,6 +1,6 @@
 # Geisha Language — Agent Quick Reference (`geisha guide`)
 
-Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative language with open Concepts/Instances, algebraic data types, exhaustive pattern matching, GC + `$Scoped` regions, `Send`-checked concurrency, and a decentralized Git/MVS package manager (`geisha.toml`), compiling to LLVM 20 IR (`native`, `wasm32`, `ios`, `ios-sim`), native WebAssembly GC (`wasm-gc`, zero linear-memory GC runtime + companion `.mjs`/`.d.ts`), and zero-dependency ES Module JavaScript + TypeScript `.d.ts` (`js`).
+Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative language with open Concepts/Instances, algebraic data types, exhaustive pattern matching, GC + `$Scoped` regions, `Send`-checked concurrency, and a decentralized Git/MVS package manager (`geisha.toml`), compiling to LLVM 20 IR (`native` on Linux, macOS, and Windows `x86_64-pc-windows-msvc`, `wasm32`, `ios`, `ios-sim`), native WebAssembly GC (`wasm-gc`, zero linear-memory GC runtime + companion `.mjs`/`.d.ts`), and zero-dependency ES Module JavaScript + TypeScript `.d.ts` (`js`).
 
 ## 1. Agent Workflow (Use These First!)
 
@@ -185,6 +185,7 @@ version = "0.1.0"
 [deps]
 crema = { git = "github.com/geisha-lang/crema", version = "0.1.0" }
 local_lib = { path = "../local_lib" }
+# `geisha add` may emit `url_encoding = "pct"` on percent-encoded `file://` Git deps to disambiguate them from legacy unencoded v1 `file://` entries.
 
 [target.native]
 c_sources  = ["native/shim.c"]
@@ -239,3 +240,4 @@ principal_class = "MyViewCtrl"   # used when `is_extension = true`
 codesign        = "-"
 ```
 - Local overrides without touching `geisha.toml` or `geisha.lock`: put `[overrides]` or machine-local `[target.macos]` / `[target.ios]` / `[target.native]` settings (e.g. local `codesign` identity) in an untracked `geisha.local.toml`.
+- **Windows (`x86_64-pc-windows-msvc`)**: Native Windows builds use LLVM/Clang + LLD + MSVC UCRT (`make runtime wasm-runtime bootstrap && make test` under Git Bash / MSYS2 with `clang`, `llvm-ar`, `wasm-ld`, and GNU `make`), emit `.exe` binaries automatically, link `-lws2_32 -lbcrypt`, and support full UTF-8 paths/argv/env, Win64 C ABI, Winsock2 TCP, Job Object process groups, and `.zip` release bundles (`make dist`).

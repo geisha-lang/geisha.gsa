@@ -18,6 +18,7 @@ use std.char.{isIdentStartByte, isIdentContByte}
 use std.path.pathDirname
 use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
 use std.json.{parse as jsonParse, stringify as jsonStringify}
+use sys.env.hostOs
 use sys.fs.fileExists
 use sys.io.eprintLn
 use ast.{
@@ -330,11 +331,28 @@ def uriToPath(uri: String): String =
         }
     } else uri
 
+def normalizeUriPath(path: String): String =
+    if (hostOs() != "windows") path
+    else {
+        let n = strLen(path);
+        let b = bufNew();
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let c = strByteAt(path, cellGet(i));
+            bufPushByte(b, if (c == 92) 47 else c);
+            cellSet(i, cellGet(i) + 1)
+        };
+        bufToString(b)
+    }
+
 def pathToUri(path: String): String =
     if (strStartsWith(path, "file://")) path
-    else if (strStartsWith(path, "//")) "file://" + percentEncodePath(strSlice(path, 2, strLen(path)))
-    else if (strStartsWith(path, "/")) "file://" + percentEncodePath(path)
-    else "file:///" + percentEncodePath(path)
+    else {
+        let norm = normalizeUriPath(path);
+        if (strStartsWith(norm, "//")) "file://" + percentEncodePath(strSlice(norm, 2, strLen(norm)))
+        else if (strStartsWith(norm, "/")) "file://" + percentEncodePath(norm)
+        else "file:///" + percentEncodePath(norm)
+    }
 
 def isUtf8Cont(b: Int): Bool = b >= 128 && b < 192
 
