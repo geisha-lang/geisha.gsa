@@ -407,6 +407,167 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
     return (chmod(path, (mode_t)(mode & 07777)) == 0) ? 0 : -1;
 }
 
+#ifdef __APPLE__
+#include <sys/acl.h>
+#elif defined(__linux__)
+#include <sys/xattr.h>
+#endif
+
+int32_t gs_sys_file_mode(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    return (int32_t)(st.st_mode & 07777);
+}
+
+/* Atomically create a brand-new file with O_CREAT|O_EXCL|O_NOFOLLOW at restrictive `mode` (default 0600),
+ * write all `len` bytes, and close. Returns: 0 = ok, 1 = EEXIST (caller may pick next name), -1 = error. */
+int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_t mode)
+{
+    if (path == NULL || path[0] == '\0' || len < 0 || (len > 0 && buf == NULL)) return -1;
+    mode_t m = (mode >= 0) ? (mode_t)(mode & 07777) : (mode_t)0600;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, m);
+    if (fd < 0) {
+        if (errno == EEXIST) return 1;
+        return -1;
+    }
+    if (fchmod(fd, m) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    int64_t rem = len;
+    while (rem > 0) {
+        ssize_t n = write(fd, p, (size_t)rem);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            unlink(path);
+            return -1;
+        }
+        if (n == 0) {
+            close(fd);
+            unlink(path);
+            return -1;
+        }
+        p += n;
+        rem -= (int64_t)n;
+    }
+    if (close(fd) != 0) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Copy POSIX owner/group, permission bits AND platform ACLs (macOS copyfile COPYFILE_ACL,
+ * Linux POSIX ACL xattr) from `src` to `dst`. Fails closed (-1) if ownership, permission,
+ * or ACL preservation fails. */
+int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
+{
+    if (src == NULL || dst == NULL || src[0] == '\0' || dst[0] == '\0') return -1;
+    struct stat st;
+    struct stat dst_st;
+    if (lstat(src, &st) != 0) return -1;
+    if (lstat(dst, &dst_st) != 0) return -1;
+    if (dst_st.st_uid != st.st_uid || dst_st.st_gid != st.st_gid) {
+        if (chown(dst, st.st_uid, st.st_gid) != 0) return -1;
+    }
+#ifdef __APPLE__
+    /* Copy exact macOS extended ACL (including inherited entries), or clear `dst`'s ACL when
+     * `src` has no extended ACL (acl_get_file returns NULL with ENOENT). */
+    errno = 0;
+    acl_t src_acl = acl_get_file(src, ACL_TYPE_EXTENDED);
+    if (src_acl != NULL) {
+        int set_rc = acl_set_file(dst, ACL_TYPE_EXTENDED, src_acl);
+        acl_free(src_acl);
+        if (set_rc != 0) return -1;
+    } else if (errno == ENOENT) {
+        acl_t empty_acl = acl_init(0);
+        if (empty_acl == NULL) return -1;
+        int clr_rc = acl_set_file(dst, ACL_TYPE_EXTENDED, empty_acl);
+        int clr_err = errno;
+        acl_free(empty_acl);
+        if (clr_rc != 0 && clr_err != ENOTSUP && clr_err != EOPNOTSUPP) return -1;
+    } else if (errno != ENOTSUP && errno != EOPNOTSUPP) {
+        return -1;
+    }
+    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+#elif defined(__linux__)
+    ssize_t sz = getxattr(src, "system.posix_acl_access", NULL, 0);
+    if (sz < 0) {
+        if (errno == ENODATA) {
+            if (removexattr(dst, "system.posix_acl_access") != 0 &&
+                errno != ENODATA && errno != ENOTSUP && errno != EOPNOTSUPP) {
+                return -1;
+            }
+        } else if (errno != ENOTSUP && errno != EOPNOTSUPP) {
+            return -1;
+        }
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+    } else if (sz > 0) {
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+        void *abuf = malloc((size_t)sz);
+        if (abuf == NULL) return -1;
+        ssize_t got = getxattr(src, "system.posix_acl_access", abuf, (size_t)sz);
+        if (got < 0 || setxattr(dst, "system.posix_acl_access", abuf, (size_t)got, 0) != 0) {
+            free(abuf);
+            return -1;
+        }
+        free(abuf);
+    } else {
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+    }
+#else
+    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+#endif
+    return 0;
+}
+
+/* Set permissions/ACLs for a brand-new staged file by creating an empty kernel-default
+ * template sibling (`O_CREAT|O_EXCL|O_NOFOLLOW`, `base_mode`), copying its kernel-computed
+ * owner/group/mode/ACL onto `path`, and removing the empty template. Never mutates process umask
+ * and accurately reflects both umask and parent-directory default/inherited ACLs. */
+int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
+{
+    if (path == NULL || path[0] == '\0' || base_mode < 0) return -1;
+    static unsigned int gs_umask_seq = 0;
+    const char *slash = strrchr(path, '/');
+    size_t pfx_len = (slash != NULL) ? (size_t)(slash - path + 1) : 0;
+    unsigned long pid = (unsigned long)getpid();
+    size_t buf_len = pfx_len + 64;
+    char *tmpl = (char *)malloc(buf_len);
+    if (tmpl == NULL) return -1;
+    if (pfx_len > 0) memcpy(tmpl, path, pfx_len);
+    mode_t m = (mode_t)(base_mode & 0777);
+
+    int created = 0;
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        unsigned int seq = __atomic_add_fetch(&gs_umask_seq, 1u, __ATOMIC_RELAXED);
+        snprintf(tmpl + pfx_len, 64, ".gsp_%lu_%u", pid, seq);
+        int fd = open(tmpl, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, m);
+        if (fd >= 0) {
+            close(fd);
+            created = 1;
+            break;
+        }
+        if (errno != EEXIST) {
+            free(tmpl);
+            return -1;
+        }
+    }
+    if (!created) {
+        free(tmpl);
+        return -1;
+    }
+    int32_t rc = gs_sys_copy_file_acl(tmpl, path);
+    unlink(tmpl);
+    free(tmpl);
+    return rc;
+}
+
 int64_t gs_sys_file_mtime_ms(const char *path)
 {
     if (path == NULL) return -1;

@@ -1,0 +1,1809 @@
+// Static HTML + CSS + JS Documentation Site Generator & JSON Exporter (`doc_site`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listLen}
+use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
+use std.str.{intToStr, strStartsWith, strEndsWith, strTrim, strJoin, strSplitChar, strContains}
+use std.path.{pathJoin, pathDirname}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
+use std.codec.{Value, VStr, VInt, VArr, VObj}
+use std.json.{stringify, stringifyPretty}
+use sys.env.hostOs
+use sys.fs.{mkdirAll, writeFile, readFile, readDir, fileExists, removeFile, renameFile, chmod}
+
+extern "gs_sys_lstat_kind" def c_site_lstat_kind(path: String): Int
+extern "gs_sys_getpid" def c_site_getpid(): Int
+extern "gs_sys_fopen" def c_site_fopen(path: String, mode: String): Ptr
+extern "fclose" def c_site_fclose(fp: Ptr): Int
+extern "gs_sys_write_excl" def c_site_write_excl(path: String, buf: String, len: Int64, mode: Int): Int
+extern "gs_sys_copy_file_acl" def c_site_copy_file_acl(src: String, dst: String): Int
+extern "gs_sys_apply_umask_mode" def c_site_apply_umask_mode(path: String, baseMode: Int): Int
+
+def gSiteTmpSeq: Cell Int = cellNew(0)
+
+pub data DocItem {
+    MkDocItem {
+        diName: String,
+        diKind: String,
+        diVis: String,
+        diModule: String,
+        diSig: String,
+        diTypeParams: List String,
+        diDocs: List String,
+        diFile: String,
+        diLine: Int,
+        diEndLine: Int,
+        diImports: List (String, String, String),
+        diChildren: List DocItem,
+    },
+}
+
+pub data DocModule {
+    MkDocModule {
+        dmKey: String,
+        dmGroup: String,
+        dmPackage: String,
+        dmSourceLabel: String,
+        dmSourceText: String,
+        dmModuleDocs: List String,
+        dmImports: List (String, String, String),
+        dmItems: List DocItem,
+    },
+}
+
+pub data DocSiteData {
+    MkDocSiteData {
+        dsTitle: String,
+        dsVersion: String,
+        dsModules: List DocModule,
+    },
+}
+
+// ============================================================================
+// Slug & Escaping Helpers
+// ============================================================================
+
+def isAsciiAlphaNum(b: Int): Bool =
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+
+def isIdentChar(b: Int): Bool =
+    isAsciiAlphaNum(b) || b == 95
+
+def isUpperAlpha(b: Int): Bool =
+    b >= 65 && b <= 90
+
+pub def moduleSlug(modKey: String): String = {
+    let b = bufNew();
+    let n = strLen(modKey);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(modKey, cellGet(i));
+        if (isAsciiAlphaNum(c) || c == 46 || c == 45 || c == 95) {
+            bufPushByte(b, c)
+        } else {
+            bufPushByte(b, 95)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    let s = bufToString(b);
+    if (strLen(s) == 0) "module" else s
+}
+
+def htmlEscapeBuf(b: StringBuf, s: String): Void = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c == 38) bufPushStr(b, "&amp;")
+        else if (c == 60) bufPushStr(b, "&lt;")
+        else if (c == 62) bufPushStr(b, "&gt;")
+        else if (c == 34) bufPushStr(b, "&quot;")
+        else if (c == 39) bufPushStr(b, "&#39;")
+        else bufPushByte(b, c);
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def htmlEscape(s: String): String = {
+    let b = bufNew();
+    htmlEscapeBuf(b, s);
+    bufToString(b)
+}
+
+def anchorId(name: String): String = {
+    let b = bufNew();
+    bufPushStr(b, "item-");
+    let n = strLen(name);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(name, cellGet(i));
+        if (isAsciiAlphaNum(c) || c == 95 || c == 45 || c == 46) bufPushByte(b, c)
+        else bufPushByte(b, 95);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def itemAnchorId(subPath: String, name: String): String =
+    if (strLen(subPath) == 0) anchorId(name)
+    else anchorId(subPath + "." + name)
+
+def firstDocSummary(docs: List String): String = {
+    let cur = cellNew(docs);
+    let found = cellNew("");
+    while (strLen(cellGet(found)) == 0 && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(line, rest) -> {
+                let t = strTrim(line);
+                if (strLen(t) > 0 && !strStartsWith(t, "```")) {
+                    cellSet(found, t)
+                } else ();
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+// ============================================================================
+// JSON Serialization (`--json` and `search-index.json`)
+// ============================================================================
+
+def strListToJson(xs: List String): Value = {
+    let rev: Cell (List Value) = cellNew(Nil);
+    let cur = cellNew(xs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(s, r) -> {
+                cellSet(rev, Cons(VStr(s), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    VArr(listRev(cellGet(rev)))
+}
+
+def docItemToValue(it: DocItem): Value = {
+    let chRev: Cell (List Value) = cellNew(Nil);
+    let cc = cellNew(it.diChildren);
+    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+        match cellGet(cc) {
+            Cons(ch, r) -> {
+                cellSet(chRev, Cons(docItemToValue(ch), cellGet(chRev)));
+                cellSet(cc, r)
+            },
+            Nil -> (),
+        }
+    };
+    VObj([
+        ("name", VStr(it.diName)),
+        ("kind", VStr(it.diKind)),
+        ("visibility", VStr(it.diVis)),
+        ("module", VStr(it.diModule)),
+        ("signature", VStr(it.diSig)),
+        ("type_params", strListToJson(it.diTypeParams)),
+        ("docs", VStr(strJoin(it.diDocs, "\n"))),
+        ("file", VStr(it.diFile)),
+        ("line", VInt(intToI64(it.diLine))),
+        ("end_line", VInt(intToI64(it.diEndLine))),
+        ("children", VArr(listRev(cellGet(chRev)))),
+    ])
+}
+
+def docModuleToValue(m: DocModule): Value = {
+    let itRev: Cell (List Value) = cellNew(Nil);
+    let cur = cellNew(m.dmItems);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(it, r) -> {
+                cellSet(itRev, Cons(docItemToValue(it), cellGet(itRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    VObj([
+        ("module", VStr(m.dmKey)),
+        ("group", VStr(m.dmGroup)),
+        ("package", VStr(m.dmPackage)),
+        ("source", VStr(m.dmSourceLabel)),
+        ("docs", VStr(strJoin(m.dmModuleDocs, "\n"))),
+        ("items", VArr(listRev(cellGet(itRev)))),
+    ])
+}
+
+pub def docSiteToJson(site: DocSiteData): String = {
+    let mRev: Cell (List Value) = cellNew(Nil);
+    let cur = cellNew(site.dsModules);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(m, r) -> {
+                cellSet(mRev, Cons(docModuleToValue(m), cellGet(mRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let root = VObj([
+        ("title", VStr(site.dsTitle)),
+        ("version", VStr(site.dsVersion)),
+        ("modules", VArr(listRev(cellGet(mRev)))),
+    ]);
+    stringifyPretty(root)
+}
+
+def collectSearchEntriesFromItems(
+    modKey: String,
+    slug: String,
+    subPath: String,
+    items: List DocItem,
+    outRev: Cell (List Value)
+): Void = {
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(it, r) -> {
+                let href = "modules/" + slug + ".html#" + itemAnchorId(subPath, it.diName);
+                let entry = VObj([
+                    ("name", VStr(it.diName)),
+                    ("kind", VStr(it.diKind)),
+                    ("module", VStr(modKey)),
+                    ("signature", VStr(it.diSig)),
+                    ("doc", VStr(firstDocSummary(it.diDocs))),
+                    ("href", VStr(href)),
+                    ("file", VStr(it.diFile)),
+                    ("line", VInt(intToI64(it.diLine))),
+                ]);
+                cellSet(outRev, Cons(entry, cellGet(outRev)));
+                let nextSub = if (strLen(subPath) == 0) it.diName else subPath + "." + it.diName;
+                collectSearchEntriesFromItems(modKey, slug, nextSub, it.diChildren, outRev);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+pub def buildSearchIndexJson(site: DocSiteData): String = {
+    let entriesRev: Cell (List Value) = cellNew(Nil);
+    let cm = cellNew(site.dsModules);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(m, rm) -> {
+                let slug = moduleSlug(m.dmKey);
+                let modEntry = VObj([
+                    ("name", VStr(m.dmKey)),
+                    ("kind", VStr("module")),
+                    ("module", VStr(m.dmKey)),
+                    ("signature", VStr("module " + m.dmKey)),
+                    ("doc", VStr(firstDocSummary(m.dmModuleDocs))),
+                    ("href", VStr("modules/" + slug + ".html")),
+                    ("file", VStr(m.dmSourceLabel)),
+                    ("line", VInt(intToI64(1))),
+                ]);
+                cellSet(entriesRev, Cons(modEntry, cellGet(entriesRev)));
+                collectSearchEntriesFromItems(m.dmKey, slug, "", m.dmItems, entriesRev);
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+    stringify(VArr(listRev(cellGet(entriesRev))))
+}
+
+// ============================================================================
+// Scoped Cross-Module Symbol Table & Syntax Highlighting
+// ============================================================================
+
+data GlobalSymIndex {
+    MkGlobalSymIndex {
+        gsiByMod: StrMap (StrMap String),
+        gsiModEntries: StrMap (List (String, String)),
+        gsiUniqueGlobal: StrMap String,
+        gsiAmbiguous: StrMap Bool,
+    },
+}
+
+def isLinkableTypeKind(k: String): Bool =
+    k == "data" || k == "type" || k == "concept"
+
+def buildGlobalSymIndex(mods: List DocModule): GlobalSymIndex = {
+    let byMod: StrMap (StrMap String) = strMapNew();
+    let modEntries: StrMap (List (String, String)) = strMapNew();
+    let uniqueGlobal: StrMap String = strMapNew();
+    let ambiguous: StrMap Bool = strMapNew();
+
+    let cm = cellNew(mods);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(m, rm) -> {
+                let slug = moduleSlug(m.dmKey);
+                let perMod: StrMap String = strMapNew();
+                let entriesRev: Cell (List (String, String)) = cellNew(Nil);
+                let ci = cellNew(m.dmItems);
+                while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                    match cellGet(ci) {
+                        Cons(it, ri) -> {
+                            if (isLinkableTypeKind(it.diKind)) {
+                                let href = slug + ".html#" + anchorId(it.diName);
+                                strMapInsert(perMod, it.diName, href);
+                                cellSet(entriesRev, Cons((it.diName, href), cellGet(entriesRev)));
+                                match strMapGet(uniqueGlobal, it.diName) {
+                                    None -> strMapInsert(uniqueGlobal, it.diName, href),
+                                    Some(prev) ->
+                                        if (prev != href) strMapInsert(ambiguous, it.diName, true)
+                                        else (),
+                                }
+                            } else ();
+                            cellSet(ci, ri)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let entries = listRev(cellGet(entriesRev));
+                strMapInsert(byMod, m.dmKey, perMod);
+                strMapInsert(modEntries, m.dmKey, entries);
+                // Also register short module key without `<pkg>.` prefix if unambiguous
+                if (strLen(m.dmPackage) > 0 && strStartsWith(m.dmKey, m.dmPackage + ".")) {
+                    let shortKey = strSlice(m.dmKey, strLen(m.dmPackage) + 1, strLen(m.dmKey));
+                    match strMapGet(byMod, shortKey) {
+                        None -> {
+                            strMapInsert(byMod, shortKey, perMod);
+                            strMapInsert(modEntries, shortKey, entries)
+                        },
+                        Some(_) -> (),
+                    }
+                } else ();
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+
+    MkGlobalSymIndex {
+        gsiByMod: byMod,
+        gsiModEntries: modEntries,
+        gsiUniqueGlobal: uniqueGlobal,
+        gsiAmbiguous: ambiguous,
+    }
+}
+
+def lookupModSymTable(idx: GlobalSymIndex, pkgName: String, rawMod: String): Option (StrMap String) =
+    match strMapGet(idx.gsiByMod, rawMod) {
+        Some(t) -> Some(t),
+        None ->
+            if (strLen(pkgName) > 0) strMapGet(idx.gsiByMod, pkgName + "." + rawMod)
+            else None,
+    }
+
+def lookupModSymEntries(idx: GlobalSymIndex, pkgName: String, rawMod: String): List (String, String) =
+    match strMapGet(idx.gsiModEntries, rawMod) {
+        Some(es) -> es,
+        None ->
+            if (strLen(pkgName) > 0) {
+                match strMapGet(idx.gsiModEntries, pkgName + "." + rawMod) {
+                    Some(es) -> es,
+                    None -> Nil,
+                }
+            } else Nil,
+    }
+
+def applyScopeLayer(
+    mp: StrMap String,
+    idx: GlobalSymIndex,
+    pkgName: String,
+    modSlug: String,
+    subPath: String,
+    imports: List (String, String, String),
+    items: List DocItem
+): Void = {
+    // Glob imports
+    let cg = cellNew(imports);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons((localName, targetMod, _), r) -> {
+                if (localName == "*") {
+                    let es = lookupModSymEntries(idx, pkgName, targetMod);
+                    let ce = cellNew(es);
+                    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                        match cellGet(ce) {
+                            Cons((nm, href), re) -> {
+                                strMapInsert(mp, nm, href);
+                                cellSet(ce, re)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                } else ();
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Explicit imports
+    let ci2 = cellNew(imports);
+    while (match cellGet(ci2) { Nil -> false, _ -> true }) {
+        match cellGet(ci2) {
+            Cons((localName, targetMod, origName), r) -> {
+                if (localName != "*") {
+                    match lookupModSymTable(idx, pkgName, targetMod) {
+                        Some(tbl) -> match strMapGet(tbl, origName) {
+                            Some(href) -> strMapInsert(mp, localName, href),
+                            None -> (),
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(ci2, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Scope's own declarations (always win)
+    let own = cellNew(items);
+    while (match cellGet(own) { Nil -> false, _ -> true }) {
+        match cellGet(own) {
+            Cons(it, r) -> {
+                if (isLinkableTypeKind(it.diKind)) {
+                    strMapInsert(mp, it.diName, modSlug + ".html#" + itemAnchorId(subPath, it.diName))
+                } else ();
+                cellSet(own, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+// Resolve type links in the exact lexical scope of module `m` plus any enclosing nested `mod` layers:
+//   1. Unambiguous global/stdlib types (never links colliding unimported names)
+//   2. Module `m`'s imports + own declarations
+//   3. Each nested `mod sub { ... }` layer's imports + own declarations (innermost wins)
+def buildScopedSymLinksLayered(
+    idx: GlobalSymIndex,
+    mods: List DocModule,
+    m: DocModule,
+    subLayers: List (String, List (String, String, String), List DocItem)
+): StrMap String = {
+    let mp: StrMap String = strMapNew();
+
+    // 1. Unambiguous global types
+    let cm = cellNew(mods);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(om, rm) -> {
+                let ci = cellNew(om.dmItems);
+                while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                    match cellGet(ci) {
+                        Cons(it, ri) -> {
+                            if (isLinkableTypeKind(it.diKind)) {
+                                match strMapGet(idx.gsiAmbiguous, it.diName) {
+                                    Some(_) -> (),
+                                    None -> match strMapGet(idx.gsiUniqueGlobal, it.diName) {
+                                        Some(href) -> strMapInsert(mp, it.diName, href),
+                                        None -> (),
+                                    },
+                                }
+                            } else ();
+                            cellSet(ci, ri)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+
+    let slug = moduleSlug(m.dmKey);
+    // 2. Module's own scope
+    applyScopeLayer(mp, idx, m.dmPackage, slug, "", m.dmImports, m.dmItems);
+
+    // 3. Nested `mod` layers (outer to inner)
+    let cl = cellNew(subLayers);
+    while (match cellGet(cl) { Nil -> false, _ -> true }) {
+        match cellGet(cl) {
+            Cons((sPath, sImps, sItems), rl) -> {
+                applyScopeLayer(mp, idx, m.dmPackage, slug, sPath, sImps, sItems);
+                cellSet(cl, rl)
+            },
+            Nil -> (),
+        }
+    };
+
+    mp
+}
+
+def isGeishaKeyword(w: String): Bool =
+    w == "pub" || w == "def" || w == "data" || w == "type" || w == "concept"
+    || w == "instance" || w == "extern" || w == "mod" || w == "use" || w == "open"
+    || w == "let" || w == "if" || w == "else" || w == "while" || w == "match"
+    || w == "forall" || w == "true" || w == "false" || w == "noalloc" || w == "ptr"
+    || w == "init" || w == "as"
+
+def highlightGeishaBuf(b: StringBuf, code: String, symLinks: Option (StrMap String), modRelPrefix: String): Void = {
+    let n = strLen(code);
+    let i = cellNew(0);
+    let prevKw = cellNew("");
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(code, idx);
+        if (c == 47 && idx + 1 < n && strByteAt(code, idx + 1) == 47) {
+            // Line comment
+            let j = cellNew(idx);
+            while (cellGet(j) < n && strByteAt(code, cellGet(j)) != 10) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            bufPushStr(b, "<span class=\"cm\">");
+            htmlEscapeBuf(b, strSlice(code, idx, cellGet(j)));
+            bufPushStr(b, "</span>");
+            cellSet(i, cellGet(j));
+            cellSet(prevKw, "")
+        } else if (c == 34) {
+            // String literal
+            let j = cellNew(idx + 1);
+            let done = cellNew(false);
+            while (cellGet(j) < n && !cellGet(done)) {
+                let ch = strByteAt(code, cellGet(j));
+                if (ch == 92 && cellGet(j) + 1 < n) {
+                    cellSet(j, cellGet(j) + 2)
+                } else if (ch == 34) {
+                    cellSet(j, cellGet(j) + 1);
+                    cellSet(done, true)
+                } else {
+                    cellSet(j, cellGet(j) + 1)
+                }
+            };
+            bufPushStr(b, "<span class=\"str\">");
+            htmlEscapeBuf(b, strSlice(code, idx, cellGet(j)));
+            bufPushStr(b, "</span>");
+            cellSet(i, cellGet(j));
+            cellSet(prevKw, "")
+        } else if (isIdentChar(c) && !(c >= 48 && c <= 57)) {
+            let j = cellNew(idx + 1);
+            while (cellGet(j) < n && isIdentChar(strByteAt(code, cellGet(j)))) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            let word = strSlice(code, idx, cellGet(j));
+            if (isGeishaKeyword(word)) {
+                bufPushStr(b, "<span class=\"kw\">");
+                htmlEscapeBuf(b, word);
+                bufPushStr(b, "</span>");
+                cellSet(prevKw, word)
+            } else if (cellGet(prevKw) == "def") {
+                bufPushStr(b, "<span class=\"fn\">");
+                htmlEscapeBuf(b, word);
+                bufPushStr(b, "</span>");
+                cellSet(prevKw, "")
+            } else if (isUpperAlpha(c)) {
+                let linked = match symLinks {
+                    Some(mp) -> match strMapGet(mp, word) {
+                        Some(target) -> {
+                            bufPushStr(b, "<a class=\"ty-link\" href=\"");
+                            bufPushStr(b, modRelPrefix);
+                            bufPushStr(b, target);
+                            bufPushStr(b, "\"><span class=\"ty\">");
+                            htmlEscapeBuf(b, word);
+                            bufPushStr(b, "</span></a>");
+                            true
+                        },
+                        None -> false,
+                    },
+                    None -> false,
+                };
+                if (!linked) {
+                    bufPushStr(b, "<span class=\"ty\">");
+                    htmlEscapeBuf(b, word);
+                    bufPushStr(b, "</span>")
+                } else ();
+                cellSet(prevKw, "")
+            } else {
+                htmlEscapeBuf(b, word);
+                cellSet(prevKw, "")
+            };
+            cellSet(i, cellGet(j))
+        } else if (c >= 48 && c <= 57) {
+            let j = cellNew(idx + 1);
+            while (cellGet(j) < n && (isIdentChar(strByteAt(code, cellGet(j))) || strByteAt(code, cellGet(j)) == 46)) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            bufPushStr(b, "<span class=\"num\">");
+            htmlEscapeBuf(b, strSlice(code, idx, cellGet(j)));
+            bufPushStr(b, "</span>");
+            cellSet(i, cellGet(j));
+            cellSet(prevKw, "")
+        } else {
+            htmlEscapeBuf(b, strSlice(code, idx, idx + 1));
+            if (c != 32 && c != 9 && c != 10 && c != 13) cellSet(prevKw, "") else ();
+            cellSet(i, idx + 1)
+        }
+    }
+}
+
+// ============================================================================
+// Lightweight Markdown Renderer for `///` Doc Comments
+// ============================================================================
+
+def renderInlineMdBuf(b: StringBuf, s: String): Void = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 96) {
+            // Inline `code`
+            let j = cellNew(idx + 1);
+            while (cellGet(j) < n && strByteAt(s, cellGet(j)) != 96) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            if (cellGet(j) < n) {
+                bufPushStr(b, "<code>");
+                htmlEscapeBuf(b, strSlice(s, idx + 1, cellGet(j)));
+                bufPushStr(b, "</code>");
+                cellSet(i, cellGet(j) + 1)
+            } else {
+                bufPushByte(b, 96);
+                cellSet(i, idx + 1)
+            }
+        } else if (c == 42 && idx + 1 < n && strByteAt(s, idx + 1) == 42) {
+            // **bold**
+            let j = cellNew(idx + 2);
+            let found = cellNew(-1);
+            while (cellGet(j) + 1 < n && cellGet(found) < 0) {
+                let p = cellGet(j);
+                if (strByteAt(s, p) == 42 && strByteAt(s, p + 1) == 42) cellSet(found, p)
+                else cellSet(j, p + 1)
+            };
+            if (cellGet(found) >= 0) {
+                bufPushStr(b, "<strong>");
+                htmlEscapeBuf(b, strSlice(s, idx + 2, cellGet(found)));
+                bufPushStr(b, "</strong>");
+                cellSet(i, cellGet(found) + 2)
+            } else {
+                bufPushStr(b, "**");
+                cellSet(i, idx + 2)
+            }
+        } else {
+            htmlEscapeBuf(b, strSlice(s, idx, idx + 1));
+            cellSet(i, idx + 1)
+        }
+    }
+}
+
+def renderDocMarkdownBuf(b: StringBuf, lines: List String): Void = {
+    let inCode = cellNew(false);
+    let codeLang = cellNew("");
+    let codeBuf = cellNew(bufNew());
+    let inPara = cellNew(false);
+    let inList = cellNew(false);
+
+    let closePara = () -> {
+        if (cellGet(inPara)) {
+            bufPushStr(b, "</p>\n");
+            cellSet(inPara, false)
+        } else ()
+    };
+    let closeList = () -> {
+        if (cellGet(inList)) {
+            bufPushStr(b, "</ul>\n");
+            cellSet(inList, false)
+        } else ()
+    };
+
+    let cur = cellNew(lines);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(line, rest) -> {
+                let t = strTrim(line);
+                if (cellGet(inCode)) {
+                    if (strStartsWith(t, "```")) {
+                        let rawCode = bufToString(cellGet(codeBuf));
+                        let lang = cellGet(codeLang);
+                        bufPushStr(b, "<pre class=\"code-block\"><code>");
+                        if (lang == "" || strStartsWith(lang, "geisha") || strStartsWith(lang, "gsa") || strStartsWith(lang, "no_run") || strStartsWith(lang, "compile_fail") || strStartsWith(lang, "ignore")) {
+                            highlightGeishaBuf(b, rawCode, None, "")
+                        } else {
+                            htmlEscapeBuf(b, rawCode)
+                        };
+                        bufPushStr(b, "</code></pre>\n");
+                        cellSet(inCode, false);
+                        cellSet(codeLang, "");
+                        cellSet(codeBuf, bufNew())
+                    } else {
+                        let cb = cellGet(codeBuf);
+                        bufPushStr(cb, line);
+                        bufPushByte(cb, 10)
+                    }
+                } else if (strStartsWith(t, "```")) {
+                    closePara();
+                    closeList();
+                    cellSet(inCode, true);
+                    cellSet(codeLang, strTrim(strSlice(t, 3, strLen(t))));
+                    cellSet(codeBuf, bufNew())
+                } else if (strLen(t) == 0) {
+                    closePara();
+                    closeList()
+                } else if (strStartsWith(t, "### ")) {
+                    closePara();
+                    closeList();
+                    bufPushStr(b, "<h4>");
+                    renderInlineMdBuf(b, strSlice(t, 4, strLen(t)));
+                    bufPushStr(b, "</h4>\n")
+                } else if (strStartsWith(t, "## ")) {
+                    closePara();
+                    closeList();
+                    bufPushStr(b, "<h3>");
+                    renderInlineMdBuf(b, strSlice(t, 3, strLen(t)));
+                    bufPushStr(b, "</h3>\n")
+                } else if (strStartsWith(t, "# ")) {
+                    closePara();
+                    closeList();
+                    bufPushStr(b, "<h3>");
+                    renderInlineMdBuf(b, strSlice(t, 2, strLen(t)));
+                    bufPushStr(b, "</h3>\n")
+                } else if (strStartsWith(t, "- ") || strStartsWith(t, "* ")) {
+                    closePara();
+                    if (!cellGet(inList)) {
+                        bufPushStr(b, "<ul>\n");
+                        cellSet(inList, true)
+                    } else ();
+                    bufPushStr(b, "<li>");
+                    renderInlineMdBuf(b, strSlice(t, 2, strLen(t)));
+                    bufPushStr(b, "</li>\n")
+                } else {
+                    closeList();
+                    if (!cellGet(inPara)) {
+                        bufPushStr(b, "<p>");
+                        cellSet(inPara, true)
+                    } else {
+                        bufPushByte(b, 32)
+                    };
+                    renderInlineMdBuf(b, t)
+                };
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    if (cellGet(inCode)) {
+        bufPushStr(b, "<pre class=\"code-block\"><code>");
+        htmlEscapeBuf(b, bufToString(cellGet(codeBuf)));
+        bufPushStr(b, "</code></pre>\n")
+    } else ();
+    closePara();
+    closeList()
+}
+
+// ============================================================================
+// HTML Layout, Sidebar, Module Pages, Source Viewer, CSS & JS
+// ============================================================================
+
+def renderSidebarGroup(b: StringBuf, title: String, group: String, mods: List DocModule, activeKey: String, rootPrefix: String): Void = {
+    let matchedRev: Cell (List DocModule) = cellNew(Nil);
+    let cm = cellNew(mods);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(m, rm) -> {
+                if (m.dmGroup == group) cellSet(matchedRev, Cons(m, cellGet(matchedRev))) else ();
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+    match listRev(cellGet(matchedRev)) {
+        Nil -> (),
+        ms -> {
+            bufPushStr(b, "<div class=\"nav-group\">\n<div class=\"nav-group-title\">");
+            htmlEscapeBuf(b, title);
+            bufPushStr(b, "</div>\n<ul class=\"nav-list\">\n");
+            let cur = cellNew(ms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(m, r) -> {
+                        let slug = moduleSlug(m.dmKey);
+                        let cls = if (m.dmKey == activeKey) " class=\"active\"" else "";
+                        bufPushStr(b, "<li data-mod=\"");
+                        htmlEscapeBuf(b, m.dmKey);
+                        bufPushStr(b, "\"><a");
+                        bufPushStr(b, cls);
+                        bufPushStr(b, " href=\"");
+                        bufPushStr(b, rootPrefix);
+                        bufPushStr(b, "modules/");
+                        bufPushStr(b, slug);
+                        bufPushStr(b, ".html\">");
+                        htmlEscapeBuf(b, m.dmKey);
+                        bufPushStr(b, "</a></li>\n");
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            bufPushStr(b, "</ul>\n</div>\n")
+        },
+    }
+}
+
+def renderPageHead(b: StringBuf, pageTitle: String, site: DocSiteData, activeKey: String, rootPrefix: String): Void = {
+    bufPushStr(b, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>");
+    htmlEscapeBuf(b, pageTitle);
+    bufPushStr(b, "</title>\n<link rel=\"stylesheet\" href=\"");
+    bufPushStr(b, rootPrefix);
+    bufPushStr(b, "style.css\">\n</head>\n<body data-root=\"");
+    bufPushStr(b, rootPrefix);
+    bufPushStr(b, "\">\n<div class=\"layout\">\n<aside class=\"sidebar\">\n<div class=\"brand\">\n<a class=\"brand-title\" href=\"");
+    bufPushStr(b, rootPrefix);
+    bufPushStr(b, "index.html\">");
+    htmlEscapeBuf(b, site.dsTitle);
+    bufPushStr(b, "</a>");
+    if (strLen(site.dsVersion) > 0) {
+        bufPushStr(b, " <span class=\"version-badge\">v");
+        htmlEscapeBuf(b, site.dsVersion);
+        bufPushStr(b, "</span>")
+    } else ();
+    bufPushStr(b, "\n</div>\n<div class=\"sidebar-filter-wrap\"><input id=\"sidebar-filter\" type=\"search\" placeholder=\"Filter modules...\" autocomplete=\"off\"></div>\n<nav class=\"sidebar-nav\">\n");
+    renderSidebarGroup(b, "Package Modules", "package", site.dsModules, activeKey, rootPrefix);
+    renderSidebarGroup(b, "Files", "file", site.dsModules, activeKey, rootPrefix);
+    renderSidebarGroup(b, "Standard Library (std)", "std", site.dsModules, activeKey, rootPrefix);
+    renderSidebarGroup(b, "System Library (sys)", "sys", site.dsModules, activeKey, rootPrefix);
+    bufPushStr(b, "</nav>\n</aside>\n<div class=\"main-wrap\">\n<header class=\"topbar\">\n<div class=\"search-box\">\n<input id=\"doc-search\" type=\"search\" placeholder=\"Search symbols, modules, signatures... (press /)\" autocomplete=\"off\">\n<div id=\"search-results\" class=\"search-results\" hidden></div>\n</div>\n<button id=\"theme-toggle\" class=\"theme-btn\" type=\"button\" title=\"Toggle light/dark theme\">Theme</button>\n</header>\n<main class=\"content\">\n")
+}
+
+def renderPageFoot(b: StringBuf, rootPrefix: String): Void = {
+    bufPushStr(b, "</main>\n<footer class=\"footer\">Generated by <code>geisha doc</code></footer>\n</div>\n</div>\n<script src=\"");
+    bufPushStr(b, rootPrefix);
+    bufPushStr(b, "search-index.js\"></script>\n<script src=\"");
+    bufPushStr(b, rootPrefix);
+    bufPushStr(b, "app.js\"></script>\n</body>\n</html>\n")
+}
+
+def appendSubLayer(
+    xs: List (String, List (String, String, String), List DocItem),
+    layer: (String, List (String, String, String), List DocItem)
+): List (String, List (String, String, String), List DocItem) = match xs {
+    Nil -> [layer],
+    Cons(h, t) -> Cons(h, appendSubLayer(t, layer)),
+}
+
+def renderItemsSection(
+    b: StringBuf,
+    sectionTitle: String,
+    kindFilter: String,
+    items: List DocItem,
+    slug: String,
+    subPath: String,
+    site: DocSiteData,
+    curMod: DocModule,
+    symIndex: GlobalSymIndex,
+    subLayers: List (String, List (String, String, String), List DocItem),
+    symLinks: StrMap String
+): Void = {
+    let matchedRev: Cell (List DocItem) = cellNew(Nil);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(it, r) -> {
+                if (it.diKind == kindFilter) cellSet(matchedRev, Cons(it, cellGet(matchedRev))) else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match listRev(cellGet(matchedRev)) {
+        Nil -> (),
+        ms -> {
+            bufPushStr(b, "<section class=\"item-section\">\n<h2 class=\"section-title\">");
+            htmlEscapeBuf(b, sectionTitle);
+            bufPushStr(b, "</h2>\n");
+            let ci = cellNew(ms);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) {
+                    Cons(it, ri) -> {
+                        let aid = itemAnchorId(subPath, it.diName);
+                        bufPushStr(b, "<article class=\"doc-item\" id=\"");
+                        bufPushStr(b, aid);
+                        bufPushStr(b, "\">\n<div class=\"item-header\">\n<span class=\"kind-badge kind-");
+                        bufPushStr(b, it.diKind);
+                        bufPushStr(b, "\">");
+                        htmlEscapeBuf(b, it.diKind);
+                        bufPushStr(b, "</span>\n<a class=\"item-name\" href=\"#");
+                        bufPushStr(b, aid);
+                        bufPushStr(b, "\">");
+                        htmlEscapeBuf(b, it.diName);
+                        bufPushStr(b, "</a>\n<a class=\"src-link\" href=\"../src/");
+                        bufPushStr(b, slug);
+                        bufPushStr(b, ".html#L");
+                        bufPushStr(b, intToStr(if (it.diLine > 0) it.diLine else 1));
+                        bufPushStr(b, "\">[src:");
+                        bufPushStr(b, intToStr(if (it.diLine > 0) it.diLine else 1));
+                        bufPushStr(b, "]</a>\n</div>\n<pre class=\"item-sig\"><code>");
+                        highlightGeishaBuf(b, it.diSig, Some(symLinks), "");
+                        bufPushStr(b, "</code></pre>\n");
+                        match it.diDocs {
+                            Nil -> (),
+                            ds -> {
+                                bufPushStr(b, "<div class=\"item-doc\">\n");
+                                renderDocMarkdownBuf(b, ds);
+                                bufPushStr(b, "</div>\n")
+                            },
+                        };
+                        match it.diChildren {
+                            Nil -> (),
+                            ch -> {
+                                let childSubPath = if (strLen(subPath) == 0) it.diName else subPath + "." + it.diName;
+                                let childLayers = appendSubLayer(subLayers, (childSubPath, it.diImports, ch));
+                                let childLinks = buildScopedSymLinksLayered(symIndex, site.dsModules, curMod, childLayers);
+                                bufPushStr(b, "<div class=\"submod-children\">\n");
+                                renderItemsSection(b, "Data Types", "data", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Type Aliases", "type", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Concepts", "concept", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Instances", "instance", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Functions", "def", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Values", "const", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Externs", "extern", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                renderItemsSection(b, "Submodules", "mod", ch, slug, childSubPath, site, curMod, symIndex, childLayers, childLinks);
+                                bufPushStr(b, "</div>\n")
+                            },
+                        };
+                        bufPushStr(b, "</article>\n");
+                        cellSet(ci, ri)
+                    },
+                    Nil -> (),
+                }
+            };
+            bufPushStr(b, "</section>\n")
+        },
+    }
+}
+
+def renderModulePage(site: DocSiteData, m: DocModule, symIndex: GlobalSymIndex, symLinks: StrMap String): String = {
+    let b = bufNew();
+    let slug = moduleSlug(m.dmKey);
+    renderPageHead(b, m.dmKey + " — " + site.dsTitle, site, m.dmKey, "../");
+    bufPushStr(b, "<div class=\"mod-header\">\n<h1><span class=\"mod-prefix\">module</span> ");
+    htmlEscapeBuf(b, m.dmKey);
+    bufPushStr(b, "</h1>\n<div class=\"mod-meta\">");
+    if (strLen(m.dmPackage) > 0) {
+        bufPushStr(b, "<span class=\"meta-pill\">pkg: ");
+        htmlEscapeBuf(b, m.dmPackage);
+        bufPushStr(b, "</span> ")
+    } else ();
+    bufPushStr(b, "<a class=\"src-link\" href=\"../src/");
+    bufPushStr(b, slug);
+    bufPushStr(b, ".html\">");
+    htmlEscapeBuf(b, m.dmSourceLabel);
+    bufPushStr(b, "</a></div>\n</div>\n");
+    match m.dmModuleDocs {
+        Nil -> (),
+        ds -> {
+            bufPushStr(b, "<div class=\"mod-doc\">\n");
+            renderDocMarkdownBuf(b, ds);
+            bufPushStr(b, "</div>\n")
+        },
+    };
+    match m.dmItems {
+        Nil -> bufPushStr(b, "<p class=\"empty-note\">No public items in this module.</p>\n"),
+        its -> {
+            renderItemsSection(b, "Data Types", "data", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Type Aliases", "type", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Concepts", "concept", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Instances", "instance", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Functions", "def", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Values", "const", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Externs", "extern", its, slug, "", site, m, symIndex, Nil, symLinks);
+            renderItemsSection(b, "Submodules", "mod", its, slug, "", site, m, symIndex, Nil, symLinks)
+        },
+    };
+    renderPageFoot(b, "../");
+    bufToString(b)
+}
+
+def renderSourcePage(site: DocSiteData, m: DocModule): String = {
+    let b = bufNew();
+    let slug = moduleSlug(m.dmKey);
+    renderPageHead(b, m.dmSourceLabel + " — Source", site, m.dmKey, "../");
+    bufPushStr(b, "<div class=\"mod-header\">\n<h1>Source: ");
+    htmlEscapeBuf(b, m.dmSourceLabel);
+    bufPushStr(b, "</h1>\n<div class=\"mod-meta\"><a class=\"src-link\" href=\"../modules/");
+    bufPushStr(b, slug);
+    bufPushStr(b, ".html\">&larr; Back to module ");
+    htmlEscapeBuf(b, m.dmKey);
+    bufPushStr(b, "</a></div>\n</div>\n<div class=\"src-viewer\"><table><tbody>\n");
+    let src = m.dmSourceText;
+    let n = strLen(src);
+    let pos = cellNew(0);
+    let lineNo = cellNew(1);
+    while (cellGet(pos) <= n) {
+        let start = cellGet(pos);
+        if (start == n && cellGet(lineNo) > 1) {
+            cellSet(pos, n + 1)
+        } else {
+            let e = cellNew(start);
+            while (cellGet(e) < n && strByteAt(src, cellGet(e)) != 10) {
+                cellSet(e, cellGet(e) + 1)
+            };
+            let endRaw = cellGet(e);
+            let endTrim = if (endRaw > start && strByteAt(src, endRaw - 1) == 13) endRaw - 1 else endRaw;
+            let lineStr = intToStr(cellGet(lineNo));
+            bufPushStr(b, "<tr id=\"L");
+            bufPushStr(b, lineStr);
+            bufPushStr(b, "\"><td class=\"ln\"><a href=\"#L");
+            bufPushStr(b, lineStr);
+            bufPushStr(b, "\">");
+            bufPushStr(b, lineStr);
+            bufPushStr(b, "</a></td><td class=\"lc\"><code>");
+            highlightGeishaBuf(b, strSlice(src, start, endTrim), None, "");
+            bufPushStr(b, "</code></td></tr>\n");
+            cellSet(lineNo, cellGet(lineNo) + 1);
+            cellSet(pos, if (endRaw < n) endRaw + 1 else n + 1)
+        }
+    };
+    bufPushStr(b, "</tbody></table></div>\n");
+    renderPageFoot(b, "../");
+    bufToString(b)
+}
+
+def renderIndexGroupCards(b: StringBuf, title: String, group: String, mods: List DocModule): Void = {
+    let matchedRev: Cell (List DocModule) = cellNew(Nil);
+    let cm = cellNew(mods);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(m, rm) -> {
+                if (m.dmGroup == group) cellSet(matchedRev, Cons(m, cellGet(matchedRev))) else ();
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+    match listRev(cellGet(matchedRev)) {
+        Nil -> (),
+        ms -> {
+            bufPushStr(b, "<section class=\"index-section\">\n<h2>");
+            htmlEscapeBuf(b, title);
+            bufPushStr(b, "</h2>\n<div class=\"mod-grid\">\n");
+            let cur = cellNew(ms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(m, r) -> {
+                        let slug = moduleSlug(m.dmKey);
+                        let summary = firstDocSummary(m.dmModuleDocs);
+                        bufPushStr(b, "<a class=\"mod-card\" href=\"modules/");
+                        bufPushStr(b, slug);
+                        bufPushStr(b, ".html\">\n<div class=\"mod-card-title\">");
+                        htmlEscapeBuf(b, m.dmKey);
+                        bufPushStr(b, " <span class=\"item-count\">");
+                        bufPushStr(b, intToStr(listLen(m.dmItems)));
+                        bufPushStr(b, " items</span></div>\n");
+                        if (strLen(summary) > 0) {
+                            bufPushStr(b, "<div class=\"mod-card-desc\">");
+                            htmlEscapeBuf(b, summary);
+                            bufPushStr(b, "</div>\n")
+                        } else ();
+                        bufPushStr(b, "</a>\n");
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            bufPushStr(b, "</div>\n</section>\n")
+        },
+    }
+}
+
+def renderIndexPage(site: DocSiteData): String = {
+    let b = bufNew();
+    renderPageHead(b, site.dsTitle + " — Documentation", site, "", "");
+    bufPushStr(b, "<div class=\"hero\">\n<h1>");
+    htmlEscapeBuf(b, site.dsTitle);
+    if (strLen(site.dsVersion) > 0) {
+        bufPushStr(b, " <span class=\"version-badge\">v");
+        htmlEscapeBuf(b, site.dsVersion);
+        bufPushStr(b, "</span>")
+    } else ();
+    bufPushStr(b, "</h1>\n<p class=\"hero-sub\">Static API documentation generated by <code>geisha doc</code>. Press <kbd>/</kbd> to search across all modules and symbols.</p>\n</div>\n");
+    renderIndexGroupCards(b, "Package Modules", "package", site.dsModules);
+    renderIndexGroupCards(b, "Files", "file", site.dsModules);
+    renderIndexGroupCards(b, "Standard Library (std)", "std", site.dsModules);
+    renderIndexGroupCards(b, "System Library (sys)", "sys", site.dsModules);
+    renderPageFoot(b, "");
+    bufToString(b)
+}
+
+def siteCss(): String =
+    ":root{--bg:#ffffff;--bg-alt:#f6f8fa;--border:#d8dee4;--text:#1f2328;--muted:#59636e;--accent:#0969da;--code-bg:#f0f3f6;--kw:#cf222e;--ty:#0550ae;--fn:#8250df;--str:#0a3069;--cm:#6e7781;--num:#116329;--hl:#fff8c5}\n"
+    + "[data-theme=dark]{--bg:#0d1117;--bg-alt:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--code-bg:#1c2128;--kw:#ff7b72;--ty:#79c0ff;--fn:#d2a8ff;--str:#a5d6ff;--cm:#8b949e;--num:#7ee787;--hl:#3b2e00}\n"
+    + "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.6}\n"
+    + "a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}\n"
+    + ".layout{display:flex;min-height:100vh}\n"
+    + ".sidebar{width:270px;flex-shrink:0;background:var(--bg-alt);border-right:1px solid var(--border);padding:16px;position:sticky;top:0;height:100vh;overflow-y:auto}\n"
+    + ".brand{font-size:1.15rem;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}.brand-title{color:var(--text)}\n"
+    + ".version-badge{font-size:0.75rem;font-weight:600;padding:2px 7px;border-radius:999px;background:var(--code-bg);border:1px solid var(--border);color:var(--muted)}\n"
+    + ".sidebar-filter-wrap input{width:100%;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:0.85rem;margin-bottom:12px}\n"
+    + ".nav-group{margin-bottom:14px}.nav-group-title{font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:6px 0}\n"
+    + ".nav-list{list-style:none;margin:0;padding:0}.nav-list li a{display:block;padding:4px 8px;border-radius:6px;font-size:0.88rem;color:var(--text)}.nav-list li a:hover,.nav-list li a.active{background:var(--code-bg);color:var(--accent);text-decoration:none;font-weight:600}\n"
+    + ".main-wrap{flex:1;min-width:0;display:flex;flex-direction:column}\n"
+    + ".topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;padding:10px 28px;background:var(--bg);border-bottom:1px solid var(--border)}\n"
+    + ".search-box{position:relative;flex:1;max-width:640px}.search-box input{width:100%;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-alt);color:var(--text);font-size:0.92rem}\n"
+    + ".search-results{position:absolute;top:calc(100% + 6px);left:0;right:0;max-height:420px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.15);z-index:30}\n"
+    + ".search-item{display:block;padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text)}.search-item:hover{background:var(--bg-alt);text-decoration:none}\n"
+    + ".search-item-head{display:flex;align-items:center;gap:8px;font-size:0.9rem}.search-item-mod{color:var(--muted);font-size:0.8rem;margin-left:auto}.search-item-doc{font-size:0.8rem;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n"
+    + ".theme-btn{padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--bg-alt);color:var(--text);cursor:pointer;font-size:0.85rem}\n"
+    + ".content{flex:1;padding:28px 36px;max-width:980px;width:100%}\n"
+    + ".hero h1{margin:0 0 8px}.hero-sub{color:var(--muted);margin-top:0}kbd{padding:2px 6px;border:1px solid var(--border);border-radius:4px;font-size:0.8em;background:var(--bg-alt)}\n"
+    + ".mod-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-bottom:24px}\n"
+    + ".mod-card{display:block;padding:14px 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-alt);color:var(--text)}.mod-card:hover{border-color:var(--accent);text-decoration:none}\n"
+    + ".mod-card-title{font-weight:700;display:flex;align-items:center;justify-content:space-between;gap:8px}.item-count{font-size:0.75rem;color:var(--muted);font-weight:500}.mod-card-desc{font-size:0.84rem;color:var(--muted);margin-top:6px}\n"
+    + ".mod-header{border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:20px}.mod-header h1{margin:0 0 6px;font-size:1.7rem}.mod-prefix{color:var(--muted);font-weight:400}\n"
+    + ".mod-meta{font-size:0.85rem;color:var(--muted);display:flex;align-items:center;gap:10px}.meta-pill{padding:2px 8px;border-radius:999px;background:var(--code-bg);border:1px solid var(--border)}\n"
+    + ".section-title{font-size:1.15rem;border-bottom:1px solid var(--border);padding-bottom:6px;margin:28px 0 14px}\n"
+    + ".doc-item{border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:14px;background:var(--bg)}.doc-item:target{border-color:var(--accent);box-shadow:0 0 0 2px rgba(9,105,218,.18)}\n"
+    + ".item-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}.item-name{font-weight:700;font-size:1.02rem;color:var(--text)}.src-link{margin-left:auto;font-size:0.8rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}\n"
+    + ".kind-badge{font-size:0.72rem;font-weight:700;text-transform:uppercase;padding:2px 7px;border-radius:4px;background:var(--code-bg);color:var(--muted)}\n"
+    + ".kind-data{color:var(--ty)}.kind-concept{color:var(--fn)}.kind-def{color:var(--num)}.kind-type{color:var(--kw)}\n"
+    + "pre.item-sig,pre.code-block{margin:8px 0;padding:10px 12px;border-radius:6px;background:var(--code-bg);overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.88rem;line-height:1.5}\n"
+    + "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.88em;background:var(--code-bg);padding:1px 4px;border-radius:4px}pre code{background:none;padding:0}\n"
+    + ".kw{color:var(--kw);font-weight:600}.ty{color:var(--ty)}.fn{color:var(--fn);font-weight:600}.str{color:var(--str)}.cm{color:var(--cm);font-style:italic}.num{color:var(--num)}.ty-link{text-decoration:none}.ty-link:hover{text-decoration:underline}\n"
+    + ".submod-children{margin-left:16px;padding-left:12px;border-left:2px solid var(--border)}\n"
+    + ".src-viewer{border:1px solid var(--border);border-radius:8px;overflow-x:auto;background:var(--bg-alt)}.src-viewer table{width:100%;border-collapse:collapse;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.85rem}\n"
+    + ".src-viewer tr:target{background:var(--hl)}.src-viewer td.ln{width:1%;white-space:nowrap;text-align:right;padding:0 12px;color:var(--muted);user-select:none;border-right:1px solid var(--border)}.src-viewer td.lc{padding:0 14px;white-space:pre}\n"
+    + ".footer{padding:16px 36px;border-top:1px solid var(--border);font-size:0.82rem;color:var(--muted)}\n"
+    + "@media(max-width:820px){.layout{flex-direction:column}.sidebar{width:100%;height:auto;position:static;border-right:none;border-bottom:1px solid var(--border)}.content{padding:20px}}\n"
+
+def siteJs(): String =
+    "(function(){\n"
+    + "  var root = document.body.getAttribute('data-root') || '';\n"
+    + "  var saved = localStorage.getItem('geisha-doc-theme');\n"
+    + "  if (saved) document.documentElement.setAttribute('data-theme', saved);\n"
+    + "  var tbtn = document.getElementById('theme-toggle');\n"
+    + "  if (tbtn) tbtn.addEventListener('click', function(){\n"
+    + "    var cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';\n"
+    + "    document.documentElement.setAttribute('data-theme', cur);\n"
+    + "    localStorage.setItem('geisha-doc-theme', cur);\n"
+    + "  });\n"
+    + "  var filterInput = document.getElementById('sidebar-filter');\n"
+    + "  if (filterInput) filterInput.addEventListener('input', function(){\n"
+    + "    var q = filterInput.value.trim().toLowerCase();\n"
+    + "    document.querySelectorAll('.nav-list li').forEach(function(li){\n"
+    + "      var m = (li.getAttribute('data-mod') || '').toLowerCase();\n"
+    + "      li.style.display = (!q || m.indexOf(q) !== -1) ? '' : 'none';\n"
+    + "    });\n"
+    + "  });\n"
+    + "  var input = document.getElementById('doc-search');\n"
+    + "  var box = document.getElementById('search-results');\n"
+    + "  var index = window.GEISHA_DOC_INDEX || [];\n"
+    + "  function runSearch(raw){\n"
+    + "    var q = raw.trim().toLowerCase();\n"
+    + "    box.textContent = '';\n"
+    + "    if (!q) { box.hidden = true; return; }\n"
+    + "    var scored = [];\n"
+    + "    for (var i = 0; i < index.length; i++) {\n"
+    + "      var it = index[i];\n"
+    + "      var name = (it.name || '').toLowerCase();\n"
+    + "      var mod = (it.module || '').toLowerCase();\n"
+    + "      var sig = (it.signature || '').toLowerCase();\n"
+    + "      var doc = (it.doc || '').toLowerCase();\n"
+    + "      var score = 0;\n"
+    + "      if (name === q) score = 100;\n"
+    + "      else if (name.indexOf(q) === 0) score = 80;\n"
+    + "      else if (name.indexOf(q) !== -1) score = 60;\n"
+    + "      else if (mod.indexOf(q) !== -1) score = 40;\n"
+    + "      else if (sig.indexOf(q) !== -1) score = 25;\n"
+    + "      else if (doc.indexOf(q) !== -1) score = 10;\n"
+    + "      if (score > 0) scored.push({score: score, it: it});\n"
+    + "    }\n"
+    + "    scored.sort(function(a, b){ return b.score - a.score || a.it.name.localeCompare(b.it.name); });\n"
+    + "    var top = scored.slice(0, 30);\n"
+    + "    if (top.length === 0) {\n"
+    + "      var empty = document.createElement('div');\n"
+    + "      empty.className = 'search-item';\n"
+    + "      empty.textContent = 'No matching symbols';\n"
+    + "      box.appendChild(empty);\n"
+    + "    } else {\n"
+    + "      var frag = document.createDocumentFragment();\n"
+    + "      for (var k = 0; k < top.length; k++) {\n"
+    + "        var it = top[k].it;\n"
+    + "        var a = document.createElement('a');\n"
+    + "        a.className = 'search-item';\n"
+    + "        a.setAttribute('href', root + (it.href || ''));\n"
+    + "        var head = document.createElement('div');\n"
+    + "        head.className = 'search-item-head';\n"
+    + "        var badge = document.createElement('span');\n"
+    + "        badge.className = 'kind-badge kind-' + String(it.kind || '').replace(/[^a-z0-9_-]/gi, '');\n"
+    + "        badge.textContent = it.kind || '';\n"
+    + "        var strong = document.createElement('strong');\n"
+    + "        strong.textContent = it.name || '';\n"
+    + "        var modEl = document.createElement('span');\n"
+    + "        modEl.className = 'search-item-mod';\n"
+    + "        modEl.textContent = it.module || '';\n"
+    + "        head.appendChild(badge);\n"
+    + "        head.appendChild(strong);\n"
+    + "        head.appendChild(modEl);\n"
+    + "        a.appendChild(head);\n"
+    + "        if (it.doc) {\n"
+    + "          var docEl = document.createElement('div');\n"
+    + "          docEl.className = 'search-item-doc';\n"
+    + "          docEl.textContent = it.doc;\n"
+    + "          a.appendChild(docEl);\n"
+    + "        }\n"
+    + "        frag.appendChild(a);\n"
+    + "      }\n"
+    + "      box.appendChild(frag);\n"
+    + "    }\n"
+    + "    box.hidden = false;\n"
+    + "  }\n"
+    + "  if (input && box) {\n"
+    + "    input.addEventListener('input', function(){ runSearch(input.value); });\n"
+    + "    document.addEventListener('keydown', function(e){\n"
+    + "      if (e.key === '/' && document.activeElement !== input && document.activeElement !== filterInput) {\n"
+    + "        e.preventDefault(); input.focus(); input.select();\n"
+    + "      } else if (e.key === 'Escape') { box.hidden = true; }\n"
+    + "    });\n"
+    + "    document.addEventListener('click', function(e){\n"
+    + "      if (!box.contains(e.target) && e.target !== input) box.hidden = true;\n"
+    + "    });\n"
+    + "  }\n"
+    + "})();\n"
+
+def isSafeFlatHtmlName(name: String): Bool = {
+    let n = strLen(name);
+    if (n <= 5 || !strEndsWith(name, ".html")) false
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let c = strByteAt(name, cellGet(i));
+            if (isAsciiAlphaNum(c) || c == 46 || c == 45 || c == 95) {
+                cellSet(i, cellGet(i) + 1)
+            } else {
+                cellSet(ok, false)
+            }
+        };
+        cellGet(ok) && !strContains(name, "..")
+    }
+}
+
+// Strict allow-list for `.geisha-doc-manifest` entries: rejects absolute paths, Windows drive
+// letters, parent traversals (`..`), and any path outside the generator's own static site outputs.
+def isSafeRelManifestPath(rel: String): Bool =
+    if (rel == "index.html" || rel == "style.css" || rel == "app.js"
+        || rel == "search-index.json" || rel == "search-index.js" || rel == "doc.json") true
+    else if (strStartsWith(rel, "modules/")) isSafeFlatHtmlName(strSlice(rel, 8, strLen(rel)))
+    else if (strStartsWith(rel, "src/")) isSafeFlatHtmlName(strSlice(rel, 4, strLen(rel)))
+    else false
+
+def asciiToLower(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c >= 65 && c <= 90) bufPushByte(b, c + 32)
+        else bufPushByte(b, c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def isMacHost(): Bool = {
+    let os = hostOs();
+    os == "macos" || os == "darwin"
+}
+
+def isSystemRootSymlink(p: String): Bool =
+    isMacHost() && (p == "/var" || p == "/tmp" || p == "/etc")
+
+def checkIntermediateDirsNoSymlink(dir: String): Result Void String = {
+    let isWin = hostOs() == "windows";
+    let n = strLen(dir);
+    let i = cellNew(1);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (cellGet(i) < n && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        let idx = cellGet(i);
+        let c = strByteAt(dir, idx);
+        if (c == 47 || (isWin && c == 92)) {
+            let pfx = strSlice(dir, 0, idx);
+            let isDrive = isWin && strLen(pfx) == 2 && strByteAt(pfx, 1) == 58;
+            if (strLen(pfx) > 0 && !isDrive && !isSystemRootSymlink(pfx)) {
+                let k = c_site_lstat_kind(pfx);
+                if (k == 3 || k == 4) cellSet(errOpt, Some("refusing to traverse symlinked output path component: " + pfx))
+                else if (k == 1) cellSet(errOpt, Some("output path component is a regular file: " + pfx))
+                else ()
+            } else ()
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
+def ensureRealDir(dir: String): Result Void String = {
+    checkIntermediateDirsNoSymlink(dir)?;
+    let k0 = c_site_lstat_kind(dir);
+    if (k0 == 3 || k0 == 4) {
+        Err("refusing to use symlinked output directory: " + dir)
+    } else if (k0 == 1) {
+        Err("output directory path is a regular file: " + dir)
+    } else {
+        if (k0 == 0) mkdirAll(dir)? else ();
+        let k1 = c_site_lstat_kind(dir);
+        if (k1 != 2) Err("output path is not a real directory: " + dir)
+        else Ok(())
+    }
+}
+
+// Allocate a short, collision-free sibling path in `pathDirname(targetPath)` using PID + monotonic
+// counter (`<dir>/.<tag>_<pid>_<seq>`). Short names avoid ENAMETOOLONG on long target filenames,
+// and any `lstat < 0` error fails immediately instead of looping.
+def allocUniqueSiblingPath(targetPath: String, tag: String): Result String String = {
+    let dir = pathDirname(targetPath);
+    let pidStr = intToStr(c_site_getpid());
+    let cand = cellNew("");
+    let errOpt: Cell (Option String) = cellNew(None);
+    let found = cellNew(false);
+    let attempts = cellNew(0);
+    while (!cellGet(found) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        if (cellGet(attempts) >= 10000) {
+            cellSet(errOpt, Some("exhausted unique temp path attempts in directory: " + dir))
+        } else {
+            cellSet(attempts, cellGet(attempts) + 1);
+            let seq = cellGet(gSiteTmpSeq) + 1;
+            cellSet(gSiteTmpSeq, seq);
+            let p = pathJoin(dir, "." + tag + "_" + pidStr + "_" + intToStr(seq));
+            let k = c_site_lstat_kind(p);
+            if (k == 0) {
+                cellSet(cand, p);
+                cellSet(found, true)
+            } else if (k < 0) {
+                cellSet(errOpt, Some("cannot inspect temp path in directory: " + dir))
+            } else ()
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(cellGet(cand)),
+    }
+}
+
+def checkExistingFileWritable(path: String): Result Void String = {
+    let fp = c_site_fopen(path, "r+b");
+    if (ptrIsNull(fp)) Err("existing doc output file is not writable: " + path)
+    else {
+        let _ = c_site_fclose(fp);
+        Ok(())
+    }
+}
+
+// Atomically create a brand-new short unique sibling temporary file with `O_CREAT|O_EXCL` at
+// restrictive mode `0600` (never exposing new contents of a `0600`/ACL-protected file as `0644`),
+// write all bytes, verify full length, and clone mode + OS ACLs from `targetPath` when replacing
+// an existing file (or set standard `0644` for brand-new files).
+def writeVerifiedTempFile(targetPath: String, content: String, copyFromExisting: Bool): Result String String = {
+    let dir = pathDirname(targetPath);
+    let pidStr = intToStr(c_site_getpid());
+    let wantLen = strLen(content);
+    let wantLen64 = intToI64(wantLen);
+
+    let createdPath = cellNew("");
+    let errOpt: Cell (Option String) = cellNew(None);
+    let created = cellNew(false);
+    let attempts = cellNew(0);
+    while (!cellGet(created) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        if (cellGet(attempts) >= 10000) {
+            cellSet(errOpt, Some("exhausted unique temp path attempts in directory: " + dir))
+        } else {
+            cellSet(attempts, cellGet(attempts) + 1);
+            let seq = cellGet(gSiteTmpSeq) + 1;
+            cellSet(gSiteTmpSeq, seq);
+            let p = pathJoin(dir, ".gst_" + pidStr + "_" + intToStr(seq));
+            let rc = c_site_write_excl(p, content, wantLen64, 0o600);
+            if (rc == 0) {
+                cellSet(createdPath, p);
+                cellSet(created, true)
+            } else if (rc == 1) {
+                // Atomic EEXIST collision: retry with next sequence number
+                ()
+            } else {
+                cellSet(errOpt, Some("failed to atomically write staged doc output file for: " + targetPath))
+            }
+        }
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> {
+            let tmpPath = cellGet(createdPath);
+            match readFile(tmpPath) {
+                Err(e) -> {
+                    let _ = removeFile(tmpPath);
+                    Err("failed to verify staged doc output file: " + e)
+                },
+                Ok(chk) ->
+                    if (strLen(chk) != wantLen) {
+                        let _ = removeFile(tmpPath);
+                        Err("short write detected for doc output file: " + targetPath)
+                    } else if (copyFromExisting) {
+                        if (c_site_copy_file_acl(targetPath, tmpPath) != 0) {
+                            let _ = removeFile(tmpPath);
+                            Err("failed to preserve permissions/ACL from: " + targetPath)
+                        } else Ok(tmpPath)
+                    } else {
+                        // Brand-new file: honor caller's process umask (0666 & ~umask) on POSIX
+                        // or restore default parent-inherited DACL on Windows.
+                        if (c_site_apply_umask_mode(tmpPath, 0o666) != 0) {
+                            let _ = removeFile(tmpPath);
+                            Err("failed to apply default file permissions for: " + targetPath)
+                        } else Ok(tmpPath)
+                    },
+            }
+        },
+    }
+}
+
+data TxOp {
+    TxCreated(String),
+    TxReplaced(String, String),
+    TxDeleted(String, String),
+    TxRenamed(String, String),
+}
+
+def rollbackTxOps(ops: List TxOp): Option String = {
+    let errOpt: Cell (Option String) = cellNew(None);
+    let cur = cellNew(ops);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(op, r) -> {
+                match op {
+                    TxCreated(livePath) ->
+                        if (c_site_lstat_kind(livePath) != 0 && !removeFile(livePath)) {
+                            match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to remove created file: " + livePath)),
+                                Some(_) -> (),
+                            }
+                        } else (),
+                    TxReplaced(livePath, bkpPath) -> {
+                        let _ = removeFile(livePath);
+                        match renameFile(bkpPath, livePath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to restore " + livePath + ": " + e)),
+                                Some(_) -> (),
+                            },
+                        }
+                    },
+                    TxDeleted(livePath, bkpPath) ->
+                        match renameFile(bkpPath, livePath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to restore deleted file " + livePath + ": " + e)),
+                                Some(_) -> (),
+                            },
+                        },
+                    TxRenamed(oldPath, newPath) ->
+                        match renameFile(newPath, oldPath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to undo rename " + newPath + ": " + e)),
+                                Some(_) -> (),
+                            },
+                        },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(errOpt)
+}
+
+def cleanupTxBackups(ops: List TxOp): Void = {
+    let cur = cellNew(ops);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(op, r) -> {
+                match op {
+                    TxReplaced(_, bkpPath) -> { let _ = removeFile(bkpPath); () },
+                    TxDeleted(_, bkpPath) -> { let _ = removeFile(bkpPath); () },
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def cleanupTempFiles(tmps: List (String, String)): Void = {
+    let cur = cellNew(tmps);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((_, tmpPath), r) -> {
+                let _ = removeFile(tmpPath);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def buildDirEntrySet(dir: String): Result (StrMap Bool) String = {
+    let entries = readDir(dir)?;
+    let mp: StrMap Bool = strMapNew();
+    let cur = cellNew(entries);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(name, r) -> {
+                strMapInsert(mp, name, true);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(mp)
+}
+
+def stripKnownSubdirPrefix(rel: String): (String, String) =
+    if (strStartsWith(rel, "modules/")) ("modules", strSlice(rel, 8, strLen(rel)))
+    else if (strStartsWith(rel, "src/")) ("src", strSlice(rel, 4, strLen(rel)))
+    else ("", rel)
+
+pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): Result Void String = {
+    let modDir = pathJoin(outDir, "modules");
+    let srcDir = pathJoin(outDir, "src");
+    ensureRealDir(outDir)?;
+    ensureRealDir(modDir)?;
+    ensureRealDir(srcDir)?;
+
+    let manifestPath = pathJoin(outDir, ".geisha-doc-manifest");
+    let mfKind = c_site_lstat_kind(manifestPath);
+    let prevFiles =
+        if (mfKind == 0) Nil
+        else if (mfKind == 1) {
+            let raw = readFile(manifestPath)?;
+            strSplitChar(raw, '\n')
+        } else {
+            let _ = Err("cannot safely read existing doc manifest: " + manifestPath)?;
+            Nil
+        };
+
+    // Pre-flight check: ensure `modules/` and `src/` are listable before modifying anything
+    // (prevents e.g. `0311` unreadable directories from silently losing stale manifest entries).
+    let _ = buildDirEntrySet(modDir)?;
+    let _ = buildDirEntrySet(srcDir)?;
+
+    // 1. Render all site artifacts in memory first (no partial writes on render error).
+    let symIndex = buildGlobalSymIndex(site.dsModules);
+    let searchJson = buildSearchIndexJson(site);
+
+    let stagedRev: Cell (List (String, String)) = cellNew(Nil);
+    let generatedRev: Cell (List String) = cellNew(Nil);
+    let generatedSet: StrMap Bool = strMapNew();
+    let generatedLowerMap: StrMap String = strMapNew();
+    let stageFile = (rel: String, content: String) -> {
+        cellSet(stagedRev, Cons((rel, content), cellGet(stagedRev)));
+        cellSet(generatedRev, Cons(rel, cellGet(generatedRev)));
+        strMapInsert(generatedSet, rel, true);
+        strMapInsert(generatedLowerMap, asciiToLower(rel), rel)
+    };
+
+    let cm = cellNew(site.dsModules);
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
+        match cellGet(cm) {
+            Cons(m, rm) -> {
+                let slug = moduleSlug(m.dmKey);
+                let scopedLinks = buildScopedSymLinksLayered(symIndex, site.dsModules, m, Nil);
+                stageFile("modules/" + slug + ".html", renderModulePage(site, m, symIndex, scopedLinks));
+                stageFile("src/" + slug + ".html", renderSourcePage(site, m));
+                cellSet(cm, rm)
+            },
+            Nil -> (),
+        }
+    };
+    stageFile("style.css", siteCss());
+    stageFile("app.js", siteJs());
+    stageFile("search-index.json", searchJson);
+    stageFile("search-index.js", "window.GEISHA_DOC_INDEX = " + searchJson + ";\n");
+    if (emitDocJson) {
+        stageFile("doc.json", docSiteToJson(site))
+    } else ();
+    stageFile("index.html", renderIndexPage(site));
+
+    // Include `.geisha-doc-manifest` in the same atomic rename transaction so any failure
+    // (including read-only manifest, short write, or stale deletion failure) rolls back ALL
+    // created, replaced, renamed, and deleted files cleanly via `renameFile`.
+    let finalManifestContent = strJoin(listRev(cellGet(generatedRev)), "\n") + "\n";
+    cellSet(stagedRev, Cons((".geisha-doc-manifest", finalManifestContent), cellGet(stagedRev)));
+
+    // 2. Pre-stage every new file into a unique verified sibling temp file AND validate every
+    //    live target path BEFORE modifying a single live file.
+    let staged = listRev(cellGet(stagedRev));
+    let readyRev: Cell (List (String, String)) = cellNew(Nil);
+    let stageErrOpt: Cell (Option String) = cellNew(None);
+    let cs0 = cellNew(staged);
+    while (match cellGet(stageErrOpt) { None -> true, Some(_) -> false } && match cellGet(cs0) { Nil -> false, _ -> true }) {
+        match cellGet(cs0) {
+            Cons((rel, content), rs) -> {
+                let full = pathJoin(outDir, rel);
+                let k = c_site_lstat_kind(full);
+                if (k == 3 || k == 4) {
+                    cellSet(stageErrOpt, Some("refusing to overwrite symlinked doc output file: " + full))
+                } else if (k == 2) {
+                    cellSet(stageErrOpt, Some("refusing to overwrite directory as doc output file: " + full))
+                } else if (k < 0) {
+                    cellSet(stageErrOpt, Some("cannot inspect existing doc output file: " + full))
+                } else {
+                    let writableRes =
+                        if (k == 1) checkExistingFileWritable(full)
+                        else Ok(());
+                    match writableRes {
+                        Err(e) -> cellSet(stageErrOpt, Some(e)),
+                        Ok(()) -> match writeVerifiedTempFile(full, content, k == 1) {
+                            Err(e) -> cellSet(stageErrOpt, Some(e)),
+                            Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
+                        },
+                    }
+                };
+                cellSet(cs0, rs)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(stageErrOpt) {
+        Some(e) -> {
+            cleanupTempFiles(cellGet(readyRev));
+            Err(e)
+        },
+        None -> {
+            // 3. Atomic `renameFile` swap of all staged files + transactional stale cleanup.
+            //    Every live file replacement/deletion moves the old file to a unique backup path
+            //    so rollback is pure `renameFile` (never re-writes or truncates under RLIMIT_FSIZE).
+            let ready = listRev(cellGet(readyRev));
+            let txLogRev: Cell (List TxOp) = cellNew(Nil);
+            let txErrOpt: Cell (Option String) = cellNew(None);
+            let remainingRev: Cell (List (String, String)) = cellNew(Nil);
+
+            let cr = cellNew(ready);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((rel, tmpPath), rest) -> {
+                        match cellGet(txErrOpt) {
+                            Some(_) -> cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev))),
+                            None -> {
+                                let full = pathJoin(outDir, rel);
+                                let k = c_site_lstat_kind(full);
+                                if (k == 1) {
+                                    match allocUniqueSiblingPath(full, "gbk") {
+                                        Err(e) -> {
+                                            cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                            cellSet(txErrOpt, Some(e))
+                                        },
+                                        Ok(bkpPath) -> match renameFile(full, bkpPath) {
+                                            Err(e) -> {
+                                                cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                                cellSet(txErrOpt, Some(e))
+                                            },
+                                            Ok(()) -> match renameFile(tmpPath, full) {
+                                                Ok(()) -> cellSet(txLogRev, Cons(TxReplaced(full, bkpPath), cellGet(txLogRev))),
+                                                Err(e) -> {
+                                                    let _ = renameFile(bkpPath, full);
+                                                    cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                                    cellSet(txErrOpt, Some(e))
+                                                },
+                                            },
+                                        },
+                                    }
+                                } else if (k == 0) {
+                                    match renameFile(tmpPath, full) {
+                                        Ok(()) -> cellSet(txLogRev, Cons(TxCreated(full), cellGet(txLogRev))),
+                                        Err(e) -> {
+                                            cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                            cellSet(txErrOpt, Some(e))
+                                        },
+                                    }
+                                } else {
+                                    cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                    cellSet(txErrOpt, Some("unexpected target state for doc output file: " + full))
+                                }
+                            },
+                        };
+                        cellSet(cr, rest)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            // 4. Transactional stale cleanup (inside the same rollback scope):
+            //    move stale files to unique backup paths; if ANY stale removal fails, roll back
+            //    the entire transaction (restoring old site, old pages, and old manifest).
+            if (match cellGet(txErrOpt) { None -> true, Some(_) -> false }) {
+                match buildDirEntrySet(modDir) {
+                    Err(e) -> cellSet(txErrOpt, Some(e)),
+                    Ok(modDirEntries) -> match buildDirEntrySet(srcDir) {
+                        Err(e) -> cellSet(txErrOpt, Some(e)),
+                        Ok(srcDirEntries) -> {
+                            let cp = cellNew(prevFiles);
+                            while (match cellGet(txErrOpt) { None -> true, Some(_) -> false } && match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(rawRel, rp) -> {
+                                        let rel = strTrim(rawRel);
+                                        if (isSafeRelManifestPath(rel)) {
+                                            match strMapGet(generatedSet, rel) {
+                                                None -> {
+                                                    let skipDelete = match strMapGet(generatedLowerMap, asciiToLower(rel)) {
+                                                        Some(newRel) -> {
+                                                            let (oldDirTag, oldBase) = stripKnownSubdirPrefix(rel);
+                                                            let (newDirTag, newBase) = stripKnownSubdirPrefix(newRel);
+                                                            if (oldDirTag == newDirTag && (oldDirTag == "modules" || oldDirTag == "src")) {
+                                                                let entries = if (oldDirTag == "modules") modDirEntries else srcDirEntries;
+                                                                let hasOld = match strMapGet(entries, oldBase) { Some(_) -> true, None -> false };
+                                                                let hasNew = match strMapGet(entries, newBase) { Some(_) -> true, None -> false };
+                                                                if (hasOld && hasNew) {
+                                                                    false
+                                                                } else if (hasOld && !hasNew) {
+                                                                    let oldFull = pathJoin(outDir, rel);
+                                                                    let newFull = pathJoin(outDir, newRel);
+                                                                    match renameFile(oldFull, newFull) {
+                                                                        Ok(()) -> cellSet(txLogRev, Cons(TxRenamed(oldFull, newFull), cellGet(txLogRev))),
+                                                                        Err(re) -> cellSet(txErrOpt, Some(re)),
+                                                                    };
+                                                                    true
+                                                                } else {
+                                                                    true
+                                                                }
+                                                            } else false
+                                                        },
+                                                        None -> false,
+                                                    };
+                                                    if (!skipDelete && match cellGet(txErrOpt) { None -> true, Some(_) -> false }) {
+                                                        let full = pathJoin(outDir, rel);
+                                                        let stKind = c_site_lstat_kind(full);
+                                                        if (stKind == 0) {
+                                                            ()
+                                                        } else if (stKind == 1) {
+                                                            match allocUniqueSiblingPath(full, "gdl") {
+                                                                Err(re) -> cellSet(txErrOpt, Some("failed to allocate stale backup path for: " + full + " (" + re + ")")),
+                                                                Ok(bkpPath) -> match renameFile(full, bkpPath) {
+                                                                    Ok(()) -> cellSet(txLogRev, Cons(TxDeleted(full, bkpPath), cellGet(txLogRev))),
+                                                                    Err(re) -> cellSet(txErrOpt, Some("failed to remove stale doc artifact: " + full + " (" + re + ")")),
+                                                                },
+                                                            }
+                                                        } else {
+                                                            cellSet(txErrOpt, Some("cannot safely remove stale doc artifact: " + full))
+                                                        }
+                                                    } else ()
+                                                },
+                                                Some(_) -> (),
+                                            }
+                                        } else ();
+                                        cellSet(cp, rp)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                    },
+                }
+            } else ();
+
+            match cellGet(txErrOpt) {
+                None -> {
+                    cleanupTxBackups(cellGet(txLogRev));
+                    Ok(())
+                },
+                Some(e) -> {
+                    cleanupTempFiles(cellGet(remainingRev));
+                    match rollbackTxOps(cellGet(txLogRev)) {
+                        None -> Err(e),
+                        Some(rbErr) -> Err(e + " (rollback error: " + rbErr + ")"),
+                    }
+                },
+            }
+        },
+    }
+}
