@@ -3480,9 +3480,8 @@ def collectUseImportOccs(
     None -> (),
     Some(fm) -> {
         let targetMod = qnameModulePrefix(targetQn);
-        // Collect exact matching module prefixes from parsed `ModUse` items
-        let matchedSingleMods: Cell (List String) = cellNew(Nil);
-        let matchedMultiMods: Cell (List String) = cellNew(Nil);
+        let hasSingleOrAlias = cellNew(false);
+        let hasMulti = cellNew(false);
         let cur = cellNew(fm.items);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
@@ -3490,9 +3489,11 @@ def collectUseImportOccs(
                     match u {
                         UseSingle(segs) -> {
                             let full = strJoin(segs, ".");
-                            if (full == targetQn) {
-                                cellSet(matchedSingleMods, Cons(qnameModulePrefix(full), cellGet(matchedSingleMods)))
-                            } else ()
+                            if (full == targetQn) cellSet(hasSingleOrAlias, true) else ()
+                        },
+                        UseAlias(segs, _) -> {
+                            let full = strJoin(segs, ".");
+                            if (full == targetQn) cellSet(hasSingleOrAlias, true) else ()
                         },
                         UseMulti(modSegs, specs) -> {
                             let modKey = strJoin(modSegs, ".");
@@ -3508,9 +3509,7 @@ def collectUseImportOccs(
                                         Nil -> (),
                                     }
                                 };
-                                if (cellGet(hit)) {
-                                    cellSet(matchedMultiMods, Cons(modKey, cellGet(matchedMultiMods)))
-                                } else ()
+                                if (cellGet(hit)) cellSet(hasMulti, true) else ()
                             } else ()
                         },
                         _ -> (),
@@ -3521,11 +3520,7 @@ def collectUseImportOccs(
                 Nil -> (),
             }
         };
-        let hasAny = match (cellGet(matchedSingleMods), cellGet(matchedMultiMods)) {
-            (Nil, Nil) -> false,
-            _ -> true,
-        };
-        if (hasAny && strLen(targetMod) > 0) {
+        if ((cellGet(hasSingleOrAlias) || cellGet(hasMulti)) && strLen(targetMod) > 0) {
             let src = wd.wdText;
             let n = strLen(src);
             let singlePrefix1 = "use " + targetMod + "." + target.stName;
@@ -3540,40 +3535,47 @@ def collectUseImportOccs(
                     None -> n,
                 };
                 let trimmed = strTrim(strSlice(src, lineStart, lineEnd));
-                // 1. Exact `use <targetMod>.<orig>`
-                let isSingleLine =
-                    (strStartsWith(trimmed, singlePrefix1) && (strLen(trimmed) == strLen(singlePrefix1) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix1)))))
-                    || (strStartsWith(trimmed, singlePrefix2) && (strLen(trimmed) == strLen(singlePrefix2) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix2)))));
-                if (isSingleLine) {
-                    let modDot = targetMod + ".";
-                    match extractAfterPrefix(strSlice(src, lineStart, lineEnd), modDot) {
-                        Some(after) -> {
-                            let relOff = (lineEnd - lineStart) - strLen(after);
-                            let symStart = lineStart + relOff;
-                            let symEnd = symStart + strLen(target.stName);
-                            if (symEnd <= lineEnd && strSlice(src, symStart, symEnd) == target.stName) {
-                                pushOcc(seen, outRev, wd.wdUri, src, symStart, symEnd)
-                            } else ()
-                        },
-                        None -> (),
-                    }
+                // 1. Exact `use <targetMod>.<orig>` or `use <targetMod>.<orig> as <alias>`
+                if (cellGet(hasSingleOrAlias)) {
+                    let isSingleLine =
+                        (strStartsWith(trimmed, singlePrefix1) && (strLen(trimmed) == strLen(singlePrefix1) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix1)))))
+                        || (strStartsWith(trimmed, singlePrefix2) && (strLen(trimmed) == strLen(singlePrefix2) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix2)))));
+                    if (isSingleLine) {
+                        let modDot = targetMod + ".";
+                        match extractAfterPrefix(strSlice(src, lineStart, lineEnd), modDot) {
+                            Some(after) -> {
+                                let relOff = (lineEnd - lineStart) - strLen(after);
+                                let symStart = lineStart + relOff;
+                                let symEnd = symStart + strLen(target.stName);
+                                if (symEnd <= lineEnd && strSlice(src, symStart, symEnd) == target.stName) {
+                                    pushOcc(seen, outRev, wd.wdUri, src, symStart, symEnd)
+                                } else ()
+                            },
+                            None -> (),
+                        }
+                    } else ()
                 } else ();
-                // 2. Exact `use <targetMod>.{ ... }` — match ONLY orig names before `as`, never aliases or other modules
-                if (strStartsWith(trimmed, multiPrefix1) || strStartsWith(trimmed, multiPrefix2)) {
+                // 2. Exact `use <targetMod>.{ ... }` (single-line OR multi-line!) — match ONLY orig names before `as`
+                if (cellGet(hasMulti) && (strStartsWith(trimmed, multiPrefix1) || strStartsWith(trimmed, multiPrefix2))) {
                     match strIndexOfByte(src, 123, lineStart) {
                         Some(openBrace) if (openBrace < lineEnd) -> {
-                            let closeBrace = match strIndexOfByte(src, 125, openBrace + 1) {
-                                Some(cb) if (cb <= lineEnd) -> cb,
-                                _ -> lineEnd,
+                            let closeBrace = match findMatchCloseBrace(src, openBrace) {
+                                Some(cb) -> cb,
+                                None -> lineEnd,
                             };
                             let occs = findAllIdentsInSpan(src, target.stName, openBrace + 1, closeBrace);
                             let co = cellNew(occs);
                             while (match cellGet(co) { Nil -> false, _ -> true }) {
                                 match cellGet(co) {
                                     Cons((s, e), ro) -> {
-                                        // Ensure this token is preceded by `{` or `,` (optional spaces), NOT by `as`!
+                                        // Preceded by `{` or `,` (skipping spaces, tabs, CR, LF) — never `as`!
                                         let p = cellNew(s - 1);
-                                        while (cellGet(p) > openBrace && (strByteAt(src, cellGet(p)) == 32 || strByteAt(src, cellGet(p)) == 9)) {
+                                        while (cellGet(p) > openBrace && (
+                                            strByteAt(src, cellGet(p)) == 32
+                                            || strByteAt(src, cellGet(p)) == 9
+                                            || strByteAt(src, cellGet(p)) == 10
+                                            || strByteAt(src, cellGet(p)) == 13
+                                        )) {
                                             cellSet(p, cellGet(p) - 1)
                                         };
                                         let prevB = strByteAt(src, cellGet(p));
@@ -3584,15 +3586,108 @@ def collectUseImportOccs(
                                     },
                                     Nil -> (),
                                 }
+                            };
+                            if (closeBrace >= lineEnd) {
+                                let nextNl = match strIndexOfByte(src, 10, closeBrace) {
+                                    Some(nl2) -> nl2 + 1,
+                                    None -> n,
+                                };
+                                cellSet(pos, nextNl)
+                            } else {
+                                cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
                             }
                         },
-                        _ -> (),
+                        _ -> cellSet(pos, if (lineEnd < n) lineEnd + 1 else n),
                     }
-                } else ();
-                cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
+                } else {
+                    cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
+                }
             }
         } else ()
     },
+}
+
+def moduleHasBindingNamed(items: List ModuleItem, name: String, skipDefStart: Int, skipDefEnd: Int): Bool = {
+    let cur = cellNew(items);
+    let found = cellNew(false);
+    while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(_, d), r) -> {
+                let isSameDef = d.dpos.start == skipDefStart && d.dpos.end == skipDefEnd;
+                if (!isSameDef) {
+                    if (d.ident == name || defHasVariant(d, name) || defHasMethod(d, name)) {
+                        cellSet(found, true)
+                    } else ()
+                } else {
+                    // Within same data/concept def, check if another variant/method already has `name`
+                    if (d.ident == name || defHasVariant(d, name) || defHasMethod(d, name)) {
+                        cellSet(found, true)
+                    } else ()
+                };
+                cellSet(cur, r)
+            },
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseSingle(segs) ->
+                        if (shortSymName(strJoin(segs, ".")) == name) cellSet(found, true) else (),
+                    UseAlias(_, al) ->
+                        if (al == name) cellSet(found, true) else (),
+                    UseMulti(_, specs) -> {
+                        let cs = cellNew(specs);
+                        while (!cellGet(found) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                            match cellGet(cs) {
+                                Cons(sp, rs) -> {
+                                    if (useSpecLocalName(sp) == name) cellSet(found, true) else ();
+                                    cellSet(cs, rs)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    UseGlob(_) -> (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName: String): Bool = {
+    let targetMod = qnameModulePrefix(targetQn);
+    let cur = cellNew(items);
+    let found = cellNew(false);
+    while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseSingle(segs) ->
+                        if (strJoin(segs, ".") == targetQn) cellSet(found, true) else (),
+                    UseMulti(modSegs, specs) if (strJoin(modSegs, ".") == targetMod) -> {
+                        let cs = cellNew(specs);
+                        while (!cellGet(found) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                            match cellGet(cs) {
+                                Cons(sp, rs) -> {
+                                    if (sp.orig == origName && match sp.alias { None -> true, Some(_) -> false }) {
+                                        cellSet(found, true)
+                                    } else ();
+                                    cellSet(cs, rs)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
 }
 
 def collectTypeAnnotOccsInForm(
@@ -3860,6 +3955,33 @@ def collectSymbolOccurrences(
                     Cons(wd, rw) -> {
                         match (wd.wdInfer, findTargetQNameInDoc(wd, target)) {
                             (Some(inf), Some(targetQn)) -> {
+                                // Check for top-level / field name collision when renaming
+                                match newNameOpt {
+                                    Some(nn) if (nn != target.stName) -> match target.stKind {
+                                        SkTopDef -> match wd.wdParsed {
+                                            Some(fm) ->
+                                                if (wd.wdCanon == target.stDeclCanon) {
+                                                    if (moduleHasBindingNamed(fm.items, nn, target.stDeclDefStart, target.stDeclDefEnd)) {
+                                                        cellSet(conflict, Some("Symbol '" + nn + "' already exists in this module"))
+                                                    } else ()
+                                                } else if (docImportsTargetUnaliased(fm.items, targetQn, target.stName)) {
+                                                    if (moduleHasBindingNamed(fm.items, nn, -1, -1)) {
+                                                        cellSet(conflict, Some("Renaming to '" + nn + "' conflicts with an existing binding in '" + wd.wdPath + "'"))
+                                                    } else ()
+                                                } else (),
+                                            None -> (),
+                                        },
+                                        SkField if (wd.wdCanon == target.stDeclCanon) ->
+                                            match lookupDefExact(inf.defs, targetQn) {
+                                                Some(adtDef) if (defHasStructField(adtDef, nn)) ->
+                                                    cellSet(conflict, Some("Field '" + nn + "' already exists on type '" + shortSymName(targetQn) + "'")),
+                                                _ -> (),
+                                            },
+                                        _ -> (),
+                                    },
+                                    _ -> (),
+                                };
+
                                 // Declaration site in declaring file
                                 if (includeDecl && wd.wdCanon == target.stDeclCanon) {
                                     let (ds, de) = findIdentInSpan(wd.wdText, target.stName, target.stDeclDefStart, target.stDeclDefEnd);

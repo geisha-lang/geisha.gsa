@@ -936,6 +936,60 @@ def main() -> int:
         assert (1, 35) in rec_excl_positions and (2, 9) in rec_excl_positions, f"expected recursive self-ref (1,35) & sig ref (2,9), got {rec_excl_positions}"
         assert (1, 5) not in rec_excl_positions, f"declaration header (1,5) must be excluded when includeDeclaration=False: {rec_excl_positions}"
 
+        # 11h-5: Top-level same-module rename collision rejected (-32602)
+        col_path = qa_dir / "collision.gsa"
+        col_src = "def first(): Int = 1\ndef second(): Int = 2\ndef main(): Int = first() + second()\n"
+        col_path.write_text(col_src, encoding="utf-8")
+        col_uri = path_to_uri(col_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": col_uri, "languageId": "geisha", "version": 1, "text": col_src},
+        })
+        assert client.wait_diag_for(col_uri) == []
+        col_ren = client.request("textDocument/rename", {
+            "textDocument": {"uri": col_uri},
+            "position": {"line": 0, "character": 5},
+            "newName": "second",
+        })
+        assert "error" in col_ren and col_ren["error"]["code"] == -32602, f"expected -32602 on top-level collision: {col_ren}"
+
+        # 11h-6: `UseAlias` (`use m1.load as loadA`) and multi-line `UseMulti` (`use m1.{\n load as chosen,\n}`)
+        ml_dir = root / "multiline_alias_proj"
+        ml_dir.mkdir(parents=True)
+        m1_path = ml_dir / "m1.gsa"
+        u1_path = ml_dir / "u1.gsa"
+        u2_path = ml_dir / "u2.gsa"
+        m1_src = "pub def load(): Int = 7\n"
+        u1_src = "use m1.load as loadA\ndef f(): Int = loadA()\n"
+        u2_src = "use m1.{\n    load as chosen,\n}\ndef g(): Int = chosen()\n"
+        m1_path.write_text(m1_src, encoding="utf-8")
+        u1_path.write_text(u1_src, encoding="utf-8")
+        u2_path.write_text(u2_src, encoding="utf-8")
+        m1_uri = path_to_uri(m1_path)
+        u1_uri = path_to_uri(u1_path)
+        u2_uri = path_to_uri(u2_path)
+        client.notifications.clear()
+        for u, t in ((m1_uri, m1_src), (u1_uri, u1_src), (u2_uri, u2_src)):
+            client.notify("textDocument/didOpen", {
+                "textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t},
+            })
+            assert client.wait_diag_for(u) == []
+        ren_ml = client.request("textDocument/rename", {
+            "textDocument": {"uri": m1_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "loadV2",
+        })
+        ch_ml = ren_ml["result"]["changes"]
+        new_m1 = apply_edits(m1_src, ch_ml[m1_uri])
+        new_u1 = apply_edits(u1_src, ch_ml[u1_uri])
+        new_u2 = apply_edits(u2_src, ch_ml[u2_uri])
+        assert new_m1 == "pub def loadV2(): Int = 7\n", f"unexpected m1: {new_m1!r}"
+        assert new_u1 == "use m1.loadV2 as loadA\ndef f(): Int = loadA()\n", f"unexpected u1: {new_u1!r}"
+        assert new_u2 == "use m1.{\n    loadV2 as chosen,\n}\ndef g(): Int = chosen()\n", f"unexpected u2: {new_u2!r}"
+        client.notifications.clear()
+        for u, t in ((m1_uri, new_m1), (u1_uri, new_u1), (u2_uri, new_u2)):
+            client.notify("textDocument/didChange", {"textDocument": {"uri": u, "version": 2}, "contentChanges": [{"text": t}]})
+            assert client.wait_diag_for(u) == []
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

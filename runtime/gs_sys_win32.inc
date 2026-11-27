@@ -2186,12 +2186,22 @@ int32_t gs_sys_shell(const char *cmd)
 
 static volatile LONG g_gs_watch_stop = 0;
 
+static BOOL WINAPI gs_watch_ctrl_handler(DWORD ctrl_type)
+{
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        InterlockedExchange(&g_gs_watch_stop, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 void gs_watch_install_signal_handlers(void)
 {
-    g_gs_watch_stop = 0;
+    InterlockedExchange(&g_gs_watch_stop, 0);
+    (void)SetConsoleCtrlHandler(gs_watch_ctrl_handler, TRUE);
 }
 
 int32_t gs_watch_should_stop(void)
 {
-    return g_gs_watch_stop ? 1 : 0;
+    return InterlockedCompareExchange(&g_gs_watch_stop, 0, 0) != 0 ? 1 : 0;
 }

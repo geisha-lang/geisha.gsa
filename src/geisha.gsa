@@ -62,6 +62,7 @@ extern "gs_proc_spawn" def c_proc_spawn(
     outInts: Ptr
 ): Int
 extern "gs_proc_wait" def c_proc_wait(pid: Int, nohang: Int): Int64
+extern "gs_proc_signal" def c_proc_signal(pid: Int, sigKind: Int, ownGroup: Int): Int
 extern "gs_sys_getpid" def c_getpid(): Int
 extern "gs_sys_rename" def c_rename(oldPath: String, newPath: String): Int
 extern "gs_watch_install_signal_handlers" def c_watch_install_signal_handlers(): Void
@@ -3205,7 +3206,7 @@ def watchPollIntervalMs(): Int =
         None -> 250,
     }
 
-def stopWatchChild(activeChild: Cell (Option Child)): Void =
+def stopWatchChild(activeChild: Cell (Option Child), activePgid: Cell Int): Void = {
     match cellGet(activeChild) {
         None -> (),
         Some(ch) -> {
@@ -3220,7 +3221,17 @@ def stopWatchChild(activeChild: Cell (Option Child)): Void =
             };
             cellSet(activeChild, None)
         },
-    }
+    };
+    let pgid = cellGet(activePgid);
+    if (pgid > 0) {
+        // Always signal the process group to clean up any background descendants
+        // even if the group leader exited naturally before restart/SIGTERM.
+        let _ = c_proc_signal(pgid, 0, 1);
+        sleepMs(50);
+        let _ = c_proc_signal(pgid, 1, 1);
+        cellSet(activePgid, 0)
+    } else ()
+}
 
 def buildCachedScriptBin(
     gsaFile: String,
@@ -3294,8 +3305,9 @@ def runWatchProcessLoop(
     let lastSnap = cellNew(computeWatchSnapshot(watchDirs, extraFiles));
     let firstRun = cellNew(true);
     let activeChild: Cell (Option Child) = cellNew(None);
+    let activePgid: Cell Int = cellNew(0);
     while (c_watch_should_stop() == 0) {
-        stopWatchChild(activeChild);
+        stopWatchChild(activeChild, activePgid);
         clearWatchScreen();
         if (cellGet(firstRun)) {
             eprintLn("[watch] Starting " + label + "...");
@@ -3308,7 +3320,10 @@ def runWatchProcessLoop(
                 if (c_watch_should_stop() == 0) {
                     let cmd = cmdOwnGroup(command(binPath, appArgs), true);
                     match procSpawn(cmd) {
-                        Ok(ch) -> cellSet(activeChild, Some(ch)),
+                        Ok(ch) -> {
+                            cellSet(activeChild, Some(ch));
+                            cellSet(activePgid, ch.pid)
+                        },
                         Err(e) -> {
                             eprintLn("error: " + e);
                             eprintLn("[watch] Watching for changes...")
@@ -3349,7 +3364,7 @@ def runWatchProcessLoop(
             } else ()
         }
     };
-    stopWatchChild(activeChild);
+    stopWatchChild(activeChild, activePgid);
     Ok(0)
 }
 

@@ -148,6 +148,18 @@ def test_watch_run_long_running_and_sigterm(geisha_bin: str, env: dict[str, str]
     import signal
 
     def pid_alive(pid: int) -> bool:
+        if sys.platform == "win32":
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x00000102
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not h:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(h)
         try:
             os.kill(pid, 0)
             return True
