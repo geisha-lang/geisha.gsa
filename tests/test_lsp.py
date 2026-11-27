@@ -81,6 +81,18 @@ class LspClient:
                 return msg
             self.notifications.append(msg)
 
+    def wait_diag_for(self, uri: str) -> list[dict]:
+        # Drain matching diagnostic notification for `uri`
+        for i, n in enumerate(self.notifications):
+            if n.get("method") == "textDocument/publishDiagnostics" and n.get("params", {}).get("uri") == uri:
+                self.notifications.pop(i)
+                return n["params"]["diagnostics"]
+        while True:
+            msg = self.read_message()
+            if msg.get("method") == "textDocument/publishDiagnostics" and msg.get("params", {}).get("uri") == uri:
+                return msg["params"]["diagnostics"]
+            self.notifications.append(msg)
+
 
 def path_to_uri(p: Path) -> str:
     return p.resolve().as_uri()
@@ -340,8 +352,8 @@ def main() -> int:
         client.notify("textDocument/didOpen", {
             "textDocument": {"uri": crlf_uri, "languageId": "geisha", "version": 1, "text": crlf_src},
         })
-        diag_crlf = client.wait_notification("textDocument/publishDiagnostics")
-        assert diag_crlf["params"]["diagnostics"] == [], f"unexpected CRLF diagnostics: {diag_crlf}"
+        diag_crlf = client.wait_diag_for(crlf_uri)
+        assert diag_crlf == [], f"unexpected CRLF diagnostics: {diag_crlf}"
         def_utf8 = client.request("textDocument/definition", {
             "textDocument": {"uri": crlf_uri},
             "position": {"line": 1, "character": 46},
@@ -350,6 +362,7 @@ def main() -> int:
         assert def_utf8["result"]["range"]["start"]["line"] == 0, f"unexpected UTF-8/CRLF def: {def_utf8}"
 
         # 8. didChange with type error -> publishDiagnostics with exact line & severity 1
+        client.notifications.clear()
         bad_src = (
             "def main(): Void = {\n"
             "    let bad: Int = \"oops\";\n"
@@ -360,8 +373,7 @@ def main() -> int:
             "textDocument": {"uri": main_uri, "version": 3},
             "contentChanges": [{"text": bad_src}],
         })
-        diag_err = client.wait_notification("textDocument/publishDiagnostics")
-        diags = diag_err["params"]["diagnostics"]
+        diags = client.wait_diag_for(main_uri)
         assert len(diags) == 1 and diags[0]["severity"] == 1 and diags[0]["source"] == "geisha"
         assert diags[0]["range"]["start"]["line"] == 1
         assert "Int" in diags[0]["message"] and "String" in diags[0]["message"]
@@ -371,8 +383,8 @@ def main() -> int:
             "textDocument": {"uri": main_uri, "version": 4},
             "contentChanges": [{"text": main_src}],
         })
-        diag_clear = client.wait_notification("textDocument/publishDiagnostics")
-        assert diag_clear["params"]["diagnostics"] == []
+        diag_clear = client.wait_diag_for(main_uri)
+        assert diag_clear == []
 
         # 10. unknown method -> -32601
         unk = client.request("geisha/nonExistentMethod", {})
@@ -380,14 +392,14 @@ def main() -> int:
 
         # 11. didClose removes cached doc state (subsequent hover returns null)
         client.notify("textDocument/didClose", {"textDocument": {"uri": main_uri}})
-        _ = client.wait_notification("textDocument/publishDiagnostics")
+        _ = client.wait_diag_for(main_uri)
         hover_after_close = client.request("textDocument/hover", {
             "textDocument": {"uri": main_uri},
             "position": {"line": 25, "character": 18},
         })
         assert hover_after_close["result"] is None, f"expected null hover after didClose, got: {hover_after_close}"
 
-        # 11b. Project `tests/spec.gsa` importing own package (`use demo_lib.hello`) -> 0 diagnostics + cross-file definition
+        # 11b. Project `tests/spec.gsa` importing own package (`use demo_lib.hello`) -> 0 diagnostics, cross-file def, no geisha.lock written
         proj_dir = root / "demo_lib_proj"
         (proj_dir / "src").mkdir(parents=True)
         (proj_dir / "tests").mkdir(parents=True)
@@ -402,13 +414,58 @@ def main() -> int:
         client.notify("textDocument/didOpen", {
             "textDocument": {"uri": spec_uri, "languageId": "geisha", "version": 1, "text": spec_src},
         })
-        diag_spec = client.wait_notification("textDocument/publishDiagnostics")
-        assert diag_spec["params"]["diagnostics"] == [], f"expected 0 diagnostics for self-pkg test import, got: {diag_spec}"
+        diag_spec = client.wait_diag_for(spec_uri)
+        assert diag_spec == [], f"expected 0 diagnostics for self-pkg test import, got: {diag_spec}"
+        assert not (proj_dir / "geisha.lock").exists(), "LSP must not write geisha.lock during read-only analysis"
         def_self = client.request("textDocument/definition", {
             "textDocument": {"uri": spec_uri},
             "position": {"line": 3, "character": 13},
         })
         assert def_self["result"] is not None and def_self["result"]["uri"] == lib_uri, f"expected def in {lib_uri}, got: {def_self}"
+
+        # 11c. Multi-file unsaved in-memory overlay & dependency diagnostic URI attribution
+        ov_dir = root / "overlay_proj"
+        ov_dir.mkdir(parents=True)
+        a_path = ov_dir / "a.gsa"
+        b_path = ov_dir / "b.gsa"
+        a_disk = "pub def value(): Int = 42\n"
+        b_src = "use a.value\n\ndef main(): Void = {\n    let s: String = value();\n    ()\n}\n"
+        a_path.write_text(a_disk, encoding="utf-8")
+        b_path.write_text(b_src, encoding="utf-8")
+        a_uri = path_to_uri(a_path)
+        b_uri = path_to_uri(b_path)
+
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": a_uri, "languageId": "geisha", "version": 1, "text": a_disk},
+        })
+        assert client.wait_diag_for(a_uri) == []
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": b_uri, "languageId": "geisha", "version": 1, "text": b_src},
+        })
+        b_diags_init = client.wait_diag_for(b_uri)
+        assert len(b_diags_init) == 1 and "Int" in b_diags_init[0]["message"], f"expected Int/String mismatch in b.gsa, got: {b_diags_init}"
+
+        # Unsaved edit to a.gsa changes return type to String -> b.gsa diagnostics automatically clear!
+        client.notifications.clear()
+        a_unsaved_ok = "pub def value(): String = \"ok\"\n"
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": a_uri, "version": 2},
+            "contentChanges": [{"text": a_unsaved_ok}],
+        })
+        assert client.wait_diag_for(a_uri) == []
+        assert client.wait_diag_for(b_uri) == [], "expected b.gsa diagnostics to clear using unsaved a.gsa overlay"
+
+        # Unsaved type error in a.gsa -> error attributed to a.gsa URI, b.gsa stays clean
+        client.notifications.clear()
+        a_unsaved_err = "pub def value(): String = 999\n"
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": a_uri, "version": 3},
+            "contentChanges": [{"text": a_unsaved_err}],
+        })
+        a_err_diags = client.wait_diag_for(a_uri)
+        assert len(a_err_diags) == 1 and a_err_diags[0]["range"]["start"]["line"] == 0, f"expected error on a.gsa: {a_err_diags}"
+        b_clean = client.wait_diag_for(b_uri)
+        assert b_clean == [], f"expected dependency error attributed to a.gsa rather than b.gsa, got: {b_clean}"
 
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")

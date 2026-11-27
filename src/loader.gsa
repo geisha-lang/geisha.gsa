@@ -14,7 +14,8 @@ use std.list.{listRev, listAppend, listLen}
 use std.control.{fmap}
 use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
 use std.path.{pathJoin, pathStem, pathDirname}
-use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains, strMapRemove}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use sys.fs.{fileExists, readFile}
 use std.char.isUpperByte
@@ -71,6 +72,65 @@ def defaultRootPkg(srcRoots: List String): PkgSpec = MkPkgSpec {
     srcRoots: srcRoots,
     deps: Nil,
 }
+
+// ============================================================================
+// Optional In-Memory Source Overlays (used by `geisha lsp` for unsaved buffers)
+// ============================================================================
+
+def gLoaderOverlays: Cell (StrMap String) = cellNew(strMapNew())
+
+def normalizeOverlayPath(path: String): String = {
+    let n = strLen(path);
+    let b = bufNew();
+    let i = cellNew(0);
+    let prevSlash = cellNew(false);
+    // Preserve leading `//` for UNC paths
+    if (n >= 2 && (strByteAt(path, 0) == 47 || strByteAt(path, 0) == 92) && (strByteAt(path, 1) == 47 || strByteAt(path, 1) == 92)) {
+        bufPushStr(b, "//");
+        cellSet(i, 2);
+        cellSet(prevSlash, true)
+    } else ();
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let ch0 = strByteAt(path, idx);
+        let ch = if (ch0 == 92) 47 else ch0;
+        if (ch == 47) {
+            if (!cellGet(prevSlash)) {
+                bufPushByte(b, 47);
+                cellSet(prevSlash, true)
+            } else ();
+            cellSet(i, idx + 1)
+        } else if (ch == 46 && idx + 1 < n && (strByteAt(path, idx + 1) == 47 || strByteAt(path, idx + 1) == 92) && (idx == 0 || cellGet(prevSlash))) {
+            // Skip `./` segments
+            cellSet(i, idx + 2)
+        } else {
+            bufPushByte(b, ch);
+            cellSet(prevSlash, false);
+            cellSet(i, idx + 1)
+        }
+    };
+    bufToString(b)
+}
+
+pub def loaderClearOverlays(): Void =
+    cellSet(gLoaderOverlays, strMapNew())
+
+pub def loaderSetOverlay(path: String, src: String): Void =
+    strMapInsert(cellGet(gLoaderOverlays), normalizeOverlayPath(path), src)
+
+pub def loaderRemoveOverlay(path: String): Void = {
+    let _ = strMapRemove(cellGet(gLoaderOverlays), normalizeOverlayPath(path));
+    ()
+}
+
+def overlayFileExists(path: String): Bool =
+    strMapContains(cellGet(gLoaderOverlays), normalizeOverlayPath(path)) || fileExists(path)
+
+def overlayReadFile(path: String): Result String String =
+    match strMapGet(cellGet(gLoaderOverlays), normalizeOverlayPath(path)) {
+        Some(src) -> Ok(src),
+        None -> readFile(path),
+    }
 
 def lookupAssocStr(pairs: List (String, String), key: String): Option String = match pairs {
     Nil -> None,
@@ -146,7 +206,7 @@ def extractModuleItems(
 def resolveModFilePathInDir(srcRoot: String, segs: List String): Option String = match segs {
     Nil -> {
         let modFile = pathJoin(srcRoot, "mod.gsa");
-        if (fileExists(modFile)) Some(modFile) else None
+        if (overlayFileExists(modFile)) Some(modFile) else None
     },
     _ -> {
         let cur = cellNew(segs);
@@ -161,10 +221,10 @@ def resolveModFilePathInDir(srcRoot: String, segs: List String): Option String =
             }
         };
         let directFile = cellGet(p) + ".gsa";
-        if (fileExists(directFile)) Some(directFile)
+        if (overlayFileExists(directFile)) Some(directFile)
         else {
             let modFile = pathJoin(cellGet(p), "mod.gsa");
-            if (fileExists(modFile)) Some(modFile) else None
+            if (overlayFileExists(modFile)) Some(modFile) else None
         }
     },
 }
@@ -225,7 +285,7 @@ def loadCanonicalFileModRec(
     else if (listContainsStr(loadingStack, canonicalKey)) {
         Err("Circular module dependency involving '" + canonicalKey + "'")
     } else {
-        let src = readFile(fpath)?;
+        let src = overlayReadFile(fpath)?;
         let fid = diagRegisterFile(fpath, src);
         let keySegs = if (canonicalKey == "") Nil else strSplitChar(canonicalKey, '.');
         let fm = parseFileModuleInFile(src, keySegs, fid)?;

@@ -39,7 +39,10 @@ use diag.{
     diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError
 }
 use parser.parseFileModuleInFile
-use loader.{PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed}
+use loader.{
+    PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed,
+    loaderSetOverlay, loaderRemoveOverlay
+}
 use infer.{InferOutput, inferProgram, preludePrimSpecs}
 use core.lowerToCore
 use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
@@ -307,17 +310,29 @@ def percentEncodePath(s: String): String = {
 def isAsciiLetter(c: Int): Bool =
     (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
 
+def stripWinLeadingSlash(dec: String): String =
+    if (strLen(dec) >= 3 && strByteAt(dec, 0) == 47 && isAsciiLetter(strByteAt(dec, 1)) && strByteAt(dec, 2) == 58) {
+        strSlice(dec, 1, strLen(dec))
+    } else dec
+
 def uriToPath(uri: String): String =
     if (strStartsWith(uri, "file://")) {
-        let dec = percentDecode(strSlice(uri, 7, strLen(uri)));
-        // Windows `file:///C:/...` -> `C:/...`
-        if (strLen(dec) >= 3 && strByteAt(dec, 0) == 47 && isAsciiLetter(strByteAt(dec, 1)) && strByteAt(dec, 2) == 58) {
-            strSlice(dec, 1, strLen(dec))
-        } else dec
+        let rest = strSlice(uri, 7, strLen(uri));
+        if (strStartsWith(rest, "/")) {
+            // Local file URI: `file:///Users/...` or `file:///C:/...`
+            stripWinLeadingSlash(percentDecode(rest))
+        } else if (strStartsWith(rest, "localhost/")) {
+            let localPart = strSlice(rest, 9, strLen(rest));
+            stripWinLeadingSlash(percentDecode(localPart))
+        } else {
+            // UNC authority URI: `file://server/share/...` -> `//server/share/...`
+            "//" + percentDecode(rest)
+        }
     } else uri
 
 def pathToUri(path: String): String =
     if (strStartsWith(path, "file://")) path
+    else if (strStartsWith(path, "//")) "file://" + percentEncodePath(strSlice(path, 2, strLen(path)))
     else if (strStartsWith(path, "/")) "file://" + percentEncodePath(path)
     else "file:///" + percentEncodePath(path)
 
@@ -439,22 +454,52 @@ data DocState {
         dsInfer: Option InferOutput,
         dsFiles: Vec SourceFile,
         dsFileId: Int,
+        dsDiagTargetUri: Option String,
     },
 }
 
 data ServerState {
     MkServerState {
         ssDocs: StrMap DocState,
+        ssOpenUris: Cell (List String),
         ssShuttingDown: Cell Bool,
         ssRootDir: Cell (Option String),
     },
+}
+
+def trackOpenUri(ss: ServerState, uri: String): Void = {
+    let cur = cellGet(ss.ssOpenUris);
+    let found = cellNew(false);
+    let it = cellNew(cur);
+    while (match cellGet(it) { Nil -> false, _ -> !cellGet(found) }) {
+        match cellGet(it) {
+            Cons(u, r) -> { if (u == uri) cellSet(found, true) else (); cellSet(it, r) },
+            Nil -> (),
+        }
+    };
+    if (!cellGet(found)) cellSet(ss.ssOpenUris, Cons(uri, cur)) else ()
+}
+
+def untrackOpenUri(ss: ServerState, uri: String): Void = {
+    let accRev = cellNew(Nil);
+    let it = cellNew(cellGet(ss.ssOpenUris));
+    while (match cellGet(it) { Nil -> false, _ -> true }) {
+        match cellGet(it) {
+            Cons(u, r) -> {
+                if (u != uri) cellSet(accRev, Cons(u, cellGet(accRev))) else ();
+                cellSet(it, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(ss.ssOpenUris, listRev(cellGet(accRev)))
 }
 
 def resolveDocPkgSpecs(filePath: String): (PkgSpec, List PkgSpec) = {
     let dir = pathDirname(filePath);
     let searchDir = if (strLen(dir) == 0) "." else dir;
     match findProjectRoot(searchDir) {
-        Some(projDir) -> match resolveProjectGraph(projDir, false, None, true) {
+        Some(projDir) -> match resolveProjectGraph(projDir, false, None, false) {
             Ok((rootMf, rootSpec, resolvedPkgs)) -> {
                 let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
                 let roots = listAppend(rootSpec.srcRoots, [searchDir]);
@@ -493,38 +538,55 @@ def getSourceFileFromVec(files: Vec SourceFile, fileId: Int): Option SourceFile 
     if (fileId <= 0 || fileId > vecLen(files)) None
     else Some(vecGetOr(files, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
 
-def buildDiagFromError(docPath: String, docText: String, errMsg: String, files: Vec SourceFile): Value =
+def buildDiagWithTarget(docUri: String, docPath: String, docText: String, errMsg: String, files: Vec SourceFile): (String, Value) =
     match diagLastError() {
         Some(rec) -> {
             let fullMsg = match rec.drHint {
                 Some(h) -> rec.drMsg + "\nhint: " + h,
                 None -> rec.drMsg,
             };
-            let rangeVal = match getSourceFileFromVec(files, rec.drFileId) {
+            match getSourceFileFromVec(files, rec.drFileId) {
                 Some(sf) if (sf.sfPath == docPath) ->
-                    makeLspRange(docText, rec.drStart, rec.drEnd),
-                _ -> makeLspRange(docText, 0, 1),
-            };
-            let displayMsg = match getSourceFileFromVec(files, rec.drFileId) {
-                Some(sf) if (sf.sfPath != docPath && strLen(sf.sfPath) > 0) ->
-                    sf.sfPath + ": " + fullMsg,
-                _ -> fullMsg,
-            };
-            VObj([
-                ("range", rangeVal),
-                ("severity", VInt(intToI64(1))),
-                ("code", VStr(rec.drKind)),
-                ("source", VStr("geisha")),
-                ("message", VStr(displayMsg)),
-            ])
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, rec.drStart, rec.drEnd)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+                Some(sf) if (strLen(sf.sfPath) > 0 && (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath))) ->
+                    (pathToUri(sf.sfPath), VObj([
+                        ("range", makeLspRange(sf.sfContent, rec.drStart, rec.drEnd)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+                Some(sf) if (strLen(sf.sfPath) > 0) ->
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, 0, 1)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(sf.sfPath + ": " + fullMsg)),
+                    ])),
+                _ ->
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, 0, 1)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+            }
         },
         None ->
-            VObj([
+            (docUri, VObj([
                 ("range", makeLspRange(docText, 0, 1)),
                 ("severity", VInt(intToI64(1))),
                 ("source", VStr("geisha")),
                 ("message", VStr(errMsg)),
-            ]),
+            ])),
     }
 
 def runFrontendCheck(path: String, text: String, rootSpec: PkgSpec, extSpecs: List PkgSpec): Result InferOutput String = {
@@ -534,7 +596,27 @@ def runFrontendCheck(path: String, text: String, rootSpec: PkgSpec, extSpecs: Li
     Ok(inf)
 }
 
-def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int): Void = {
+def clearStaleForeignDiag(prevDocOpt: Option DocState, currentUri: String, newTargetUri: Option String): Void =
+    match prevDocOpt {
+        Some(prev) -> match prev.dsDiagTargetUri {
+            Some(oldTarget) if (oldTarget != currentUri) -> {
+                let stillSame = match newTargetUri {
+                    Some(nt) -> nt == oldTarget,
+                    None -> false,
+                };
+                if (!stillSame) {
+                    sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                        ("uri", VStr(oldTarget)),
+                        ("diagnostics", VArr(Nil)),
+                    ]))
+                } else ()
+            },
+            _ -> (),
+        },
+        None -> (),
+    }
+
+def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): Void = {
     let path = uriToPath(uri);
     let prevDocOpt = strMapGet(ss.ssDocs, uri);
 
@@ -549,7 +631,7 @@ def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int):
         },
     };
 
-    // Full frontend analysis: load + infer + core lowering (Send/exhaustiveness/etc.)
+    // Full frontend analysis: load (with in-memory overlays) + infer + core lowering
     diagReset();
     let (rootSpec, extSpecs) = resolveDocPkgSpecs(path);
     let checkRes = runFrontendCheck(path, text, rootSpec, extSpecs);
@@ -557,6 +639,7 @@ def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int):
 
     match checkRes {
         Ok(inf) -> {
+            clearStaleForeignDiag(prevDocOpt, uri, None);
             let st = MkDocState {
                 dsUri: uri,
                 dsPath: path,
@@ -566,6 +649,7 @@ def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int):
                 dsInfer: Some(inf),
                 dsFiles: filesSnap,
                 dsFileId: 1,
+                dsDiagTargetUri: None,
             };
             strMapInsert(ss.ssDocs, uri, st);
             sendRpcNotification("textDocument/publishDiagnostics", VObj([
@@ -574,7 +658,9 @@ def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int):
             ]))
         },
         Err(errMsg) -> {
-            let diagObj = buildDiagFromError(path, text, errMsg, filesSnap);
+            let (targetUri, diagObj) = buildDiagWithTarget(uri, path, text, errMsg, filesSnap);
+            let foreignOpt = if (targetUri != uri) Some(targetUri) else None;
+            clearStaleForeignDiag(prevDocOpt, uri, foreignOpt);
             let keepInf = match prevDocOpt {
                 Some(prev) -> prev.dsInfer,
                 None -> None,
@@ -592,14 +678,47 @@ def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int):
                 dsInfer: keepInf,
                 dsFiles: keepFiles,
                 dsFileId: 1,
+                dsDiagTargetUri: foreignOpt,
             };
             strMapInsert(ss.ssDocs, uri, st);
+            if (targetUri != uri) {
+                sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                    ("uri", VStr(uri)),
+                    ("diagnostics", VArr(Nil)),
+                ]))
+            } else ();
             sendRpcNotification("textDocument/publishDiagnostics", VObj([
-                ("uri", VStr(uri)),
+                ("uri", VStr(targetUri)),
                 ("diagnostics", VArr([diagObj])),
             ]))
         },
     }
+}
+
+def refreshOtherOpenDocs(ss: ServerState, skipUri: String): Void = {
+    let cur = cellNew(cellGet(ss.ssOpenUris));
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(otherUri, r) -> {
+                if (otherUri != skipUri) {
+                    match strMapGet(ss.ssDocs, otherUri) {
+                        Some(doc) -> analyzeSingleDoc(ss, doc.dsUri, doc.dsText, doc.dsVersion),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int): Void = {
+    let path = uriToPath(uri);
+    loaderSetOverlay(path, text);
+    trackOpenUri(ss, uri);
+    analyzeSingleDoc(ss, uri, text, version);
+    refreshOtherOpenDocs(ss, uri)
 }
 
 // ============================================================================
@@ -1939,11 +2058,16 @@ def handleDidClose(ss: ServerState, params: Value): Void =
     match objGet(params, "textDocument") {
         Some(td) -> match objGetStr(td, "uri") {
             Some(uri) -> {
+                let prevOpt = strMapGet(ss.ssDocs, uri);
+                clearStaleForeignDiag(prevOpt, uri, None);
+                loaderRemoveOverlay(uriToPath(uri));
+                untrackOpenUri(ss, uri);
                 let _ = strMapRemove(ss.ssDocs, uri);
                 sendRpcNotification("textDocument/publishDiagnostics", VObj([
                     ("uri", VStr(uri)),
                     ("diagnostics", VArr(Nil)),
-                ]))
+                ]));
+                refreshOtherOpenDocs(ss, uri)
             },
             None -> (),
         },
@@ -1978,6 +2102,7 @@ pub def cmdLsp(args: List String): Result Int String = {
     validateLspArgs(args)?;
     let ss = MkServerState {
         ssDocs: strMapNew(),
+        ssOpenUris: cellNew(Nil),
         ssShuttingDown: cellNew(false),
         ssRootDir: cellNew(None),
     };
