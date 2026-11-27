@@ -15,6 +15,7 @@ geisha build -g
 geisha -g -e -o main.ll main.gsa
 
 # Override optimization level (default is -O0 when -g is set, -O2 otherwise)
+# Accepts -O0..-O3, -Os, -Oz, --opt[=]<0|1|2|3|s|z>, --dev (-O0), --release (-O2)
 geisha -g -O2 -o app main.gsa
 ```
 

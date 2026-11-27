@@ -65,7 +65,7 @@ data CliOpts {
         optSubArgs: List String,
         optEmitIr: Bool,
         optDebug: Bool,
-        optOptLevel: Option Int,
+        optLevel: Option String,
         optDumpCore: Option String,
         optCompileOnly: Bool,
         optTarget: String,
@@ -125,13 +125,17 @@ def parseDepFlagSpec(spec: String): Result (String, String, String) String =
         _ -> Err("invalid '--dep' argument '" + spec + "' (expected '[from:]<alias>=<pkg_id>')"),
     }
 
+def normalizeOptLevel(raw: String): Option String =
+    if (raw == "0" || raw == "1" || raw == "2" || raw == "3" || raw == "s" || raw == "z") Some(raw)
+    else None
+
 def parseCliArgs(): Result CliOpts String = {
     let argc = argCount();
     if (argc >= 2 && isSubcommandWord(argAt(1))) {
         let sub = argAt(1);
         let emitIr = cellNew(false);
         let debugInfo = cellNew(false);
-        let optLevel: Cell (Option Int) = cellNew(None);
+        let optLevel: Cell (Option String) = cellNew(None);
         let dumpCore: Cell (Option String) = cellNew(None);
         let compOnly = cellNew(false);
         let targetCell = cellNew("native");
@@ -212,18 +216,30 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "-g" || a == "--debug") {
                 cellSet(debugInfo, true);
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O0") {
-                cellSet(optLevel, Some(0));
+            } else if (a == "--dev") {
+                cellSet(optLevel, Some("0"));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O1") {
-                cellSet(optLevel, Some(1));
+            } else if (a == "--release") {
+                cellSet(optLevel, Some("2"));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O2") {
-                cellSet(optLevel, Some(2));
+            } else if (a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz") {
+                cellSet(optLevel, Some(strSlice(a, 2, strLen(a))));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O3") {
-                cellSet(optLevel, Some(3));
-                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--opt") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing level after '--opt' (expected 0|1|2|3|s|z)"))
+                else {
+                    let lvl = argAt(cellGet(i) + 1);
+                    match normalizeOptLevel(lvl) {
+                        Some(norm) -> { cellSet(optLevel, Some(norm)); cellSet(i, cellGet(i) + 2) },
+                        None -> cellSet(errOpt, Some("Invalid optimization level '" + lvl + "' (expected 0|1|2|3|s|z)")),
+                    }
+                }
+            } else if (strStartsWith(a, "--opt=")) {
+                let lvl = strSlice(a, 6, strLen(a));
+                match normalizeOptLevel(lvl) {
+                    Some(norm) -> { cellSet(optLevel, Some(norm)); cellSet(i, cellGet(i) + 1) },
+                    None -> cellSet(errOpt, Some("Invalid optimization level '" + lvl + "' (expected 0|1|2|3|s|z)")),
+                }
             } else if (a == "-c" || a == "--compile-only") {
                 cellSet(compOnly, true);
                 cellSet(i, cellGet(i) + 1)
@@ -295,7 +311,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optSubArgs: listRev(cellGet(restArgsRev)),
                 optEmitIr: cellGet(emitIr),
                 optDebug: cellGet(debugInfo),
-                optOptLevel: cellGet(optLevel),
+                optLevel: cellGet(optLevel),
                 optDumpCore: cellGet(dumpCore),
                 optCompileOnly: cellGet(compOnly),
                 optTarget: cellGet(targetCell),
@@ -316,7 +332,7 @@ def parseCliArgs(): Result CliOpts String = {
     } else {
         let emitIr = cellNew(false);
         let debugInfo = cellNew(false);
-        let optLevel: Cell (Option Int) = cellNew(None);
+        let optLevel: Cell (Option String) = cellNew(None);
         let dumpCore: Cell (Option String) = cellNew(None);
         let compOnly = cellNew(false);
         let targetCell = cellNew("native");
@@ -345,18 +361,30 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "-g" || a == "--debug") {
                 cellSet(debugInfo, true);
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O0") {
-                cellSet(optLevel, Some(0));
+            } else if (a == "--dev") {
+                cellSet(optLevel, Some("0"));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O1") {
-                cellSet(optLevel, Some(1));
+            } else if (a == "--release") {
+                cellSet(optLevel, Some("2"));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O2") {
-                cellSet(optLevel, Some(2));
+            } else if (a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz") {
+                cellSet(optLevel, Some(strSlice(a, 2, strLen(a))));
                 cellSet(i, cellGet(i) + 1)
-            } else if (a == "-O3") {
-                cellSet(optLevel, Some(3));
-                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--opt") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing level after '--opt' (expected 0|1|2|3|s|z)"))
+                else {
+                    let lvl = argAt(cellGet(i) + 1);
+                    match normalizeOptLevel(lvl) {
+                        Some(norm) -> { cellSet(optLevel, Some(norm)); cellSet(i, cellGet(i) + 2) },
+                        None -> cellSet(errOpt, Some("Invalid optimization level '" + lvl + "' (expected 0|1|2|3|s|z)")),
+                    }
+                }
+            } else if (strStartsWith(a, "--opt=")) {
+                let lvl = strSlice(a, 6, strLen(a));
+                match normalizeOptLevel(lvl) {
+                    Some(norm) -> { cellSet(optLevel, Some(norm)); cellSet(i, cellGet(i) + 1) },
+                    None -> cellSet(errOpt, Some("Invalid optimization level '" + lvl + "' (expected 0|1|2|3|s|z)")),
+                }
             } else if (a == "--no-main") {
                 cellSet(noMain, true);
                 cellSet(i, cellGet(i) + 1)
@@ -427,7 +455,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optSubArgs: Nil,
                 optEmitIr: cellGet(emitIr),
                 optDebug: cellGet(debugInfo),
-                optOptLevel: cellGet(optLevel),
+                optLevel: cellGet(optLevel),
                 optDumpCore: cellGet(dumpCore),
                 optCompileOnly: cellGet(compOnly),
                 optTarget: cellGet(targetCell),
@@ -572,8 +600,8 @@ def maybeDumpCoreIr(coreProg: core.CoreProgram, dumpCoreOpt: Option String): Res
         None -> Ok(()),
     }
 
-def resolveOptFlag(debugInfo: Bool, optOverride: Option Int): String = match optOverride {
-    Some(lvl) -> " -O" + intToStr(lvl),
+def resolveOptFlag(debugInfo: Bool, optOverride: Option String): String = match optOverride {
+    Some(lvl) -> " -O" + lvl,
     None -> if (debugInfo) " -O0" else " -O2",
 }
 
@@ -1632,7 +1660,7 @@ def printUsage(): Void = {
     printLn("Compiler Options:");
     printLn("  -e, --emit-llvm                Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
     printLn("  -g, --debug                    Emit DWARF debug info (defaults to -O0, disables TCO, runs dsymutil on macOS)");
-    printLn("  -O0 | -O1 | -O2 | -O3          Set LLVM optimization level (default: -O2, or -O0 with -g)");
+    printLn("  -O<0|1|2|3|s|z>, --opt <lvl>   Set LLVM optimization level (--dev=-O0, --release=-O2; default: -O2, or -O0 with -g)");
     printLn("  --dump-core <file>             Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
     printLn("  --target <target>              native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app");
     printLn("  --export <fn>                  Export function symbol on native or wasm32 (repeatable)");
@@ -1654,7 +1682,7 @@ def runDriver(): Result Int String = {
         printUsage();
         Ok(0)
     } else {
-        let optFlag = resolveOptFlag(opts.optDebug, opts.optOptLevel);
+        let optFlag = resolveOptFlag(opts.optDebug, opts.optLevel);
         let cbs = makeCompileCallbacks(opts.optDebug, optFlag);
         match opts.optSubcmd {
             Some("init") -> { cmdInit(opts.optSubArgs)?; Ok(0) },
@@ -1686,7 +1714,7 @@ def runDriver(): Result Int String = {
             Some("check") -> runCheckSubcmd(opts),
             Some("run") -> match opts.optInput {
                 Some(gsaFile) -> {
-                    let customBuild = opts.optDebug || match opts.optOptLevel { Some(_) -> true, None -> false };
+                    let customBuild = opts.optDebug || match opts.optLevel { Some(_) -> true, None -> false };
                     if (customBuild) runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
                     else runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime)
                 },
