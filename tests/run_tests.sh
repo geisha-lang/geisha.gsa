@@ -4768,4 +4768,66 @@ EOF
     assert_eq "semantics_wasm32" "1" "$T41_WASM_OUT"
 fi
 
+echo "[Test 42] CLI run/eval exit code propagation, decoded sys.proc.shell, parTabulate & GC page coalescing..."
+ABS_GEISHA_42="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_42="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+cat > "$TMP_DIR/t42_exit7.gsa" << 'EOF'
+use sys.proc.{exit, shell}
+use std.str.intToStr
+
+def main(): Void = {
+    let shCode = shell("exit 7");
+    if (shCode != 7) {
+        printLn("bad-shell:" + intToStr(shCode));
+        exit(99)
+    } else {
+        exit(7)
+    }
+}
+EOF
+set +e
+GEISHA_HOME="$TMP_DIR/ghome_exit" GEISHA_RUNTIME="$ABS_RT_42" "$ABS_GEISHA_42" run "$TMP_DIR/t42_exit7.gsa"
+RC_SCRIPT_COLD=$?
+GEISHA_HOME="$TMP_DIR/ghome_exit" GEISHA_RUNTIME="$ABS_RT_42" "$ABS_GEISHA_42" run "$TMP_DIR/t42_exit7.gsa"
+RC_SCRIPT_HOT=$?
+GEISHA_HOME="$TMP_DIR/ghome_exit" GEISHA_RUNTIME="$ABS_RT_42" "$ABS_GEISHA_42" run -g "$TMP_DIR/t42_exit7.gsa"
+RC_SCRIPT_DBG=$?
+GEISHA_HOME="$TMP_DIR/ghome_exit" GEISHA_RUNTIME="$ABS_RT_42" "$ABS_GEISHA_42" eval 'use sys.proc.exit; exit(7)'
+RC_EVAL_7=$?
+mkdir -p "$TMP_DIR/proj_exit7/src"
+cat > "$TMP_DIR/proj_exit7/geisha.toml" << 'EOF'
+name = "proj_exit7"
+version = "0.1.0"
+EOF
+cp "$TMP_DIR/t42_exit7.gsa" "$TMP_DIR/proj_exit7/src/main.gsa"
+(cd "$TMP_DIR/proj_exit7" && GEISHA_HOME="$TMP_DIR/ghome_exit" GEISHA_RUNTIME="$ABS_RT_42" "$ABS_GEISHA_42" run)
+RC_PROJ_7=$?
+set -e
+assert_eq "cli_exit_codes_and_shell_decoded" "7|7|7|7|7" "$RC_SCRIPT_COLD|$RC_SCRIPT_HOT|$RC_SCRIPT_DBG|$RC_EVAL_7|$RC_PROJ_7"
+
+cat > "$TMP_DIR/t42_rt_perf.gsa" << 'EOF'
+use std.str.intToStr
+
+def main(): Void = {
+    // Exercise small parTabulate fast path (n < 64) + GC slab page coalesced release
+    let sum = cellNew(0);
+    let r = cellNew(0);
+    while (cellGet(r) < 500) {
+        let arr = parTabulate(8, (i) -> i + 1);
+        cellSet(sum, cellGet(sum) + immArrayGet(arr, 7));
+        let k = cellNew(0);
+        while (cellGet(k) < 64) {
+            let tmp = arrayNew(256, cellGet(k));
+            cellSet(sum, cellGet(sum) + arrayGet(tmp, 0) - cellGet(k));
+            cellSet(k, cellGet(k) + 1)
+        };
+        cellSet(r, cellGet(r) + 1)
+    };
+    gcTrim();
+    printLn(intToStr(cellGet(sum)))
+}
+EOF
+"$ABS_GEISHA_42" --runtime "$ABS_RT_42" -o "$TMP_DIR/t42_rt_perf" "$TMP_DIR/t42_rt_perf.gsa"
+assert_eq "par_tabulate_small_and_gc_coalesce" "4000" "$("$TMP_DIR/t42_rt_perf")"
+
 echo "All $PASS end-to-end test suites passed!"

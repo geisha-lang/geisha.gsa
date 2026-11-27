@@ -15,7 +15,7 @@ use std.path.{pathStem, pathJoin, pathDirname, pathBasename}
 use sys.env.{argCount, argAt, getEnv}
 use sys.fs.{readFile, writeFile, removeFile, removeDirAll, fileExists, mkdirAll}
 use sys.io.eprintLn
-use sys.proc.{ExitStatus, Exited, exit, shell, command, cmdEnv, spawn as procSpawn, childWait}
+use sys.proc.{ExitStatus, Exited, Signaled, exit, shell, command, cmdEnv, spawn as procSpawn, childWait}
 use ast.{addUniqueStr, sortUniqueStrings}
 use loader.{
     PkgSpec, MkPkgSpec,
@@ -657,7 +657,8 @@ def runHostProc(program: String, args: List String, envVars: List (String, Strin
         Err(_) -> 1,
         Ok(child) -> match childWait(child) {
             Ok(Exited(code)) -> code,
-            _ -> 1,
+            Ok(Signaled(sig)) -> 128 + sig,
+            Err(_) -> 1,
         },
     }
 }

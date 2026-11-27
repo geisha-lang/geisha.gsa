@@ -166,7 +166,7 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `sys.io` — stdout/stderr/stdin (`eprintLn`, ...)
 - `sys.fs` — files, directories, atomic writes, permissions/mtime, and zero-copy `Mmap` (`readFile`, `writeFile`, `writeFileAtomic`, `writeFileAtomicMode`, `renameFile`, `chmod`, `fileMtimeMs`, `fileExists`, `isDir`, `mkdirAll`, `readDir`, `removeFile`, `removeDir`, `removeDirAll`, `withMmap`)
 - `sys.env` — CLI args and env vars (`argCount`, `argAt`, `getEnv`)
-- `sys.proc` — structured subprocesses, pipes, timeouts, signals, and shell execution (`Command`, `command`, `spawn`, `run`, `runTimeout`, `childSignal`, `Pipe`, `exit`, `shell`)
+- `sys.proc` — structured subprocesses, pipes, timeouts, signals, and decoded-exit-code shell execution (`Command`, `command`, `spawn`, `run`, `runTimeout`, `childSignal`, `Pipe`, `exit`, `shell`)
 - `sys.time` — monotonic/wall clock and sleep
 - `sys.net` — TCP/UDP networking sockets
 - `sys.ffi` — dynamic library loading (`dlOpen`, `dlOpenSelf`, `dlSym`, `dlClose`, `ptrToStrOpt`)

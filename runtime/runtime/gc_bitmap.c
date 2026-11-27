@@ -2203,21 +2203,41 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     }
 
     for (gc_chunk_t *ch = _chunks_head; ch != NULL; ch = ch->next) {
+        uintptr_t rel_base = 0;
+        size_t rel_bytes = 0;
         for (size_t i = ch->first_data_page; i < GC_PAGES_PER_CHUNK; i++) {
             gc_page_t *p = &ch->pages[i];
-            if (p->state != GC_PAGE_INUSE) continue;
+            if (p->state != GC_PAGE_INUSE) {
+                if (rel_bytes > 0) {
+                    release_page_memory((void *)rel_base, rel_bytes);
+                    rel_bytes = 0;
+                }
+                continue;
+            }
 
             if (p->live_count == 0) {
-                /* Entire 16 KB page is dead: return physical RAM to OS immediately! */
+                /* Entire 16 KB page is dead: coalesce contiguous pages to return RAM to OS in bulk */
                 p->state = GC_PAGE_FREE;
                 p->free_list = NULL;
                 p->bump_idx = 0;
                 memset(p->alloc_bits, 0, sizeof(p->alloc_bits));
                 memset(p->mark_bits, 0, sizeof(p->mark_bits));
-                release_page_memory((void *)p->base, GC_PAGE_SIZE);
+                if (rel_bytes > 0 && rel_base + rel_bytes == p->base) {
+                    rel_bytes += GC_PAGE_SIZE;
+                } else {
+                    if (rel_bytes > 0) {
+                        release_page_memory((void *)rel_base, rel_bytes);
+                    }
+                    rel_base = p->base;
+                    rel_bytes = GC_PAGE_SIZE;
+                }
                 page_list_push(&_free_pages, p, PAGE_LIST_FREE);
                 _free_page_count++;
             } else {
+                if (rel_bytes > 0) {
+                    release_page_memory((void *)rel_base, rel_bytes);
+                    rel_bytes = 0;
+                }
                 total_live_bytes += (size_t)p->live_count * p->slot_size;
                 if (p->live_count < p->num_slots) {
                     page_list_push(&_unswept_pages[p->size_class], p, PAGE_LIST_UNSWEPT);
@@ -2225,6 +2245,9 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                     page_list_push(&_full_pages[p->size_class], p, PAGE_LIST_FULL);
                 }
             }
+        }
+        if (rel_bytes > 0) {
+            release_page_memory((void *)rel_base, rel_bytes);
         }
     }
 
@@ -2259,9 +2282,11 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                     n->owned = false;
                 }
                 if (is_major && !n->owned) {
-                    /* Release dead 16 KB pages inside retired nurseries back to OS (MADV_FREE_REUSABLE) */
+                    /* Release dead 16 KB pages inside retired nurseries back to OS (coalesced) */
                     size_t pages = GC_NURSERY_SIZE / GC_PAGE_SIZE;
                     size_t words_per_page = (GC_PAGE_SIZE >> 3) >> 6; /* 32 uint64_t words per 16 KB page */
+                    uintptr_t nrel_base = 0;
+                    size_t nrel_bytes = 0;
                     for (size_t pg = 0; pg < pages; pg++) {
                         size_t base_w = pg * words_per_page;
                         uint64_t any_live = 0;
@@ -2271,10 +2296,25 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                             any_alloc |= n->alloc_bits[base_w + w];
                         }
                         bool prev_tail_live = (pg > 0) && (n->mark_bits[base_w - 1u] != 0);
+                        uintptr_t pg_addr = n->base + pg * GC_PAGE_SIZE;
                         if (any_live == 0 && any_alloc != 0 && !prev_tail_live) {
                             memset(&n->alloc_bits[base_w], 0, words_per_page * sizeof(uint64_t));
-                            release_page_memory((void *)(n->base + pg * GC_PAGE_SIZE), GC_PAGE_SIZE);
+                            if (nrel_bytes > 0 && nrel_base + nrel_bytes == pg_addr) {
+                                nrel_bytes += GC_PAGE_SIZE;
+                            } else {
+                                if (nrel_bytes > 0) {
+                                    release_page_memory((void *)nrel_base, nrel_bytes);
+                                }
+                                nrel_base = pg_addr;
+                                nrel_bytes = GC_PAGE_SIZE;
+                            }
+                        } else if (nrel_bytes > 0) {
+                            release_page_memory((void *)nrel_base, nrel_bytes);
+                            nrel_bytes = 0;
                         }
+                    }
+                    if (nrel_bytes > 0) {
+                        release_page_memory((void *)nrel_base, nrel_bytes);
                     }
                 }
             }

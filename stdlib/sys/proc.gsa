@@ -10,7 +10,7 @@ use std.generic
 use sys.time.monotonicMs
 
 extern "exit" def c_exit(code: Int): Void
-extern "system" def c_system(cmd: String): Int
+extern "gs_sys_shell" def c_shell(cmd: String): Int
 extern "gs_proc_spawn" def c_proc_spawn(
     program: String,
     argBlob: String,
@@ -92,8 +92,9 @@ pub data Output : Eq {
 /// Terminate the current process immediately with exit status `code`.
 pub def exit(code: Int): Void = c_exit(code)
 
-/// Execute a command line through the host shell (`/bin/sh -c`).
-pub def shell(cmd: String): Int = c_system(cmd)
+/// Execute a command line through the host shell (`/bin/sh -c` on POSIX, `cmd.exe` on Windows),
+/// returning the decoded exit status (`0..255`, `128 + signal`, or `-1` on launch error).
+pub def shell(cmd: String): Int = c_shell(cmd)
 
 /// Construct a `Command` for `program` and `args` (inheriting cwd, env, and stdio by default).
 pub def command(program: String, args: List String): Command = Command {

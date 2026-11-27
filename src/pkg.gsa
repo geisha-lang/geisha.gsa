@@ -22,7 +22,7 @@ use std.toml.{parse as tomlParse, stringify as tomlStringify}
 use sys.env.{getEnv}
 use sys.fs.{fileExists, isDir, mkdirAll, readDir, readFile, writeFile, removeFile, renameFile, removeDirAll}
 use sys.io.eprintLn
-use sys.proc.{ExitStatus, Exited, command, cmdCwd, cmdEnv, run as procRun, spawn as procSpawn, childWait}
+use sys.proc.{ExitStatus, Exited, Signaled, command, cmdCwd, cmdEnv, run as procRun, spawn as procSpawn, childWait}
 use ast.{sortUniqueStrings, listContainsStr, addUniqueStr}
 use loader.{PkgSpec, MkPkgSpec}
 
@@ -291,7 +291,8 @@ def runCmdStatus(program: String, args: List String, cwdOpt: Option String): Int
         Err(_) -> 1,
         Ok(child) -> match childWait(child) {
             Ok(Exited(code)) -> code,
-            _ -> 1,
+            Ok(Signaled(sig)) -> 128 + sig,
+            Err(_) -> 1,
         },
     }
 }
@@ -2849,7 +2850,7 @@ pub def cmdRun(
         Some(_) -> { let _ = removeFile(binPath); () },
         None -> (),
     };
-    Ok(if (rc == 0) 0 else 1)
+    Ok(rc)
 }
 
 def discoverTestFiles(projectDir: String, mf: Manifest): Result (List String) String =
