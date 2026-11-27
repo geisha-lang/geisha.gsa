@@ -54,6 +54,60 @@ pub data Parser {
 def eofToken(): Token =
     MkToken { kind: TkEof, span: emptySpan(), hadNewline: true }
 
+def hexDigitVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def isRadixIntRaw(raw: String): Bool =
+    if (strLen(raw) >= 3 && strByteAt(raw, 0) == 48) {
+        let b1 = strByteAt(raw, 1);
+        b1 == 120 || b1 == 111 || b1 == 98
+    } else false
+
+def parseRadixLitInt(raw: String, neg: Bool, sp: Span): Result Int String = {
+    let b1 = strByteAt(raw, 1);
+    let radix = if (b1 == 120) 16 else if (b1 == 111) 8 else 2;
+    let rad64 = intToI64(radix);
+    let maxU32 = (intToI64(65535) << 16) | intToI64(65535);
+    let maxNegMag = intToI64(1) << 31;
+    let limit = if (neg) maxNegMag else maxU32;
+    let n = strLen(raw);
+    let acc = cellNew(intToI64(0));
+    let i = cellNew(2);
+    let overflow = cellNew(false);
+    while (cellGet(i) < n && !cellGet(overflow)) {
+        let dv = hexDigitVal(strByteAt(raw, cellGet(i)));
+        let next = cellGet(acc) * rad64 + intToI64(dv);
+        if (dv < 0 || dv >= radix || next > limit) {
+            cellSet(overflow, true)
+        } else {
+            cellSet(acc, next);
+            cellSet(i, cellGet(i) + 1)
+        }
+    };
+    if (cellGet(overflow)) {
+        let disp = if (neg) "-" + raw else raw;
+        Err(formatSpanDiag("Parse error", sp, "integer literal '" + disp + "' out of 32-bit Int range"))
+    } else {
+        let v64 = cellGet(acc);
+        if (neg) Ok(i64ToInt(intToI64(0) - v64))
+        else Ok(i64ToInt(v64))
+    }
+}
+
+def parseStrictIntTok(raw: String, neg: Bool, sp: Span): Result Int String =
+    if (isRadixIntRaw(raw)) {
+        parseRadixLitInt(raw, neg, sp)
+    } else {
+        let s = if (neg) "-" + raw else raw;
+        match parseInt(s) {
+            Ok(n) -> Ok(n),
+            Err(_) -> Err(formatSpanDiag("Parse error", sp, "integer literal '" + s + "' out of 32-bit Int range")),
+        }
+    }
+
 def newParser(toks: Vec Token): Parser =
     MkParser {
         tokens: toks,
@@ -718,8 +772,8 @@ pub def parsePattern(p: Parser): Result Pattern String = match peekTok(p).kind {
     TkChar(c) -> { let _ = bumpTok(p); Ok(PatLit(LitChar(c))) },
     TkStr(s) -> { let _ = bumpTok(p); Ok(PatLit(LitStr(s))) },
     TkInt(raw) -> {
-        let _ = bumpTok(p);
-        let n = parseInt(raw)?;
+        let tok = bumpTok(p);
+        let n = parseStrictIntTok(raw, false, tok.span)?;
         Ok(PatLit(LitInt(n)))
     },
     TkFloat(raw) -> {
@@ -729,11 +783,11 @@ pub def parsePattern(p: Parser): Result Pattern String = match peekTok(p).kind {
     },
     TkSym(sym) ->
         if (sym == "-") {
-            let _ = bumpTok(p);
+            let negSp = bumpTok(p).span;
             match peekTok(p).kind {
                 TkInt(raw) -> {
-                    let _ = bumpTok(p);
-                    let n = parseInt("-" + raw)?;
+                    let intSp = bumpTok(p).span;
+                    let n = parseStrictIntTok(raw, true, unionSpan(negSp, intSp))?;
                     Ok(PatLit(LitInt(n)))
                 },
                 TkFloat(raw) -> {
@@ -1120,12 +1174,17 @@ def parseAtomExpr(p: Parser): Result Form String = {
         },
         TkInt(raw) -> {
             let _ = bumpTok(p);
-            match parseInt(raw) {
-                Ok(n) -> Ok(mkForm(t.span, ExLit(LitInt(n)))),
-                Err(_) -> {
-                    let f = parseFloat(raw)?;
-                    Ok(mkForm(t.span, ExLit(LitFloat(f))))
-                },
+            if (isRadixIntRaw(raw)) {
+                let n = parseRadixLitInt(raw, false, t.span)?;
+                Ok(mkForm(t.span, ExLit(LitInt(n))))
+            } else {
+                match parseInt(raw) {
+                    Ok(n) -> Ok(mkForm(t.span, ExLit(LitInt(n)))),
+                    Err(_) -> {
+                        let f = parseFloat(raw)?;
+                        Ok(mkForm(t.span, ExLit(LitFloat(f))))
+                    },
+                }
             }
         },
         TkFloat(raw) -> {
@@ -1263,12 +1322,17 @@ def parseUnaryExpr(p: Parser): Result Form String = {
                         if (!nextT.hadNewline && nextT.span.start == t.span.start + 1) {
                             let _ = bumpTok(p);
                             let fullSp = unionSpan(t.span, nextT.span);
-                            match parseInt("-" + raw) {
-                                Ok(n) -> Ok(mkForm(fullSp, ExLit(LitInt(n)))),
-                                Err(_) -> {
-                                    let f = parseFloat("-" + raw)?;
-                                    Ok(mkForm(fullSp, ExLit(LitFloat(f))))
-                                },
+                            if (isRadixIntRaw(raw)) {
+                                let n = parseRadixLitInt(raw, true, fullSp)?;
+                                Ok(mkForm(fullSp, ExLit(LitInt(n))))
+                            } else {
+                                match parseInt("-" + raw) {
+                                    Ok(n) -> Ok(mkForm(fullSp, ExLit(LitInt(n)))),
+                                    Err(_) -> {
+                                        let f = parseFloat("-" + raw)?;
+                                        Ok(mkForm(fullSp, ExLit(LitFloat(f))))
+                                    },
+                                }
                             }
                         } else {
                             let operand = parseUnaryExpr(p)?;
@@ -1663,8 +1727,8 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                     let _ = bumpTok(p);
                                     let pv = match peekTok(p).kind {
                                         TkInt(ns) -> {
-                                            let _ = bumpTok(p);
-                                            match parseInt(ns) {
+                                            let itok = bumpTok(p);
+                                            match parseStrictIntTok(ns, false, itok.span) {
                                                 Ok(v) -> Ok(v),
                                                 Err(_) -> Err(parseErr(p, "Invalid integer priority in 'extern init(...)'")),
                                             }

@@ -19,6 +19,10 @@ extern "gs_sys_dir_close" def c_dir_close(dir: Ptr): Int
 extern "gs_sys_file_size" def c_file_size(path: String): Int64
 extern "gs_sys_mmap_open" def c_mmap_open(path: String): Ptr
 extern "gs_sys_mmap_close" def c_mmap_close(ptr: Ptr, len: Int64): Int
+extern "gs_sys_write_atomic" def c_write_atomic(path: String, buf: String, len: Int64, mode: Int): Int
+extern "gs_sys_rename" def c_rename(src: String, dst: String): Int
+extern "gs_sys_chmod" def c_chmod(path: String, mode: Int): Int
+extern "gs_sys_file_mtime_ms" def c_file_mtime_ms(path: String): Int64
 
 pub def fileExists(path: String): Bool =
     c_access(path, 0) == 0
@@ -123,6 +127,37 @@ pub def writeFile(path: String, content: String): Result Void String = {
 
 pub def removeFile(path: String): Bool =
     c_remove(path) == 0
+
+/// Atomically write `content` to `path` via a same-directory temporary file (`fsync` + `rename`).
+/// Preserves existing permissions when `path` already exists, or creates with `0o666 & ~umask`.
+pub def writeFileAtomic(path: String, content: String): Result Void String =
+    if (c_write_atomic(path, content, intToI64(strLen(content)), -1) == 0) Ok(())
+    else Err("failed to atomically write file: " + path)
+
+/// Atomically write `content` to `path` with explicit POSIX permissions (e.g. `0o600`),
+/// applied via `fchmod` before `rename` so the file is never exposed with wider permissions.
+pub def writeFileAtomicMode(path: String, content: String, mode: Int): Result Void String =
+    if (mode < 0) Err("invalid negative file mode for: " + path)
+    else if (c_write_atomic(path, content, intToI64(strLen(content)), mode) == 0) Ok(())
+    else Err("failed to atomically write file with mode: " + path)
+
+/// Atomically rename or move a filesystem entry from `src` to `dst`.
+pub def renameFile(src: String, dst: String): Result Void String =
+    if (c_rename(src, dst) == 0) Ok(())
+    else Err("failed to rename '" + src + "' to '" + dst + "'")
+
+/// Set POSIX permission bits on `path` (e.g. `chmod(path, 0o755)`).
+pub def chmod(path: String, mode: Int): Result Void String =
+    if (mode < 0) Err("invalid negative file mode for: " + path)
+    else if (c_chmod(path, mode) == 0) Ok(())
+    else Err("failed to chmod file: " + path)
+
+/// Return the last-modification timestamp of `path` in milliseconds since the Unix epoch.
+pub def fileMtimeMs(path: String): Result Int64 String = {
+    let ts = c_file_mtime_ms(path);
+    if (ts < intToI64(0)) Err("failed to stat mtime for: " + path)
+    else Ok(ts)
+}
 
 // ---- Zero-copy read-only memory-mapped file handle (`Mmap`) ----
 

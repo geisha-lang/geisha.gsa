@@ -58,8 +58,8 @@ use      mod      open     as       true     false    Void
 ```
 
 ### 2.4 Literals & Escapes
-- **Integers**: Decimal digits (`[0-9]+`), typed as `Int` (platform word-sized signed integer).
-- **Floats**: Decimal with fractional part and optional exponent (`[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?`), typed as `Float` (`f64`).
+- **Integers**: Decimal (`[0-9][0-9_]*`), hexadecimal (`0[xX][0-9a-fA-F_]+`), octal (`0[oO][0-7_]+`), and binary (`0[bB][01_]+`), typed as `Int` (32-bit signed integer; non-negative radix literals accept full 32-bit bit patterns `0x00000000`–`0xFFFFFFFF`).
+- **Floats**: Decimal with fractional part and optional exponent (`[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?`), typed as `Float` (`f64`).
 - **Booleans**: `true`, `false` (`Bool`).
 - **Unit**: `()` (`Void`).
 - **Characters**: Single ASCII byte `'a'` or escaped `'\n'` (`Char`).
@@ -368,7 +368,7 @@ web_assets = ["host/web/runtime.js"]
 - **Global Cache**: Treeless bare clones and content-addressed package snapshots live in `~/.geisha/cache/p/<name>-<ver>-<sha256_12>/`.
 - **Lockfile**: `geisha.lock` records exact `[[pkg]]` entries (`name`, `url`, `subdir`, `version`, `rev`, `sha256`).
 - **Index**: Optional `$GEISHA_INDEX` static Git index maps short package names to Git URLs.
-- **Local Overrides**: Untracked `geisha.local.toml` supports `[overrides]` (`"github.com/org/repo" = { path = "../repo" }`) without modifying `geisha.toml` or `geisha.lock`.
+- **Local Overrides**: Untracked `geisha.local.toml` supports `[overrides]` (`"github.com/org/repo" = { path = "../repo" }`) as well as machine-local `[target.macos]`, `[target.ios]`, `[target.native]`, and `[target.wasm32]` overrides (e.g. local `codesign` certificates or SDK flags) without modifying `geisha.toml` or `geisha.lock`.
 
 ---
 

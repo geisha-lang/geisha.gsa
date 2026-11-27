@@ -45,7 +45,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 ## 3. Core Syntax & Semantics
 
 ### Primitives & Built-ins
-- Types: `Int` (32/64-bit platform int), `Int64`, `Float` (f64), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
+- Types: `Int` (32-bit signed int; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
 - Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`.
 - Operators: `+`, `-`, `*`, `/` (works on `Int`, `Float`, `Float32`, and `String` concatenation via `+`), `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, `>>>`, `~`. Custom symbolic operators can be defined with `def (<op>)(a, b) = ...`.
 
@@ -153,14 +153,14 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.generic` — `Generic` representation (`Rep`, `toRep`, `fromRep`) for zero-keyword deriving
 - `std.codec` — binary/text encoding & decoding concepts
 - `std.json` — JSON parser, AST, and serializer
-- `std.toml` — TOML parser and AST
+- `std.toml` — TOML parser, canonical serializer, and comment-preserving `patch`
 - `std.sha256` — SHA-256 hashing
 
 ### `sys.*`
 - `sys.io` — stdout/stderr/stdin (`eprintLn`, ...)
-- `sys.fs` — files, directories, and zero-copy `Mmap` (`readFile`, `writeFile`, `fileExists`, `isDir`, `mkdirAll`, `readDir`, `removeFile`, `withMmap`)
+- `sys.fs` — files, directories, atomic writes, permissions/mtime, and zero-copy `Mmap` (`readFile`, `writeFile`, `writeFileAtomic`, `writeFileAtomicMode`, `renameFile`, `chmod`, `fileMtimeMs`, `fileExists`, `isDir`, `mkdirAll`, `readDir`, `removeFile`, `withMmap`)
 - `sys.env` — CLI args and env vars (`argCount`, `argAt`, `getEnv`)
-- `sys.proc` — process exit and shell execution (`exit`, `shell`)
+- `sys.proc` — structured subprocesses, pipes, timeouts, signals, and shell execution (`Command`, `command`, `spawn`, `run`, `runTimeout`, `childSignal`, `Pipe`, `exit`, `shell`)
 - `sys.time` — monotonic/wall clock and sleep
 - `sys.net` — TCP/UDP networking sockets
 - `sys.ffi` — dynamic library loading (`dlOpen`, `dlOpenSelf`, `dlSym`, `dlClose`, `ptrToStrOpt`)
@@ -216,4 +216,4 @@ extension_point = "com.apple.keyboard-service"
 principal_class = "MyViewCtrl"   # used when `is_extension = true`
 codesign        = "-"
 ```
-- Local overrides without touching `geisha.toml` or `geisha.lock`: put `[overrides]` in an untracked `geisha.local.toml`.
+- Local overrides without touching `geisha.toml` or `geisha.lock`: put `[overrides]` or machine-local `[target.macos]` / `[target.ios]` / `[target.native]` settings (e.g. local `codesign` identity) in an untracked `geisha.local.toml`.

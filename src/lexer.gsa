@@ -96,6 +96,42 @@ def classifyWord(w: String): TokKind =
 def sliceIntoBuf(buf: StringBuf, src: String, start: Int, end: Int): String =
     ptrSliceFromStr(src, start, end - start)
 
+def isRadixDigitByte(b: Int, radix: Int): Bool =
+    if (radix == 16) {
+        (b >= 48 && b <= 57) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+    } else if (radix == 8) {
+        b >= 48 && b <= 55
+    } else if (radix == 2) {
+        b == 48 || b == 49
+    } else {
+        isDigitByte(b)
+    }
+
+def scanDigitsToBuf(src: String, len: Int, i: Cell Int, radix: Int, allowLeadingSep: Bool, outBuf: StringBuf): Result Int String = {
+    let count = cellNew(0);
+    let scanning = cellNew(true);
+    let badSep = cellNew(false);
+    while (cellGet(i) < len && cellGet(scanning) && !cellGet(badSep)) {
+        let cur = cellGet(i);
+        let c = strByteAt(src, cur);
+        if (isRadixDigitByte(c, radix)) {
+            bufPushByte(outBuf, c);
+            cellSet(count, cellGet(count) + 1);
+            cellSet(i, cur + 1)
+        } else if (c == 95) {
+            if ((cellGet(count) > 0 || allowLeadingSep) && cur + 1 < len && isRadixDigitByte(strByteAt(src, cur + 1), radix)) {
+                cellSet(i, cur + 1)
+            } else {
+                cellSet(badSep, true)
+            }
+        } else {
+            cellSet(scanning, false)
+        }
+    };
+    if (cellGet(badSep)) Err("invalid '_' digit separator in numeric literal")
+    else Ok(cellGet(count))
+}
+
 pub def tokenize(src: String): Result (Vec Token) String =
     tokenizeInFile(src, 0)
 
@@ -194,37 +230,100 @@ pub def tokenizeInFile(src: String, fileId: Int): Result (Vec Token) String = {
                 let word = sliceIntoBuf(tokBuf, src, start, end);
                 vecPush(out, MkToken { kind: classifyWord(word), span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
             } else if (isDigitByte(b)) {
-                cellSet(i, start + 1);
-                while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
-                    cellSet(i, cellGet(i) + 1)
-                };
-                let isFloat = cellNew(false);
-                if (cellGet(i) + 1 < len && strByteAt(src, cellGet(i)) == 46 && isDigitByte(strByteAt(src, cellGet(i) + 1))) {
-                    cellSet(isFloat, true);
-                    cellSet(i, cellGet(i) + 2);
-                    while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
-                        cellSet(i, cellGet(i) + 1)
-                    };
-                    if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 101 || strByteAt(src, cellGet(i)) == 69)) {
-                        let expStart = cellGet(i);
-                        cellSet(i, expStart + 1);
-                        if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 43 || strByteAt(src, cellGet(i)) == 45)) {
-                            cellSet(i, cellGet(i) + 1)
-                        } else ();
-                        let expDigits = cellNew(0);
-                        while (cellGet(i) < len && isDigitByte(strByteAt(src, cellGet(i)))) {
-                            cellSet(expDigits, cellGet(expDigits) + 1);
-                            cellSet(i, cellGet(i) + 1)
-                        };
-                        if (cellGet(expDigits) == 0) {
-                            cellSet(i, expStart)
-                        } else ()
-                    } else ()
-                } else ();
-                let end = cellGet(i);
-                let rawNum = sliceIntoBuf(tokBuf, src, start, end);
-                let k = if (cellGet(isFloat)) TkFloat(rawNum) else TkInt(rawNum);
-                vecPush(out, MkToken { kind: k, span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
+                bufClear(tokBuf);
+                let radix =
+                    if (b == 48 && start + 1 < len) {
+                        let b1 = strByteAt(src, start + 1);
+                        if (b1 == 120 || b1 == 88) 16
+                        else if (b1 == 111 || b1 == 79) 8
+                        else if (b1 == 98 || b1 == 66) 2
+                        else 10
+                    } else 10;
+
+                if (radix != 10) {
+                    bufPushByte(tokBuf, 48);
+                    bufPushByte(tokBuf, if (radix == 16) 120 else if (radix == 8) 111 else 98);
+                    cellSet(i, start + 2);
+                    match scanDigitsToBuf(src, len, i, radix, true, tokBuf) {
+                        Err(msg) -> {
+                            cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, msg));
+                            cellSet(failed, true)
+                        },
+                        Ok(dcount) ->
+                            if (dcount == 0) {
+                                let errEnd = if (cellGet(i) < len) cellGet(i) + 1 else cellGet(i);
+                                cellSet(errMsg, formatDiagAt("Lex error", fileId, start, errEnd, "expected digits after base prefix"));
+                                cellSet(failed, true)
+                            } else if (cellGet(i) < len && isIdentContByte(strByteAt(src, cellGet(i)))) {
+                                cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, "invalid digit in radix integer literal"));
+                                cellSet(failed, true)
+                            } else {
+                                let end = cellGet(i);
+                                vecPush(out, MkToken { kind: TkInt(bufToString(tokBuf)), span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
+                            },
+                    }
+                } else {
+                    match scanDigitsToBuf(src, len, i, 10, false, tokBuf) {
+                        Err(msg) -> {
+                            cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, msg));
+                            cellSet(failed, true)
+                        },
+                        Ok(_) -> {
+                            let isFloat = cellNew(false);
+                            if (cellGet(i) + 1 < len && strByteAt(src, cellGet(i)) == 46 && isDigitByte(strByteAt(src, cellGet(i) + 1))) {
+                                cellSet(isFloat, true);
+                                bufPushByte(tokBuf, 46);
+                                cellSet(i, cellGet(i) + 1);
+                                match scanDigitsToBuf(src, len, i, 10, false, tokBuf) {
+                                    Err(fmsg) -> {
+                                        cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, fmsg));
+                                        cellSet(failed, true)
+                                    },
+                                    Ok(_) ->
+                                        if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 101 || strByteAt(src, cellGet(i)) == 69)) {
+                                            let expStart = cellGet(i);
+                                            let expSaveLen = strLen(bufToString(tokBuf));
+                                            bufPushByte(tokBuf, strByteAt(src, expStart));
+                                            cellSet(i, expStart + 1);
+                                            if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 43 || strByteAt(src, cellGet(i)) == 45)) {
+                                                bufPushByte(tokBuf, strByteAt(src, cellGet(i)));
+                                                cellSet(i, cellGet(i) + 1)
+                                            } else ();
+                                            match scanDigitsToBuf(src, len, i, 10, false, tokBuf) {
+                                                Err(emsg) -> {
+                                                    cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, emsg));
+                                                    cellSet(failed, true)
+                                                },
+                                                Ok(expDigits) ->
+                                                    if (expDigits == 0) {
+                                                        cellSet(i, expStart);
+                                                        let preExp = ptrSliceFromStr(bufToString(tokBuf), 0, expSaveLen);
+                                                        bufClear(tokBuf);
+                                                        let j = cellNew(0);
+                                                        while (cellGet(j) < expSaveLen) {
+                                                            bufPushByte(tokBuf, strByteAt(preExp, cellGet(j)));
+                                                            cellSet(j, cellGet(j) + 1)
+                                                        }
+                                                    } else (),
+                                            }
+                                        } else (),
+                                }
+                            } else ();
+
+                            if (!cellGet(failed)) {
+                                if (cellGet(i) < len && strByteAt(src, cellGet(i)) == 95) {
+                                    cellSet(errMsg, formatDiagAt("Lex error", fileId, start, cellGet(i) + 1, "invalid trailing '_' in numeric literal"));
+                                    cellSet(failed, true)
+                                } else {
+                                    let end = cellGet(i);
+                                    let cleanNum = bufToString(tokBuf);
+                                    let k = if (cellGet(isFloat)) TkFloat(cleanNum) else TkInt(cleanNum);
+                                    vecPush(out, MkToken { kind: k, span: MkSpan { fileId: fileId, start: start, end: end }, hadNewline: nl })
+                                }
+                            } else ()
+                        },
+                    }
+                }
             } else if (b == 34) {
                 // String literal `"..."`
                 cellSet(i, start + 1);

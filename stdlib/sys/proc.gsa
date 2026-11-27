@@ -1,8 +1,496 @@
-// Process exit & external command execution (`sys.proc`)
+/// Process management, streaming pipes, and timeout-bounded command execution (`sys.proc`).
+///
+/// Built on thread-safe `posix_spawnp` and single-thread `poll` multiplexing without
+/// modifying global `SIGCHLD` handlers or spawning background runtime worker threads.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufPushPtr, bufToString}
+use std.generic
+use sys.time.monotonicMs
 
 extern "exit" def c_exit(code: Int): Void
 extern "system" def c_system(cmd: String): Int
+extern "gs_proc_spawn" def c_proc_spawn(
+    program: String,
+    argBlob: String,
+    argc: Int,
+    cwd: String,
+    envMode: Int,
+    envBlob: String,
+    envc: Int,
+    stdioPacked: Int,
+    ownGroup: Int,
+    outInts: Ptr
+): Int
+extern "gs_proc_wait" def c_proc_wait(pid: Int, nohang: Int): Int64
+extern "gs_proc_wait_timeout" def c_proc_wait_timeout(pid: Int, timeoutMs: Int): Int64
+extern "gs_proc_signal" def c_proc_signal(pid: Int, sigKind: Int, ownGroup: Int): Int
+extern "gs_pipe_read" def c_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
+extern "gs_pipe_write" def c_pipe_write(fd: Int, buf: String, len: Int): Int
+extern "gs_pipe_close" def c_pipe_close(fd: Int): Int
+extern "gs_pipe_poll2" def c_pipe_poll2(fd0: Int, fd1: Int, timeoutMs: Int): Int
 
+/// Standard stream redirection mode for child processes.
+pub data Stdio : Eq {
+    Inherit,
+    Null,
+    Piped,
+}
+
+/// Environment variable policy for child processes.
+pub data EnvMode {
+    InheritEnv,
+    OverrideEnv(List (String, String)),
+    ReplaceEnv(List (String, String)),
+}
+
+/// Portable POSIX process signals.
+pub data Signal : Eq {
+    SigTerm,
+    SigKill,
+    SigInt,
+}
+
+/// Child process launch specification.
+pub data Command {
+    program: String,
+    args: List String,
+    cwd: Option String,
+    env: EnvMode,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+    ownGroup: Bool,
+}
+
+/// OS pipe file descriptor handle (`Send`-safe value wrapper).
+pub data Pipe(Int) : Eq
+
+/// Running child process handle (`Send`-safe value wrapper).
+pub data Child {
+    pid: Int,
+    ownGroup: Bool,
+    stdin: Option Pipe,
+    stdout: Option Pipe,
+    stderr: Option Pipe,
+}
+
+/// Child termination status.
+pub data ExitStatus : Eq {
+    Exited(Int),
+    Signaled(Int),
+}
+
+/// Captured output and exit status of a completed child process.
+pub data Output : Eq {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Terminate the current process immediately with exit status `code`.
 pub def exit(code: Int): Void = c_exit(code)
 
+/// Execute a command line through the host shell (`/bin/sh -c`).
 pub def shell(cmd: String): Int = c_system(cmd)
+
+/// Construct a `Command` for `program` and `args` (inheriting cwd, env, and stdio by default).
+pub def command(program: String, args: List String): Command = Command {
+    program: program,
+    args: args,
+    cwd: None,
+    env: InheritEnv,
+    stdin: Inherit,
+    stdout: Inherit,
+    stderr: Inherit,
+    ownGroup: false,
+}
+
+/// Return a copy of `cmd` with working directory `dir`.
+pub def cmdCwd(cmd: Command, dir: String): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: Some(dir),
+    env: cmd.env,
+    stdin: cmd.stdin,
+    stdout: cmd.stdout,
+    stderr: cmd.stderr,
+    ownGroup: cmd.ownGroup,
+}
+
+/// Return a copy of `cmd` overriding `vars` on top of the current process environment.
+pub def cmdEnv(cmd: Command, vars: List (String, String)): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: cmd.cwd,
+    env: OverrideEnv(vars),
+    stdin: cmd.stdin,
+    stdout: cmd.stdout,
+    stderr: cmd.stderr,
+    ownGroup: cmd.ownGroup,
+}
+
+/// Return a copy of `cmd` with explicit environment policy `mode`.
+pub def cmdEnvMode(cmd: Command, mode: EnvMode): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: cmd.cwd,
+    env: mode,
+    stdin: cmd.stdin,
+    stdout: cmd.stdout,
+    stderr: cmd.stderr,
+    ownGroup: cmd.ownGroup,
+}
+
+/// Return a copy of `cmd` with explicit `stdin`, `stdout`, and `stderr` redirection modes.
+pub def cmdStdio(cmd: Command, stdin: Stdio, stdout: Stdio, stderr: Stdio): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: cmd.cwd,
+    env: cmd.env,
+    stdin: stdin,
+    stdout: stdout,
+    stderr: stderr,
+    ownGroup: cmd.ownGroup,
+}
+
+/// Return a copy of `cmd` configured to start in its own process group (`setpgid(0, 0)`),
+/// allowing `childSignal` and `runTimeout` to terminate the entire child process tree.
+pub def cmdOwnGroup(cmd: Command, enabled: Bool): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: cmd.cwd,
+    env: cmd.env,
+    stdin: cmd.stdin,
+    stdout: cmd.stdout,
+    stderr: cmd.stderr,
+    ownGroup: enabled,
+}
+
+def stdioCode(s: Stdio): Int = match s {
+    Inherit -> 0,
+    Null -> 1,
+    Piped -> 2,
+}
+
+def signalCode(s: Signal): Int = match s {
+    SigTerm -> 0,
+    SigKill -> 1,
+    SigInt -> 2,
+}
+
+def packArgBlob(prog: String, args: List String): (String, Int) = {
+    let b = bufNew();
+    bufPushStr(b, prog);
+    bufPushByte(b, 0);
+    let count = cellNew(1);
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                bufPushStr(b, a);
+                bufPushByte(b, 0);
+                cellSet(count, cellGet(count) + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (bufToString(b), cellGet(count))
+}
+
+def packEnvBlob(pairs: List (String, String)): (String, Int) = {
+    let b = bufNew();
+    let count = cellNew(0);
+    let cur = cellNew(pairs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), r) -> {
+                bufPushStr(b, k);
+                bufPushByte(b, 61);
+                bufPushStr(b, v);
+                bufPushByte(b, 0);
+                cellSet(count, cellGet(count) + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (bufToString(b), cellGet(count))
+}
+
+def optPipeFromFd(fd: Int): Option Pipe =
+    if (fd < 0) None else Some(Pipe(fd))
+
+/// Spawn `cmd` without invoking a shell (`posix_spawnp`).
+pub def spawn(cmd: Command): Result Child String =
+    if (strLen(cmd.program) == 0) Err("cannot spawn empty program name")
+    else {
+        let (argBlob, argc) = packArgBlob(cmd.program, cmd.args);
+        let (envModeInt, envBlob, envc) = match cmd.env {
+            InheritEnv -> (0, "", 0),
+            OverrideEnv(vs) -> {
+                let (eb, ec) = packEnvBlob(vs);
+                (1, eb, ec)
+            },
+            ReplaceEnv(vs) -> {
+                let (eb, ec) = packEnvBlob(vs);
+                (2, eb, ec)
+            },
+        };
+        let cwdStr = match cmd.cwd { Some(d) -> d, None -> "" };
+        let stdioPacked = stdioCode(cmd.stdin) | (stdioCode(cmd.stdout) << 2) | (stdioCode(cmd.stderr) << 4);
+        let outInts = ptrAllocBytes(16);
+        let rc = c_proc_spawn(
+            cmd.program, argBlob, argc, cwdStr,
+            envModeInt, envBlob, envc, stdioPacked,
+            if (cmd.ownGroup) 1 else 0, outInts
+        );
+        if (rc != 0) Err("failed to spawn process: " + cmd.program)
+        else {
+            let pid = ptrReadU32Le(outInts, 0);
+            let inFd = ptrReadU32Le(outInts, 4);
+            let outFd = ptrReadU32Le(outInts, 8);
+            let errFd = ptrReadU32Le(outInts, 12);
+            Ok(Child {
+                pid: pid,
+                ownGroup: cmd.ownGroup,
+                stdin: optPipeFromFd(inFd),
+                stdout: optPipeFromFd(outFd),
+                stderr: optPipeFromFd(errFd),
+            })
+        }
+    }
+
+def decodeWaitResult(raw: Int64): Result (Option ExitStatus) String =
+    if (raw < intToI64(0)) Err("waitpid failed")
+    else if (raw == intToI64(0)) Ok(None)
+    else {
+        let tag = i64ToInt(raw >>> 32);
+        let lowMask = (intToI64(0xFFFF) << 16) | intToI64(0xFFFF);
+        let code = i64ToInt(raw & lowMask);
+        if (tag == 2) Ok(Some(Signaled(code)))
+        else Ok(Some(Exited(code)))
+    }
+
+/// Poll whether `c` has exited without blocking (`WNOHANG`).
+pub def childTryWait(c: Child): Result (Option ExitStatus) String =
+    decodeWaitResult(c_proc_wait(c.pid, 1))
+
+/// Block until `c` terminates and reap its exit status.
+pub def childWait(c: Child): Result ExitStatus String =
+    match decodeWaitResult(c_proc_wait(c.pid, 0))? {
+        Some(st) -> Ok(st),
+        None -> Err("unexpected empty waitpid result"),
+    }
+
+/// Wait up to `timeoutMs` milliseconds for `c` to exit (`Ok(None)` on timeout).
+pub def childWaitTimeout(c: Child, timeoutMs: Int): Result (Option ExitStatus) String =
+    decodeWaitResult(c_proc_wait_timeout(c.pid, timeoutMs))
+
+/// Send `sig` to `c` (targets the entire process group `-c.pid` when `c.ownGroup` is `true`).
+pub def childSignal(c: Child, sig: Signal): Result Void String =
+    if (c_proc_signal(c.pid, signalCode(sig), if (c.ownGroup) 1 else 0) == 0) Ok(())
+    else Err("failed to send signal to process")
+
+/// Read up to `cap` raw bytes from `p` into `buf` (`Ok(0)` on EOF).
+pub def pipeReadPtr(p: Pipe, buf: Ptr, cap: Int): Result Int String = match p {
+    Pipe(fd) -> {
+        let n = c_pipe_read(fd, buf, cap);
+        if (n < 0) Err("pipe read failed")
+        else Ok(n)
+    },
+}
+
+/// Read up to `maxBytes` bytes from `p` as a `String` (`Ok("")` on EOF).
+pub def pipeRead(p: Pipe, maxBytes: Int): Result String String = {
+    let cap = if (maxBytes <= 0) 1 else maxBytes;
+    let buf = ptrAllocBytes(cap);
+    let n = pipeReadPtr(p, buf, cap)?;
+    Ok(ptrSliceToString(buf, n))
+}
+
+/// Read `p` until EOF into a `String` and close `p`.
+pub def pipeReadAll(p: Pipe): Result String String = {
+    let chunkCap = 16384;
+    let chunk = ptrAllocBytes(chunkCap);
+    let out = bufNew();
+    let reading = cellNew(true);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (cellGet(reading) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        match pipeReadPtr(p, chunk, chunkCap) {
+            Err(e) -> cellSet(errOpt, Some(e)),
+            Ok(0) -> cellSet(reading, false),
+            Ok(n) -> bufPushPtr(out, chunk, n),
+        }
+    };
+    pipeClose(p);
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(bufToString(out)),
+    }
+}
+
+/// Write all bytes of `payload` to `p`.
+pub def pipeWrite(p: Pipe, payload: String): Result Void String = match p {
+    Pipe(fd) -> {
+        let total = strLen(payload);
+        if (total == 0) Ok(())
+        else if (c_pipe_write(fd, payload, total) == total) Ok(())
+        else Err("pipe write failed")
+    },
+}
+
+/// Close pipe handle `p`.
+pub def pipeClose(p: Pipe): Void = match p {
+    Pipe(fd) -> {
+        let _ = c_pipe_close(fd);
+        ()
+    },
+}
+
+def pipeFdOrNeg1(opt: Option Pipe): Int = match opt {
+    Some(Pipe(fd)) -> fd,
+    None -> -1,
+}
+
+def closeOptPipe(opt: Option Pipe): Void = match opt {
+    Some(p) -> pipeClose(p),
+    None -> (),
+}
+
+def prepareRunCommand(cmd: Command, forceGroup: Bool): Command = Command {
+    program: cmd.program,
+    args: cmd.args,
+    cwd: cmd.cwd,
+    env: cmd.env,
+    stdin: match cmd.stdin { Inherit -> Null, s -> s },
+    stdout: match cmd.stdout { Null -> Null, _ -> Piped },
+    stderr: match cmd.stderr { Null -> Null, _ -> Piped },
+    ownGroup: cmd.ownGroup || forceGroup,
+}
+
+def collectChildOutput(c: Child, timeoutOpt: Option Int): Result (Option Output) String = {
+    closeOptPipe(c.stdin);
+    let outFd = cellNew(pipeFdOrNeg1(c.stdout));
+    let errFd = cellNew(pipeFdOrNeg1(c.stderr));
+    let outBuf = bufNew();
+    let errBuf = bufNew();
+    let scratch = ptrAllocBytes(16384);
+    let timedOut = cellNew(false);
+    let ioErr: Cell (Option String) = cellNew(None);
+
+    let deadlineOpt: Option Int64 = match timeoutOpt {
+        Some(ms) -> Some(monotonicMs() + intToI64(if (ms < 0) 0 else ms)),
+        None -> None,
+    };
+
+    while ((cellGet(outFd) >= 0 || cellGet(errFd) >= 0) && !cellGet(timedOut) && match cellGet(ioErr) { None -> true, Some(_) -> false }) {
+        let waitMs = match deadlineOpt {
+            None -> -1,
+            Some(dl) -> {
+                let rem = i64ToInt(dl - monotonicMs());
+                if (rem <= 0) 0 else rem
+            },
+        };
+        if (waitMs == 0 && match deadlineOpt { Some(_) -> true, None -> false }) {
+            // Drain any immediately ready bytes once before declaring timeout
+            let readyNow = c_pipe_poll2(cellGet(outFd), cellGet(errFd), 0);
+            if (readyNow <= 0) {
+                cellSet(timedOut, true)
+            } else {
+                if ((readyNow & 1) != 0 && cellGet(outFd) >= 0) {
+                    let n = c_pipe_read(cellGet(outFd), scratch, 16384);
+                    if (n <= 0) { let _ = c_pipe_close(cellGet(outFd)); cellSet(outFd, -1) }
+                    else bufPushPtr(outBuf, scratch, n)
+                } else ();
+                if ((readyNow & 2) != 0 && cellGet(errFd) >= 0) {
+                    let n = c_pipe_read(cellGet(errFd), scratch, 16384);
+                    if (n <= 0) { let _ = c_pipe_close(cellGet(errFd)); cellSet(errFd, -1) }
+                    else bufPushPtr(errBuf, scratch, n)
+                } else ()
+            }
+        } else {
+            let mask = c_pipe_poll2(cellGet(outFd), cellGet(errFd), waitMs);
+            if (mask < 0) {
+                cellSet(ioErr, Some("poll failed while reading process pipes"))
+            } else if (mask == 0) {
+                cellSet(timedOut, true)
+            } else {
+                if ((mask & 1) != 0 && cellGet(outFd) >= 0) {
+                    let n = c_pipe_read(cellGet(outFd), scratch, 16384);
+                    if (n < 0) cellSet(ioErr, Some("failed reading child stdout"))
+                    else if (n == 0) { let _ = c_pipe_close(cellGet(outFd)); cellSet(outFd, -1) }
+                    else bufPushPtr(outBuf, scratch, n)
+                } else ();
+                if ((mask & 2) != 0 && cellGet(errFd) >= 0) {
+                    let n = c_pipe_read(cellGet(errFd), scratch, 16384);
+                    if (n < 0) cellSet(ioErr, Some("failed reading child stderr"))
+                    else if (n == 0) { let _ = c_pipe_close(cellGet(errFd)); cellSet(errFd, -1) }
+                    else bufPushPtr(errBuf, scratch, n)
+                } else ()
+            }
+        }
+    };
+
+    if (cellGet(outFd) >= 0) { let _ = c_pipe_close(cellGet(outFd)); cellSet(outFd, -1) } else ();
+    if (cellGet(errFd) >= 0) { let _ = c_pipe_close(cellGet(errFd)); cellSet(errFd, -1) } else ();
+
+    match cellGet(ioErr) {
+        Some(e) -> {
+            let _ = childSignal(c, SigKill);
+            let _ = childWait(c);
+            Err(e)
+        },
+        None ->
+            if (cellGet(timedOut)) {
+                let _ = childSignal(c, SigKill);
+                let _ = childWait(c);
+                Ok(None)
+            } else {
+                match deadlineOpt {
+                    None -> {
+                        let st = childWait(c)?;
+                        Ok(Some(Output {
+                            status: st,
+                            stdout: bufToString(outBuf),
+                            stderr: bufToString(errBuf),
+                        }))
+                    },
+                    Some(dl) -> {
+                        let rem = i64ToInt(dl - monotonicMs());
+                        let stOpt = childWaitTimeout(c, if (rem < 0) 0 else rem)?;
+                        match stOpt {
+                            Some(st) -> Ok(Some(Output {
+                                status: st,
+                                stdout: bufToString(outBuf),
+                                stderr: bufToString(errBuf),
+                            })),
+                            None -> {
+                                let _ = childSignal(c, SigKill);
+                                let _ = childWait(c);
+                                Ok(None)
+                            },
+                        }
+                    },
+                }
+            },
+    }
+}
+
+/// Spawn `cmd`, capture `stdout` and `stderr` concurrently without deadlocking, and wait for exit.
+pub def run(cmd: Command): Result Output String = {
+    let child = spawn(prepareRunCommand(cmd, false))?;
+    match collectChildOutput(child, None)? {
+        Some(out) -> Ok(out),
+        None -> Err("unexpected timeout in blocking run"),
+    }
+}
+
+/// Spawn `cmd` in its own process group and wait up to `timeoutMs` ms.
+/// Returns `Ok(None)` if the process exceeds `timeoutMs` (killing and reaping the entire group).
+pub def runTimeout(cmd: Command, timeoutMs: Int): Result (Option Output) String = {
+    let child = spawn(prepareRunCommand(cmd, true))?;
+    collectChildOutput(child, Some(timeoutMs))
+}

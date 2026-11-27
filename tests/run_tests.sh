@@ -2443,4 +2443,278 @@ EOF
     fi
 fi
 
+# 36. Radix/Separator Literals (`0x`/`0o`/`0b`/`_`), `sys.fs` Atomic Writes, `sys.proc` Subprocesses, `std.toml.patch`, & `geisha.local.toml` Target Overrides
+cat > "$TMP_DIR/t36_sys_and_toml.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.str.{intToStr, strStartsWith}
+use std.codec.{Value, VBool, VInt, VFloat, VStr, VArr, VObj}
+use std.toml.{parse as tomlParse, patch as tomlPatch}
+use sys.fs.{
+    readFile, writeFileAtomic, writeFileAtomicMode, renameFile, chmod, fileMtimeMs
+}
+use sys.proc.{
+    Stdio, Null, Piped, EnvMode, ReplaceEnv, Signal, SigTerm,
+    ExitStatus, Exited, Signaled, Output,
+    command, cmdCwd, cmdEnv, cmdEnvMode, cmdStdio, cmdOwnGroup,
+    spawn, childWait, childSignal, pipeWrite, pipeClose, pipeReadAll,
+    run, runTimeout
+}
+
+def hasSubstr(hay: String, needle: String): Bool = {
+    let hl = strLen(hay);
+    let nl = strLen(needle);
+    if (nl == 0) true
+    else if (nl > hl) false
+    else {
+        let limit = hl - nl;
+        let i = cellNew(0);
+        let found = cellNew(false);
+        while (cellGet(i) <= limit && !cellGet(found)) {
+            let cur = cellGet(i);
+            if (strStartsWith(strSlice(hay, cur, cur + nl), needle)) {
+                cellSet(found, true)
+            } else {
+                cellSet(i, cur + 1)
+            }
+        };
+        cellGet(found)
+    }
+}
+
+def classifyMode(m: Int): String = match m {
+    0o600 -> "priv",
+    0o755 -> "exec",
+    -0x80 -> "neg128",
+    _ -> "other",
+}
+
+def main(): Result Void String = {
+    // 1. Radix & `_`-separated numeric literals + pattern matching
+    let hexMask = 0x_DEAD_BEEF;
+    let hi16 = (hexMask >>> 16) & 0xFFFF;
+    let octPerm = 0o600;
+    let binBits = 0b_1010_0101;
+    let decSep = 1_000_000;
+    let minI32 = -0x8000_0000;
+    let fltSep = 1_000.25_0 + 1.5e1_0 - 1.5e10;
+    let patRes = classifyMode(0o600) + ":" + classifyMode(0o755) + ":" + classifyMode(-0x80);
+
+    // 2. `sys.fs`: atomic write with explicit 0o600, mode preservation on overwrite, chmod, rename, mtime
+    let baseDir = sysArgv(1);
+    let secretPath = baseDir + "/secret.toml";
+    let movedPath = baseDir + "/secret_moved.toml";
+    writeFileAtomicMode(secretPath, "token = 1\n", 0o600)?;
+    writeFileAtomic(secretPath, "token = 2\n")?;
+    let secretText = readFile(secretPath)?;
+    let mtime = fileMtimeMs(secretPath)?;
+    let execPath = baseDir + "/script.sh";
+    writeFileAtomic(execPath, "#!/bin/sh\nexit 0\n")?;
+    chmod(execPath, 0o755)?;
+    renameFile(secretPath, movedPath)?;
+    let movedText = readFile(movedPath)?;
+
+    // 3. `sys.proc`:
+    // 3a. `run` with `cmdCwd`, `OverrideEnv`, empty arg `""`, and >128KB simultaneous stdout+stderr (no deadlock!)
+    let pyDual =
+        "import os, sys; "
+        + "a1 = sys.argv[1]; a2 = sys.argv[2]; "
+        + "cwd_base = os.path.basename(os.getcwd()); "
+        + "ev = os.environ.get('GS_TEST_VAR', ''); "
+        + "sys.stdout.write(cwd_base + '|' + str(len(a1)) + '|' + a2 + '|' + ev + '|'); "
+        + " chunk = 'O' * 4096; echunk = 'E' * 4096;\n"
+        + "for _ in range(36):\n"
+        + "    sys.stdout.write(chunk); sys.stdout.flush()\n"
+        + "    sys.stderr.write(echunk); sys.stderr.flush()\n";
+    let cmd1 = cmdEnv(cmdCwd(command("python3", ["-c", pyDual, "", "arg2"]), baseDir), [("GS_TEST_VAR", "override_val")]);
+    let out1 = run(cmd1)?;
+    let dualOk =
+        out1.status == Exited(0)
+        && strLen(out1.stderr) == 147456
+        && hasSubstr(out1.stdout, "t36_work|0|arg2|override_val|")
+        && strLen(out1.stdout) > 147456;
+
+    // 3b. `ReplaceEnv` clean environment check
+    let outClean = run(cmdEnvMode(
+        command("python3", ["-c", "import os; print(os.environ.get('ONLY_KEY','') + ':' + str(len(os.environ)))"]),
+        ReplaceEnv([("ONLY_KEY", "pure")])
+    ))?;
+
+    // 3c. Streaming `spawn` + `stdin` pipe write + `stdout` read + `childWait`
+    let catChild = spawn(cmdStdio(command("cat", []), Piped, Piped, Null))?;
+    let pipeOut = match (catChild.stdin, catChild.stdout) {
+        (Some(pin), Some(pout)) -> {
+            pipeWrite(pin, "hello-geisha-pipe")?;
+            pipeClose(pin);
+            pipeReadAll(pout)?
+        },
+        _ -> "missing_pipes",
+    };
+    let catSt = childWait(catChild)?;
+
+    // 3d. `runTimeout` killing entire process group cleanly (`Ok(None)`)
+    let toRes = runTimeout(command("sh", ["-c", "sleep 30"]), 80)?;
+    let timeoutOk = match toRes {
+        None -> true,
+        Some(_) -> false,
+    };
+
+    // 3e. `childSignal` with `SigTerm`
+    let sigChild = spawn(cmdOwnGroup(cmdStdio(command("sleep", ["30"]), Null, Null, Null), true))?;
+    childSignal(sigChild, SigTerm)?;
+    let sigSt = childWait(sigChild)?;
+    let sigOk = sigSt == Signaled(15);
+
+    // 4. `std.toml.patch`: comment-preserving in-place edit (Talus-style config)
+    let origToml =
+        "# User custom header comment\n"
+        + "modifiers = [\"option\"]\n\n"
+        + "[layout]\n"
+        + "# Keep golden ratio\n"
+        + "master_ratio = 0.6 # inline note\n"
+        + "obsolete_key = 99\n\n"
+        + "[deps]\n"
+        + "# Core UI\n"
+        + "crema = { git = \"github.com/geisha-lang/crema\", version = \"0.1.0\" }\n\n"
+        + "[rules.app_workspaces]\n"
+        + "\"com.tencent.xinWeChat\" = \"聊天\"\n\n"
+        + "[[rules.float_windows]]\n"
+        + "# WeChat viewer rule\n"
+        + "app = \"com.tencent.xinWeChat\"\n"
+        + "titles = [\"图片\"]\n";
+
+    let targetVal = VObj([
+        ("modifiers", VArr([VStr("option"), VStr("command")])),
+        ("layout", VObj([
+            ("master_ratio", VFloat(0.55)),
+            ("outer_gap", VInt(intToI64(8))),
+        ])),
+        ("deps", VObj([
+            ("crema", VObj([("git", VStr("github.com/geisha-lang/crema")), ("version", VStr("0.2.0"))])),
+            ("objc", VObj([("git", VStr("github.com/geisha-lang/objc.gsa")), ("version", VStr("0.1.0"))])),
+        ])),
+        ("rules", VObj([
+            ("app_workspaces", VObj([
+                ("com.tencent.xinWeChat", VStr("聊天")),
+            ])),
+            ("float_windows", VArr([
+                VObj([("app", VStr("com.tencent.xinWeChat")), ("titles", VArr([VStr("图片"), VStr("视频")]))]),
+                VObj([("app", VStr("com.apple.Finder")), ("titles", VArr([VStr("简介")]))]),
+            ])),
+        ])),
+        ("extra", VObj([("enabled", VBool(true))])),
+    ]);
+
+    let patchedToml = tomlPatch(origToml, targetVal)?;
+    let reparsed = tomlParse(patchedToml)?;
+    let commentsKept =
+        hasSubstr(patchedToml, "# User custom header comment")
+        && hasSubstr(patchedToml, "# Keep golden ratio")
+        && hasSubstr(patchedToml, "master_ratio = 0.55 # inline note")
+        && hasSubstr(patchedToml, "# Core UI")
+        && hasSubstr(patchedToml, "# WeChat viewer rule")
+        && !hasSubstr(patchedToml, "obsolete_key");
+    // Re-patching an unchanged value should return the exact string untouched
+    let idempToml = tomlPatch(patchedToml, reparsed)?;
+    let patchOk = commentsKept && (idempToml == patchedToml);
+
+    printLn(
+        intToStr(hi16) + "|"
+        + intToStr(octPerm) + "|"
+        + intToStr(binBits) + "|"
+        + intToStr(decSep) + "|"
+        + (if (minI32 == -2147483647 - 1) "minOk" else "minBad") + "|"
+        + intToStr(floatToInt(fltSep * 4.0)) + "|"
+        + patRes + "|"
+        + (if (secretText == "token = 2\n" && movedText == "token = 2\n" && mtime > intToI64(0)) "fsOk" else "fsBad") + "|"
+        + (if (dualOk) "dualOk" else "dualBad") + "|"
+        + (if (hasSubstr(outClean.stdout, "pure:")) "envOk" else "envBad") + "|"
+        + pipeOut + ":" + (if (catSt == Exited(0)) "0" else "1") + "|"
+        + (if (timeoutOk && sigOk) "sigToOk" else "sigToBad") + "|"
+        + (if (patchOk) "tomlPatchOk" else "tomlPatchBad")
+    );
+    Ok(())
+}
+EOF
+mkdir -p "$TMP_DIR/t36_work"
+"$GEISHA_BIN" -o "$TMP_DIR/t36_sys_and_toml" "$TMP_DIR/t36_sys_and_toml.gsa"
+T36_OUT="$("$TMP_DIR/t36_sys_and_toml" "$TMP_DIR/t36_work")"
+assert_eq "literals_sysfs_sysproc_tomlpatch" "57005|384|165|1000000|minOk|4001|priv:exec:neg128|fsOk|dualOk|envOk|hello-geisha-pipe:0|sigToOk|tomlPatchOk" "$T36_OUT"
+
+# Verify exact POSIX file modes on disk (0o600 preserved across writeFileAtomic + rename, and 0o755 via chmod)
+MODES_OUT="$(python3 - "$TMP_DIR/t36_work/secret_moved.toml" "$TMP_DIR/t36_work/script.sh" << 'PY'
+import os, sys
+m1 = oct(os.stat(sys.argv[1]).st_mode & 0o777)
+m2 = oct(os.stat(sys.argv[2]).st_mode & 0o777)
+print(f"{m1}|{m2}")
+PY
+)"
+assert_eq "sysfs_atomic_mode_and_chmod_bits" "0o600|0o755" "$MODES_OUT"
+
+# Negative lex/parse checks for malformed radix & separator literals
+for bad_lit in "0x" "0o78" "0b102" "123_" "0x1_0000_0000"; do
+    cat > "$TMP_DIR/t36_bad_lit.gsa" << EOF
+def main(): Int = $bad_lit
+EOF
+    if "$GEISHA_BIN" check "$TMP_DIR/t36_bad_lit.gsa" >/dev/null 2>&1; then
+        echo "FAIL [bad_numeric_literal]: '$bad_lit' should be rejected" >&2
+        exit 1
+    fi
+done
+
+# Verify `geisha add` / `geisha remove` comment preservation & `geisha.local.toml` `[target.*]` overrides
+LOCAL_OVR_PROJ="$TMP_DIR/t36_local_ovr"
+mkdir -p "$LOCAL_OVR_PROJ/src" "$LOCAL_OVR_PROJ/native" "$TMP_DIR/t36_dep_lib/src"
+cat > "$TMP_DIR/t36_dep_lib/geisha.toml" << 'EOF'
+name = "t36_dep_lib"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/t36_dep_lib/src/t36_dep_lib.gsa" << 'EOF'
+pub def bonus(): Int = 0x2A
+EOF
+cat > "$LOCAL_OVR_PROJ/native/val.c" << 'EOF'
+#include <stdint.h>
+#ifndef LOCAL_OVR_NUM
+#define LOCAL_OVR_NUM 0
+#endif
+int32_t c_local_ovr_num(void) { return LOCAL_OVR_NUM; }
+EOF
+cat > "$LOCAL_OVR_PROJ/geisha.toml" << 'EOF'
+# Top project comment preserved across geisha add/remove
+name = "t36_local_ovr"
+version = "0.1.0"
+
+[target.native]
+# Native C helper comment
+c_sources = ["native/val.c"]
+EOF
+cat > "$LOCAL_OVR_PROJ/geisha.local.toml" << 'EOF'
+[target.native]
+c_flags = ["-DLOCAL_OVR_NUM=777"]
+EOF
+cat > "$LOCAL_OVR_PROJ/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use t36_dep_lib.bonus
+
+extern "c_local_ovr_num" def localNum(): Int
+
+def main(): Void = printLn(intToStr(localNum() + bonus()))
+EOF
+ABS_GEISHA_36="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_36="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+(cd "$LOCAL_OVR_PROJ" && "$ABS_GEISHA_36" add --path "$TMP_DIR/t36_dep_lib" --as t36_dep_lib >/dev/null)
+if ! grep -q "# Top project comment preserved" "$LOCAL_OVR_PROJ/geisha.toml" || ! grep -q "# Native C helper comment" "$LOCAL_OVR_PROJ/geisha.toml"; then
+    echo "FAIL [geisha_add_preserves_comments]: comments lost in geisha.toml after geisha add" >&2
+    exit 1
+fi
+T36_PROJ_BIN="$(cd "$LOCAL_OVR_PROJ" && "$ABS_GEISHA_36" build --runtime "$ABS_RT_36" >/dev/null && ./build/t36_local_ovr)"
+assert_eq "geisha_local_toml_target_override" "819" "$T36_PROJ_BIN"
+(cd "$LOCAL_OVR_PROJ" && "$ABS_GEISHA_36" remove t36_dep_lib >/dev/null)
+if ! grep -q "# Top project comment preserved" "$LOCAL_OVR_PROJ/geisha.toml" || grep -q "t36_dep_lib" "$LOCAL_OVR_PROJ/geisha.toml"; then
+    echo "FAIL [geisha_remove_preserves_comments]: comments lost or dep remained after geisha remove" >&2
+    exit 1
+fi
+echo "PASS [syslib_literals_toml_patch]: 0x/0o/0b/_ literals, sys.fs atomic writes, sys.proc poll/timeout/signals, std.toml.patch, & geisha.local.toml verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
