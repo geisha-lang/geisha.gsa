@@ -1138,6 +1138,46 @@ def main() -> int:
         })
         assert "error" in ren_open_ext and ren_open_ext["error"]["code"] == -32602, f"expected -32602 on open extra conflict: {ren_open_ext}"
 
+        # (f) Re-exported conflict via `bridge.gsa` (`pub use extra.fetchA`): `use m2.load; open bridge` -> rejected (-32602)
+        bridge_ext_path = ms_dir / "bridge_ext.gsa"
+        bridge_ext_path.write_text("pub use extra.fetchA\n", encoding="utf-8")
+        ms_reexp_ext_src = (
+            "pub mod inner {\n"
+            "    use m2.load\n"
+            "    open bridge_ext\n"
+            "    pub def run(): Int = load() + fetchA()\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 6}, "contentChanges": [{"text": ms_reexp_ext_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_reexp_ext = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "error" in ren_reexp_ext and ren_reexp_ext["error"]["code"] == -32602, f"expected -32602 on re-exported open bridge_ext conflict: {ren_reexp_ext}"
+
+        # (g) Re-exported target via `bridge_tgt.gsa` (`pub use m2.load`): `open bridge_tgt; def fetchA() = 93` -> rejected (-32602)
+        bridge_tgt_path = ms_dir / "bridge_tgt.gsa"
+        bridge_tgt_path.write_text("pub use m2.load\n", encoding="utf-8")
+        ms_reexp_tgt_src = (
+            "pub mod inner {\n"
+            "    open bridge_tgt\n"
+            "    def fetchA(): Int = 93\n"
+            "    pub def run(): Int = load() + fetchA()\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 7}, "contentChanges": [{"text": ms_reexp_tgt_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_reexp_tgt = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "error" in ren_reexp_tgt and ren_reexp_tgt["error"]["code"] == -32602, f"expected -32602 on re-exported open bridge_tgt conflict: {ren_reexp_tgt}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

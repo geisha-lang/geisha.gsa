@@ -42,7 +42,7 @@ use diag.{
 use parser.parseFileModuleInFile
 use loader.{
     PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed,
-    loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay
+    loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay, loaderLastPublicExports
 }
 use infer.{InferOutput, AdtInfo, VariantInfo, inferProgram, preludePrimSpecs}
 use core.lowerToCoreForCheck
@@ -458,6 +458,7 @@ data DocState {
         dsVersion: Int,
         dsParsed: Option FileModule,
         dsInfer: Option InferOutput,
+        dsExports: StrMap String,
         dsFiles: Vec SourceFile,
         dsFileId: Int,
         dsDiagTargetUri: Option String,
@@ -650,6 +651,7 @@ def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): 
     let (rootSpec, extSpecs) = resolveDocPkgSpecs(path);
     let checkRes = runFrontendCheck(path, text, rootSpec, extSpecs);
     let filesSnap = diagRegisteredFiles();
+    let exportsSnap = loaderLastPublicExports();
 
     match checkRes {
         Ok(inf) -> {
@@ -661,6 +663,7 @@ def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): 
                 dsVersion: version,
                 dsParsed: parsedOpt,
                 dsInfer: Some(inf),
+                dsExports: exportsSnap,
                 dsFiles: filesSnap,
                 dsFileId: 1,
                 dsDiagTargetUri: None,
@@ -679,6 +682,10 @@ def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): 
                 Some(prev) -> prev.dsInfer,
                 None -> None,
             };
+            let keepExports = match prevDocOpt {
+                Some(prev) -> prev.dsExports,
+                None -> exportsSnap,
+            };
             let keepFiles = match prevDocOpt {
                 Some(prev) -> if (vecLen(prev.dsFiles) > 0) prev.dsFiles else filesSnap,
                 None -> filesSnap,
@@ -690,6 +697,7 @@ def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): 
                 dsVersion: version,
                 dsParsed: parsedOpt,
                 dsInfer: keepInf,
+                dsExports: keepExports,
                 dsFiles: keepFiles,
                 dsFileId: 1,
                 dsDiagTargetUri: foreignOpt,
@@ -2085,6 +2093,7 @@ data WorkspaceDoc {
         wdText: String,
         wdParsed: Option FileModule,
         wdInfer: Option InferOutput,
+        wdExports: StrMap String,
         wdFiles: Vec SourceFile,
         wdFileId: Int,
     },
@@ -2733,6 +2742,7 @@ def collectWorkspaceDocsForTarget(ss: ServerState, currentDoc: DocState, targetN
                                 wdText: d.dsText,
                                 wdParsed: d.dsParsed,
                                 wdInfer: d.dsInfer,
+                                wdExports: d.dsExports,
                                 wdFiles: d.dsFiles,
                                 wdFileId: d.dsFileId,
                             }, cellGet(docsRev)))
@@ -2785,6 +2795,7 @@ def collectWorkspaceDocsForTarget(ss: ServerState, currentDoc: DocState, targetN
                                     Err(_) -> None,
                                 };
                                 let fSnap = diagRegisteredFiles();
+                                let eSnap = loaderLastPublicExports();
                                 cellSet(docsRev, Cons(MkWorkspaceDoc {
                                     wdUri: resolveClientUriForPath(ss, fp),
                                     wdPath: fp,
@@ -2792,6 +2803,7 @@ def collectWorkspaceDocsForTarget(ss: ServerState, currentDoc: DocState, targetN
                                     wdText: txt,
                                     wdParsed: parsedOpt,
                                     wdInfer: infOpt,
+                                    wdExports: eSnap,
                                     wdFiles: fSnap,
                                     wdFileId: 1,
                                 }, cellGet(docsRev)))
@@ -3541,32 +3553,35 @@ def collectUseImportOccs(
     },
 }
 
-def inferModuleExportsName(inf: InferOutput, modKey: String, symName: String): Bool = {
+def inferModuleExportsName(inf: InferOutput, exports: StrMap String, modKey: String, symName: String): Bool = {
     let want = modKey + "." + symName;
-    let cur = cellNew(inf.defs);
-    let found = cellNew(false);
-    while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
-        match cellGet(cur) {
-            Cons(d, r) -> {
-                if (isPublicVis(d.vis) && (d.ident == want || defHasVariant(d, want) || defHasMethod(d, want))) {
-                    cellSet(found, true)
-                } else ();
-                cellSet(cur, r)
+    if (strMapContains(exports, want)) true
+    else {
+        let cur = cellNew(inf.defs);
+        let found = cellNew(false);
+        while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(d, r) -> {
+                    if (isPublicVis(d.vis) && (d.ident == want || defHasVariant(d, want) || defHasMethod(d, want))) {
+                        cellSet(found, true)
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(found)) true
+        else match builtinModuleSource(modKey) {
+            Some(msrc) if (strContains(msrc, symName)) -> match parseFileModuleInFile(msrc, Nil, 0) {
+                Ok(fm) -> moduleItemsExportName(fm.items, symName),
+                Err(_) -> false,
             },
-            Nil -> (),
+            _ -> false,
         }
-    };
-    if (cellGet(found)) true
-    else match builtinModuleSource(modKey) {
-        Some(msrc) if (strContains(msrc, symName)) -> match parseFileModuleInFile(msrc, Nil, 0) {
-            Ok(fm) -> moduleItemsExportName(fm.items, symName),
-            Err(_) -> false,
-        },
-        _ -> false,
     }
 }
 
-def moduleHasBindingNamed(inf: InferOutput, items: List ModuleItem, name: String, skipDefStart: Int, skipDefEnd: Int): Bool = {
+def moduleHasBindingNamed(inf: InferOutput, exports: StrMap String, items: List ModuleItem, name: String, skipDefStart: Int, skipDefEnd: Int): Bool = {
     let cur = cellNew(items);
     let found = cellNew(false);
     while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -3578,7 +3593,6 @@ def moduleHasBindingNamed(inf: InferOutput, items: List ModuleItem, name: String
                         cellSet(found, true)
                     } else ()
                 } else {
-                    // Within same data/concept def, check if another variant/method already has `name`
                     if (d.ident == name || defHasVariant(d, name) || defHasMethod(d, name)) {
                         cellSet(found, true)
                     } else ()
@@ -3604,7 +3618,7 @@ def moduleHasBindingNamed(inf: InferOutput, items: List ModuleItem, name: String
                         }
                     },
                     UseGlob(segs) ->
-                        if (inferModuleExportsName(inf, strJoin(segs, "."), name)) cellSet(found, true) else (),
+                        if (inferModuleExportsName(inf, exports, strJoin(segs, "."), name)) cellSet(found, true) else (),
                 };
                 cellSet(cur, r)
             },
@@ -3615,7 +3629,13 @@ def moduleHasBindingNamed(inf: InferOutput, items: List ModuleItem, name: String
     cellGet(found)
 }
 
-def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName: String): Bool = {
+def exportResolvesToTarget(exports: StrMap String, exportKey: String, targetQn: String): Bool =
+    match strMapGet(exports, exportKey) {
+        Some(qn) -> qn == targetQn,
+        None -> false,
+    }
+
+def docImportsTargetUnaliased(exports: StrMap String, items: List ModuleItem, targetQn: String, origName: String): Bool = {
     let targetMod = qnameModulePrefix(targetQn);
     let cur = cellNew(items);
     let found = cellNew(false);
@@ -3623,17 +3643,26 @@ def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName
         match cellGet(cur) {
             Cons(ModUse(_, u), r) -> {
                 match u {
-                    UseSingle(segs, _) ->
-                        if (strJoin(segs, ".") == targetQn) cellSet(found, true) else (),
-                    UseGlob(segs) ->
-                        if (strLen(targetMod) > 0 && strJoin(segs, ".") == targetMod) cellSet(found, true) else (),
-                    UseMulti(modSegs, specs) if (strJoin(modSegs, ".") == targetMod) -> {
+                    UseSingle(segs, _) -> {
+                        let full = strJoin(segs, ".");
+                        if (full == targetQn || exportResolvesToTarget(exports, full, targetQn)) cellSet(found, true) else ()
+                    },
+                    UseGlob(segs) -> {
+                        let mk = strJoin(segs, ".");
+                        if ((strLen(targetMod) > 0 && mk == targetMod) || exportResolvesToTarget(exports, mk + "." + origName, targetQn)) {
+                            cellSet(found, true)
+                        } else ()
+                    },
+                    UseMulti(modSegs, specs) -> {
+                        let mk = strJoin(modSegs, ".");
                         let cs = cellNew(specs);
                         while (!cellGet(found) && match cellGet(cs) { Nil -> false, _ -> true }) {
                             match cellGet(cs) {
                                 Cons(sp, rs) -> {
                                     if (sp.orig == origName && match sp.alias { None -> true, Some(_) -> false }) {
-                                        cellSet(found, true)
+                                        if (mk == targetMod || exportResolvesToTarget(exports, mk + "." + sp.orig, targetQn)) {
+                                            cellSet(found, true)
+                                        } else ()
                                     } else ();
                                     cellSet(cs, rs)
                                 },
@@ -3652,8 +3681,8 @@ def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName
     cellGet(found)
 }
 
-def checkScopeUnaliasedImportConflict(inf: InferOutput, items: List ModuleItem, targetQn: String, origName: String, newName: String): Bool = {
-    if (docImportsTargetUnaliased(items, targetQn, origName) && moduleHasBindingNamed(inf, items, newName, -1, -1)) {
+def checkScopeUnaliasedImportConflict(inf: InferOutput, exports: StrMap String, items: List ModuleItem, targetQn: String, origName: String, newName: String): Bool = {
+    if (docImportsTargetUnaliased(exports, items, targetQn, origName) && moduleHasBindingNamed(inf, exports, items, newName, -1, -1)) {
         true
     } else {
         let cur = cellNew(items);
@@ -3661,7 +3690,7 @@ def checkScopeUnaliasedImportConflict(inf: InferOutput, items: List ModuleItem, 
         while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(ModSub(_, _, subItems, _), r) -> {
-                    if (checkScopeUnaliasedImportConflict(inf, subItems, targetQn, origName, newName)) {
+                    if (checkScopeUnaliasedImportConflict(inf, exports, subItems, targetQn, origName, newName)) {
                         cellSet(found, true)
                     } else ();
                     cellSet(cur, r)
@@ -3945,10 +3974,10 @@ def collectSymbolOccurrences(
                                         SkTopDef -> match wd.wdParsed {
                                             Some(fm) ->
                                                 if (wd.wdCanon == target.stDeclCanon) {
-                                                    if (moduleHasBindingNamed(inf, fm.items, nn, target.stDeclDefStart, target.stDeclDefEnd)) {
+                                                    if (moduleHasBindingNamed(inf, wd.wdExports, fm.items, nn, target.stDeclDefStart, target.stDeclDefEnd)) {
                                                         cellSet(conflict, Some("Symbol '" + nn + "' already exists in this module"))
                                                     } else ()
-                                                } else if (checkScopeUnaliasedImportConflict(inf, fm.items, targetQn, target.stName, nn)) {
+                                                } else if (checkScopeUnaliasedImportConflict(inf, wd.wdExports, fm.items, targetQn, target.stName, nn)) {
                                                     cellSet(conflict, Some("Renaming to '" + nn + "' conflicts with an existing binding in '" + wd.wdPath + "'"))
                                                 } else (),
                                             None -> (),

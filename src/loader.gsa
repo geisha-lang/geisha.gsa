@@ -81,6 +81,9 @@ extern "gs_sys_realpath" def c_loader_realpath(path: String): Ptr
 extern "free" def c_loader_free(p: Ptr): Void
 
 def gLoaderOverlays: Cell (StrMap String) = cellNew(strMapNew())
+def gLoaderLastExports: Cell (StrMap String) = cellNew(strMapNew())
+
+pub def loaderLastPublicExports(): StrMap String = cellGet(gLoaderLastExports)
 
 def normalizeOverlayPath(path: String): String = {
     let n = strLen(path);
@@ -1947,6 +1950,19 @@ def compileLoadedCache(
             Nil -> (),
         }
     };
+
+    let pubExp: StrMap String = strMapNew();
+    let ekLen = vecLen(allExportKeys);
+    let ekIdx = cellNew(0);
+    while (cellGet(ekIdx) < ekLen) {
+        let ek = vecGetOr(allExportKeys, cellGet(ekIdx), "");
+        match strMapGet(avail, ek) {
+            Some(info) if (info.isPublic) -> strMapInsert(pubExp, ek, info.qualifiedName),
+            _ -> (),
+        };
+        cellSet(ekIdx, cellGet(ekIdx) + 1)
+    };
+    cellSet(gLoaderLastExports, pubExp);
 
     match cellGet(errFinal) {
         Some(e) -> Err(e),
