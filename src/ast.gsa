@@ -325,9 +325,15 @@ pub data MethodImpl {
     MkMethodImpl { implName: String, implBody: Form },
 }
 
+pub data DefAttr {
+    AttrExport(Option String),
+    AttrCtor(Int),
+    AttrCStruct,
+}
+
 pub data Item {
     ItForm(Form),
-    ItExtern(String, Scheme, Bool),
+    ItExtern(String, Scheme, Bool, Bool),
     ItAlias(List String, Scheme),
     ItAlg(List String, List VariantDef),
     ItConcept(List String, List ConstraintSpec, List FunDep, List MethodDecl),
@@ -335,7 +341,7 @@ pub data Item {
 }
 
 pub data Def {
-    MkDef { ident: String, dpos: Span, vis: Visibility, item: Item },
+    MkDef { ident: String, dpos: Span, vis: Visibility, attrs: List DefAttr, item: Item },
 }
 
 pub data UseSpec {

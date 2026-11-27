@@ -292,19 +292,36 @@ A type `T` is `Send` if:
 
 ---
 
-## 11. C FFI & Compilation Targets
+## 11. C FFI, Objective-C Interop & Compilation Targets
 
-### 11.1 `extern` Declarations
+### 11.1 `extern`, Indirect Function Pointers & Pure C ABI
 ```geisha
 extern "strlen" def c_strlen(s: Ptr): Int64
+extern ptr def call_imp(fn: Ptr, obj: Ptr, sel: Ptr): Ptr
+
+@cstruct
+pub data CGPoint { x: Float, y: Float }
+
+@export("my_c_add")
+pub def myAdd(a: Int, b: Int): Int = a + b
+
+@ctor
+def registerRuntimeClasses(): Void = ()
 ```
+- Multiple `extern` declarations may alias the same C symbol (such as `"objc_msgSend"`) with distinct non-variadic signatures.
+- `extern ptr [noalloc] def ...` invokes parameter 0 (`Ptr`) as a typed C function pointer.
+- `@export` / `@export("sym")` emits a pure C ABI symbol without a trailing closure-environment parameter, automatically wrapped in `gc_host_enter`/`gc_host_leave`.
+- `cFnPtr(fn)` obtains a C function pointer (`Ptr`) for an `extern` function or a top-level monomorphic Geisha function (synthesizing a C ABI callback trampoline).
+- `@cstruct` enforces C ABI value-struct layout & calling conventions (ARM64 HFA / SysV AMD64 / `sret` / `byval`) across FFI boundaries.
+- `@ctor` / `@ctor(priority)` registers a `() -> Void` static constructor in `@llvm.global_ctors`.
 - `ForeignPtr` parameters in `extern` calls can auto-borrow as `ScopedPtr` with compiler-inserted keep-alives.
-- `gcHandleNew`, `gcHandleGet`, and `gcHandleFree` pin GC-managed values across C callbacks.
+- `gcHandleNew`, `gcHandleGet`, and `gcHandleFree` pin GC-managed values across C/ObjC callbacks.
 
 ### 11.2 Targets
 - `native` (default): Host executable, object file (`-c`), or static/shared library (`--no-main`, `--export <fn>`, `--boot-sym <sym>`).
 - `wasm32`: Freestanding WebAssembly module (`--target=wasm32 -mbulk-memory -mnontrapping-fptoint`) linked against `wasm_rt.o`, with configurable `exports` and `web_assets`.
 - `ios` / `ios-sim`: ARM64 iOS device (`arm64-apple-ios16.0`) and simulator (`arm64-apple-ios16.0-simulator`) static archives (`libgeisha_runtime_ios.a` / `libgeisha_runtime_ios_sim.a`) for embedding into Xcode/Swift hosts.
+- `macos-app` / `ios-app` / `ios-sim-app`: Native Apple `.app` and `.appex` bundles configured via `[target.macos]` / `[target.ios]` in `geisha.toml` (with `Info.plist`, frameworks, resources, nested `PlugIns/*.appex`, and `codesign`).
 
 ---
 

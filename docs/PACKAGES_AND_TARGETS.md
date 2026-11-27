@@ -110,7 +110,7 @@ Requires LLVM `clang` with `wasm32` target support and `wasm-ld` (`lld`), plus `
 
 ---
 
-## 4. iOS & iOS Simulator (`ios` / `ios-sim`)
+## 4. iOS, macOS `.app` & `.appex` Bundles (`ios`, `ios-sim`, `macos-app`, `ios-app`, `ios-sim-app`)
 
 Build static runtime archives once in `geisha.gsa`:
 ```sh
@@ -118,11 +118,46 @@ make runtime-ios runtime-ios-sim
 make install
 ```
 
-Then compile your Geisha library/app as a static archive (`.a`) with `--no-main` and `--export` for linking into an Xcode target:
-
+### Static Libraries (for Xcode / Swift embedding)
 ```sh
 geisha build --target ios --no-main --export app_init --export app_step -o build/libapp_ios.a
 geisha build --target ios-sim --no-main --export app_init --export app_step -o build/libapp_iossim.a
+```
+
+### Native Apple App & App Extension Bundles (Pure Geisha, No Xcode Project Needed)
+Configure `[target.macos]` and/or `[target.ios]` in `geisha.toml`:
+
+```toml
+[target.macos]
+bundle_id    = "com.example.myapp"
+bundle_name  = "MyApp"
+min_os       = "14.0"
+frameworks   = ["Cocoa", "QuartzCore", "ScreenCaptureKit"]
+lsui_element = true
+icon         = "Resources/AppIcon.icns"
+resources    = ["Resources/Dicts"]
+entitlements = "Resources/app.entitlements"
+codesign     = "-"
+
+[target.ios]
+bundle_id            = "com.example.myapp"
+bundle_name          = "MyApp"
+min_os               = "16.0"
+frameworks           = ["UIKit", "Foundation", "QuartzCore"]
+is_extension         = false         # set true for `.appex` (`-fapplication-extension -e _NSExtensionMain`)
+principal_class      = "MyController"
+provisioning_profile = "iOS/embedded.mobileprovision"
+embed_extensions     = ["../my_keyboard/build/MyKeyboard.appex"]
+codesign             = "-"
+```
+
+Build and run directly from the CLI:
+```sh
+geisha build --target macos-app
+geisha run --target macos-app
+geisha build --target ios-sim-app
+geisha run --target ios-sim-app
+geisha build --target ios-app
 ```
 
 ---

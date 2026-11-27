@@ -1,0 +1,34 @@
+/// Low-level C FFI utilities: dynamic library loading (`dlopen`/`dlsym`),
+/// C string conversions, and scoped foreign pointer helpers.
+
+use std.option.{Option, Some, None}
+
+extern "gs_dlopen" def c_dlopen(path: String): Ptr
+extern "gs_dlsym" def c_dlsym(handle: Ptr, sym: String): Ptr
+extern "gs_dlclose" def c_dlclose(handle: Ptr): Int
+
+/// Open a shared library or framework by path (e.g. `"/System/Library/Frameworks/AppKit.framework/AppKit"`).
+/// Returns `None` if loading fails.
+pub def dlOpen(path: String): Option Ptr = {
+    let h = c_dlopen(path);
+    if (ptrIsNull(h)) None else Some(h)
+}
+
+/// Open the current process image (`dlopen(NULL, ...)`), useful for resolving already-linked symbols.
+pub def dlOpenSelf(): Ptr = c_dlopen("")
+
+/// Resolve a C symbol address from a library handle (or pass `ptrNull()` for `RTLD_DEFAULT`).
+pub def dlSym(handle: Ptr, symbol: String): Option Ptr = {
+    let p = c_dlsym(handle, symbol);
+    if (ptrIsNull(p)) None else Some(p)
+}
+
+/// Close a handle previously returned by `dlOpen`.
+pub def dlClose(handle: Ptr): Void = {
+    let _ = c_dlclose(handle);
+    ()
+}
+
+/// Convert a nullable C `const char *` pointer into `Option String`.
+pub def ptrToStrOpt(p: Ptr): Option String =
+    if (ptrIsNull(p)) None else Some(ptrToString(p))

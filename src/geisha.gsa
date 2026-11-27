@@ -9,9 +9,9 @@ use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend}
 use std.vec.{vecLen, vecGetOr}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
-use std.str.{strStartsWith, strIndexOfByte, strSplitChar, strJoin, intToStr}
+use std.str.{strStartsWith, strEndsWith, strIndexOfByte, strSplitChar, strJoin, intToStr}
 use std.sha256.sha256Hex
-use std.path.{pathStem, pathJoin, pathDirname}
+use std.path.{pathStem, pathJoin, pathDirname, pathBasename}
 use sys.env.{argCount, argAt, getEnv}
 use sys.fs.{readFile, writeFile, removeFile, fileExists, mkdirAll}
 use sys.io.eprintLn
@@ -24,12 +24,13 @@ use loader.{
 use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
-use codegen.emitProgramLlvmIrOpts
+use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch}
 use doc.cmdDoc
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
-    NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, CompileCallbacks, MkCompileCallbacks,
+    NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, AppleBundleCfg, MkAppleBundleCfg,
+    CompileCallbacks, MkCompileCallbacks,
     shellQuote, geishaHomeDir, findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, resolveDefaultEntryFile,
     cmdInit, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
 }
@@ -93,6 +94,10 @@ def isSubcommandWord(w: String): Bool =
     || w == "test"
     || w == "doc"
     || w == "guide"
+
+def isSupportedTarget(t: String): Bool =
+    t == "native" || t == "wasm32" || t == "ios" || t == "ios-sim"
+    || t == "macos-app" || t == "ios-app" || t == "ios-sim-app"
 
 def parsePkgFlagSpec(spec: String): Result (String, String) String =
     match strIndexOfByte(spec, 61, 0) {
@@ -197,11 +202,11 @@ def parseCliArgs(): Result CliOpts String = {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing output path after '--dump-core'"))
                 else { cellSet(dumpCore, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
             } else if (a == "--target") {
-                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim)"))
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
                 else {
                     let t = argAt(cellGet(i) + 1);
-                    if (t == "native" || t == "wasm32" || t == "ios" || t == "ios-sim") { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
-                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected 'native', 'wasm32', 'ios', or 'ios-sim')"))
+                    if (isSupportedTarget(t)) { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
+                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
                 }
             } else if (a == "--export") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing function name after '--export'"))
@@ -308,11 +313,11 @@ def parseCliArgs(): Result CliOpts String = {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing output path after '--dump-core'"))
                 else { cellSet(dumpCore, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
             } else if (a == "--target") {
-                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim)"))
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
                 else {
                     let t = argAt(cellGet(i) + 1);
-                    if (t == "native" || t == "wasm32" || t == "ios" || t == "ios-sim") { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
-                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected 'native', 'wasm32', 'ios', or 'ios-sim')"))
+                    if (isSupportedTarget(t)) { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
+                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
                 }
             } else if (a == "--export") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing function name after '--export'"))
@@ -511,10 +516,11 @@ def maybeDumpCoreIr(coreProg: core.CoreProgram, dumpCoreOpt: Option String): Res
         None -> Ok(()),
     }
 
-def compileLoadedDefsToIr(
+def compileLoadedDefsToIrForArch(
     rawDefs: List ast.Def,
     dumpCoreOpt: Option String,
     isWasm: Bool,
+    targetArch: String,
     exports: List String,
     noMain: Bool,
     bootSymOpt: Option String
@@ -522,8 +528,20 @@ def compileLoadedDefsToIr(
     let inf = inferProgram(rawDefs)?;
     let coreProg = lowerToCore(inf)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
-    Ok(emitProgramLlvmIrOpts(coreProg, isWasm, exports, noMain, bootSymOpt))
+    Ok(emitProgramLlvmIrForArch(coreProg, isWasm, targetArch, exports, noMain, bootSymOpt))
 }
+
+def compileLoadedDefsToIr(
+    rawDefs: List ast.Def,
+    dumpCoreOpt: Option String,
+    isWasm: Bool,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): Result String String =
+    compileLoadedDefsToIrForArch(
+        rawDefs, dumpCoreOpt, isWasm, if (isWasm) "wasm32" else currentHostArch(), exports, noMain, bootSymOpt
+    )
 
 def buildCliPkgGraph(
     entryFile: String,
@@ -611,7 +629,7 @@ def buildCliPkgGraph(
     (rootSpec, cellGet(extSpecs))
 }
 
-def compileWithPkgSpecsToIr(
+def compileWithPkgSpecsToIrForArch(
     entryFile: String,
     useProjectLoader: Bool,
     rootSpec: PkgSpec,
@@ -619,6 +637,7 @@ def compileWithPkgSpecsToIr(
     libPaths: List String,
     dumpCoreOpt: Option String,
     isWasm: Bool,
+    targetArch: String,
     exports: List String,
     noMain: Bool,
     bootSymOpt: Option String
@@ -630,8 +649,25 @@ def compileWithPkgSpecsToIr(
             let src = readFile(entryFile)?;
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
-    compileLoadedDefsToIr(rawDefs, dumpCoreOpt, isWasm, exports, noMain, bootSymOpt)
+    compileLoadedDefsToIrForArch(rawDefs, dumpCoreOpt, isWasm, targetArch, exports, noMain, bootSymOpt)
 }
+
+def compileWithPkgSpecsToIr(
+    entryFile: String,
+    useProjectLoader: Bool,
+    rootSpec: PkgSpec,
+    extSpecs: List PkgSpec,
+    libPaths: List String,
+    dumpCoreOpt: Option String,
+    isWasm: Bool,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): Result String String =
+    compileWithPkgSpecsToIrForArch(
+        entryFile, useProjectLoader, rootSpec, extSpecs, libPaths, dumpCoreOpt,
+        isWasm, if (isWasm) "wasm32" else currentHostArch(), exports, noMain, bootSymOpt
+    )
 
 def jsonEscapeStr(s: String): String = {
     let b = bufNew();
@@ -943,6 +979,226 @@ def emitWasmFromIr(
     }
 }
 
+def generateDefaultMacosPlist(
+    bundleId: String,
+    bundleName: String,
+    version: String,
+    minOs: String,
+    lsuiElement: Bool,
+    iconFileOpt: Option String
+): String = {
+    let b = bufNew();
+    bufPushStr(b, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    bufPushStr(b, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    bufPushStr(b, "<plist version=\"1.0\">\n<dict>\n");
+    bufPushStr(b, "  <key>CFBundleDevelopmentRegion</key><string>en</string>\n");
+    bufPushStr(b, "  <key>CFBundleExecutable</key><string>" + bundleName + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleIdentifier</key><string>" + bundleId + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n");
+    bufPushStr(b, "  <key>CFBundleName</key><string>" + bundleName + "</string>\n");
+    bufPushStr(b, "  <key>CFBundlePackageType</key><string>APPL</string>\n");
+    bufPushStr(b, "  <key>CFBundleShortVersionString</key><string>" + version + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleVersion</key><string>" + version + "</string>\n");
+    bufPushStr(b, "  <key>LSMinimumSystemVersion</key><string>" + minOs + "</string>\n");
+    bufPushStr(b, "  <key>NSHighResolutionCapable</key><true/>\n");
+    if (lsuiElement) bufPushStr(b, "  <key>LSUIElement</key><true/>\n") else ();
+    match iconFileOpt {
+        Some(ic) -> bufPushStr(b, "  <key>CFBundleIconFile</key><string>" + ic + "</string>\n"),
+        None -> (),
+    };
+    bufPushStr(b, "</dict>\n</plist>\n");
+    bufToString(b)
+}
+
+def generateDefaultIosPlist(
+    bundleId: String,
+    bundleName: String,
+    version: String,
+    minOs: String,
+    isExtension: Bool,
+    principalClassOpt: Option String
+): String = {
+    let b = bufNew();
+    bufPushStr(b, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    bufPushStr(b, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+    bufPushStr(b, "<plist version=\"1.0\">\n<dict>\n");
+    bufPushStr(b, "  <key>CFBundleDevelopmentRegion</key><string>en</string>\n");
+    bufPushStr(b, "  <key>CFBundleExecutable</key><string>" + bundleName + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleIdentifier</key><string>" + bundleId + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>\n");
+    bufPushStr(b, "  <key>CFBundleName</key><string>" + bundleName + "</string>\n");
+    bufPushStr(b, "  <key>CFBundlePackageType</key><string>" + (if (isExtension) "XPC!" else "APPL") + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleShortVersionString</key><string>" + version + "</string>\n");
+    bufPushStr(b, "  <key>CFBundleVersion</key><string>" + version + "</string>\n");
+    bufPushStr(b, "  <key>MinimumOSVersion</key><string>" + minOs + "</string>\n");
+    bufPushStr(b, "  <key>LSRequiresIPhoneOS</key><true/>\n");
+    bufPushStr(b, "  <key>UILaunchScreen</key><dict/>\n");
+    if (isExtension) {
+        let pCls = match principalClassOpt { Some(c) -> c, None -> bundleName + "ViewController" };
+        bufPushStr(b, "  <key>NSExtension</key>\n  <dict>\n");
+        bufPushStr(b, "    <key>NSExtensionPointIdentifier</key><string>com.apple.keyboard-service</string>\n");
+        bufPushStr(b, "    <key>NSExtensionPrincipalClass</key><string>" + pCls + "</string>\n");
+        bufPushStr(b, "  </dict>\n")
+    } else ();
+    bufPushStr(b, "</dict>\n</plist>\n");
+    bufToString(b)
+}
+
+def copyPathsIntoDir(paths: List String, dstDir: String): Result Void String = match paths {
+    Nil -> Ok(()),
+    Cons(src, rest) -> {
+        let cmd = "cp -R " + shellQuote(src) + " " + shellQuote(dstDir) + "/";
+        if (shell(cmd) != 0) Err("failed to copy bundle resource '" + src + "' into '" + dstDir + "'")
+        else copyPathsIntoDir(rest, dstDir)
+    },
+}
+
+def emitAppleBundleFromIr(
+    target: String,
+    llText: String,
+    tc: TargetCfg,
+    ab: AppleBundleCfg,
+    pkgName: String,
+    pkgVersion: String,
+    outDirOrBundleOpt: Option String,
+    rtOverrideOpt: Option String
+): Result String String = {
+    if (currentHostOs() != "macos") {
+        Err("Apple bundle target '" + target + "' requires macOS with Xcode Command Line Tools")
+    } else {
+        let isMacos = target == "macos-app";
+        let isIosSim = target == "ios-sim-app";
+        let isExt = !isMacos && ab.abIsExtension;
+        let bundleName = match ab.abBundleName { Some(n) -> n, None -> pkgName };
+        let bundleId = match ab.abBundleId { Some(id) -> id, None -> "com.geisha." + pkgName };
+        let version = match ab.abVersion { Some(v) -> v, None -> pkgVersion };
+        let minOs = match ab.abMinOs { Some(m) -> m, None -> if (isMacos) "14.0" else "16.0" };
+        let extSuffix = if (isExt) ".appex" else ".app";
+        let bundlePath = match outDirOrBundleOpt {
+            Some(p) ->
+                if (strEndsWith(p, ".app") || strEndsWith(p, ".appex")) p
+                else pathJoin(p, bundleName + extSuffix),
+            None -> bundleName + extSuffix,
+        };
+        let contentsDir = if (isMacos) pathJoin(bundlePath, "Contents") else bundlePath;
+        let execDir = if (isMacos) pathJoin(contentsDir, "MacOS") else bundlePath;
+        let resDir = if (isMacos) pathJoin(contentsDir, "Resources") else bundlePath;
+        let binPath = pathJoin(execDir, bundleName);
+        mkdirAll(execDir)?;
+        mkdirAll(resDir)?;
+
+        let rtTarget = if (isMacos) "native" else if (isIosSim) "ios-sim" else "ios";
+        let rtArchive = resolveRuntimeArchiveForTarget(rtTarget, rtOverrideOpt)?;
+        let tmpLl = binPath + ".tmp.ll";
+        let tmpObj = binPath + ".tmp.o";
+        writeFile(tmpLl, llText)?;
+
+        let hostArch = currentHostArch();
+        let compilePrefix =
+            if (isMacos) {
+                "MACOSX_DEPLOYMENT_TARGET=" + minOs + " " + shellQuote(resolveNativeCc())
+                + " -target " + hostArch + "-apple-macosx" + minOs
+            } else if (isIosSim) {
+                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=" + minOs
+                + " xcrun --sdk iphonesimulator clang -target arm64-apple-ios" + minOs + "-simulator"
+            } else {
+                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=" + minOs
+                + " xcrun --sdk iphoneos clang -target arm64-apple-ios" + minOs
+            };
+        let extFlags = if (isExt) " -fapplication-extension" else "";
+        let extLinkFlags = if (isExt) " -fapplication-extension -e _NSExtensionMain" else "";
+
+        let cmdObj =
+            compilePrefix + extFlags + " -O2 -Wno-override-module -x ir -c "
+            + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
+        let rc1 = shell(cmdObj);
+        let _ = removeFile(tmpLl);
+        if (rc1 != 0) {
+            let _ = removeFile(tmpObj);
+            Err("LLVM backend failed compiling object for Apple bundle '" + bundlePath + "'")
+        } else {
+            let cmdLink =
+                compilePrefix + extLinkFlags + " -O2 -pthread"
+                + shellQuoteArgs(tc.tcCFlags)
+                + shellQuoteArgs(tc.tcCSources)
+                + " " + shellQuote(tmpObj)
+                + " " + shellQuote(rtArchive)
+                + " -lobjc"
+                + shellQuoteArgs(tc.tcLinkFlags)
+                + " -o " + shellQuote(binPath);
+            let rc2 = shell(cmdLink);
+            let _ = removeFile(tmpObj);
+            if (rc2 != 0) {
+                Err("Linker failed while building Apple bundle '" + bundlePath + "'")
+            } else {
+                // Copy icon & resources
+                let iconFileOpt = match ab.abIcon {
+                    Some(icPath) -> {
+                        let _ = copyPathsIntoDir([icPath], resDir)?;
+                        Some(pathBasename(icPath))
+                    },
+                    None -> None,
+                };
+                let _ = copyPathsIntoDir(ab.abResources, resDir)?;
+
+                // Write or copy Info.plist
+                let plistDst = pathJoin(contentsDir, "Info.plist");
+                let _ = match ab.abInfoPlist {
+                    Some(srcPlist) -> {
+                        let rawP = readFile(srcPlist)?;
+                        writeFile(plistDst, rawP)
+                    },
+                    None -> {
+                        let genP =
+                            if (isMacos) generateDefaultMacosPlist(bundleId, bundleName, version, minOs, ab.abLsuiElement, iconFileOpt)
+                            else generateDefaultIosPlist(bundleId, bundleName, version, minOs, isExt, ab.abPrincipalClass);
+                        writeFile(plistDst, genP)
+                    },
+                }?;
+
+                // Copy iOS provisioning profile if provided
+                let _ = match ab.abProvisioningProfile {
+                    Some(prov) -> {
+                        let dstProv = pathJoin(bundlePath, "embedded.mobileprovision");
+                        if (shell("cp " + shellQuote(prov) + " " + shellQuote(dstProv)) != 0) {
+                            Err("failed to copy provisioning profile '" + prov + "'")
+                        } else Ok(())
+                    },
+                    None -> Ok(()),
+                }?;
+
+                // Embed nested extensions (e.g. PlugIns/JuxuKeyboard.appex)
+                let _ = match ab.abEmbedExtensions {
+                    Nil -> Ok(()),
+                    exts -> {
+                        let pluginsDir = pathJoin(contentsDir, "PlugIns");
+                        mkdirAll(pluginsDir)?;
+                        copyPathsIntoDir(exts, pluginsDir)
+                    },
+                }?;
+
+                // Code sign bundle
+                let signId = match ab.abCodesign { Some(s) -> s, None -> "-" };
+                if (strLen(signId) > 0 && signId != "none") {
+                    let entFlag = match ab.abEntitlements {
+                        Some(ep) -> " --entitlements " + shellQuote(ep),
+                        None -> "",
+                    };
+                    let rtOptFlag = if (isMacos && signId != "-") " --options runtime" else "";
+                    let signCmd =
+                        "codesign --force --sign " + shellQuote(signId)
+                        + rtOptFlag + entFlag + " " + shellQuote(bundlePath);
+                    if (shell(signCmd) != 0) {
+                        Err("codesign failed for Apple bundle '" + bundlePath + "'")
+                    } else Ok(bundlePath)
+                } else {
+                    Ok(bundlePath)
+                }
+            }
+        }
+    }
+}
+
 def makeCompileCallbacks(): CompileCallbacks = MkCompileCallbacks {
     cbCompileNativeExe: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt, rtOpt) -> {
         let llText = compileWithPkgSpecsToIr(
@@ -967,6 +1223,23 @@ def makeCompileCallbacks(): CompileCallbacks = MkCompileCallbacks {
         )?;
         let outWasm = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + (if (compOnly) ".o" else ".wasm") };
         emitWasmFromIr(llText, outWasm, compOnly, tc, rtOpt)
+    },
+    cbCompileAppleBundle: (target, entryFile, rootSpec, extSpecs, tc, ab, pkgName, pkgVersion, outOpt, dumpCoreOpt, rtOpt) -> {
+        let noMainFlag = tc.tcOwnsMain || (target != "macos-app" && ab.abIsExtension);
+        let arch = if (target == "macos-app") currentHostArch() else "arm64";
+        let llText = compileWithPkgSpecsToIrForArch(
+            entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
+            false, arch, tc.tcExports, noMainFlag, tc.tcBootSymbol
+        )?;
+        emitAppleBundleFromIr(target, llText, tc, ab, pkgName, pkgVersion, outOpt, rtOpt)
+    },
+    cbCompileTargetArchive: (target, entryFile, rootSpec, extSpecs, tc, outArc, dumpCoreOpt, rtOpt) -> {
+        let arch = if (target == "ios" || target == "ios-sim") "arm64" else currentHostArch();
+        let llText = compileWithPkgSpecsToIrForArch(
+            entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
+            false, arch, tc.tcExports, true, tc.tcBootSymbol
+        )?;
+        emitStaticLibFromIr(llText, outArc, target, rtOpt)
     },
     cbEmitIr: (entryFile, rootSpec, extSpecs, tc, isWasm, outOpt, dumpCoreOpt) -> {
         let llText = compileWithPkgSpecsToIr(
@@ -1165,7 +1438,7 @@ def printUsage(): Void = {
     printLn("Compiler Options:");
     printLn("  -e, --emit-llvm                Emit LLVM 20 textual IR (.ll) to stdout or -o <file.ll>");
     printLn("  --dump-core <file>             Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
-    printLn("  --target <native|wasm32>       Target platform (default: 'native')");
+    printLn("  --target <target>              native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app");
     printLn("  --export <fn>                  Export function symbol on native or wasm32 (repeatable)");
     printLn("  --no-main                      Omit C main() wrapper (for custom native host entry)");
     printLn("  --boot-sym <sym>               Emit custom native global initializer symbol");
@@ -1216,7 +1489,36 @@ def runDriver(): Result Int String = {
             Some("check") -> runCheckSubcmd(opts),
             Some("run") -> match opts.optInput {
                 Some(gsaFile) -> runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime),
-                None -> cmdRun(opts.optSubArgs, None, opts.optRuntime, cbs),
+                None ->
+                    if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {
+                        let projDir = match findProjectRoot(".") {
+                            Some(d) -> d,
+                            None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
+                        };
+                        let bundlePath = cmdBuildProject(
+                            projDir, opts.optTarget, false, false, opts.optOutPath, None,
+                            opts.optRuntime, opts.optExports, opts.optNoMain, opts.optBootSym, None, cbs
+                        )?;
+                        if (opts.optTarget == "macos-app") {
+                            let rc = shell("open " + shellQuote(bundlePath));
+                            Ok(if (rc == 0) 0 else 1)
+                        } else {
+                            let (rootMf, _, _) = resolveProjectGraph(projDir, false, None, false)?;
+                            let bid = match rootMf.mfIosBundle.abBundleId {
+                                Some(id) -> id,
+                                None -> "com.geisha." + rootMf.mfName,
+                            };
+                            let cmd =
+                                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl install booted "
+                                + shellQuote(bundlePath)
+                                + " && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl launch booted "
+                                + shellQuote(bid);
+                            let rc = shell(cmd);
+                            Ok(if (rc == 0) 0 else 1)
+                        }
+                    } else {
+                        cmdRun(opts.optSubArgs, None, opts.optRuntime, cbs)
+                    },
             },
             Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
@@ -1231,7 +1533,11 @@ def runDriver(): Result Int String = {
                 let isWasm = opts.optTarget == "wasm32";
                 let useProjLoader = match opts.optSrcRoot { Some(_) -> true, None -> false };
                 let (rootSpec, extSpecs) = buildCliPkgGraph(inputFile, opts.optSrcRoot, opts.optPkgFlags, opts.optDepFlags);
-                let llText = compileWithPkgSpecsToIr(
+                let arch =
+                    if (isWasm) "wasm32"
+                    else if (opts.optTarget == "ios" || opts.optTarget == "ios-sim" || opts.optTarget == "ios-app" || opts.optTarget == "ios-sim-app") "arm64"
+                    else currentHostArch();
+                let llText = compileWithPkgSpecsToIrForArch(
                     inputFile,
                     useProjLoader,
                     rootSpec,
@@ -1239,6 +1545,7 @@ def runDriver(): Result Int String = {
                     opts.optLibPaths,
                     opts.optDumpCore,
                     isWasm,
+                    arch,
                     opts.optExports,
                     opts.optNoMain,
                     opts.optBootSym

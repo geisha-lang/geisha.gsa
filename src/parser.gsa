@@ -25,6 +25,7 @@ use ast.{
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
     FunDep, MkFunDep,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct,
     Def, MkDef, UseSpec, MkUseSpec, UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
     ModuleItem, ModDef, ModUse, ModSub, ModDecl, FileModule, MkFileModule,
     encodeOpName, isDefinableOp, builtinBinOpFromStr, infixPrecedence, isRightAssocOp
@@ -1312,7 +1313,8 @@ def parseInfixPrec(p: Parser, minPrec: Int): Result Form String = {
         let t = peekTok(p);
         match t.kind {
             TkSym(op) -> {
-                let prec = infixPrecedence(op);
+                let isAttrStart = op == "@" && t.hadNewline;
+                let prec = if (isAttrStart) 0 else infixPrecedence(op);
                 if (prec < minPrec || prec == 0) {
                     cellSet(looping, false)
                 } else {
@@ -1425,7 +1427,7 @@ def parseFormDefBody(p: Parser, vis: Visibility, startSp: Span): Result Def Stri
             };
             let fullSp = unionSpan(startSp, body.pos);
             let form = MkForm { pos: body.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
-            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, item: ItForm(form) })
+            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: Nil, item: ItForm(form) })
         },
         _ -> {
             let valAnn: Option Scheme = if (eatSym(p, ":")) Some(parseTypeScheme(p)?) else None;
@@ -1433,10 +1435,66 @@ def parseFormDefBody(p: Parser, vis: Visibility, startSp: Span): Result Def Stri
             let val = parseExpr(p)?;
             let fullSp = unionSpan(startSp, val.pos);
             let annotatedVal = MkForm { pos: val.pos, ty: val.ty, annot: valAnn, node: val.node };
-            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, item: ItForm(annotatedVal) })
+            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: Nil, item: ItForm(annotatedVal) })
         },
     }
 }
+
+def parseDefAttrs(p: Parser): Result (List DefAttr) String = {
+    let acc = cellNew(Nil);
+    let going = cellNew(true);
+    while (cellGet(going)) {
+        match peekTok(p).kind {
+            TkSym(s) if (s == "@") -> {
+                let _ = bumpTok(p);
+                let attrName = parseIdent(p)?;
+                if (attrName == "export") {
+                    match peekTok(p).kind {
+                        TkLParen -> {
+                            let _ = bumpTok(p);
+                            let sym = match peekTok(p).kind {
+                                TkStr(cs) -> { let _ = bumpTok(p); Ok(cs) },
+                                _ -> Err(parseErr(p, "Expected string symbol name inside '@export(\"...\")'")),
+                            }?;
+                            let _ = expectRParen(p)?;
+                            cellSet(acc, listAppend(cellGet(acc), [AttrExport(Some(sym))]))
+                        },
+                        _ -> cellSet(acc, listAppend(cellGet(acc), [AttrExport(None)])),
+                    }
+                } else if (attrName == "ctor") {
+                    match peekTok(p).kind {
+                        TkLParen -> {
+                            let _ = bumpTok(p);
+                            let prio = match peekTok(p).kind {
+                                TkInt(ns) -> {
+                                    let _ = bumpTok(p);
+                                    match parseInt(ns) {
+                                        Ok(v) -> Ok(v),
+                                        Err(_) -> Err(parseErr(p, "Invalid integer priority in '@ctor(...)'")),
+                                    }
+                                },
+                                _ -> Err(parseErr(p, "Expected integer priority inside '@ctor(...)'")),
+                            }?;
+                            let _ = expectRParen(p)?;
+                            cellSet(acc, listAppend(cellGet(acc), [AttrCtor(prio)]))
+                        },
+                        _ -> cellSet(acc, listAppend(cellGet(acc), [AttrCtor(65535)])),
+                    }
+                } else if (attrName == "cstruct") {
+                    cellSet(acc, listAppend(cellGet(acc), [AttrCStruct]))
+                } else {
+                    let _ = returnAttrErr(p, attrName)?;
+                    cellSet(going, false)
+                }
+            },
+            _ -> cellSet(going, false),
+        }
+    };
+    Ok(cellGet(acc))
+}
+
+def returnAttrErr(p: Parser, attrName: String): Result Void String =
+    Err(parseErr(p, "Unknown attribute '@" + attrName + "' (supported: @export, @ctor, @cstruct)"))
 
 def tryParseForwardDecl(p: Parser): Option (String, Scheme) = {
     let snap = savePos(p);
@@ -1451,11 +1509,17 @@ def tryParseForwardDecl(p: Parser): Option (String, Scheme) = {
     }
 }
 
-pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def String = {
+pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def String =
+    parseDefinitionWithAttrs(p, knownVis, Nil)
+
+def parseDefinitionWithAttrs(p: Parser, knownVis: Option Visibility, preAttrs: List DefAttr): Result Def String = {
+    let extraAttrs = parseDefAttrs(p)?;
+    let attrs = listAppend(preAttrs, extraAttrs);
     // Check optional `name : Scheme` forward declaration before `[pub] def name ...`
-    let fwdOpt: Option (String, Scheme) = match knownVis {
-        Some(_) -> None,
-        None -> match peekTok(p).kind {
+    let fwdOpt: Option (String, Scheme) = match (knownVis, attrs) {
+        (Some(_), _) -> None,
+        (_, Cons(_, _)) -> None,
+        (None, Nil) -> match peekTok(p).kind {
             TkIdent(_) -> tryParseForwardDecl(p),
             TkLParen -> tryParseForwardDecl(p),
             _ -> None,
@@ -1475,7 +1539,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                     } else match d.item {
                         ItForm(f) -> {
                             let f2 = MkForm { pos: f.pos, ty: f.ty, annot: Some(fwdScm), node: f.node };
-                            Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItForm(f2) })
+                            Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: attrs, item: ItForm(f2) })
                         },
                         _ -> Ok(d),
                     }
@@ -1490,12 +1554,21 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                 None -> parseVisibility(p),
             };
             match peekTok(p).kind {
-                TkDef -> parseFormDefBody(p, vis, startSp),
+                TkDef -> {
+                    let d = parseFormDefBody(p, vis, startSp)?;
+                    Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: attrs, item: d.item })
+                },
                 TkExtern -> {
                     let _ = bumpTok(p);
-                    let isNoAlloc = match peekTok(p).kind {
-                        TkIdent(w) if (w == "noalloc") -> { let _ = bumpTok(p); true },
-                        _ -> false,
+                    let isNoAlloc = cellNew(false);
+                    let isFnPtr = cellNew(false);
+                    let modMore = cellNew(true);
+                    while (cellGet(modMore)) {
+                        match peekTok(p).kind {
+                            TkIdent(w) if (w == "noalloc") -> { let _ = bumpTok(p); cellSet(isNoAlloc, true) },
+                            TkIdent(w) if (w == "ptr") -> { let _ = bumpTok(p); cellSet(isFnPtr, true) },
+                            _ -> cellSet(modMore, false),
+                        }
                     };
                     let linkOpt: Option String = match peekTok(p).kind {
                         TkStr(s) -> { let _ = bumpTok(p); Some(s) },
@@ -1523,14 +1596,15 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                     let retTy = if (eatSym(p, ":")) parseTypeExpr(p)? else TyVoid;
                     let linkSym = match linkOpt {
                         Some(s) -> s,
-                        None -> fnName,
+                        None -> if (cellGet(isFnPtr)) "" else fnName,
                     };
                     let fnTy = TyArr(TyVoid, cellGet(ps), retTy);
                     Ok(MkDef {
                         ident: fnName,
                         dpos: unionSpan(startSp, closeSp),
                         vis: vis,
-                        item: ItExtern(linkSym, ScmMono(fnTy), isNoAlloc),
+                        attrs: attrs,
+                        item: ItExtern(linkSym, ScmMono(fnTy), cellGet(isNoAlloc), cellGet(isFnPtr)),
                     })
                 },
                 TkType -> {
@@ -1539,7 +1613,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                     let tparams = parseInlineTypeParams(p)?;
                     let _ = expectSym(p, "=")?;
                     let target = parseTypeScheme(p)?;
-                    Ok(MkDef { ident: tname, dpos: startSp, vis: vis, item: ItAlias(tparams, target) })
+                    Ok(MkDef { ident: tname, dpos: startSp, vis: vis, attrs: attrs, item: ItAlias(tparams, target) })
                 },
                 TkData -> {
                     let _ = bumpTok(p);
@@ -1648,6 +1722,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                     ident: "instance_" + cn,
                                     dpos: fullSp,
                                     vis: vis,
+                                    attrs: Nil,
                                     item: ItInstance(cn, [cellGet(targetTy)], cellGet(autoCs), Nil),
                                 };
                                 cellSet(p.pendingItems, listAppend(cellGet(p.pendingItems), [ModDef(vis, instDef)]));
@@ -1656,7 +1731,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                             Nil -> (),
                         }
                     };
-                    Ok(MkDef { ident: dname, dpos: fullSp, vis: vis, item: ItAlg(tparams, cellGet(variants)) })
+                    Ok(MkDef { ident: dname, dpos: fullSp, vis: vis, attrs: attrs, item: ItAlg(tparams, cellGet(variants)) })
                 },
                 TkConcept -> {
                     let _ = bumpTok(p);
@@ -1705,7 +1780,7 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         }
                     };
                     let closeSp = expectRBrace(p)?;
-                    Ok(MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItConcept(tparams, supers, fundeps, cellGet(methods)) })
+                    Ok(MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: attrs, item: ItConcept(tparams, supers, fundeps, cellGet(methods)) })
                 },
                 TkInstance -> {
                     let _ = bumpTok(p);
@@ -1751,9 +1826,9 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                 }
                             };
                             let closeSp = expectRBrace(p)?;
-                            Ok(MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, item: ItInstance(cname, cellGet(targs), cs, cellGet(impls)) })
+                            Ok(MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: attrs, item: ItInstance(cname, cellGet(targs), cs, cellGet(impls)) })
                         },
-                        _ -> Ok(MkDef { ident: instIdent, dpos: startSp, vis: vis, item: ItInstance(cname, cellGet(targs), cs, Nil) }),
+                        _ -> Ok(MkDef { ident: instIdent, dpos: startSp, vis: vis, attrs: attrs, item: ItInstance(cname, cellGet(targs), cs, Nil) }),
                     }
                 },
                 _ -> Err(parseErr(p, "expected top-level definition")),
@@ -1834,6 +1909,7 @@ def parseModPath(p: Parser): Result (List String) String = {
 
 def parseModuleItem(p: Parser): Result ModuleItem String = {
     let startSp = peekTok(p).span;
+    let preAttrs = parseDefAttrs(p)?;
     let visOpt: Option Visibility = match peekTok(p).kind {
         TkPub -> { let _ = bumpTok(p); Some(VisPublic) },
         _ -> None,
@@ -1842,46 +1918,53 @@ def parseModuleItem(p: Parser): Result ModuleItem String = {
         Some(v) -> v,
         None -> VisPrivate,
     };
-    match peekTok(p).kind {
-        TkUse -> {
-            let _ = bumpTok(p);
-            let u = parseUseStatement(p)?;
-            Ok(ModUse(vis, u))
-        },
-        TkOpen -> {
-            let _ = bumpTok(p);
-            let mp = parseModPath(p)?;
-            Ok(ModUse(vis, UseGlob(mp)))
-        },
-        TkMod -> {
-            let _ = bumpTok(p);
-            let mname = parseIdent(p)?;
-            match peekTok(p).kind {
-                TkLBrace -> {
-                    let _ = bumpTok(p);
-                    let subItems = cellNew(Nil);
-                    while ({ skipSemis(p); match peekTok(p).kind { TkRBrace -> false, TkEof -> false, _ -> true } }) {
-                        let it = parseModuleItem(p)?;
-                        cellSet(subItems, listAppend(cellGet(subItems), [it]));
-                        let pend = cellGet(p.pendingItems);
-                        cellSet(p.pendingItems, Nil);
-                        cellSet(subItems, listAppend(cellGet(subItems), pend));
-                        skipSemis(p)
-                    };
-                    let closeSp = expectRBrace(p)?;
-                    Ok(ModSub(vis, mname, cellGet(subItems), unionSpan(startSp, closeSp)))
-                },
-                _ -> Ok(ModDecl(vis, mname)),
-            }
-        },
-        _ -> {
-            let d = parseDefinition(p, visOpt)?;
+    match preAttrs {
+        Cons(_, _) -> {
+            let d = parseDefinitionWithAttrs(p, visOpt, preAttrs)?;
             Ok(ModDef(d.vis, d))
+        },
+        Nil -> match peekTok(p).kind {
+            TkUse -> {
+                let _ = bumpTok(p);
+                let u = parseUseStatement(p)?;
+                Ok(ModUse(vis, u))
+            },
+            TkOpen -> {
+                let _ = bumpTok(p);
+                let mp = parseModPath(p)?;
+                Ok(ModUse(vis, UseGlob(mp)))
+            },
+            TkMod -> {
+                let _ = bumpTok(p);
+                let mname = parseIdent(p)?;
+                match peekTok(p).kind {
+                    TkLBrace -> {
+                        let _ = bumpTok(p);
+                        let subItems = cellNew(Nil);
+                        while ({ skipSemis(p); match peekTok(p).kind { TkRBrace -> false, TkEof -> false, _ -> true } }) {
+                            let it = parseModuleItem(p)?;
+                            cellSet(subItems, listAppend(cellGet(subItems), [it]));
+                            let pend = cellGet(p.pendingItems);
+                            cellSet(p.pendingItems, Nil);
+                            cellSet(subItems, listAppend(cellGet(subItems), pend));
+                            skipSemis(p)
+                        };
+                        let closeSp = expectRBrace(p)?;
+                        Ok(ModSub(vis, mname, cellGet(subItems), unionSpan(startSp, closeSp)))
+                    },
+                    _ -> Ok(ModDecl(vis, mname)),
+                }
+            },
+            _ -> {
+                let d = parseDefinition(p, visOpt)?;
+                Ok(ModDef(d.vis, d))
+            },
         },
     }
 }
 
 def isTopLevelModuleItemStart(p: Parser): Bool = match peekTok(p).kind {
+    TkSym(s) if (s == "@") -> true,
     TkPub -> true,
     TkUse -> true,
     TkOpen -> true,
@@ -2013,6 +2096,7 @@ pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): R
                     ident: "main",
                     dpos: bodyForm.pos,
                     vis: VisPrivate,
+                    attrs: Nil,
                     item: ItForm(mainForm),
                 };
                 Ok(MkFileModule {
@@ -2456,7 +2540,7 @@ pub def desugarTryInDef(d: Def, okCtor: String, errCtor: String): Def =
     else {
         let ctx = MkTryCtx { okCtor: okCtor, errCtor: errCtor, counter: cellNew(0) };
         match d.item {
-            ItForm(f) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItForm(desugarResultScope(ctx, f)) },
+            ItForm(f) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: ItForm(desugarResultScope(ctx, f)) },
             ItInstance(cn, tas, cs, ms) -> {
                 let newMs = cellNew(Nil);
                 let cur = cellNew(ms);
@@ -2470,7 +2554,7 @@ pub def desugarTryInDef(d: Def, okCtor: String, errCtor: String): Def =
                         Nil -> (),
                     }
                 };
-                MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItInstance(cn, tas, cs, cellGet(newMs)) }
+                MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: ItInstance(cn, tas, cs, cellGet(newMs)) }
             },
             _ -> d,
         }
