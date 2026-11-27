@@ -370,6 +370,8 @@ static gs_cond_t _task_event_cv = GS_COND_INIT;
 static gs_task_t *_pool_q_head = NULL;
 static gs_task_t *_pool_q_tail = NULL;
 
+static int32_t _cached_hw_cpus = 0;
+
 int32_t gs_conc_num_cpu(void)
 {
     const char *env_t = getenv("GEISHA_THREADS");
@@ -377,6 +379,8 @@ int32_t gs_conc_num_cpu(void)
         int n = atoi(env_t);
         if (n >= 1 && n <= 256) return n;
     }
+    int32_t cached = __atomic_load_n(&_cached_hw_cpus, __ATOMIC_RELAXED);
+    if (cached > 0) return cached;
 #if defined(_WIN32)
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -384,9 +388,9 @@ int32_t gs_conc_num_cpu(void)
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
-    if (n < 2) return 2;
-    if (n > 64) return 64;
-    return (int32_t)n;
+    int32_t clamped = (n < 2) ? 2 : ((n > 64) ? 64 : (int32_t)n);
+    __atomic_store_n(&_cached_hw_cpus, clamped, __ATOMIC_RELAXED);
+    return clamped;
 }
 
 static gs_task_t *pool_pop_locked(void)
@@ -889,8 +893,12 @@ static void *tabulate_worker_entry(void *arg_void)
 void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_fn, void *cls_ptr)
 {
     if (n <= 0 || chunk_fn == NULL) return;
+    if (n < 64) {
+        chunk_fn(arr_ptr, 0, n, cls_ptr);
+        return;
+    }
     int32_t workers = gs_conc_num_cpu();
-    if (workers <= 1 || n < 64) {
+    if (workers <= 1) {
         chunk_fn(arr_ptr, 0, n, cls_ptr);
         return;
     }

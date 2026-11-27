@@ -111,6 +111,21 @@ int32_t gs_sys_getpid(void)
     return (int32_t)getpid();
 }
 
+int32_t gs_sys_shell(const char *cmd)
+{
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)cmd;
+    return -1;
+#else
+    if (cmd == NULL) return -1;
+    int raw = system(cmd);
+    if (raw < 0) return -1;
+    if (WIFEXITED(raw)) return (int32_t)WEXITSTATUS(raw);
+    if (WIFSIGNALED(raw)) return (int32_t)(128 + WTERMSIG(raw));
+    return raw;
+#endif
+}
+
 char *gs_sys_realpath(const char *path)
 {
     if (path == NULL || path[0] == '\0') return NULL;

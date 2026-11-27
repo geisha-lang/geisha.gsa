@@ -2173,3 +2173,13 @@ int32_t gs_pipe_poll2(int32_t fd0, int32_t fd1, int32_t timeout_ms)
         if (slice_ms < 4) slice_ms *= 2;
     }
 }
+
+int32_t gs_sys_shell(const char *cmd)
+{
+    if (cmd == NULL) return -1;
+    wchar_t *wcmd = gs_utf8_to_wide(cmd);
+    if (wcmd == NULL) return -1;
+    int rc = _wsystem(wcmd);
+    free(wcmd);
+    return (int32_t)rc;
+}
