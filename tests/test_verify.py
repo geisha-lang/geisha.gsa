@@ -217,6 +217,7 @@ def main() -> int:
             "    ensures |r| r >= 0\n"
             "= if (x < 0) 0 else x\n",
             encoding="utf-8",
+            newline="\n",
         )
         r_fmt = run([geisha, "fmt", "--stdout", str(fmt_src)])
         assert r_fmt.returncode == 0, f"fmt failed: {r_fmt.stderr}"
@@ -778,8 +779,8 @@ def main() -> int:
             "}\n",
             encoding="utf-8",
         )
-        a1_bin = tmp / "a1_try_while_rt"
-        rc_a1 = run([geisha, "--contracts=check", "-o", str(a1_bin), str(a1_rt)])
+        a1_bin = tmp / ("a1_try_while_rt.exe" if sys.platform == "win32" else "a1_try_while_rt")
+        rc_a1 = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(a1_bin), str(a1_rt)])
         assert rc_a1.returncode == 0, f"A1 runtime compile failed:\n{rc_a1.stdout}\n{rc_a1.stderr}"
         rr_a1 = run([str(a1_bin)])
         assert rr_a1.returncode == 0, f"A1 runtime 3-path test failed:\n{rr_a1.stdout}\n{rr_a1.stderr}"
@@ -836,11 +837,12 @@ def main() -> int:
             "    }\n"
             "}\n",
             encoding="utf-8",
+            newline="\n",
         )
         r_fmt1 = run([geisha, "fmt", "--stdout", str(a6_fmt)])
         assert r_fmt1.returncode == 0 and "        invariant cellGet(i) >= 0" in r_fmt1.stdout, f"A6 fmt indent wrong:\n{r_fmt1.stdout}\n{r_fmt1.stderr}"
         a6_fmt2 = tmp / "a6_fmt2.gsa"
-        a6_fmt2.write_text(r_fmt1.stdout, encoding="utf-8")
+        a6_fmt2.write_text(r_fmt1.stdout, encoding="utf-8", newline="\n")
         r_fmt2 = run([geisha, "fmt", "--stdout", str(a6_fmt2)])
         assert r_fmt2.returncode == 0 and r_fmt2.stdout == r_fmt1.stdout, f"A6 fmt not idempotent:\n{r_fmt1.stdout}\n---\n{r_fmt2.stdout}"
         print("PASS [smt_verify_a1_a6_polish]: A1 runtime 3-path, A5 duplicate decreases, A6 loc_count/doc/fmt verified")
