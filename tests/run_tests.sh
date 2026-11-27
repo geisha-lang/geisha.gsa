@@ -5020,18 +5020,19 @@ if [ ! -f "$TMP_DIR/t44_wasmgc.wasm" ] || [ ! -f "$TMP_DIR/t44_wasmgc.mjs" ] || 
     echo "FAIL [wasmgc_outputs]: expected .wasm, .mjs, and .d.ts outputs" >&2
     exit 1
 fi
-WGC_OUT="$(node --input-type=module -e "
-import fs from 'node:fs';
-import { add, greet, gcStress } from '$TMP_DIR/t44_wasmgc.mjs';
-const bytes = fs.readFileSync('$TMP_DIR/t44_wasmgc.wasm');
+WGC_OUT="$(node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const { add, greet, gcStress } = await import(pathToFileURL(process.argv[1]).href);
+const bytes = fs.readFileSync(process.argv[2]);
 const mod = new WebAssembly.Module(bytes);
-const memExports = WebAssembly.Module.exports(mod).filter(e => e.kind === 'memory');
-const memImports = WebAssembly.Module.imports(mod).filter(i => i.kind === 'memory');
+const memExports = WebAssembly.Module.exports(mod).filter(e => e.kind === "memory");
+const memImports = WebAssembly.Module.imports(mod).filter(i => i.kind === "memory");
 if (memExports.length !== 0 || memImports.length !== 0) {
-    throw new Error('Expected zero linear memory in WasmGC module');
+    throw new Error("Expected zero linear memory in WasmGC module");
 }
-console.log(add(19, 23) + '|' + greet('WasmGC') + '|' + gcStress(10000));
-")"
+console.log(add(19, 23) + "|" + greet("WasmGC") + "|" + gcStress(10000));
+' "$TMP_DIR/t44_wasmgc.mjs" "$TMP_DIR/t44_wasmgc.wasm")"
 WGC_MAIN_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '1p')"
 WGC_HOST_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '2p')"
 assert_eq "wasmgc_full_e2e_main" '6|72|5000050000|42|6|25|wasmgc:6|{"a":[1,true,"ok"]}|56872|77' "$WGC_MAIN_LINE"
@@ -5128,25 +5129,38 @@ pub def testNegAlloc64(): Int = {
     0
 }
 
+pub def testExtraBuiltins(): Int = {
+    let p = ptrAllocBytes(16);
+    ptrWriteU16Le(p, 0, 51321);
+    let u16v = ptrReadU16Le(p, 0);
+    ptrWriteF64Le64(p, intToI64(8), 12.5);
+    let f64v = floatToInt(ptrReadF64Le64(p, intToI64(8)));
+    let a = __concAtomicNew(10);
+    let ok1 = if (__concAtomicCas(a, 10, 42)) 1 else 0;
+    let ok2 = if (__concAtomicCas(a, 10, 99)) 1 else 0;
+    u16v + f64v + __concAtomicLoad(a) + ok1 * 10 + ok2
+}
+
 def main(): Void = {
     printLn("main text");
-    printLn(intToStr(testForeignAndArena()))
+    printLn(intToStr(testForeignAndArena()) + "|" + intToStr(testExtraBuiltins()))
 }
 EOF
 "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_reg.wasm" "$TMP_DIR/t44_reg.gsa"
-WGC_REG_OUT="$(node --input-type=module -e "
-import { testNegAlloc64 } from '$TMP_DIR/t44_reg.mjs';
+WGC_REG_OUT="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { testNegAlloc64 } = await import(pathToFileURL(process.argv[1]).href);
 let trapped = false;
 try { testNegAlloc64(); } catch (e) { trapped = true; }
-console.log('trap:' + trapped);
-")"
+console.log("trap:" + trapped);
+' "$TMP_DIR/t44_reg.mjs")"
 WGC_REG_L1="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '1p')"
 WGC_REG_L2="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '2p')"
 WGC_REG_L3="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '3p')"
 WGC_REG_L4="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '4p')"
 assert_eq "wasmgc_extern_init_print_order_1" "boot text" "$WGC_REG_L1"
 assert_eq "wasmgc_extern_init_print_order_2" "main text" "$WGC_REG_L2"
-assert_eq "wasmgc_foreign_and_arena_i64_alloc" "1567" "$WGC_REG_L3"
+assert_eq "wasmgc_foreign_arena_and_builtins" "1567|51385" "$WGC_REG_L3"
 assert_eq "wasmgc_neg_i64_alloc_traps" "trap:true" "$WGC_REG_L4"
 
 cat > "$TMP_DIR/t44_bad_extern.gsa" << 'EOF'
