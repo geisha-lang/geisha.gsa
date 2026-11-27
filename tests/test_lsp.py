@@ -492,13 +492,21 @@ def main() -> int:
         assert len(app_init) == 1 and "Int" in app_init[0]["message"], f"expected Int/String error via symlink, got: {app_init}"
 
         # Unsaved edit via symlink URI updates canonical overlay -> app.gsa via symlink clears!
+        # Also shift `msg` to line 2 in the unsaved buffer so definition verifies BOTH symlink URI & unsaved range!
         client.notifications.clear()
         client.notify("textDocument/didChange", {
             "textDocument": {"uri": dep_link_uri, "version": 2},
-            "contentChanges": [{"text": "pub def msg(): String = \"ok\"\n"}],
+            "contentChanges": [{"text": "// shifted in unsaved buffer\n\npub def msg(): String = \"ok\"\n"}],
         })
         assert client.wait_diag_for(dep_link_uri) == []
         assert client.wait_diag_for(app_link_uri) == [], "expected symlinked app.gsa to clear via canonicalized overlay"
+        def_sym = client.request("textDocument/definition", {
+            "textDocument": {"uri": app_link_uri},
+            "position": {"line": 3, "character": 22},
+        })
+        assert def_sym["result"] is not None, "symlink cross-file definition returned null"
+        assert def_sym["result"]["uri"] == dep_link_uri, f"expected symlink URI {dep_link_uri}, got {def_sym}"
+        assert def_sym["result"]["range"]["start"]["line"] == 2, f"expected unsaved buffer line 2, got {def_sym}"
 
         # Unsaved error in symlinked dep.gsa -> diagnostic preserves client's symlink URI
         client.notifications.clear()

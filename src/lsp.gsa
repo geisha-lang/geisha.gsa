@@ -1373,7 +1373,7 @@ def handleHover(ss: ServerState, params: Value): Value = {
 // Go to Definition (`textDocument/definition`)
 // ============================================================================
 
-def makeLocationFromSpan(files: Vec SourceFile, currentUri: String, currentText: String, currentFileId: Int, sp: Span): Option Value =
+def makeLocationFromSpan(ss: ServerState, files: Vec SourceFile, currentUri: String, currentText: String, currentFileId: Int, sp: Span): Option Value =
     if (sp.fileId == currentFileId) {
         Some(VObj([
             ("uri", VStr(currentUri)),
@@ -1382,9 +1382,9 @@ def makeLocationFromSpan(files: Vec SourceFile, currentUri: String, currentText:
     } else {
         match getSourceFileFromVec(files, sp.fileId) {
             Some(sf) ->
-                if (strStartsWith(sf.sfPath, "/") || fileExists(sf.sfPath)) {
+                if (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath)) {
                     Some(VObj([
-                        ("uri", VStr(pathToUri(sf.sfPath))),
+                        ("uri", VStr(resolveClientUriForPath(ss, sf.sfPath))),
                         ("range", makeLspRange(sf.sfContent, sp.start, sp.end)),
                     ]))
                 } else None,
@@ -1409,19 +1409,19 @@ def handleDefinition(ss: ServerState, params: Value): Value = {
                         let byForm: Option Value = match findInnermostFormInDefs(doc.dsText, inf.defs, doc.dsFileId, off) {
                             Some(ff) -> match ff.ffForm.node {
                                 ExVar(qname) -> match lookupLocalBind(ff.ffLocals, qname) {
-                                    Some(lb) -> makeLocationFromSpan(doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
+                                    Some(lb) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
                                     None -> match lookupDefExact(inf.defs, qname) {
-                                        Some(d) -> makeLocationFromSpan(doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                        Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
                                         None -> None,
                                     },
                                 },
                                 ExStructInit(qname, _) -> match lookupDefExact(inf.defs, qname) {
-                                    Some(d) -> makeLocationFromSpan(doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                    Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
                                     None -> None,
                                 },
                                 _ -> match wordOpt {
                                     Some((word, _, _)) -> match lookupLocalBind(ff.ffLocals, word) {
-                                        Some(lb) -> makeLocationFromSpan(doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
+                                        Some(lb) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
                                         None -> None,
                                     },
                                     None -> None,
@@ -1433,7 +1433,7 @@ def handleDefinition(ss: ServerState, params: Value): Value = {
                             Some(v) -> Some(v),
                             None -> match wordOpt {
                                 Some((word, _, _)) -> match lookupDefLoose(inf.defs, word) {
-                                    Some(d) -> makeLocationFromSpan(doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                    Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
                                     None -> None,
                                 },
                                 None -> None,
