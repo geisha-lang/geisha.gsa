@@ -144,12 +144,14 @@ static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
 static size_t _large_total_bytes = 0;
 
-/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 2 MB hot working set; drained by gc_trim) */
-#define LARGE_CACHE_MAX_BYTES       (1024u * 1024u)
-#define LARGE_CACHE_BUCKETS         (LARGE_CACHE_MAX_BYTES / GC_PAGE_SIZE)
-#define LARGE_CACHE_MAX_TOTAL_BYTES (2u * 1024u * 1024u)
+/* Size-classed span cache for medium-large blocks (<= 1 MB, default 8 MB cap; tightened by gc_set_mem_limit; drained by gc_trim) */
+#define LARGE_CACHE_MAX_BYTES           (1024u * 1024u)
+#define LARGE_CACHE_BUCKETS             (LARGE_CACHE_MAX_BYTES / GC_PAGE_SIZE)
+#define LARGE_CACHE_DEFAULT_TOTAL_BYTES (8u * 1024u * 1024u)
 static void *_large_cache_buckets[LARGE_CACHE_BUCKETS];
 static size_t _large_cache_bytes = 0;
+static size_t _large_cache_limit_bytes = LARGE_CACHE_DEFAULT_TOTAL_BYTES;
+static size_t _soft_mem_limit_bytes = 0; /* 0 = unlimited (proportional GOGC=100 growth) */
 
 static void drain_large_cache_locked(void)
 {
@@ -2003,7 +2005,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
             if (_large_total_bytes >= msz) _large_total_bytes -= msz;
             else _large_total_bytes = 0;
             if (msz >= GC_PAGE_SIZE && msz <= LARGE_CACHE_MAX_BYTES &&
-                _large_cache_bytes + msz <= LARGE_CACHE_MAX_TOTAL_BYTES) {
+                _large_cache_bytes + msz <= _large_cache_limit_bytes) {
                 size_t b = (msz >> GC_PAGE_SHIFT) - 1u;
                 *(void **)lo = _large_cache_buckets[b];
                 _large_cache_buckets[b] = (void *)lo;
@@ -2023,9 +2025,16 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         _major_collections++;
         _consecutive_minors = 0;
         _last_major_live_bytes = total_live_bytes;
-        size_t headroom = total_live_bytes / 2u;
-        if (headroom > 4u * 1024u * 1024u) headroom = 4u * 1024u * 1024u;
-        size_t next_major = total_live_bytes + headroom;
+        size_t next_major = total_live_bytes * 2u;
+        if (_soft_mem_limit_bytes > 0) {
+            size_t budget = (_soft_mem_limit_bytes > total_live_bytes)
+                          ? (_soft_mem_limit_bytes - total_live_bytes)
+                          : 0u;
+            size_t cap_headroom = budget / 2u;
+            if (cap_headroom < 2u * 1024u * 1024u) cap_headroom = 2u * 1024u * 1024u;
+            size_t limited = total_live_bytes + cap_headroom;
+            if (limited < next_major) next_major = limited;
+        }
         if (next_major < MIN_MAJOR_THRESHOLD_BYTES && _init_threshold_bytes >= MIN_GC_THRESHOLD_BYTES) {
             next_major = MIN_MAJOR_THRESHOLD_BYTES;
         } else if (next_major < _init_threshold_bytes * 4) {
@@ -2224,6 +2233,24 @@ void gc_set_thresholds(size_t minor_bytes, size_t major_bytes)
     _init_threshold_bytes = minor_bytes;
     _gc_threshold_bytes = minor_bytes;
     _major_threshold_bytes = major_bytes;
+    pthread_mutex_unlock(&_gc_mu);
+}
+
+void gc_set_mem_limit(size_t soft_limit_bytes)
+{
+    pthread_mutex_lock(&_gc_mu);
+    _soft_mem_limit_bytes = soft_limit_bytes;
+    if (soft_limit_bytes == 0) {
+        _large_cache_limit_bytes = LARGE_CACHE_DEFAULT_TOTAL_BYTES;
+    } else {
+        size_t cache_cap = soft_limit_bytes / 16u;
+        if (cache_cap < 1024u * 1024u) cache_cap = 1024u * 1024u;
+        if (cache_cap > LARGE_CACHE_DEFAULT_TOTAL_BYTES) cache_cap = LARGE_CACHE_DEFAULT_TOTAL_BYTES;
+        _large_cache_limit_bytes = cache_cap;
+        if (_large_cache_bytes > _large_cache_limit_bytes) {
+            drain_large_cache_locked();
+        }
+    }
     pthread_mutex_unlock(&_gc_mu);
 }
 

@@ -37,6 +37,7 @@ void gc_write_barrier(void *container_ptr);
 void gc_collect_major(void);
 void gc_trim(void);
 void gc_set_thresholds(size_t minor_bytes, size_t major_bytes);
+void gc_set_mem_limit(size_t soft_limit_bytes);
 size_t gc_collection_count(void);
 size_t gc_minor_collection_count(void);
 size_t gc_major_collection_count(void);
