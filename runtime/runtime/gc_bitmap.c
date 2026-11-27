@@ -238,6 +238,12 @@ static size_t _major_threshold_bytes = MIN_MAJOR_THRESHOLD_BYTES;
 static size_t _last_live_bytes = 0;
 static size_t _last_major_live_bytes = 0;
 static size_t _init_threshold_bytes = MIN_GC_THRESHOLD_BYTES;
+static bool _gc_heap_inited = false;
+static bool _thresholds_custom = false;
+
+static pthread_mutex_t _ginit_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t _ginit_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t _ginit_owner;
 
 static void **_global_roots[MAX_GLOBAL_ROOTS];
 static size_t _global_roots_count = 0;
@@ -786,16 +792,70 @@ void gc_register_root(void **slot)
 {
     if (slot == NULL) return;
     pthread_mutex_lock(&_gc_mu);
-    if (_global_roots_count < MAX_GLOBAL_ROOTS) {
-        _global_roots[_global_roots_count++] = slot;
+    for (size_t i = 0; i < _global_roots_count; i++) {
+        if (_global_roots[i] == slot) {
+            pthread_mutex_unlock(&_gc_mu);
+            return;
+        }
     }
+    if (_global_roots_count >= MAX_GLOBAL_ROOTS) {
+        pthread_mutex_unlock(&_gc_mu);
+        fprintf(stderr, "GC fatal: MAX_GLOBAL_ROOTS (%u) exceeded\n", (unsigned)MAX_GLOBAL_ROOTS);
+        abort();
+    }
+    _global_roots[_global_roots_count++] = slot;
     pthread_mutex_unlock(&_gc_mu);
 }
 
-void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
+void gc_run_globals_init_once(int32_t *state, void (*init_fn)(void))
 {
-    init_size_tables();
+    if (state == NULL || init_fn == NULL) return;
+    if (__builtin_expect(__atomic_load_n(state, __ATOMIC_ACQUIRE) == 2, 1)) {
+        return;
+    }
 
+    pthread_mutex_lock(&_ginit_mu);
+    int32_t cur = __atomic_load_n(state, __ATOMIC_RELAXED);
+    if (cur == 2) {
+        pthread_mutex_unlock(&_ginit_mu);
+        return;
+    }
+    pthread_t self = pthread_self();
+    if (cur == 1) {
+        if (pthread_equal(_ginit_owner, self)) {
+            /* Re-entrant entry on the initializing thread */
+            pthread_mutex_unlock(&_ginit_mu);
+            return;
+        }
+        pthread_mutex_unlock(&_ginit_mu);
+
+        /* Cooperate with STW GC while waiting for the initializing thread to finish */
+        jmp_buf regs;
+        _setjmp(regs);
+        gc_enter_blocking(&regs);
+        pthread_mutex_lock(&_ginit_mu);
+        while (__atomic_load_n(state, __ATOMIC_RELAXED) == 1) {
+            pthread_cond_wait(&_ginit_cv, &_ginit_mu);
+        }
+        pthread_mutex_unlock(&_ginit_mu);
+        gc_leave_blocking();
+        return;
+    }
+
+    __atomic_store_n(state, 1, __ATOMIC_RELAXED);
+    _ginit_owner = self;
+    pthread_mutex_unlock(&_ginit_mu);
+
+    init_fn();
+
+    pthread_mutex_lock(&_ginit_mu);
+    __atomic_store_n(state, 2, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&_ginit_cv);
+    pthread_mutex_unlock(&_ginit_mu);
+}
+
+static void compute_default_thresholds(size_t init_size_words, size_t *minor_out, size_t *major_out)
+{
     const char *env_words = getenv("GEISHA_GC_HEAP_WORDS");
     if (env_words != NULL) {
         long parsed = atol(env_words);
@@ -812,29 +872,49 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
     if (env_words == NULL && init_bytes < MIN_GC_THRESHOLD_BYTES) {
         init_bytes = MIN_GC_THRESHOLD_BYTES;
     }
+    *minor_out = init_bytes;
+    *major_out = (init_bytes * 4 > MIN_MAJOR_THRESHOLD_BYTES)
+               ? (init_bytes * 4)
+               : ((env_words != NULL) ? (init_bytes * 4) : MIN_MAJOR_THRESHOLD_BYTES);
+}
+
+void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
+{
+    init_size_tables();
+
+    size_t minor_b = 0, major_b = 0;
+    compute_default_thresholds(init_size_words, &minor_b, &major_b);
 
     pthread_mutex_lock(&_gc_mu);
-    _init_threshold_bytes = init_bytes;
-    _gc_threshold_bytes = init_bytes;
-    _major_threshold_bytes = (init_bytes * 4 > MIN_MAJOR_THRESHOLD_BYTES)
-                           ? (init_bytes * 4)
-                           : ((env_words != NULL) ? (init_bytes * 4) : MIN_MAJOR_THRESHOLD_BYTES);
-
-    if (_chunks_head == NULL) {
-        if (!alloc_chunk_locked()) {
-            pthread_mutex_unlock(&_gc_mu);
-            fprintf(stderr, "GC initial chunk allocation failed\n");
-            abort();
-        }
+    while (_stw_in_progress) {
+        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
     }
 
-    _global_roots_count = 0;
-    _minor_collections = 0;
-    _major_collections = 0;
-    _consecutive_minors = 0;
-    _bytes_alloc_since_gc = 0;
-    _stw_in_progress = false;
-    __atomic_store_n(&__gs_gc_stw_requested, 0, __ATOMIC_RELEASE);
+    if (!_gc_heap_inited) {
+        if (!_thresholds_custom) {
+            _init_threshold_bytes = minor_b;
+            _gc_threshold_bytes = minor_b;
+            _major_threshold_bytes = major_b;
+        }
+        if (_chunks_head == NULL) {
+            if (!alloc_chunk_locked()) {
+                pthread_mutex_unlock(&_gc_mu);
+                fprintf(stderr, "GC initial chunk allocation failed\n");
+                abort();
+            }
+        }
+        _minor_collections = 0;
+        _major_collections = 0;
+        _consecutive_minors = 0;
+        _bytes_alloc_since_gc = 0;
+        _stw_in_progress = false;
+        __atomic_store_n(&__gs_gc_stw_requested, 0, __ATOMIC_RELEASE);
+        _gc_heap_inited = true;
+    } else if (!_thresholds_custom && _minor_collections == 0 && _major_collections == 0) {
+        _init_threshold_bytes = minor_b;
+        _gc_threshold_bytes = minor_b;
+        _major_threshold_bytes = major_b;
+    }
 
     if (_tls_thread == NULL) {
         gc_thread_t *main_thr = (gc_thread_t *)calloc(1, sizeof(gc_thread_t));
@@ -843,13 +923,12 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
             abort();
         }
         main_thr->root_start = (uintptr_t)stack_anchor;
-        __atomic_store_n(&main_thr->state, THR_RUNNING, __ATOMIC_RELEASE);
+        __atomic_store_n(&main_thr->state, THR_RUNNING, __ATOMIC_SEQ_CST);
         link_thread_locked(main_thr);
         _tls_thread = main_thr;
     } else {
         _tls_thread->root_start = (uintptr_t)stack_anchor;
-        __atomic_store_n(&_tls_thread->state, THR_RUNNING, __ATOMIC_RELEASE);
-        retire_thread_local_pages_locked(_tls_thread);
+        __atomic_store_n(&_tls_thread->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
     pthread_mutex_unlock(&_gc_mu);
 }
@@ -2122,14 +2201,24 @@ void gc_collect_major(void)
 void geisha_rt_init(void)
 {
     init_size_tables();
+    size_t minor_b = 0, major_b = 0;
+    compute_default_thresholds(131072u, &minor_b, &major_b);
     pthread_mutex_lock(&_gc_mu);
-    if (_chunks_head == NULL) {
-        if (!alloc_chunk_locked()) {
-            pthread_mutex_unlock(&_gc_mu);
-            fprintf(stderr, "GC initial chunk allocation failed\n");
-            abort();
+    if (!_gc_heap_inited) {
+        if (!_thresholds_custom) {
+            _init_threshold_bytes = minor_b;
+            _gc_threshold_bytes = minor_b;
+            _major_threshold_bytes = major_b;
+        }
+        if (_chunks_head == NULL) {
+            if (!alloc_chunk_locked()) {
+                pthread_mutex_unlock(&_gc_mu);
+                fprintf(stderr, "GC initial chunk allocation failed\n");
+                abort();
+            }
         }
         __atomic_store_n(&_generational_enabled, true, __ATOMIC_RELEASE);
+        _gc_heap_inited = true;
     }
     pthread_mutex_unlock(&_gc_mu);
 }
@@ -2280,6 +2369,7 @@ void gc_set_thresholds(size_t minor_bytes, size_t major_bytes)
     _init_threshold_bytes = minor_bytes;
     _gc_threshold_bytes = minor_bytes;
     _major_threshold_bytes = major_bytes;
+    _thresholds_custom = true;
     pthread_mutex_unlock(&_gc_mu);
 }
 

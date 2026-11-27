@@ -601,6 +601,7 @@ data ModEmitCtx {
         mcWasmExports: StrMap Bool,
         mcHasExplicitExports: Bool,
         mcCExportSyms: StrMap Bool,
+        mcUseGlobalsOnce: Bool,
     },
 }
 
@@ -894,13 +895,15 @@ def emitCAbiTrampoline(
         CAbiRetSret(_, _) -> "void",
     };
 
-    if (!mctx.mcIsWasm) {
+    let tokReg = if (!mctx.mcIsWasm) {
         let anchor = emitEntryAlloca(fctx, "i64");
         emitLine(fctx, "store i64 0, ptr " + anchor + ", align 8");
-        let _ = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
-        ()
-    } else ();
-    let tokReg = if (!mctx.mcIsWasm) "%r" + intToStr(cellGet(fctx.fcRegCnt)) else "0";
+        let tok = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
+        if (mctx.mcUseGlobalsOnce) {
+            emitLine(fctx, "call void @__gs_init_globals_once()")
+        } else ();
+        tok
+    } else "0";
 
     let gsArgTysRev = cellNew(Nil);
     let gsArgValsRev = cellNew(Nil);
@@ -4064,6 +4067,9 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         bufPushStr(out, "  %anchor = alloca i64, align 8\n");
         bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
         bufPushStr(out, "  %tok = call i64 @gc_host_enter(ptr %anchor)\n");
+        if (mctx.mcUseGlobalsOnce) {
+            bufPushStr(out, "  call void @__gs_init_globals_once()\n")
+        } else ();
         if (retLlvm == "void") {
             bufPushStr(out, "  call void " + implSym + "(" + paramSigStr + ")\n");
             bufPushStr(out, "  call void @gc_host_leave(i64 %tok)\n");
@@ -4250,6 +4256,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
         ("gc_enable_generational", "declare void @gc_enable_generational() nounwind"),
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
+        ("gc_run_globals_init_once", "declare void @gc_run_globals_init_once(ptr, ptr) nounwind"),
         ("gc_host_enter", "declare i64 @gc_host_enter(ptr) nounwind"),
         ("gc_host_leave", "declare void @gc_host_leave(i64) nounwind"),
         ("gc_handle_new", "declare i64 @gc_handle_new(ptr) nounwind"),
@@ -4431,23 +4438,17 @@ def emitGlobalsInitOnceHelper(
     mctx: ModEmitCtx,
     globals: List GlobalValDef
 ): Void = {
-    let fctx = newFnEmitCtx("__gs_init_globals_once");
-    let already = emitAssign(fctx, "load i1, ptr @__gs_globals_inited, align 1");
-    let doBlk = appendBlock(fctx, "ginit_do");
-    let doneBlk = appendBlock(fctx, "ginit_done");
-    emitTermLine(fctx, "br i1 " + already + ", label %" + blockLabel(fctx, doneBlk) + ", label %" + blockLabel(fctx, doBlk));
-    setInsertBlock(fctx, doBlk);
-    emitLine(fctx, "store i1 true, ptr @__gs_globals_inited, align 1");
+    let bodyCtx = newFnEmitCtx("__gs_init_globals_body");
     let cg = cellNew(globals);
     while (match cellGet(cg) { Nil -> false, _ -> true }) {
         match cellGet(cg) {
             Cons(g, r) -> {
                 match strMapGet(mctx.mcGlobalSlots, g.gvName) {
                     Some(slot) -> {
-                        emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
-                        cellSet(fctx.fcPendingLet, None);
-                        let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
-                        emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                        emitRegisterGlobalRoots(bodyCtx, g.gvTy, slot.vsPtr);
+                        cellSet(bodyCtx.fcPendingLet, None);
+                        let initVal = genExpr(mctx, bodyCtx, g.gvInit, Nil, false);
+                        emitStore(bodyCtx, slot.vsLlvmTy, initVal, slot.vsPtr)
                     },
                     None -> (),
                 };
@@ -4456,10 +4457,18 @@ def emitGlobalsInitOnceHelper(
             Nil -> (),
         }
     };
-    emitTermLine(fctx, "br label %" + blockLabel(fctx, doneBlk));
-    setInsertBlock(fctx, doneBlk);
-    emitTermLine(fctx, "ret void");
-    flushFunctionToBuf(out, "define internal void @__gs_init_globals_once() nounwind", fctx)
+    if (!curBlockHasTerm(bodyCtx)) emitTermLine(bodyCtx, "ret void") else ();
+    flushFunctionToBuf(out, "define internal void @__gs_init_globals_body() nounwind", bodyCtx);
+
+    bufPushStr(out, "define internal void @__gs_init_globals_once() nounwind {\nentry:\n");
+    bufPushStr(out, "  %st = load atomic i32, ptr @__gs_globals_init_state acquire, align 4\n");
+    bufPushStr(out, "  %done = icmp eq i32 %st, 2\n");
+    bufPushStr(out, "  br i1 %done, label %ginit_ok, label %ginit_slow\n");
+    bufPushStr(out, "ginit_slow:\n");
+    bufPushStr(out, "  call void @gc_run_globals_init_once(ptr @__gs_globals_init_state, ptr @__gs_init_globals_body)\n");
+    bufPushStr(out, "  br label %ginit_ok\n");
+    bufPushStr(out, "ginit_ok:\n");
+    bufPushStr(out, "  ret void\n}\n\n")
 }
 
 def emitGlobalCtors(
@@ -4589,10 +4598,10 @@ pub def emitProgramLlvmIrForArch(
     };
     bufPushStr(globalsBuf, "@__gs_argc = internal global i32 0\n");
     bufPushStr(globalsBuf, "@__gs_argv = internal global ptr null\n");
-    let hasCtors = match prog.coreCtors { Nil -> false, _ -> true };
-    let useGlobalsOnce = !isWasm && hasCtors;
+    let hasGlobals = match prog.coreGlobals { Nil -> false, _ -> true };
+    let useGlobalsOnce = !isWasm && hasGlobals;
     if (useGlobalsOnce) {
-        bufPushStr(globalsBuf, "@__gs_globals_inited = internal global i1 false\n")
+        bufPushStr(globalsBuf, "@__gs_globals_init_state = internal global i32 0\n")
     } else ();
     if (!isWasm) {
         bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
@@ -4750,6 +4759,7 @@ pub def emitProgramLlvmIrForArch(
         mcWasmExports: exportMap,
         mcHasExplicitExports: hasExplicit,
         mcCExportSyms: cExportSymMap,
+        mcUseGlobalsOnce: useGlobalsOnce,
     };
 
     let fnsBuf = bufNew();

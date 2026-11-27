@@ -85,6 +85,12 @@ def treeLen(t: Tree): Int = match t {
     Branch(_, l, r) -> treeLen(l) + treeLen(r),
 }
 
+def gBootTree: Cell Tree = cellNew(buildTree(3, 77))
+
+extern init def initSanHeapBoot(): Void = {
+    cellSet(gBootTree, buildTree(4, 99))
+}
+
 def mutateOldAndShadow(box: Cell Tree, round: Int): Int = {
     cellSet(box, buildTree(4, round));
     let box = cellNew(round * 2);
@@ -139,7 +145,8 @@ def main(): Void = {
         Some(s) -> s,
         None -> "none",
     };
-    let ok = treeLen(cellGet(oldCell)) > 40 && tailStr == "item-119" && cellGet(acc) > 10000;
+    let ok = treeLen(cellGet(oldCell)) > 40 && treeLen(cellGet(gBootTree)) > 60
+             && tailStr == "item-119" && cellGet(acc) > 10000;
     printLn(if (ok) "ASAN_HEAP_OK" else "ASAN_HEAP_BAD")
 }
 EOF
@@ -156,6 +163,13 @@ extern "gc_collect_major" def gcCollectMajor(): Void
 
 data Packet {
     MkPacket(Int, String),
+}
+
+def gBootChan: Chan Packet = chanNew(8)
+
+extern init def initSanConcBoot(): Void = {
+    let _ = chanSend(gBootChan, MkPacket(42, "boot-ctor-packet"));
+    ()
 }
 
 def workerLoop(id: Int, rounds: Int, ch: Chan Packet, act: Actor (Cell (List String))): Int = {
@@ -242,7 +256,12 @@ def main(): Void = {
     }));
     actorStop(act);
 
-    let ok = closedNone && pL > 0 && pR > 0 && consVal == mvVal && consVal > 10000
+    let bootOk = match chanRecv(gBootChan) {
+        Some(MkPacket(v, s)) -> v == 42 && s == "boot-ctor-packet",
+        None -> false,
+    };
+
+    let ok = bootOk && closedNone && pL > 0 && pR > 0 && consVal == mvVal && consVal > 10000
              && actCount == 40 && cellGet(tabSum) > 768
              && arrayGet(oldArr, 500) == "mut-5";
     printLn(if (ok) "CONC_SAN_OK" else "CONC_SAN_BAD")
