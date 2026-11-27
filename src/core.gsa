@@ -4128,7 +4128,7 @@ pub def isRecursiveAdt(esc: EscapeInfo, adtName: String): Bool =
 // Top-Level Entry Point (`lowerToCore`)
 // ============================================================================
 
-pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
+def lowerToCoreOpts(inf: InferOutput, runEscape: Bool): Result CoreProgram String = {
     let ctorMap: StrMap (String, VariantInfo) = strMapNew();
     let ai = cellNew(0);
     while (cellGet(ai) < vecLen(inf.adtNames)) {
@@ -4248,6 +4248,7 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
                 match d.item {
                     ItForm(f) -> {
                         cellSet(ctx.kCurrentFn, d.ident);
+                        cellSet(ctx.kCount, 0);
                         match f.node {
                             ExAbs(ps, _, bd) -> {
                                 let (lps, _, lbd) = transLambda(ctx, ps, bd, false);
@@ -4278,7 +4279,13 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
         None -> {
             let (concreteFns, concreteNames, concreteGlobals) = runMonomorphizationWorklist(ctx);
             verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
-            let escapeInfo = runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames);
+            let escapeInfo =
+                if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames)
+                else MkEscapeInfo {
+                    escRecAdts: strMapNew(),
+                    escFnStackVars: strMapNew(),
+                    escFnHasStack: strMapNew(),
+                };
 
             Ok(MkCoreProgram {
                 coreFns: concreteFns,
@@ -4293,4 +4300,12 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
             })
         },
     }
+}
+
+pub def lowerToCore(inf: InferOutput): Result CoreProgram String =
+    lowerToCoreOpts(inf, true)
+
+pub def lowerToCoreForCheck(inf: InferOutput): Result Void String = {
+    let _ = lowerToCoreOpts(inf, false)?;
+    Ok(())
 }

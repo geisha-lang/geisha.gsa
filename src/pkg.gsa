@@ -142,12 +142,12 @@ pub data ResolvedPkg {
 
 pub data CompileCallbacks {
     MkCompileCallbacks {
-        cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String) -> Result Void String,
+        cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String, Option String) -> Result Void String,
         cbCompileNativeExeSource: (String, String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
-        cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String) -> Result Void String,
+        cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String, Option String) -> Result Void String,
         cbCompileJs: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
-        cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String) -> Result String String,
+        cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String, Option String) -> Result String String,
         cbCompileTargetArchive: (String, String, PkgSpec, List PkgSpec, TargetCfg, String, Option String, Option String) -> Result Void String,
         cbEmitIr: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String) -> Result Void String,
     },
@@ -2757,6 +2757,7 @@ pub def cmdBuildProject(
     };
 
     let buildDir = pathJoin(projectDir, "build");
+    let cacheDirOpt = Some(pathJoin(buildDir, "cache"));
     let needBuildDir = match outPathOpt { None -> !emitIr, Some(_) -> false };
     let _ = if (needBuildDir) mkdirAll(buildDir)? else ();
 
@@ -2776,7 +2777,7 @@ pub def cmdBuildProject(
         let defaultOut = pathJoin(buildDir, rootMf.mfName + (if (compileOnly) ".o" else ".wasm"));
         let outWasm = match outPathOpt { Some(p) -> p, None -> defaultOut };
         ensureParentDirExists(outWasm)?;
-        cbs.cbCompileWasm(entryFile, rootSpec, extSpecs, mergedTc, compileOnly, Some(outWasm), dumpCoreOpt, rtOverrideOpt)?;
+        cbs.cbCompileWasm(entryFile, rootSpec, extSpecs, mergedTc, compileOnly, Some(outWasm), dumpCoreOpt, rtOverrideOpt, cacheDirOpt)?;
         let _ = if (!compileOnly) copyWebAssetsRec(mergedTc.tcWebAssets, pathDirname(outWasm))? else ();
         Ok(outWasm)
     } else if (isAppleBundle) {
@@ -2788,7 +2789,7 @@ pub def cmdBuildProject(
         };
         cbs.cbCompileAppleBundle(
             target, entryFile, rootSpec, extSpecs, mergedTc, ab,
-            rootMf.mfName, rootMf.mfVersion, defaultOut, dumpCoreOpt, rtOverrideOpt
+            rootMf.mfName, rootMf.mfVersion, defaultOut, dumpCoreOpt, rtOverrideOpt, cacheDirOpt
         )
     } else if (isIosLib) {
         let defaultArc = pathJoin(buildDir, "lib" + rootMf.mfName + (if (target == "ios") "_ios.a" else "_iossim.a"));
@@ -2806,7 +2807,7 @@ pub def cmdBuildProject(
         let defaultBin = pathJoin(buildDir, rootMf.mfName);
         let outBin = match outPathOpt { Some(p) -> p, None -> defaultBin };
         ensureParentDirExists(outBin)?;
-        cbs.cbCompileNativeExe(entryFile, rootSpec, extSpecs, mergedTc, Some(outBin), dumpCoreOpt, rtOverrideOpt)?;
+        cbs.cbCompileNativeExe(entryFile, rootSpec, extSpecs, mergedTc, Some(outBin), dumpCoreOpt, rtOverrideOpt, cacheDirOpt)?;
         Ok(outBin)
     }
 }
@@ -2828,7 +2829,7 @@ pub def cmdRun(
                 srcRoots: [pathDirname(gsaFile)],
                 deps: Nil,
             };
-            cbs.cbCompileNativeExe(gsaFile, rootSpec, Nil, emptyTargetCfg(), Some(outBin), None, rtOverrideOpt)?;
+            cbs.cbCompileNativeExe(gsaFile, rootSpec, Nil, emptyTargetCfg(), Some(outBin), None, rtOverrideOpt, None)?;
             outBin
         },
         None -> {
@@ -2957,7 +2958,8 @@ def runTestFilesRec(
     Cons(tf, rest) -> {
         let stem = pathStem(tf);
         let outBin = pathJoin(buildDir, "test_" + stem);
-        cbs.cbCompileNativeExe(tf, testRootSpec, allExtSpecs, testTc, Some(outBin), None, rtOverrideOpt)?;
+        let cacheDirOpt = Some(pathJoin(projDir, "build/cache"));
+        cbs.cbCompileNativeExe(tf, testRootSpec, allExtSpecs, testTc, Some(outBin), None, rtOverrideOpt, cacheDirOpt)?;
         let rc = runCmdStatus(outBin, Nil, Some(projDir));
         if (rc != 0) Err("test suite failed: " + tf)
         else runTestFilesRec(rest, projDir, buildDir, testRootSpec, allExtSpecs, testTc, rtOverrideOpt, cbs, acc + 1)

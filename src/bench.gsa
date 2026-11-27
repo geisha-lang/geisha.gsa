@@ -687,7 +687,7 @@ def runSingleBenchFile(
         let stem = pathStem(bf);
         let pidStr = intToStr(c_bench_getpid());
         let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr);
-        cbs.cbCompileNativeExe(bf, rootSpec, extSpecs, benchTc, Some(outBin), None, rtOverrideOpt)?;
+        cbs.cbCompileNativeExe(bf, rootSpec, extSpecs, benchTc, Some(outBin), None, rtOverrideOpt, Some(pathJoin(buildDir, "cache")))?;
         let passFilter = match bOpts.bFilter {
             None -> false,
             Some(pat) ->

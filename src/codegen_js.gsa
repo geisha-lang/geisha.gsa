@@ -1768,7 +1768,9 @@ pub def emitProgramJs(prog: CoreProgram, exports: List String, noMain: Bool): St
     while (match cellGet(cg1) { Nil -> false, _ -> true }) {
         match cellGet(cg1) {
             Cons(gv, r) -> {
+                bufPushStr(out, "  {\n");
                 emitJsStmt(initCtx, gv.gvInit, Nil, TgtAssign(jsGlobalIdent(gv.gvName)));
+                bufPushStr(out, "  }\n");
                 cellSet(cg1, r)
             },
             Nil -> (),
