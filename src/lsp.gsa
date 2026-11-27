@@ -40,7 +40,7 @@ use diag.{
     SourceFile, MkSourceFile,
     diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError
 }
-use lexer.{Token, MkToken, TokKind, TkIdent, TkDot, TkLBrace, TkEof, tokenizeInFile}
+use lexer.{Token, MkToken, TokKind, TkIdent, TkDot, TkLBrace, TkRBrace, TkLParen, TkRParen, TkComma, TkDef, TkSym, TkEof, tokenizeInFile}
 use parser.parseFileModuleInFile
 use loader.{
     PkgSpec, MkPkgSpec, NameInfo, loadSingleSourceProgramWithPkgsNamed,
@@ -3396,6 +3396,134 @@ def findAllIdentTokIndicesInSpan(toks: Vec Token, ident: String, lo: Int, hi: In
     listRev(cellGet(outRev))
 }
 
+def findTypeTokIndicesInSigHeader(toks: Vec Token, ident: String, lo: Int, hi: Int): List Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let inType = cellNew(false);
+    let inParamList = cellNew(false);
+    let parenDepth = cellNew(0);
+    let outRev: Cell (List Int) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let tok = vecGetOr(toks, idx, d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
+        } else {
+            if (tok.span.start >= lo && tok.span.end <= hi) {
+                match tok.kind {
+                    TkDef -> {
+                        cellSet(inType, false);
+                        cellSet(inParamList, false);
+                        cellSet(parenDepth, 0)
+                    },
+                    TkLParen -> {
+                        if (cellGet(parenDepth) == 0 && !cellGet(inType)) {
+                            cellSet(inParamList, true);
+                            cellSet(parenDepth, 1);
+                            cellSet(inType, false)
+                        } else cellSet(parenDepth, cellGet(parenDepth) + 1)
+                    },
+                    TkRParen -> {
+                        if (cellGet(inParamList) && cellGet(parenDepth) == 1) {
+                            cellSet(inParamList, false);
+                            cellSet(parenDepth, 0);
+                            cellSet(inType, false)
+                        } else if (cellGet(parenDepth) > 0) {
+                            cellSet(parenDepth, cellGet(parenDepth) - 1)
+                        } else ()
+                    },
+                    TkComma -> {
+                        if (cellGet(inParamList) && cellGet(parenDepth) == 1) {
+                            cellSet(inType, false)
+                        } else ()
+                    },
+                    TkSym(sym) -> {
+                        if (sym == ":") cellSet(inType, true)
+                        else if (sym == "=" && cellGet(parenDepth) == 0) cellSet(inType, false)
+                        else ()
+                    },
+                    TkIdent(nm) if (nm == ident && cellGet(inType)) -> {
+                        let followedByDot = if (idx + 1 < n) {
+                            match vecGetOr(toks, idx + 1, d).kind { TkDot -> true, _ -> false }
+                        } else false;
+                        if (!followedByDot) cellSet(outRev, Cons(idx, cellGet(outRev))) else ()
+                    },
+                    _ -> (),
+                }
+            } else ();
+            cellSet(i, idx + 1)
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+def findTypeTokIndicesInTypeDecl(toks: Vec Token, ident: String, lo: Int, hi: Int): List Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let outRev: Cell (List Int) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let tok = vecGetOr(toks, idx, d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
+        } else {
+            if (tok.span.start >= lo && tok.span.end <= hi) {
+                match tok.kind {
+                    TkIdent(nm) if (nm == ident) -> {
+                        let followedByDotOrColon = if (idx + 1 < n) {
+                            match vecGetOr(toks, idx + 1, d).kind {
+                                TkDot -> true,
+                                TkSym(s) if (s == ":") -> true,
+                                _ -> false,
+                            }
+                        } else false;
+                        let precededByDef = if (idx > 0) {
+                            match vecGetOr(toks, idx - 1, d).kind { TkDef -> true, _ -> false }
+                        } else false;
+                        if (!followedByDotOrColon && !precededByDef) cellSet(outRev, Cons(idx, cellGet(outRev))) else ()
+                    },
+                    _ -> (),
+                }
+            } else ();
+            cellSet(i, idx + 1)
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
+def findFieldLabelTokIndicesInSpan(toks: Vec Token, fieldName: String, lo: Int, hi: Int): List Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let braceDepth = cellNew(0);
+    let outRev: Cell (List Int) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let tok = vecGetOr(toks, idx, d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
+        } else {
+            if (tok.span.start >= lo && tok.span.end <= hi) {
+                match tok.kind {
+                    TkLBrace -> cellSet(braceDepth, cellGet(braceDepth) + 1),
+                    TkRBrace -> if (cellGet(braceDepth) > 0) cellSet(braceDepth, cellGet(braceDepth) - 1) else (),
+                    TkIdent(nm) if (nm == fieldName && cellGet(braceDepth) > 0) -> {
+                        let followedByColon = if (idx + 1 < n) {
+                            match vecGetOr(toks, idx + 1, d).kind { TkSym(s) if (s == ":") -> true, _ -> false }
+                        } else false;
+                        if (followedByColon) cellSet(outRev, Cons(idx, cellGet(outRev))) else ()
+                    },
+                    _ -> (),
+                }
+            } else ();
+            cellSet(i, idx + 1)
+        }
+    };
+    listRev(cellGet(outRev))
+}
+
 def extractQualBeforeTokIdx(toks: Vec Token, idx: Int): Option String = {
     let d = dummyEofTok();
     let j = cellNew(idx - 1);
@@ -3658,11 +3786,15 @@ def collectTopDefOccsInForm(
                                     }
                                 },
                                 SkField if (patContainsStructField(arm.pat, inf, targetQn, target.stName)) -> {
-                                    let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
+                                    let occs = findFieldLabelTokIndicesInSpan(rscope.rsToks, target.stName, patLo, patHi);
                                     let co = cellNew(occs);
                                     while (match cellGet(co) { Nil -> false, _ -> true }) {
                                         match cellGet(co) {
-                                            Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                                            Cons(tidx, ro) -> {
+                                                let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                                                pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end);
+                                                cellSet(co, ro)
+                                            },
                                             Nil -> (),
                                         }
                                     }
@@ -3991,7 +4123,7 @@ def collectTypeAnnotOccsInForm(
         },
         ExAbs(_, _, body) -> {
             if (body.pos.start > f.pos.start) {
-                let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, typeName, f.pos.start, body.pos.start);
+                let occs = findTypeTokIndicesInSigHeader(rscope.rsToks, typeName, f.pos.start, body.pos.start);
                 let co = cellNew(occs);
                 while (match cellGet(co) { Nil -> false, _ -> true }) {
                     match cellGet(co) {
@@ -4089,7 +4221,7 @@ def collectTypeOccsInDef(
                 ExAbs(_, _, body) -> if (body.pos.start > d.dpos.start) body.pos.start else d.dpos.end,
                 _ -> if (f.pos.start > d.dpos.start) f.pos.start else d.dpos.end,
             };
-            let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, d.dpos.start, bodyStart);
+            let occs = findTypeTokIndicesInSigHeader(rscope.rsToks, target.stName, d.dpos.start, bodyStart);
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
@@ -4136,7 +4268,7 @@ def collectTypeOccsInDef(
             }
         },
         _ -> {
-            let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, d.dpos.start, d.dpos.end);
+            let occs = findTypeTokIndicesInTypeDecl(rscope.rsToks, target.stName, d.dpos.start, d.dpos.end);
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {

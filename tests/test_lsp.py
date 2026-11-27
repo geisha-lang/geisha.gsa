@@ -1560,6 +1560,84 @@ def main() -> int:
         )
         assert res_o.returncode == 0 and res_o.stdout.strip() == "7", f"renamed load.load() failed to run: rc={res_o.returncode} stdout={res_o.stdout!r} stderr={res_o.stderr!r}"
 
+        # (p) Value parameter name shares spelling with type name: `pub def number(Marker: Int): Int = Marker + 1` (untouched) & `pub def idMarker(Marker: Marker): Marker = Marker` (only type positions renamed)
+        pt_dir = root / "param_vs_type_proj"
+        pt_dir.mkdir(parents=True)
+        pt_path = pt_dir / "main.gsa"
+        pt_src = (
+            "use std.str.intToStr\n"
+            "pub data Marker { MkMarker { val: Int } }\n"
+            "pub def number(Marker: Int): Int = Marker + 1\n"
+            "pub def idMarker(Marker: Marker): Marker = Marker\n"
+            "def main(): Void = printLn(intToStr(number(6) + idMarker(MkMarker { val: 10 }).val))\n"
+        )
+        pt_path.write_text(pt_src, encoding="utf-8")
+        pt_uri = path_to_uri(pt_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": pt_uri, "languageId": "geisha", "version": 1, "text": pt_src}})
+        assert client.wait_diag_for(pt_uri) == []
+        ren_pt = client.request("textDocument/rename", {
+            "textDocument": {"uri": pt_uri},
+            "position": {"line": 1, "character": 9},
+            "newName": "NewMarker",
+        })
+        assert "result" in ren_pt, f"expected param-vs-type rename to succeed: {ren_pt}"
+        new_pt = apply_edits(pt_src, ren_pt["result"]["changes"][pt_uri])
+        assert "pub data NewMarker { MkMarker { val: Int } }" in new_pt, f"expected data renamed: {new_pt!r}"
+        assert "pub def number(Marker: Int): Int = Marker + 1" in new_pt, f"value parameter `Marker` in number() must NOT be renamed: {new_pt!r}"
+        assert "pub def idMarker(Marker: NewMarker): NewMarker = Marker" in new_pt, f"only type annotations in idMarker() should be renamed: {new_pt!r}"
+        run_p_dir = root / "run_param_vs_type"
+        run_p_dir.mkdir(parents=True)
+        (run_p_dir / "main.gsa").write_text(new_pt, encoding="utf-8")
+        res_p = subprocess.run(
+            [abs_geisha_bin, "run", str(run_p_dir / "main.gsa")],
+            cwd=str(run_p_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_p.returncode == 0 and res_p.stdout.strip() == "17", f"renamed param-vs-type program failed to run: rc={res_p.returncode} stdout={res_p.stdout!r} stderr={res_p.stderr!r}"
+
+        # (q) Field rename in struct match pattern with comment & same-named binder: `Point { /* x */ x: x } -> x` -> `Point { /* x */ coord: x } -> x`, compiles & runs -> `7`
+        fp_dir = root / "field_pat_proj"
+        fp_dir.mkdir(parents=True)
+        fp_path = fp_dir / "main.gsa"
+        fp_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int, y: Int } }\n"
+            "def getX(p: Point): Int = match p {\n"
+            "    Point { /* x */ x: x } -> x,\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(getX(Point { x: 7, y: 2 })))\n"
+        )
+        fp_path.write_text(fp_src, encoding="utf-8")
+        fp_uri = path_to_uri(fp_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": fp_uri, "languageId": "geisha", "version": 1, "text": fp_src}})
+        assert client.wait_diag_for(fp_uri) == []
+        ren_fp = client.request("textDocument/rename", {
+            "textDocument": {"uri": fp_uri},
+            "position": {"line": 1, "character": 21},
+            "newName": "coord",
+        })
+        assert "result" in ren_fp, f"expected field pattern rename to succeed: {ren_fp}"
+        new_fp = apply_edits(fp_src, ren_fp["result"]["changes"][fp_uri])
+        assert "Point { /* x */ coord: x } -> x," in new_fp, f"comment and local binder `x` must be preserved verbatim, got: {new_fp!r}"
+        assert "Point { coord: 7, y: 2 }" in new_fp, f"struct init field must be renamed: {new_fp!r}"
+        run_q_dir = root / "run_field_pat"
+        run_q_dir.mkdir(parents=True)
+        (run_q_dir / "main.gsa").write_text(new_fp, encoding="utf-8")
+        res_q = subprocess.run(
+            [abs_geisha_bin, "run", str(run_q_dir / "main.gsa")],
+            cwd=str(run_q_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_q.returncode == 0 and res_q.stdout.strip() == "7", f"renamed field pattern program failed to run: rc={res_q.returncode} stdout={res_q.stdout!r} stderr={res_q.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
