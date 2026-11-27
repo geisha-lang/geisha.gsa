@@ -45,12 +45,23 @@ mutual
 def tyEq : Ty → Ty → Bool
   | .void, .void => true
   | .int, .int => true
+  | .int64, .int64 => true
+  | .float, .float => true
+  | .float32, .float32 => true
   | .bool, .bool => true
+  | .char, .char => true
   | .str, .str => true
+  | .ptr, .ptr => true
+  | .scopedPtr, .scopedPtr => true
+  | .arena, .arena => true
+  | .foreignPtr, .foreignPtr => true
+  | .atomicInt, .atomicInt => true
   | .tuple ts1, .tuple ts2 => tyListEq ts1 ts2
   | .fn m1 ps1 r1, .fn m2 ps2 r2 => modeEq m1 m2 && tyListEq ps1 ps2 && tyEq r1 r2
   | .adt n1, .adt n2 => n1 == n2
   | .cell t1, .cell t2 => tyEq t1 t2
+  | .mutArray t1, .mutArray t2 => tyEq t1 t2
+  | .immArray t1, .immArray t2 => tyEq t1 t2
   | .task t1, .task t2 => tyEq t1 t2
   | .mvar t1, .mvar t2 => tyEq t1 t2
   | .chan t1, .chan t2 => tyEq t1 t2
@@ -65,21 +76,16 @@ end
 
 mutual
 theorem tyEq_sound {t1 t2 : Ty} (h : tyEq t1 t2 = true) : t1 = t2 := by
-  cases t1 <;> cases t2 <;> simp only [tyEq] at h <;> try cases h
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rw [tyListEq_sound h]
-  · simp only [Bool.and_eq_true] at h
-    rw [modeEq_sound h.1.1, tyListEq_sound h.1.2, tyEq_sound h.2]
-  · simp only [beq_iff_eq] at h
-    rw [h]
-  · rw [tyEq_sound h]
-  · rw [tyEq_sound h]
-  · rw [tyEq_sound h]
-  · rw [tyEq_sound h]
-  · rw [tyEq_sound h]
+  cases t1 <;> cases t2 <;> try cases h
+  all_goals
+    first
+    | rfl
+    | (simp only [tyEq, Bool.and_eq_true, beq_iff_eq] at h
+       first
+       | rw [h]
+       | rw [tyEq_sound h]
+       | rw [tyListEq_sound h]
+       | rw [modeEq_sound h.1.1, tyListEq_sound h.1.2, tyEq_sound h.2])
 
 theorem tyListEq_sound {ts1 ts2 : List Ty} (h : tyListEq ts1 ts2 = true) : ts1 = ts2 := by
   cases ts1 <;> cases ts2 <;> simp only [tyListEq] at h <;> try cases h
@@ -92,13 +98,24 @@ mutual
 def tySub : Ty → Ty → Bool
   | .void, .void => true
   | .int, .int => true
+  | .int64, .int64 => true
+  | .float, .float => true
+  | .float32, .float32 => true
   | .bool, .bool => true
+  | .char, .char => true
   | .str, .str => true
+  | .ptr, .ptr => true
+  | .scopedPtr, .scopedPtr => true
+  | .arena, .arena => true
+  | .foreignPtr, .foreignPtr => true
+  | .atomicInt, .atomicInt => true
   | .tuple ts1, .tuple ts2 => tyListSub ts1 ts2
   | .fn m1 ps1 r1, .fn m2 ps2 r2 =>
     modeSub m1 m2 && tyListSub ps2 ps1 && tySub r1 r2
   | .adt n1, .adt n2 => n1 == n2
   | .cell t1, .cell t2 => tyEq t1 t2
+  | .mutArray t1, .mutArray t2 => tyEq t1 t2
+  | .immArray t1, .immArray t2 => tySub t1 t2
   | .task t1, .task t2 => tySub t1 t2
   | .mvar t1, .mvar t2 => tyEq t1 t2
   | .chan t1, .chan t2 => tyEq t1 t2
@@ -118,14 +135,24 @@ theorem tySub_sound {t1 t2 : Ty} (h : tySub t1 t2 = true) : TySub t1 t2 := by
   cases t1 <;> cases t2 <;> simp only [tySub] at h <;> try cases h
   · exact .void
   · exact .int
+  · exact .int64
+  · exact .float
+  · exact .float32
   · exact .bool
+  · exact .char
   · exact .str
+  · exact .ptr
+  · exact .scopedPtr
+  · exact .arena
+  · exact .foreignPtr
+  · exact .atomicInt
   · exact .tuple (tyListSub_sound h)
   · simp only [Bool.and_eq_true] at h
     exact .fn (modeSub_sound h.1.1) (tyListSub_sound h.1.2) (tySub_sound h.2)
-  · simp only [beq_iff_eq] at h
-    subst h; exact .adt _
+  · simp only [beq_iff_eq] at h; subst h; exact .adt _
   · rw [tyEq_sound h]; exact .cell _
+  · rw [tyEq_sound h]; exact .mutArray _
+  · exact .immArray (tySub_sound h)
   · exact .task (tySub_sound h)
   · rw [tyEq_sound h]; exact .mvar _
   · rw [tyEq_sound h]; exact .chan _
@@ -146,13 +173,24 @@ mutual
 def tySendInList (sendAdts : List Ident) : Ty → Bool
   | .void => true
   | .int => true
+  | .int64 => true
+  | .float => true
+  | .float32 => true
   | .bool => true
+  | .char => true
   | .str => true
+  | .ptr => false
+  | .scopedPtr => false
+  | .arena => false
+  | .foreignPtr => false
+  | .atomicInt => true
   | .tuple ts => tyListSendInList sendAdts ts
   | .fn .shared _ _ => true
   | .fn .local _ _ => false
   | .adt n => sendAdts.contains n
   | .cell _ => false
+  | .mutArray _ => false
+  | .immArray t => tySendInList sendAdts t
   | .task t => tySendInList sendAdts t
   | .mvar t => tySendInList sendAdts t
   | .chan t => tySendInList sendAdts t
@@ -189,8 +227,17 @@ theorem tySendInList_sound {sendAdts : List Ident} {τ : Ty}
   cases τ with
   | void => exact .void
   | int => exact .int
+  | int64 => exact .int64
+  | float => exact .float
+  | float32 => exact .float32
   | bool => exact .bool
+  | char => exact .char
   | str => exact .str
+  | ptr => simp [tySendInList] at h
+  | scopedPtr => simp [tySendInList] at h
+  | arena => simp [tySendInList] at h
+  | foreignPtr => simp [tySendInList] at h
+  | atomicInt => exact .atomicInt
   | tuple ts => exact .tuple (tyListSendInList_sound h)
   | fn m ps r =>
     cases m
@@ -200,6 +247,8 @@ theorem tySendInList_sound {sendAdts : List Ident} {τ : Ty}
     simp only [tySendInList] at h
     exact .adt (List.contains_iff_mem.mp h)
   | cell _ => simp [tySendInList] at h
+  | mutArray _ => simp [tySendInList] at h
+  | immArray t => exact .immArray (tySendInList_sound h)
   | task t => exact .task (tySendInList_sound h)
   | mvar t => exact .mvar (tySendInList_sound h)
   | chan t => exact .chan (tySendInList_sound h)
@@ -521,50 +570,134 @@ theorem checkConcPrim_sound {Δ : AdtEnv} {sendAdts : List Ident}
 
 def checkLit : Lit → Ty
   | .int _ => .int
+  | .int64 _ => .int64
+  | .floatBits _ => .float
+  | .float32Bits _ => .float32
   | .bool _ => .bool
+  | .char _ => .char
   | .str _ => .str
   | .unit => .void
 
 theorem checkLit_sound (l : Lit) : LitHasType l (checkLit l) := by
   cases l <;> constructor
 
+def unOpSig : UnOp → Ty × Ty
+  | .not => (.bool, .bool)
+  | .neg => (.int, .int)
+  | .bitNot => (.int, .int)
+  | .neg64 => (.int64, .int64)
+  | .bitNot64 => (.int64, .int64)
+  | .negFloat => (.float, .float)
+  | .negFloat32 => (.float32, .float32)
+
 def checkUnOp (op : UnOp) (τ : Ty) : Except String Ty :=
-  match op, τ with
-  | .not, .bool => .ok .bool
-  | .neg, .int => .ok .int
-  | .bitNot, .int => .ok .int
-  | _, _ => .error s!"unary operator {repr op} ill-typed for {repr τ}"
+  let (e1, τr) := unOpSig op
+  if tyEq τ e1 then .ok τr
+  else .error s!"unary operator {repr op} ill-typed for {repr τ}"
 
 theorem checkUnOp_sound {op : UnOp} {τ1 τr : Ty} (h : checkUnOp op τ1 = .ok τr) :
     UnOpHasType op τ1 τr := by
-  cases op <;> cases τ1 <;> simp [checkUnOp] at h <;> subst h <;> constructor
+  unfold checkUnOp at h
+  dsimp only at h
+  split at h
+  · rename_i heq
+    rw [tyEq_sound heq]
+    cases h
+    cases op <;> constructor
+  · cases h
+
+def binOpSig : BinOp → Ty × Ty × Ty
+  | .add => (.int, .int, .int)
+  | .sub => (.int, .int, .int)
+  | .mul => (.int, .int, .int)
+  | .div => (.int, .int, .int)
+  | .rem => (.int, .int, .int)
+  | .bitAnd => (.int, .int, .int)
+  | .bitOr => (.int, .int, .int)
+  | .bitXor => (.int, .int, .int)
+  | .shlInt => (.int, .int, .int)
+  | .shrInt => (.int, .int, .int)
+  | .ushrInt => (.int, .int, .int)
+  | .eqInt => (.int, .int, .bool)
+  | .neInt => (.int, .int, .bool)
+  | .ltInt => (.int, .int, .bool)
+  | .leInt => (.int, .int, .bool)
+  | .gtInt => (.int, .int, .bool)
+  | .geInt => (.int, .int, .bool)
+  | .add64 => (.int64, .int64, .int64)
+  | .sub64 => (.int64, .int64, .int64)
+  | .mul64 => (.int64, .int64, .int64)
+  | .div64 => (.int64, .int64, .int64)
+  | .rem64 => (.int64, .int64, .int64)
+  | .bitAnd64 => (.int64, .int64, .int64)
+  | .bitOr64 => (.int64, .int64, .int64)
+  | .bitXor64 => (.int64, .int64, .int64)
+  | .shl64 => (.int64, .int, .int64)
+  | .shr64 => (.int64, .int, .int64)
+  | .ushr64 => (.int64, .int, .int64)
+  | .eq64 => (.int64, .int64, .bool)
+  | .ne64 => (.int64, .int64, .bool)
+  | .lt64 => (.int64, .int64, .bool)
+  | .le64 => (.int64, .int64, .bool)
+  | .gt64 => (.int64, .int64, .bool)
+  | .ge64 => (.int64, .int64, .bool)
+  | .addFloat => (.float, .float, .float)
+  | .subFloat => (.float, .float, .float)
+  | .mulFloat => (.float, .float, .float)
+  | .divFloat => (.float, .float, .float)
+  | .eqFloat => (.float, .float, .bool)
+  | .neFloat => (.float, .float, .bool)
+  | .ltFloat => (.float, .float, .bool)
+  | .leFloat => (.float, .float, .bool)
+  | .gtFloat => (.float, .float, .bool)
+  | .geFloat => (.float, .float, .bool)
+  | .addF32 => (.float32, .float32, .float32)
+  | .subF32 => (.float32, .float32, .float32)
+  | .mulF32 => (.float32, .float32, .float32)
+  | .divF32 => (.float32, .float32, .float32)
+  | .eqF32 => (.float32, .float32, .bool)
+  | .neF32 => (.float32, .float32, .bool)
+  | .ltF32 => (.float32, .float32, .bool)
+  | .leF32 => (.float32, .float32, .bool)
+  | .gtF32 => (.float32, .float32, .bool)
+  | .geF32 => (.float32, .float32, .bool)
+  | .eqBool => (.bool, .bool, .bool)
+  | .neBool => (.bool, .bool, .bool)
+  | .bitAndBool => (.bool, .bool, .bool)
+  | .bitOrBool => (.bool, .bool, .bool)
+  | .bitXorBool => (.bool, .bool, .bool)
+  | .eqChar => (.char, .char, .bool)
+  | .neChar => (.char, .char, .bool)
+  | .ltChar => (.char, .char, .bool)
+  | .leChar => (.char, .char, .bool)
+  | .gtChar => (.char, .char, .bool)
+  | .geChar => (.char, .char, .bool)
+  | .eqStr => (.str, .str, .bool)
+  | .neStr => (.str, .str, .bool)
+  | .ltStr => (.str, .str, .bool)
+  | .leStr => (.str, .str, .bool)
+  | .gtStr => (.str, .str, .bool)
+  | .geStr => (.str, .str, .bool)
+  | .strConcat => (.str, .str, .str)
+  | .and => (.bool, .bool, .bool)
+  | .or => (.bool, .bool, .bool)
 
 def checkBinOp (op : BinOp) (τ1 τ2 : Ty) : Except String Ty :=
-  match op, τ1, τ2 with
-  | .add, .int, .int => .ok .int
-  | .sub, .int, .int => .ok .int
-  | .mul, .int, .int => .ok .int
-  | .div, .int, .int => .ok .int
-  | .rem, .int, .int => .ok .int
-  | .bitAnd, .int, .int => .ok .int
-  | .bitOr, .int, .int => .ok .int
-  | .bitXor, .int, .int => .ok .int
-  | .eqInt, .int, .int => .ok .bool
-  | .neInt, .int, .int => .ok .bool
-  | .ltInt, .int, .int => .ok .bool
-  | .leInt, .int, .int => .ok .bool
-  | .gtInt, .int, .int => .ok .bool
-  | .geInt, .int, .int => .ok .bool
-  | .eqBool, .bool, .bool => .ok .bool
-  | .eqStr, .str, .str => .ok .bool
-  | .strConcat, .str, .str => .ok .str
-  | .and, .bool, .bool => .ok .bool
-  | .or, .bool, .bool => .ok .bool
-  | _, _, _ => .error s!"binary operator {repr op} ill-typed for ({repr τ1}, {repr τ2})"
+  let (e1, e2, τr) := binOpSig op
+  if tyEq τ1 e1 && tyEq τ2 e2 then .ok τr
+  else .error s!"binary operator {repr op} ill-typed for ({repr τ1}, {repr τ2})"
 
 theorem checkBinOp_sound {op : BinOp} {τ1 τ2 τr : Ty} (h : checkBinOp op τ1 τ2 = .ok τr) :
     BinOpHasType op τ1 τ2 τr := by
-  cases op <;> cases τ1 <;> cases τ2 <;> simp [checkBinOp] at h <;> subst h <;> constructor
+  unfold checkBinOp at h
+  dsimp only at h
+  split at h
+  · rename_i hcond
+    simp only [Bool.and_eq_true] at hcond
+    rw [tyEq_sound hcond.1, tyEq_sound hcond.2]
+    cases h
+    cases op <;> constructor
+  · cases h
 
 /-! ## Pattern Type Checker -/
 
@@ -1183,14 +1316,18 @@ end
 structure Program where
   adts        : List AdtDef
   funs        : List FunDef
+  externs     : List ExternDecl := []
   stackAllocs : List FnStackSpec := []
   deriving Repr
+
+def Program.allFuns (p : Program) : List FunDef :=
+  p.funs ++ p.externs.map ExternDecl.toFunDef
 
 def Program.toAdtEnv (p : Program) : AdtEnv :=
   fun name => p.adts.find? (fun a => a.name == name)
 
 def Program.toFunEnv (p : Program) : FunEnv :=
-  fun name => p.funs.find? (fun f => f.name == name)
+  fun name => p.allFuns.find? (fun f => f.name == name)
 
 def checkFunDef (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) (fd : FunDef) :
     Except String Unit :=
@@ -1209,7 +1346,7 @@ def checkFunList (Δ : AdtEnv) (Φ : FunEnv) (sendAdts : List Ident) :
     | .ok () => checkFunList Δ Φ sendAdts rest
 
 /-- Whole-program verifier checking:
-    1. Types, closure capture modes (`local`/`shared`), and `Task`/`MVar`/`Chan`/`Actor` concurrency
+    1. Types, closure capture modes (`local`/`shared`), host `extern` boundaries, and `Task`/`MVar`/`Chan`/`Actor` concurrency
     2. Maranget pattern-matrix exhaustiveness (`checkProgramExhaustive`)
     3. Intraprocedural & frame stack-allocation escape safety (`checkProgramEscape`)
     4. Exact 40-bit GC pointer-mask layouts (`checkProgramGcLayouts`) -/
@@ -1221,10 +1358,10 @@ def checkProgram (prog : Program) : Except String Unit :=
     match checkFunList Δ Φ sendAdts prog.funs with
     | .error err => .error err
     | .ok () =>
-      match checkProgramExhaustive Δ prog.funs with
+      match checkProgramExhaustive Δ prog.allFuns with
       | .error err => .error err
       | .ok () =>
-        match checkProgramEscape prog.funs prog.stackAllocs with
+        match checkProgramEscape prog.allFuns prog.stackAllocs with
         | .error err => .error err
         | .ok () =>
           if checkProgramGcLayouts prog.adts then .ok ()
@@ -1266,7 +1403,7 @@ theorem checkFunList_mem {Δ : AdtEnv} {Φ : FunEnv} {sendAdts : List Ident}
 theorem checkProgram_components {prog : Program} (h : checkProgram prog = .ok ()) :
     FunEnvTyped prog.toAdtEnv prog.toFunEnv ∧
     FunEnvExhSafe prog.toAdtEnv prog.toFunEnv ∧
-    checkProgramEscape prog.funs prog.stackAllocs = .ok () ∧
+    checkProgramEscape prog.allFuns prog.stackAllocs = .ok () ∧
     checkProgramGcLayouts prog.adts = true := by
   unfold checkProgram at h
   dsimp only at h
@@ -1276,11 +1413,11 @@ theorem checkProgram_components {prog : Program} (h : checkProgram prog = .ok ()
     | error _ => rw [hfl] at h; cases h
     | ok u1 =>
       rw [hfl] at h; dsimp only at h
-      cases hexh : checkProgramExhaustive prog.toAdtEnv prog.funs with
+      cases hexh : checkProgramExhaustive prog.toAdtEnv prog.allFuns with
       | error _ => rw [hexh] at h; cases h
       | ok u2 =>
         rw [hexh] at h; dsimp only at h
-        cases hesc : checkProgramEscape prog.funs prog.stackAllocs with
+        cases hesc : checkProgramEscape prog.allFuns prog.stackAllocs with
         | error _ => rw [hesc] at h; cases h
         | ok u3 =>
           rw [hesc] at h; dsimp only at h
@@ -1289,7 +1426,11 @@ theorem checkProgram_components {prog : Program} (h : checkProgram prog = .ok ()
             cases u3
             refine ⟨?_, ?_, rfl, hgc⟩
             · intro name fd hfd
-              exact checkFunList_mem hcl hfl (List.mem_of_find?_eq_some hfd)
+              have hmem := List.mem_of_find?_eq_some hfd
+              rcases List.mem_append.mp hmem with hfun | hext
+              · exact checkFunList_mem hcl hfl hfun
+              · rcases List.mem_map.mp hext with ⟨ed, _, rfl⟩
+                exact .trap .hostTrap ed.retTy
             · exact checkProgramExhaustive_sound
                 (fun _ _ hfd => List.mem_of_find?_eq_some hfd) hexh
           · cases h

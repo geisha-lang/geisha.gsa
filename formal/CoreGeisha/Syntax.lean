@@ -53,16 +53,27 @@ inductive Mode where
   | shared : Mode
   deriving Repr, BEq, DecidableEq
 
-/-- Core Geisha monomorphic types (post-monomorphization, matching `src/core.gsa`). -/
+/-- Core Geisha monomorphic types (post-monomorphization, matching `src/core.gsa` & `src/codegen.gsa`). -/
 inductive Ty where
   | void : Ty
   | int : Ty
+  | int64 : Ty
+  | float : Ty
+  | float32 : Ty
   | bool : Ty
+  | char : Ty
   | str : Ty
+  | ptr : Ty
+  | scopedPtr : Ty
+  | arena : Ty
+  | foreignPtr : Ty
+  | atomicInt : Ty
   | tuple : List Ty → Ty
   | fn : Mode → List Ty → Ty → Ty
   | adt : Ident → Ty
   | cell : Ty → Ty
+  | mutArray : Ty → Ty
+  | immArray : Ty → Ty
   | task : Ty → Ty
   | mvar : Ty → Ty
   | chan : Ty → Ty
@@ -84,42 +95,105 @@ inductive ConcPrim where
   | actorSend : ConcPrim
   deriving Repr, BEq
 
-/-- Core literals (`Lit` in `src/ast.gsa`). -/
+/-- Core literals (`Lit` in `src/ast.gsa`; IEEE-754 floats stored as exact bit patterns). -/
 inductive Lit where
   | int : Int32 → Lit
+  | int64 : Int64 → Lit
+  | floatBits : UInt64 → Lit
+  | float32Bits : UInt32 → Lit
   | bool : Bool → Lit
+  | char : UInt32 → Lit
   | str : String → Lit
   | unit : Lit
   deriving Repr, BEq, DecidableEq
 
-/-- Unary operators (`UnOp` in `src/ast.gsa`). -/
+/-- Unary operators (`UnOp` in `src/ast.gsa`, monomorphized by operand type). -/
 inductive UnOp where
-  | not : UnOp      -- `!` on Bool
-  | neg : UnOp      -- unary `-` on Int (wrapping 32-bit)
-  | bitNot : UnOp   -- `~` on Int
+  | not : UnOp         -- `!` on Bool
+  | neg : UnOp         -- unary `-` on Int (wrapping 32-bit)
+  | bitNot : UnOp      -- `~` on Int
+  | neg64 : UnOp       -- unary `-` on Int64 (wrapping 64-bit)
+  | bitNot64 : UnOp    -- `~` on Int64
+  | negFloat : UnOp    -- unary `-` on Float
+  | negFloat32 : UnOp  -- unary `-` on Float32
   deriving Repr, BEq, DecidableEq
 
-/-- Binary operators (`BinOp` in `src/ast.gsa`). -/
+/-- Binary operators (`BinOp` in `src/ast.gsa`, monomorphized by operand type). -/
 inductive BinOp where
   | add : BinOp
   | sub : BinOp
   | mul : BinOp
-  | div : BinOp     -- traps on divisor == 0
-  | rem : BinOp     -- traps on divisor == 0
+  | div : BinOp        -- traps on divisor == 0
+  | rem : BinOp        -- traps on divisor == 0
   | bitAnd : BinOp
   | bitOr : BinOp
   | bitXor : BinOp
+  | shlInt : BinOp
+  | shrInt : BinOp
+  | ushrInt : BinOp
   | eqInt : BinOp
   | neInt : BinOp
   | ltInt : BinOp
   | leInt : BinOp
   | gtInt : BinOp
   | geInt : BinOp
+  | add64 : BinOp
+  | sub64 : BinOp
+  | mul64 : BinOp
+  | div64 : BinOp      -- traps on divisor == 0
+  | rem64 : BinOp      -- traps on divisor == 0
+  | bitAnd64 : BinOp
+  | bitOr64 : BinOp
+  | bitXor64 : BinOp
+  | shl64 : BinOp      -- (Int64, Int) -> Int64
+  | shr64 : BinOp      -- (Int64, Int) -> Int64
+  | ushr64 : BinOp     -- (Int64, Int) -> Int64
+  | eq64 : BinOp
+  | ne64 : BinOp
+  | lt64 : BinOp
+  | le64 : BinOp
+  | gt64 : BinOp
+  | ge64 : BinOp
+  | addFloat : BinOp
+  | subFloat : BinOp
+  | mulFloat : BinOp
+  | divFloat : BinOp
+  | eqFloat : BinOp
+  | neFloat : BinOp
+  | ltFloat : BinOp
+  | leFloat : BinOp
+  | gtFloat : BinOp
+  | geFloat : BinOp
+  | addF32 : BinOp
+  | subF32 : BinOp
+  | mulF32 : BinOp
+  | divF32 : BinOp
+  | eqF32 : BinOp
+  | neF32 : BinOp
+  | ltF32 : BinOp
+  | leF32 : BinOp
+  | gtF32 : BinOp
+  | geF32 : BinOp
   | eqBool : BinOp
+  | neBool : BinOp
+  | bitAndBool : BinOp
+  | bitOrBool : BinOp
+  | bitXorBool : BinOp
+  | eqChar : BinOp
+  | neChar : BinOp
+  | ltChar : BinOp
+  | leChar : BinOp
+  | gtChar : BinOp
+  | geChar : BinOp
   | eqStr : BinOp
+  | neStr : BinOp
+  | ltStr : BinOp
+  | leStr : BinOp
+  | gtStr : BinOp
+  | geStr : BinOp
   | strConcat : BinOp
-  | and : BinOp     -- short-circuit logical &&
-  | or : BinOp      -- short-circuit logical ||
+  | and : BinOp        -- short-circuit logical &&
+  | or : BinOp         -- short-circuit logical ||
   deriving Repr, BEq, DecidableEq
 
 /-- Patterns (`Pattern` in `src/ast.gsa`, normalized for Core IR). -/
@@ -135,6 +209,7 @@ inductive Pat where
 inductive Trap where
   | divByZero : Trap
   | matchFailure : Trap
+  | hostTrap : Trap
   deriving Repr, BEq, DecidableEq
 
 /-- Core Geisha expressions, mirroring `Term` in `src/core.gsa` plus runtime
@@ -186,6 +261,17 @@ structure FunDef where
   retTy : Ty
   body : Expr
   deriving Repr
+
+/-- Host/runtime builtin or C `extern` declaration (`ExternDef` / prelude intrinsics). -/
+structure ExternDecl where
+  name : Ident
+  params : List (Ident × Ty)
+  retTy : Ty
+  deriving Repr
+
+/-- Lower an `ExternDecl` into a typed `FunDef` stub at the host boundary. -/
+def ExternDecl.toFunDef (ed : ExternDecl) : FunDef :=
+  { name := ed.name, params := ed.params, retTy := ed.retTy, body := .trap .hostTrap }
 
 /-- Global ADT registry `Δ`. -/
 abbrev AdtEnv := Ident → Option AdtDef

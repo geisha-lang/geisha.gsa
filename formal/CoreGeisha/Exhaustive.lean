@@ -121,7 +121,9 @@ def checkPatsExhaustive : Nat → AdtEnv → Nat → List (List Pat) → Bool
       | some (.lit (.bool _)) =>
         checkPatsExhaustive fuel' Δ k (specializeLit (.bool true) matrix) &&
         checkPatsExhaustive fuel' Δ k (specializeLit (.bool false) matrix)
-      | some (.lit (.int _)) | some (.lit (.str _)) =>
+      | some (.lit (.int _)) | some (.lit (.int64 _))
+      | some (.lit (.floatBits _)) | some (.lit (.float32Bits _))
+      | some (.lit (.char _)) | some (.lit (.str _)) =>
         checkPatsExhaustive fuel' Δ k (specializeWild matrix)
       | some (.tuple ps) =>
         checkPatsExhaustive fuel' Δ (ps.length + k) (specializeTuple ps.length matrix)
@@ -171,6 +173,7 @@ def checkExprExhaustive (Δ : AdtEnv) : Expr → Bool
   | .await e => checkExprExhaustive Δ e
   | .concPrim _ args => checkExprListExhaustive Δ args
   | .trap .divByZero => true
+  | .trap .hostTrap => true
   | .trap .matchFailure => false
 
 def checkExprListExhaustive (Δ : AdtEnv) : List Expr → Bool
@@ -197,21 +200,23 @@ def checkProgramExhaustive (Δ : AdtEnv) (funs : List FunDef) : Except String Un
 private theorem lit_beq_self (l : Lit) : (l == l) = true := by
   cases l with
   | int a => exact beq_self_eq_true a
+  | int64 a => exact beq_self_eq_true a
+  | floatBits a => exact beq_self_eq_true a
+  | float32Bits a => exact beq_self_eq_true a
   | bool b => exact beq_self_eq_true b
+  | char c => exact beq_self_eq_true c
   | str s => exact beq_self_eq_true s
   | unit => rfl
 
 private theorem lit_eq_of_beq {l1 l2 : Lit} (h : (l1 == l2) = true) : l1 = l2 := by
   cases l1 <;> cases l2 <;> try cases h
-  · rename_i a1 a2
-    have heq : (a1 == a2) = true := h
-    rw [beq_iff_eq.mp heq]
-  · rename_i b1 b2
-    have heq : (b1 == b2) = true := h
-    rw [beq_iff_eq.mp heq]
-  · rename_i s1 s2
-    have heq : (s1 == s2) = true := h
-    rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
+  · rename_i a1 a2; have heq : (a1 == a2) = true := h; rw [beq_iff_eq.mp heq]
   · rfl
 
 private theorem find?_pred_of_some {α : Type} {p : α → Bool} {xs : List α} {a : α}
@@ -683,6 +688,10 @@ theorem checkPatsExhaustive_sound {fuel : Nat} {Δ : AdtEnv} {Φ : FunEnv} {Ψ :
                     · exact litCase (.bool false) hv0_eq hexh.2
                     · exact litCase (.bool true) hv0_eq hexh.1
               | int _ => exact wildCase hexh
+              | int64 _ => exact wildCase hexh
+              | floatBits _ => exact wildCase hexh
+              | float32Bits _ => exact wildCase hexh
+              | char _ => exact wildCase hexh
               | str _ => exact wildCase hexh
             | tuple ps0 =>
               rcases hmat (.tuple ps0 :: rest0) hp0_mem with ⟨_, hps0⟩
@@ -865,6 +874,7 @@ def ExprExhSafe (Δ : AdtEnv) : Expr → Prop
   | .await e => ExprExhSafe Δ e
   | .concPrim _ args => ExprListExhSafe Δ args
   | .trap .divByZero => True
+  | .trap .hostTrap => True
   | .trap .matchFailure => False
 
 def ExprListExhSafe (Δ : AdtEnv) : List Expr → Prop
@@ -965,6 +975,7 @@ theorem checkExprExhaustive_sound {Δ : AdtEnv} {e : Expr}
     cases t
     · trivial
     · simp [checkExprExhaustive] at h
+    · trivial
 termination_by sizeOf e
 
 theorem checkExprListExhaustive_sound {Δ : AdtEnv} {es : List Expr}
@@ -1185,6 +1196,7 @@ theorem subst_preserves_exhSafe {Δ : AdtEnv} {x : Ident} {val : Expr}
   | .await e1, h => subst_preserves_exhSafe hval_exh e1 h
   | .concPrim _ args, h => substList_preserves_exhSafe hval_exh args h
   | .trap .divByZero, _ => trivial
+  | .trap .hostTrap, _ => trivial
   | .trap .matchFailure, h => False.elim h
 termination_by e => sizeOf e
 
@@ -1341,11 +1353,15 @@ theorem listFirstTrap_exhSafe {Δ : AdtEnv} {es : List Expr} {t : Trap}
 theorem evalBinOp_trap_exhSafe {Δ : AdtEnv} {op : BinOp} {l1 l2 : Lit} {t : Trap}
     (he : evalBinOp op l1 l2 = some (.trap t)) :
     ExprExhSafe Δ (.trap t) := by
-  cases op <;> cases l1 <;> cases l2 <;> simp [evalBinOp] at he
-  all_goals
-    split at he <;> simp at he
-    subst he
-    trivial
+  cases op with
+  | div | rem | div64 | rem64 =>
+    cases l1 <;> cases l2 <;> simp [evalBinOp] at he
+    all_goals
+      split at he <;> simp at he
+      subst he
+      trivial
+  | _ =>
+    cases l1 <;> cases l2 <;> cases he
 
 /-- Match-safety invariant for an `Actor`'s lifecycle phase (excluding `.failed .matchFailure`). -/
 def ActorPhaseExhSafe (Δ : AdtEnv) : ActorPhase → Prop
@@ -1353,6 +1369,7 @@ def ActorPhaseExhSafe (Δ : AdtEnv) : ActorPhase → Prop
   | .idle sv => ExprExhSafe Δ sv
   | .busy sv e _ => ExprExhSafe Δ sv ∧ ExprExhSafe Δ e
   | .failed .divByZero => True
+  | .failed .hostTrap => True
   | .failed .matchFailure => False
 
 /-- Match-safety invariant across the mutable store `σ` and concurrent `ConcPool`. -/

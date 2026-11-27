@@ -100,6 +100,27 @@ private def expectInt32 : SExpr → Except String Int32
     | none => .error s!"expected int32, got '{s}'"
   | other => .error s!"expected int32, got {repr other}"
 
+private def expectInt64 : SExpr → Except String Int64
+  | .atom s =>
+    match s.toInt? with
+    | some n => .ok (Int64.ofInt n)
+    | none => .error s!"expected int64, got '{s}'"
+  | other => .error s!"expected int64, got {repr other}"
+
+private def expectUInt32 : SExpr → Except String UInt32
+  | .atom s =>
+    match s.toInt? with
+    | some n => .ok (Int32.ofInt n).toUInt32
+    | none => .error s!"expected uint32, got '{s}'"
+  | other => .error s!"expected uint32, got {repr other}"
+
+private def expectUInt64 : SExpr → Except String UInt64
+  | .atom s =>
+    match s.toInt? with
+    | some n => .ok (Int64.ofInt n).toUInt64
+    | none => .error s!"expected uint64, got '{s}'"
+  | other => .error s!"expected uint64, got {repr other}"
+
 private def parseMode : SExpr → Except String Mode
   | .atom "local" => .ok .local
   | .atom "shared" => .ok .shared
@@ -108,8 +129,17 @@ private def parseMode : SExpr → Except String Mode
 private partial def parseTy : SExpr → Except String Ty
   | .atom "void" => .ok .void
   | .atom "int" => .ok .int
+  | .atom "int64" => .ok .int64
+  | .atom "float" => .ok .float
+  | .atom "float32" => .ok .float32
   | .atom "bool" => .ok .bool
+  | .atom "char" => .ok .char
   | .atom "str" => .ok .str
+  | .atom "ptr" => .ok .ptr
+  | .atom "scoped-ptr" => .ok .scopedPtr
+  | .atom "arena" => .ok .arena
+  | .atom "foreign-ptr" => .ok .foreignPtr
+  | .atom "atomic-int" => .ok .atomicInt
   | .list (.atom "tuple" :: ts) => do
     let ts' ← ts.mapM parseTy
     pure (.tuple ts')
@@ -128,6 +158,12 @@ private partial def parseTy : SExpr → Except String Ty
   | .list [.atom "cell", t] => do
     let t' ← parseTy t
     pure (.cell t')
+  | .list [.atom "mut-array", t] => do
+    let t' ← parseTy t
+    pure (.mutArray t')
+  | .list [.atom "imm-array", t] => do
+    let t' ← parseTy t
+    pure (.immArray t')
   | .list [.atom "task", t] => do
     let t' ← parseTy t
     pure (.task t')
@@ -160,6 +196,10 @@ private def parseUnOp : String → Except String UnOp
   | "not" => .ok .not
   | "neg" => .ok .neg
   | "bitNot" => .ok .bitNot
+  | "neg64" => .ok .neg64
+  | "bitNot64" => .ok .bitNot64
+  | "negFloat" => .ok .negFloat
+  | "negFloat32" => .ok .negFloat32
   | s => .error s!"unknown unary op '{s}'"
 
 private def parseBinOp : String → Except String BinOp
@@ -171,14 +211,69 @@ private def parseBinOp : String → Except String BinOp
   | "bitAnd" => .ok .bitAnd
   | "bitOr" => .ok .bitOr
   | "bitXor" => .ok .bitXor
+  | "shlInt" => .ok .shlInt
+  | "shrInt" => .ok .shrInt
+  | "ushrInt" => .ok .ushrInt
   | "eqInt" => .ok .eqInt
   | "neInt" => .ok .neInt
   | "ltInt" => .ok .ltInt
   | "leInt" => .ok .leInt
   | "gtInt" => .ok .gtInt
   | "geInt" => .ok .geInt
+  | "add64" => .ok .add64
+  | "sub64" => .ok .sub64
+  | "mul64" => .ok .mul64
+  | "div64" => .ok .div64
+  | "rem64" => .ok .rem64
+  | "bitAnd64" => .ok .bitAnd64
+  | "bitOr64" => .ok .bitOr64
+  | "bitXor64" => .ok .bitXor64
+  | "shl64" => .ok .shl64
+  | "shr64" => .ok .shr64
+  | "ushr64" => .ok .ushr64
+  | "eq64" => .ok .eq64
+  | "ne64" => .ok .ne64
+  | "lt64" => .ok .lt64
+  | "le64" => .ok .le64
+  | "gt64" => .ok .gt64
+  | "ge64" => .ok .ge64
+  | "addFloat" => .ok .addFloat
+  | "subFloat" => .ok .subFloat
+  | "mulFloat" => .ok .mulFloat
+  | "divFloat" => .ok .divFloat
+  | "eqFloat" => .ok .eqFloat
+  | "neFloat" => .ok .neFloat
+  | "ltFloat" => .ok .ltFloat
+  | "leFloat" => .ok .leFloat
+  | "gtFloat" => .ok .gtFloat
+  | "geFloat" => .ok .geFloat
+  | "addF32" => .ok .addF32
+  | "subF32" => .ok .subF32
+  | "mulF32" => .ok .mulF32
+  | "divF32" => .ok .divF32
+  | "eqF32" => .ok .eqF32
+  | "neF32" => .ok .neF32
+  | "ltF32" => .ok .ltF32
+  | "leF32" => .ok .leF32
+  | "gtF32" => .ok .gtF32
+  | "geF32" => .ok .geF32
   | "eqBool" => .ok .eqBool
+  | "neBool" => .ok .neBool
+  | "bitAndBool" => .ok .bitAndBool
+  | "bitOrBool" => .ok .bitOrBool
+  | "bitXorBool" => .ok .bitXorBool
+  | "eqChar" => .ok .eqChar
+  | "neChar" => .ok .neChar
+  | "ltChar" => .ok .ltChar
+  | "leChar" => .ok .leChar
+  | "gtChar" => .ok .gtChar
+  | "geChar" => .ok .geChar
   | "eqStr" => .ok .eqStr
+  | "neStr" => .ok .neStr
+  | "ltStr" => .ok .ltStr
+  | "leStr" => .ok .leStr
+  | "gtStr" => .ok .gtStr
+  | "geStr" => .ok .geStr
   | "strConcat" => .ok .strConcat
   | "and" => .ok .and
   | "or" => .ok .or
@@ -186,8 +281,12 @@ private def parseBinOp : String → Except String BinOp
 
 private def parseLit : SExpr → Except String Lit
   | .list [.atom "lit-int", n] => do pure (.int (← expectInt32 n))
+  | .list [.atom "lit-int64", n] => do pure (.int64 (← expectInt64 n))
+  | .list [.atom "lit-float-bits", n] => do pure (.floatBits (← expectUInt64 n))
+  | .list [.atom "lit-f32-bits", n] => do pure (.float32Bits (← expectUInt32 n))
   | .list [.atom "lit-bool", .atom "true"] => .ok (.bool true)
   | .list [.atom "lit-bool", .atom "false"] => .ok (.bool false)
+  | .list [.atom "lit-char", n] => do pure (.char (← expectUInt32 n))
   | .list [.atom "lit-str", s] => do pure (.str (← expectStr s))
   | .list [.atom "lit-unit"] => .ok .unit
   | other => .error s!"invalid literal: {repr other}"
@@ -210,8 +309,12 @@ private def parseParam : SExpr → Except String (Ident × Ty)
 
 private partial def parseExpr : SExpr → Except String Expr
   | .list [.atom "lit-int", n] => do pure (.lit (.int (← expectInt32 n)))
+  | .list [.atom "lit-int64", n] => do pure (.lit (.int64 (← expectInt64 n)))
+  | .list [.atom "lit-float-bits", n] => do pure (.lit (.floatBits (← expectUInt64 n)))
+  | .list [.atom "lit-f32-bits", n] => do pure (.lit (.float32Bits (← expectUInt32 n)))
   | .list [.atom "lit-bool", .atom "true"] => .ok (.lit (.bool true))
   | .list [.atom "lit-bool", .atom "false"] => .ok (.lit (.bool false))
+  | .list [.atom "lit-char", n] => do pure (.lit (.char (← expectUInt32 n)))
   | .list [.atom "lit-str", s] => do pure (.lit (.str (← expectStr s)))
   | .list [.atom "lit-unit"] => .ok (.lit .unit)
   | .list [.atom "var", x] => do pure (.var (← expectStr x))
@@ -280,6 +383,15 @@ private def parseFun : SExpr → Except String FunDef
     }
   | other => .error s!"invalid fun: {repr other}"
 
+private def parseExtern : SExpr → Except String ExternDecl
+  | .list [.atom "extern", name, .list ps, ret] => do
+    pure {
+      name := ← expectStr name
+      params := ← ps.mapM parseParam
+      retTy := ← parseTy ret
+    }
+  | other => .error s!"invalid extern: {repr other}"
+
 private def parseStackSpec : SExpr → Except String FnStackSpec
   | .list (.atom "fn-stack" :: fnName :: vars) => do
     pure {
@@ -296,13 +408,19 @@ def parseProgram (src : String) : Except String Program := do
     | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs)] => do
       let adts' ← adts.mapM parseAdt
       let funs' ← funs.mapM parseFun
-      pure { adts := adts', funs := funs', stackAllocs := [] }
+      pure { adts := adts', funs := funs', externs := [], stackAllocs := [] }
     | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs), .list (.atom "stack-allocs" :: specs)] => do
       let adts' ← adts.mapM parseAdt
       let funs' ← funs.mapM parseFun
       let specs' ← specs.mapM parseStackSpec
-      pure { adts := adts', funs := funs', stackAllocs := specs' }
-    | other => .error s!"expected (program (adts ...) (funs ...) [(stack-allocs ...)]), got {repr other}"
+      pure { adts := adts', funs := funs', externs := [], stackAllocs := specs' }
+    | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "externs" :: exts), .list (.atom "funs" :: funs), .list (.atom "stack-allocs" :: specs)] => do
+      let adts' ← adts.mapM parseAdt
+      let exts' ← exts.mapM parseExtern
+      let funs' ← funs.mapM parseFun
+      let specs' ← specs.mapM parseStackSpec
+      pure { adts := adts', funs := funs', externs := exts', stackAllocs := specs' }
+    | other => .error s!"expected (program (adts ...) [(externs ...)] (funs ...) [(stack-allocs ...)]), got {repr other}"
   | _ => .error "trailing tokens after top-level program"
 
 end CoreGeisha.Parser

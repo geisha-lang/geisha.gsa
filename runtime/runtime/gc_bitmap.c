@@ -22,6 +22,22 @@
 #define MAP_ANON MAP_ANONYMOUS
 #endif
 
+#if defined(__clang__)
+#define GC_NO_SANITIZE_STACK __attribute__((no_sanitize("address", "thread"), noinline))
+#elif defined(__GNUC__)
+#define GC_NO_SANITIZE_STACK __attribute__((no_sanitize_address, no_sanitize_thread, noinline))
+#else
+#define GC_NO_SANITIZE_STACK
+#endif
+
+GC_NO_SANITIZE_STACK static uintptr_t current_stack_sp(void)
+{
+    volatile uintptr_t sp_probe = 0;
+    uintptr_t addr = (uintptr_t)&sp_probe;
+    __asm__ volatile("" : "+r"(addr) :: "memory");
+    return addr;
+}
+
 #define MAX_GLOBAL_ROOTS 4096
 #define THR_RUNNING      0
 #define THR_BLOCKED      1
@@ -60,7 +76,7 @@ static const uint16_t _class_slot_sizes[GC_NUM_CLASSES] = {
 static uint8_t _words_to_class[513];
 /* Precomputed 32-bit reciprocal multipliers for O(1) division: slot_idx = (off * mul) >> 32 */
 static uint32_t _class_inv_mul[GC_NUM_CLASSES];
-static bool _tables_inited = false;
+static pthread_once_t _tables_once = PTHREAD_ONCE_INIT;
 
 typedef struct gc_nursery_t {
     uintptr_t cur;
@@ -252,9 +268,8 @@ static size_t _mark_stack_cap = 0;
 static void gc_collect_locked(gc_thread_t *collector, bool force_major);
 static bool mark_candidate_ptr(uintptr_t payload_ptr);
 
-static void init_size_tables(void)
+static void init_size_tables_once(void)
 {
-    if (_tables_inited) return;
     size_t c = 0;
     for (size_t w = 0; w <= 512; w++) {
         size_t bytes = w * WORD_SIZE;
@@ -267,7 +282,11 @@ static void init_size_tables(void)
         uint64_t d = _class_slot_sizes[i];
         _class_inv_mul[i] = (uint32_t)((((uint64_t)1 << 32) + d - 1) / d);
     }
-    _tables_inited = true;
+}
+
+static inline void init_size_tables(void)
+{
+    pthread_once(&_tables_once, init_size_tables_once);
 }
 
 static inline size_t fast_slot_index(size_t off, uint8_t cls)
@@ -727,7 +746,7 @@ static void retire_thread_local_pages_locked(gc_thread_t *t)
 void gc_enable_generational(void)
 {
     pthread_mutex_lock(&_gc_mu);
-    _generational_enabled = true;
+    __atomic_store_n(&_generational_enabled, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&_gc_mu);
 }
 
@@ -910,12 +929,12 @@ __attribute__((noinline)) void gc_safepoint_slow(void)
 
     jmp_buf regs;
     _setjmp(regs);
-    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp_here = current_stack_sp();
 
     pthread_mutex_lock(&_gc_mu);
     if (_stw_in_progress) {
         memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-        self->safepoint_sp = (uintptr_t)&sp_marker;
+        self->safepoint_sp = sp_here;
         __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
         if (all_threads_parked_locked()) {
             pthread_cond_signal(&_stw_park_cv);
@@ -935,13 +954,11 @@ void gc_enter_blocking(void *jmp_buf_on_stack)
     if (self == NULL) {
         return;
     }
-    volatile uintptr_t sp_here = 0;
+    uintptr_t sp_here = current_stack_sp();
     if (jmp_buf_on_stack != NULL) {
         memcpy(&self->safepoint_regs, jmp_buf_on_stack, sizeof(jmp_buf));
-        self->safepoint_sp = (uintptr_t)jmp_buf_on_stack;
-    } else {
-        self->safepoint_sp = (uintptr_t)&sp_here;
     }
+    self->safepoint_sp = sp_here;
     __atomic_store_n(&self->state, THR_BLOCKED, __ATOMIC_SEQ_CST);
     if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
         pthread_mutex_lock(&_gc_mu);
@@ -976,62 +993,63 @@ void gc_leave_blocking(void)
     }
 }
 
-/* ---- Sticky Generational Write Barrier (lock-free, O(1)) ---- */
+/* ---- Sticky Generational Write Barrier (race-free under TSan & safe on stack pointers) ---- */
 void gc_write_barrier(void *container_ptr)
 {
-    if (__builtin_expect(!_generational_enabled || container_ptr == NULL, 0)) {
+    if (__builtin_expect(!__atomic_load_n(&_generational_enabled, __ATOMIC_RELAXED) || container_ptr == NULL, 0)) {
         return;
     }
-    uintptr_t addr = (uintptr_t)container_ptr;
     gc_thread_t *self = _tls_thread;
     if (__builtin_expect(self == NULL, 0)) {
         return;
     }
 
-    /* Fast check: is it a nursery object? */
+    uintptr_t addr = (uintptr_t)container_ptr;
+    uintptr_t sp_here = current_stack_sp();
+    if (self->root_start != 0 && sp_here <= self->root_start && addr >= sp_here - 4096u && addr <= self->root_start) {
+        return;
+    }
+
+    header_t *hp = (header_t *)(addr - Header_size);
+    header_t prev = __atomic_load_n(hp, __ATOMIC_RELAXED);
+    if ((prev & (HEADER_OLD_BIT | HEADER_REMEMBERED_BIT)) != HEADER_OLD_BIT) {
+        return;
+    }
+
+    /* Slow path (entered at most once per old-gen object per Minor GC): verify heap membership under `_gc_mu` */
+    bool valid_old_heap = false;
+    pthread_mutex_lock(&_gc_mu);
     gc_nursery_t *nurs = find_nursery(addr);
     if (nurs != NULL) {
         uintptr_t hdr_addr = addr - Header_size;
-        if (hdr_addr < nurs->base || hdr_addr >= nurs->cur) return;
-        size_t slot = (hdr_addr - nurs->base) >> 3;
-        if ((nurs->mark_bits[slot >> 6] & (1ULL << (slot & 63u))) == 0) {
-            return;
-        }
-        header_t *hp = (header_t *)hdr_addr;
-        if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
-            return;
+        if (hdr_addr >= nurs->base && hdr_addr < nurs->cur) {
+            size_t slot = (hdr_addr - nurs->base) >> 3;
+            valid_old_heap = ((nurs->mark_bits[slot >> 6] & (1ULL << (slot & 63u))) != 0);
         }
     } else {
-        /* Fast check: is it a small slab object? */
         gc_chunk_t *chunk = find_chunk(addr);
-        if (__builtin_expect(chunk != NULL, 1)) {
+        if (chunk != NULL) {
             size_t pidx = (addr - chunk->base) >> GC_PAGE_SHIFT;
-            if (pidx < chunk->first_data_page) return;
-            gc_page_t *page = &chunk->pages[pidx];
-            if (page->state != GC_PAGE_INUSE) return;
-            uintptr_t hdr_addr = addr - Header_size;
-            if (hdr_addr < page->base) return;
-            size_t off = hdr_addr - page->base;
-            size_t slot_idx = off / page->slot_size;
-            /* Only record if container is in Old generation (`mark_bit == 1`) */
-            if ((page->mark_bits[slot_idx >> 6] & (1ULL << (slot_idx & 63u))) == 0) {
-                return;
-            }
-            header_t *hp = (header_t *)hdr_addr;
-            if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
-                return;
+            if (pidx >= chunk->first_data_page) {
+                gc_page_t *page = &chunk->pages[pidx];
+                uintptr_t hdr_addr = addr - Header_size;
+                if (page->state == GC_PAGE_INUSE && hdr_addr >= page->base) {
+                    size_t slot_idx = (hdr_addr - page->base) / page->slot_size;
+                    valid_old_heap = ((page->mark_bits[slot_idx >> 6] & (1ULL << (slot_idx & 63u))) != 0);
+                }
             }
         } else {
-            /* Large object check (e.g. large MutArray of pointers) */
             gc_large_t *lo = find_large_obj(addr);
-            if (lo == NULL || !lo->marked) {
-                return;
-            }
-            header_t *hp = (header_t *)(addr - Header_size);
-            if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
-                return;
-            }
+            valid_old_heap = (lo != NULL && lo->marked);
         }
+    }
+    pthread_mutex_unlock(&_gc_mu);
+
+    if (!valid_old_heap) {
+        return;
+    }
+    if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
+        return;
     }
 
     /* Append to thread-local remembered set */
@@ -1169,7 +1187,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
     gc_thread_t *self = _tls_thread;
     jmp_buf regs;
     bool regs_saved = false;
-    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp_here = current_stack_sp();
 
     size_t hdr_offset = (sizeof(gc_large_t) + Header_size + 15u) & ~(size_t)15u;
     size_t map_size = (hdr_offset + payload_words * WORD_SIZE + GC_PAGE_SIZE - 1) & ~(GC_PAGE_SIZE - 1);
@@ -1182,7 +1200,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
             if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
         }
@@ -1197,7 +1215,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
         }
         gc_collect_locked(self, false);
     }
@@ -1225,7 +1243,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
         }
         gc_collect_locked(self, true);
         drain_large_cache_locked();
@@ -1274,7 +1292,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
     gc_thread_t *self = _tls_thread;
     jmp_buf regs;
     bool regs_saved = false;
-    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp_here = current_stack_sp();
 
     pthread_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
@@ -1284,7 +1302,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
             if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
         }
@@ -1304,7 +1322,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
 
     gc_page_t *p = (self != NULL && self->local_pages[cls] != NULL)
                  ? self->local_pages[cls]
-                 : acquire_page_for_class_locked(cls, self, &regs, &regs_saved, (uintptr_t)&sp_marker);
+                 : acquire_page_for_class_locked(cls, self, &regs, &regs_saved, sp_here);
 
     if (p == NULL) {
         pthread_mutex_unlock(&_gc_mu);
@@ -1350,7 +1368,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
     gc_thread_t *self = _tls_thread;
     jmp_buf regs;
     bool regs_saved = false;
-    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp_here = current_stack_sp();
     size_t total_bytes = (payload_words + 1) * WORD_SIZE;
 
     pthread_mutex_lock(&_gc_mu);
@@ -1361,7 +1379,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
             if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
         }
@@ -1376,7 +1394,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-            self->safepoint_sp = (uintptr_t)&sp_marker;
+            self->safepoint_sp = sp_here;
         }
         gc_collect_locked(self, false);
     }
@@ -1557,8 +1575,8 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
         nurs->mark_bits[widx] |= bit;
         nurs->live_count++;
         header_t *hp = (header_t *)hdr_addr;
-        header_t hdr = *hp | HEADER_OLD_BIT;
-        *hp = hdr;
+        header_t hdr = __atomic_load_n(hp, __ATOMIC_RELAXED) | HEADER_OLD_BIT;
+        __atomic_store_n(hp, hdr, __ATOMIC_RELAXED);
         if (!Is_noscan_hdr(hdr)) {
             __builtin_prefetch((const void *)payload_ptr, 0, 1);
             mark_stack_push(hdr_addr, 0, sp);
@@ -1588,8 +1606,8 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
         page->live_count++;
 
         header_t *hp = (header_t *)hdr_addr;
-        header_t hdr = *hp | HEADER_OLD_BIT;
-        *hp = hdr;
+        header_t hdr = __atomic_load_n(hp, __ATOMIC_RELAXED) | HEADER_OLD_BIT;
+        __atomic_store_n(hp, hdr, __ATOMIC_RELAXED);
         if (!Is_noscan_hdr(hdr)) {
             __builtin_prefetch((const void *)payload_ptr, 0, 1);
             mark_stack_push(hdr_addr, 0, sp);
@@ -1602,8 +1620,8 @@ static inline bool try_mark_ptr_push(uintptr_t payload_ptr, size_t *sp)
         lo->marked = true;
         uintptr_t hdr_addr = payload_ptr - Header_size;
         header_t *hp = (header_t *)hdr_addr;
-        header_t hdr = *hp | HEADER_OLD_BIT;
-        *hp = hdr;
+        header_t hdr = __atomic_load_n(hp, __ATOMIC_RELAXED) | HEADER_OLD_BIT;
+        __atomic_store_n(hp, hdr, __ATOMIC_RELAXED);
         if (!Is_noscan_hdr(hdr)) {
             mark_stack_push(hdr_addr, lo->payload_words, sp);
         }
@@ -1724,12 +1742,17 @@ bool gc_mark_ptr(const void *payload_ptr)
     return mark_candidate_ptr((uintptr_t)payload_ptr);
 }
 
+GC_NO_SANITIZE_STACK static uintptr_t load_raw_stack_word(uintptr_t addr)
+{
+    return *(const uintptr_t *)addr;
+}
+
 static void mark_stack_range(uintptr_t sp_low, uintptr_t sp_high)
 {
     size_t sp = 0;
     uintptr_t cur = sp_low & ~(uintptr_t)(WORD_SIZE - 1);
     for (; cur <= sp_high; cur += WORD_SIZE) {
-        uintptr_t candidate = *(const uintptr_t *)cur;
+        uintptr_t candidate = load_raw_stack_word(cur);
         if (candidate != 0) {
             try_mark_ptr_push(candidate, &sp);
         }
@@ -1754,8 +1777,9 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     }
 
     /* Decide Minor vs Major GC */
+    bool gen_enabled = __atomic_load_n(&_generational_enabled, __ATOMIC_RELAXED);
     bool is_major = force_major
-                 || !_generational_enabled
+                 || !gen_enabled
                  || (_major_collections == 0 && _minor_collections == 0)
                  || (_consecutive_minors >= MAX_CONSECUTIVE_MINORS)
                  || (_last_live_bytes >= _major_threshold_bytes)
@@ -1790,13 +1814,13 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         for (gc_thread_t *t = _threads_head; t != NULL; t = t->next) {
             for (size_t i = 0; i < t->remset_len; i++) {
                 header_t *hp = (header_t *)(t->remset[i] - Header_size);
-                *hp &= ~HEADER_REMEMBERED_BIT;
+                __atomic_store_n(hp, __atomic_load_n(hp, __ATOMIC_RELAXED) & ~HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED);
             }
             t->remset_len = 0;
         }
         for (size_t i = 0; i < _orphan_remset_len; i++) {
             header_t *hp = (header_t *)(_orphan_remset[i] - Header_size);
-            *hp &= ~HEADER_REMEMBERED_BIT;
+            __atomic_store_n(hp, __atomic_load_n(hp, __ATOMIC_RELAXED) & ~HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED);
         }
         _orphan_remset_len = 0;
     }
@@ -1806,12 +1830,13 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == THR_IDLE) {
             continue;
         }
-        const uintptr_t *reg_words = (const uintptr_t *)&t->safepoint_regs;
+        uintptr_t reg_base = (uintptr_t)&t->safepoint_regs;
         size_t reg_count = sizeof(jmp_buf) / sizeof(uintptr_t);
         size_t sp = 0;
         for (size_t i = 0; i < reg_count; i++) {
-            if (reg_words[i] != 0) {
-                try_mark_ptr_push(reg_words[i], &sp);
+            uintptr_t rw = load_raw_stack_word(reg_base + i * sizeof(uintptr_t));
+            if (rw != 0) {
+                try_mark_ptr_push(rw, &sp);
             }
         }
         if (sp > 0) drain_mark_stack(&sp);
@@ -1848,7 +1873,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
             for (size_t i = 0; i < t->remset_len; i++) {
                 uintptr_t obj_ptr = t->remset[i];
                 header_t *hp = (header_t *)(obj_ptr - Header_size);
-                *hp &= ~HEADER_REMEMBERED_BIT;
+                __atomic_store_n(hp, __atomic_load_n(hp, __ATOMIC_RELAXED) & ~HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED);
                 scan_object_children_only(obj_ptr);
             }
             t->remset_len = 0;
@@ -1856,7 +1881,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         for (size_t i = 0; i < _orphan_remset_len; i++) {
             uintptr_t obj_ptr = _orphan_remset[i];
             header_t *hp = (header_t *)(obj_ptr - Header_size);
-            *hp &= ~HEADER_REMEMBERED_BIT;
+            __atomic_store_n(hp, __atomic_load_n(hp, __ATOMIC_RELAXED) & ~HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED);
             scan_object_children_only(obj_ptr);
         }
         _orphan_remset_len = 0;
@@ -2061,7 +2086,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         next_thresh = _init_threshold_bytes;
     }
     /* Cap nursery budget at 16 MB for responsive Minor GC pauses */
-    if (_generational_enabled && !is_major && next_thresh > 16u * 1024u * 1024u) {
+    if (gen_enabled && !is_major && next_thresh > 16u * 1024u * 1024u) {
         next_thresh = 16u * 1024u * 1024u;
     }
     if (soft_headroom > 0 && next_thresh > soft_headroom) {
@@ -2081,13 +2106,13 @@ void gc_collect_major(void)
 {
     gc_thread_t *self = _tls_thread;
     jmp_buf regs;
-    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp_here = current_stack_sp();
     _setjmp(regs);
 
     pthread_mutex_lock(&_gc_mu);
     if (self != NULL) {
         memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
-        self->safepoint_sp = (uintptr_t)&sp_marker;
+        self->safepoint_sp = sp_here;
     }
     gc_collect_locked(self, true);
     pthread_mutex_unlock(&_gc_mu);
@@ -2104,7 +2129,7 @@ void geisha_rt_init(void)
             fprintf(stderr, "GC initial chunk allocation failed\n");
             abort();
         }
-        _generational_enabled = true;
+        __atomic_store_n(&_generational_enabled, true, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&_gc_mu);
 }
@@ -2129,9 +2154,19 @@ int64_t gc_host_enter(void *stack_anchor)
     if (__builtin_expect(self != NULL, 1)) {
         int32_t prev = __atomic_load_n(&self->state, __ATOMIC_ACQUIRE);
         if (prev == THR_IDLE) {
+            if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
+                pthread_mutex_lock(&_gc_mu);
+                while (_stw_in_progress) {
+                    pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+                }
+                self->root_start = (uintptr_t)stack_anchor;
+                __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
+                pthread_mutex_unlock(&_gc_mu);
+                return 3;
+            }
             self->root_start = (uintptr_t)stack_anchor;
             __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
-            if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_ACQUIRE) != 0, 0)) {
+            if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
                 gc_safepoint_slow();
             }
             return 3;

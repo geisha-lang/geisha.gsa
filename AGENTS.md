@@ -5,13 +5,13 @@ Because Geisha is a custom language not present in LLM pretraining corpora, **ke
 
 ## Branch, Worktree & Pull Request Workflow (No Direct Push to `main`)
 
-`main` is protected on GitHub and gated by cross-platform CI (`linux-x86_64`, `linux-arm64`, `darwin-arm64`) and Lean 4 formal verification.
+`main` is protected on GitHub and gated by cross-platform CI (`linux-x86_64`, `linux-arm64`, `darwin-arm64`), `ASan + UBSan & TSan` sanitizers, and Lean 4 formal proofs + full self-hosting compiler translation validation.
 
 1. **Never edit or commit on `main` in the shared `~/code/geisha.gsa` checkout**:
    - Keep `~/code/geisha.gsa` strictly on clean `main` (used only to `git pull --ff-only` and `make runtime wasm-runtime bootstrap && make install` into `~/.geisha`).
    - Always create an isolated `git worktree` in your session workspace on a feature/fix branch (`git -C ~/code/geisha.gsa worktree add -b <type>/<topic> <workspace>/geisha-wt origin/main`).
-2. **Open a Pull Request & wait for all 4 CI jobs before merging**:
-   - Push your branch (`git push -u origin <branch>`), open a PR with `gh pr create`, and enable auto-merge (`gh pr merge --squash --auto --delete-branch`) or merge only after all 4 required checks succeed.
+2. **Open a Pull Request & wait for all 5 CI jobs before merging**:
+   - Push your branch (`git push -u origin <branch>`), open a PR with `gh pr create`, and enable auto-merge (`gh pr merge --squash --auto --delete-branch`) or merge only after all 5 required checks succeed.
    - Never bypass branch protection or push directly to `main`.
 
 ## Mandatory Sync Rules When Changing Language Features

@@ -117,9 +117,10 @@ make install
 Run checks, tests, and Lean 4 formal verification:
 
 ```sh
-make check-docs    # Verify AGENT_GUIDE.md, stdlib_bundle.gsa, guide_bundle.gsa, and CLI docs
-make test          # End-to-end language & package manager test suite
-make verify-core   # Lean 4 Core Geisha proofs + --dump-core validation
+make check-docs       # Verify AGENT_GUIDE.md, stdlib_bundle.gsa, guide_bundle.gsa, and CLI docs
+make test             # End-to-end language & package manager test suite
+make test-sanitizers  # ASan + UBSan & TSan runtime + generated LLVM IR stress suite
+make verify-core      # Lean 4 zero-sorry proofs + full self-hosted compiler translation validation
 ```
 
 Package a relocatable release archive (`dist/geisha-<version>-<os>-<arch>.tar.gz`):
