@@ -3265,6 +3265,23 @@ def buildCachedScriptBin(
     }
 }
 
+def settleWatchSnapshot(watchDirs: List String, extraFiles: List String, initialSnap: String): String = {
+    let cur = cellNew(initialSnap);
+    let stable = cellNew(false);
+    let tries = cellNew(0);
+    while (!cellGet(stable) && cellGet(tries) < 10 && c_watch_should_stop() == 0) {
+        sleepMs(40);
+        let next = computeWatchSnapshot(watchDirs, extraFiles);
+        if (next == cellGet(cur)) {
+            cellSet(stable, true)
+        } else {
+            cellSet(cur, next);
+            cellSet(tries, cellGet(tries) + 1)
+        }
+    };
+    cellGet(cur)
+}
+
 def runWatchProcessLoop(
     label: String,
     watchDirs: List String,
@@ -3326,7 +3343,7 @@ def runWatchProcessLoop(
                 sleepMs(pollMs);
                 let nextSnap = computeWatchSnapshot(watchDirs, extraFiles);
                 if (nextSnap != cellGet(lastSnap)) {
-                    cellSet(lastSnap, nextSnap);
+                    cellSet(lastSnap, settleWatchSnapshot(watchDirs, extraFiles, nextSnap));
                     cellSet(changed, true)
                 } else ()
             } else ()
@@ -3369,7 +3386,7 @@ def runWatchLoop(
             sleepMs(pollMs);
             let nextSnap = computeWatchSnapshot(watchDirs, extraFiles);
             if (nextSnap != cellGet(lastSnap)) {
-                cellSet(lastSnap, nextSnap);
+                cellSet(lastSnap, settleWatchSnapshot(watchDirs, extraFiles, nextSnap));
                 cellSet(changed, true)
             } else ()
         }

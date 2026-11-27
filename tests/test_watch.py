@@ -48,6 +48,12 @@ class StreamReader:
         raise AssertionError(f"Timed out waiting for {needle!r}; output so far:\n{joined}")
 
 
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def stop_proc(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is None:
         proc.terminate()
@@ -90,19 +96,19 @@ def test_watch_test_project(geisha_bin: str, env: dict[str, str]) -> None:
 
             # 1. Break the code -> watcher reports failure and keeps watching
             time.sleep(0.1)
-            lib_path.write_text("pub def answer(): Int = 99\n", encoding="utf-8")
+            atomic_write(lib_path, "pub def answer(): Int = 99\n")
             out2 = reader.read_until("Watching for changes...")
             assert "Change detected" in out2 and "test suite failed" in out2, f"expected failure re-run:\n{out2}"
 
             # 2. Fix the code -> watcher re-runs and passes again
             time.sleep(0.1)
-            lib_path.write_text("pub def answer(): Int = 42\n", encoding="utf-8")
+            atomic_write(lib_path, "pub def answer(): Int = 42\n")
             out3 = reader.read_until("Watching for changes...")
             assert "Change detected" in out3 and "All 1 test target(s) passed." in out3, f"expected passing re-run:\n{out3}"
 
             # 3. Edit geisha.toml -> watcher detects manifest change and re-runs
             time.sleep(0.1)
-            toml_path.write_text('name = "watch_demo"\nversion = "0.1.1"\n', encoding="utf-8")
+            atomic_write(toml_path, 'name = "watch_demo"\nversion = "0.1.1"\n')
             out4 = reader.read_until("Watching for changes...")
             assert "Change detected" in out4 and "All 1 test target(s) passed." in out4, f"expected geisha.toml re-run:\n{out4}"
         finally:
@@ -129,7 +135,7 @@ def test_watch_run_script(geisha_bin: str, env: dict[str, str]) -> None:
             assert "RUN_V1" in out1, f"expected RUN_V1 in initial run:\n{out1}"
 
             time.sleep(0.1)
-            script_path.write_text("def main(): Void = printLn(\"RUN_V2\")\n", encoding="utf-8")
+            atomic_write(script_path, "def main(): Void = printLn(\"RUN_V2\")\n")
             out2 = reader.read_until("Watching for changes...")
             assert "Change detected" in out2 and "RUN_V2" in out2, f"expected RUN_V2 after edit:\n{out2}"
         finally:
@@ -195,7 +201,7 @@ def test_watch_run_long_running_and_sigterm(geisha_bin: str, env: dict[str, str]
 
             # Edit while V1 child is STILL RUNNING -> watcher must kill V1 and start V2!
             time.sleep(0.1)
-            script_path.write_text(script_v2, encoding="utf-8")
+            atomic_write(script_path, script_v2)
             out2 = reader.read_until("SERVER_V2_PID=")
             m2 = re.search(r"SERVER_V2_PID=(\d+)", out2)
             assert m2 is not None, f"missing PID in V2 output:\n{out2}"
