@@ -860,3 +860,19 @@ void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_f
     if (n <= 0 || chunk_fn == NULL) return;
     chunk_fn(arr_ptr, 0, n, cls_ptr);
 }
+
+void gs_bench_black_box_mem(void *slot)
+{
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(__wasm__)
+    __asm__ volatile("" : "+r"(slot) : : "memory");
+#else
+    void *volatile sink = slot;
+    (void)sink;
+    __asm__ volatile("" : : : "memory");
+#endif
+}
+
+void gs_bench_black_box_void(void)
+{
+    __asm__ volatile("" : : : "memory");
+}

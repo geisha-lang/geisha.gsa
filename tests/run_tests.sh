@@ -2838,4 +2838,270 @@ fi
 echo "PASS [syslib_literals_toml_patch]: 0x/0o/0b/_ literals, sys.fs atomic writes, sys.proc poll/timeout/signals, std.toml.patch, & geisha.local.toml verified"
 PASS=$((PASS + 1))
 
+# --- Test 37: `geisha bench` microbenchmarking framework & `std.bench` ---
+ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+
+# 37a: `geisha doc std.bench` exposes polymorphic blackBox, measure, bench, BenchStats
+DOC_BENCH="$("$GEISHA_BIN" doc std.bench)"
+for sym in "def blackBox(" "def blackBoxBarrier(" "def measure(" "def bench(" "data BenchStats" "def formatStatsJsonInFile("; do
+    if ! printf '%s\n' "$DOC_BENCH" | grep -q "$sym"; then
+        echo "FAIL [bench_doc]: missing '$sym' in 'geisha doc std.bench'" >&2
+        exit 1
+    fi
+done
+
+# 37b: Verify polymorphic `__blackBox` emits `@gs_bench_black_box_mem` / `@gs_bench_black_box_void`
+#      and works on primitives, Tuples, Option, and custom user `data` structs without Orphan Rule issues
+cat > "$TMP_DIR/t37_blackbox.gsa" << 'EOF'
+use std.bench.{blackBox, blackBoxBarrier}
+use std.option.{Option, Some, None}
+use std.str.{intToStr, i64ToStr, boolToStr}
+
+data PairBox {
+    x: Int,
+    y: Float,
+}
+
+def pureWork(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+def main(): Void = {
+    let a = blackBox(pureWork(100));
+    let b = blackBox(intToI64(42));
+    let c = blackBox(3.5);
+    let d = blackBox(true);
+    let s = blackBox("ok");
+    let o = match blackBox(Some(7)) { Some(v) -> v, None -> 0 };
+    let (t1, t2) = blackBox((11, 2.5));
+    let pb = blackBox(PairBox { x: 9, y: 1.5 });
+    blackBoxBarrier();
+    printLn(
+        intToStr(a) + "|" + i64ToStr(b) + "|" + intToStr(floatToInt(c * 2.0))
+        + "|" + boolToStr(d) + "|" + s + "|" + intToStr(o)
+        + "|" + intToStr(t1 + floatToInt(t2 * 2.0))
+        + "|" + intToStr(pb.x + floatToInt(pb.y * 2.0))
+    )
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t37_blackbox.ll" "$TMP_DIR/t37_blackbox.gsa"
+if ! grep -q "@gs_bench_black_box_mem" "$TMP_DIR/t37_blackbox.ll" || ! grep -q "@gs_bench_black_box_void" "$TMP_DIR/t37_blackbox.ll"; then
+    echo "FAIL [bench_blackbox_ir]: expected @gs_bench_black_box_mem and @gs_bench_black_box_void in LLVM IR" >&2
+    exit 1
+fi
+"$GEISHA_BIN" -o "$TMP_DIR/t37_blackbox" "$TMP_DIR/t37_blackbox.gsa"
+T37_BB_OUT="$("$TMP_DIR/t37_blackbox")"
+assert_eq "bench_blackbox_values" "5050|42|7|true|ok|7|16|12" "$T37_BB_OUT"
+
+# 37b-wasm: Verify `std.bench.blackBox` compiles & links for `--target wasm32` with ZERO wasm-ld signature warnings
+cat > "$TMP_DIR/t37_blackbox_wasm.gsa" << 'EOF'
+use std.bench.{blackBox, blackBoxBarrier}
+
+pub def run_wasm_bb(n: Int): Int = {
+    let s = blackBox("hello");
+    let p = blackBox((n, strLen(s)));
+    blackBoxBarrier();
+    let (a, b) = p;
+    a + b
+}
+
+def main(): Void = { let _ = run_wasm_bb(10); () }
+EOF
+WASM_BB_ERR="$("$GEISHA_BIN" --target wasm32 --export run_wasm_bb -o "$TMP_DIR/t37_blackbox_wasm.wasm" "$TMP_DIR/t37_blackbox_wasm.gsa" 2>&1)"
+if printf '%s\n' "$WASM_BB_ERR" | grep -qi "signature_mismatch\|warning"; then
+    echo "FAIL [bench_wasm32_clean_link]: unexpected wasm-ld warning:" >&2
+    echo "$WASM_BB_ERR" >&2
+    exit 1
+fi
+if [ ! -s "$TMP_DIR/t37_blackbox_wasm.wasm" ]; then
+    echo "FAIL [bench_wasm32_clean_link]: wasm output missing or empty" >&2
+    exit 1
+fi
+
+# 37c: Standalone single-file mode with `bench_*` functions (no `main`)
+cat > "$TMP_DIR/t37_standalone_fns.gsa" << 'EOF'
+use std.bench.blackBox
+
+def sumTo(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+def fib(n: Int): Int = if (n <= 1) n else fib(n - 1) + fib(n - 2)
+
+def bench_sum_1000(): Void = {
+    let _ = blackBox(sumTo(blackBox(1000)));
+    ()
+}
+
+def bench_fib_14(): Int = blackBox(fib(blackBox(14)))
+EOF
+T37_TEXT="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" --iters 30 --warmup 2 --rounds 5 --runtime "$GEISHA_RUNTIME")"
+for tok in "bench_sum_1000" "bench_fib_14" "mean:" "median:" "min:" "max:" "ops/s" "30 iters x 5 rounds"; do
+    if ! printf '%s\n' "$T37_TEXT" | grep -q "$tok"; then
+        echo "FAIL [bench_standalone_text]: missing '$tok' in output:" >&2
+        echo "$T37_TEXT" >&2
+        exit 1
+    fi
+done
+
+T37_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" --iters 30 --warmup 2 --rounds 5 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True, data
+bs = data["benchmarks"]
+assert len(bs) == 2, bs
+assert [b["name"] for b in bs] == ["bench_sum_1000", "bench_fib_14"], bs
+for b in bs:
+    assert b["iters"] == 30, b
+    assert b["rounds"] == 5, b
+    assert b["total_ns"] > 0, b
+    assert b["min_ns"] <= b["median_ns"] <= b["max_ns"], b
+    assert b["mean_ns"] > 0, b
+    assert b["ops_per_sec"] > 0, b
+    assert b["file"].endswith("t37_standalone_fns.gsa"), b
+PY
+
+T37_FILT_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" fib --iters 15 --warmup 1 --rounds 3 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_FILT_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True
+bs = data["benchmarks"]
+assert len(bs) == 1 and bs[0]["name"] == "bench_fib_14", bs
+assert bs[0]["iters"] == 15 and bs[0]["rounds"] == 3, bs
+PY
+
+# 37d: Standalone script with explicit `main()` calling `std.bench.{bench, benchGroup}`
+cat > "$TMP_DIR/t37_standalone_main.gsa" << 'EOF'
+use std.bench.{bench, benchGroup, blackBox}
+
+def work(n: Int): Int = {
+    let s = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        cellSet(s, cellGet(s) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(s)
+}
+
+def main(): Void = {
+    let _ = bench("custom_loop", () -> { let _ = blackBox(work(blackBox(500))); () });
+    let _ = benchGroup("grp", [
+        ("a", () -> { let _ = blackBox(work(blackBox(200))); () }),
+        ("b", () -> { let _ = blackBox(work(blackBox(400))); () }),
+    ]);
+    ()
+}
+EOF
+T37_MAIN_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_main.gsa" --filter grp/ --iters 20 --warmup 1 --rounds 3 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_MAIN_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True
+bs = data["benchmarks"]
+assert [b["name"] for b in bs] == ["grp/a", "grp/b"], bs
+assert all(b["iters"] == 20 and b["rounds"] == 3 for b in bs), bs
+PY
+
+# 37e: Project mode (`geisha.toml` + `src/` + `benches/*.gsa`, auto-calibrated iters)
+BENCH_PROJ="$TMP_DIR/t37_bench_proj"
+mkdir -p "$BENCH_PROJ/src" "$BENCH_PROJ/benches"
+cat > "$BENCH_PROJ/geisha.toml" << 'EOF'
+name = "t37_bench_proj"
+version = "0.1.0"
+EOF
+cat > "$BENCH_PROJ/src/t37_bench_proj.gsa" << 'EOF'
+pub def triSum(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+EOF
+cat > "$BENCH_PROJ/benches/core_bench.gsa" << 'EOF'
+use t37_bench_proj.triSum
+use std.bench.blackBox
+
+def bench_tri_sum_500(): Void = {
+    let _ = blackBox(triSum(blackBox(500)));
+    ()
+}
+EOF
+T37_PROJ_JSON="$(cd "$BENCH_PROJ" && "$ABS_GEISHA_37" bench --warmup 2 --rounds 5 --json --runtime "$ABS_RT_37")"
+python3 - "$T37_PROJ_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True, data
+bs = data["benchmarks"]
+assert len(bs) == 1 and bs[0]["name"] == "bench_tri_sum_500", bs
+assert bs[0]["iters"] >= 1 and bs[0]["rounds"] == 5, bs
+assert bs[0]["mean_ns"] > 0 and bs[0]["ops_per_sec"] > 0, bs
+PY
+
+# 37f: Error diagnostics line-number alignment, negative checks & `--json` error contract
+cat > "$TMP_DIR/t37_line_err.gsa" << 'EOF'
+#!/usr/bin/env -S geisha bench
+use std.bench.blackBox
+
+def bench_bad_type(): Int = {
+    let x: Int = "not_an_int";
+    blackBox(x)
+}
+EOF
+T37_LINE_ERR="$("$GEISHA_BIN" bench "$TMP_DIR/t37_line_err.gsa" --runtime "$GEISHA_RUNTIME" 2>&1 || true)"
+if ! printf '%s\n' "$T37_LINE_ERR" | grep -q "t37_line_err.gsa:5:"; then
+    echo "FAIL [bench_line_alignment]: expected exact 't37_line_err.gsa:5:' diagnostic, got:" >&2
+    echo "$T37_LINE_ERR" >&2
+    exit 1
+fi
+
+# Reject `bench_*` with parameters
+cat > "$TMP_DIR/t37_bad_param.gsa" << 'EOF'
+def bench_with_arg(n: Int): Int = n + 1
+EOF
+if "$GEISHA_BIN" bench "$TMP_DIR/t37_bad_param.gsa" --runtime "$GEISHA_RUNTIME" >/dev/null 2>&1; then
+    echo "FAIL [bench_reject_params]: expected bench_with_arg(n) to be rejected" >&2
+    exit 1
+fi
+
+# Reject mixing `bench_*` with top-level script statements
+cat > "$TMP_DIR/t37_mixed_script.gsa" << 'EOF'
+let top = 123
+def bench_never_run(): Int = top
+EOF
+if "$GEISHA_BIN" bench "$TMP_DIR/t37_mixed_script.gsa" --runtime "$GEISHA_RUNTIME" >/dev/null 2>&1; then
+    echo "FAIL [bench_reject_mixed_script]: expected mixed top-level let + bench_* to be rejected" >&2
+    exit 1
+fi
+
+# Reject unknown compiler flags on `geisha bench` (e.g. `--target wasm32`) + verify `--json` error contract
+T37_BAD_FLAG_JSON="$("$GEISHA_BIN" bench --target wasm32 --json --runtime "$GEISHA_RUNTIME" 2>/dev/null || true)"
+python3 - "$T37_BAD_FLAG_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is False, data
+assert "unknown option" in data["error"] and "--target" in data["error"], data
+PY
+
+echo "PASS [geisha_bench]: polymorphic __blackBox (native+wasm32), standalone/project modes, line-aligned diagnostics, & --json error contract verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
