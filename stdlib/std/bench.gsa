@@ -2,108 +2,41 @@
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
-use std.list.{listRev, listMap}
+use std.list.listRev
 use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
-use std.str.{intToStr, i64ToStr, parseInt}
+use std.str.{intToStr, i64ToStr, floatToStr, parseInt, strContains}
 use sys.time.monotonicNanos
 use sys.env.getEnv
 
-extern noalloc "gs_bench_black_box_i32" def c_black_box_i32(v: Int): Int
-extern noalloc "gs_bench_black_box_i64" def c_black_box_i64(v: Int64): Int64
-extern noalloc "gs_bench_black_box_f64" def c_black_box_f64(v: Float): Float
-extern noalloc "gs_bench_black_box_f32" def c_black_box_f32(v: Float32): Float32
-extern noalloc "gs_bench_black_box_ptr" def c_black_box_ptr(v: Ptr): Ptr
-extern noalloc "gs_bench_black_box_ptr" def c_black_box_str(v: String): String
-extern noalloc "gs_bench_black_box_void" def c_black_box_void(): Void
-
-/// Prevents the compiler and LLVM optimizer from constant-folding or eliminating a value.
-pub concept BlackBox a {
-    blackBox: a -> a
-}
-
-pub instance BlackBox Int {
-    def blackBox(x: Int): Int = c_black_box_i32(x)
-}
-
-pub instance BlackBox Int64 {
-    def blackBox(x: Int64): Int64 = c_black_box_i64(x)
-}
-
-pub instance BlackBox Float {
-    def blackBox(x: Float): Float = c_black_box_f64(x)
-}
-
-pub instance BlackBox Float32 {
-    def blackBox(x: Float32): Float32 = c_black_box_f32(x)
-}
-
-pub instance BlackBox Bool {
-    def blackBox(x: Bool): Bool = c_black_box_i32(if (x) 1 else 0) != 0
-}
-
-pub instance BlackBox Char {
-    def blackBox(x: Char): Char = intToChar(c_black_box_i32(charToInt(x)))
-}
-
-pub instance BlackBox String {
-    def blackBox(x: String): String = c_black_box_str(x)
-}
-
-pub instance BlackBox Ptr {
-    def blackBox(x: Ptr): Ptr = c_black_box_ptr(x)
-}
-
-pub instance BlackBox Void {
-    def blackBox(x: Void): Void = {
-        c_black_box_void();
-        x
-    }
-}
-
-pub instance (BlackBox a) => BlackBox (Option a) {
-    def blackBox(opt) = match opt {
-        Some(v) -> Some(blackBox(v)),
-        None -> { c_black_box_void(); None },
-    }
-}
-
-pub instance (BlackBox a) => BlackBox (List a) {
-    def blackBox(xs) = match xs {
-        Nil -> { c_black_box_void(); Nil },
-        Cons(h, t) -> Cons(blackBox(h), t),
-    }
-}
+/// Prevents the compiler and LLVM optimizer from constant-folding or eliminating a value of any type.
+pub def blackBox(x: a): a = __blackBox(x)
 
 /// Compiler optimization barrier that prevents reordering or eliminating surrounding work.
-pub def blackBoxBarrier(): Void = c_black_box_void()
+pub def blackBoxBarrier(): Void = __blackBox(())
 
 /// Configuration for benchmark warmup and sampling.
 /// Set `sampleIters` to `0` for automatic per-round iteration calibration.
 pub data BenchConfig {
-    MkBenchConfig {
-        warmupIters: Int,
-        sampleIters: Int,
-        rounds: Int,
-    },
+    warmupIters: Int,
+    sampleIters: Int,
+    rounds: Int,
 }
 
 /// Summary statistics produced by measuring a benchmark function.
 pub data BenchStats {
-    MkBenchStats {
-        name: String,
-        iters: Int,
-        rounds: Int,
-        totalNs: Int64,
-        meanNs: Float,
-        medianNs: Float,
-        minNs: Float,
-        maxNs: Float,
-        opsPerSec: Float,
-    },
+    name: String,
+    iters: Int,
+    rounds: Int,
+    totalNs: Int64,
+    meanNs: Float,
+    medianNs: Float,
+    minNs: Float,
+    maxNs: Float,
+    opsPerSec: Float,
 }
 
 /// Default benchmark configuration (5 warmup iterations, auto-calibrated sample iterations, 11 rounds).
-pub def defaultConfig(): BenchConfig = MkBenchConfig {
+pub def defaultConfig(): BenchConfig = BenchConfig {
     warmupIters: 5,
     sampleIters: 0,
     rounds: 11,
@@ -120,7 +53,7 @@ def readEnvInt(key: String, fallback: Int, minVal: Int): Int = match getEnv(key)
 /// Read benchmark configuration from `GEISHA_BENCH_WARMUP`, `GEISHA_BENCH_ITERS`, and `GEISHA_BENCH_ROUNDS`.
 pub def envConfig(): BenchConfig = {
     let d = defaultConfig();
-    MkBenchConfig {
+    BenchConfig {
         warmupIters: readEnvInt("GEISHA_BENCH_WARMUP", d.warmupIters, 0),
         sampleIters: readEnvInt("GEISHA_BENCH_ITERS", d.sampleIters, 0),
         rounds: readEnvInt("GEISHA_BENCH_ROUNDS", d.rounds, 1),
@@ -229,7 +162,7 @@ pub def measure(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
     let meanNs = cellGet(sumNsCell) / intToFloat(numRounds);
     let opsPerSec = if (meanNs > 0.0) 1000000000.0 / meanNs else 0.0;
 
-    MkBenchStats {
+    BenchStats {
         name: name,
         iters: batchIters,
         rounds: numRounds,
@@ -242,22 +175,19 @@ pub def measure(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
     }
 }
 
-def formatFloat2(f: Float): String = {
-    let neg = f < 0.0;
-    let v = if (neg) -f else f;
-    let b = bufNew();
-    if (neg) bufPushByte(b, 45) else ();
-    let rounded = v + 0.005;
+def isNonFiniteFloat(f: Float): Bool = {
+    let bits = floatToBits64(f);
+    let expMask = (intToI64(2047)) << 52;
+    (bits & expMask) == expMask
+}
+
+def formatLargeFloat2(v: Float): String = {
     let billion = 1000000000.0;
-    if (rounded < billion) {
-        let whole = floatToInt(rounded);
-        let frac = floatToInt((rounded - intToFloat(whole)) * 100.0);
-        let cFrac = if (frac < 0) 0 else if (frac > 99) 99 else frac;
-        bufPushStr(b, intToStr(whole));
-        bufPushByte(b, 46);
-        if (cFrac < 10) bufPushByte(b, 48) else ();
-        bufPushStr(b, intToStr(cFrac))
-    } else if (rounded < 1000000000000000000.0) {
+    let rounded = v + 0.005;
+    if (rounded >= 1000000000000000000.0) {
+        "999999999999999999.00"
+    } else {
+        let b = bufNew();
         let hi = floatToInt(rounded / billion);
         let rem = rounded - intToFloat(hi) * billion;
         let lo = floatToInt(rem);
@@ -273,12 +203,36 @@ def formatFloat2(f: Float): String = {
         bufPushStr(b, loStr);
         bufPushByte(b, 46);
         if (cFrac < 10) bufPushByte(b, 48) else ();
-        bufPushStr(b, intToStr(cFrac))
-    } else {
-        bufPushStr(b, "999999999999999999.00")
-    };
-    bufToString(b)
+        bufPushStr(b, intToStr(cFrac));
+        bufToString(b)
+    }
 }
+
+def formatFloat2(f: Float): String =
+    if (isNonFiniteFloat(f)) "0.00"
+    else {
+        let neg = f < 0.0;
+        let v = if (neg) -f else f;
+        let pfx = if (neg) "-" else "";
+        if (v + 0.005 < 1000000000.0) {
+            let rounded = v + 0.005;
+            let whole = floatToInt(rounded);
+            let frac = floatToInt((rounded - intToFloat(whole)) * 100.0);
+            let cFrac = if (frac < 0) 0 else if (frac > 99) 99 else frac;
+            pfx + intToStr(whole) + "." + (if (cFrac < 10) "0" else "") + intToStr(cFrac)
+        } else {
+            pfx + formatLargeFloat2(v)
+        }
+    }
+
+def formatJsonFloat(f: Float): String =
+    if (isNonFiniteFloat(f)) "0.0"
+    else {
+        let neg = f < 0.0;
+        let v = if (neg) -f else f;
+        if (v < 1000000000.0) floatToStr(f)
+        else (if (neg) "-" else "") + formatLargeFloat2(v)
+    }
 
 /// Format a duration in nanoseconds with automatic unit scaling (`ns`, `us`, `ms`, `s`).
 pub def formatDurationNs(ns: Float): String =
@@ -321,9 +275,9 @@ pub def formatStatsText(s: BenchStats): String =
     + " | " + formatOpsPerSec(s.opsPerSec)
     + " (" + intToStr(s.iters) + " iters x " + intToStr(s.rounds) + " rounds)"
 
-/// Format `BenchStats` as a compact JSON object string.
-pub def formatStatsJson(s: BenchStats): String = {
-    let fileField = match getEnv("GEISHA_BENCH_FILE") {
+/// Format `BenchStats` as a compact JSON object string with an optional `"file"` field.
+pub def formatStatsJsonInFile(s: BenchStats, fileOpt: Option String): String = {
+    let fileField = match fileOpt {
         Some(f) if (strLen(f) > 0) -> ",\"file\":\"" + jsonEscape(f) + "\"",
         _ -> "",
     };
@@ -332,43 +286,22 @@ pub def formatStatsJson(s: BenchStats): String = {
     + ",\"iters\":" + intToStr(s.iters)
     + ",\"rounds\":" + intToStr(s.rounds)
     + ",\"total_ns\":" + i64ToStr(s.totalNs)
-    + ",\"mean_ns\":" + formatFloat2(s.meanNs)
-    + ",\"median_ns\":" + formatFloat2(s.medianNs)
-    + ",\"min_ns\":" + formatFloat2(s.minNs)
-    + ",\"max_ns\":" + formatFloat2(s.maxNs)
-    + ",\"ops_per_sec\":" + formatFloat2(s.opsPerSec)
+    + ",\"mean_ns\":" + formatJsonFloat(s.meanNs)
+    + ",\"median_ns\":" + formatJsonFloat(s.medianNs)
+    + ",\"min_ns\":" + formatJsonFloat(s.minNs)
+    + ",\"max_ns\":" + formatJsonFloat(s.maxNs)
+    + ",\"ops_per_sec\":" + formatJsonFloat(s.opsPerSec)
     + "}"
 }
 
-def strContainsSubstr(hay: String, needle: String): Bool = {
-    let hl = strLen(hay);
-    let nl = strLen(needle);
-    if (nl == 0) true
-    else if (nl > hl) false
-    else {
-        let i = cellNew(0);
-        let found = cellNew(false);
-        let limit = hl - nl;
-        while (cellGet(i) <= limit && !cellGet(found)) {
-            let start = cellGet(i);
-            let j = cellNew(0);
-            let ok = cellNew(true);
-            while (cellGet(j) < nl && cellGet(ok)) {
-                if (strByteAt(hay, start + cellGet(j)) != strByteAt(needle, cellGet(j))) {
-                    cellSet(ok, false)
-                } else ();
-                cellSet(j, cellGet(j) + 1)
-            };
-            if (cellGet(ok)) cellSet(found, true) else cellSet(i, start + 1)
-        };
-        cellGet(found)
-    }
-}
+/// Format `BenchStats` as a pure, compact JSON object string.
+pub def formatStatsJson(s: BenchStats): String =
+    formatStatsJsonInFile(s, None)
 
 def matchesBenchFilter(name: String): Bool = match getEnv("GEISHA_BENCH_FILTER") {
     None -> true,
     Some(pat) if (strLen(pat) == 0) -> true,
-    Some(pat) -> strContainsSubstr(name, pat),
+    Some(pat) -> strContains(name, pat),
 }
 
 def isJsonOutputMode(): Bool = match getEnv("GEISHA_BENCH_JSON") {
@@ -379,7 +312,7 @@ def isJsonOutputMode(): Bool = match getEnv("GEISHA_BENCH_JSON") {
 /// Run a benchmark with explicit `BenchConfig`, printing text or JSON based on `GEISHA_BENCH_JSON`.
 pub def benchWith(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
     if (!matchesBenchFilter(name)) {
-        MkBenchStats {
+        BenchStats {
             name: name,
             iters: 0,
             rounds: 0,
@@ -393,7 +326,7 @@ pub def benchWith(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
     } else {
         let s = measure(name, cfg, f);
         if (isJsonOutputMode()) {
-            printLn(formatStatsJson(s))
+            printLn(formatStatsJsonInFile(s, getEnv("GEISHA_BENCH_FILE")))
         } else {
             printLn(formatStatsText(s))
         };

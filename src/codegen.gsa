@@ -1666,7 +1666,24 @@ def tryEmitIntrinsic(
     locals: List (String, VarSlot),
     directLetVar: Option String
 ): Option String = {
-    if (name == "cellNew") {
+    if (name == "__blackBox") {
+        let a0 = nthArgTerm(args, 0);
+        let argVal = genExpr(mctx, fctx, a0, locals, false);
+        let valTy = schemeBody(a0.tscm);
+        match valTy {
+            TyVoid -> {
+                emitLine(fctx, "call void @gs_bench_black_box_void()");
+                Some("0")
+            },
+            _ -> {
+                let llvmTy = getValLlvmType(valTy);
+                let slot = emitEntryAlloca(fctx, llvmTy);
+                emitStore(fctx, llvmTy, argVal, slot);
+                emitLine(fctx, "call void @gs_bench_black_box_mem(ptr " + slot + ")");
+                Some(emitLoad(fctx, llvmTy, slot))
+            },
+        }
+    } else if (name == "cellNew") {
         let a0 = nthArgTerm(args, 0);
         let initVal = genExpr(mctx, fctx, a0, locals, false);
         let elemTy = schemeBody(a0.tscm);
@@ -4209,6 +4226,8 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
+        ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
@@ -4278,6 +4297,8 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
+        ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),

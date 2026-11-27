@@ -1,25 +1,41 @@
-// Microbenchmark Runner (`geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--json]`)
+// Microbenchmark Runner (`geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]`)
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend}
-use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.{strStartsWith, strEndsWith, strTrim, strSplitChar, strJoin, intToStr, parseInt}
 use std.path.{pathJoin, pathDirname, pathStem}
-use sys.fs.{fileExists, isDir, readFile, writeFile, removeFile, mkdirAll, readDir}
-use sys.proc.shell
+use sys.fs.{fileExists, isDir, readFile, removeFile, mkdirAll, readDir}
 use ast.{
-    ModuleItem, ModDef, Item, ItForm, ExAbs, sortUniqueStrings
+    Span, emptySpan, ModuleItem, ModDef, Item, ItForm, ExAbs, sortUniqueStrings, addUniqueStr
 }
+use diag.{diagReset, diagRegisterFile, formatSpanDiag}
 use parser.parseFileModuleInFile
 use loader.{PkgSpec, MkPkgSpec}
 use pkg.{
     Manifest, TargetCfg, MkTargetCfg, CompileCallbacks,
-    shellQuote, geishaHomeDir, findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs,
+    geishaHomeDir, findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs,
     sanitizeIdentAlias, resolveRelList, mergeTargetConfigs
 }
 
 extern "getpid" def c_bench_getpid(): Int
+extern "gs_proc_spawn" def c_bench_proc_spawn(
+    program: String,
+    argBlob: String,
+    argc: Int,
+    cwd: String,
+    envMode: Int,
+    envBlob: String,
+    envc: Int,
+    stdioPacked: Int,
+    ownGroup: Int,
+    outInts: Ptr
+): Int
+extern "gs_proc_wait" def c_bench_proc_wait(pid: Int, nohang: Int): Int64
+extern "gs_pipe_read" def c_bench_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
+extern "gs_pipe_close" def c_bench_pipe_close(fd: Int): Int
+extern "gs_pipe_poll2" def c_bench_pipe_poll2(fd0: Int, fd1: Int, timeoutMs: Int): Int
 
 data BenchCliOpts {
     MkBenchCliOpts {
@@ -37,6 +53,23 @@ data InspectedBenchFile {
         ibHasMain: Bool,
         ibBenchFns: List String,
     },
+}
+
+def benchJsonEscape(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i));
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else bufPushByte(b, ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
 }
 
 def parsePositiveIntArg(flag: String, raw: String, minVal: Int): Result Int String =
@@ -160,20 +193,34 @@ def strContainsSub(hay: String, needle: String): Bool = {
 }
 
 def inspectBenchFile(filePath: String, src: String): Result InspectedBenchFile String = {
-    let fm = parseFileModuleInFile(src, Nil, 0)?;
-    let hasMain = cellNew(false);
+    diagReset();
+    let fid = diagRegisterFile(filePath, src);
+    let fm = parseFileModuleInFile(src, Nil, fid)?;
+    let mainSpanOpt: Cell (Option Span) = cellNew(None);
     let fnsRev: Cell (List String) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
     let cur = cellNew(fm.items);
-    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(ModDef(_, d), rest) -> {
                 if (d.ident == "main") {
-                    cellSet(hasMain, true)
+                    cellSet(mainSpanOpt, Some(d.dpos))
                 } else if (strStartsWith(d.ident, "bench_")) {
                     match d.item {
                         ItForm(f) -> match f.node {
                             ExAbs(Nil, _, _) -> cellSet(fnsRev, Cons(d.ident, cellGet(fnsRev))),
-                            _ -> (),
+                            ExAbs(_, _, _) ->
+                                cellSet(errOpt, Some(formatSpanDiag(
+                                    "Bench error",
+                                    d.dpos,
+                                    "benchmark function '" + d.ident + "' must take zero parameters (use `def " + d.ident + "(): ...`)"
+                                ))),
+                            _ ->
+                                cellSet(errOpt, Some(formatSpanDiag(
+                                    "Bench error",
+                                    d.dpos,
+                                    "benchmark item '" + d.ident + "' must be a zero-parameter function (use `def " + d.ident + "(): ...`)"
+                                ))),
                         },
                         _ -> (),
                     }
@@ -184,21 +231,35 @@ def inspectBenchFile(filePath: String, src: String): Result InspectedBenchFile S
             Nil -> (),
         }
     };
-    let _ = filePath;
-    Ok(MkInspectedBenchFile {
-        ibHasMain: cellGet(hasMain),
-        ibBenchFns: listRev(cellGet(fnsRev)),
-    })
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> {
+            let fns = listRev(cellGet(fnsRev));
+            let hasFns = match fns { Cons(_, _) -> true, Nil -> false };
+            match cellGet(mainSpanOpt) {
+                Some(msp) if (hasFns) ->
+                    Err(formatSpanDiag(
+                        "Bench error",
+                        msp,
+                        "cannot mix `bench_*` functions with `def main` or top-level script statements in the same benchmark file"
+                    )),
+                Some(_) -> Ok(MkInspectedBenchFile { ibHasMain: true, ibBenchFns: Nil }),
+                None -> Ok(MkInspectedBenchFile { ibHasMain: false, ibBenchFns: fns }),
+            }
+        },
+    }
 }
 
-def stripShebangLine(src: String): String =
+// Replace leading `#!...` with `//...` while preserving the trailing `\n` so user line numbers stay 1:1.
+def neutralizeShebangPreserveLines(src: String): String =
     if (strStartsWith(src, "#!")) {
         let n = strLen(src);
         let i = cellNew(0);
         while (cellGet(i) < n && strByteAt(src, cellGet(i)) != 10) {
             cellSet(i, cellGet(i) + 1)
         };
-        if (cellGet(i) < n) strSlice(src, cellGet(i) + 1, n) else ""
+        let rest = if (cellGet(i) < n) strSlice(src, cellGet(i), n) else "";
+        "//" + rest
     } else {
         src
     }
@@ -217,11 +278,11 @@ def escapeGeishaStrLit(s: String): String = {
     bufToString(b)
 }
 
+// Append harness at EOF so all user source lines remain at their exact original 1-based line numbers.
 def synthesizeBenchHarnessSource(origSrc: String, benchFns: List String): String = {
     let b = bufNew();
-    bufPushStr(b, "use std.bench as __gs_bench_rt\n");
-    bufPushStr(b, stripShebangLine(origSrc));
-    bufPushStr(b, "\n\ndef main(): Void = {\n");
+    bufPushStr(b, neutralizeShebangPreserveLines(origSrc));
+    bufPushStr(b, "\n\nuse std.bench as __gs_bench_rt\n\ndef main(): Void = {\n");
     bufPushStr(b, "    let __cfg = __gs_bench_rt.envConfig();\n");
     let cur = cellNew(benchFns);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -371,47 +432,104 @@ def buildBenchEnvVars(
     cellGet(vars)
 }
 
-def formatEnvPrefix(vars: List (String, String)): String = {
+def packBenchArgBlob(prog: String): (String, Int) = {
     let b = bufNew();
+    bufPushStr(b, prog);
+    bufPushByte(b, 0);
+    (bufToString(b), 1)
+}
+
+def packBenchEnvBlob(vars: List (String, String)): (String, Int) = {
+    let b = bufNew();
+    let count = cellNew(0);
     let cur = cellNew(vars);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons((k, v), rest) -> {
                 bufPushStr(b, k);
                 bufPushByte(b, 61);
-                bufPushStr(b, shellQuote(v));
-                bufPushByte(b, 32);
+                bufPushStr(b, v);
+                bufPushByte(b, 0);
+                cellSet(count, cellGet(count) + 1);
                 cellSet(cur, rest)
             },
             Nil -> (),
         }
     };
-    bufToString(b)
+    (bufToString(b), cellGet(count))
 }
 
-def execBenchBinCapture(
+def readI32Le(p: Ptr, off: Int): Int =
+    ptrByteAt(p, off)
+    | (ptrByteAt(p, off + 1) << 8)
+    | (ptrByteAt(p, off + 2) << 16)
+    | (ptrByteAt(p, off + 3) << 24)
+
+def pushPtrBytes(b: StringBuf, p: Ptr, n: Int): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        bufPushByte(b, ptrByteAt(p, cellGet(i)));
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+// Spawn benchmark binary directly via posix_spawnp (no `/bin/sh`, no `.tmp` files).
+// Text mode inherits stdout/stderr for real-time streaming; JSON mode pipes stdout/stderr for aggregation.
+def execBenchBinDirect(
     outBin: String,
     workDirOpt: Option String,
     envVars: List (String, String),
-    buildDir: String,
-    tag: String
-): Result (Int, String, String) String = {
-    let stdoutFile = pathJoin(buildDir, "__bench_out_" + tag + ".tmp");
-    let stderrFile = pathJoin(buildDir, "__bench_err_" + tag + ".tmp");
-    let cdPrefix = match workDirOpt {
-        Some(wd) -> "cd " + shellQuote(wd) + " && ",
-        None -> "",
-    };
-    let cmd =
-        cdPrefix + formatEnvPrefix(envVars) + shellQuote(outBin)
-        + " > " + shellQuote(stdoutFile)
-        + " 2> " + shellQuote(stderrFile);
-    let rc = shell(cmd);
-    let stdoutStr = match readFile(stdoutFile) { Ok(s) -> s, Err(_) -> "" };
-    let stderrStr = match readFile(stderrFile) { Ok(s) -> s, Err(_) -> "" };
-    let _ = removeFile(stdoutFile);
-    let _ = removeFile(stderrFile);
-    Ok((rc, stdoutStr, stderrStr))
+    capturePipes: Bool
+): Result (Int, Int, String, String) String = {
+    let (argBlob, argc) = packBenchArgBlob(outBin);
+    let (envBlob, envc) = packBenchEnvBlob(envVars);
+    let cwdStr = match workDirOpt { Some(wd) -> wd, None -> "" };
+    // stdioPacked: stdin=Inherit(0), stdout/stderr=Piped(2) when capturePipes else Inherit(0)
+    let stdioPacked = if (capturePipes) (0 | (2 << 2) | (2 << 4)) else 0;
+    let outInts = ptrAllocBytes(16);
+    let rc = c_bench_proc_spawn(outBin, argBlob, argc, cwdStr, 1, envBlob, envc, stdioPacked, 0, outInts);
+    if (rc != 0) {
+        Err("failed to spawn benchmark binary '" + outBin + "'")
+    } else {
+        let pid = readI32Le(outInts, 0);
+        let outFd = cellNew(readI32Le(outInts, 8));
+        let errFd = cellNew(readI32Le(outInts, 12));
+        let outBuf = bufNew();
+        let errBuf = bufNew();
+        if (capturePipes) {
+            let scratch = ptrAllocBytes(16384);
+            let ioDone = cellNew(false);
+            while (!cellGet(ioDone) && (cellGet(outFd) >= 0 || cellGet(errFd) >= 0)) {
+                let mask = c_bench_pipe_poll2(cellGet(outFd), cellGet(errFd), -1);
+                if (mask <= 0) {
+                    cellSet(ioDone, true)
+                } else {
+                    if ((mask & 1) != 0 && cellGet(outFd) >= 0) {
+                        let n = c_bench_pipe_read(cellGet(outFd), scratch, 16384);
+                        if (n <= 0) { let _ = c_bench_pipe_close(cellGet(outFd)); cellSet(outFd, -1) }
+                        else pushPtrBytes(outBuf, scratch, n)
+                    } else ();
+                    if ((mask & 2) != 0 && cellGet(errFd) >= 0) {
+                        let n = c_bench_pipe_read(cellGet(errFd), scratch, 16384);
+                        if (n <= 0) { let _ = c_bench_pipe_close(cellGet(errFd)); cellSet(errFd, -1) }
+                        else pushPtrBytes(errBuf, scratch, n)
+                    } else ()
+                }
+            };
+            if (cellGet(outFd) >= 0) { let _ = c_bench_pipe_close(cellGet(outFd)); () } else ();
+            if (cellGet(errFd) >= 0) { let _ = c_bench_pipe_close(cellGet(errFd)); () } else ()
+        } else ();
+
+        let rawWait = c_bench_proc_wait(pid, 0);
+        if (rawWait <= intToI64(0)) {
+            Err("waitpid failed for benchmark binary '" + outBin + "'")
+        } else {
+            let tag = i64ToInt(rawWait >>> 32);
+            let lowMask = (intToI64(65535) << 16) | intToI64(65535);
+            let code = i64ToInt(rawWait & lowMask);
+            Ok((tag, code, bufToString(outBuf), bufToString(errBuf)))
+        }
+    }
 }
 
 def collectJsonLines(stdout: String, accRev: Cell (List String)): Int = {
@@ -434,12 +552,17 @@ def collectJsonLines(stdout: String, accRev: Cell (List String)): Int = {
     cellGet(count)
 }
 
-def trimTrailingNewlines(s: String): String = {
-    let end = cellNew(strLen(s));
-    while (cellGet(end) > 0 && (strByteAt(s, cellGet(end) - 1) == 10 || strByteAt(s, cellGet(end) - 1) == 13)) {
-        cellSet(end, cellGet(end) - 1)
-    };
-    strSlice(s, 0, cellGet(end))
+def withBenchFileDirInRootSpec(rootSpec: PkgSpec, bf: String): PkgSpec = {
+    let dir = pathDirname(bf);
+    let dirs =
+        if (dir != "" && dir != ".") addUniqueStr(rootSpec.srcRoots, dir)
+        else rootSpec.srcRoots;
+    MkPkgSpec {
+        pkgId: rootSpec.pkgId,
+        pkgName: rootSpec.pkgName,
+        srcRoots: dirs,
+        deps: rootSpec.deps,
+    }
 }
 
 def runSingleBenchFile(
@@ -448,7 +571,7 @@ def runSingleBenchFile(
     workDirOpt: Option String,
     buildDir: String,
     removeBinAfter: Bool,
-    rootSpec: PkgSpec,
+    rootSpec0: PkgSpec,
     extSpecs: List PkgSpec,
     benchTc: TargetCfg,
     bOpts: BenchCliOpts,
@@ -460,6 +583,7 @@ def runSingleBenchFile(
     let src = readFile(bf)?;
     let info = inspectBenchFile(bf, src)?;
     let hasBenchFns = match info.ibBenchFns { Cons(_, _) -> true, Nil -> false };
+    let rootSpec = withBenchFileDirInRootSpec(rootSpec0, bf);
 
     if (!info.ibHasMain && !hasBenchFns) {
         if (explicitSingle) {
@@ -474,32 +598,29 @@ def runSingleBenchFile(
             _ -> {
                 let stem = pathStem(bf);
                 let pidStr = intToStr(c_bench_getpid());
-                let harnessSrcPath = pathJoin(buildDir, "__bench_harness_" + stem + "_" + pidStr + ".gsa");
                 let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr);
                 let harnessSrc = synthesizeBenchHarnessSource(src, selectedFns);
-                writeFile(harnessSrcPath, harnessSrc)?;
-                let compileRes = cbs.cbCompileNativeExe(
-                    harnessSrcPath, rootSpec, extSpecs, benchTc, Some(outBin), None, rtOverrideOpt
-                );
-                let _ = removeFile(harnessSrcPath);
-                let _ = compileRes?;
+                cbs.cbCompileNativeExeSource(
+                    bf, harnessSrc, rootSpec, extSpecs, benchTc, Some(outBin), rtOverrideOpt
+                )?;
 
                 let envVars = buildBenchEnvVars(bf, bOpts, false);
-                let runRes = execBenchBinCapture(outBin, workDirOpt, envVars, buildDir, stem + "_" + pidStr);
+                let runRes = execBenchBinDirect(outBin, workDirOpt, envVars, bOpts.bJson);
                 if (removeBinAfter) { let _ = removeFile(outBin); () } else ();
-                let (rc, stdoutStr, stderrStr) = runRes?;
-                if (rc == 0) {
+                let (tag, code, stdoutStr, stderrStr) = runRes?;
+                if (tag == 2) {
+                    Err("benchmark killed by signal " + intToStr(code) + " (" + bf + ")")
+                } else if (code != 0) {
+                    let detail = strTrim(stderrStr);
+                    Err("benchmark failed (" + bf + ", exit " + intToStr(code) + ")" + (if (strLen(detail) > 0) ": " + detail else ""))
+                } else {
                     cellSet(filesRunCell, cellGet(filesRunCell) + 1);
                     if (bOpts.bJson) {
                         let _ = collectJsonLines(stdoutStr, jsonLinesRev);
                         Ok(())
                     } else {
-                        let body = trimTrailingNewlines(stdoutStr);
-                        if (strLen(body) > 0) printLn(body) else ();
                         Ok(())
                     }
-                } else {
-                    Err("benchmark failed (" + bf + ", exit " + intToStr(rc) + "): " + strTrim(stderrStr))
                 }
             },
         }
@@ -516,24 +637,23 @@ def runSingleBenchFile(
                 else !strContainsSub(bf, pat),
         };
         let envVars = buildBenchEnvVars(bf, bOpts, passFilter);
-        let runRes = execBenchBinCapture(outBin, workDirOpt, envVars, buildDir, stem + "_" + pidStr);
+        let runRes = execBenchBinDirect(outBin, workDirOpt, envVars, bOpts.bJson);
         if (removeBinAfter) { let _ = removeFile(outBin); () } else ();
-        let (rc, stdoutStr, stderrStr) = runRes?;
-        if (rc == 0) {
+        let (tag, code, stdoutStr, stderrStr) = runRes?;
+        if (tag == 2) {
+            Err("benchmark killed by signal " + intToStr(code) + " (" + bf + ")")
+        } else if (code != 0) {
+            let detail = strTrim(stderrStr);
+            Err("benchmark failed (" + bf + ", exit " + intToStr(code) + ")" + (if (strLen(detail) > 0) ": " + detail else ""))
+        } else {
             if (bOpts.bJson) {
                 let nAdded = collectJsonLines(stdoutStr, jsonLinesRev);
                 if (nAdded > 0) cellSet(filesRunCell, cellGet(filesRunCell) + 1) else ();
                 Ok(())
             } else {
-                let body = trimTrailingNewlines(stdoutStr);
-                if (strLen(body) > 0) {
-                    cellSet(filesRunCell, cellGet(filesRunCell) + 1);
-                    printLn(body)
-                } else ();
+                cellSet(filesRunCell, cellGet(filesRunCell) + 1);
                 Ok(())
             }
-        } else {
-            Err("benchmark failed (" + bf + ", exit " + intToStr(rc) + "): " + strTrim(stderrStr))
         }
     }
 }
@@ -566,13 +686,16 @@ def runBenchFilesList(
     },
 }
 
-pub def cmdBench(
-    subArgs: List String,
-    jsonFromTop: Bool,
+def printZeroBenchNotice(filterOpt: Option String): Void = match filterOpt {
+    Some(pat) if (strLen(pat) > 0) -> printLn("No benchmarks matched filter '" + pat + "'."),
+    _ -> printLn("No benchmarks were executed."),
+}
+
+def cmdBenchInner(
+    bOpts: BenchCliOpts,
     rtOverrideOpt: Option String,
     cbs: CompileCallbacks
 ): Result Int String = {
-    let bOpts = parseBenchSubArgs(subArgs, jsonFromTop)?;
     let jsonLinesRev: Cell (List String) = cellNew(Nil);
     let filesRunCell = cellNew(0);
 
@@ -582,8 +705,9 @@ pub def cmdBench(
                 Err("benchmark file not found: '" + gsaFile + "'")
             } else {
                 let fileDir = pathDirname(gsaFile);
+                let searchRoot = if (fileDir == "") "." else fileDir;
                 let (workDirOpt, buildDir, removeBinAfter, rootSpec, extSpecs, benchTc) =
-                    match findProjectRoot(".") {
+                    match findProjectRoot(searchRoot) {
                         Some(projDir) -> {
                             let (rootMf, rootSpec0, resolvedPkgs) = resolveProjectGraph(projDir, false, None, true)?;
                             let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
@@ -597,7 +721,7 @@ pub def cmdBench(
                             let benchRootDeps =
                                 if (rootMf.mfName != "") listAppend(rootSpec0.deps, [(rootMf.mfName, selfPkgId)])
                                 else rootSpec0.deps;
-                            let benchSrcRoots = listAppend([fileDir], rootSpec0.srcRoots);
+                            let benchSrcRoots = listAppend([searchRoot], rootSpec0.srcRoots);
                             let benchRootSpec = MkPkgSpec {
                                 pkgId: "",
                                 pkgName: "",
@@ -625,7 +749,7 @@ pub def cmdBench(
                             let rootSpec = MkPkgSpec {
                                 pkgId: "",
                                 pkgName: "",
-                                srcRoots: [fileDir],
+                                srcRoots: [searchRoot],
                                 deps: Nil,
                             };
                             (None, bd, true, rootSpec, Nil, emptyBenchTargetCfg())
@@ -637,16 +761,15 @@ pub def cmdBench(
                 )?;
                 if (bOpts.bJson) {
                     printLn("{\"ok\":true,\"benchmarks\":[" + strJoin(listRev(cellGet(jsonLinesRev)), ",") + "]}")
-                } else {
-                    if (cellGet(filesRunCell) == 0) printLn("No benchmarks matched filter.")
-                    else ()
-                };
+                } else if (cellGet(filesRunCell) == 0) {
+                    printZeroBenchNotice(bOpts.bFilter)
+                } else ();
                 Ok(0)
             }
         },
         None -> {
             match findProjectRoot(".") {
-                None -> Err("no geisha.toml found and no .gsa file specified (usage: geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--json])"),
+                None -> Err("no geisha.toml found and no .gsa file specified (usage: geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json])"),
                 Some(projDir) -> {
                     let (rootMf, rootSpec0, resolvedPkgs) = resolveProjectGraph(projDir, false, None, true)?;
                     let benchFiles = discoverProjectBenchFiles(projDir, rootMf)?;
@@ -694,12 +817,45 @@ pub def cmdBench(
                         printLn("{\"ok\":true,\"benchmarks\":[" + strJoin(listRev(cellGet(jsonLinesRev)), ",") + "]}")
                     } else {
                         let n = cellGet(filesRunCell);
-                        if (n == 0) printLn("No benchmarks matched filter.")
+                        if (n == 0) printZeroBenchNotice(bOpts.bFilter)
                         else printLn("Completed benchmarks across " + intToStr(n) + " file(s).")
                     };
                     Ok(0)
                 },
             }
         },
+    }
+}
+
+pub def cmdBench(
+    subArgs: List String,
+    jsonFromTop: Bool,
+    rtOverrideOpt: Option String,
+    cbs: CompileCallbacks
+): Result Int String = {
+    let wantJson = jsonFromTop || {
+        let cur = cellNew(subArgs);
+        let found = cellNew(false);
+        while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> { if (a == "--json") cellSet(found, true) else (); cellSet(cur, r) },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    };
+    let res = match parseBenchSubArgs(subArgs, jsonFromTop) {
+        Err(e) -> Err(e),
+        Ok(bOpts) -> cmdBenchInner(bOpts, rtOverrideOpt, cbs),
+    };
+    match res {
+        Ok(code) -> Ok(code),
+        Err(msg) ->
+            if (wantJson) {
+                printLn("{\"ok\":false,\"error\":\"" + benchJsonEscape(msg) + "\"}");
+                Ok(1)
+            } else {
+                Err(msg)
+            },
     }
 }

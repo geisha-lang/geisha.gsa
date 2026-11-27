@@ -96,7 +96,8 @@ geisha run hello.gsa
 | `src/codegen.gsa` | LP64 / Wasm32 ABI layout calculator, 40-bit pointer masks, and LLVM 20 opaque-pointer IR (`.ll`) emitter |
 | `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/iOS builder |
 | `src/doc.gsa` | Built-in `geisha doc` signature & `///` doc-comment extractor |
-| `src/geisha.gsa` | Unified CLI driver (`init`, `add`, `remove`, `fetch`, `update`, `build`, `check`, `run`, `eval`, `test`, `doc`, `guide`) |
+| `src/bench.gsa` | Built-in `geisha bench` microbenchmark discovery, harness synthesis, and text/`--json` runner |
+| `src/geisha.gsa` | Unified CLI driver (`init`, `add`, `remove`, `fetch`, `update`, `build`, `check`, `run`, `eval`, `test`, `bench`, `doc`, `guide`) |
 
 ---
 

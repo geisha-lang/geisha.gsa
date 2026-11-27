@@ -138,6 +138,7 @@ pub data ResolvedPkg {
 pub data CompileCallbacks {
     MkCompileCallbacks {
         cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String) -> Result Void String,
+        cbCompileNativeExeSource: (String, String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String) -> Result Void String,
         cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String) -> Result String String,

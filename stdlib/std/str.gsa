@@ -170,6 +170,32 @@ pub def strEndsWith(s: String, suffix: String): Bool = {
     }
 }
 
+/// Return `true` if `needle` occurs as a contiguous byte substring of `hay`.
+pub def strContains(hay: String, needle: String): Bool = {
+    let hl = strLen(hay);
+    let nl = strLen(needle);
+    if (nl == 0) true
+    else if (nl > hl) false
+    else {
+        let i = cellNew(0);
+        let found = cellNew(false);
+        let limit = hl - nl;
+        while (cellGet(i) <= limit && !cellGet(found)) {
+            let start = cellGet(i);
+            let j = cellNew(0);
+            let ok = cellNew(true);
+            while (cellGet(j) < nl && cellGet(ok)) {
+                if (strByteAt(hay, start + cellGet(j)) != strByteAt(needle, cellGet(j))) {
+                    cellSet(ok, false)
+                } else ();
+                cellSet(j, cellGet(j) + 1)
+            };
+            if (cellGet(ok)) cellSet(found, true) else cellSet(i, start + 1)
+        };
+        cellGet(found)
+    }
+}
+
 pub def strIndexOfByte(s: String, targetByte: Int, startIdx: Int): Option Int = {
     let len = strLen(s);
     let i = cellNew(if (startIdx < 0) 0 else startIdx);

@@ -2821,20 +2821,26 @@ PASS=$((PASS + 1))
 ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
 ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
 
-# 37a: `geisha doc std.bench` exposes BlackBox, measure, bench, BenchStats
+# 37a: `geisha doc std.bench` exposes polymorphic blackBox, measure, bench, BenchStats
 DOC_BENCH="$("$GEISHA_BIN" doc std.bench)"
-for sym in "concept BlackBox" "def measure" "def bench(" "data BenchStats"; do
+for sym in "def blackBox(" "def blackBoxBarrier(" "def measure(" "def bench(" "data BenchStats" "def formatStatsJsonInFile("; do
     if ! printf '%s\n' "$DOC_BENCH" | grep -q "$sym"; then
         echo "FAIL [bench_doc]: missing '$sym' in 'geisha doc std.bench'" >&2
         exit 1
     fi
 done
 
-# 37b: Verify blackBox emits opaque runtime barriers in LLVM IR & preserves values
+# 37b: Verify polymorphic `__blackBox` emits `@gs_bench_black_box_mem` / `@gs_bench_black_box_void`
+#      and works on primitives, Tuples, Option, and custom user `data` structs without Orphan Rule issues
 cat > "$TMP_DIR/t37_blackbox.gsa" << 'EOF'
 use std.bench.{blackBox, blackBoxBarrier}
 use std.option.{Option, Some, None}
 use std.str.{intToStr, i64ToStr, boolToStr}
+
+data PairBox {
+    x: Int,
+    y: Float,
+}
 
 def pureWork(n: Int): Int = {
     let acc = cellNew(0);
@@ -2853,18 +2859,50 @@ def main(): Void = {
     let d = blackBox(true);
     let s = blackBox("ok");
     let o = match blackBox(Some(7)) { Some(v) -> v, None -> 0 };
+    let (t1, t2) = blackBox((11, 2.5));
+    let pb = blackBox(PairBox { x: 9, y: 1.5 });
     blackBoxBarrier();
-    printLn(intToStr(a) + "|" + i64ToStr(b) + "|" + intToStr(floatToInt(c * 2.0)) + "|" + boolToStr(d) + "|" + s + "|" + intToStr(o))
+    printLn(
+        intToStr(a) + "|" + i64ToStr(b) + "|" + intToStr(floatToInt(c * 2.0))
+        + "|" + boolToStr(d) + "|" + s + "|" + intToStr(o)
+        + "|" + intToStr(t1 + floatToInt(t2 * 2.0))
+        + "|" + intToStr(pb.x + floatToInt(pb.y * 2.0))
+    )
 }
 EOF
 "$GEISHA_BIN" -e -o "$TMP_DIR/t37_blackbox.ll" "$TMP_DIR/t37_blackbox.gsa"
-if ! grep -q "@gs_bench_black_box_i32" "$TMP_DIR/t37_blackbox.ll" || ! grep -q "@gs_bench_black_box_f64" "$TMP_DIR/t37_blackbox.ll"; then
-    echo "FAIL [bench_blackbox_ir]: expected @gs_bench_black_box_* calls in LLVM IR" >&2
+if ! grep -q "@gs_bench_black_box_mem" "$TMP_DIR/t37_blackbox.ll" || ! grep -q "@gs_bench_black_box_void" "$TMP_DIR/t37_blackbox.ll"; then
+    echo "FAIL [bench_blackbox_ir]: expected @gs_bench_black_box_mem and @gs_bench_black_box_void in LLVM IR" >&2
     exit 1
 fi
 "$GEISHA_BIN" -o "$TMP_DIR/t37_blackbox" "$TMP_DIR/t37_blackbox.gsa"
 T37_BB_OUT="$("$TMP_DIR/t37_blackbox")"
-assert_eq "bench_blackbox_values" "5050|42|7|true|ok|7" "$T37_BB_OUT"
+assert_eq "bench_blackbox_values" "5050|42|7|true|ok|7|16|12" "$T37_BB_OUT"
+
+# 37b-wasm: Verify `std.bench.blackBox` compiles & links for `--target wasm32` with ZERO wasm-ld signature warnings
+cat > "$TMP_DIR/t37_blackbox_wasm.gsa" << 'EOF'
+use std.bench.{blackBox, blackBoxBarrier}
+
+pub def run_wasm_bb(n: Int): Int = {
+    let s = blackBox("hello");
+    let p = blackBox((n, strLen(s)));
+    blackBoxBarrier();
+    let (a, b) = p;
+    a + b
+}
+
+def main(): Void = { let _ = run_wasm_bb(10); () }
+EOF
+WASM_BB_ERR="$("$GEISHA_BIN" --target wasm32 --export run_wasm_bb -o "$TMP_DIR/t37_blackbox_wasm.wasm" "$TMP_DIR/t37_blackbox_wasm.gsa" 2>&1)"
+if printf '%s\n' "$WASM_BB_ERR" | grep -qi "signature_mismatch\|warning"; then
+    echo "FAIL [bench_wasm32_clean_link]: unexpected wasm-ld warning:" >&2
+    echo "$WASM_BB_ERR" >&2
+    exit 1
+fi
+if [ ! -s "$TMP_DIR/t37_blackbox_wasm.wasm" ]; then
+    echo "FAIL [bench_wasm32_clean_link]: wasm output missing or empty" >&2
+    exit 1
+fi
 
 # 37c: Standalone single-file mode with `bench_*` functions (no `main`)
 cat > "$TMP_DIR/t37_standalone_fns.gsa" << 'EOF'
@@ -2997,7 +3035,52 @@ assert bs[0]["iters"] >= 1 and bs[0]["rounds"] == 5, bs
 assert bs[0]["mean_ns"] > 0 and bs[0]["ops_per_sec"] > 0, bs
 PY
 
-echo "PASS [geisha_bench]: std.bench blackBox barriers, standalone bench_*/main, project benches/*.gsa, filter & --json verified"
+# 37f: Error diagnostics line-number alignment, negative checks & `--json` error contract
+cat > "$TMP_DIR/t37_line_err.gsa" << 'EOF'
+#!/usr/bin/env -S geisha bench
+use std.bench.blackBox
+
+def bench_bad_type(): Int = {
+    let x: Int = "not_an_int";
+    blackBox(x)
+}
+EOF
+T37_LINE_ERR="$("$GEISHA_BIN" bench "$TMP_DIR/t37_line_err.gsa" --runtime "$GEISHA_RUNTIME" 2>&1 || true)"
+if ! printf '%s\n' "$T37_LINE_ERR" | grep -q "t37_line_err.gsa:5:"; then
+    echo "FAIL [bench_line_alignment]: expected exact 't37_line_err.gsa:5:' diagnostic, got:" >&2
+    echo "$T37_LINE_ERR" >&2
+    exit 1
+fi
+
+# Reject `bench_*` with parameters
+cat > "$TMP_DIR/t37_bad_param.gsa" << 'EOF'
+def bench_with_arg(n: Int): Int = n + 1
+EOF
+if "$GEISHA_BIN" bench "$TMP_DIR/t37_bad_param.gsa" --runtime "$GEISHA_RUNTIME" >/dev/null 2>&1; then
+    echo "FAIL [bench_reject_params]: expected bench_with_arg(n) to be rejected" >&2
+    exit 1
+fi
+
+# Reject mixing `bench_*` with top-level script statements
+cat > "$TMP_DIR/t37_mixed_script.gsa" << 'EOF'
+let top = 123
+def bench_never_run(): Int = top
+EOF
+if "$GEISHA_BIN" bench "$TMP_DIR/t37_mixed_script.gsa" --runtime "$GEISHA_RUNTIME" >/dev/null 2>&1; then
+    echo "FAIL [bench_reject_mixed_script]: expected mixed top-level let + bench_* to be rejected" >&2
+    exit 1
+fi
+
+# Reject unknown compiler flags on `geisha bench` (e.g. `--target wasm32`) + verify `--json` error contract
+T37_BAD_FLAG_JSON="$("$GEISHA_BIN" bench --target wasm32 --json --runtime "$GEISHA_RUNTIME" 2>/dev/null || true)"
+python3 - "$T37_BAD_FLAG_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is False, data
+assert "unknown option" in data["error"] and "--target" in data["error"], data
+PY
+
+echo "PASS [geisha_bench]: polymorphic __blackBox (native+wasm32), standalone/project modes, line-aligned diagnostics, & --json error contract verified"
 PASS=$((PASS + 1))
 
 echo "All $PASS end-to-end test suites passed!"
