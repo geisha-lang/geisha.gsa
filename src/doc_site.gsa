@@ -1336,30 +1336,43 @@ def writeDocFileSafe(path: String, content: String): Result Void String = {
     else writeFile(path, content)
 }
 
-def buildDirEntrySet(dir: String): StrMap Bool = {
+def buildDirEntrySet(dir: String): Result (StrMap Bool) String = {
+    let entries = readDir(dir)?;
     let mp: StrMap Bool = strMapNew();
-    match readDir(dir) {
-        Err(_) -> mp,
-        Ok(entries) -> {
-            let cur = cellNew(entries);
-            while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                match cellGet(cur) {
-                    Cons(name, r) -> {
-                        strMapInsert(mp, name, true);
-                        cellSet(cur, r)
-                    },
-                    Nil -> (),
-                }
-            };
-            mp
-        },
-    }
+    let cur = cellNew(entries);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(name, r) -> {
+                strMapInsert(mp, name, true);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(mp)
 }
 
 def stripKnownSubdirPrefix(rel: String): (String, String) =
     if (strStartsWith(rel, "modules/")) ("modules", strSlice(rel, 8, strLen(rel)))
     else if (strStartsWith(rel, "src/")) ("src", strSlice(rel, 4, strLen(rel)))
     else ("", rel)
+
+def rollbackWrittenFiles(outDir: String, backups: List (String, Option String)): Void = {
+    let cur = cellNew(backups);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((rel, origOpt), r) -> {
+                let full = pathJoin(outDir, rel);
+                match origOpt {
+                    Some(orig) -> { let _ = writeFile(full, orig); () },
+                    None -> { let _ = removeFile(full); () },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
 
 pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): Result Void String = {
     let modDir = pathJoin(outDir, "modules");
@@ -1380,71 +1393,99 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
             Nil
         };
 
+    // Pre-flight check: ensure `modules/` and `src/` are listable before modifying anything
+    // (prevents e.g. `0311` unreadable directories from silently losing stale manifest entries).
+    let _ = buildDirEntrySet(modDir)?;
+    let _ = buildDirEntrySet(srcDir)?;
+
+    // 1. Render all site artifacts in memory first (no partial writes on render error).
     let symIndex = buildGlobalSymIndex(site.dsModules);
     let searchJson = buildSearchIndexJson(site);
 
+    let stagedRev: Cell (List (String, String)) = cellNew(Nil);
     let generatedRev: Cell (List String) = cellNew(Nil);
     let generatedSet: StrMap Bool = strMapNew();
     let generatedLowerMap: StrMap String = strMapNew();
-    let recordFile = (rel: String) -> {
+    let stageFile = (rel: String, content: String) -> {
+        cellSet(stagedRev, Cons((rel, content), cellGet(stagedRev)));
         cellSet(generatedRev, Cons(rel, cellGet(generatedRev)));
         strMapInsert(generatedSet, rel, true);
         strMapInsert(generatedLowerMap, asciiToLower(rel), rel)
     };
 
-    // 1. Write all module pages and source pages FIRST so any write failure leaves the
-    //    previous `index.html`, `search-index.*`, and `.geisha-doc-manifest` intact (no dead links).
     let cm = cellNew(site.dsModules);
-    let errOpt: Cell (Option String) = cellNew(None);
-    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cm) { Nil -> false, _ -> true }) {
+    while (match cellGet(cm) { Nil -> false, _ -> true }) {
         match cellGet(cm) {
             Cons(m, rm) -> {
                 let slug = moduleSlug(m.dmKey);
                 let scopedLinks = buildScopedSymLinksLayered(symIndex, site.dsModules, m, Nil);
-                let modRel = "modules/" + slug + ".html";
-                let srcRel = "src/" + slug + ".html";
-                match writeDocFileSafe(pathJoin(outDir, modRel), renderModulePage(site, m, symIndex, scopedLinks)) {
-                    Err(e) -> cellSet(errOpt, Some(e)),
-                    Ok(()) -> {
-                        recordFile(modRel);
-                        match writeDocFileSafe(pathJoin(outDir, srcRel), renderSourcePage(site, m)) {
-                            Err(e) -> cellSet(errOpt, Some(e)),
-                            Ok(()) -> recordFile(srcRel),
-                        }
-                    },
-                };
+                stageFile("modules/" + slug + ".html", renderModulePage(site, m, symIndex, scopedLinks));
+                stageFile("src/" + slug + ".html", renderSourcePage(site, m));
                 cellSet(cm, rm)
             },
             Nil -> (),
         }
     };
-    match cellGet(errOpt) {
-        Some(e) -> Err(e),
-        None -> {
-            // 2. Write static assets, then publish search index, optional doc.json, and `index.html` LAST.
-            writeDocFileSafe(pathJoin(outDir, "style.css"), siteCss())?;
-            recordFile("style.css");
-            writeDocFileSafe(pathJoin(outDir, "app.js"), siteJs())?;
-            recordFile("app.js");
-            writeDocFileSafe(pathJoin(outDir, "search-index.json"), searchJson)?;
-            recordFile("search-index.json");
-            writeDocFileSafe(pathJoin(outDir, "search-index.js"), "window.GEISHA_DOC_INDEX = " + searchJson + ";\n")?;
-            recordFile("search-index.js");
-            if (emitDocJson) {
-                writeDocFileSafe(pathJoin(outDir, "doc.json"), docSiteToJson(site))?;
-                recordFile("doc.json")
-            } else ();
-            writeDocFileSafe(pathJoin(outDir, "index.html"), renderIndexPage(site))?;
-            recordFile("index.html");
+    stageFile("style.css", siteCss());
+    stageFile("app.js", siteJs());
+    stageFile("search-index.json", searchJson);
+    stageFile("search-index.js", "window.GEISHA_DOC_INDEX = " + searchJson + ";\n");
+    if (emitDocJson) {
+        stageFile("doc.json", docSiteToJson(site))
+    } else ();
+    stageFile("index.html", renderIndexPage(site));
 
-            // 3. Clean stale artifacts using actual directory entries (`readDir`) rather than
-            //    guessing volume case-sensitivity from `hostOs()`.
-            //    - If BOTH `oldBase` and `newBase` exist as separate directory entries (case-sensitive
-            //      volume: Linux ext4, macOS APFS-cs/HFSX), delete `oldRel` cleanly without touching `newRel`.
-            //    - If ONLY `oldBase` exists (single shared entry on a case-insensitive volume whose
-            //      contents were already updated to `newRel`), rename in-place to `newRel`.
-            let modDirEntries = buildDirEntrySet(modDir);
-            let srcDirEntries = buildDirEntrySet(srcDir);
+    // 2. Transactional publish with full rollback on any write/permission/symlink failure:
+    //    if writing any file fails (e.g. read-only `src/<mod>.html` or `app.js`), every
+    //    previously overwritten/created file is restored so the previous site stays 100% consistent.
+    let staged = listRev(cellGet(stagedRev));
+    let backupsRev: Cell (List (String, Option String)) = cellNew(Nil);
+    let writeErrOpt: Cell (Option String) = cellNew(None);
+    let cs = cellNew(staged);
+    while (match cellGet(writeErrOpt) { None -> true, Some(_) -> false } && match cellGet(cs) { Nil -> false, _ -> true }) {
+        match cellGet(cs) {
+            Cons((rel, content), rs) -> {
+                let full = pathJoin(outDir, rel);
+                let k = c_site_lstat_kind(full);
+                if (k == 3 || k == 4) {
+                    cellSet(writeErrOpt, Some("refusing to overwrite symlinked doc output file: " + full))
+                } else if (k == 2) {
+                    cellSet(writeErrOpt, Some("refusing to overwrite directory as doc output file: " + full))
+                } else {
+                    let prevOptRes =
+                        if (k == 1) {
+                            match readFile(full) {
+                                Ok(orig) -> Ok(Some(orig)),
+                                Err(e) -> Err(e),
+                            }
+                        } else if (k == 0) {
+                            Ok(None)
+                        } else {
+                            Err("cannot inspect existing doc output file: " + full)
+                        };
+                    match prevOptRes {
+                        Err(e) -> cellSet(writeErrOpt, Some(e)),
+                        Ok(prevOpt) -> match writeDocFileSafe(full, content) {
+                            Err(e) -> cellSet(writeErrOpt, Some(e)),
+                            Ok(()) -> cellSet(backupsRev, Cons((rel, prevOpt), cellGet(backupsRev))),
+                        },
+                    }
+                };
+                cellSet(cs, rs)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(writeErrOpt) {
+        Some(e) -> {
+            rollbackWrittenFiles(outDir, cellGet(backupsRev));
+            Err(e)
+        },
+        None -> {
+            // 3. Clean stale artifacts using actual directory entries (`readDir`), propagating errors.
+            let modDirEntries = buildDirEntrySet(modDir)?;
+            let srcDirEntries = buildDirEntrySet(srcDir)?;
             let retainedRev: Cell (List String) = cellNew(Nil);
             let cleanupErrOpt: Cell (Option String) = cellNew(None);
             let cp = cellNew(prevFiles);
@@ -1464,10 +1505,8 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                                                 let hasOld = match strMapGet(entries, oldBase) { Some(_) -> true, None -> false };
                                                 let hasNew = match strMapGet(entries, newBase) { Some(_) -> true, None -> false };
                                                 if (hasOld && hasNew) {
-                                                    // Distinct files on a case-sensitive volume: delete old file normally
                                                     false
                                                 } else if (hasOld && !hasNew) {
-                                                    // Single shared entry on a case-insensitive volume: update casing in-place
                                                     match renameFile(pathJoin(outDir, rel), pathJoin(outDir, newRel)) {
                                                         Ok(()) -> (),
                                                         Err(re) -> {
@@ -1480,7 +1519,6 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                                                     };
                                                     true
                                                 } else {
-                                                    // Already at new casing (or absent): nothing to delete
                                                     true
                                                 }
                                             } else false

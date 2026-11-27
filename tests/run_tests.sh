@@ -6933,6 +6933,34 @@ EOF
     fi
     rm -f "$T44_CASE_PROJ/src/blocked.gsa" "$T44_CASE_SITE/modules/caseproj.blocked.html"
 
+    # Read-only `src/<mod>.html` during symbol update (`newApi` -> `v3Api`) must roll back `modules/<mod>.html`
+    cat > "$T44_CASE_PROJ/src/writer.gsa" << 'EOF'
+/// Updated writer module v3.
+pub def v3Api(): Int = 3
+EOF
+    chmod 444 "$T44_CASE_SITE/src/caseproj.writer.html"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_SRC_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/src/caseproj.writer.html"
+    if [ "$T44_SRC_RO_RC" -eq 0 ] || grep -q 'v3Api' "$T44_CASE_SITE/modules/caseproj.writer.html" || ! grep -q 'newApi' "$T44_CASE_SITE/modules/caseproj.writer.html"; then
+        echo "FAIL [doc_src_ro_rollback]: failed src write must roll back modules/caseproj.writer.html to previous newApi" >&2
+        exit 1
+    fi
+
+    # Unlistable `modules/` (`chmod 0311`) must fail cleanly via propagated readDir error without losing manifest
+    chmod 311 "$T44_CASE_SITE/modules"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_311_RC=$?
+    set -e
+    chmod 755 "$T44_CASE_SITE/modules"
+    if [ "$T44_311_RC" -eq 0 ] || ! grep -q 'modules/caseproj.writer.html' "$T44_CASE_SITE/.geisha-doc-manifest"; then
+        echo "FAIL [doc_unlistable_modules_0311]: chmod 0311 modules/ must abort and preserve manifest" >&2
+        exit 1
+    fi
+
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
     printf 'not a dir\n' > "$TMP_DIR/notes"
     T44_BS_OUT="$TMP_DIR/notes\\site"
