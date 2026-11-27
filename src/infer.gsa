@@ -1116,10 +1116,8 @@ def finalizePreludeScheme(nm: String, rawScm: Scheme): Scheme = {
     quantifyModeVarsInScheme(updated)
 }
 
-def buildPreludeBaseMap(): StrMap Scheme = {
-    let m: StrMap Scheme = strMapNew();
-    let specs = [
-        ("printLn", "String -> Void"),
+pub def preludePrimSpecs(): List (String, String) = [
+    ("printLn", "String -> Void"),
         ("putNumber", "Int -> Void"),
         ("putFloat", "Float -> Void"),
         ("putF32", "Float32 -> Void"),
@@ -1289,8 +1287,11 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("__concActorCall", "forall s r. (Send r) => (Actor s, s -> r) -> Task r"),
         ("__concActorSend", "forall s. (Actor s, s -> Void) -> Void"),
         ("__concActorStop", "forall s. Actor s -> Void")
-    ];
-    let cur = cellNew(specs);
+]
+
+def buildPreludeBaseMap(): StrMap Scheme = {
+    let m: StrMap Scheme = strMapNew();
+    let cur = cellNew(preludePrimSpecs());
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons((nm, sig), r) -> {

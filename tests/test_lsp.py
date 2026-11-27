@@ -93,6 +93,12 @@ def main() -> int:
         root = Path(td)
         helper_path = root / "helper.gsa"
         helper_src = (
+            "/// A boxed integer wrapper.\n"
+            "pub data Boxed {\n"
+            "    Wrap(Int),\n"
+            "    Empty,\n"
+            "}\n"
+            "\n"
             "/// Multiply an integer by two.\n"
             "pub def doubleVal(n: Int): Int = n * 2\n"
         )
@@ -101,7 +107,7 @@ def main() -> int:
         main_path = root / "main.gsa"
         main_src = (
             "use std.str.{intToStr}\n"
-            "use helper.{doubleVal}\n"
+            "use helper.{Boxed, Wrap, Empty, doubleVal}\n"
             "\n"
             "/// A 2D integer point.\n"
             "pub data Point { x: Int, y: Int }\n"
@@ -118,8 +124,14 @@ def main() -> int:
             "/// Add two integers together.\n"
             "def addNums(a: Int, b: Int): Int = a + b\n"
             "\n"
+            "def unwrapBox(bx: Boxed): Int = match bx {\n"
+            "    Wrap(val) -> val + 1,\n"
+            "    Empty -> 0,\n"
+            "}\n"
+            "\n"
             "def main(): Void = {\n"
-            "    let total = addNums(10, doubleVal(16));\n"
+            "    let (px, py) = (10, 20);\n"
+            "    let total = addNums(px, doubleVal(py)) + unwrapBox(Wrap(5));\n"
             "    printLn(intToStr(total))\n"
             "}\n"
         )
@@ -158,13 +170,13 @@ def main() -> int:
         assert diag_ok["params"]["uri"] == main_uri
         assert diag_ok["params"]["diagnostics"] == [], f"expected 0 diagnostics, got: {diag_ok}"
 
-        # 3. documentSymbol
+        # 3. documentSymbol (and word-boundary selectionRange)
         sym_resp = client.request("textDocument/documentSymbol", {
             "textDocument": {"uri": main_uri},
         })
         syms = sym_resp["result"]
         sym_names = [s["name"] for s in syms]
-        for expected in ("Point", "Shape", "Describable", "addNums", "main"):
+        for expected in ("Point", "Shape", "Describable", "addNums", "unwrapBox", "main"):
             assert expected in sym_names, f"missing symbol {expected!r} in {sym_names}"
         shape_sym = next(s for s in syms if s["name"] == "Shape")
         variant_names = [c["name"] for c in shape_sym.get("children", [])]
@@ -172,53 +184,93 @@ def main() -> int:
         desc_sym = next(s for s in syms if s["name"] == "Describable")
         method_names = [c["name"] for c in desc_sym.get("children", [])]
         assert "describe" in method_names, f"missing concept method: {method_names}"
+        add_sym = next(s for s in syms if s["name"] == "addNums")
+        assert add_sym["selectionRange"]["start"] == {"line": 16, "character": 4}, f"unexpected selectionRange: {add_sym}"
 
-        # 4. hover on `addNums` call (line 19, col 18) -> inferred type + `///` doc
+        # 4. hover on `addNums` call (line 25, col 18) -> inferred type + `///` doc
         hover_add = client.request("textDocument/hover", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 19, "character": 18},
+            "position": {"line": 25, "character": 18},
         })
-        assert hover_add["result"] is not None, f"hover on addNums returned null"
+        assert hover_add["result"] is not None, "hover on addNums returned null"
         hover_add_md = hover_add["result"]["contents"]["value"]
-        assert "Int" in hover_add_md, f"expected Int in hover: {hover_add_md}"
-        assert "Add two integers together." in hover_add_md, f"expected doc comment in hover: {hover_add_md}"
+        assert "Int" in hover_add_md and "Add two integers together." in hover_add_md, f"unexpected hover: {hover_add_md}"
 
-        # 4b. hover on `doubleVal` call (line 19, col 31) -> cross-file inferred type + `///` doc
+        # 4b. hover on `doubleVal` call (line 25, col 31) -> cross-file inferred type + `///` doc
         hover_dbl = client.request("textDocument/hover", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 19, "character": 31},
+            "position": {"line": 25, "character": 31},
         })
-        assert hover_dbl["result"] is not None, f"hover on doubleVal returned null"
+        assert hover_dbl["result"] is not None, "hover on doubleVal returned null"
         hover_dbl_md = hover_dbl["result"]["contents"]["value"]
         assert "Int" in hover_dbl_md and "Multiply an integer by two." in hover_dbl_md, f"unexpected hover: {hover_dbl_md}"
 
-        # 4c. hover on `total` in `intToStr(total)` (line 20, col 22) -> inferred `Int`
+        # 4c. hover on `total` in `intToStr(total)` (line 26, col 22) -> inferred `Int`
         hover_tot = client.request("textDocument/hover", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 20, "character": 22},
+            "position": {"line": 26, "character": 22},
         })
         assert hover_tot["result"] is not None, "hover on total returned null"
         assert "Int" in hover_tot["result"]["contents"]["value"], f"unexpected hover on total: {hover_tot}"
 
-        # 5. definition on `addNums` (same file) and `doubleVal` (cross-file helper.gsa)
+        # 5. definition: top-level, cross-file fn, local param, local let, match pattern var, destructured let, cross-file pattern ctor
         def_add = client.request("textDocument/definition", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 19, "character": 18},
+            "position": {"line": 25, "character": 18},
         })
-        assert def_add["result"] is not None, "definition for addNums returned null"
         assert def_add["result"]["uri"] == main_uri
-        assert def_add["result"]["range"]["start"]["line"] == 16, f"unexpected addNums def line: {def_add}"
+        assert def_add["result"]["range"]["start"]["line"] == 16, f"unexpected addNums def: {def_add}"
 
         def_dbl = client.request("textDocument/definition", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 19, "character": 31},
+            "position": {"line": 25, "character": 31},
         })
-        assert def_dbl["result"] is not None, "definition for doubleVal returned null"
-        assert def_dbl["result"]["uri"] == helper_uri, f"expected {helper_uri}, got {def_dbl}"
-        assert def_dbl["result"]["range"]["start"]["line"] == 1, f"unexpected doubleVal def line: {def_dbl}"
+        assert def_dbl["result"]["uri"] == helper_uri
+        assert def_dbl["result"]["range"]["start"]["line"] == 7, f"unexpected doubleVal def: {def_dbl}"
 
-        # 6. completion: `std.`, `sys.`, `std.str.`, and local/imported identifiers
-        comp_src = main_src + "\ndef _c1() = std.\ndef _c2() = sys.\ndef _c3() = std.str.\ndef _c4() = add\n"
+        # Local param `a` in `def addNums(a: Int, b: Int): Int = a + b` (line 16, col 35 -> col 12)
+        def_param = client.request("textDocument/definition", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 16, "character": 35},
+        })
+        assert def_param["result"]["uri"] == main_uri
+        assert def_param["result"]["range"]["start"] == {"line": 16, "character": 12}, f"unexpected param def: {def_param}"
+
+        # Local `let total` usage on line 26, col 22 -> line 25, col 8
+        def_let = client.request("textDocument/definition", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 26, "character": 22},
+        })
+        assert def_let["result"]["uri"] == main_uri
+        assert def_let["result"]["range"]["start"] == {"line": 25, "character": 8}, f"unexpected let def: {def_let}"
+
+        # Match pattern binder `val` usage on line 19, col 18 -> line 19, col 9
+        def_patvar = client.request("textDocument/definition", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 19, "character": 18},
+        })
+        assert def_patvar["result"]["uri"] == main_uri
+        assert def_patvar["result"]["range"]["start"] == {"line": 19, "character": 9}, f"unexpected patvar def: {def_patvar}"
+
+        # Destructured `let (px, py)` usage `px` on line 25, col 25 -> line 24, col 9
+        def_destr = client.request("textDocument/definition", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 25, "character": 25},
+        })
+        assert def_destr["result"]["uri"] == main_uri
+        assert def_destr["result"]["range"]["start"] == {"line": 24, "character": 9}, f"unexpected destructured let def: {def_destr}"
+
+        # Cross-module pattern constructor `Wrap` on line 19, col 5 -> helper.gsa line 1
+        def_ctor = client.request("textDocument/definition", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 19, "character": 5},
+        })
+        assert def_ctor["result"] is not None, "cross-module pattern ctor definition returned null"
+        assert def_ctor["result"]["uri"] == helper_uri, f"expected {helper_uri}, got {def_ctor}"
+        assert def_ctor["result"]["range"]["start"]["line"] == 1, f"unexpected Boxed/Wrap def: {def_ctor}"
+
+        # 6. completion: `std.`, `sys.`, `std.str.`, local defs, and preludePrimSpecs (`MutArray`, `immArrayGet`, no `__conc*`)
+        comp_src = main_src + "\ndef _c1() = std.\ndef _c2() = sys.\ndef _c3() = std.str.\ndef _c4() = add\ndef _c5() = arrayN\ndef _c6() = immArray\n"
         client.notify("textDocument/didChange", {
             "textDocument": {"uri": main_uri, "version": 2},
             "contentChanges": [{"text": comp_src}],
@@ -227,33 +279,70 @@ def main() -> int:
 
         comp_std = client.request("textDocument/completion", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 23, "character": 16},
+            "position": {"line": 29, "character": 16},
         })
         std_labels = {it["label"] for it in comp_std["result"]["items"]}
-        assert {"str", "json", "list", "vec", "map", "option", "result"}.issubset(std_labels), f"missing std.* modules: {std_labels}"
+        assert {"str", "json", "list", "vec", "map", "option", "result"}.issubset(std_labels)
 
         comp_sys = client.request("textDocument/completion", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 24, "character": 16},
+            "position": {"line": 30, "character": 16},
         })
         sys_labels = {it["label"] for it in comp_sys["result"]["items"]}
-        assert {"io", "fs", "env", "proc"}.issubset(sys_labels), f"missing sys.* modules: {sys_labels}"
+        assert {"io", "fs", "env", "proc"}.issubset(sys_labels)
 
         comp_str = client.request("textDocument/completion", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 25, "character": 20},
+            "position": {"line": 31, "character": 20},
         })
         str_labels = {it["label"] for it in comp_str["result"]["items"]}
-        assert {"intToStr", "strStartsWith", "strJoin"}.issubset(str_labels), f"missing std.str exports: {str_labels}"
+        assert {"intToStr", "strStartsWith", "strJoin"}.issubset(str_labels)
 
         comp_local = client.request("textDocument/completion", {
             "textDocument": {"uri": main_uri},
-            "position": {"line": 26, "character": 15},
+            "position": {"line": 32, "character": 15},
         })
         local_labels = {it["label"] for it in comp_local["result"]["items"]}
-        assert "addNums" in local_labels, f"missing local def addNums in completion: {local_labels}"
+        assert "addNums" in local_labels
 
-        # 7. didChange with type error -> publishDiagnostics with exact line & severity 1
+        comp_arr = client.request("textDocument/completion", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 33, "character": 18},
+        })
+        arr_item = next(it for it in comp_arr["result"]["items"] if it["label"] == "arrayNew")
+        assert "MutArray" in arr_item["detail"], f"expected MutArray in arrayNew detail, got: {arr_item}"
+
+        comp_imm = client.request("textDocument/completion", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 34, "character": 20},
+        })
+        imm_labels = {it["label"] for it in comp_imm["result"]["items"]}
+        assert "immArrayGet" in imm_labels and not any(l.startswith("__") for l in imm_labels)
+
+        # 7. UTF-8 (CJK + 4-byte emoji surrogate pair) & CRLF position accuracy
+        crlf_path = root / "utf8_crlf.gsa"
+        # Line 0: `def greet(n: Int): Int = n + 1\r\n`
+        # Line 1: `def main(): Void = { let _ = "你好🚀"; let v = greet(7); () }\r\n`
+        # UTF-16 columns on line 1:
+        # `def main(): Void = { let _ = "` -> 30 chars
+        # `你` (1) + `好` (1) + `🚀` (2) = 4 UTF-16 units -> col 34
+        # `"; let v = ` -> 11 chars -> `greet` starts at UTF-16 col 45!
+        crlf_src = "def greet(n: Int): Int = n + 1\r\ndef main(): Void = { let _ = \"你好🚀\"; let v = greet(7); () }\r\n"
+        crlf_path.write_bytes(crlf_src.encode("utf-8"))
+        crlf_uri = path_to_uri(crlf_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": crlf_uri, "languageId": "geisha", "version": 1, "text": crlf_src},
+        })
+        diag_crlf = client.wait_notification("textDocument/publishDiagnostics")
+        assert diag_crlf["params"]["diagnostics"] == [], f"unexpected CRLF diagnostics: {diag_crlf}"
+        def_utf8 = client.request("textDocument/definition", {
+            "textDocument": {"uri": crlf_uri},
+            "position": {"line": 1, "character": 46},
+        })
+        assert def_utf8["result"] is not None, "UTF-8/CRLF definition returned null"
+        assert def_utf8["result"]["range"]["start"]["line"] == 0, f"unexpected UTF-8/CRLF def: {def_utf8}"
+
+        # 8. didChange with type error -> publishDiagnostics with exact line & severity 1
         bad_src = (
             "def main(): Void = {\n"
             "    let bad: Int = \"oops\";\n"
@@ -266,14 +355,11 @@ def main() -> int:
         })
         diag_err = client.wait_notification("textDocument/publishDiagnostics")
         diags = diag_err["params"]["diagnostics"]
-        assert len(diags) == 1, f"expected 1 diagnostic, got: {diags}"
-        d0 = diags[0]
-        assert d0["severity"] == 1
-        assert d0["source"] == "geisha"
-        assert d0["range"]["start"]["line"] == 1, f"expected error on line 1, got: {d0}"
-        assert "Int" in d0["message"] and "String" in d0["message"], f"unexpected error msg: {d0}"
+        assert len(diags) == 1 and diags[0]["severity"] == 1 and diags[0]["source"] == "geisha"
+        assert diags[0]["range"]["start"]["line"] == 1
+        assert "Int" in diags[0]["message"] and "String" in diags[0]["message"]
 
-        # 8. didChange back to valid -> clears diagnostics
+        # 9. didChange back to valid -> clears diagnostics
         client.notify("textDocument/didChange", {
             "textDocument": {"uri": main_uri, "version": 4},
             "contentChanges": [{"text": main_src}],
@@ -281,20 +367,32 @@ def main() -> int:
         diag_clear = client.wait_notification("textDocument/publishDiagnostics")
         assert diag_clear["params"]["diagnostics"] == []
 
-        # 9. unknown method -> -32601
+        # 10. unknown method -> -32601
         unk = client.request("geisha/nonExistentMethod", {})
-        assert unk["error"]["code"] == -32601, f"expected -32601, got: {unk}"
+        assert unk["error"]["code"] == -32601
 
-        # 10. didClose + shutdown + exit -> rc == 0
+        # 11. didClose removes cached doc state (subsequent hover returns null)
         client.notify("textDocument/didClose", {"textDocument": {"uri": main_uri}})
         _ = client.wait_notification("textDocument/publishDiagnostics")
+        hover_after_close = client.request("textDocument/hover", {
+            "textDocument": {"uri": main_uri},
+            "position": {"line": 25, "character": 18},
+        })
+        assert hover_after_close["result"] is None, f"expected null hover after didClose, got: {hover_after_close}"
+
+        # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
+        post_shut = client.request("textDocument/hover", {
+            "textDocument": {"uri": crlf_uri},
+            "position": {"line": 0, "character": 4},
+        })
+        assert post_shut["error"]["code"] == -32600, f"expected -32600 after shutdown, got: {post_shut}"
         client.notify("exit")
         rc = client.proc.wait(timeout=10)
         assert rc == 0, f"expected exit code 0, got {rc}"
 
-    print("PASS [geisha_lsp]: JSON-RPC stdio round-trip (diagnostics, hover, definition, documentSymbol, completion, shutdown) verified!")
+    print("PASS [geisha_lsp]: JSON-RPC stdio round-trip (diagnostics, hover, definition, documentSymbol, completion, UTF-8/CRLF, didClose, shutdown) verified!")
     return 0
 
 
