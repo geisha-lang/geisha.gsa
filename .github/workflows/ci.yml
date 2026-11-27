@@ -32,6 +32,7 @@ jobs:
       - name: Install LLVM/Clang & Wasm32 toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
           sudo apt-get update
           sudo apt-get install -y clang lld xz-utils
 
@@ -54,8 +55,8 @@ jobs:
         run: |
           make check-docs
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags --depth=50 origin "${{ github.event.pull_request.base.sha }}" || true
-            python3 scripts/check_agent_docs.py --diff "${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
+            git fetch --no-tags --depth=50 origin "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+            python3 scripts/check_agent_docs.py --diff "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
           fi
 
       - name: 3-stage self-hosting bootstrap & fixed-point check
@@ -89,6 +90,7 @@ jobs:
 
       - name: Install Clang & build tools
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
           sudo apt-get update
           sudo apt-get install -y clang lld xz-utils curl python3
 

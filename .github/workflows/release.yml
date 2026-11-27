@@ -39,6 +39,7 @@ jobs:
       - name: Install LLVM/Clang & Wasm32 toolchain (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
           sudo apt-get update
           sudo apt-get install -y clang lld xz-utils
 

@@ -425,7 +425,7 @@ def emitInlineNurseryAlloc(
 ): String = {
     let payloadWords = if (byteSz <= 0) 1 else (byteSz + 7) / 8;
     let totalBytes = (payloadWords + 1) * 8;
-    if (mctx.mcIsWasm || totalBytes > 512) {
+    if (mctx.mcIsWasm || mctx.mcPtrSize != 8 || totalBytes > 512) {
         emitAssign(fctx, fallbackCall)
     } else {
         let wBits = intToI64(payloadWords) << 3;
@@ -813,7 +813,7 @@ def genLit(mctx: ModEmitCtx, lit: Lit): String = match lit {
 
 def emitInlineWriteBarrier(fctx: FnEmitCtx, containerPtr: String): Void = {
     let hdrPtr = emitAssign(fctx, "getelementptr i8, ptr " + containerPtr + ", i64 -8");
-    let hdrVal = emitAssign(fctx, "load i64, ptr " + hdrPtr + ", align 8");
+    let hdrVal = emitAssign(fctx, "load atomic i64, ptr " + hdrPtr + " monotonic, align 8");
     let bits = emitAssign(fctx, "and i64 " + hdrVal + ", 8388610");
     let need = emitAssign(fctx, "icmp eq i64 " + bits + ", 8388608");
     let slowBlk = appendBlock(fctx, "wb.slow");

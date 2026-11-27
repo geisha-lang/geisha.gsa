@@ -3031,6 +3031,92 @@ def intArraysEqual(a: MutArray Int, b: MutArray Int): Bool = {
     }
 }
 
+def insertOrMergeAlloc(
+    allocMap: StrMap (Bool, List String),
+    allocKeys: Cell (List String),
+    name: String,
+    isRec: Bool,
+    contained: List String
+): Void = match strMapGet(allocMap, name) {
+    Some((oldRec, oldList)) ->
+        strMapInsert(allocMap, name, (oldRec || isRec, listAppend(contained, oldList))),
+    None -> {
+        cellSet(allocKeys, Cons(name, cellGet(allocKeys)));
+        strMapInsert(allocMap, name, (isRec, contained))
+    },
+}
+
+def collectNonAllocBindings(tm: TaggedTerm, nonAlloc: StrMap Bool): Void = match tm.tnode {
+    TmMakeCls(_, _, body) -> collectNonAllocBindings(body, nonAlloc),
+    TmLet(vd, val, body) -> {
+        let isEligibleAlloc = match val.tnode {
+            TmMakeData(_, _, _, _, _) -> true,
+            TmApplyDir(fvd, _) if (fvd.vname == "cellNew") -> true,
+            _ -> false,
+        };
+        if (!isEligibleAlloc) strMapInsert(nonAlloc, vd.vname, true) else ();
+        collectNonAllocBindings(val, nonAlloc);
+        collectNonAllocBindings(body, nonAlloc)
+    },
+    TmIf(c, t, e) -> {
+        collectNonAllocBindings(c, nonAlloc);
+        collectNonAllocBindings(t, nonAlloc);
+        collectNonAllocBindings(e, nonAlloc)
+    },
+    TmWhile(c, b) -> {
+        collectNonAllocBindings(c, nonAlloc);
+        collectNonAllocBindings(b, nonAlloc)
+    },
+    TmBin(_, l, r) -> {
+        collectNonAllocBindings(l, nonAlloc);
+        collectNonAllocBindings(r, nonAlloc)
+    },
+    TmUn(_, e) -> collectNonAllocBindings(e, nonAlloc),
+    TmGetTag(e) -> collectNonAllocBindings(e, nonAlloc),
+    TmMatch(s, arms) -> {
+        collectNonAllocBindings(s, nonAlloc);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let pvs = collectPatVarsList(a.caPat, Nil);
+                    let cp = cellNew(pvs);
+                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                        match cellGet(cp) {
+                            Cons(pv, rp) -> {
+                                strMapInsert(nonAlloc, pv, true);
+                                cellSet(cp, rp)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    match a.caGuard { Some(g) -> collectNonAllocBindings(g, nonAlloc), None -> () };
+                    collectNonAllocBindings(a.caBody, nonAlloc);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmApplyDir(_, es) -> collectNonAllocBindingsInList(es, nonAlloc),
+    TmTuple(es) -> collectNonAllocBindingsInList(es, nonAlloc),
+    TmBlock(es) -> collectNonAllocBindingsInList(es, nonAlloc),
+    TmMakeData(_, _, es, _, _) -> collectNonAllocBindingsInList(es, nonAlloc),
+    TmApplyCls(c, args) -> {
+        collectNonAllocBindings(c, nonAlloc);
+        collectNonAllocBindingsInList(args, nonAlloc)
+    },
+    _ -> (),
+}
+
+def collectNonAllocBindingsInList(es: List TaggedTerm, nonAlloc: StrMap Bool): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectNonAllocBindings(h, nonAlloc);
+        collectNonAllocBindingsInList(t, nonAlloc)
+    },
+}
+
 def collectLocalAllocs(
     tm: TaggedTerm,
     recAdts: StrMap Bool,
@@ -3038,8 +3124,7 @@ def collectLocalAllocs(
     allocKeys: Cell (List String)
 ): Void = match tm.tnode {
     TmMakeCls(vd, cls, body) -> {
-        if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
-        strMapInsert(allocMap, vd.vname, (false, cls.clsFvs));
+        insertOrMergeAlloc(allocMap, allocKeys, vd.vname, false, cls.clsFvs);
         collectLocalAllocs(body, recAdts, allocMap, allocKeys)
     },
     TmLet(vd, val, body) -> {
@@ -3048,15 +3133,13 @@ def collectLocalAllocs(
                 let seen: StrMap Bool = strMapNew();
                 let contained = cellNew(Nil);
                 collectVarsInCoreList(fs, seen, contained);
-                if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
-                strMapInsert(allocMap, vd.vname, (strMapContains(recAdts, tn), cellGet(contained)))
+                insertOrMergeAlloc(allocMap, allocKeys, vd.vname, strMapContains(recAdts, tn), cellGet(contained))
             },
             TmApplyDir(fvd, args) if (fvd.vname == "cellNew") -> {
                 let seen: StrMap Bool = strMapNew();
                 let contained = cellNew(Nil);
                 collectVarsInCoreList(args, seen, contained);
-                if (!strMapContains(allocMap, vd.vname)) cellSet(allocKeys, Cons(vd.vname, cellGet(allocKeys))) else ();
-                strMapInsert(allocMap, vd.vname, (false, cellGet(contained)))
+                insertOrMergeAlloc(allocMap, allocKeys, vd.vname, false, cellGet(contained))
             },
             _ -> (),
         };
@@ -3526,6 +3609,19 @@ def runEscapeAnalysis(
             Cons(fnm, r) -> {
                 match strMapGet(fns, fnm) {
                     Some(fd) -> {
+                        let nonAlloc: StrMap Bool = strMapNew();
+                        let cp0 = cellNew(fd.fnParams);
+                        while (match cellGet(cp0) { Nil -> false, _ -> true }) {
+                            match cellGet(cp0) {
+                                Cons(pvd, rp) -> {
+                                    strMapInsert(nonAlloc, pvd.vname, true);
+                                    cellSet(cp0, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        collectNonAllocBindings(fd.fnBody, nonAlloc);
+
                         let allocMap: StrMap (Bool, List String) = strMapNew();
                         let allocKeys = cellNew(Nil);
                         collectLocalAllocs(fd.fnBody, recAdts, allocMap, allocKeys);
@@ -3537,6 +3633,9 @@ def runEscapeAnalysis(
                         while (match cellGet(ck0) { Nil -> false, _ -> true }) {
                             match cellGet(ck0) {
                                 Cons(aid, rk) -> {
+                                    if (strMapContains(nonAlloc, aid)) {
+                                        markEscaping(aid, allocMap, escaping, escList)
+                                    } else ();
                                     match strMapGet(allocMap, aid) {
                                         Some((isRec, _)) -> if (isRec) markEscaping(aid, allocMap, escaping, escList) else (),
                                         None -> (),

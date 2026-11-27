@@ -2080,4 +2080,47 @@ fi
 echo "PASS [script_mode]: shebang, top-level statements, cached geisha run (+ dep invalidation), and geisha eval verified"
 PASS=$((PASS + 1))
 
+# 33. Shadowed heap Cell write-barrier soundness + >4KB large-object GC survival + gc_set_mem_limit
+cat > "$TMP_DIR/t33_gc_shadow_wb.gsa" << 'EOF'
+use std.str.intToStr
+
+extern "gc_collect_major" def gcCollectMajor(): Void
+extern "gc_set_mem_limit" def gcSetMemLimit(bytes: Int64): Void
+
+def makeHeapCell(init: String): Cell String = cellNew(init)
+
+def mutateShadowed(x: Cell String, n: Int): Int = {
+    // Mutate old-gen heap Cell `x` with a freshly allocated young String:
+    cellSet(x, "young-" + intToStr(n) + "-" + intToStr(n * 3));
+    // Shadow `x` with a pure non-escaping local Cell in the same function:
+    let x = cellNew(n + 10);
+    cellSet(x, cellGet(x) + 1);
+    cellGet(x)
+}
+
+def main(): Void = {
+    gcSetMemLimit(intToI64(16 * 1024 * 1024));
+    let oldCell = makeHeapCell("initial");
+    // Promote `oldCell` + a >4KB large Array into Old generation
+    let big = arrayNew(2048, "seed");
+    arraySet(big, 1023, "mid-" + intToStr(1023));
+    gcCollectMajor();
+
+    let r = mutateShadowed(oldCell, 77);
+    // Churn nursery to trigger Minor GCs without touching `oldCell` directly on stack
+    let i = cellNew(0);
+    while (cellGet(i) < 20000) {
+        let k = cellGet(i);
+        let _tmp = "churn-" + intToStr(k);
+        cellSet(i, k + 1)
+    };
+    printLn(cellGet(oldCell) + "|" + arrayGet(big, 1023) + "|" + intToStr(r))
+}
+EOF
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t33_gc_shadow_wb" "$TMP_DIR/t33_gc_shadow_wb.gsa"
+OUT_T33="$(GEISHA_GC_HEAP_WORDS=8192 "$TMP_DIR/t33_gc_shadow_wb")"
+assert_eq "gc_shadow_wb_and_large_obj" "young-77-231|mid-1023|88" "$OUT_T33"
+echo "PASS [gc_shadow_wb_and_large_obj]: shadowed heap Cell write barrier, >4KB large object survival, and gc_set_mem_limit verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
