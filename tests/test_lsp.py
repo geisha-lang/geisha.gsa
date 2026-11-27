@@ -387,6 +387,29 @@ def main() -> int:
         })
         assert hover_after_close["result"] is None, f"expected null hover after didClose, got: {hover_after_close}"
 
+        # 11b. Project `tests/spec.gsa` importing own package (`use demo_lib.hello`) -> 0 diagnostics + cross-file definition
+        proj_dir = root / "demo_lib_proj"
+        (proj_dir / "src").mkdir(parents=True)
+        (proj_dir / "tests").mkdir(parents=True)
+        (proj_dir / "geisha.toml").write_text('name = "demo_lib"\nversion = "0.1.0"\n', encoding="utf-8")
+        lib_path = proj_dir / "src" / "demo_lib.gsa"
+        lib_path.write_text("/// Return 42.\npub def hello(): Int = 42\n", encoding="utf-8")
+        spec_path = proj_dir / "tests" / "spec.gsa"
+        spec_src = "use demo_lib.hello\n\ndef main(): Void = {\n    let v = hello();\n    ()\n}\n"
+        spec_path.write_text(spec_src, encoding="utf-8")
+        spec_uri = path_to_uri(spec_path)
+        lib_uri = path_to_uri(lib_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": spec_uri, "languageId": "geisha", "version": 1, "text": spec_src},
+        })
+        diag_spec = client.wait_notification("textDocument/publishDiagnostics")
+        assert diag_spec["params"]["diagnostics"] == [], f"expected 0 diagnostics for self-pkg test import, got: {diag_spec}"
+        def_self = client.request("textDocument/definition", {
+            "textDocument": {"uri": spec_uri},
+            "position": {"line": 3, "character": 13},
+        })
+        assert def_self["result"] is not None and def_self["result"]["uri"] == lib_uri, f"expected def in {lib_uri}, got: {def_self}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

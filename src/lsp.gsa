@@ -44,7 +44,7 @@ use infer.{InferOutput, inferProgram, preludePrimSpecs}
 use core.lowerToCore
 use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
-use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs}
+use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, sanitizeIdentAlias}
 
 extern "gs_pipe_read" def gs_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
 extern "gs_pipe_write" def gs_pipe_write(fd: Int, buf: String, len: Int): Int
@@ -304,10 +304,16 @@ def percentEncodePath(s: String): String = {
     bufToString(b)
 }
 
+def isAsciiLetter(c: Int): Bool =
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
 def uriToPath(uri: String): String =
     if (strStartsWith(uri, "file://")) {
-        let rest = strSlice(uri, 7, strLen(uri));
-        percentDecode(rest)
+        let dec = percentDecode(strSlice(uri, 7, strLen(uri)));
+        // Windows `file:///C:/...` -> `C:/...`
+        if (strLen(dec) >= 3 && strByteAt(dec, 0) == 47 && isAsciiLetter(strByteAt(dec, 1)) && strByteAt(dec, 2) == 58) {
+            strSlice(dec, 1, strLen(dec))
+        } else dec
     } else uri
 
 def pathToUri(path: String): String =
@@ -449,16 +455,33 @@ def resolveDocPkgSpecs(filePath: String): (PkgSpec, List PkgSpec) = {
     let searchDir = if (strLen(dir) == 0) "." else dir;
     match findProjectRoot(searchDir) {
         Some(projDir) -> match resolveProjectGraph(projDir, false, None, true) {
-            Ok((_, rootSpec, resolvedPkgs)) -> {
-                let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
+            Ok((rootMf, rootSpec, resolvedPkgs)) -> {
+                let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
                 let roots = listAppend(rootSpec.srcRoots, [searchDir]);
-                let mergedRoot = MkPkgSpec {
-                    pkgId: rootSpec.pkgId,
-                    pkgName: rootSpec.pkgName,
-                    srcRoots: roots,
-                    deps: rootSpec.deps,
-                };
-                (mergedRoot, extSpecs)
+                if (rootMf.mfName != "") {
+                    let selfPkgId = "__self_" + sanitizeIdentAlias(rootMf.mfName);
+                    let selfPkgSpec = MkPkgSpec {
+                        pkgId: selfPkgId,
+                        pkgName: rootMf.mfName,
+                        srcRoots: rootSpec.srcRoots,
+                        deps: rootSpec.deps,
+                    };
+                    let mergedRoot = MkPkgSpec {
+                        pkgId: rootSpec.pkgId,
+                        pkgName: rootSpec.pkgName,
+                        srcRoots: roots,
+                        deps: listAppend(rootSpec.deps, [(rootMf.mfName, selfPkgId)]),
+                    };
+                    (mergedRoot, Cons(selfPkgSpec, extSpecs0))
+                } else {
+                    let mergedRoot = MkPkgSpec {
+                        pkgId: rootSpec.pkgId,
+                        pkgName: rootSpec.pkgName,
+                        srcRoots: roots,
+                        deps: rootSpec.deps,
+                    };
+                    (mergedRoot, extSpecs0)
+                }
             },
             Err(_) -> (MkPkgSpec { pkgId: "", pkgName: "", srcRoots: [searchDir], deps: Nil }, Nil),
         },
