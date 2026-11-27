@@ -345,7 +345,7 @@ pub data Def {
 }
 
 pub data UseSpec {
-    MkUseSpec { orig: String, alias: Option String },
+    MkUseSpec { orig: String, alias: Option String, origSpan: Span },
 }
 
 pub def useSpecLocalName(s: UseSpec): String = match s.alias {
@@ -354,10 +354,10 @@ pub def useSpecLocalName(s: UseSpec): String = match s.alias {
 }
 
 pub data UseItem {
-    UseSingle(List String),
+    UseSingle(List String, Span),
     UseMulti(List String, List UseSpec),
     UseGlob(List String),
-    UseAlias(List String, String),
+    UseAlias(List String, String, Span),
 }
 
 pub data ModuleItem {

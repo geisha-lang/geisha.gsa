@@ -1726,11 +1726,11 @@ def resolveImportedAliasModKey(items: List ModuleItem, aliasName: String): Optio
     let found: Cell (Option String) = cellNew(None);
     while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
-            Cons(ModUse(_, UseAlias(segs, al)), r) -> {
+            Cons(ModUse(_, UseAlias(segs, al, _)), r) -> {
                 if (al == aliasName) cellSet(found, Some(strJoin(segs, "."))) else ();
                 cellSet(cur, r)
             },
-            Cons(ModUse(_, UseSingle(segs)), r) -> {
+            Cons(ModUse(_, UseSingle(segs, _)), r) -> {
                 let full = strJoin(segs, ".");
                 if (shortSymName(full) == aliasName) cellSet(found, Some(full)) else ();
                 cellSet(cur, r)
@@ -1791,11 +1791,11 @@ def collectUseImportsCompletion(items: List ModuleItem, seen: StrMap Bool, outRe
                             }
                         }
                     },
-                    UseSingle(segs) -> {
+                    UseSingle(segs, _) -> {
                         let full = strJoin(segs, ".");
                         addUniqueComp(seen, outRev, shortSymName(full), 3, "from " + full, "", prefix)
                     },
-                    UseAlias(segs, al) -> {
+                    UseAlias(segs, al, _) -> {
                         let full = strJoin(segs, ".");
                         addUniqueComp(seen, outRev, al, 9, "alias for " + full, "", prefix)
                     },
@@ -3480,130 +3480,48 @@ def collectUseImportOccs(
     None -> (),
     Some(fm) -> {
         let targetMod = qnameModulePrefix(targetQn);
-        let hasSingleOrAlias = cellNew(false);
-        let hasMulti = cellNew(false);
         let cur = cellNew(fm.items);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(ModUse(_, u), r) -> {
                     match u {
-                        UseSingle(segs) -> {
+                        UseSingle(segs, sp) -> {
                             let full = strJoin(segs, ".");
-                            if (full == targetQn) cellSet(hasSingleOrAlias, true) else ()
+                            if (full == targetQn) {
+                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
+                            } else ()
                         },
-                        UseAlias(segs, _) -> {
+                        UseAlias(segs, _, sp) -> {
                             let full = strJoin(segs, ".");
-                            if (full == targetQn) cellSet(hasSingleOrAlias, true) else ()
+                            if (full == targetQn) {
+                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
+                            } else ()
                         },
                         UseMulti(modSegs, specs) -> {
                             let modKey = strJoin(modSegs, ".");
                             if (modKey == targetMod) {
                                 let cs = cellNew(specs);
-                                let hit = cellNew(false);
-                                while (!cellGet(hit) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                                while (match cellGet(cs) { Nil -> false, _ -> true }) {
                                     match cellGet(cs) {
                                         Cons(sp, rs) -> {
-                                            if (sp.orig == target.stName) cellSet(hit, true) else ();
+                                            if (sp.orig == target.stName) {
+                                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.origSpan.start, sp.origSpan.end)
+                                            } else ();
                                             cellSet(cs, rs)
                                         },
                                         Nil -> (),
                                     }
-                                };
-                                if (cellGet(hit)) cellSet(hasMulti, true) else ()
+                                }
                             } else ()
                         },
-                        _ -> (),
+                        UseGlob(_) -> (),
                     };
                     cellSet(cur, r)
                 },
                 Cons(_, r) -> cellSet(cur, r),
                 Nil -> (),
             }
-        };
-        if ((cellGet(hasSingleOrAlias) || cellGet(hasMulti)) && strLen(targetMod) > 0) {
-            let src = wd.wdText;
-            let n = strLen(src);
-            let singlePrefix1 = "use " + targetMod + "." + target.stName;
-            let singlePrefix2 = "pub use " + targetMod + "." + target.stName;
-            let multiPrefix1 = "use " + targetMod + ".{";
-            let multiPrefix2 = "pub use " + targetMod + ".{";
-            let pos = cellNew(0);
-            while (cellGet(pos) < n) {
-                let lineStart = cellGet(pos);
-                let lineEnd = match strIndexOfByte(src, 10, lineStart) {
-                    Some(nl) -> nl,
-                    None -> n,
-                };
-                let trimmed = strTrim(strSlice(src, lineStart, lineEnd));
-                // 1. Exact `use <targetMod>.<orig>` or `use <targetMod>.<orig> as <alias>`
-                if (cellGet(hasSingleOrAlias)) {
-                    let isSingleLine =
-                        (strStartsWith(trimmed, singlePrefix1) && (strLen(trimmed) == strLen(singlePrefix1) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix1)))))
-                        || (strStartsWith(trimmed, singlePrefix2) && (strLen(trimmed) == strLen(singlePrefix2) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix2)))));
-                    if (isSingleLine) {
-                        let modDot = targetMod + ".";
-                        match extractAfterPrefix(strSlice(src, lineStart, lineEnd), modDot) {
-                            Some(after) -> {
-                                let relOff = (lineEnd - lineStart) - strLen(after);
-                                let symStart = lineStart + relOff;
-                                let symEnd = symStart + strLen(target.stName);
-                                if (symEnd <= lineEnd && strSlice(src, symStart, symEnd) == target.stName) {
-                                    pushOcc(seen, outRev, wd.wdUri, src, symStart, symEnd)
-                                } else ()
-                            },
-                            None -> (),
-                        }
-                    } else ()
-                } else ();
-                // 2. Exact `use <targetMod>.{ ... }` (single-line OR multi-line!) — match ONLY orig names before `as`
-                if (cellGet(hasMulti) && (strStartsWith(trimmed, multiPrefix1) || strStartsWith(trimmed, multiPrefix2))) {
-                    match strIndexOfByte(src, 123, lineStart) {
-                        Some(openBrace) if (openBrace < lineEnd) -> {
-                            let closeBrace = match findMatchCloseBrace(src, openBrace) {
-                                Some(cb) -> cb,
-                                None -> lineEnd,
-                            };
-                            let occs = findAllIdentsInSpan(src, target.stName, openBrace + 1, closeBrace);
-                            let co = cellNew(occs);
-                            while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                match cellGet(co) {
-                                    Cons((s, e), ro) -> {
-                                        // Preceded by `{` or `,` (skipping spaces, tabs, CR, LF) — never `as`!
-                                        let p = cellNew(s - 1);
-                                        while (cellGet(p) > openBrace && (
-                                            strByteAt(src, cellGet(p)) == 32
-                                            || strByteAt(src, cellGet(p)) == 9
-                                            || strByteAt(src, cellGet(p)) == 10
-                                            || strByteAt(src, cellGet(p)) == 13
-                                        )) {
-                                            cellSet(p, cellGet(p) - 1)
-                                        };
-                                        let prevB = strByteAt(src, cellGet(p));
-                                        if (prevB == 123 || prevB == 44) {
-                                            pushOcc(seen, outRev, wd.wdUri, src, s, e)
-                                        } else ();
-                                        cellSet(co, ro)
-                                    },
-                                    Nil -> (),
-                                }
-                            };
-                            if (closeBrace >= lineEnd) {
-                                let nextNl = match strIndexOfByte(src, 10, closeBrace) {
-                                    Some(nl2) -> nl2 + 1,
-                                    None -> n,
-                                };
-                                cellSet(pos, nextNl)
-                            } else {
-                                cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
-                            }
-                        },
-                        _ -> cellSet(pos, if (lineEnd < n) lineEnd + 1 else n),
-                    }
-                } else {
-                    cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
-                }
-            }
-        } else ()
+        }
     },
 }
 
@@ -3628,9 +3546,9 @@ def moduleHasBindingNamed(items: List ModuleItem, name: String, skipDefStart: In
             },
             Cons(ModUse(_, u), r) -> {
                 match u {
-                    UseSingle(segs) ->
+                    UseSingle(segs, _) ->
                         if (shortSymName(strJoin(segs, ".")) == name) cellSet(found, true) else (),
-                    UseAlias(_, al) ->
+                    UseAlias(_, al, _) ->
                         if (al == name) cellSet(found, true) else (),
                     UseMulti(_, specs) -> {
                         let cs = cellNew(specs);
@@ -3663,7 +3581,7 @@ def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName
         match cellGet(cur) {
             Cons(ModUse(_, u), r) -> {
                 match u {
-                    UseSingle(segs) ->
+                    UseSingle(segs, _) ->
                         if (strJoin(segs, ".") == targetQn) cellSet(found, true) else (),
                     UseMulti(modSegs, specs) if (strJoin(modSegs, ".") == targetMod) -> {
                         let cs = cellNew(specs);

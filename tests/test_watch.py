@@ -150,12 +150,21 @@ def test_watch_run_long_running_and_sigterm(geisha_bin: str, env: dict[str, str]
     def pid_alive(pid: int) -> bool:
         if sys.platform == "win32":
             import ctypes
+            from ctypes import wintypes
+
             SYNCHRONIZE = 0x00100000
             WAIT_TIMEOUT = 0x00000102
-            kernel32 = ctypes.windll.kernel32
+            ERROR_INVALID_PARAMETER = 87
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = wintypes.BOOL
             h = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
             if not h:
-                return False
+                return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
             try:
                 return kernel32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
             finally:

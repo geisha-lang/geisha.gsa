@@ -62,7 +62,8 @@ extern "gs_proc_spawn" def c_proc_spawn(
     outInts: Ptr
 ): Int
 extern "gs_proc_wait" def c_proc_wait(pid: Int, nohang: Int): Int64
-extern "gs_proc_signal" def c_proc_signal(pid: Int, sigKind: Int, ownGroup: Int): Int
+extern "gs_proc_signal_group_only" def c_proc_signal_group_only(pgid: Int, sigKind: Int): Int
+extern "gs_proc_poll_exited_no_reap" def c_proc_poll_exited_no_reap(pid: Int): Int
 extern "gs_sys_getpid" def c_getpid(): Int
 extern "gs_sys_rename" def c_rename(oldPath: String, newPath: String): Int
 extern "gs_watch_install_signal_handlers" def c_watch_install_signal_handlers(): Void
@@ -3206,32 +3207,29 @@ def watchPollIntervalMs(): Int =
         None -> 250,
     }
 
-def stopWatchChild(activeChild: Cell (Option Child), activePgid: Cell Int): Void = {
+def stopWatchChild(activeChild: Cell (Option Child)): Void =
     match cellGet(activeChild) {
         None -> (),
         Some(ch) -> {
-            let _ = childSignal(ch, SigTerm);
-            match childWaitTimeout(ch, 1500) {
-                Ok(Some(_)) -> (),
-                _ -> {
-                    let _ = childSignal(ch, SigKill);
-                    let _ = childWait(ch);
-                    ()
-                },
+            // While `ch` has NOT yet been reaped by `waitpid`, POSIX guarantees its
+            // PID/PGID cannot be recycled by the OS. Signal ONLY `-ch.pid` (never `+pid`),
+            // wait for exit via WNOWAIT, escalate to SIGKILL on `-ch.pid`, then reap `ch`.
+            let _ = c_proc_signal_group_only(ch.pid, 0);
+            let waited = cellNew(0);
+            let exited = cellNew(false);
+            while (!cellGet(exited) && cellGet(waited) < 1500) {
+                if (c_proc_poll_exited_no_reap(ch.pid) != 0) {
+                    cellSet(exited, true)
+                } else {
+                    sleepMs(25);
+                    cellSet(waited, cellGet(waited) + 25)
+                }
             };
+            let _ = c_proc_signal_group_only(ch.pid, 1);
+            let _ = childWait(ch);
             cellSet(activeChild, None)
         },
-    };
-    let pgid = cellGet(activePgid);
-    if (pgid > 0) {
-        // Always signal the process group to clean up any background descendants
-        // even if the group leader exited naturally before restart/SIGTERM.
-        let _ = c_proc_signal(pgid, 0, 1);
-        sleepMs(50);
-        let _ = c_proc_signal(pgid, 1, 1);
-        cellSet(activePgid, 0)
-    } else ()
-}
+    }
 
 def buildCachedScriptBin(
     gsaFile: String,
@@ -3305,9 +3303,8 @@ def runWatchProcessLoop(
     let lastSnap = cellNew(computeWatchSnapshot(watchDirs, extraFiles));
     let firstRun = cellNew(true);
     let activeChild: Cell (Option Child) = cellNew(None);
-    let activePgid: Cell Int = cellNew(0);
     while (c_watch_should_stop() == 0) {
-        stopWatchChild(activeChild, activePgid);
+        stopWatchChild(activeChild);
         clearWatchScreen();
         if (cellGet(firstRun)) {
             eprintLn("[watch] Starting " + label + "...");
@@ -3320,10 +3317,7 @@ def runWatchProcessLoop(
                 if (c_watch_should_stop() == 0) {
                     let cmd = cmdOwnGroup(command(binPath, appArgs), true);
                     match procSpawn(cmd) {
-                        Ok(ch) -> {
-                            cellSet(activeChild, Some(ch));
-                            cellSet(activePgid, ch.pid)
-                        },
+                        Ok(ch) -> cellSet(activeChild, Some(ch)),
                         Err(e) -> {
                             eprintLn("error: " + e);
                             eprintLn("[watch] Watching for changes...")
@@ -3339,18 +3333,30 @@ def runWatchProcessLoop(
         let changed = cellNew(false);
         while (!cellGet(changed) && c_watch_should_stop() == 0) {
             match cellGet(activeChild) {
-                Some(ch) -> match childTryWait(ch) {
-                    Ok(Some(Exited(rc))) -> {
-                        cellSet(activeChild, None);
-                        if (rc != 0) eprintLn("[watch] Exited with status " + intToStr(rc) + ". Watching for changes...")
-                        else eprintLn("[watch] Done. Watching for changes...")
-                    },
-                    Ok(Some(Signaled(sig))) -> {
-                        cellSet(activeChild, None);
-                        eprintLn("[watch] Exited with signal " + intToStr(sig) + ". Watching for changes...")
-                    },
-                    Ok(None) -> (),
-                    Err(_) -> cellSet(activeChild, None),
+                Some(ch) -> {
+                    let pollSt = c_proc_poll_exited_no_reap(ch.pid);
+                    if (pollSt > 0) {
+                        // Leader exited naturally (still unreaped so PGID cannot be reused!):
+                        // immediately clean up any surviving background descendants in `-ch.pid`,
+                        // then reap `ch` and clear `activeChild`.
+                        let _ = c_proc_signal_group_only(ch.pid, 0);
+                        sleepMs(25);
+                        let _ = c_proc_signal_group_only(ch.pid, 1);
+                        match childWait(ch) {
+                            Ok(Exited(rc)) -> {
+                                cellSet(activeChild, None);
+                                if (rc != 0) eprintLn("[watch] Exited with status " + intToStr(rc) + ". Watching for changes...")
+                                else eprintLn("[watch] Done. Watching for changes...")
+                            },
+                            Ok(Signaled(sig)) -> {
+                                cellSet(activeChild, None);
+                                eprintLn("[watch] Exited with signal " + intToStr(sig) + ". Watching for changes...")
+                            },
+                            Err(_) -> cellSet(activeChild, None),
+                        }
+                    } else if (pollSt < 0) {
+                        cellSet(activeChild, None)
+                    } else ()
                 },
                 None -> (),
             };
@@ -3364,7 +3370,7 @@ def runWatchProcessLoop(
             } else ()
         }
     };
-    stopWatchChild(activeChild, activePgid);
+    stopWatchChild(activeChild);
     Ok(0)
 }
 

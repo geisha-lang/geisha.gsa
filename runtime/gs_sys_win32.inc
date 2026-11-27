@@ -2184,6 +2184,23 @@ int32_t gs_sys_shell(const char *cmd)
     return (int32_t)rc;
 }
 
+int32_t gs_proc_signal_group_only(int32_t pgid, int32_t sig_kind)
+{
+    return gs_proc_signal(pgid, sig_kind, 1);
+}
+
+int32_t gs_proc_poll_exited_no_reap(int32_t pid)
+{
+    if (pid <= 0) return -1;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+    if (h == NULL) {
+        return (GetLastError() == ERROR_INVALID_PARAMETER) ? 1 : 0;
+    }
+    DWORD w = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    return (w == WAIT_OBJECT_0) ? 1 : 0;
+}
+
 static volatile LONG g_gs_watch_stop = 0;
 
 static BOOL WINAPI gs_watch_ctrl_handler(DWORD ctrl_type)

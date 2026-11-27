@@ -1925,6 +1925,7 @@ def returnErrHelper(p: Parser): Result Void String =
     Err(parseErr(p, "expected 'def' or '}' inside instance block"))
 
 def parseUseSpec(p: Parser): Result UseSpec String = {
+    let origSp = peekTok(p).span;
     let name = parseCallableIdent(p)?;
     let aliasOpt = match peekTok(p).kind {
         TkAs -> {
@@ -1933,10 +1934,11 @@ def parseUseSpec(p: Parser): Result UseSpec String = {
         },
         _ -> None,
     };
-    Ok(MkUseSpec { orig: name, alias: aliasOpt })
+    Ok(MkUseSpec { orig: name, alias: aliasOpt, origSpan: origSp })
 }
 
 def parseUseStatement(p: Parser): Result UseItem String = {
+    let lastSpan = cellNew(peekTok(p).span);
     let seg0 = parseIdent(p)?;
     let segs = cellNew([seg0]);
     let isMulti = cellNew(false);
@@ -1963,6 +1965,7 @@ def parseUseStatement(p: Parser): Result UseItem String = {
                 ()
             },
             _ -> {
+                cellSet(lastSpan, peekTok(p).span);
                 let s = parseIdent(p)?;
                 cellSet(segs, listAppend(cellGet(segs), [s]))
             },
@@ -1974,9 +1977,9 @@ def parseUseStatement(p: Parser): Result UseItem String = {
         TkAs -> {
             let _ = bumpTok(p);
             let alias = parseIdent(p)?;
-            Ok(UseAlias(cellGet(segs), alias))
+            Ok(UseAlias(cellGet(segs), alias, cellGet(lastSpan)))
         },
-        _ -> Ok(UseSingle(cellGet(segs))),
+        _ -> Ok(UseSingle(cellGet(segs), cellGet(lastSpan))),
     }
 }
 

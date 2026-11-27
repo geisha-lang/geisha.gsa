@@ -514,11 +514,11 @@ def collectCandidateModPathsFromMod(m: LoadedMod): List (List String) = {
                 match u {
                     UseMulti(p, _) -> pushCand(p),
                     UseGlob(p) -> pushCand(p),
-                    UseSingle(p) -> {
+                    UseSingle(p, _) -> {
                         if (listLen(p) >= 2) pushCand(listInit(p)) else ();
                         pushCand(p)
                     },
-                    UseAlias(p, _) -> {
+                    UseAlias(p, _, _) -> {
                         if (listLen(p) >= 2) pushCand(listInit(p)) else ();
                         pushCand(p)
                     },
@@ -937,7 +937,7 @@ def resolveModuleImports(
 
     while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errCell) { None -> true, Some(_) -> false } }) {
         match cellGet(cur) {
-            Cons((_, UseSingle(path)), r) -> {
+            Cons((_, UseSingle(path, _)), r) -> {
                 let modSegs = listInit(path);
                 let itemName = listLastOr(path, "");
                 let modStr = strJoin(modSegs, ".");
@@ -957,7 +957,7 @@ def resolveModuleImports(
                 };
                 cellSet(cur, r)
             },
-            Cons((_, UseAlias(path, alias)), r) -> {
+            Cons((_, UseAlias(path, alias, _)), r) -> {
                 let modSegs = listInit(path);
                 let itemName = listLastOr(path, "");
                 let modStr = strJoin(modSegs, ".");
@@ -1767,7 +1767,7 @@ def compileLoadedCache(
                                     match cellGet(curPU) {
                                         Cons((VisPublic, u), rPU) -> {
                                             match u {
-                                                UseSingle(p) -> {
+                                                UseSingle(p, _) -> {
                                                     let nm = listLastOr(p, "");
                                                     match strMapGet(imapLookup, nm) {
                                                         Some(tq) -> {
@@ -1777,7 +1777,7 @@ def compileLoadedCache(
                                                         None -> (),
                                                     }
                                                 },
-                                                UseAlias(_, al) -> match strMapGet(imapLookup, al) {
+                                                UseAlias(_, al, _) -> match strMapGet(imapLookup, al) {
                                                     Some(tq) -> {
                                                         let ek = joinKeyPrefix(pref, al);
                                                         registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
