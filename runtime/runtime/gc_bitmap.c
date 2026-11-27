@@ -144,10 +144,10 @@ static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
 static size_t _large_total_bytes = 0;
 
-/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 16 MB total; drained by gc_trim) */
+/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 4 MB hot working set; drained by gc_trim) */
 #define LARGE_CACHE_MAX_BYTES       (1024u * 1024u)
 #define LARGE_CACHE_BUCKETS         (LARGE_CACHE_MAX_BYTES / GC_PAGE_SIZE)
-#define LARGE_CACHE_MAX_TOTAL_BYTES (16u * 1024u * 1024u)
+#define LARGE_CACHE_MAX_TOTAL_BYTES (4u * 1024u * 1024u)
 static void *_large_cache_buckets[LARGE_CACHE_BUCKETS];
 static size_t _large_cache_bytes = 0;
 
@@ -311,7 +311,9 @@ static inline gc_page_t *page_list_pop(gc_page_t **head)
 
 static inline void release_page_memory(void *addr, size_t len)
 {
-#if defined(__APPLE__) && defined(MADV_FREE)
+#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+    madvise(addr, len, MADV_FREE_REUSABLE);
+#elif defined(__APPLE__) && defined(MADV_FREE)
     madvise(addr, len, MADV_FREE);
 #elif defined(MADV_DONTNEED)
     madvise(addr, len, MADV_DONTNEED);
@@ -1957,6 +1959,25 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                     }
                     n->owned = false;
                 }
+                if (is_major && !n->owned) {
+                    /* Release dead 16 KB pages inside retired nurseries back to OS (MADV_FREE_REUSABLE) */
+                    size_t pages = GC_NURSERY_SIZE / GC_PAGE_SIZE;
+                    size_t words_per_page = (GC_PAGE_SIZE >> 3) >> 6; /* 32 uint64_t words per 16 KB page */
+                    for (size_t pg = 0; pg < pages; pg++) {
+                        size_t base_w = pg * words_per_page;
+                        uint64_t any_live = 0;
+                        uint64_t any_alloc = 0;
+                        for (size_t w = 0; w < words_per_page; w++) {
+                            any_live |= n->mark_bits[base_w + w];
+                            any_alloc |= n->alloc_bits[base_w + w];
+                        }
+                        bool prev_tail_live = (pg > 0) && (n->mark_bits[base_w - 1u] != 0);
+                        if (any_live == 0 && any_alloc != 0 && !prev_tail_live) {
+                            memset(&n->alloc_bits[base_w], 0, words_per_page * sizeof(uint64_t));
+                            release_page_memory((void *)(n->base + pg * GC_PAGE_SIZE), GC_PAGE_SIZE);
+                        }
+                    }
+                }
             }
             n = next;
         }
@@ -2002,7 +2023,9 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         _major_collections++;
         _consecutive_minors = 0;
         _last_major_live_bytes = total_live_bytes;
-        size_t next_major = total_live_bytes * 2;
+        size_t headroom = total_live_bytes / 2u;
+        if (headroom > 8u * 1024u * 1024u) headroom = 8u * 1024u * 1024u;
+        size_t next_major = total_live_bytes + headroom;
         if (next_major < MIN_MAJOR_THRESHOLD_BYTES && _init_threshold_bytes >= MIN_GC_THRESHOLD_BYTES) {
             next_major = MIN_MAJOR_THRESHOLD_BYTES;
         } else if (next_major < _init_threshold_bytes * 4) {
