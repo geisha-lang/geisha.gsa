@@ -973,7 +973,11 @@ def main() -> int:
             "    // comment before imported symbol\n"
             "    load as chosen,\n"
             "}\n"
-            "def g(): Int = chosen()\n"
+            "pub mod inner {\n"
+            "    use m1.load as innerLoad\n"
+            "    pub def h(): Int = innerLoad()\n"
+            "}\n"
+            "def g(): Int = chosen() + inner.h()\n"
         )
         m1_path.write_text(m1_src, encoding="utf-8")
         u1_path.write_text(u1_src, encoding="utf-8")
@@ -1010,7 +1014,11 @@ def main() -> int:
             "    // comment before imported symbol\n"
             "    loadV2 as chosen,\n"
             "}\n"
-            "def g(): Int = chosen()\n"
+            "pub mod inner {\n"
+            "    use m1.loadV2 as innerLoad\n"
+            "    pub def h(): Int = innerLoad()\n"
+            "}\n"
+            "def g(): Int = chosen() + inner.h()\n"
         ), f"unexpected u2: {new_u2!r}"
         client.notifications.clear()
         for u, t in ((m1_uri, new_m1), (u1_uri, new_u1), (u2_uri, new_u2)):

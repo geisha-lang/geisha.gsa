@@ -3470,6 +3470,63 @@ def qnameModulePrefix(qn: String): String = {
     if (ld > 0) strSlice(qn, 0, ld) else ""
 }
 
+def collectUseImportOccsInItems(
+    wd: WorkspaceDoc,
+    items: List ModuleItem,
+    target: SymTarget,
+    targetQn: String,
+    targetMod: String,
+    seen: StrMap Bool,
+    outRev: Cell (List OccSpan)
+): Void = {
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseSingle(segs, sp) -> {
+                        let full = strJoin(segs, ".");
+                        if (full == targetQn) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
+                        } else ()
+                    },
+                    UseAlias(segs, _, sp) -> {
+                        let full = strJoin(segs, ".");
+                        if (full == targetQn) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
+                        } else ()
+                    },
+                    UseMulti(modSegs, specs) -> {
+                        let modKey = strJoin(modSegs, ".");
+                        if (modKey == targetMod) {
+                            let cs = cellNew(specs);
+                            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                match cellGet(cs) {
+                                    Cons(sp, rs) -> {
+                                        if (sp.orig == target.stName) {
+                                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.origSpan.start, sp.origSpan.end)
+                                        } else ();
+                                        cellSet(cs, rs)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        } else ()
+                    },
+                    UseGlob(_) -> (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(ModSub(_, _, subItems, _), r) -> {
+                collectUseImportOccsInItems(wd, subItems, target, targetQn, targetMod, seen, outRev);
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    }
+}
+
 def collectUseImportOccs(
     wd: WorkspaceDoc,
     target: SymTarget,
@@ -3480,48 +3537,7 @@ def collectUseImportOccs(
     None -> (),
     Some(fm) -> {
         let targetMod = qnameModulePrefix(targetQn);
-        let cur = cellNew(fm.items);
-        while (match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) {
-                Cons(ModUse(_, u), r) -> {
-                    match u {
-                        UseSingle(segs, sp) -> {
-                            let full = strJoin(segs, ".");
-                            if (full == targetQn) {
-                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
-                            } else ()
-                        },
-                        UseAlias(segs, _, sp) -> {
-                            let full = strJoin(segs, ".");
-                            if (full == targetQn) {
-                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
-                            } else ()
-                        },
-                        UseMulti(modSegs, specs) -> {
-                            let modKey = strJoin(modSegs, ".");
-                            if (modKey == targetMod) {
-                                let cs = cellNew(specs);
-                                while (match cellGet(cs) { Nil -> false, _ -> true }) {
-                                    match cellGet(cs) {
-                                        Cons(sp, rs) -> {
-                                            if (sp.orig == target.stName) {
-                                                pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.origSpan.start, sp.origSpan.end)
-                                            } else ();
-                                            cellSet(cs, rs)
-                                        },
-                                        Nil -> (),
-                                    }
-                                }
-                            } else ()
-                        },
-                        UseGlob(_) -> (),
-                    };
-                    cellSet(cur, r)
-                },
-                Cons(_, r) -> cellSet(cur, r),
-                Nil -> (),
-            }
-        }
+        collectUseImportOccsInItems(wd, fm.items, target, targetQn, targetMod, seen, outRev)
     },
 }
 

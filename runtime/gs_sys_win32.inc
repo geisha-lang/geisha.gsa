@@ -2191,14 +2191,13 @@ int32_t gs_proc_signal_group_only(int32_t pgid, int32_t sig_kind)
 
 int32_t gs_proc_poll_exited_no_reap(int32_t pid)
 {
-    if (pid <= 0) return -1;
-    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
-    if (h == NULL) {
-        return (GetLastError() == ERROR_INVALID_PARAMETER) ? 1 : 0;
-    }
-    DWORD w = WaitForSingleObject(h, 0);
-    CloseHandle(h);
-    return (w == WAIT_OBJECT_0) ? 1 : 0;
+    HANDLE hProc = NULL;
+    if (!gs_proc_acquire(pid, &hProc, NULL) || hProc == NULL) return -1;
+    DWORD w = WaitForSingleObject(hProc, 0);
+    gs_proc_release(pid, 0, NULL, NULL);
+    if (w == WAIT_OBJECT_0) return 1;
+    if (w == WAIT_TIMEOUT) return 0;
+    return -1;
 }
 
 static volatile LONG g_gs_watch_stop = 0;
