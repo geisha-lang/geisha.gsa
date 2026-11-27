@@ -18,7 +18,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - **Script mode**: standalone entry files support Unix shebang (`#!/usr/bin/env -S geisha run`) and top-level statements (`let` / expressions) without needing an explicit `def main()`
    - `geisha test`
    - `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]` — run microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]` in `geisha.toml`, or `bench_*` functions) or standalone script mode (outputs mean/median/min/max/ops/sec, with `--json` for CI/Agent regression tracking)
-   - `geisha fmt [--check] [--write] [paths...]` — format `.gsa` files in-place (defaults to project/cwd; `--check` exits non-zero if any file needs formatting)
+   - `geisha fmt [--check] [--write] [--stdout] [paths...]` — format `.gsa` files in-place (defaults to project/cwd; `--check` exits non-zero if any file needs formatting; `--stdout` prints formatted output)
    - `geisha build [--target native|wasm32|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-o out]`
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
 

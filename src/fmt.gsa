@@ -8,13 +8,19 @@ use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufToString}
 use std.char.{isDigitByte, isIdentStartByte, isIdentContByte, isUpperByte, isLowerByte}
 use std.str.{strStartsWith, strEndsWith, intToStr}
 use std.path.pathJoin
-use sys.fs.{fileExists, isDir, readFile, writeFile, readDir}
-use sys.io.eprintLn
+use sys.fs.{fileExists, isDir, readFile, readDir}
+use sys.io.{print, eprintLn}
 use ast.sortUniqueStrings
 use lexer.isOpByte
 use diag.{diagReset, diagRegisterFile}
 use parser.parseFileModuleInFile
 use pkg.findProjectRoot
+
+extern "gs_sys_write_atomic" def c_fmt_write_atomic(path: String, buf: String, len: Int64, mode: Int): Int
+
+def writeFileAtomicSafe(path: String, content: String): Result Void String =
+    if (c_fmt_write_atomic(path, content, intToI64(strLen(content)), -1) == 0) Ok(())
+    else Err("failed to atomically write file: " + path)
 
 // ============================================================================
 // Lossless Token Stream (Preserving Comments, Raw Literals, Shebang, Newlines)
@@ -404,11 +410,13 @@ data IndentFrame {
         openedLine: Int,
         isUseBrace: Bool,
         isDataBrace: Bool,
+        isDataParen: Bool,
         isConceptBrace: Bool,
         isDefParamParen: Bool,
         eqHanging: Cell Bool,
         ifHanging: Cell Bool,
         contHanging: Cell Bool,
+        typeHanging: Cell Bool,
     },
 }
 
@@ -419,17 +427,20 @@ def mkRootFrame(): IndentFrame = MkIndentFrame {
     openedLine: -1,
     isUseBrace: false,
     isDataBrace: false,
+    isDataParen: false,
     isConceptBrace: false,
     isDefParamParen: false,
     eqHanging: cellNew(false),
     ifHanging: cellNew(false),
     contHanging: cellNew(false),
+    typeHanging: cellNew(false),
 }
 
 def clearHanging(f: IndentFrame): Void = {
     cellSet(f.eqHanging, false);
     cellSet(f.ifHanging, false);
-    cellSet(f.contHanging, false)
+    cellSet(f.contHanging, false);
+    cellSet(f.typeHanging, false)
 }
 
 def frameIndent(f: IndentFrame): Int =
@@ -452,8 +463,6 @@ def isDeclOrStmtKeyword(raw: String): Bool =
     || raw == "use"
     || raw == "open"
     || raw == "mod"
-    || raw == "let"
-    || raw == "while"
 
 def isCloserTok(t: FTok): Bool = match t.kind {
     FtRBrace -> true,
@@ -514,35 +523,17 @@ def lineEndsWithBareIfCond(line: Vec FTok): Bool = {
     if (lastIdx < 0) false
     else match vecGetOr(line, lastIdx, emptyFTok()).kind {
         FtRParen -> {
-            // Find the `if` keyword (after optional leading `}` and/or `else`)
             let n = vecLen(line);
             let i = cellNew(0);
-            let ifPos = cellNew(-1);
-            let scanning = cellNew(true);
-            while (cellGet(i) < n && cellGet(scanning)) {
+            let matched = cellNew(false);
+            while (cellGet(i) < lastIdx && !cellGet(matched)) {
                 let t = vecGetOr(line, cellGet(i), emptyFTok());
-                if (isTriviaTok(t)) {
-                    cellSet(i, cellGet(i) + 1)
-                } else if (isCloserTok(t) || t.raw == "else") {
-                    cellSet(i, cellGet(i) + 1)
-                } else if (t.raw == "if") {
-                    cellSet(ifPos, cellGet(i));
-                    cellSet(scanning, false)
-                } else {
-                    cellSet(scanning, false)
-                }
-            };
-            let ip = cellGet(ifPos);
-            if (ip < 0) false
-            else {
-                // Verify the opening `(` after `if` closes at `lastIdx`
-                let p = cellNew(ip + 1);
-                while (cellGet(p) < n && isTriviaTok(vecGetOr(line, cellGet(p), emptyFTok()))) {
-                    cellSet(p, cellGet(p) + 1)
-                };
-                if (cellGet(p) >= n) false
-                else match vecGetOr(line, cellGet(p), emptyFTok()).kind {
-                    FtLParen -> {
+                if (t.raw == "if") {
+                    let p = cellNew(cellGet(i) + 1);
+                    while (cellGet(p) < n && isTriviaTok(vecGetOr(line, cellGet(p), emptyFTok()))) {
+                        cellSet(p, cellGet(p) + 1)
+                    };
+                    if (cellGet(p) < lastIdx && match vecGetOr(line, cellGet(p), emptyFTok()).kind { FtLParen -> true, _ -> false }) {
                         let depth = cellNew(0);
                         let closedEarly = cellNew(false);
                         let j = cellNew(cellGet(p));
@@ -559,13 +550,67 @@ def lineEndsWithBareIfCond(line: Vec FTok): Bool = {
                             };
                             cellSet(j, cellGet(j) + 1)
                         };
-                        !cellGet(closedEarly) && cellGet(depth) == 0
-                    },
-                    _ -> false,
-                }
-            }
+                        if (!cellGet(closedEarly) && cellGet(depth) == 0) {
+                            cellSet(matched, true)
+                        } else ()
+                    } else ()
+                } else ();
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellGet(matched)
         },
         _ -> false,
+    }
+}
+
+def lineHasUnclosedInlineIf(line: Vec FTok): Bool = {
+    let fc = lineFirstCodeIdx(line);
+    if (fc < 0) false
+    else {
+        let firstRaw = vecGetOr(line, fc, emptyFTok()).raw;
+        if (firstRaw == "if" || firstRaw == "else") false
+        else {
+            let n = vecLen(line);
+            let i = cellNew(fc);
+            let depth = cellNew(0);
+            let ifCount = cellNew(0);
+            let elseCount = cellNew(0);
+            while (cellGet(i) < n) {
+                let t = vecGetOr(line, cellGet(i), emptyFTok());
+                match t.kind {
+                    FtLParen -> cellSet(depth, cellGet(depth) + 1),
+                    FtLBrace -> cellSet(depth, cellGet(depth) + 1),
+                    FtLBracket -> cellSet(depth, cellGet(depth) + 1),
+                    FtRParen -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtRBrace -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtRBracket -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtKeyword ->
+                        if (cellGet(depth) == 0) {
+                            if (t.raw == "if") cellSet(ifCount, cellGet(ifCount) + 1)
+                            else if (t.raw == "else") cellSet(elseCount, cellGet(elseCount) + 1)
+                            else ()
+                        } else (),
+                    _ -> (),
+                };
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellGet(ifCount) > cellGet(elseCount)
+        }
+    }
+}
+
+def isPureUnaryChain(raw: String): Bool = {
+    let len = strLen(raw);
+    if (len == 0 || raw == "!=" || raw == "->") false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < len && cellGet(ok)) {
+            let b = strByteAt(raw, cellGet(i));
+            if (b != 33 && b != 126 && b != 45) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
     }
 }
 
@@ -609,7 +654,7 @@ def formatLineTokens(
     topFrame: IndentFrame,
     prevLineEndedWithValue: Bool,
     out: StringBuf
-): Void = {
+): Bool = {
     let n = vecLen(line);
     let inUse = topFrame.isUseBrace || lineStartsWithHeaderKw(line, "use");
     let isDataLine = lineStartsWithHeaderKw(line, "data");
@@ -619,7 +664,10 @@ def formatLineTokens(
     let isDefLine = lineStartsWithHeaderKw(line, "def");
     let isLetLine = lineStartsWithHeaderKw(line, "let");
 
-    let inType = cellNew((isInstanceLine || isConceptLine || topFrame.isDataBrace || topFrame.isConceptBrace) && !isDefLine);
+    let inType = cellNew(
+        (isInstanceLine || isConceptLine || topFrame.isDataBrace || topFrame.isDataParen || topFrame.isConceptBrace || cellGet(topFrame.typeHanging))
+        && !isDefLine
+    );
     let seenForall = cellNew(false);
     let seenEq = cellNew(false);
     let seenRetColon = cellNew(false);
@@ -646,13 +694,13 @@ def formatLineTokens(
             _ -> false,
         };
 
-        // Determine if current token is unary prefix (`!`, `~`, or unary `-`)
+        // Determine if current token is unary prefix (`!`, `~`, unary `-`, or pure prefix chain like `~-` / `!!`)
         let curIsUnary =
             if (curIsParenOp) false
             else match cur.kind {
                 FtSym ->
                     if (cur.raw == "!" || cur.raw == "~") true
-                    else if (cur.raw == "-") {
+                    else if (isPureUnaryChain(cur.raw)) {
                         cellGet(prevClosedCond) || isUnaryPrefixContext(cellGet(prevCodeOpt), prevLineEndedWithValue)
                     } else false,
                 _ -> false,
@@ -663,7 +711,11 @@ def formatLineTokens(
             None -> false,
             Some(prev) ->
                 if (cellGet(prevWasUnary)) {
-                    false
+                    // Keep space between consecutive unary prefix operators (e.g. `~ -x`, `- -x`, `! !b`)
+                    match cur.kind {
+                        FtSym -> true,
+                        _ -> false,
+                    }
                 } else if (cellGet(prevWasForallDot)) {
                     true
                 } else if (curIsParenOp || prevIsParenOp) {
@@ -704,7 +756,7 @@ def formatLineTokens(
                                 isLowerStart(prev.raw)
                             } else if (cellGet(inType)) {
                                 // Inside `data { Variant(Int) }`: variant ctor before `(` has no space if preceded by `{` or `,` or start of line
-                                if (topFrame.isDataBrace && isUpperStart(prev.raw) && cellGet(parenDepth) == 0) {
+                                if ((topFrame.isDataBrace || (isDataLine && cellGet(braceDepth) == 1)) && isUpperStart(prev.raw) && cellGet(parenDepth) == 0) {
                                     let wasFieldType =
                                         if (idx >= 2) {
                                             match vecGetOr(line, idx - 2, emptyFTok()).kind {
@@ -793,7 +845,7 @@ def formatLineTokens(
                     cellSet(justClosedCond, true);
                     cellSet(condParenTarget, -1)
                 } else ();
-                if (cellGet(parenDepth) == 0 && isDefLine) cellSet(inType, false) else ()
+                if (cellGet(parenDepth) == 0 && isDefLine && !cellGet(seenRetColon)) cellSet(inType, false) else ()
             },
             FtComma -> {
                 if (cellGet(parenDepth) == 1 && isDefLine && !cellGet(seenRetColon) && !isTypeLine && !isInstanceLine && !isConceptLine) {
@@ -806,12 +858,15 @@ def formatLineTokens(
                         Some(p) -> match p.kind { FtRParen -> true, _ -> false },
                         None -> false,
                     };
-                    if (prevWasRParen && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
+                    if ((prevWasRParen || (isDefLine && cellGet(parenDepth) == 0)) && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
                         cellSet(seenRetColon, true);
                         cellSet(inType, true)
                     } else if ((isDefLine || isLetLine || topFrame.isDefParamParen) && !cellGet(seenEq) && cellGet(braceDepth) == 0) {
                         cellSet(inType, true)
                     } else if (isConceptLine || topFrame.isConceptBrace || topFrame.isDataBrace || isDataLine) {
+                        cellSet(inType, true)
+                    } else if (topFrame.delim == 0 && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
+                        // Top-level forward declaration `ident: Type` without `=`
                         cellSet(inType, true)
                     } else if (cellGet(parenDepth) > 0 && cellGet(braceDepth) == 0) {
                         cellSet(inType, true)
@@ -822,22 +877,26 @@ def formatLineTokens(
                     else cellSet(inType, false)
                 } else if (cur.raw == "->") {
                     if (!cellGet(inType)) ()
-                    else if (!isDefLine && !isTypeLine && !isConceptLine && !topFrame.isConceptBrace && !topFrame.isDataBrace) {
+                    else if (
+                        (isDefLine && cellGet(seenEq))
+                        || (!isDefLine && !topFrame.isDefParamParen && !topFrame.isDataParen && !isTypeLine && !isConceptLine && !topFrame.isConceptBrace && !topFrame.isDataBrace && !cellGet(topFrame.typeHanging))
+                    ) {
                         cellSet(inType, false)
                     } else ()
                 } else (),
             _ -> (),
         };
 
-        cellSet(prevClosedCond, cellGet(justClosedCond));
         cellSet(prevWasUnary, curIsUnary);
         cellSet(prevTokOpt, Some(cur));
         if (!isTriviaTok(cur)) {
+            cellSet(prevClosedCond, cellGet(justClosedCond));
             cellSet(prevCodeOpt, Some(cur))
         } else ();
 
         cellSet(i, idx + 1)
-    }
+    };
+    cellGet(prevClosedCond)
 }
 
 def pushIndent(out: StringBuf, level: Int): Void = {
@@ -887,7 +946,8 @@ pub def formatSource(src: String): String = {
             let ln = vecGetOr(lines, idx, emptyLine);
             if (vecLen(ln) == 0) {
                 if (vecLen(stack) == 1) {
-                    clearHanging(stackTop(stack))
+                    clearHanging(stackTop(stack));
+                    cellSet(prevLineEndedWithValue, false)
                 } else ();
                 bufPushByte(out, 10)
             } else if (isCommentOnlyLine(ln)) {
@@ -911,7 +971,7 @@ pub def formatSource(src: String): String = {
                         };
                         let indent = frameIndent(stackTop(stack));
                         pushIndent(out, indent);
-                        formatLineTokens(ln, stackTop(stack), cellGet(prevLineEndedWithValue), out);
+                        let _ = formatLineTokens(ln, stackTop(stack), cellGet(prevLineEndedWithValue), out);
                         bufPushByte(out, 10)
                     },
                 }
@@ -961,7 +1021,7 @@ pub def formatSource(src: String): String = {
                     };
 
                 pushIndent(out, lineIndent);
-                formatLineTokens(ln, top, cellGet(prevLineEndedWithValue), out);
+                let endedCondParen = formatLineTokens(ln, top, cellGet(prevLineEndedWithValue), out);
                 bufPushByte(out, 10);
 
                 // Update delimiter stack for remaining tokens on this line
@@ -969,7 +1029,9 @@ pub def formatSource(src: String): String = {
                 let isDataLine = lineStartsWithHeaderKw(ln, "data");
                 let isConceptLine = lineStartsWithHeaderKw(ln, "concept");
                 let isDefLine = lineStartsWithHeaderKw(ln, "def");
+                let isTypeLine = lineStartsWithHeaderKw(ln, "type");
                 let effectiveBase = cellNew(lineIndent);
+                let sawEqOnLine = cellNew(false);
                 let j = cellNew(cellGet(scanIdx));
                 while (cellGet(j) < n) {
                     let t = vecGetOr(ln, cellGet(j), emptyFTok());
@@ -981,25 +1043,32 @@ pub def formatSource(src: String): String = {
                             openedLine: idx,
                             isUseBrace: isUseLine,
                             isDataBrace: isDataLine || stackTop(stack).isDataBrace,
+                            isDataParen: false,
                             isConceptBrace: isConceptLine,
                             isDefParamParen: false,
                             eqHanging: cellNew(false),
                             ifHanging: cellNew(false),
                             contHanging: cellNew(false),
+                            typeHanging: cellNew(false),
                         }),
-                        FtLParen -> vecPush(stack, MkIndentFrame {
-                            delim: 40,
-                            baseIndent: cellGet(effectiveBase),
-                            bodyIndent: cellGet(effectiveBase) + 1,
-                            openedLine: idx,
-                            isUseBrace: false,
-                            isDataBrace: false,
-                            isConceptBrace: false,
-                            isDefParamParen: isDefLine,
-                            eqHanging: cellNew(false),
-                            ifHanging: cellNew(false),
-                            contHanging: cellNew(false),
-                        }),
+                        FtLParen -> {
+                            let curTop = stackTop(stack);
+                            vecPush(stack, MkIndentFrame {
+                                delim: 40,
+                                baseIndent: cellGet(effectiveBase),
+                                bodyIndent: cellGet(effectiveBase) + 1,
+                                openedLine: idx,
+                                isUseBrace: false,
+                                isDataBrace: false,
+                                isDataParen: isDataLine || curTop.isDataBrace || curTop.isDataParen,
+                                isConceptBrace: false,
+                                isDefParamParen: isDefLine,
+                                eqHanging: cellNew(false),
+                                ifHanging: cellNew(false),
+                                contHanging: cellNew(false),
+                                typeHanging: cellNew(false),
+                            })
+                        },
                         FtLBracket -> vecPush(stack, MkIndentFrame {
                             delim: 91,
                             baseIndent: cellGet(effectiveBase),
@@ -1007,11 +1076,13 @@ pub def formatSource(src: String): String = {
                             openedLine: idx,
                             isUseBrace: false,
                             isDataBrace: false,
+                            isDataParen: false,
                             isConceptBrace: false,
                             isDefParamParen: false,
                             eqHanging: cellNew(false),
                             ifHanging: cellNew(false),
                             contHanging: cellNew(false),
+                            typeHanging: cellNew(false),
                         }),
                         FtRBrace -> if (vecLen(stack) > 1) {
                             match vecPop(stack) {
@@ -1031,6 +1102,7 @@ pub def formatSource(src: String): String = {
                                 None -> (),
                             }
                         } else (),
+                        FtSym -> if (t.raw == "=") cellSet(sawEqOnLine, true) else (),
                         _ -> (),
                     };
                     cellSet(j, cellGet(j) + 1)
@@ -1040,18 +1112,31 @@ pub def formatSource(src: String): String = {
                 let newTop = stackTop(stack);
                 let lc = lineLastCodeIdx(ln);
                 let lastCode = vecGetOr(ln, lc, emptyFTok());
-                cellSet(prevLineEndedWithValue, isValueEndingTok(lastCode));
+                cellSet(prevLineEndedWithValue, isValueEndingTok(lastCode) && !endedCondParen);
 
                 if (newTop.openedLine != idx) {
+                    if (cellGet(sawEqOnLine) && !isTypeLine) {
+                        cellSet(newTop.typeHanging, false)
+                    } else ();
                     match lastCode.kind {
                         FtSemi -> clearHanging(newTop),
                         FtComma ->
                             if (newTop.delim != 0) clearHanging(newTop) else (),
                         FtSym ->
-                            if (lastCode.raw == "=" || lastCode.raw == "->") {
+                            if (lastCode.raw == "=") {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.ifHanging, false);
+                                cellSet(newTop.contHanging, false);
+                                cellSet(newTop.typeHanging, isTypeLine)
+                            } else if (lastCode.raw == "->") {
                                 cellSet(newTop.eqHanging, true);
                                 cellSet(newTop.ifHanging, false);
                                 cellSet(newTop.contHanging, false)
+                            } else if (lastCode.raw == ":") {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.ifHanging, false);
+                                cellSet(newTop.contHanging, false);
+                                cellSet(newTop.typeHanging, true)
                             } else if (isTrailingBinOpTok(lastCode)) {
                                 if ((newTop.delim == 0 || newTop.delim == 123) && !cellGet(newTop.eqHanging) && !cellGet(newTop.ifHanging)) {
                                     cellSet(newTop.contHanging, true)
@@ -1066,8 +1151,15 @@ pub def formatSource(src: String): String = {
                             if (lineEndsWithBareIfCond(ln)) {
                                 cellSet(newTop.ifHanging, true);
                                 cellSet(newTop.contHanging, false)
+                            } else if (lineHasUnclosedInlineIf(ln)) {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.contHanging, false)
                             } else (),
-                        _ -> (),
+                        _ ->
+                            if (lineHasUnclosedInlineIf(ln)) {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.contHanging, false)
+                            } else (),
                     }
                 } else ()
             };
@@ -1195,6 +1287,8 @@ pub def cmdFmt(args: List String): Result Int String = {
                 Err("cannot combine '--check' and '--write'")
             } else if (cellGet(checkMode) && cellGet(stdoutMode)) {
                 Err("cannot combine '--check' and '--stdout'")
+            } else if (cellGet(writeMode) && cellGet(stdoutMode)) {
+                Err("cannot combine '--write' and '--stdout'")
             } else {
                 let files = collectTargetFiles(listRev(cellGet(pathsRev)))?;
                 let unformattedCount = cellNew(0);
@@ -1207,10 +1301,7 @@ pub def cmdFmt(args: List String): Result Int String = {
                                 Err(e) -> cellSet(runErr, Some(e)),
                                 Ok((orig, formatted)) -> {
                                     if (cellGet(stdoutMode)) {
-                                        printLn(
-                                            if (strEndsWith(formatted, "\n")) strSlice(formatted, 0, strLen(formatted) - 1)
-                                            else formatted
-                                        )
+                                        print(formatted)
                                     } else if (cellGet(checkMode)) {
                                         if (formatted != orig) {
                                             eprintLn("needs formatting: " + path);
@@ -1218,7 +1309,7 @@ pub def cmdFmt(args: List String): Result Int String = {
                                         } else ()
                                     } else {
                                         if (formatted != orig) {
-                                            match writeFile(path, formatted) {
+                                            match writeFileAtomicSafe(path, formatted) {
                                                 Ok(_) -> (),
                                                 Err(we) -> cellSet(runErr, Some("failed to write '" + path + "': " + we)),
                                             }

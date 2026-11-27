@@ -3270,7 +3270,116 @@ if "$GEISHA_BIN" fmt "$FMT_DIR/broken.gsa" >/dev/null 2>&1; then
     exit 1
 fi
 diff -u "$FMT_DIR/broken.orig.gsa" "$FMT_DIR/broken.gsa"
-echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, project scan, & semantic equivalence verified"
+
+# 37h. P0/P1/P2 regression suite: cross-line cond unary `-2147483648`, unary chains, `inType` edge cases, braceless `let`/`if`, CLI flags & atomic chmod
+cat > "$FMT_DIR/edge_cases.gsa" << 'EOF'
+#!/usr/bin/env -S geisha run
+use std.option.{Option, Some, None}
+use std.str.intToStr
+
+pub data Database { Database(Int64) }
+
+pub data MultiData {
+EApp(
+Option (List Int),
+String
+),
+}
+
+pub type MultiAlias =
+List (Int, String)
+
+def minI32If(flag: Bool): Int =
+if (flag)
+-2147483648
+else 0
+
+def unaryChains(x: Int, b: Bool): (Int, Int, Bool, Int, Bool) =
+(~ -x, - -x, ! !b, ~-x, !!b)
+
+def constrainedRet: forall a. (Eq a) => a -> Option (List a) = (x) -> Some([x])
+
+def inc(x: Int): Int = x + 1
+
+def applyFn(
+f: Int -> Option (List Int),
+x: Int
+): Option (List Int) = f(x)
+
+def singleDefLambda(x: Int): Int = ((v: Int) -> inc(v))(x)
+
+def crossLineRet(x: Int):
+Option (List Int) = Some([x])
+
+def bracelessLet(x: Int): Int =
+let y = x + 1 in
+y * 2
+
+def inlineLetIf(flag: Bool): Int = {
+let pick = if (flag) 1
+else 2;
+pick
+}
+
+def main(): Void = {
+let m = minI32If(true);
+let (u1, u2, u3, u4, u5) = unaryChains(5, true);
+let _ = constrainedRet(1);
+let _ = applyFn((n: Int) -> crossLineRet(n), 3);
+let s = singleDefLambda(10) + bracelessLet(4) + inlineLetIf(false);
+printLn(
+intToStr(m) + "|" + intToStr(u1) + "|" + intToStr(u2) + "|"
++ (if (u3 && u5) "1" else "0") + "|" + intToStr(u4) + "|" + intToStr(s)
+)
+}
+EOF
+chmod 0755 "$FMT_DIR/edge_cases.gsa"
+"$GEISHA_BIN" check "$FMT_DIR/edge_cases.gsa" >/dev/null
+"$GEISHA_BIN" -o "$FMT_DIR/edge_before" "$FMT_DIR/edge_cases.gsa"
+EDGE_BEFORE="$("$FMT_DIR/edge_before")"
+
+"$GEISHA_BIN" fmt --write "$FMT_DIR/edge_cases.gsa"
+"$GEISHA_BIN" fmt --check "$FMT_DIR/edge_cases.gsa"
+"$GEISHA_BIN" check "$FMT_DIR/edge_cases.gsa" >/dev/null
+"$GEISHA_BIN" -o "$FMT_DIR/edge_after" "$FMT_DIR/edge_cases.gsa"
+EDGE_AFTER="$("$FMT_DIR/edge_after")"
+assert_eq "geisha_fmt_edge_semantic_equivalence" "$EDGE_BEFORE" "$EDGE_AFTER"
+
+python3 - "$FMT_DIR/edge_cases.gsa" << 'PY'
+import os, sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+mode = oct(os.stat(p).st_mode & 0o777)
+assert mode == "0o755", f"expected 0o755 preserved via writeFileAtomic, got {mode}"
+required = [
+    "pub data Database { Database(Int64) }",
+    "        Option (List Int),\n",
+    "pub type MultiAlias =\n    List (Int, String)\n",
+    "    if (flag)\n        -2147483648\n    else 0\n",
+    "    (~ -x, - -x, ! !b, ~-x, !!b)\n",
+    "def constrainedRet: forall a. (Eq a) => a -> Option (List a) = (x) -> Some([x])",
+    "    f: Int -> Option (List Int),\n",
+    "def singleDefLambda(x: Int): Int = ((v: Int) -> inc(v))(x)",
+    "def crossLineRet(x: Int):\n    Option (List Int) = Some([x])\n",
+    "def bracelessLet(x: Int): Int =\n    let y = x + 1 in\n    y * 2\n",
+    "    let pick = if (flag) 1\n        else 2;\n",
+]
+for needle in required:
+    assert needle in src, f"missing expected formatted edge case: {needle!r}\n---\n{src}"
+PY
+
+# `--write --stdout` must be rejected
+if "$GEISHA_BIN" fmt --write --stdout "$FMT_DIR/edge_cases.gsa" >/dev/null 2>&1; then
+    echo "FAIL [geisha_fmt_write_stdout_conflict]: expected error when combining --write and --stdout" >&2
+    exit 1
+fi
+
+# `--stdout` on empty file must emit 0 bytes (no spurious newline)
+: > "$FMT_DIR/empty.gsa"
+EMPTY_BYTES="$("$GEISHA_BIN" fmt --stdout "$FMT_DIR/empty.gsa" | wc -c | tr -d ' ')"
+assert_eq "geisha_fmt_stdout_empty_file" "0" "$EMPTY_BYTES"
+
+echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, --stdout, edge regressions, & semantic equivalence verified"
 PASS=$((PASS + 1))
 
 echo "All $PASS end-to-end test suites passed!"
