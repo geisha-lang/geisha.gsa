@@ -52,8 +52,8 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 ## 3. Core Syntax & Semantics
 
 ### Primitives & Built-ins
-- Types: `Int` (32-bit signed int `-2147483648..2147483647`, checked at parse time; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
-- Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`, `assert`, `assume`.
+- Types: `Int` (32-bit signed int `-2147483648..2147483647`, checked at parse time; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Simd n e` (128-bit & 256-bit hardware SIMD vectors via `std.simd`), `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
+- Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `withStrPtr`, `withForeignPtr`, `withAlloca`, `withArena`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`, `assert`, `assume`.
 - **Contracts & Static Verification**:
   - Function contracts (contextual clauses between signature and `=`): `requires <Bool>`, `ensures <Bool>` / `ensures res -> <Bool>` / `ensures |res| <Bool>`, `decreases <Int>`.
   - Loop contracts (between `while (cond)` and body): `invariant <Bool>`, `decreases <Int>`.
@@ -149,7 +149,8 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.result` — `Result a e` (`Ok`, `Err`) and helpers
 - `std.list` — singly-linked `List a` (`listLen`, `listRev`, `listAppend`, ...)
 - `std.control` — higher-order combinators (`fmap`, ...)
-- `std.bits` — bitwise utilities
+- `std.bits` — bitwise & bit-scanning utilities (`hasFlag`, `setFlag`, `clearFlag`, `toggleFlag`, `popCount`, `popCount64`, `trailingZeros`, `trailingZeros64`, `leadingZeros`, `leadingZeros64`, `prefixXor`, `prefixXor64`)
+- `std.simd` — portable hardware SIMD vectors & masks (`Simd n e`, `I8x16..F64x4`, `Mask n e`, scalar-broadcasting `+ - * /`, lane-wise `==~ !=~ <~ <=~ >~ >=~`, `+| -|`, `select`, `bitmask`, `any`/`all`/`firstTrue`/`countTrue`, `reduceAdd`/`reduceAddWide`/`simdDot`/`simdFma`, `swizzleZero`/`swizzle32`, `widenLo`/`widenHi`/`narrow`/`narrowSat`/`splitHalves`/`concatHalves`/`castSimd`/`bitcastSimd`, `simdLoadStr`/`simdLoadStrTail`, and exact 256-byte `SimdByteSet` LUT classifier)
 - `std.path` — host-OS-aware path manipulation (`isAbsPath`, `pathJoin`, `pathDirname`, `pathBasename`, `pathStem`, `pathWithExt`) plus explicit Windows-style `*Win` variants (`isAbsPathWin`, `pathJoinWin`, `pathDirnameWin`, `pathBasenameWin`, `pathStemWin`, `pathWithExtWin`)
 - `std.char` — ASCII/byte classification (`isDigitByte`, `isUpperByte`, `isLowerByte`, ...)
 - `std.buf` — mutable `StringBuf` (`bufNew`, `bufPushStr`, `bufPushByte`, `bufToString`)

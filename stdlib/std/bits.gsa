@@ -1,15 +1,52 @@
-// Bit manipulation helpers (`std.bits`) backed by LLVM hardware bit intrinsics (`ctpop` / `cttz`)
+// Bit manipulation helpers (`std.bits`) backed by LLVM hardware bit intrinsics (`ctpop` / `cttz` / `ctlz`)
 
+/// Return `true` when every bit in `mask` is set in `flags`.
 pub def hasFlag(flags: Int, mask: Int): Bool = (flags & mask) == mask
 
+/// Set all bits of `mask` in `flags`.
 pub def setFlag(flags: Int, mask: Int): Int = flags | mask
 
+/// Clear all bits of `mask` in `flags`.
 pub def clearFlag(flags: Int, mask: Int): Int = flags & ~mask
 
+/// Flip all bits of `mask` in `flags`.
 pub def toggleFlag(flags: Int, mask: Int): Int = flags ^ mask
 
+/// Count set `1` bits in a 32-bit `Int`.
 pub def popCount(x: Int): Int = bitPopCount(x)
 
+/// Count set `1` bits in a 64-bit `Int64`.
 pub def popCount64(x: Int64): Int = bitPopCount64(x)
 
+/// Count trailing `0` bits in a 32-bit `Int` (`32` when `x == 0`).
 pub def trailingZeros(x: Int): Int = bitCtz(x)
+
+/// Count trailing `0` bits in a 64-bit `Int64` (`64` when `x == 0`).
+pub def trailingZeros64(x: Int64): Int = bitCtz64(x)
+
+/// Count leading `0` bits in a 32-bit `Int` (`32` when `x == 0`).
+pub def leadingZeros(x: Int): Int = bitClz(x)
+
+/// Count leading `0` bits in a 64-bit `Int64` (`64` when `x == 0`).
+pub def leadingZeros64(x: Int64): Int = bitClz64(x)
+
+/// Inclusive prefix XOR across all 32 bits of `x` (`bit k = x[0] ^ ... ^ x[k]`).
+/// Equivalent to carryless multiply by `0xFFFFFFFF`; turns delimiter bitmasks into interior region masks.
+pub def prefixXor(x: Int): Int = {
+    let a = x ^ (x << 1);
+    let b = a ^ (a << 2);
+    let c = b ^ (b << 4);
+    let d = c ^ (c << 8);
+    d ^ (d << 16)
+}
+
+/// Inclusive prefix XOR across all 64 bits of `x` (`bit k = x[0] ^ ... ^ x[k]`).
+/// Equivalent to carryless multiply by `-1` (`0xFFFFFFFFFFFFFFFF`).
+pub def prefixXor64(x: Int64): Int64 = {
+    let a = x ^ (x << 1);
+    let b = a ^ (a << 2);
+    let c = b ^ (b << 4);
+    let d = c ^ (c << 8);
+    let e = d ^ (d << 16);
+    e ^ (e << 32)
+}

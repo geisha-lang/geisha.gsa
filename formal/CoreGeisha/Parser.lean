@@ -155,6 +155,12 @@ private partial def parseTy : SExpr → Except String Ty
   | .list [.atom "adt", name] => do
     let n ← expectStr name
     pure (.adt n)
+  | .list [.atom "simd128", spec] => do
+    let s ← expectStr spec
+    pure (.simd128 s)
+  | .list [.atom "simd256", spec] => do
+    let s ← expectStr spec
+    pure (.simd256 s)
   | .list [.atom "cell", t] => do
     let t' ← parseTy t
     pure (.cell t')

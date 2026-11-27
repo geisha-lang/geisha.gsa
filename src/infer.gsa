@@ -536,6 +536,14 @@ def expandTypeWithMode(ctx: InferCtx, ty: Type, visiting: List String, sp: Span,
                         } else {
                             Ok(composeTypes(Cons(TyCon(name), Cons(pickExpandedMode(ctx, fixedModeOpt), argList))))
                         }
+                    } else if (name == "Simd") {
+                        if (listLen(argList) != 2) {
+                            Err(typeErr(sp, "Type 'Simd' expects 2 type arguments (lane marker and element type)"))
+                        } else {
+                            let comp = composeTypes(Cons(TyCon("Simd"), argList));
+                            validateSimdAppIfConcrete(comp, sp)?;
+                            Ok(comp)
+                        }
                     } else {
                         let eh = expandTypeWithMode(ctx, head, visiting, sp, fixedModeOpt)?;
                         Ok(composeTypes(Cons(eh, argList)))
@@ -731,6 +739,53 @@ def buildArrowKind(paramKinds: List Kind, retKind: Kind): Kind = match paramKind
     Cons(k, r) -> KArr(k, buildArrowKind(r, retKind)),
 }
 
+def stripSimdMarkerMod(s: String): String = {
+    let n = strLen(s);
+    let lastDot = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        if (strByteAt(s, cellGet(i)) == 46) cellSet(lastDot, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let d = cellGet(lastDot);
+    if (d >= 0) strSlice(s, d + 1, n) else s
+}
+
+def simdMarkerLanes(ln: String): Int = {
+    let b = stripSimdMarkerMod(ln);
+    if (b == "L2") 2
+    else if (b == "L4") 4
+    else if (b == "L8") 8
+    else if (b == "L16") 16
+    else if (b == "L32") 32
+    else 0
+}
+
+def simdMarkerElemBytes(en: String): Int = {
+    let b = stripSimdMarkerMod(en);
+    if (b == "I8" || b == "U8") 1
+    else if (b == "I16" || b == "U16") 2
+    else if (b == "Int" || b == "I32" || b == "U32" || b == "Float32" || b == "F32") 4
+    else if (b == "Int64" || b == "I64" || b == "U64" || b == "Float" || b == "F64") 8
+    else 0
+}
+
+def validateSimdAppIfConcrete(ty: Type, sp: Span): Result Void String = match ty {
+    TyComp(TyComp(TyCon("Simd"), laneTy), elemTy) -> match (laneTy, elemTy) {
+        (TyVar(_), _) -> Ok(()),
+        (_, TyVar(_)) -> Ok(()),
+        (TyCon(ln), TyCon(en)) -> {
+            let lanes = simdMarkerLanes(ln);
+            let ebytes = simdMarkerElemBytes(en);
+            let total = lanes * ebytes;
+            if (lanes > 0 && ebytes > 0 && (total == 16 || total == 32)) Ok(())
+            else Err(typeErr(sp, "Invalid SIMD vector type '" + typeToString(ty) + "': expected 128-bit or 256-bit vector over (L2..L32) and (I8/U8/I16/U16/Int/U32/Int64/U64/Float32/Float)"))
+        },
+        _ -> Err(typeErr(sp, "Invalid SIMD vector type '" + typeToString(ty) + "': expected concrete lane marker (L2..L32) and scalar/element marker")),
+    },
+    _ -> Ok(()),
+}
+
 def inferTypeKind(ctx: InferCtx, ty: Type, tvKinds: StrMap Kind, sp: Span): Result Kind String = match ty {
     TyVoid -> Ok(KStar),
     TyCon(name) -> match strMapGet(ctx.tyConKinds, name) {
@@ -782,6 +837,7 @@ def inferTypeKind(ctx: InferCtx, ty: Type, tvKinds: StrMap Kind, sp: Span): Resu
         let ka = inferTypeKind(ctx, a, tvKinds, sp)?;
         let kres = freshKindVar(ctx);
         unifyKinds(ctx.kindSubst, kb, KArr(ka, kres), sp)?;
+        validateSimdAppIfConcrete(ty, sp)?;
         Ok(zonkKind(ctx.kindSubst, kres))
     },
 }
@@ -954,6 +1010,7 @@ def initInferCtx(): InferCtx = {
     };
     strMapInsert(ctx.tyConKinds, "Prod", KArr(KStar, KArr(KStar, KStar)));
     strMapInsert(ctx.tyConKinds, "Sum", KArr(KStar, KArr(KStar, KStar)));
+    strMapInsert(ctx.tyConKinds, "Simd", KArr(KStar, KArr(KStar, KStar)));
     let tvA = TyVar("a");
     let tvM = TyVar(".$m_op");
     let binSame = TyArr(tvM, [tvA, tvA], tvA);
@@ -1166,6 +1223,9 @@ pub def preludePrimSpecs(): List (String, String) = [
         ("bitPopCount", "Int -> Int"),
         ("bitPopCount64", "Int64 -> Int"),
         ("bitCtz", "Int -> Int"),
+        ("bitCtz64", "Int64 -> Int"),
+        ("bitClz", "Int -> Int"),
+        ("bitClz64", "Int64 -> Int"),
         ("charToInt", "Char -> Int"),
         ("intToChar", "Int -> Char"),
         ("intToI64", "Int -> Int64"),
@@ -1244,6 +1304,7 @@ pub def preludePrimSpecs(): List (String, String) = [
         ("foreignPtrNew", "(Ptr, Ptr, Int64) -> ForeignPtr"),
         ("cFnPtr", "forall a. a -> Ptr"),
         ("withForeignPtr", "forall r. (ForeignPtr, ScopedPtr -> r) -> r"),
+        ("withStrPtr", "forall r. (String, ScopedPtr -> r) -> r"),
         ("withAlloca", "forall r. (Int, ScopedPtr -> r) -> r"),
         ("withArena", "forall r. (Arena -> r) -> r"),
         ("arenaAlloc", "(Arena, Int64) -> ScopedPtr"),
@@ -1302,7 +1363,25 @@ pub def preludePrimSpecs(): List (String, String) = [
         ("__concActorSpawn", "forall s. (() -> s) -> Actor s"),
         ("__concActorCall", "forall s r. (Send r) => (Actor s, s -> r) -> Task r"),
         ("__concActorSend", "forall s. (Actor s, s -> Void) -> Void"),
-        ("__concActorStop", "forall s. Actor s -> Void")
+        ("__concActorStop", "forall s. Actor s -> Void"),
+        ("__simdSplat", "forall v s. s -> v"),
+        ("__simdIota", "forall v. () -> v"),
+        ("__simdExtract", "forall v s. (v, Int) -> s"),
+        ("__simdReplace", "forall v s. (v, Int, s) -> v"),
+        ("__simdUnary", "forall v. (Int, v) -> v"),
+        ("__simdBin", "forall v. (Int, v, v) -> v"),
+        ("__simdShift", "forall v. (Int, v, Int) -> v"),
+        ("__simdFma", "forall v. (v, v, v) -> v"),
+        ("__simdCmp", "forall v. (Int, v, v) -> v"),
+        ("__simdReduce", "forall v r. (Int, v) -> r"),
+        ("__simdPermute", "forall v. (Int, v, v, Int) -> v"),
+        ("__simdConvert", "forall a b. (Int, a) -> b"),
+        ("__simdCombine", "forall a b. (Int, a, a) -> b"),
+        ("__simdLoad", "forall v. (ScopedPtr, Int64) -> v"),
+        ("__simdStore", "forall v. (ScopedPtr, Int64, v) -> Void"),
+        ("__simdLoadRaw", "forall v. (Ptr, Int64) -> v"),
+        ("__simdStoreRaw", "forall v. (Ptr, Int64, v) -> Void"),
+        ("__simdLoadStr", "forall v. (String, Int64) -> v")
 ]
 
 def buildPreludeBaseMap(): StrMap Scheme = {
@@ -1459,7 +1538,7 @@ def checkTypeSendRec(adtReg: StrMap AdtInfo, ty: Type, visiting: List String): B
         match cellGet(curr) {
             TyCon(baseName) ->
                 if (baseName == "Cell" || baseName == "MutArray") false
-                else if (baseName == "Actor") true
+                else if (baseName == "Actor" || baseName == "Simd") true
                 else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                     match targs {
                         Cons(elem, Nil) -> checkTypeSendRec(adtReg, elem, visiting),
@@ -1932,7 +2011,7 @@ def evalSendStatus(ctx: InferCtx, rawTy: Type, assumeSharedVarOpt: Option String
                 match cellGet(curr) {
                     TyCon(baseName) ->
                         if (baseName == "Cell" || baseName == "MutArray") SendNo
-                        else if (baseName == "Actor") SendYes
+                        else if (baseName == "Actor" || baseName == "Simd") SendYes
                         else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                             evalSendStatusList(ctx, targs, assumeSharedVarOpt, Cons(key, visiting))
                         } else match strMapGet(ctx.adtReg, baseName) {
@@ -2063,7 +2142,7 @@ def dischargeSendConstraint(
                         TyCon(baseName) ->
                             if (baseName == "Cell" || baseName == "MutArray") {
                                 Err(typeErr(sp, "No instance of 'Send' for mutable container '" + typeToString(ty) + "'"))
-                            } else if (baseName == "Actor") Ok(())
+                            } else if (baseName == "Actor" || baseName == "Simd") Ok(())
                             else if (baseName == "MVar" || baseName == "Chan" || baseName == "Task" || baseName == "ImmArray") {
                                 dischargeSendList(ctx, targs, sp, given, residual, Cons(key, visiting), depth + 1)
                             } else match strMapGet(ctx.adtReg, baseName) {
@@ -2373,6 +2452,114 @@ def dischargeWantedPass(
     Ok(listRev(cellGet(residual)))
 }
 
+def hasUipVar(ty: Type): Bool = match ty {
+    TyVoid -> false,
+    TyCon(_) -> false,
+    TyVar(v) -> strLen(v) >= 5 && strSlice(v, 0, 5) == ".uip_",
+    TyArr(m, ps, r) -> hasUipVar(m) || hasUipVarList(ps) || hasUipVar(r),
+    TyTuple(es) -> hasUipVarList(es),
+    TyComp(b, a) -> hasUipVar(b) || hasUipVar(a),
+}
+
+def hasUipVarList(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> if (hasUipVar(h)) true else hasUipVarList(t),
+}
+
+def hasAmbigUnifVar(fvs: List String, liveFtvs: List String): Bool = match fvs {
+    Nil -> false,
+    Cons(v, r) ->
+        if (strLen(v) > 0 && strByteAt(v, 0) == 46 && !isModeVarName(v) && !listContainsStr(liveFtvs, v)) true
+        else hasAmbigUnifVar(r, liveFtvs),
+}
+
+def tryUniqueInstanceImprove(
+    ctx: InferCtx,
+    ws: List WantedConstraint,
+    given: List ConstraintSpec,
+    liveFtvs: List String
+): Result Bool String = match given {
+    Cons(_, _) -> Ok(false),
+    Nil -> {
+        let improved = cellNew(false);
+        let cur = cellNew(ws);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(rw, rest) -> {
+                    if (rw.wcConcept != "Send" && rw.wcConcept != "SendIf" && rw.wcConcept != "NoScoped") {
+                        let zArgs = zonkTypeList(ctx.subst, rw.wcArgs);
+                        let fvs = collectFtvsInTypeList(zArgs);
+                        if (hasNonVarInList(zArgs) && hasAmbigUnifVar(fvs, liveFtvs)) {
+                            let matchCount = cellNew(0);
+                            let bestTrial: Cell (Option (StrMap Type)) = cellNew(None);
+                            let ci = cellNew(cellGet(ctx.instanceReg));
+                            while (match cellGet(ci) { Nil -> false, _ -> cellGet(matchCount) <= 1 }) {
+                                match cellGet(ci) {
+                                    Cons(inst, ri) -> {
+                                        if (inst.conceptName == rw.wcConcept && listLen(inst.targetTypes) == listLen(zArgs)) {
+                                            let patMap: StrMap Type = strMapNew();
+                                            let ctp = cellNew(inst.typeParams);
+                                            while (match cellGet(ctp) { Nil -> false, _ -> true }) {
+                                                match cellGet(ctp) {
+                                                    Cons(tp, rtp) -> {
+                                                        strMapInsert(patMap, tp, TyVar(".uip_" + tp));
+                                                        cellSet(ctp, rtp)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            let patArgs = applyExplicitSubstList(inst.targetTypes, patMap);
+                                            let trial: StrMap Type = strMapNew();
+                                            match unifyTypeLists(trial, patArgs, zArgs, rw.wcSpan) {
+                                                Ok(()) -> {
+                                                    cellSet(matchCount, cellGet(matchCount) + 1);
+                                                    cellSet(bestTrial, Some(trial))
+                                                },
+                                                Err(_) -> (),
+                                            }
+                                        } else ();
+                                        cellSet(ci, ri)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            if (cellGet(matchCount) == 1) {
+                                match cellGet(bestTrial) {
+                                    Some(trial) -> {
+                                        let cf = cellNew(fvs);
+                                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                            match cellGet(cf) {
+                                                Cons(fv, rf) -> {
+                                                    if (strLen(fv) > 0 && strByteAt(fv, 0) == 46 && !isModeVarName(fv)) {
+                                                        let resolved = zonkType(trial, TyVar(fv));
+                                                        if (!hasUipVar(resolved)) {
+                                                            let curZ = zonkType(ctx.subst, TyVar(fv));
+                                                            if (!typesEqual(curZ, resolved)) {
+                                                                unifyTypes(ctx.subst, curZ, resolved, rw.wcSpan)?;
+                                                                cellSet(improved, true)
+                                                            } else ()
+                                                        } else ()
+                                                    } else ();
+                                                    cellSet(cf, rf)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        }
+                                    },
+                                    None -> (),
+                                }
+                            } else ()
+                        } else ()
+                    } else ();
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(cellGet(improved))
+    },
+}
+
 def dischargeWantedFixedPoint(
     ctx: InferCtx,
     wantedList: List WantedConstraint,
@@ -2380,11 +2567,24 @@ def dischargeWantedFixedPoint(
     liveFtvs: List String
 ): Result (List WantedConstraint) String = {
     let r1 = dischargeWantedPass(ctx, wantedList, given)?;
-    let r2 = dischargeWantedPass(ctx, r1, given)?;
+    let r2 = cellNew(dischargeWantedPass(ctx, r1, given)?);
+    let uRound = cellNew(0);
+    let uLoop = cellNew(true);
+    while (cellGet(uLoop) && cellGet(uRound) < 4) {
+        cellSet(uRound, cellGet(uRound) + 1);
+        let didImprove = tryUniqueInstanceImprove(ctx, cellGet(r2), given, liveFtvs)?;
+        if (didImprove) {
+            let nextR = dischargeWantedPass(ctx, cellGet(r2), given)?;
+            cellSet(r2, dischargeWantedPass(ctx, nextR, given)?)
+        } else {
+            cellSet(uLoop, false)
+        }
+    };
+    let r2Final = cellGet(r2);
     // Any internal mode variable in `SendIf(m, t)` that does not escape into `liveFtvs`
     // belongs to a purely local closure call and safely defaults to `$Local`.
     let defaultedAny = cellNew(false);
-    let cur = cellNew(r2);
+    let cur = cellNew(r2Final);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(rw, rest) -> {
@@ -2406,8 +2606,8 @@ def dischargeWantedFixedPoint(
             Nil -> (),
         }
     };
-    if (cellGet(defaultedAny)) dischargeWantedPass(ctx, r2, given)
-    else Ok(r2)
+    if (cellGet(defaultedAny)) dischargeWantedPass(ctx, r2Final, given)
+    else Ok(r2Final)
 }
 
 def generalizeType(
@@ -2785,7 +2985,7 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             }?;
             match ic.node {
                 ExVar(fnNm) -> {
-                    if (fnNm == "withForeignPtr" || fnNm == "withAlloca" || fnNm == "withArena") {
+                    if (fnNm == "withForeignPtr" || fnNm == "withStrPtr" || fnNm == "withAlloca" || fnNm == "withArena") {
                         cellSet(ctx.wanted, listAppend(cellGet(ctx.wanted), [MkWanted { wcConcept: "NoScoped", wcArgs: [resZ], wcSpan: sp }]))
                     } else if (fnNm == "cellNew") {
                         match cellGet(argTys) {
@@ -3348,13 +3548,15 @@ def typeContainsScoped(adtReg: StrMap AdtInfo, subst: StrMap Type, rawTy: Type, 
                 let targs = cellGet(args);
                 if (typeContainsScopedList(adtReg, subst, targs, Cons(key, visiting))) true
                 else match cellGet(curr) {
-                    TyCon(baseName) -> match strMapGet(adtReg, baseName) {
-                        Some(ainfo) -> {
-                            let sub = buildPairMap(ainfo.typeParams, targs);
-                            typeContainsScopedVariants(adtReg, subst, ainfo.variants, sub, Cons(key, visiting))
+                    TyCon(baseName) ->
+                        if (baseName == "Simd") false
+                        else match strMapGet(adtReg, baseName) {
+                            Some(ainfo) -> {
+                                let sub = buildPairMap(ainfo.typeParams, targs);
+                                typeContainsScopedVariants(adtReg, subst, ainfo.variants, sub, Cons(key, visiting))
+                            },
+                            None -> false,
                         },
-                        None -> false,
-                    },
                     _ -> false,
                 }
             }
@@ -4365,6 +4567,20 @@ def inferPass1Aliases(ctx: InferCtx, rawDefs: List Def): Result Void String = {
                         strMapInsert(ctx.tyConKinds, d.ident, buildArrowKind(cellGet(pks), KStar));
                         strMapInsert(aliasParamKindMaps, d.ident, cellGet(pPairs));
                         cellSet(aliasNames, listAppend(cellGet(aliasNames), [(d.ident, ps, d.dpos)]))
+                    },
+                    ItAlg(ps, _) -> {
+                        let pks = cellNew(Nil);
+                        let cp = cellNew(ps);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(_, rp) -> {
+                                    cellSet(pks, listAppend(cellGet(pks), [freshKindVar(ctx)]));
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        strMapInsert(ctx.tyConKinds, d.ident, buildArrowKind(cellGet(pks), KStar))
                     },
                     _ -> (),
                 };

@@ -31,7 +31,7 @@ use core.{
     TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
     FunDef, GlobalValDef, EscapeInfo, CoreProgram, extractTypeArgs
 }
-use codegen.{initCodegenLayoutContext, computeCodegenVariantGcMaskSExpr}
+use codegen.{initCodegenLayoutContext, computeCodegenVariantGcMaskSExpr, parseSimdType}
 
 data DumpCtx {
     MkDumpCtx {
@@ -340,7 +340,7 @@ def markTypeAdtsShared(
     TyComp(_, _) -> {
         let base = compBaseName(ty);
         let targs = extractTypeArgs(ty);
-        if (base == "Actor") ()
+        if (base == "Actor" || base == "Simd") ()
         else if (strMapContains(prog.coreAdtReg, base)) {
             let mangled = mangleCoreAdt(base, targs);
             if (!strMapContains(visiting, mangled)) {
@@ -679,7 +679,7 @@ def typeHasIntrinsicNonSend(
         let base = compBaseName(ty);
         let targs = extractTypeArgs(ty);
         if (base == "Cell" || base == "MutArray") true
-        else if (base == "Actor") false
+        else if (base == "Actor" || base == "Simd") false
         else if (strMapContains(prog.coreAdtReg, base)) adtHasIntrinsicNonSend(prog, adtLocal, base, targs, visiting)
         else {
             let bad = cellNew(false);
@@ -725,7 +725,7 @@ def isTypeNonSendInDump(prog: CoreProgram, adtLocal: StrMap Bool, ty: Type, fnMo
         let targs = extractTypeArgs(ty);
         let mangled = mangleCoreAdt(base, targs);
         if (base == "Cell" || base == "MutArray") true
-        else if (base == "Actor") false
+        else if (base == "Actor" || base == "Simd") false
         else if (strMapContains(adtLocal, mangled) || strMapContains(adtLocal, base)) true
         else if (strMapContains(prog.coreAdtReg, base) && adtHasIntrinsicNonSend(prog, adtLocal, base, targs, strMapNew())) true
         else {
@@ -1625,6 +1625,19 @@ def emitCoreTyWithMode(ctx: DumpCtx, b: StringBuf, ty: Type, fnMode: String): Vo
                     bufPushStr(b, "void")
                 },
             }
+        } else if (base == "Simd") {
+            match parseSimdType(ty) {
+                Some(si) -> {
+                    let head = if (si.siTotalBytes == 32) "(simd256 " else "(simd128 ";
+                    bufPushStr(b, head);
+                    pushQuotedStr(b, si.siSpec);
+                    bufPushByte(b, 41)
+                },
+                None -> {
+                    setDumpErr(ctx, "Invalid Simd type application in Core IR");
+                    bufPushStr(b, "void")
+                },
+            }
         } else if (strMapContains(ctx.dcProg.coreAdtReg, base)) {
             let m = registerCoreAdtMode(ctx, base, targs, fnMode);
             bufPushStr(b, "(adt ");
@@ -1898,6 +1911,14 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "bitAnd64" || name == "bitOr64" || name == "bitXor64" || name == "bitNot64"
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
     || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "bitCtz64" || name == "bitClz" || name == "bitClz64"
+    || name == "withStrPtr"
+    || name == "__simdSplat" || name == "__simdIota" || name == "__simdExtract" || name == "__simdReplace"
+    || name == "__simdUnary" || name == "__simdBin" || name == "__simdShift" || name == "__simdFma"
+    || name == "__simdCmp" || name == "__simdReduce" || name == "__simdPermute"
+    || name == "__simdConvert" || name == "__simdCombine"
+    || name == "__simdLoad" || name == "__simdStore"
+    || name == "__simdLoadRaw" || name == "__simdStoreRaw" || name == "__simdLoadStr"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
     || name == "intToFloat" || name == "floatToInt" || name == "floatToF32" || name == "f32ToFloat"

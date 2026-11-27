@@ -179,6 +179,8 @@ theorem TySub.refl : (t : Ty) → TySub t t
   | .tuple ts => .tuple (TyListSub.refl ts)
   | .fn m ps r => .fn (.refl m) (TyListSub.refl ps) (TySub.refl r)
   | .adt n => .adt n
+  | .simd128 s => .simd128 s
+  | .simd256 s => .simd256 s
   | .cell t => .cell t
   | .mutArray t => .mutArray t
   | .immArray t => .immArray (TySub.refl t)
@@ -221,6 +223,8 @@ theorem TySub.trans {t1 t2 t3 : Ty} (h12 : TySub t1 t2) (h23 : TySub t2 t3) :
       | fn hm23 hps23 hr23 =>
         exact .fn (ModeSub.trans hm12 hm23) (TyListSub.trans hps23 hps12) (TySub.trans hr12 hr23)
   | adt n => cases h12; cases h23; exact .adt n
+  | simd128 s => cases h12; cases h23; exact .simd128 s
+  | simd256 s => cases h12; cases h23; exact .simd256 s
   | cell t => cases h12; cases h23; exact .cell t
   | mutArray t => cases h12; cases h23; exact .mutArray t
   | immArray u2 =>
@@ -386,6 +390,8 @@ theorem tySendIn_of_tySub {S : Ident → Prop} {τ0 τ : Ty}
       cases hm with
       | refl => exact .fnShared _ _
   | adt _ => exact hsend
+  | simd128 _ => exact .simd128 _
+  | simd256 _ => exact .simd256 _
   | cell _ => cases hsend
   | mutArray _ => cases hsend
   | immArray ht =>

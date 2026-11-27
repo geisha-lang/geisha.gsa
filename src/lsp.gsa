@@ -2037,7 +2037,7 @@ def addGeishaKeywordsAndBuiltins(seen: StrMap Bool, outRev: Cell (List Value), p
         "noalloc", "init", "ptr", "forall", "true", "false",
         "Void", "Int", "Int64", "Float", "Float32", "Bool", "Char", "String",
         "List", "Cell", "MutArray", "ImmArray", "Ptr", "ForeignPtr", "ScopedPtr",
-        "Arena", "Send", "Task", "Actor", "Chan", "MVar", "AtomicInt",
+        "Arena", "Send", "Task", "Actor", "Chan", "MVar", "AtomicInt", "Simd",
         "Nil", "Cons", "std", "sys"
     ];
     let ck = cellNew(kws);

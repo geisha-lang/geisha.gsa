@@ -7176,4 +7176,206 @@ PASS=$((PASS + 1))
 "$PYTHON" tests/test_verify.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
+# ---------------------------------------------------------------------------
+# Suite 48: Hardware SIMD (`std.simd` + `std.bits` + `withStrPtr`) Across Native, Debug, Wasm32 & JS
+# ---------------------------------------------------------------------------
+cat > "$TMP_DIR/t48_bad_simd.gsa" << 'EOF'
+def bad(x: Simd Int Int): Int = 0
+def main(): Void = printLn("unreachable")
+EOF
+if "$GEISHA_BIN" check "$TMP_DIR/t48_bad_simd.gsa" >"$TMP_DIR/t48_bad.out" 2>&1; then
+    echo "FAIL [simd_invalid_type_rejected]: expected Simd Int Int to fail typecheck" >&2
+    exit 1
+fi
+PASS=$((PASS + 1))
+
+cat > "$TMP_DIR/t48_std_simd.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.bits.{trailingZeros64, leadingZeros, leadingZeros64, prefixXor, prefixXor64}
+use std.str.{intToStr, i64ToStr, floatToStr}
+use std.simd.{
+    L4, L8, L16, L32, I8, U8, I16, U16, U32, U64,
+    I8x16, U8x16, I16x8, U16x8, I32x4, U32x4, I64x2, U64x2, F32x4, F64x2,
+    U8x32, I32x8, F32x8, F64x4,
+    Mask, Mask8x16, Mask8x32,
+    lanes, byteWidth, splat, zero, iota, extract, replace,
+    bitmask, any, all, none, countTrue, firstTrue, lastTrue, select,
+    (==~), (!=~), (<~), (<=~), (>~), (>=~),
+    (+|), (-|), simdMin, simdMax, simdClamp, simdAbs,
+    reduceAdd, reduceMin, reduceMax, reduceBitOr, reduceBitAnd, reduceAddWide,
+    rotl, rotr, simdFma, simdSqrt, simdFloor, simdCeil, simdRound, simdDot,
+    reverseLanes, zipLo, zipHi, unzipEven, unzipOdd,
+    swizzleZero, swizzle32, prev1Byte16, prev1Byte32, shiftBytesRightZero16,
+    splitHalves, concatHalves, widenLo, widenHi, narrow, narrowSat, castSimd, bitcastSimd,
+    simdLoadScoped, simdStoreScoped, simdLoadStr, simdLoadStrTail,
+    SimdByteSet, byteSetEmpty, byteSetAdd, byteSetAddRange, byteSetFromStr, byteSetUnion, byteSetInvert, byteSetContains,
+    matchByteSet16, matchByteSet32
+}
+
+def scanQuoteOrSlash16(s: String, n: Int): Int = {
+    let i = cellNew(0);
+    let found = cellNew(-1);
+    while (cellGet(found) < 0 && cellGet(i) + 16 <= n) {
+        let off = cellGet(i);
+        let v: U8x16 = simdLoadStr(s, off);
+        let m = (v ==~ '"') | (v ==~ '\\') | (v <~ ' ');
+        if (any(m)) {
+            cellSet(found, off + firstTrue(m))
+        } else {
+            cellSet(i, off + 16)
+        }
+    };
+    if (cellGet(found) >= 0) cellGet(found)
+    else {
+        let off = cellGet(i);
+        let rem = n - off;
+        if (rem <= 0) n
+        else {
+            let tail: U8x16 = simdLoadStrTail(s, off, rem);
+            let m = (tail ==~ '"') | (tail ==~ '\\') | (tail <~ ' ');
+            let hit = firstTrue(m);
+            if (hit < rem) off + hit else n
+        }
+    }
+}
+
+def main(): Void = {
+    // 1. Mixed scalar broadcast, masks, select, saturating add/sub, widen/reduceAddWide
+    let seq: U8x16 = iota();
+    let v1 = 2 * seq + 10;
+    let m1 = (v1 >=~ 20) & (v1 <~ 30);
+    let blended = select(m1, v1 +| splat(240), v1 -| splat(15));
+    let sumWide: Int = reduceAdd(widenLo(blended) + widenHi(blended));
+    let rw16: Int = reduceAddWide(seq);
+
+    // 2. Float32x8 & Float64x4 arithmetic, scalar broadcast, FMA, dot, round
+    let f8: F32x8 = iota();
+    let fScaled = 0.5 * f8 + 1.0;
+    let fFma = simdFma(fScaled, splat(floatToF32(2.0)), splat(floatToF32(-1.0)));
+    let dot8 = simdDot(fFma, splat(floatToF32(1.0)));
+    let d4: F64x4 = replace(replace(iota(), 0, -2.5), 3, 3.5);
+    let dSum = reduceAdd(simdFloor(d4) + simdCeil(simdAbs(d4)) + simdRound(splat(1.5)));
+
+    // 3. Permutations, halves, narrowSat, castSimd, bitcastSimd, rotl/rotr
+    let rev4: I32x4 = reverseLanes(iota() + 1);
+    let casted: F32x4 = castSimd(rev4);
+    let back4: I32x4 = castSimd(casted * 2.0);
+    let (lo16, hi16) = splitHalves(concatHalves(seq, seq + 100));
+    let wideLo: I16x8 = splat(-200);
+    let wideHi: I16x8 = splat(300);
+    let satNarrow: I8x16 = narrowSat(wideLo, wideHi);
+    let uWideLo: U16x8 = splat(10);
+    let uWideHi: U16x8 = splat(500);
+    let uSatNarrow: U8x16 = narrowSat(uWideLo, uWideHi);
+    let rotTest: U32x4 = rotr(rotl(splat(0x12345678), 8), 8);
+
+    // 4. Universal 256-byte SimdByteSet (test high-rank >8 ASCII + non-ASCII bytes 0..255!)
+    let bsAscii = byteSetFromStr("09azAZ!@#\n\t_~[]{}:,\"\\");
+    let bsFull = byteSetAdd(byteSetAdd(bsAscii, 0xC3), 0xFF);
+    let bsInv = byteSetInvert(bsFull);
+    let buf256 = foreignPtrAlloc(intToI64(256));
+    withForeignPtr(buf256, (p) -> {
+        let b = cellNew(0);
+        while (cellGet(b) < 256) {
+            let k = cellGet(b);
+            scopedPtrSetByte(p, k, k);
+            cellSet(b, k + 1)
+        }
+    });
+    let lutMismatch = withForeignPtr(buf256, (p) -> {
+        let bad = cellNew(0);
+        let blk = cellNew(0);
+        while (cellGet(blk) < 256) {
+            let off = cellGet(blk);
+            let chunk32: U8x32 = simdLoadScoped(p, intToI64(off));
+            let mFull = bitmask(matchByteSet32(bsFull, chunk32));
+            let mInv = bitmask(matchByteSet32(bsInv, chunk32));
+            if ((mFull ^ mInv) != -1) cellSet(bad, cellGet(bad) + 1) else ();
+            let j = cellNew(0);
+            while (cellGet(j) < 32) {
+                let lane = cellGet(j);
+                let got = ((mFull >>> lane) & 1) != 0;
+                let exp = byteSetContains(bsFull, off + lane);
+                if (got != exp) cellSet(bad, cellGet(bad) + 1) else ();
+                cellSet(j, lane + 1)
+            };
+            cellSet(blk, off + 32)
+        };
+        cellGet(bad)
+    });
+
+    // 5. String SIMD scanning + tail loads across short & unaligned lengths
+    let s1 = "hello_world_0123456789_abcdef\"tail";
+    let s2 = "short\\esc";
+    let s3 = "plain_ascii_17chr";
+    let p1 = scanQuoteOrSlash16(s1, strLen(s1));
+    let p2 = scanQuoteOrSlash16(s2, strLen(s2));
+    let p3 = scanQuoteOrSlash16(s3, strLen(s3));
+
+    // 6. Heap / Tuple / Boxed Option / Closure / parTabulate integration
+    let optVec: Option (U8x32, String) = Some((concatHalves(seq, seq + 16), "ok"));
+    let heapCheck = match optVec {
+        Some((uv, tag)) -> extract(uv, 31) + strLen(tag),
+        None -> 0,
+    };
+    let captured: U8x16 = splat(7);
+    let parArr = parTabulate(8, (idx) -> {
+        let v: U8x16 = captured + idx;
+        (v, idx)
+    });
+    let (pv7, pi7) = immArrayGet(parArr, 7);
+
+    // 7. New std.bits operations (64-bit clz/ctz + prefixXor/prefixXor64)
+    let px = prefixXor((1 << 2) | (1 << 5));
+    let px64 = prefixXor64((intToI64(1) << 3) | (intToI64(1) << 40));
+    let bz = trailingZeros64(intToI64(1) << 42) + leadingZeros(1 << 20) + leadingZeros64(intToI64(1) << 60);
+
+    printLn(
+        intToStr(countTrue(m1)) + "|" +
+        intToStr(firstTrue(m1)) + "|" +
+        intToStr(lastTrue(m1)) + "|" +
+        intToStr(sumWide) + "|" +
+        intToStr(rw16) + "|" +
+        floatToStr(f32ToFloat(dot8)) + "|" +
+        floatToStr(dSum) + "|" +
+        intToStr(extract(back4, 0)) + "|" +
+        intToStr(extract(hi16, 5)) + "|" +
+        intToStr(extract(satNarrow, 0) + extract(satNarrow, 15) + extract(uSatNarrow, 15)) + "|" +
+        intToStr(extract(rotTest, 2)) + "|" +
+        intToStr(lutMismatch) + "|" +
+        intToStr(p1) + "," + intToStr(p2) + "," + intToStr(p3) + "|" +
+        intToStr(heapCheck) + "|" +
+        intToStr(extract(pv7, 0) + pi7) + "|" +
+        intToStr(px) + "|" +
+        i64ToStr(px64 >> 39) + "|" +
+        intToStr(bz)
+    )
+}
+EOF
+
+EXPECTED_SIMD="5|5|9|1399|120|36.0|21.0|8|105|254|305419896|0|29,5,17|33|21|28|1|56"
+
+"$GEISHA_BIN" -e -o "$TMP_DIR/t48_std_simd.ll" "$TMP_DIR/t48_std_simd.gsa"
+T48_SCAN_FN="$(sed -n '/^define .*@scanQuoteOrSlash16(/,/^}/p' "$TMP_DIR/t48_std_simd.ll")"
+if [ -z "$T48_SCAN_FN" ] || printf "%s\n" "$T48_SCAN_FN" | grep -q '@std\.simd\.any'; then
+    echo "FAIL [simd_inline_scan_fn]: expected std.simd.any/firstTrue/==~ to inline in scanQuoteOrSlash16" >&2
+    exit 1
+fi
+
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t48_std_simd$EXE_EXT" "$TMP_DIR/t48_std_simd.gsa"
+assert_eq "std_simd_native" "$EXPECTED_SIMD" "$("$TMP_DIR/t48_std_simd$EXE_EXT")"
+
+"$GEISHA_BIN" -g --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t48_std_simd_dbg$EXE_EXT" "$TMP_DIR/t48_std_simd.gsa"
+assert_eq "std_simd_debug" "$EXPECTED_SIMD" "$("$TMP_DIR/t48_std_simd_dbg$EXE_EXT")"
+
+if [ -f "./build/wasm_rt.o" ]; then
+    "$GEISHA_BIN" --target wasm32 --runtime "./build/wasm_rt.o" -o "$TMP_DIR/t48_std_simd.wasm" "$TMP_DIR/t48_std_simd.gsa"
+    PASS=$((PASS + 1))
+fi
+
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t48_std_simd.mjs" "$TMP_DIR/t48_std_simd.gsa"
+    assert_eq "std_simd_js" "$EXPECTED_SIMD" "$(node "$TMP_DIR/t48_std_simd.mjs")"
+fi
+
 echo "All $PASS end-to-end test suites passed!"

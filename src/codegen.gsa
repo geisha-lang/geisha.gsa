@@ -114,6 +114,80 @@ pub def isVoidGeishaType(ty: Type): Bool = match ty {
     _ -> false,
 }
 
+data SimdInfo {
+    SimdInfo {
+        siLanes: Int,
+        siElemBytes: Int,
+        siTotalBytes: Int,
+        siElemLlvm: String,
+        siIntElemLlvm: String,
+        siVecLlvm: String,
+        siIntVecLlvm: String,
+        siLlvmSuf: String,
+        siIntLlvmSuf: String,
+        siUnsigned: Bool,
+        siFloat: Bool,
+        siSpec: String,
+    },
+}
+
+def stripSimdModPrefix(s: String): String = {
+    let n = strLen(s);
+    let lastDot = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        if (strByteAt(s, cellGet(i)) == 46) cellSet(lastDot, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let d = cellGet(lastDot);
+    if (d >= 0) strSlice(s, d + 1, n) else s
+}
+
+pub def parseSimdType(ty: Type): Option SimdInfo = match ty {
+    TyComp(TyComp(TyCon("Simd"), TyCon(rawLane)), TyCon(rawElem)) -> {
+        let ln = stripSimdModPrefix(rawLane);
+        let en = stripSimdModPrefix(rawElem);
+        let lanes =
+            if (ln == "L2") 2
+            else if (ln == "L4") 4
+            else if (ln == "L8") 8
+            else if (ln == "L16") 16
+            else if (ln == "L32") 32
+            else 0;
+        let (ebytes, ellvm, iellvm, esuf, iesuf, isUns, isFlt, spTag) =
+            if (en == "I8") (1, "i8", "i8", "i8", "i8", false, false, "i8")
+            else if (en == "U8") (1, "i8", "i8", "i8", "i8", true, false, "u8")
+            else if (en == "I16") (2, "i16", "i16", "i16", "i16", false, false, "i16")
+            else if (en == "U16") (2, "i16", "i16", "i16", "i16", true, false, "u16")
+            else if (en == "Int" || en == "I32") (4, "i32", "i32", "i32", "i32", false, false, "i32")
+            else if (en == "U32") (4, "i32", "i32", "i32", "i32", true, false, "u32")
+            else if (en == "Int64" || en == "I64") (8, "i64", "i64", "i64", "i64", false, false, "i64")
+            else if (en == "U64") (8, "i64", "i64", "i64", "i64", true, false, "u64")
+            else if (en == "Float32" || en == "F32") (4, "float", "i32", "f32", "i32", false, true, "f32")
+            else if (en == "Float" || en == "F64") (8, "double", "i64", "f64", "i64", false, true, "f64")
+            else (0, "", "", "", "", false, false, "");
+        let total = lanes * ebytes;
+        if (lanes > 0 && ebytes > 0 && (total == 16 || total == 32)) {
+            let ls = intToStr(lanes);
+            Some(SimdInfo {
+                siLanes: lanes,
+                siElemBytes: ebytes,
+                siTotalBytes: total,
+                siElemLlvm: ellvm,
+                siIntElemLlvm: iellvm,
+                siVecLlvm: "<" + ls + " x " + ellvm + ">",
+                siIntVecLlvm: "<" + ls + " x " + iellvm + ">",
+                siLlvmSuf: "v" + ls + esuf,
+                siIntLlvmSuf: "v" + ls + iesuf,
+                siUnsigned: isUns,
+                siFloat: isFlt,
+                siSpec: spTag + "x" + ls,
+            })
+        } else None
+    },
+    _ -> None,
+}
+
 def getCompBaseName(ty: Type): String = match ty {
     TyComp(b, _) -> getCompBaseName(b),
     TyCon(n) -> n,
@@ -122,14 +196,14 @@ def getCompBaseName(ty: Type): String = match ty {
 
 def isAdtGeishaType(ty: Type): Bool = match ty {
     TyCon(n) ->
-        !(n == "Int" || n == "Int64" || n == "Float" || n == "Char"
+        !(n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Char"
           || n == "String" || n == "Void" || n == "Bool" || n == "Ptr" || n == "AtomicInt"),
     TyComp(_, _) -> {
         let base = getCompBaseName(ty);
-        !(base == "Int" || base == "Int64" || base == "Float" || base == "Char"
+        !(base == "Int" || base == "Int64" || base == "Float" || base == "Float32" || base == "Char"
           || base == "String" || base == "Void" || base == "Bool" || base == "Ptr"
-          || base == "Cell" || base == "MutArray" || base == "MVar"
-          || base == "Chan" || base == "Task" || base == "Actor")
+          || base == "Cell" || base == "MutArray" || base == "ImmArray" || base == "MVar"
+          || base == "Chan" || base == "Task" || base == "Actor" || base == "Simd")
     },
     _ -> false,
 }
@@ -230,9 +304,12 @@ pub def isNoscanElemType(ty: Type): Bool = match ty {
             Some(fs) -> isNoscanList(fs),
             None -> false,
         },
-    TyComp(_, _) -> match unboxedAdtFields(ty) {
-        Some(fs) -> isNoscanList(fs),
-        None -> false,
+    TyComp(_, _) -> match parseSimdType(ty) {
+        Some(_) -> true,
+        None -> match unboxedAdtFields(ty) {
+            Some(fs) -> isNoscanList(fs),
+            None -> false,
+        },
     },
     TyTuple(es) -> isNoscanList(es),
     _ -> false,
@@ -274,12 +351,28 @@ pub def getValLlvmType(ty: Type): String = match ty {
             None -> "ptr",
         },
     TyArr(_, _, _) -> "ptr",
-    TyComp(_, _) -> match unboxedAdtFields(ty) {
-        Some(fs) -> formatLlvmStructType(mapValLlvmTypes(fs)),
-        None -> "ptr",
+    TyComp(_, _) -> match parseSimdType(ty) {
+        Some(si) -> si.siVecLlvm,
+        None -> match unboxedAdtFields(ty) {
+            Some(fs) -> formatLlvmStructType(mapValLlvmTypes(fs)),
+            None -> "ptr",
+        },
     },
     TyTuple(elems) -> formatLlvmStructType(mapValLlvmTypes(elems)),
     TyVar(_) -> "i64",
+}
+
+// Inside LLVM struct types (`{ ... }`), SIMD vectors are stored as pointer-aligned word arrays
+// (`[2 x i64]` / `[4 x i64]` on LP64, `[4 x i32]` / `[8 x i32]` on wasm32) so struct field offsets
+// and ABI alignment match Geisha's 8B/4B heap allocator and GC pointer-word bitmap invariants.
+def getStructFieldLlvmType(ty: Type): String = match parseSimdType(ty) {
+    Some(si) ->
+        if (cellGet(gActivePtrSize) == 4) {
+            if (si.siTotalBytes == 32) "[8 x i32]" else "[4 x i32]"
+        } else {
+            if (si.siTotalBytes == 32) "[4 x i64]" else "[2 x i64]"
+        },
+    None -> getValLlvmType(ty),
 }
 
 def mapValLlvmTypes(ts: List Type): List String = {
@@ -288,7 +381,7 @@ def mapValLlvmTypes(ts: List Type): List String = {
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(t, r) -> {
-                cellSet(rev, Cons(getValLlvmType(t), cellGet(rev)));
+                cellSet(rev, Cons(getStructFieldLlvmType(t), cellGet(rev)));
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -334,9 +427,12 @@ def typeSizeAndAlignRec(ty: Type, ptrSize: Int, visiting: List String, depth: In
             None -> (ptrSize, ptrSize),
         },
     TyArr(_, _, _) -> (ptrSize, ptrSize),
-    TyComp(_, _) -> match unboxedAdtFieldsRec(ty, visiting, depth) {
-        Some(fs) -> structSizeAndAlignRec(fs, ptrSize, Cons(unboxTypeKey(ty), visiting), depth + 1),
-        None -> (ptrSize, ptrSize),
+    TyComp(_, _) -> match parseSimdType(ty) {
+        Some(si) -> (si.siTotalBytes, ptrSize),
+        None -> match unboxedAdtFieldsRec(ty, visiting, depth) {
+            Some(fs) -> structSizeAndAlignRec(fs, ptrSize, Cons(unboxTypeKey(ty), visiting), depth + 1),
+            None -> (ptrSize, ptrSize),
+        },
     },
     TyVar(_) -> (8, 8),
     TyTuple(elems) -> structSizeAndAlignRec(elems, ptrSize, visiting, depth),
@@ -1401,24 +1497,32 @@ def dbgTypeForGeishaType(mctx: ModEmitCtx, ty: Type): Int = {
                     dbgEmitStructType(mctx, structId, key, Nil, elems);
                     structId
                 },
-                TyComp(_, elemTy) -> {
-                    let base = getCompBaseName(ty);
-                    if (base == "Cell") {
-                        let ptrId = dbgAllocId(mctx);
-                        strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
-                        let innerId = dbgTypeForGeishaType(mctx, elemTy);
-                        dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(innerId) + ", size: " + intToStr(ptrBits) + ")");
-                        ptrId
-                    } else if (base == "MutArray" || base == "ImmArray") {
-                        let ptrId = dbgAllocId(mctx);
-                        strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
-                        let structId = dbgAllocId(mctx);
-                        dbgEmitStructType(mctx, structId, "gs_array<" + typeToString(elemTy) + ">", ["len", "elem0"], [TyCon("Int64"), elemTy]);
-                        dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
-                        ptrId
-                    } else {
-                        dbgTypeForAdtOrOpaque(mctx, ty, key, ptrBits)
-                    }
+                TyComp(_, elemTy) -> match parseSimdType(ty) {
+                    Some(si) -> {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"" + escapeDbgStr(key) + "\", size: " + intToStr(si.siTotalBytes * 8) + ", encoding: DW_ATE_unsigned)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    },
+                    None -> {
+                        let base = getCompBaseName(ty);
+                        if (base == "Cell") {
+                            let ptrId = dbgAllocId(mctx);
+                            strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
+                            let innerId = dbgTypeForGeishaType(mctx, elemTy);
+                            dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(innerId) + ", size: " + intToStr(ptrBits) + ")");
+                            ptrId
+                        } else if (base == "MutArray" || base == "ImmArray") {
+                            let ptrId = dbgAllocId(mctx);
+                            strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
+                            let structId = dbgAllocId(mctx);
+                            dbgEmitStructType(mctx, structId, "gs_array<" + typeToString(elemTy) + ">", ["len", "elem0"], [TyCon("Int64"), elemTy]);
+                            dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
+                            ptrId
+                        } else {
+                            dbgTypeForAdtOrOpaque(mctx, ty, key, ptrBits)
+                        }
+                    },
                 },
                 _ -> {
                     let id = dbgAllocId(mctx);
@@ -1661,12 +1765,78 @@ def emitStructFieldPtr(fctx: FnEmitCtx, structTy: String, basePtr: String, field
 def emitGep(fctx: FnEmitCtx, elemTy: String, basePtr: String, idx64Val: String): String =
     emitAssign(fctx, "getelementptr " + elemTy + ", ptr " + basePtr + ", i64 " + idx64Val)
 
+def isLlvmVectorType(llvmTy: String): Bool =
+    strLen(llvmTy) > 0 && strByteAt(llvmTy, 0) == 60
+
 def emitLoad(fctx: FnEmitCtx, llvmTy: String, ptrVal: String): String =
-    emitAssign(fctx, "load " + llvmTy + ", ptr " + ptrVal)
+    if (isLlvmVectorType(llvmTy)) {
+        emitAssign(fctx, "load " + llvmTy + ", ptr " + ptrVal + ", align " + intToStr(cellGet(gActivePtrSize)))
+    } else {
+        emitAssign(fctx, "load " + llvmTy + ", ptr " + ptrVal)
+    }
 
 def emitStore(fctx: FnEmitCtx, llvmTy: String, val: String, ptrVal: String): Void = {
     let normVal = if (llvmTy == "ptr" && val == "0") "null" else val;
-    emitLine(fctx, "store " + llvmTy + " " + normVal + ", ptr " + ptrVal)
+    if (isLlvmVectorType(llvmTy)) {
+        emitLine(fctx, "store " + llvmTy + " " + normVal + ", ptr " + ptrVal + ", align " + intToStr(cellGet(gActivePtrSize)))
+    } else {
+        emitLine(fctx, "store " + llvmTy + " " + normVal + ", ptr " + ptrVal)
+    }
+}
+
+def packStructFieldVal(fctx: FnEmitCtx, ty: Type, val: String): String = match parseSimdType(ty) {
+    None -> val,
+    Some(si) -> {
+        let is32 = cellGet(gActivePtrSize) == 4;
+        let wordTy = if (is32) "i32" else "i64";
+        let words = if (is32) (si.siTotalBytes / 4) else (si.siTotalBytes / 8);
+        let vecWordTy = "<" + intToStr(words) + " x " + wordTy + ">";
+        let arrTy = "[" + intToStr(words) + " x " + wordTy + "]";
+        let vw = if (si.siVecLlvm == vecWordTy) val else emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + val + " to " + vecWordTy);
+        let agg = cellNew("undef");
+        let i = cellNew(0);
+        while (cellGet(i) < words) {
+            let k = cellGet(i);
+            let w = emitAssign(fctx, "extractelement " + vecWordTy + " " + vw + ", i32 " + intToStr(k));
+            cellSet(agg, emitAssign(fctx, "insertvalue " + arrTy + " " + cellGet(agg) + ", " + wordTy + " " + w + ", " + intToStr(k)));
+            cellSet(i, k + 1)
+        };
+        cellGet(agg)
+    },
+}
+
+def unpackStructFieldVal(fctx: FnEmitCtx, ty: Type, rawVal: String): String = match parseSimdType(ty) {
+    None -> rawVal,
+    Some(si) -> {
+        let is32 = cellGet(gActivePtrSize) == 4;
+        let wordTy = if (is32) "i32" else "i64";
+        let words = if (is32) (si.siTotalBytes / 4) else (si.siTotalBytes / 8);
+        let vecWordTy = "<" + intToStr(words) + " x " + wordTy + ">";
+        let arrTy = "[" + intToStr(words) + " x " + wordTy + "]";
+        let vw = cellNew("undef");
+        let i = cellNew(0);
+        while (cellGet(i) < words) {
+            let k = cellGet(i);
+            let w = emitAssign(fctx, "extractvalue " + arrTy + " " + rawVal + ", " + intToStr(k));
+            cellSet(vw, emitAssign(fctx, "insertelement " + vecWordTy + " " + cellGet(vw) + ", " + wordTy + " " + w + ", i32 " + intToStr(k)));
+            cellSet(i, k + 1)
+        };
+        let packedVec = cellGet(vw);
+        if (si.siVecLlvm == vecWordTy) packedVec
+        else emitAssign(fctx, "bitcast " + vecWordTy + " " + packedVec + " to " + si.siVecLlvm)
+    },
+}
+
+def ensureLlvmIntrinsicDecl(mctx: ModEmitCtx, symName: String, declLine: String): Void = {
+    let key = "intrin:" + symName;
+    match strMapGet(mctx.mcConstPool, key) {
+        Some(_) -> (),
+        None -> {
+            strMapInsert(mctx.mcConstPool, key, symName);
+            bufPushStr(mctx.mcStrDecls, declLine);
+            bufPushByte(mctx.mcStrDecls, 10)
+        },
+    }
 }
 
 def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = {
@@ -1894,7 +2064,9 @@ def emitNullableBoxToPair(fctx: FnEmitCtx, boxPtr: String, pairRetTy: Type): Str
         "phi " + elemLlvmTy + " [ " + loadedVal + ", %" + blockLabel(fctx, someEnd) + " ], [ " + zeroVal + ", %" + blockLabel(fctx, noneEnd) + " ]"
     );
     let agg0 = emitAssign(fctx, "insertvalue " + pairLlvmTy + " undef, i1 " + hasVal + ", 0");
-    emitAssign(fctx, "insertvalue " + pairLlvmTy + " " + agg0 + ", " + elemLlvmTy + " " + valPhi + ", 1")
+    let packedPhi = packStructFieldVal(fctx, elemTy, valPhi);
+    let fieldElemTy = getStructFieldLlvmType(elemTy);
+    emitAssign(fctx, "insertvalue " + pairLlvmTy + " " + agg0 + ", " + fieldElemTy + " " + packedPhi + ", 1")
 }
 
 def emitClosureFnSlot(mctx: ModEmitCtx, fctx: FnEmitCtx, clsPtr: String): String =
@@ -2016,6 +2188,688 @@ def getOrEmitTabulateRunner(mctx: ModEmitCtx, elemTy: Type): String = {
 // ============================================================================
 // Binary Operators, Intrinsics, Pattern Matching, and Expression Emission
 // ============================================================================
+
+def extractConstIntTerm(tm: TaggedTerm): Int = match tm.tnode {
+    TmLit(LitInt(n)) -> n,
+    TmUn(UnNeg, inner) -> 0 - extractConstIntTerm(inner),
+    _ -> 0,
+}
+
+def emitSimdSplatElem(fctx: FnEmitCtx, lanes: Int, elemLlvm: String, elemVal: String): String = {
+    let vecTy = "<" + intToStr(lanes) + " x " + elemLlvm + ">";
+    let maskTy = "<" + intToStr(lanes) + " x i32>";
+    let ins = emitAssign(fctx, "insertelement " + vecTy + " undef, " + elemLlvm + " " + elemVal + ", i32 0");
+    emitAssign(fctx, "shufflevector " + vecTy + " " + ins + ", " + vecTy + " undef, " + maskTy + " zeroinitializer")
+}
+
+def formatShuffleMaskConst(indices: List Int): String = {
+    let n = listLen(indices);
+    let partsRev = cellNew(Nil);
+    let cur = cellNew(indices);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(idx, r) -> {
+                cellSet(partsRev, Cons("i32 " + intToStr(idx), cellGet(partsRev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    "<" + intToStr(n) + " x i32> <" + strJoin(listRev(cellGet(partsRev)), ", ") + ">"
+}
+
+def makeRangeIndices(start: Int, count: Int): List Int = {
+    let rev = cellNew(Nil);
+    let i = cellNew(0);
+    while (cellGet(i) < count) {
+        let k = cellGet(i);
+        cellSet(rev, Cons(start + k, cellGet(rev)));
+        cellSet(i, k + 1)
+    };
+    listRev(cellGet(rev))
+}
+
+def coerceScalarToSimdElem(fctx: FnEmitCtx, si: SimdInfo, srcVal: String, srcTy: Type): String = {
+    let srcLlvm = getValLlvmType(srcTy);
+    if (srcLlvm == si.siElemLlvm) srcVal
+    else if (si.siFloat) {
+        if (si.siElemLlvm == "float") {
+            if (srcLlvm == "double") emitAssign(fctx, "fptrunc double " + srcVal + " to float")
+            else if (srcLlvm == "i64") emitAssign(fctx, "sitofp i64 " + srcVal + " to float")
+            else if (srcLlvm == "i8") {
+                let z = emitAssign(fctx, "zext i8 " + srcVal + " to i32");
+                emitAssign(fctx, "sitofp i32 " + z + " to float")
+            } else emitAssign(fctx, "sitofp i32 " + srcVal + " to float")
+        } else {
+            if (srcLlvm == "float") emitAssign(fctx, "fpext float " + srcVal + " to double")
+            else if (srcLlvm == "i64") emitAssign(fctx, "sitofp i64 " + srcVal + " to double")
+            else if (srcLlvm == "i8") {
+                let z = emitAssign(fctx, "zext i8 " + srcVal + " to i32");
+                emitAssign(fctx, "sitofp i32 " + z + " to double")
+            } else emitAssign(fctx, "sitofp i32 " + srcVal + " to double")
+        }
+    } else {
+        if (srcLlvm == "i8") {
+            if (si.siElemLlvm == "i8") srcVal
+            else emitAssign(fctx, "zext i8 " + srcVal + " to " + si.siElemLlvm)
+        } else if (srcLlvm == "i64") {
+            emitAssign(fctx, "trunc i64 " + srcVal + " to " + si.siElemLlvm)
+        } else {
+            if (si.siElemLlvm == "i64") {
+                let op = if (si.siUnsigned) "zext" else "sext";
+                emitAssign(fctx, op + " i32 " + srcVal + " to i64")
+            } else {
+                emitAssign(fctx, "trunc i32 " + srcVal + " to " + si.siElemLlvm)
+            }
+        }
+    }
+}
+
+def coerceSimdElemToScalar(fctx: FnEmitCtx, si: SimdInfo, elemVal: String, dstTy: Type): String = {
+    let dstLlvm = getValLlvmType(dstTy);
+    if (si.siElemLlvm == dstLlvm) elemVal
+    else if (si.siFloat) {
+        if (si.siElemLlvm == "float" && dstLlvm == "double") emitAssign(fctx, "fpext float " + elemVal + " to double")
+        else if (si.siElemLlvm == "double" && dstLlvm == "float") emitAssign(fctx, "fptrunc double " + elemVal + " to float")
+        else emitAssign(fctx, "fptosi " + si.siElemLlvm + " " + elemVal + " to " + dstLlvm)
+    } else {
+        let dstBytes = if (dstLlvm == "i64") 8 else if (dstLlvm == "i8") 1 else 4;
+        if (si.siElemBytes < dstBytes) {
+            let op = if (si.siUnsigned) "zext" else "sext";
+            emitAssign(fctx, op + " " + si.siElemLlvm + " " + elemVal + " to " + dstLlvm)
+        } else {
+            emitAssign(fctx, "trunc " + si.siElemLlvm + " " + elemVal + " to " + dstLlvm)
+        }
+    }
+}
+
+def emitSimdSwizzle16(mctx: ModEmitCtx, fctx: FnEmitCtx, tbl16: String, idx16: String): String =
+    if (mctx.mcIsWasm) {
+        ensureLlvmIntrinsicDecl(
+            mctx,
+            "llvm.wasm.swizzle",
+            "declare <16 x i8> @llvm.wasm.swizzle(<16 x i8>, <16 x i8>) nounwind willreturn memory(none)"
+        );
+        emitAssign(fctx, "call <16 x i8> @llvm.wasm.swizzle(<16 x i8> " + tbl16 + ", <16 x i8> " + idx16 + ")")
+    } else if (mctx.mcTargetArch == "arm64") {
+        ensureLlvmIntrinsicDecl(
+            mctx,
+            "llvm.aarch64.neon.tbl1.v16i8",
+            "declare <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8>, <16 x i8>) nounwind willreturn memory(none)"
+        );
+        emitAssign(fctx, "call <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8> " + tbl16 + ", <16 x i8> " + idx16 + ")")
+    } else if (mctx.mcTargetArch == "x86_64") {
+        ensureLlvmIntrinsicDecl(
+            mctx,
+            "llvm.x86.ssse3.pshuf.b.128",
+            "declare <16 x i8> @llvm.x86.ssse3.pshuf.b.128(<16 x i8>, <16 x i8>) nounwind willreturn memory(none)"
+        );
+        let c16 = "<i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16>";
+        let ge16 = emitAssign(fctx, "icmp uge <16 x i8> " + idx16 + ", " + c16);
+        let msk = emitAssign(fctx, "sext <16 x i1> " + ge16 + " to <16 x i8>");
+        let safeIdx = emitAssign(fctx, "or <16 x i8> " + idx16 + ", " + msk);
+        emitAssign(fctx, "call <16 x i8> @llvm.x86.ssse3.pshuf.b.128(<16 x i8> " + tbl16 + ", <16 x i8> " + safeIdx + ")")
+    } else {
+        let acc = cellNew("zeroinitializer");
+        let i = cellNew(0);
+        while (cellGet(i) < 16) {
+            let k = cellGet(i);
+            let ks = intToStr(k);
+            let ix = emitAssign(fctx, "extractelement <16 x i8> " + idx16 + ", i32 " + ks);
+            let inRange = emitAssign(fctx, "icmp ult i8 " + ix + ", 16");
+            let safeIx = emitAssign(fctx, "and i8 " + ix + ", 15");
+            let safeIx32 = emitAssign(fctx, "zext i8 " + safeIx + " to i32");
+            let got = emitAssign(fctx, "extractelement <16 x i8> " + tbl16 + ", i32 " + safeIx32);
+            let laneVal = emitAssign(fctx, "select i1 " + inRange + ", i8 " + got + ", i8 0");
+            cellSet(acc, emitAssign(fctx, "insertelement <16 x i8> " + cellGet(acc) + ", i8 " + laneVal + ", i32 " + ks));
+            cellSet(i, k + 1)
+        };
+        cellGet(acc)
+    }
+
+def emitSimdElemCast(mctx: ModEmitCtx, fctx: FnEmitCtx, srcSi: SimdInfo, dstSi: SimdInfo, srcVec: String): String =
+    if (srcSi.siElemLlvm == dstSi.siElemLlvm) srcVec
+    else if (srcSi.siFloat && dstSi.siFloat) {
+        let op = if (srcSi.siElemBytes < dstSi.siElemBytes) "fpext" else "fptrunc";
+        emitAssign(fctx, op + " " + srcSi.siVecLlvm + " " + srcVec + " to " + dstSi.siVecLlvm)
+    } else if (srcSi.siFloat && !dstSi.siFloat) {
+        let fnBase = if (dstSi.siUnsigned) "llvm.fptoui.sat." else "llvm.fptosi.sat.";
+        let sym = fnBase + dstSi.siLlvmSuf + "." + srcSi.siLlvmSuf;
+        ensureLlvmIntrinsicDecl(
+            mctx,
+            sym,
+            "declare " + dstSi.siVecLlvm + " @" + sym + "(" + srcSi.siVecLlvm + ") nounwind willreturn memory(none)"
+        );
+        emitAssign(fctx, "call " + dstSi.siVecLlvm + " @" + sym + "(" + srcSi.siVecLlvm + " " + srcVec + ")")
+    } else if (!srcSi.siFloat && dstSi.siFloat) {
+        let op = if (srcSi.siUnsigned) "uitofp" else "sitofp";
+        emitAssign(fctx, op + " " + srcSi.siVecLlvm + " " + srcVec + " to " + dstSi.siVecLlvm)
+    } else {
+        if (srcSi.siElemBytes < dstSi.siElemBytes) {
+            let op = if (srcSi.siUnsigned) "zext" else "sext";
+            emitAssign(fctx, op + " " + srcSi.siVecLlvm + " " + srcVec + " to " + dstSi.siVecLlvm)
+        } else {
+            emitAssign(fctx, "trunc " + srcSi.siVecLlvm + " " + srcVec + " to " + dstSi.siVecLlvm)
+        }
+    }
+
+def tryEmitSimdIntrinsic(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    name: String,
+    args: List TaggedTerm,
+    retTy: Type,
+    locals: List (String, VarSlot)
+): Option String =
+    if (name == "__simdSplat") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let a0 = nthArgTerm(args, 0);
+                let sVal = genExpr(mctx, fctx, a0, locals, false);
+                let el = coerceScalarToSimdElem(fctx, si, sVal, schemeBody(a0.tscm));
+                Some(emitSimdSplatElem(fctx, si.siLanes, si.siElemLlvm, el))
+            },
+        }
+    } else if (name == "__simdIota") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let partsRev = cellNew(Nil);
+                let i = cellNew(0);
+                while (cellGet(i) < si.siLanes) {
+                    let k = cellGet(i);
+                    cellSet(partsRev, Cons(si.siIntElemLlvm + " " + intToStr(k), cellGet(partsRev)));
+                    cellSet(i, k + 1)
+                };
+                let intConst = "<" + strJoin(listRev(cellGet(partsRev)), ", ") + ">";
+                if (si.siFloat) {
+                    Some(emitAssign(fctx, "sitofp " + si.siIntVecLlvm + " " + intConst + " to " + si.siVecLlvm))
+                } else {
+                    Some(intConst)
+                }
+            },
+        }
+    } else if (name == "__simdExtract") {
+        let a0 = nthArgTerm(args, 0);
+        match parseSimdType(schemeBody(a0.tscm)) {
+            None -> Some("0"),
+            Some(si) -> {
+                let vecVal = genExpr(mctx, fctx, a0, locals, false);
+                let idxVal = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let mIdx = emitAssign(fctx, "and i32 " + idxVal + ", " + intToStr(si.siLanes - 1));
+                let el = emitAssign(fctx, "extractelement " + si.siVecLlvm + " " + vecVal + ", i32 " + mIdx);
+                Some(coerceSimdElemToScalar(fctx, si, el, retTy))
+            },
+        }
+    } else if (name == "__simdReplace") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let vecVal = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+                let idxVal = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let a2 = nthArgTerm(args, 2);
+                let sVal = genExpr(mctx, fctx, a2, locals, false);
+                let mIdx = emitAssign(fctx, "and i32 " + idxVal + ", " + intToStr(si.siLanes - 1));
+                let el = coerceScalarToSimdElem(fctx, si, sVal, schemeBody(a2.tscm));
+                Some(emitAssign(fctx, "insertelement " + si.siVecLlvm + " " + vecVal + ", " + si.siElemLlvm + " " + el + ", i32 " + mIdx))
+            },
+        }
+    } else if (name == "__simdUnary") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let v = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                if (op == 0) {
+                    if (si.siFloat) Some(emitAssign(fctx, "fneg " + si.siVecLlvm + " " + v))
+                    else Some(emitAssign(fctx, "sub " + si.siVecLlvm + " zeroinitializer, " + v))
+                } else if (op == 1) {
+                    let iv = if (si.siFloat) emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + v + " to " + si.siIntVecLlvm) else v;
+                    let allOnes = emitSimdSplatElem(fctx, si.siLanes, si.siIntElemLlvm, "-1");
+                    let inv = emitAssign(fctx, "xor " + si.siIntVecLlvm + " " + iv + ", " + allOnes);
+                    if (si.siFloat) Some(emitAssign(fctx, "bitcast " + si.siIntVecLlvm + " " + inv + " to " + si.siVecLlvm))
+                    else Some(inv)
+                } else if (op == 2) {
+                    if (si.siFloat) {
+                        let sym = "llvm.fabs." + si.siLlvmSuf;
+                        ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + ") nounwind willreturn memory(none)");
+                        Some(emitAssign(fctx, "call " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + " " + v + ")"))
+                    } else {
+                        let sym = "llvm.abs." + si.siLlvmSuf;
+                        ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + ", i1 immarg) nounwind willreturn memory(none)");
+                        Some(emitAssign(fctx, "call " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + " " + v + ", i1 false)"))
+                    }
+                } else {
+                    let fnBase =
+                        if (op == 3) "llvm.sqrt."
+                        else if (op == 4) "llvm.floor."
+                        else if (op == 5) "llvm.ceil."
+                        else "llvm.roundeven.";
+                    let sym = fnBase + si.siLlvmSuf;
+                    ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + ") nounwind willreturn memory(none)");
+                    Some(emitAssign(fctx, "call " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + " " + v + ")"))
+                }
+            },
+        }
+    } else if (name == "__simdBin") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let vb = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                if (op == 0) {
+                    let ins = if (si.siFloat) "fadd " else "add ";
+                    Some(emitAssign(fctx, ins + si.siVecLlvm + " " + va + ", " + vb))
+                } else if (op == 1) {
+                    let ins = if (si.siFloat) "fsub " else "sub ";
+                    Some(emitAssign(fctx, ins + si.siVecLlvm + " " + va + ", " + vb))
+                } else if (op == 2) {
+                    let ins = if (si.siFloat) "fmul " else "mul ";
+                    Some(emitAssign(fctx, ins + si.siVecLlvm + " " + va + ", " + vb))
+                } else if (op == 3 || op == 4) {
+                    if (si.siFloat) {
+                        let ins = if (op == 3) "fdiv " else "frem ";
+                        Some(emitAssign(fctx, ins + si.siVecLlvm + " " + va + ", " + vb))
+                    } else {
+                        let zCmp = emitAssign(fctx, "icmp eq " + si.siVecLlvm + " " + vb + ", zeroinitializer");
+                        let iNTy = "i" + intToStr(si.siLanes);
+                        let zBits = emitAssign(fctx, "bitcast <" + intToStr(si.siLanes) + " x i1> " + zCmp + " to " + iNTy);
+                        let anyZ = emitAssign(fctx, "icmp ne " + iNTy + " " + zBits + ", 0");
+                        let trapBlk = appendBlock(fctx, "simd.div.zero");
+                        let okBlk = appendBlock(fctx, "simd.div.ok");
+                        emitCondBr(fctx, anyZ, trapBlk, okBlk);
+                        setInsertBlock(fctx, trapBlk);
+                        emitLine(fctx, "call void @gs_div_zero_fail()");
+                        emitTermLine(fctx, "unreachable");
+                        setInsertBlock(fctx, okBlk);
+                        if (si.siUnsigned) {
+                            let ins = if (op == 3) "udiv " else "urem ";
+                            Some(emitAssign(fctx, ins + si.siVecLlvm + " " + va + ", " + vb))
+                        } else {
+                            let minScalar =
+                                if (si.siElemBytes == 1) "-128"
+                                else if (si.siElemBytes == 2) "-32768"
+                                else if (si.siElemBytes == 4) "-2147483648"
+                                else "-9223372036854775808";
+                            let minVec = emitSimdSplatElem(fctx, si.siLanes, si.siElemLlvm, minScalar);
+                            let neg1Vec = emitSimdSplatElem(fctx, si.siLanes, si.siElemLlvm, "-1");
+                            let oneVec = emitSimdSplatElem(fctx, si.siLanes, si.siElemLlvm, "1");
+                            let isMin = emitAssign(fctx, "icmp eq " + si.siVecLlvm + " " + va + ", " + minVec);
+                            let isNeg1 = emitAssign(fctx, "icmp eq " + si.siVecLlvm + " " + vb + ", " + neg1Vec);
+                            let i1VecTy = "<" + intToStr(si.siLanes) + " x i1>";
+                            let isOv = emitAssign(fctx, "and " + i1VecTy + " " + isMin + ", " + isNeg1);
+                            let safeB = emitAssign(fctx, "select " + i1VecTy + " " + isOv + ", " + si.siVecLlvm + " " + oneVec + ", " + si.siVecLlvm + " " + vb);
+                            if (op == 3) {
+                                Some(emitAssign(fctx, "sdiv " + si.siVecLlvm + " " + va + ", " + safeB))
+                            } else {
+                                let rawRem = emitAssign(fctx, "srem " + si.siVecLlvm + " " + va + ", " + safeB);
+                                Some(emitAssign(fctx, "select " + i1VecTy + " " + isOv + ", " + si.siVecLlvm + " zeroinitializer, " + si.siVecLlvm + " " + rawRem))
+                            }
+                        }
+                    }
+                } else if (op == 5 || op == 6 || op == 7) {
+                    let ins = if (op == 5) "and " else if (op == 6) "or " else "xor ";
+                    let ia = if (si.siFloat) emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + va + " to " + si.siIntVecLlvm) else va;
+                    let ib = if (si.siFloat) emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + vb + " to " + si.siIntVecLlvm) else vb;
+                    let ir = emitAssign(fctx, ins + si.siIntVecLlvm + " " + ia + ", " + ib);
+                    if (si.siFloat) Some(emitAssign(fctx, "bitcast " + si.siIntVecLlvm + " " + ir + " to " + si.siVecLlvm))
+                    else Some(ir)
+                } else {
+                    let fnBase =
+                        if (op == 8) {
+                            if (si.siFloat) "llvm.minnum." else if (si.siUnsigned) "llvm.umin." else "llvm.smin."
+                        } else if (op == 9) {
+                            if (si.siFloat) "llvm.maxnum." else if (si.siUnsigned) "llvm.umax." else "llvm.smax."
+                        } else if (op == 10) {
+                            if (si.siUnsigned) "llvm.uadd.sat." else "llvm.sadd.sat."
+                        } else {
+                            if (si.siUnsigned) "llvm.usub.sat." else "llvm.ssub.sat."
+                        };
+                    let sym = fnBase + si.siLlvmSuf;
+                    ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + ", " + si.siVecLlvm + ") nounwind willreturn memory(none)");
+                    Some(emitAssign(fctx, "call " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + " " + va + ", " + si.siVecLlvm + " " + vb + ")"))
+                }
+            },
+        }
+    } else if (name == "__simdShift") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let amt32 = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                let maskBits = (si.siElemBytes * 8) - 1;
+                let m32 = emitAssign(fctx, "and i32 " + amt32 + ", " + intToStr(maskBits));
+                let amtEl =
+                    if (si.siIntElemLlvm == "i32") m32
+                    else if (si.siIntElemLlvm == "i64") emitAssign(fctx, "zext i32 " + m32 + " to i64")
+                    else emitAssign(fctx, "trunc i32 " + m32 + " to " + si.siIntElemLlvm);
+                let amtVec = emitSimdSplatElem(fctx, si.siLanes, si.siIntElemLlvm, amtEl);
+                let ins = if (op == 0) "shl " else if (op == 1) "ashr " else "lshr ";
+                Some(emitAssign(fctx, ins + si.siIntVecLlvm + " " + va + ", " + amtVec))
+            },
+        }
+    } else if (name == "__simdFma") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let va = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+                let vb = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let vc = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                let sym = "llvm.fma." + si.siLlvmSuf;
+                ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + ", " + si.siVecLlvm + ", " + si.siVecLlvm + ") nounwind willreturn memory(none)");
+                Some(emitAssign(fctx, "call " + si.siVecLlvm + " @" + sym + "(" + si.siVecLlvm + " " + va + ", " + si.siVecLlvm + " " + vb + ", " + si.siVecLlvm + " " + vc + ")"))
+            },
+        }
+    } else if (name == "__simdCmp") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let vb = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                let i1VecTy = "<" + intToStr(si.siLanes) + " x i1>";
+                let cmpBits =
+                    if (si.siFloat) {
+                        let pred =
+                            if (op == 0) "oeq"
+                            else if (op == 1) "une"
+                            else if (op == 2) "olt"
+                            else if (op == 3) "ole"
+                            else if (op == 4) "ogt"
+                            else "oge";
+                        emitAssign(fctx, "fcmp " + pred + " " + si.siVecLlvm + " " + va + ", " + vb)
+                    } else {
+                        let pred =
+                            if (op == 0) "eq"
+                            else if (op == 1) "ne"
+                            else if (op == 2) (if (si.siUnsigned) "ult" else "slt")
+                            else if (op == 3) (if (si.siUnsigned) "ule" else "sle")
+                            else if (op == 4) (if (si.siUnsigned) "ugt" else "sgt")
+                            else (if (si.siUnsigned) "uge" else "sge");
+                        emitAssign(fctx, "icmp " + pred + " " + si.siVecLlvm + " " + va + ", " + vb)
+                    };
+                let sextVec = emitAssign(fctx, "sext " + i1VecTy + " " + cmpBits + " to " + si.siIntVecLlvm);
+                if (si.siFloat) Some(emitAssign(fctx, "bitcast " + si.siIntVecLlvm + " " + sextVec + " to " + si.siVecLlvm))
+                else Some(sextVec)
+            },
+        }
+    } else if (name == "__simdReduce") {
+        let a1 = nthArgTerm(args, 1);
+        match parseSimdType(schemeBody(a1.tscm)) {
+            None -> Some("0"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let v = genExpr(mctx, fctx, a1, locals, false);
+                if (op == 5) {
+                    let iv = if (si.siFloat) emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + v + " to " + si.siIntVecLlvm) else v;
+                    let msb = emitAssign(fctx, "icmp slt " + si.siIntVecLlvm + " " + iv + ", zeroinitializer");
+                    let iNTy = "i" + intToStr(si.siLanes);
+                    let bits = emitAssign(fctx, "bitcast <" + intToStr(si.siLanes) + " x i1> " + msb + " to " + iNTy);
+                    if (si.siLanes == 32) Some(bits)
+                    else Some(emitAssign(fctx, "zext " + iNTy + " " + bits + " to i32"))
+                } else if (op == 0 && si.siFloat) {
+                    let curVec = cellNew(v);
+                    let curN = cellNew(si.siLanes);
+                    while (cellGet(curN) > 2) {
+                        let n = cellGet(curN);
+                        let half = n / 2;
+                        let curTy = "<" + intToStr(n) + " x " + si.siElemLlvm + ">";
+                        let evensRev = cellNew(Nil);
+                        let oddsRev = cellNew(Nil);
+                        let i = cellNew(0);
+                        while (cellGet(i) < half) {
+                            let k = cellGet(i);
+                            cellSet(evensRev, Cons(k * 2, cellGet(evensRev)));
+                            cellSet(oddsRev, Cons(k * 2 + 1, cellGet(oddsRev)));
+                            cellSet(i, k + 1)
+                        };
+                        let halfTy = "<" + intToStr(half) + " x " + si.siElemLlvm + ">";
+                        let vEven = emitAssign(fctx, "shufflevector " + curTy + " " + cellGet(curVec) + ", " + curTy + " undef, " + formatShuffleMaskConst(listRev(cellGet(evensRev))));
+                        let vOdd = emitAssign(fctx, "shufflevector " + curTy + " " + cellGet(curVec) + ", " + curTy + " undef, " + formatShuffleMaskConst(listRev(cellGet(oddsRev))));
+                        cellSet(curVec, emitAssign(fctx, "fadd " + halfTy + " " + vEven + ", " + vOdd));
+                        cellSet(curN, half)
+                    };
+                    let pairTy = "<2 x " + si.siElemLlvm + ">";
+                    let e0 = emitAssign(fctx, "extractelement " + pairTy + " " + cellGet(curVec) + ", i32 0");
+                    let e1 = emitAssign(fctx, "extractelement " + pairTy + " " + cellGet(curVec) + ", i32 1");
+                    let sum = emitAssign(fctx, "fadd " + si.siElemLlvm + " " + e0 + ", " + e1);
+                    Some(coerceSimdElemToScalar(fctx, si, sum, retTy))
+                } else if (op == 3 || op == 4) {
+                    let iv = if (si.siFloat) emitAssign(fctx, "bitcast " + si.siVecLlvm + " " + v + " to " + si.siIntVecLlvm) else v;
+                    let fnBase = if (op == 3) "llvm.vector.reduce.or." else "llvm.vector.reduce.and.";
+                    let sym = fnBase + si.siIntLlvmSuf;
+                    ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siIntElemLlvm + " @" + sym + "(" + si.siIntVecLlvm + ") nounwind willreturn memory(none)");
+                    let rawR = emitAssign(fctx, "call " + si.siIntElemLlvm + " @" + sym + "(" + si.siIntVecLlvm + " " + iv + ")");
+                    let dstLlvm = getValLlvmType(retTy);
+                    if (si.siIntElemLlvm == dstLlvm) Some(rawR)
+                    else if (si.siElemBytes < (if (dstLlvm == "i64") 8 else 4)) {
+                        let extOp = if (si.siUnsigned) "zext" else "sext";
+                        Some(emitAssign(fctx, extOp + " " + si.siIntElemLlvm + " " + rawR + " to " + dstLlvm))
+                    } else Some(emitAssign(fctx, "trunc " + si.siIntElemLlvm + " " + rawR + " to " + dstLlvm))
+                } else {
+                    let fnBase =
+                        if (op == 0) "llvm.vector.reduce.add."
+                        else if (op == 1) {
+                            if (si.siFloat) "llvm.vector.reduce.fmin." else if (si.siUnsigned) "llvm.vector.reduce.umin." else "llvm.vector.reduce.smin."
+                        } else {
+                            if (si.siFloat) "llvm.vector.reduce.fmax." else if (si.siUnsigned) "llvm.vector.reduce.umax." else "llvm.vector.reduce.smax."
+                        };
+                    let sym = fnBase + si.siLlvmSuf;
+                    ensureLlvmIntrinsicDecl(mctx, sym, "declare " + si.siElemLlvm + " @" + sym + "(" + si.siVecLlvm + ") nounwind willreturn memory(none)");
+                    let rawR = emitAssign(fctx, "call " + si.siElemLlvm + " @" + sym + "(" + si.siVecLlvm + " " + v + ")");
+                    Some(coerceSimdElemToScalar(fctx, si, rawR, retTy))
+                }
+            },
+        }
+    } else if (name == "__simdPermute") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let vb = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                let n = si.siLanes;
+                if (op == 6) {
+                    if (n == 16) Some(emitSimdSwizzle16(mctx, fctx, va, vb))
+                    else {
+                        let loMask = formatShuffleMaskConst(makeRangeIndices(0, 16));
+                        let hiMask = formatShuffleMaskConst(makeRangeIndices(16, 16));
+                        let catMask = formatShuffleMaskConst(makeRangeIndices(0, 32));
+                        let tblLo = emitAssign(fctx, "shufflevector <32 x i8> " + va + ", <32 x i8> undef, " + loMask);
+                        let tblHi = emitAssign(fctx, "shufflevector <32 x i8> " + va + ", <32 x i8> undef, " + hiMask);
+                        let idxLo = emitAssign(fctx, "shufflevector <32 x i8> " + vb + ", <32 x i8> undef, " + loMask);
+                        let idxHi = emitAssign(fctx, "shufflevector <32 x i8> " + vb + ", <32 x i8> undef, " + hiMask);
+                        let rLo = emitSimdSwizzle16(mctx, fctx, tblLo, idxLo);
+                        let rHi = emitSimdSwizzle16(mctx, fctx, tblHi, idxHi);
+                        Some(emitAssign(fctx, "shufflevector <16 x i8> " + rLo + ", <16 x i8> " + rHi + ", " + catMask))
+                    }
+                } else {
+                    let indices =
+                        if (op == 0) {
+                            let rev = cellNew(Nil);
+                            let i = cellNew(0);
+                            while (cellGet(i) < n) {
+                                let k = cellGet(i);
+                                cellSet(rev, Cons(n - 1 - k, cellGet(rev)));
+                                cellSet(i, k + 1)
+                            };
+                            listRev(cellGet(rev))
+                        } else if (op == 1) {
+                            let half = n / 2;
+                            let rev = cellNew(Nil);
+                            let i = cellNew(0);
+                            while (cellGet(i) < half) {
+                                let k = cellGet(i);
+                                cellSet(rev, Cons(n + k, Cons(k, cellGet(rev))));
+                                cellSet(i, k + 1)
+                            };
+                            listRev(cellGet(rev))
+                        } else if (op == 2) {
+                            let half = n / 2;
+                            let rev = cellNew(Nil);
+                            let i = cellNew(0);
+                            while (cellGet(i) < half) {
+                                let k = cellGet(i);
+                                cellSet(rev, Cons(n + half + k, Cons(half + k, cellGet(rev))));
+                                cellSet(i, k + 1)
+                            };
+                            listRev(cellGet(rev))
+                        } else if (op == 3) {
+                            let rev = cellNew(Nil);
+                            let i = cellNew(0);
+                            while (cellGet(i) < n) {
+                                let k = cellGet(i);
+                                cellSet(rev, Cons(k * 2, cellGet(rev)));
+                                cellSet(i, k + 1)
+                            };
+                            listRev(cellGet(rev))
+                        } else if (op == 4) {
+                            let rev = cellNew(Nil);
+                            let i = cellNew(0);
+                            while (cellGet(i) < n) {
+                                let k = cellGet(i);
+                                cellSet(rev, Cons(k * 2 + 1, cellGet(rev)));
+                                cellSet(i, k + 1)
+                            };
+                            listRev(cellGet(rev))
+                        } else {
+                            let imm = extractConstIntTerm(nthArgTerm(args, 3));
+                            let shift = ((imm % n) + n) % n;
+                            makeRangeIndices(shift, n)
+                        };
+                    let rhsVec = if (op == 0) "undef" else vb;
+                    Some(emitAssign(fctx, "shufflevector " + si.siVecLlvm + " " + va + ", " + si.siVecLlvm + " " + rhsVec + ", " + formatShuffleMaskConst(indices)))
+                }
+            },
+        }
+    } else if (name == "__simdConvert") {
+        let a1 = nthArgTerm(args, 1);
+        match (parseSimdType(schemeBody(a1.tscm)), parseSimdType(retTy)) {
+            (Some(srcSi), Some(dstSi)) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, a1, locals, false);
+                if (op == 0) {
+                    if (srcSi.siVecLlvm == dstSi.siVecLlvm) Some(va)
+                    else Some(emitAssign(fctx, "bitcast " + srcSi.siVecLlvm + " " + va + " to " + dstSi.siVecLlvm))
+                } else if (op == 1) {
+                    Some(emitSimdElemCast(mctx, fctx, srcSi, dstSi, va))
+                } else if (op == 2 || op == 3) {
+                    let start = if (op == 2) 0 else dstSi.siLanes;
+                    let halfMask = formatShuffleMaskConst(makeRangeIndices(start, dstSi.siLanes));
+                    let halfVec = emitAssign(fctx, "shufflevector " + srcSi.siVecLlvm + " " + va + ", " + srcSi.siVecLlvm + " undef, " + halfMask);
+                    let halfSrcSi = SimdInfo {
+                        siLanes: dstSi.siLanes,
+                        siElemBytes: srcSi.siElemBytes,
+                        siTotalBytes: dstSi.siLanes * srcSi.siElemBytes,
+                        siElemLlvm: srcSi.siElemLlvm,
+                        siIntElemLlvm: srcSi.siIntElemLlvm,
+                        siVecLlvm: "<" + intToStr(dstSi.siLanes) + " x " + srcSi.siElemLlvm + ">",
+                        siIntVecLlvm: "<" + intToStr(dstSi.siLanes) + " x " + srcSi.siIntElemLlvm + ">",
+                        siLlvmSuf: "v" + intToStr(dstSi.siLanes) + (if (srcSi.siFloat) (if (srcSi.siElemBytes == 4) "f32" else "f64") else srcSi.siElemLlvm),
+                        siIntLlvmSuf: "v" + intToStr(dstSi.siLanes) + srcSi.siIntElemLlvm,
+                        siUnsigned: srcSi.siUnsigned,
+                        siFloat: srcSi.siFloat,
+                        siSpec: "",
+                    };
+                    Some(emitSimdElemCast(mctx, fctx, halfSrcSi, dstSi, halfVec))
+                } else {
+                    let start = if (op == 4) 0 else dstSi.siLanes;
+                    let halfMask = formatShuffleMaskConst(makeRangeIndices(start, dstSi.siLanes));
+                    Some(emitAssign(fctx, "shufflevector " + srcSi.siVecLlvm + " " + va + ", " + srcSi.siVecLlvm + " undef, " + halfMask))
+                }
+            },
+            _ -> Some("zeroinitializer"),
+        }
+    } else if (name == "__simdCombine") {
+        let a1 = nthArgTerm(args, 1);
+        match (parseSimdType(schemeBody(a1.tscm)), parseSimdType(retTy)) {
+            (Some(srcSi), Some(dstSi)) -> {
+                let op = extractConstIntTerm(nthArgTerm(args, 0));
+                let va = genExpr(mctx, fctx, a1, locals, false);
+                let vb = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
+                let catLanes = srcSi.siLanes * 2;
+                let catMask = formatShuffleMaskConst(makeRangeIndices(0, catLanes));
+                let catVec = emitAssign(fctx, "shufflevector " + srcSi.siVecLlvm + " " + va + ", " + srcSi.siVecLlvm + " " + vb + ", " + catMask);
+                if (op == 0) {
+                    Some(catVec)
+                } else if (op == 1) {
+                    let catTy = "<" + intToStr(catLanes) + " x " + srcSi.siElemLlvm + ">";
+                    let castOp = if (dstSi.siFloat) "fptrunc " else "trunc ";
+                    Some(emitAssign(fctx, castOp + catTy + " " + catVec + " to " + dstSi.siVecLlvm))
+                } else {
+                    let catTy = "<" + intToStr(catLanes) + " x " + srcSi.siElemLlvm + ">";
+                    let catSuf = "v" + intToStr(catLanes) + srcSi.siElemLlvm;
+                    let clamped =
+                        if (dstSi.siUnsigned) {
+                            let maxStr =
+                                if (dstSi.siElemBytes == 1) "255"
+                                else if (dstSi.siElemBytes == 2) "65535"
+                                else "4294967295";
+                            let maxVec = emitSimdSplatElem(fctx, catLanes, srcSi.siElemLlvm, maxStr);
+                            if (srcSi.siUnsigned) {
+                                let uminSym = "llvm.umin." + catSuf;
+                                ensureLlvmIntrinsicDecl(mctx, uminSym, "declare " + catTy + " @" + uminSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                emitAssign(fctx, "call " + catTy + " @" + uminSym + "(" + catTy + " " + catVec + ", " + catTy + " " + maxVec + ")")
+                            } else {
+                                let smaxSym = "llvm.smax." + catSuf;
+                                let sminSym = "llvm.smin." + catSuf;
+                                ensureLlvmIntrinsicDecl(mctx, smaxSym, "declare " + catTy + " @" + smaxSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                ensureLlvmIntrinsicDecl(mctx, sminSym, "declare " + catTy + " @" + sminSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                let nonNeg = emitAssign(fctx, "call " + catTy + " @" + smaxSym + "(" + catTy + " " + catVec + ", " + catTy + " zeroinitializer)");
+                                emitAssign(fctx, "call " + catTy + " @" + sminSym + "(" + catTy + " " + nonNeg + ", " + catTy + " " + maxVec + ")")
+                            }
+                        } else {
+                            let (minStr, maxStr) =
+                                if (dstSi.siElemBytes == 1) ("-128", "127")
+                                else if (dstSi.siElemBytes == 2) ("-32768", "32767")
+                                else ("-2147483648", "2147483647");
+                            let maxVec = emitSimdSplatElem(fctx, catLanes, srcSi.siElemLlvm, maxStr);
+                            if (srcSi.siUnsigned) {
+                                let uminSym = "llvm.umin." + catSuf;
+                                ensureLlvmIntrinsicDecl(mctx, uminSym, "declare " + catTy + " @" + uminSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                emitAssign(fctx, "call " + catTy + " @" + uminSym + "(" + catTy + " " + catVec + ", " + catTy + " " + maxVec + ")")
+                            } else {
+                                let minVec = emitSimdSplatElem(fctx, catLanes, srcSi.siElemLlvm, minStr);
+                                let smaxSym = "llvm.smax." + catSuf;
+                                let sminSym = "llvm.smin." + catSuf;
+                                ensureLlvmIntrinsicDecl(mctx, smaxSym, "declare " + catTy + " @" + smaxSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                ensureLlvmIntrinsicDecl(mctx, sminSym, "declare " + catTy + " @" + sminSym + "(" + catTy + ", " + catTy + ") nounwind willreturn memory(none)");
+                                let loClamped = emitAssign(fctx, "call " + catTy + " @" + smaxSym + "(" + catTy + " " + catVec + ", " + catTy + " " + minVec + ")");
+                                emitAssign(fctx, "call " + catTy + " @" + sminSym + "(" + catTy + " " + loClamped + ", " + catTy + " " + maxVec + ")")
+                            }
+                        };
+                    Some(emitAssign(fctx, "trunc " + catTy + " " + clamped + " to " + dstSi.siVecLlvm))
+                }
+            },
+            _ -> Some("zeroinitializer"),
+        }
+    } else if (name == "__simdLoad" || name == "__simdLoadRaw" || name == "__simdLoadStr") {
+        match parseSimdType(retTy) {
+            None -> Some("zeroinitializer"),
+            Some(si) -> {
+                let basePtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+                let off64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let bp = emitGep(fctx, "i8", basePtr, off64);
+                Some(emitAssign(fctx, "load " + si.siVecLlvm + ", ptr " + bp + ", align 1"))
+            },
+        }
+    } else if (name == "__simdStore" || name == "__simdStoreRaw") {
+        let a2 = nthArgTerm(args, 2);
+        match parseSimdType(schemeBody(a2.tscm)) {
+            None -> Some("0"),
+            Some(si) -> {
+                let basePtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+                let off64 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+                let vecVal = genExpr(mctx, fctx, a2, locals, false);
+                let bp = emitGep(fctx, "i8", basePtr, off64);
+                emitLine(fctx, "store " + si.siVecLlvm + " " + vecVal + ", ptr " + bp + ", align 1");
+                Some("0")
+            },
+        }
+    } else None
 
 def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, rhs: String, operandTy: Type): String = {
     let tyName = match operandTy {
@@ -2592,6 +3446,22 @@ def tryEmitIntrinsic(
     } else if (name == "bitCtz") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "call i32 @llvm.cttz.i32(i32 " + a + ", i1 false)"))
+    } else if (name == "bitCtz64") {
+        if (mctx.mcIsWasm) {
+            ensureLlvmIntrinsicDecl(mctx, "llvm.cttz.i64", "declare i64 @llvm.cttz.i64(i64, i1 immarg) nounwind willreturn memory(none)")
+        } else ();
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let c64 = emitAssign(fctx, "call i64 @llvm.cttz.i64(i64 " + a + ", i1 false)");
+        Some(emitAssign(fctx, "trunc i64 " + c64 + " to i32"))
+    } else if (name == "bitClz") {
+        ensureLlvmIntrinsicDecl(mctx, "llvm.ctlz.i32", "declare i32 @llvm.ctlz.i32(i32, i1 immarg) nounwind willreturn memory(none)");
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        Some(emitAssign(fctx, "call i32 @llvm.ctlz.i32(i32 " + a + ", i1 false)"))
+    } else if (name == "bitClz64") {
+        ensureLlvmIntrinsicDecl(mctx, "llvm.ctlz.i64", "declare i64 @llvm.ctlz.i64(i64, i1 immarg) nounwind willreturn memory(none)");
+        let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let c64 = emitAssign(fctx, "call i64 @llvm.ctlz.i64(i64 " + a + ", i1 false)");
+        Some(emitAssign(fctx, "trunc i64 " + c64 + " to i32"))
     } else if (name == "charToInt") {
         let c = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         Some(emitAssign(fctx, "zext i8 " + c + " to i32"))
@@ -2969,6 +3839,26 @@ def tryEmitIntrinsic(
         }
     } else if (name == "gcExternalLiveBytes") {
         Some(emitAssign(fctx, "call i64 @gc_external_live_bytes()"))
+    } else if (name == "withStrPtr") {
+        let sPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
+        let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
+        let fnEntry = emitLoad(fctx, "ptr", fnSlot);
+        let retLlvm = getFnRetLlvmType(retTy);
+        let res =
+            if (retLlvm == "void") {
+                emitLine(fctx, "call void " + fnEntry + "(ptr " + sPtr + ", ptr " + fvsPtr + ")");
+                "0"
+            } else {
+                emitAssign(fctx, "call " + retLlvm + " " + fnEntry + "(ptr " + sPtr + ", ptr " + fvsPtr + ")")
+            };
+        if (!mctx.mcIsWasm) {
+            emitLine(fctx, "call void asm sideeffect \"\", \"r,~{memory}\"(ptr " + sPtr + ")")
+        } else ();
+        Some(res)
+    } else if (strStartsWith(name, "__simd")) {
+        tryEmitSimdIntrinsic(mctx, fctx, name, args, retTy, locals)
     } else if (name == "withForeignPtr") {
         let fp = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
@@ -3469,7 +4359,8 @@ def emitPatternCheck(
             match (cellGet(cp), cellGet(ct)) {
                 (Cons(sp, rp), Cons(et, rt)) -> {
                     let i = cellGet(idx);
-                    let elemVal = emitAssign(fctx, "extractvalue " + tupleLlvm + " " + val + ", " + intToStr(i));
+                    let rawElemVal = emitAssign(fctx, "extractvalue " + tupleLlvm + " " + val + ", " + intToStr(i));
+                    let elemVal = unpackStructFieldVal(fctx, et, rawElemVal);
                     emitPatternCheck(mctx, fctx, elemVal, et, sp, localsCell, failBlk);
                     cellSet(idx, i + 1);
                     cellSet(cp, rp);
@@ -3492,7 +4383,8 @@ def emitPatternCheck(
                         match sp {
                             PatWild -> (),
                             _ -> {
-                                let fVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(i));
+                                let rawFVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(i));
+                                let fVal = unpackStructFieldVal(fctx, gt, rawFVal);
                                 emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
                             },
                         };
@@ -3540,7 +4432,7 @@ def emitPatternCheck(
                                                 PatWild -> (),
                                                 _ -> {
                                                     let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                                                    let fVal = emitLoad(fctx, lt, fPtr);
+                                                    let fVal = emitLoad(fctx, getValLlvmType(gt), fPtr);
                                                     emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
                                                 },
                                             };
@@ -3651,7 +4543,7 @@ def bindCtorSubPats(
                         PatWild -> (),
                         _ -> {
                             let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                            let fVal = emitLoad(fctx, lt, fPtr);
+                            let fVal = emitLoad(fctx, getValLlvmType(gt), fPtr);
                             emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
                         },
                     };
@@ -3838,9 +4730,11 @@ def genExpr(
                 match cellGet(cur) {
                     Cons(el, r) -> {
                         let i = cellGet(idx);
+                        let elTy = schemeBody(el.tscm);
                         let v = genExpr(mctx, fctx, el, locals, false);
-                        let elLlvm = getValLlvmType(schemeBody(el.tscm));
-                        cellSet(agg, emitAssign(fctx, "insertvalue " + tupleLlvm + " " + cellGet(agg) + ", " + elLlvm + " " + v + ", " + intToStr(i)));
+                        let packedV = packStructFieldVal(fctx, elTy, v);
+                        let elLlvm = getStructFieldLlvmType(elTy);
+                        cellSet(agg, emitAssign(fctx, "insertvalue " + tupleLlvm + " " + cellGet(agg) + ", " + elLlvm + " " + packedV + ", " + intToStr(i)));
                         cellSet(idx, i + 1);
                         cellSet(cur, r)
                     },
@@ -4179,7 +5073,7 @@ def genExpr(
                             Cons(fvName, r) -> {
                                 match lookupVarSlot(extLocals, mctx, fvName) {
                                     Some(s) -> {
-                                        cellSet(fvLlvmRev, Cons(s.vsLlvmTy, cellGet(fvLlvmRev)));
+                                        cellSet(fvLlvmRev, Cons(getStructFieldLlvmType(s.vsGeishaTy), cellGet(fvLlvmRev)));
                                         cellSet(fvGeishaRev, Cons(s.vsGeishaTy, cellGet(fvGeishaRev)))
                                     },
                                     None -> (),
@@ -4302,14 +5196,17 @@ def genExpr(
                         let agg = cellNew("undef");
                         let idx = cellNew(0);
                         let cv = cellNew(fieldVals);
+                        let cg = cellNew(fieldTys);
                         let ct = cellNew(fLlvmTys);
-                        while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                            match (cellGet(cv), cellGet(ct)) {
-                                (Cons(fv, rv), Cons(flt, rt)) -> {
+                        while (match (cellGet(cv), cellGet(cg), cellGet(ct)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                            match (cellGet(cv), cellGet(cg), cellGet(ct)) {
+                                (Cons(fv, rv), Cons(fgt, rgt), Cons(flt, rt)) -> {
                                     let i = cellGet(idx);
-                                    cellSet(agg, emitAssign(fctx, "insertvalue " + structLlvm + " " + cellGet(agg) + ", " + flt + " " + fv + ", " + intToStr(i)));
+                                    let packedFv = packStructFieldVal(fctx, fgt, fv);
+                                    cellSet(agg, emitAssign(fctx, "insertvalue " + structLlvm + " " + cellGet(agg) + ", " + flt + " " + packedFv + ", " + intToStr(i)));
                                     cellSet(idx, i + 1);
                                     cellSet(cv, rv);
+                                    cellSet(cg, rgt);
                                     cellSet(ct, rt)
                                 },
                                 _ -> (),
@@ -4337,16 +5234,16 @@ def genExpr(
                         let payloadStructTy = formatLlvmStructType(fLlvmTys);
                         let idx = cellNew(0);
                         let cv = cellNew(fieldVals);
-                        let ct = cellNew(fLlvmTys);
-                        while (match (cellGet(cv), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                            match (cellGet(cv), cellGet(ct)) {
-                                (Cons(fv, rv), Cons(flt, rt)) -> {
+                        let cg = cellNew(fieldTys);
+                        while (match (cellGet(cv), cellGet(cg)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                            match (cellGet(cv), cellGet(cg)) {
+                                (Cons(fv, rv), Cons(fgt, rgt)) -> {
                                     let i = cellGet(idx);
                                     let fPtr = emitStructFieldPtr(fctx, payloadStructTy, payloadPtr, i);
-                                    emitStore(fctx, flt, fv, fPtr);
+                                    emitStore(fctx, getValLlvmType(fgt), fv, fPtr);
                                     cellSet(idx, i + 1);
                                     cellSet(cv, rv);
-                                    cellSet(ct, rt)
+                                    cellSet(cg, rgt)
                                 },
                                 _ -> (),
                             }
@@ -4479,6 +5376,13 @@ def isPureBuiltinIntrinsic(name: String): Bool =
     || name == "bitShl" || name == "bitShr" || name == "bitUshr"
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
     || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "bitCtz64" || name == "bitClz" || name == "bitClz64"
+    || name == "__simdSplat" || name == "__simdIota" || name == "__simdExtract" || name == "__simdReplace"
+    || name == "__simdUnary" || name == "__simdBin" || name == "__simdShift" || name == "__simdFma"
+    || name == "__simdCmp" || name == "__simdReduce" || name == "__simdPermute"
+    || name == "__simdConvert" || name == "__simdCombine"
+    || name == "__simdLoad" || name == "__simdStore"
+    || name == "__simdLoadRaw" || name == "__simdStoreRaw" || name == "__simdLoadStr"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
     || name == "intToFloat" || name == "floatToInt"
@@ -4519,6 +5423,13 @@ def isNonAllocLeafIntrinsic(name: String): Bool =
     || name == "bitShl" || name == "bitShr" || name == "bitUshr"
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
     || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "bitCtz64" || name == "bitClz" || name == "bitClz64"
+    || name == "__simdSplat" || name == "__simdIota" || name == "__simdExtract" || name == "__simdReplace"
+    || name == "__simdUnary" || name == "__simdBin" || name == "__simdShift" || name == "__simdFma"
+    || name == "__simdCmp" || name == "__simdReduce" || name == "__simdPermute"
+    || name == "__simdConvert" || name == "__simdCombine"
+    || name == "__simdLoad" || name == "__simdStore"
+    || name == "__simdLoadRaw" || name == "__simdStoreRaw" || name == "__simdLoadStr"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
     || name == "intToFloat" || name == "floatToInt"
@@ -4655,7 +5566,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
             while (match cellGet(cf0) { Nil -> false, _ -> true }) {
                 match cellGet(cf0) {
                     Cons(vd, r) -> {
-                        cellSet(fvLlvmRev, Cons(getValLlvmType(schemeBody(vd.vscm)), cellGet(fvLlvmRev)));
+                        cellSet(fvLlvmRev, Cons(getStructFieldLlvmType(schemeBody(vd.vscm)), cellGet(fvLlvmRev)));
                         cellSet(cf0, r)
                     },
                     Nil -> (),
@@ -4666,21 +5577,21 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
 
             let idx = cellNew(0);
             let cf1 = cellNew(fvs);
-            let clt = cellNew(fvLlvmTys);
-            while (match (cellGet(cf1), cellGet(clt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                match (cellGet(cf1), cellGet(clt)) {
-                    (Cons(vd, r1), Cons(elemTy, r2)) -> {
+            while (match cellGet(cf1) { Nil -> false, _ -> true }) {
+                match cellGet(cf1) {
+                    Cons(vd, r1) -> {
                         let i = cellGet(idx);
+                        let vdTy = schemeBody(vd.vscm);
+                        let elemTy = getValLlvmType(vdTy);
                         let slotPtr = emitEntryAlloca(fctx, elemTy);
                         let fPtr = emitStructFieldPtr(fctx, fvStructTy, "%fvs", i);
                         let fvVal = emitLoad(fctx, elemTy, fPtr);
-                        dbgEmitLocalVar(mctx, fctx, vd.vname, schemeBody(vd.vscm), slotPtr, fd.fnSpan, 0);
+                        dbgEmitLocalVar(mctx, fctx, vd.vname, vdTy, slotPtr, fd.fnSpan, 0);
                         emitStore(fctx, elemTy, fvVal, slotPtr);
-                        let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: elemTy, vsGeishaTy: schemeBody(vd.vscm) };
+                        let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: elemTy, vsGeishaTy: vdTy };
                         cellSet(localsRev, Cons((vd.vname, slot), cellGet(localsRev)));
                         cellSet(idx, i + 1);
-                        cellSet(cf1, r1);
-                        cellSet(clt, r2)
+                        cellSet(cf1, r1)
                     },
                     _ -> (),
                 }
@@ -4697,16 +5608,17 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
     } else ();
 
     let privLinkage = if (mctx.mcMultiCgu) "hidden " else "internal ";
+    let x64SimdAttr = if (!mctx.mcIsWasm && mctx.mcTargetArch == "x86_64") " \"target-features\"=\"+sse4.2,+popcnt\"" else "";
     let paramSigStr = strJoin(listRev(cellGet(paramSigPartsRev)), ", ");
     if (isCExported) {
-        let implHeader = "define " + privLinkage + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind";
+        let implHeader = "define " + privLinkage + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind" + x64SimdAttr;
         flushFunctionToBuf(out, implHeader, fctx)
     } else if (!mctx.mcIsWasm && isExp) {
         let implSym = llvmSym("__gs_exp_" + fd.fnName);
-        let implHeader = "define " + privLinkage + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind";
+        let implHeader = "define " + privLinkage + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind" + x64SimdAttr;
         flushFunctionToBuf(out, implHeader, fctx);
         // Emit thread-safe C/Swift host entry trampoline for exported native symbol
-        bufPushStr(out, "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind {\nentry:\n");
+        bufPushStr(out, "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind" + x64SimdAttr + " {\nentry:\n");
         bufPushStr(out, "  %anchor = alloca i64, align 8\n");
         bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
         bufPushStr(out, "  %tok = call i64 @gc_host_enter(ptr %anchor)\n");
@@ -4726,7 +5638,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         let linkage = if (isExp) "" else privLinkage;
         let exportAttr =
             if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
-            else "";
+            else x64SimdAttr;
         let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind" + exportAttr;
         flushFunctionToBuf(out, header, fctx)
     }

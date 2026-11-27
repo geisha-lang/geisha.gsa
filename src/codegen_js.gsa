@@ -168,6 +168,50 @@ def isFloat32Ty(ty: Type): Bool = match ty {
     _ -> false,
 }
 
+def jsStripModPrefix(s: String): String = {
+    let n = strLen(s);
+    let lastDot = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        if (strByteAt(s, cellGet(i)) == 46) cellSet(lastDot, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let d = cellGet(lastDot);
+    if (d >= 0) strSlice(s, d + 1, n) else s
+}
+
+// Returns `Some((lanes, elemKind, totalBytes))` where `elemKind` is:
+// 0=I8, 1=U8, 2=I16, 3=U16, 4=I32/Int, 5=U32, 6=I64/Int64, 7=U64, 8=F32/Float32, 9=F64/Float
+def jsParseSimd(ty: Type): Option (Int, Int, Int) = match ty {
+    TyComp(TyComp(TyCon("Simd"), TyCon(rawLane)), TyCon(rawElem)) -> {
+        let ln = jsStripModPrefix(rawLane);
+        let en = jsStripModPrefix(rawElem);
+        let lanes =
+            if (ln == "L2") 2
+            else if (ln == "L4") 4
+            else if (ln == "L8") 8
+            else if (ln == "L16") 16
+            else if (ln == "L32") 32
+            else 0;
+        let (ek, eb) =
+            if (en == "I8") (0, 1)
+            else if (en == "U8") (1, 1)
+            else if (en == "I16") (2, 2)
+            else if (en == "U16") (3, 2)
+            else if (en == "Int" || en == "I32") (4, 4)
+            else if (en == "U32") (5, 4)
+            else if (en == "Int64" || en == "I64") (6, 8)
+            else if (en == "U64") (7, 8)
+            else if (en == "Float32" || en == "F32") (8, 4)
+            else if (en == "Float" || en == "F64") (9, 8)
+            else (-1, 0);
+        let tb = lanes * eb;
+        if (lanes > 0 && ek >= 0 && (tb == 16 || tb == 32)) Some((lanes, ek, tb))
+        else None
+    },
+    _ -> None,
+}
+
 def jsZeroForType(ty: Type): String = match ty {
     TyVoid -> "undefined",
     TyCon(n) ->
@@ -178,6 +222,10 @@ def jsZeroForType(ty: Type): String = match ty {
         else if (n == "String") "_gs_emptyStr"
         else if (n == "Ptr" || n == "ScopedPtr" || n == "ForeignPtr" || n == "Arena") "null"
         else "undefined",
+    TyComp(_, _) -> match jsParseSimd(ty) {
+        Some((_, _, tb)) -> "new DataView(new ArrayBuffer(" + intToStr(tb) + "))",
+        None -> "undefined",
+    },
     _ -> "undefined",
 }
 
@@ -749,6 +797,15 @@ def tryEmitBuiltinJs(
     } else if (name == "bitCtz") {
         let vs = evalArgsJs(ctx, args, locals);
         Some("_gs_ctz32(" + nthStr(vs, 0) + ")")
+    } else if (name == "bitCtz64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ctz64(" + nthStr(vs, 0) + ")")
+    } else if (name == "bitClz") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("Math.clz32(" + nthStr(vs, 0) + ")")
+    } else if (name == "bitClz64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_clz64(" + nthStr(vs, 0) + ")")
     } else if (name == "charToInt") {
         let vs = evalArgsJs(ctx, args, locals);
         Some("(" + nthStr(vs, 0) + " & 255)")
@@ -902,6 +959,97 @@ def tryEmitBuiltinJs(
     } else if (name == "ptrToString") {
         let vs = evalArgsJs(ctx, args, locals);
         Some("_gs_ptrToString(" + nthStr(vs, 0) + ")")
+    } else if (name == "withStrPtr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 1) + ")({ buf: " + nthStr(vs, 0) + ", off: 0 })")
+    } else if (strStartsWith(name, "__simd")) {
+        let vs = evalArgsJs(ctx, args, locals);
+        if (name == "__simdSplat") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdSplat(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdIota") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdIota(" + intToStr(ln) + ", " + intToStr(ek) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdExtract") {
+            match jsParseSimd(schemeBody(nthArgTerm(args, 0).tscm)) {
+                Some((ln, ek, _)) -> Some("_gs_simdExtract(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")"),
+                None -> Some("0"),
+            }
+        } else if (name == "__simdReplace") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdReplace(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdUnary") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdUnary(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdBin") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdBin(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdShift") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdShift(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdFma") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdFma(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdCmp") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdCmp(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdReduce") {
+            match jsParseSimd(schemeBody(nthArgTerm(args, 1).tscm)) {
+                Some((ln, ek, _)) -> Some("_gs_simdReduce(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")"),
+                None -> Some("0"),
+            }
+        } else if (name == "__simdPermute") {
+            match jsParseSimd(retTy) {
+                Some((ln, ek, _)) -> Some("_gs_simdPermute(" + intToStr(ln) + ", " + intToStr(ek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ", " + nthStr(vs, 3) + ")"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdConvert") {
+            match (jsParseSimd(schemeBody(nthArgTerm(args, 1).tscm)), jsParseSimd(retTy)) {
+                (Some((sln, sek, _)), Some((dln, dek, _))) ->
+                    Some("_gs_simdConvert(" + intToStr(sln) + ", " + intToStr(sek) + ", " + intToStr(dln) + ", " + intToStr(dek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")"),
+                _ -> Some("undefined"),
+            }
+        } else if (name == "__simdCombine") {
+            match (jsParseSimd(schemeBody(nthArgTerm(args, 1).tscm)), jsParseSimd(retTy)) {
+                (Some((sln, sek, _)), Some((dln, dek, _))) ->
+                    Some("_gs_simdCombine(" + intToStr(sln) + ", " + intToStr(sek) + ", " + intToStr(dln) + ", " + intToStr(dek) + ", " + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")"),
+                _ -> Some("undefined"),
+            }
+        } else if (name == "__simdLoad" || name == "__simdLoadRaw") {
+            match jsParseSimd(retTy) {
+                Some((_, _, tb)) -> Some("_gs_simdLoadPtr(" + intToStr(tb) + ", " + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdLoadStr") {
+            match jsParseSimd(retTy) {
+                Some((_, _, tb)) -> Some("_gs_simdLoadStr(" + intToStr(tb) + ", " + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))"),
+                None -> Some("undefined"),
+            }
+        } else if (name == "__simdStore" || name == "__simdStoreRaw") {
+            match jsParseSimd(schemeBody(nthArgTerm(args, 2).tscm)) {
+                Some((_, _, tb)) -> {
+                    jcEmitLine(ctx, "_gs_simdStorePtr(" + intToStr(tb) + ", " + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+                    Some("undefined")
+                },
+                None -> Some("undefined"),
+            }
+        } else None
     } else if (name == "withForeignPtr") {
         let vs = evalArgsJs(ctx, args, locals);
         Some("(" + nthStr(vs, 1) + ")(" + nthStr(vs, 0) + ")")
@@ -1388,8 +1536,8 @@ def emitJsRuntimePrelude(out: StringBuf): Void = {
     bufPushStr(out, "function _gs_toJsStr(b) { return b instanceof Uint8Array ? _gs_dec.decode(b) : String(b); }\n");
     bufPushStr(out, "function _gs_fromJsStr(s) { return s instanceof Uint8Array ? s : _gs_enc.encode(String(s)); }\n");
     bufPushStr(out, "function _gs_isPtr(v) { return v !== null && typeof v === \"object\" && v.buf instanceof Uint8Array && typeof v.off === \"number\"; }\n");
-    bufPushStr(out, "function _gs_toJs(v) { if (v instanceof Uint8Array) return _gs_dec.decode(v); if (v === null || typeof v !== \"object\" || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_toJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_toJs(v[k]); return o; }\n");
-    bufPushStr(out, "function _gs_fromJs(v) { if (typeof v === \"string\") return _gs_enc.encode(v); if (v === null || typeof v !== \"object\" || v instanceof Uint8Array || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_fromJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_fromJs(v[k]); return o; }\n");
+    bufPushStr(out, "function _gs_toJs(v) { if (v instanceof Uint8Array) return _gs_dec.decode(v); if (v === null || typeof v !== \"object\" || v instanceof DataView || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_toJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_toJs(v[k]); return o; }\n");
+    bufPushStr(out, "function _gs_fromJs(v) { if (typeof v === \"string\") return _gs_enc.encode(v); if (v === null || typeof v !== \"object\" || v instanceof Uint8Array || v instanceof DataView || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_fromJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_fromJs(v[k]); return o; }\n");
     bufPushStr(out, "function _gs_mutArrProxy(arr, fromElem, toElem) { return new Proxy(arr, { get(t, p, r) { const v = Reflect.get(t, p, r); return (typeof p === \"string\" && /^\\d+$/.test(p)) ? fromElem(v) : v; }, set(t, p, v, r) { return (typeof p === \"string\" && /^\\d+$/.test(p)) ? Reflect.set(t, p, toElem(v), r) : Reflect.set(t, p, v, r); } }); }\n");
     bufPushStr(out, "function _gs_cellProxy(c, fromElem, toElem) { return { get v() { return fromElem(c.v); }, set v(x) { c.v = toElem(x); } }; }\n");
     bufPushStr(out, "function _gs_strConcat(a, b) { const r = new Uint8Array(a.length + b.length); r.set(a, 0); r.set(b, a.length); return r; }\n");
@@ -1440,6 +1588,31 @@ def emitJsRuntimePrelude(out: StringBuf): Void = {
     bufPushStr(out, "function _gs_sysArgv(i) { return (typeof process !== \"undefined\" && Array.isArray(process.argv) && i >= 0 && i + 1 < process.argv.length) ? _gs_enc.encode(process.argv[i + 1]) : _gs_emptyStr; }\n");
     bufPushStr(out, "function _gs_atomicAdd(a, d) { const prev = a.v | 0; a.v = (prev + (d | 0)) | 0; return prev; }\n");
     bufPushStr(out, "function _gs_atomicCas(a, exp, des) { if ((a.v | 0) === (exp | 0)) { a.v = des | 0; return true; } return false; }\n");
+    bufPushStr(out, "function _gs_ctz64(x) { const u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0, v = u; while ((v & 1n) === 0n) { v >>= 1n; n++; } return n; }\n");
+    bufPushStr(out, "function _gs_clz64(x) { const u = BigInt.asUintN(64, x); if (u === 0n) return 64; let n = 0, m = 1n << 63n; while ((u & m) === 0n) { m >>= 1n; n++; } return n; }\n");
+    bufPushStr(out, "const _gs_sEB = [1,1,2,2,4,4,8,8,4,8];\n");
+    bufPushStr(out, "function _gs_sNew(ln, ek) { return new DataView(new ArrayBuffer(ln * _gs_sEB[ek])); }\n");
+    bufPushStr(out, "function _gs_sGet(dv, ek, i) { switch (ek) { case 0: return dv.getInt8(i); case 1: return dv.getUint8(i); case 2: return dv.getInt16(i * 2, true); case 3: return dv.getUint16(i * 2, true); case 4: return dv.getInt32(i * 4, true); case 5: return dv.getUint32(i * 4, true); case 6: return dv.getBigInt64(i * 8, true); case 7: return dv.getBigUint64(i * 8, true); case 8: return dv.getFloat32(i * 4, true); default: return dv.getFloat64(i * 8, true); } }\n");
+    bufPushStr(out, "function _gs_sSet(dv, ek, i, v) { switch (ek) { case 0: dv.setInt8(i, Number(v) | 0); break; case 1: dv.setUint8(i, Number(v) & 255); break; case 2: dv.setInt16(i * 2, Number(v) | 0, true); break; case 3: dv.setUint16(i * 2, Number(v) & 65535, true); break; case 4: dv.setInt32(i * 4, Number(v) | 0, true); break; case 5: dv.setUint32(i * 4, Number(v) >>> 0, true); break; case 6: dv.setBigInt64(i * 8, typeof v === \"bigint\" ? BigInt.asIntN(64, v) : BigInt(v | 0), true); break; case 7: dv.setBigUint64(i * 8, typeof v === \"bigint\" ? BigInt.asUintN(64, v) : BigInt(v >>> 0), true); break; case 8: dv.setFloat32(i * 4, Math.fround(Number(v)), true); break; default: dv.setFloat64(i * 8, Number(v), true); } }\n");
+    bufPushStr(out, "function _gs_sRoundEven(x) { if (!Number.isFinite(x)) return x; const f = Math.floor(x), d = x - f; return d < 0.5 ? f : d > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1); }\n");
+    bufPushStr(out, "function _gs_simdSplat(ln, ek, s) { const r = _gs_sNew(ln, ek); for (let i = 0; i < ln; i++) _gs_sSet(r, ek, i, s); return r; }\n");
+    bufPushStr(out, "function _gs_simdIota(ln, ek) { const r = _gs_sNew(ln, ek); for (let i = 0; i < ln; i++) _gs_sSet(r, ek, i, ek === 6 || ek === 7 ? BigInt(i) : i); return r; }\n");
+    bufPushStr(out, "function _gs_simdExtract(ln, ek, v, idx) { const m = idx & (ln - 1); if (ek === 5) return v.getInt32(m * 4, true) | 0; if (ek === 7) return v.getBigInt64(m * 8, true); return _gs_sGet(v, ek, m); }\n");
+    bufPushStr(out, "function _gs_simdReplace(ln, ek, v, idx, s) { const r = new DataView(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)); _gs_sSet(r, ek, idx & (ln - 1), s); return r; }\n");
+    bufPushStr(out, "function _gs_simdUnary(ln, ek, op, v) { const r = _gs_sNew(ln, ek); if (op === 1) { const s = new Uint8Array(v.buffer, v.byteOffset, v.byteLength), d = new Uint8Array(r.buffer); for (let i = 0; i < d.length; i++) d[i] = ~s[i] & 255; return r; } for (let i = 0; i < ln; i++) { const x = _gs_sGet(v, ek, i); let y; if (op === 0) y = (ek === 6 || ek === 7) ? -x : -x; else if (op === 2) y = (ek === 6 || ek === 7) ? (x < 0n ? -x : x) : Math.abs(x); else if (op === 3) y = Math.sqrt(x); else if (op === 4) y = Math.floor(x); else if (op === 5) y = Math.ceil(x); else y = _gs_sRoundEven(x); _gs_sSet(r, ek, i, y); } return r; }\n");
+    bufPushStr(out, "function _gs_sClamp(ek, x) { switch (ek) { case 0: return x < -128 ? -128 : x > 127 ? 127 : x; case 1: return x < 0 ? 0 : x > 255 ? 255 : x; case 2: return x < -32768 ? -32768 : x > 32767 ? 32767 : x; case 3: return x < 0 ? 0 : x > 65535 ? 65535 : x; case 4: return x < -2147483648 ? -2147483648 : x > 2147483647 ? 2147483647 : x; case 5: return x < 0 ? 0 : x > 4294967295 ? 4294967295 : x; case 6: return x < -9223372036854775808n ? -9223372036854775808n : x > 9223372036854775807n ? 9223372036854775807n : x; default: return x < 0n ? 0n : x > 18446744073709551615n ? 18446744073709551615n : x; } }\n");
+    bufPushStr(out, "function _gs_simdBin(ln, ek, op, a, b) { const r = _gs_sNew(ln, ek); if (op >= 5 && op <= 7) { const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength), ur = new Uint8Array(r.buffer); for (let i = 0; i < ur.length; i++) ur[i] = op === 5 ? (ua[i] & ub[i]) : op === 6 ? (ua[i] | ub[i]) : (ua[i] ^ ub[i]); return r; } const isBig = ek === 6 || ek === 7, isFlt = ek >= 8; if (!isFlt && (op === 3 || op === 4)) { for (let i = 0; i < ln; i++) { const y = _gs_sGet(b, ek, i); if (y === 0 || y === 0n) throw new RangeError(\"Geisha division by zero\"); } } for (let i = 0; i < ln; i++) { const x = _gs_sGet(a, ek, i), y = _gs_sGet(b, ek, i); let z; if (op === 0) z = x + y; else if (op === 1) z = x - y; else if (op === 2) z = (ek === 4 || ek === 5) ? Math.imul(x, y) : x * y; else if (op === 3) z = isFlt ? x / y : isBig ? x / y : Math.trunc(x / y); else if (op === 4) z = x % y; else if (op === 8) z = isFlt ? (Number.isNaN(x) ? y : Number.isNaN(y) ? x : Math.min(x, y)) : (x < y ? x : y); else if (op === 9) z = isFlt ? (Number.isNaN(x) ? y : Number.isNaN(y) ? x : Math.max(x, y)) : (x > y ? x : y); else if (op === 10) z = _gs_sClamp(ek, x + y); else z = _gs_sClamp(ek, x - y); _gs_sSet(r, ek, i, z); } return r; }\n");
+    bufPushStr(out, "function _gs_simdShift(ln, ek, op, a, amt) { const r = _gs_sNew(ln, ek), bits = _gs_sEB[ek] * 8, m = amt & (bits - 1); for (let i = 0; i < ln; i++) { const x = _gs_sGet(a, ek, i); let z; if (ek === 6 || ek === 7) { const bm = BigInt(m), ux = BigInt.asUintN(64, x), sx = BigInt.asIntN(64, x); z = op === 0 ? (ux << bm) : op === 1 ? (sx >> bm) : (ux >> bm); } else if (ek === 4 || ek === 5) { z = op === 0 ? (x << m) : op === 1 ? ((x | 0) >> m) : (x >>> m); } else { const mask = (1 << bits) - 1, ux = x & mask, sx = (ux << (32 - bits)) >> (32 - bits); z = op === 0 ? (ux << m) : op === 1 ? (sx >> m) : (ux >>> m); } _gs_sSet(r, ek, i, z); } return r; }\n");
+    bufPushStr(out, "function _gs_simdFma(ln, ek, a, b, c) { const r = _gs_sNew(ln, ek); for (let i = 0; i < ln; i++) _gs_sSet(r, ek, i, _gs_sGet(a, ek, i) * _gs_sGet(b, ek, i) + _gs_sGet(c, ek, i)); return r; }\n");
+    bufPushStr(out, "function _gs_simdCmp(ln, ek, op, a, b) { const r = _gs_sNew(ln, ek), ur = new Uint8Array(r.buffer), eb = _gs_sEB[ek]; for (let i = 0; i < ln; i++) { const x = _gs_sGet(a, ek, i), y = _gs_sGet(b, ek, i); const hit = op === 0 ? x === y : op === 1 ? (ek >= 8 ? x !== y : x !== y) : op === 2 ? x < y : op === 3 ? x <= y : op === 4 ? x > y : x >= y; if (hit) ur.fill(255, i * eb, (i + 1) * eb); } return r; }\n");
+    bufPushStr(out, "function _gs_simdReduce(ln, ek, op, v) { const eb = _gs_sEB[ek], ub = new Uint8Array(v.buffer, v.byteOffset, v.byteLength); if (op === 5) { let m = 0; for (let i = 0; i < ln; i++) if (ub[i * eb + eb - 1] & 128) m |= (1 << i); return m | 0; } if (op === 3 || op === 4) { const ik = ek === 8 ? 4 : ek === 9 ? 6 : ek; let acc = _gs_sGet(v, ik, 0); for (let i = 1; i < ln; i++) { const x = _gs_sGet(v, ik, i); acc = op === 3 ? (acc | x) : (acc & x); } if (ik === 5) return acc | 0; if (ik === 7) return BigInt.asIntN(64, acc); return acc; } let acc = _gs_sGet(v, ek, 0); for (let i = 1; i < ln; i++) { const x = _gs_sGet(v, ek, i); if (op === 0) acc = ek === 8 ? Math.fround(acc + x) : acc + x; else if (op === 1) acc = ek >= 8 ? (Number.isNaN(acc) ? x : Number.isNaN(x) ? acc : Math.min(acc, x)) : (x < acc ? x : acc); else acc = ek >= 8 ? (Number.isNaN(acc) ? x : Number.isNaN(x) ? acc : Math.max(acc, x)) : (x > acc ? x : acc); } const tmp = _gs_sNew(1, ek); _gs_sSet(tmp, ek, 0, acc); return _gs_simdExtract(1, ek, tmp, 0); }\n");
+    bufPushStr(out, "function _gs_simdPermute(ln, ek, op, a, b, imm) { const r = _gs_sNew(ln, ek); if (op === 6) { const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength), ur = new Uint8Array(r.buffer); for (let blk = 0; blk < ln; blk += 16) for (let i = 0; i < 16; i++) { const ix = ub[blk + i]; ur[blk + i] = ix < 16 ? ua[blk + ix] : 0; } return r; } const get2 = (k) => k < ln ? _gs_sGet(a, ek, k) : _gs_sGet(b, ek, k - ln); const h = ln >> 1, sh = ((imm % ln) + ln) % ln; for (let i = 0; i < ln; i++) { const src = op === 0 ? (ln - 1 - i) : op === 1 ? ((i & 1) ? ln + (i >> 1) : (i >> 1)) : op === 2 ? ((i & 1) ? ln + h + (i >> 1) : h + (i >> 1)) : op === 3 ? (i * 2) : op === 4 ? (i * 2 + 1) : (sh + i); _gs_sSet(r, ek, i, get2(src)); } return r; }\n");
+    bufPushStr(out, "function _gs_sCastVal(sek, dek, x) { if (sek >= 8 && dek < 8) { if (Number.isNaN(x)) return dek >= 6 ? 0n : 0; if (dek === 6) return x <= -9223372036854775808 ? -9223372036854775808n : x >= 9223372036854775808 ? 9223372036854775807n : BigInt(Math.trunc(x)); if (dek === 7) return x <= 0 ? 0n : x >= 18446744073709551616 ? 18446744073709551615n : BigInt(Math.trunc(x)); return _gs_sClamp(dek, Math.trunc(x)); } if (dek >= 6 && dek <= 7) return typeof x === \"bigint\" ? x : BigInt(Math.trunc(x)); return typeof x === \"bigint\" ? Number(dek >= 8 ? x : BigInt.asIntN(32, x)) : x; }\n");
+    bufPushStr(out, "function _gs_simdConvert(sln, sek, dln, dek, op, a) { if (op === 0) return new DataView(a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength)); const r = _gs_sNew(dln, dek), st = (op === 3 || op === 5) ? dln : 0; for (let i = 0; i < dln; i++) _gs_sSet(r, dek, i, op >= 4 ? _gs_sGet(a, sek, st + i) : _gs_sCastVal(sek, dek, _gs_sGet(a, sek, st + i))); return r; }\n");
+    bufPushStr(out, "function _gs_simdCombine(sln, sek, dln, dek, op, a, b) { const r = _gs_sNew(dln, dek); for (let i = 0; i < dln; i++) { const x = i < sln ? _gs_sGet(a, sek, i) : _gs_sGet(b, sek, i - sln); if (op === 0) _gs_sSet(r, dek, i, x); else if (op === 1) _gs_sSet(r, dek, i, _gs_sCastVal(sek, dek, x)); else { const bx = (dek <= 5 && typeof x === \"bigint\") ? Number(x < -9007199254740991n ? -9007199254740991n : x > 9007199254740991n ? 9007199254740991n : x) : x; _gs_sSet(r, dek, i, _gs_sClamp(dek, bx)); } } return r; }\n");
+    bufPushStr(out, "function _gs_simdLoadPtr(tb, p, off) { const r = new Uint8Array(tb), s = p.buf, o = p.off + off; r.set(s.subarray(o, o + tb), 0); return new DataView(r.buffer); }\n");
+    bufPushStr(out, "function _gs_simdLoadStr(tb, s, off) { const r = new Uint8Array(tb); r.set(s.subarray(off, Math.min(s.length, off + tb)), 0); return new DataView(r.buffer); }\n");
+    bufPushStr(out, "function _gs_simdStorePtr(tb, p, off, v) { p.buf.set(new Uint8Array(v.buffer, v.byteOffset, tb), p.off + off); }\n");
     bufPushStr(out, "function _gs_hostCall(path, args) { const parts = path.split(\".\"); let obj = globalThis; let parent = globalThis; for (const k of parts) { parent = obj; obj = obj == null ? undefined : obj[k]; } if (typeof obj !== \"function\") throw new Error(\"Geisha JS extern not found: \" + path); return _gs_fromJs(obj.apply(parent, args.map(_gs_toJs))); }\n\n")
 }
 
@@ -1908,6 +2081,8 @@ def typeToTs(adtReg: StrMap AdtInfo, ty: Type): String = match ty {
         } else if (base == "ImmArray") {
             let inner = match targs { Cons(t, _) -> typeToTs(adtReg, t), Nil -> "unknown" };
             "readonly (" + inner + ")[]"
+        } else if (base == "Simd") {
+            "DataView"
         } else if (strMapContains(adtReg, base)) {
             let argsTs = mapTypesToTs(adtReg, targs);
             tsTypeIdent(base) + "<" + strJoin(argsTs, ", ") + ">"
