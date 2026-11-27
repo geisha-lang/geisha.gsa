@@ -30,6 +30,8 @@ def evalUnOp : UnOp → Lit → Option Lit
   | .bitNot64, .int64 n => some (.int64 (~~~n))
   | .negFloat, .floatBits bits => some (.floatBits (-(Float.ofBits bits)).toBits)
   | .negFloat32, .float32Bits bits => some (.float32Bits (-(Float32.ofBits bits)).toBits)
+  | .intToI64, .int n => some (.int64 (Int64.ofInt n.toInt))
+  | .i64ToInt, .int64 n => some (.int (Int32.ofInt n.toInt))
   | _, _ => none
 
 /-- Result of evaluating a strict binary operator on two literal values. -/

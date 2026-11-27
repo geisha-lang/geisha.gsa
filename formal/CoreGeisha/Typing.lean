@@ -179,6 +179,8 @@ inductive UnOpHasType : UnOp → Ty → Ty → Prop where
   | bitNot64 : UnOpHasType .bitNot64 .int64 .int64
   | negFloat : UnOpHasType .negFloat .float .float
   | negFloat32 : UnOpHasType .negFloat32 .float32 .float32
+  | intToI64 : UnOpHasType .intToI64 .int .int64
+  | i64ToInt : UnOpHasType .i64ToInt .int64 .int
 
 /-- Binary operator typing judgment. -/
 inductive BinOpHasType : BinOp → Ty → Ty → Ty → Prop where

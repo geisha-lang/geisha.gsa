@@ -569,4 +569,97 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_zero_bad_inv.gscore" 2>/dev/null; t
     echo "FAIL [vcg_cross_zero_inv_lean]: Lean geisha-check --verify-vcg accepted entry invariant false!" >&2
     exit 1
 fi
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv)"
+
+# T1: Local Cell<Int> across while loop (havocCells preserves cellTys -> typed sym, no .getD .int)
+cat > "$TMP_DIR/vcg_local_cell.gsa" << 'EOF'
+def localCellWhile(): Int
+    ensures r -> r == r
+= {
+    let c = cellNew(0);
+    while (false)
+        invariant true
+    { () };
+    cellGet(c)
+}
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_local_cell.gscore" "$TMP_DIR/vcg_local_cell.gsa" >/dev/null
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_local_cell.gscore"
+
+# T2: Int64 shift by 32-bit Int count (<< 64) and Int <-> Int64 casts
+cat > "$TMP_DIR/vcg_i64_casts.gsa" << 'EOF'
+def shift64(x: Int64): Int64
+    ensures r -> r == x
+= x << 64
+
+def roundtripI64(x: Int): Int64
+    ensures r -> i64ToInt(r) == x
+= intToI64(x)
+
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_i64_casts.gscore" "$TMP_DIR/vcg_i64_casts.gsa" >/dev/null
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_i64_casts.gscore"
+
+# T3: Mutual recursion SCC decreases (positive + non-decreasing negative + missing-decreases negative)
+cat > "$TMP_DIR/vcg_mutrec_pos.gsa" << 'EOF'
+def isEven(n: Int): Bool
+    requires n >= 0
+    decreases n
+= if (n == 0) { true } else { isOdd(n - 1) }
+
+def isOdd(n: Int): Bool
+    requires n >= 0
+    decreases n
+= if (n == 0) { false } else { isEven(n - 1) }
+
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_mutrec_pos.gscore" "$TMP_DIR/vcg_mutrec_pos.gsa" >/dev/null
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_pos.gscore"
+
+cat > "$TMP_DIR/vcg_mutrec_nondec.gsa" << 'EOF'
+def badEven(n: Int): Bool
+    requires n >= 0
+    decreases n
+= if (n == 0) { true } else { badOdd(n) }
+
+def badOdd(n: Int): Bool
+    requires n >= 0
+    decreases n
+= if (n == 0) { false } else { badEven(n - 1) }
+
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_mutrec_nondec.gscore" "$TMP_DIR/vcg_mutrec_nondec.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_cross_mutrec_nondec_compiler]: geisha verify accepted non-decreasing mutual recursion!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_mutrec_nondec.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_nondec.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_mutrec_nondec_lean]: Lean geisha-check --verify-vcg accepted non-decreasing mutual recursion!" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/vcg_mutrec_missing.gsa" << 'EOF'
+def missEven(n: Int): Bool
+    requires n >= 0
+    decreases n
+= if (n == 0) { true } else { missOdd(n - 1) }
+
+def missOdd(n: Int): Bool
+    requires n >= 0
+= if (n == 0) { false } else { missEven(n - 1) }
+
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_mutrec_missing.gscore" "$TMP_DIR/vcg_mutrec_missing.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_cross_mutrec_missing_compiler]: geisha verify accepted mutual recursion missing decreases!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_mutrec_missing.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_missing.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_mutrec_missing_lean]: Lean geisha-check --verify-vcg accepted mutual recursion missing decreases!" >&2
+    exit 1
+fi
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases)"

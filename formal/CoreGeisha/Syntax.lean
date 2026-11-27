@@ -116,6 +116,8 @@ inductive UnOp where
   | bitNot64 : UnOp    -- `~` on Int64
   | negFloat : UnOp    -- unary `-` on Float
   | negFloat32 : UnOp  -- unary `-` on Float32
+  | intToI64 : UnOp    -- sign-extending Int -> Int64 cast
+  | i64ToInt : UnOp    -- truncating Int64 -> Int cast
   deriving Repr, BEq, DecidableEq
 
 /-- Binary operators (`BinOp` in `src/ast.gsa`, monomorphized by operand type). -/

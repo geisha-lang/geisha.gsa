@@ -1822,6 +1822,12 @@ theorem unOp_eval_progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : Task
   | negFloat32 =>
     rcases canonical_float32 ht1 hv1 with ⟨bits, rfl⟩
     exact ⟨_, σ, .none, .unVal (l' := .float32Bits (-(Float32.ofBits bits)).toBits) rfl⟩
+  | intToI64 =>
+    rcases canonical_int ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int64 (Int64.ofInt n.toInt)) rfl⟩
+  | i64ToInt =>
+    rcases canonical_int64 ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int (Int32.ofInt n.toInt)) rfl⟩
 
 theorem binOp_eval_progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     {pool : ConcPool} {σ : Store} {op : BinOp} {v1 v2 : Expr} {τ1 τ2 τr : Ty}

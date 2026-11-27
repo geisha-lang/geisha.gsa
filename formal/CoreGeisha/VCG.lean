@@ -1188,6 +1188,8 @@ def isModeledUnOp : UnOp → Bool
   | .bitNot => true
   | .neg64 => true
   | .bitNot64 => true
+  | .intToI64 => true
+  | .i64ToInt => true
   | .negFloat => false
   | .negFloat32 => false
 
@@ -1631,10 +1633,13 @@ structure LoopContract where
   dec : Option Expr := none
   deriving Repr
 
-/-- Verification environment providing callee contracts and loop invariants. -/
+/-- Verification environment providing callee contracts, loop invariants, and SCC decreases context. -/
 structure VcgEnv where
   contracts : Ident → Option FnContract := fun _ => none
   loops     : Expr → Expr → Option LoopContract := fun _ _ => none
+  curFn     : Ident := ""
+  curDec    : Option (Ty × SVal) := none
+  isSameScc : Ident → Ident → Bool := fun a b => a == b
 
 /-- Check that a list of heap locations contains no duplicates (pairwise non-aliasing). -/
 def noDupLocs : List Loc → Bool
@@ -1705,6 +1710,76 @@ def scalarTyEq : Ty → Ty → Bool
 
 theorem scalarTyEq_true {t1 t2 : Ty} (h : scalarTyEq t1 t2 = true) : t1 = t2 := by
   cases t1 <;> cases t2 <;> simp [scalarTyEq] at h <;> rfl
+
+/-- Collect `(symId, ty)` pairs from `.hasTy (.sym id) ty` atoms in a formula. -/
+def collectSymTys : SForm → List (SymId × Ty)
+  | .hasTy (.sym id) ty => [(id, ty)]
+  | .not p => collectSymTys p
+  | .and p q | .imp p q => collectSymTys p ++ collectSymTys q
+  | _ => []
+
+/-- Infer the modeled scalar type of a symbolic value `SVal` using `st.path` type facts.
+    Fail-closed (`none`) on `.loc`, unmodeled literals/ops, or untyped symbols. -/
+def inferSValTy (st : SymState) : SVal → Option Ty
+  | .lit (.int _) => some .int
+  | .lit (.int64 _) => some .int64
+  | .lit (.bool _) => some .bool
+  | .lit (.char _) => some .char
+  | .lit .unit => some .void
+  | .lit _ => none
+  | .sym id =>
+    match (collectSymTys st.path).find? (·.1 == id) with
+    | some (_, ty) => if isModeledScalarTy ty then some ty else none
+    | none => none
+  | .loc _ => none
+  | .un op e =>
+    match inferSValTy st e with
+    | none => none
+    | some _ =>
+      match op with
+      | .not => some .bool
+      | .neg | .bitNot | .i64ToInt => some .int
+      | .neg64 | .bitNot64 | .intToI64 => some .int64
+      | _ => none
+  | .bin op e1 e2 =>
+    match inferSValTy st e1, inferSValTy st e2 with
+    | some _, some _ =>
+      match op with
+      | .add | .sub | .mul | .div | .rem
+      | .bitAnd | .bitOr | .bitXor | .shlInt | .shrInt | .ushrInt => some .int
+      | .add64 | .sub64 | .mul64 | .div64 | .rem64
+      | .bitAnd64 | .bitOr64 | .bitXor64 | .shl64 | .shr64 | .ushr64 => some .int64
+      | .eqInt | .neInt | .ltInt | .leInt | .gtInt | .geInt
+      | .eq64 | .ne64 | .lt64 | .le64 | .gt64 | .ge64
+      | .eqBool | .neBool | .and | .or | .bitAndBool | .bitOrBool | .bitXorBool
+      | .eqChar | .neChar | .ltChar | .leChar | .gtChar | .geChar => some .bool
+      | _ => none
+    | _, _ => none
+  | .ite c t e =>
+    match inferSValTy st c, inferSValTy st t, inferSValTy st e with
+    | some .bool, some t1, some t2 => if scalarTyEq t1 t2 then some t1 else none
+    | _, _, _ => none
+  | .getTag e =>
+    match inferSValTy st e with
+    | some _ => some .int
+    | none => none
+
+/-- Comparison operators and zero literal for `decreases` measures (`.int` and `.int64`). -/
+def decOpsForTy : Ty → Option (BinOp × BinOp × SVal)
+  | .int => some (.geInt, .ltInt, .lit (.int 0))
+  | .int64 => some (.ge64, .lt64, .lit (.int64 0))
+  | _ => none
+
+theorem valHasTy_lit_of_modeled {v : Expr} {ty : Ty}
+    (hm : isModeledScalarTy ty = true) (hvt : valHasTy v ty) :
+    ∃ l, v = .lit l := by
+  cases ty with
+  | int => rcases hvt with ⟨n, rfl⟩; exact ⟨.int n, rfl⟩
+  | int64 => rcases hvt with ⟨n, rfl⟩; exact ⟨.int64 n, rfl⟩
+  | bool => rcases hvt with ⟨b, rfl⟩; exact ⟨.bool b, rfl⟩
+  | char => rcases hvt with ⟨c, rfl, _⟩; exact ⟨.char c, rfl⟩
+  | void => exact ⟨.unit, hvt⟩
+  | _ => simp [isModeledScalarTy] at hm
 
 /-- Check argument-to-parameter type compatibility for modular calls:
     - `Cell elemTy` parameters must receive `.loc l` (no symbolic/scalar confusion);
@@ -1795,6 +1870,60 @@ def vcgenPure (st : SymState) (e : Expr) : Option (SymState × SVal) :=
     | some (st1, sv1) => some (st1, .getTag sv1)
   | _ => none
 termination_by sizeOf e
+
+/-- Emit pre-iteration loop `decreases >= 0` obligation (supports `.int` and `.int64`). -/
+def checkLoopPreDec (stBodyIn0 : SymState) (decOpt : Option Expr) :
+    Option (SymState × Option (Ty × SVal)) :=
+  match decOpt with
+  | none => some (stBodyIn0, none)
+  | some decE =>
+    match vcgenPure stBodyIn0 decE with
+    | none => none
+    | some (stD0, svD0) =>
+      match inferSValTy stD0 svD0 with
+      | none => none
+      | some decTy =>
+        match decOpsForTy decTy with
+        | none => none
+        | some (geOp, _, zeroLit) =>
+          some (emitOb stD0 (.isTrue (.bin geOp svD0 zeroLit)), some (decTy, svD0))
+
+/-- Emit post-iteration loop `decreases' < decreases` obligation. -/
+def checkLoopPostDec (stB : SymState) (decOpt : Option Expr) (svD0Opt : Option (Ty × SVal)) :
+    Option SymState :=
+  match decOpt, svD0Opt with
+  | some decE, some (decTy, svD0) =>
+    match vcgenPure stB decE with
+    | none => none
+    | some (stD1, svD1) =>
+      match inferSValTy stD1 svD1, decOpsForTy decTy with
+      | some decTy1, some (_, ltOp, _) =>
+        if scalarTyEq decTy1 decTy then
+          some (emitOb stD1 (.isTrue (.bin ltOp svD1 svD0)))
+        else none
+      | _, _ => none
+  | _, _ => some stB
+
+/-- Emit self- or mutual-recursive SCC call-edge `decreases` obligation (fail-closed if callee lacks `decreases`). -/
+def checkCallDecreases (env : VcgEnv) (calleeName : Ident) (fc : FnContract)
+    (stChecked0 : SymState) : Option SymState :=
+  match env.curDec with
+  | some (curTy, curSv) =>
+    if env.isSameScc env.curFn calleeName then
+      match fc.dec with
+      | none => none
+      | some calleeDecE =>
+        match vcgenPure stChecked0 calleeDecE with
+        | none => none
+        | some (stDec, nextSv) =>
+          match inferSValTy stDec nextSv, decOpsForTy curTy with
+          | some nextTy, some (geOp, ltOp, zeroLit) =>
+            if scalarTyEq nextTy curTy then
+              some (emitOb stDec (.isTrue (.bin .and (.bin geOp curSv zeroLit) (.bin ltOp nextSv curSv))))
+            else none
+          | _, _ => none
+    else some stChecked0
+  | none => some stChecked0
 
 mutual
 /-- Executable, fail-closed Verification Condition Generator mirroring `src/verify.gsa`.
@@ -1889,8 +2018,17 @@ def vcgen (env : VcgEnv) (st : SymState) (e : Expr) : Option (SymState × SVal) 
     match vcgen env st e1 with
     | none => none
     | some (st1, sv1) =>
-      let l := st1.nextLoc
-      some ({ st1 with nextLoc := l + 1, cells := (l, sv1) :: st1.cells }, .loc l)
+      match inferSValTy st1 sv1 with
+      | none => none
+      | some elemTy =>
+        if !isModeledScalarTy elemTy then none
+        else
+          let st1' := emitOb st1 (.hasTy sv1 elemTy)
+          let l := st1'.nextLoc
+          some ({ st1' with
+                  nextLoc := l + 1
+                  cells := (l, sv1) :: st1'.cells
+                  cellTys := (l, elemTy) :: st1'.cellTys }, .loc l)
   | .cellGet e1 =>
     match vcgen env st e1 with
     | none => none
@@ -1942,15 +2080,7 @@ def vcgen (env : VcgEnv) (st : SymState) (e : Expr) : Option (SymState × SVal) 
             else
               -- 5. Optional pre-iteration `decreases >= 0` check, then body, then `decreases' < decreases` & `inv`
               let stBodyIn0 := withPath stC (.isTrue svC)
-              let preDecRes : Option (SymState × Option SVal) :=
-                match lc.dec with
-                | none => some (stBodyIn0, none)
-                | some decE =>
-                  match vcgenPure stBodyIn0 decE with
-                  | none => none
-                  | some (stD0, svD0) =>
-                    some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)
-              match preDecRes with
+              match checkLoopPreDec stBodyIn0 lc.dec with
               | none => none
               | some (stBodyIn, svD0Opt) =>
                 match vcgen env stBodyIn b with
@@ -1958,15 +2088,7 @@ def vcgen (env : VcgEnv) (st : SymState) (e : Expr) : Option (SymState × SVal) 
                 | some (stB, _) =>
                   if stB.nextLoc != stC.nextLoc then none
                   else
-                    let postDecRes : Option SymState :=
-                      match lc.dec, svD0Opt with
-                      | some decE, some svD0 =>
-                        match vcgenPure stB decE with
-                        | none => none
-                        | some (stD1, svD1) =>
-                          some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                      | _, _ => some stB
-                    match postDecRes with
+                    match checkLoopPostDec stB lc.dec svD0Opt with
                     | none => none
                     | some stBDec =>
                       match vcgenPure stBDec lc.inv with
@@ -2016,24 +2138,27 @@ def vcgen (env : VcgEnv) (st : SymState) (e : Expr) : Option (SymState × SVal) 
                 match vcgenPure { stTyped with vars := paramBindings } fc.req with
                 | none => none
                 | some (stReq, svReq) =>
-                  let stChecked := emitOb stReq (.isTrue svReq)
-                  -- Havoc mutable `Loc` arguments and allocate fresh typed return symbol
-                  let stHav := havocCells stChecked locArgs
-                  let retId := stHav.nextSym
-                  let stRet : SymState :=
-                    { stHav with
-                      nextSym := retId + 1
-                      vars := (fc.retVar, .sym retId) :: paramBindings
-                      path := .and stHav.path (.hasTy (.sym retId) fc.retTy) }
-                  match vcgenPure stRet fc.ens with
+                  let stChecked0 := emitOb stReq (.isTrue svReq)
+                  match checkCallDecreases env name fc stChecked0 with
                   | none => none
-                  | some (stEns, svEns) =>
-                    let stPost : SymState :=
-                      { nextSym := stEns.nextSym, nextLoc := stA.nextLoc,
-                        vars := stA.vars, cells := stHav.cells, cellTys := stA.cellTys,
-                        path := .and (.and stHav.path (.hasTy (.sym retId) fc.retTy)) (.isTrue svEns),
-                        obs := stEns.obs }
-                    some (stPost, .sym retId)
+                  | some stChecked =>
+                    -- Havoc mutable `Loc` arguments and allocate fresh typed return symbol
+                    let stHav := havocCells stChecked locArgs
+                    let retId := stHav.nextSym
+                    let stRet : SymState :=
+                      { stHav with
+                        nextSym := retId + 1
+                        vars := (fc.retVar, .sym retId) :: paramBindings
+                        path := .and stHav.path (.hasTy (.sym retId) fc.retTy) }
+                    match vcgenPure stRet fc.ens with
+                    | none => none
+                    | some (stEns, svEns) =>
+                      let stPost : SymState :=
+                        { nextSym := stEns.nextSym, nextLoc := stA.nextLoc,
+                          vars := stA.vars, cells := stHav.cells, cellTys := stA.cellTys,
+                          path := .and (.and stHav.path (.hasTy (.sym retId) fc.retTy)) (.isTrue svEns),
+                          obs := stEns.obs }
+                      some (stPost, .sym retId)
   | _ => none
 termination_by sizeOf e
 
@@ -2100,18 +2225,11 @@ def verifyFn (env : VcgEnv) (fd : FunDef) (fc : FnContract) : Option (List SForm
       | none => none
       | some (stReq, svReq) =>
         let stAssumed0 := withPath stReq (.isTrue svReq)
-        let stAssumedOpt : Option SymState :=
-          match fc.dec with
-          | none => some stAssumed0
-          | some decE =>
-            match vcgenPure stAssumed0 decE with
-            | none => none
-            | some (stDec, svDec) =>
-              some (emitOb stDec (.isTrue (.bin .geInt svDec (.lit (.int 0)))))
-        match stAssumedOpt with
+        match checkLoopPreDec stAssumed0 fc.dec with
         | none => none
-        | some stAssumed =>
-          match vcgen env stAssumed fd.body with
+        | some (stAssumed, curDecOpt) =>
+          let bodyEnv : VcgEnv := { env with curFn := fd.name, curDec := curDecOpt }
+          match vcgen bodyEnv stAssumed fd.body with
           | none => none
           | some (stBody, svRet) =>
             match vcgenPure { stBody with vars := (fc.retVar, svRet) :: stBody.vars } fc.ens with
@@ -3078,6 +3196,112 @@ def CalleeSound (Δ : AdtEnv) (Φ : FunEnv) (env : VcgEnv) (bound : Nat) : Prop 
 
 /- Well-formedness and obligation monotonicity for `vcgen` (straight-line, control-flow,
    cells, loops, and modular calls). -/
+theorem checkLoopPreDec_props {st0 st1 : SymState} {decOpt : Option Expr}
+    {svOpt : Option (Ty × SVal)}
+    (hwf : SymWf st0) (h : checkLoopPreDec st0 decOpt = some (st1, svOpt)) :
+    st1.nextSym = st0.nextSym ∧ st1.nextLoc = st0.nextLoc ∧ st1.vars = st0.vars ∧
+    st1.cells = st0.cells ∧ st1.cellTys = st0.cellTys ∧ st1.path = st0.path ∧
+    (∀ f ∈ st0.obs, f ∈ st1.obs) ∧ SymWf st1 := by
+  cases decOpt with
+  | none =>
+    simp [checkLoopPreDec] at h; rcases h with ⟨rfl, _⟩
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+  | some decE =>
+    simp only [checkLoopPreDec] at h
+    cases hd : vcgenPure st0 decE with
+    | none => simp [hd] at h
+    | some rd =>
+      rcases rd with ⟨stD0, svD0⟩; simp only [hd] at h
+      cases hty : inferSValTy stD0 svD0 with
+      | none => simp [hty] at h
+      | some decTy =>
+        simp only [hty] at h
+        cases hops : decOpsForTy decTy with
+        | none => simp [hops] at h
+        | some rops =>
+          rcases rops with ⟨geOp, ltOp, zeroLit⟩
+          simp [hops] at h; rcases h with ⟨rfl, _⟩
+          rcases vcgenPure_wf hwf hd with ⟨hs, hl, hv, hc, hp, ho, _⟩
+          have hct := vcgenPure_cellTys_eq hd
+          refine ⟨hs, hl, hv, hc, hct, hp, fun f hf => List.mem_cons_of_mem _ (ho f hf), ?_⟩
+          exact ⟨by simp only [emitOb, hs, hv]; exact hwf.vars_bound,
+            by simp only [emitOb, hs, hl, hc]; exact hwf.cells_bound,
+            by simp only [emitOb, hs, hp]; exact hwf.path_bound⟩
+
+theorem checkLoopPostDec_props {st0 st1 : SymState} {decOpt : Option Expr}
+    {svOpt : Option (Ty × SVal)}
+    (hwf : SymWf st0) (h : checkLoopPostDec st0 decOpt svOpt = some st1) :
+    st1.nextSym = st0.nextSym ∧ st1.nextLoc = st0.nextLoc ∧ st1.vars = st0.vars ∧
+    st1.cells = st0.cells ∧ st1.cellTys = st0.cellTys ∧ st1.path = st0.path ∧
+    (∀ f ∈ st0.obs, f ∈ st1.obs) ∧ SymWf st1 := by
+  cases decOpt <;> cases svOpt <;> simp only [checkLoopPostDec] at h
+  · cases h; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+  · cases h; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+  · cases h; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+  · rename_i decE p; rcases p with ⟨decTy, svD0⟩
+    cases hd : vcgenPure st0 decE with
+    | none => simp [hd] at h
+    | some rd =>
+      rcases rd with ⟨stD1, svD1⟩; simp only [hd] at h
+      cases hty : inferSValTy stD1 svD1 with
+      | none => simp [hty] at h
+      | some decTy1 =>
+        cases hops : decOpsForTy decTy with
+        | none => simp [hty, hops] at h
+        | some rops =>
+          rcases rops with ⟨geOp, ltOp, zeroLit⟩
+          simp only [hty, hops] at h
+          split at h
+          · cases h
+            rcases vcgenPure_wf hwf hd with ⟨hs, hl, hv, hc, hp, ho, _⟩
+            have hct := vcgenPure_cellTys_eq hd
+            refine ⟨hs, hl, hv, hc, hct, hp, fun f hf => List.mem_cons_of_mem _ (ho f hf), ?_⟩
+            exact ⟨by simp only [emitOb, hs, hv]; exact hwf.vars_bound,
+              by simp only [emitOb, hs, hl, hc]; exact hwf.cells_bound,
+              by simp only [emitOb, hs, hp]; exact hwf.path_bound⟩
+          · cases h
+
+theorem checkCallDecreases_props {env : VcgEnv} {nm : Ident} {fc : FnContract}
+    {st0 st1 : SymState}
+    (hwf : SymWf st0) (h : checkCallDecreases env nm fc st0 = some st1) :
+    st1.nextSym = st0.nextSym ∧ st1.nextLoc = st0.nextLoc ∧ st1.vars = st0.vars ∧
+    st1.cells = st0.cells ∧ st1.cellTys = st0.cellTys ∧ st1.path = st0.path ∧
+    (∀ f ∈ st0.obs, f ∈ st1.obs) ∧ SymWf st1 := by
+  unfold checkCallDecreases at h
+  cases hcur : env.curDec with
+  | none =>
+    simp [hcur] at h; subst h
+    exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+  | some p =>
+    rcases p with ⟨curTy, curSv⟩; simp only [hcur] at h
+    split at h
+    · cases hdec : fc.dec with
+      | none => simp [hdec] at h
+      | some calleeDecE =>
+        simp only [hdec] at h
+        cases hd : vcgenPure st0 calleeDecE with
+        | none => simp [hd] at h
+        | some rd =>
+          rcases rd with ⟨stDec, nextSv⟩; simp only [hd] at h
+          cases hty : inferSValTy stDec nextSv with
+          | none => simp [hty] at h
+          | some nextTy =>
+            cases hops : decOpsForTy curTy with
+            | none => simp [hty, hops] at h
+            | some rops =>
+              rcases rops with ⟨geOp, ltOp, zeroLit⟩
+              simp only [hty, hops] at h
+              split at h
+              · cases h
+                rcases vcgenPure_wf hwf hd with ⟨hs, hl, hv, hc, hp, ho, _⟩
+                have hct := vcgenPure_cellTys_eq hd
+                refine ⟨hs, hl, hv, hc, hct, hp, fun f hf => List.mem_cons_of_mem _ (ho f hf), ?_⟩
+                exact ⟨by simp only [emitOb, hs, hv]; exact hwf.vars_bound,
+                  by simp only [emitOb, hs, hl, hc]; exact hwf.cells_bound,
+                  by simp only [emitOb, hs, hp]; exact hwf.path_bound⟩
+              · cases h
+    · cases h; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwf⟩
+
 mutual
 theorem vcgen_wf {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
     (hwf : SymWf st) (hvc : vcgen env st e = some (st', sv)) :
@@ -3254,14 +3478,20 @@ theorem vcgen_wf {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
     | some r1 =>
-      rcases r1 with ⟨st1, sv1⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, rfl⟩
-      rcases vcgen_wf hwf h1 with ⟨hs1, hl1, hv1, ho1, hwf1, hb1⟩
-      refine ⟨hs1, Nat.le_trans hl1 (Nat.le_succ _), hv1, ho1, ?_, trivial⟩
-      refine ⟨hwf1.vars_bound, ?_, hwf1.path_bound⟩
-      intro p hp
-      rcases List.mem_cons.mp hp with rfl | hp'
-      · exact ⟨Nat.lt_succ_self _, hb1⟩
-      · exact ⟨Nat.lt_succ_of_lt (hwf1.cells_bound p hp').1, (hwf1.cells_bound p hp').2⟩
+      rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      cases hty : inferSValTy st1 sv1 with
+      | none => simp [hty] at hvc
+      | some elemTy =>
+        simp only [hty] at hvc; split at hvc
+        · cases hvc
+        · rcases hvc with ⟨rfl, rfl⟩
+          rcases vcgen_wf hwf h1 with ⟨hs1, hl1, hv1, ho1, hwf1, hb1⟩
+          refine ⟨hs1, Nat.le_trans hl1 (Nat.le_succ _), hv1, fun f hf => List.mem_cons_of_mem _ (ho1 f hf), ?_, trivial⟩
+          refine ⟨hwf1.vars_bound, ?_, hwf1.path_bound⟩
+          intro p hp
+          rcases List.mem_cons.mp hp with rfl | hp'
+          · exact ⟨Nat.lt_succ_self _, hb1⟩
+          · exact ⟨Nat.lt_succ_of_lt (hwf1.cells_bound p hp').1, (hwf1.cells_bound p hp').2⟩
   | cellGet e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
@@ -3363,34 +3593,11 @@ theorem vcgen_wf {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
             · cases hvc
             · rcases vcgen_wf hwfLE hC with ⟨hsC, hlC, hvC, hoC, hwfC, hbC⟩
               have hwfB0 : SymWf (withPath stC (.isTrue svC)) := symWf_withPath hwfC (c := .isTrue svC) hbC
-              cases hPre : (match lc.dec with
-                  | none => some (withPath stC (.isTrue svC), none)
-                  | some decE =>
-                    match vcgenPure (withPath stC (.isTrue svC)) decE with
-                    | none => none
-                    | some (stD0, svD0) =>
-                      some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)) with
+              cases hPre : checkLoopPreDec (withPath stC (.isTrue svC)) lc.dec with
               | none => simp [hPre] at hvc
               | some rPre =>
                 rcases rPre with ⟨stBodyIn, svD0Opt⟩; simp only [hPre] at hvc
-                have hPreProps : stBodyIn.nextSym = stC.nextSym ∧ stBodyIn.nextLoc = stC.nextLoc ∧
-                    (∀ f ∈ stC.obs, f ∈ stBodyIn.obs) ∧ SymWf stBodyIn := by
-                  cases hdc : lc.dec with
-                  | none =>
-                    simp [hdc] at hPre; rcases hPre with ⟨rfl, _⟩
-                    exact ⟨rfl, rfl, fun _ hf => hf, hwfB0⟩
-                  | some decE =>
-                    simp [hdc] at hPre
-                    cases hd0 : vcgenPure (withPath stC (.isTrue svC)) decE with
-                    | none => simp [hd0] at hPre
-                    | some rd0 =>
-                      rcases rd0 with ⟨stD0, svD0⟩; simp [hd0] at hPre; rcases hPre with ⟨rfl, _⟩
-                      rcases vcgenPure_wf hwfB0 hd0 with ⟨hsd0, hld0, hvd0, hcd0, hpd0, hod0, _⟩
-                      refine ⟨hsd0, hld0, fun f hf => List.mem_cons_of_mem _ (hod0 f hf), ?_⟩
-                      exact ⟨by simp only [emitOb, hsd0, hvd0]; exact hwfB0.vars_bound,
-                        by simp only [emitOb, hsd0, hld0, hcd0]; exact hwfB0.cells_bound,
-                        by simp only [emitOb, hsd0, hpd0]; exact hwfB0.path_bound⟩
-                rcases hPreProps with ⟨hsPre, hlPre, hoPre, hwfBodyIn⟩
+                rcases checkLoopPreDec_props hwfB0 hPre with ⟨hsPre, hlPre, _, _, _, _, hoPre, hwfBodyIn⟩
                 cases hB : vcgen env stBodyIn b with
                 | none => simp [hB] at hvc
                 | some rB =>
@@ -3398,38 +3605,17 @@ theorem vcgen_wf {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
                   split at hvc
                   · cases hvc
                   · rcases vcgen_wf hwfBodyIn hB with ⟨hsB, _, _, hoB, hwfB, _⟩
-                    cases hPost : (match lc.dec, svD0Opt with
-                        | some decE, some svD0 =>
-                          match vcgenPure stB decE with
-                          | none => none
-                          | some (stD1, svD1) =>
-                            some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                        | _, _ => some stB) with
+                    cases hPost : checkLoopPostDec stB lc.dec svD0Opt with
                     | none => simp [hPost] at hvc
                     | some stBDec =>
                       simp only [hPost] at hvc
-                      have hPostProps : stBDec.nextSym = stB.nextSym ∧ (∀ f ∈ stB.obs, f ∈ stBDec.obs) ∧ SymWf stBDec := by
-                        cases hdc : lc.dec <;> cases hsv0 : svD0Opt <;> simp [hdc, hsv0] at hPost
-                        · subst hPost; exact ⟨rfl, fun _ hf => hf, hwfB⟩
-                        · subst hPost; exact ⟨rfl, fun _ hf => hf, hwfB⟩
-                        · subst hPost; exact ⟨rfl, fun _ hf => hf, hwfB⟩
-                        · rename_i decE svD0
-                          cases hd1 : vcgenPure stB decE with
-                          | none => simp [hd1] at hPost
-                          | some rd1 =>
-                            rcases rd1 with ⟨stD1, svD1⟩; simp [hd1] at hPost; subst hPost
-                            rcases vcgenPure_wf hwfB hd1 with ⟨hsd1, hld1, hvd1, hcd1, hpd1, hod1, _⟩
-                            refine ⟨hsd1, fun f hf => List.mem_cons_of_mem _ (hod1 f hf), ?_⟩
-                            exact ⟨by simp only [emitOb, hsd1, hvd1]; exact hwfB.vars_bound,
-                              by simp only [emitOb, hsd1, hld1, hcd1]; exact hwfB.cells_bound,
-                              by simp only [emitOb, hsd1, hpd1]; exact hwfB.path_bound⟩
-                      rcases hPostProps with ⟨hsPost, hoPost, hwfBDec⟩
+                      rcases checkLoopPostDec_props hwfB hPost with ⟨hsPost, _, _, _, _, _, hoPost, hwfBDec⟩
                       cases hBI : vcgenPure stBDec lc.inv with
                       | none => simp [hBI] at hvc
                       | some rBI =>
                         rcases rBI with ⟨stBI, svBI⟩; simp [hBI] at hvc; rcases hvc with ⟨rfl, rfl⟩
                         rcases vcgenPure_wf hwfBDec hBI with ⟨hsBI, _, _, _, _, hoBI, _⟩
-                        simp only [emitOb_nextSym, emitOb_nextLoc, withPath_nextSym, withPath_nextLoc] at hsH hlH hsC hlC hsB
+                        simp only [emitOb_nextSym, emitOb_nextLoc, withPath_nextSym, withPath_nextLoc] at hsH hlH hsC hlC hsB hsPre
                         have hsAll1 : st.nextSym ≤ stC.nextSym := by omega
                         have hsAll2 : stC.nextSym ≤ stBI.nextSym := by omega
                         have hlAll : st.nextLoc ≤ stC.nextLoc := by omega
@@ -3477,64 +3663,70 @@ theorem vcgen_wf {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
                   | some rReq =>
                     rcases rReq with ⟨stReq, svReq⟩; simp only [hReq] at hvc
                     rcases vcgenPure_wf hwfCall hReq with ⟨hsReq, hlReq, hvReq, hcReq, hpReq, hoReq, _⟩
-                    let stChecked := emitOb stReq (.isTrue svReq)
-                    let locArgs := collectLocArgs svArgs
-                    have hlocAll : ∀ l ∈ locArgs, l < stChecked.nextLoc := by
-                      rename_i hcond
-                      have hcond' : noDupLocs (collectLocArgs svArgs) = true ∧ (collectLocArgs svArgs).all (· < stA.nextLoc) = true := by
-                        cases h1 : noDupLocs (collectLocArgs svArgs) <;>
-                        cases h2 : (collectLocArgs svArgs).all (· < stA.nextLoc) <;>
-                        simp_all
-                      have hall := List.all_eq_true.mp hcond'.2
-                      intro l hl
-                      have := hall l hl
-                      simp only [decide_eq_true_eq] at this
-                      simp only [stChecked, emitOb_nextLoc, hlReq, hlT]; exact this
-                    have hwfChecked : SymWf stChecked :=
-                      ⟨by simp only [stChecked, emitOb, hsReq, hvReq]; exact hwfCall.vars_bound,
-                       by simp only [stChecked, emitOb, hsReq, hlReq, hcReq]; exact hwfCall.cells_bound,
-                       by simp only [stChecked, emitOb, hsReq, hpReq]; exact hwfCall.path_bound⟩
-                    rcases havocCells_props stChecked locArgs hlocAll hwfChecked with
-                      ⟨hsHav, hlHav, _, _, hoHav, hwfHav, _, _⟩
-                    let stHav := havocCells stChecked locArgs
-                    let retId := stHav.nextSym
-                    have hwfRet : SymWf ({ stHav with
-                        nextSym := retId + 1,
-                        vars := (fc.retVar, .sym retId) :: (fc.params.map Prod.fst).zip svArgs,
-                        path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState) := by
-                      refine ⟨?_, ?_, ⟨sformBound_mono (Nat.le_succ _) hwfHav.path_bound, Nat.lt_succ_self _⟩⟩
-                      · intro p hp
-                        rcases List.mem_cons.mp hp with rfl | hp'
-                        · exact Nat.lt_succ_self _
-                        · have hb := hwfCall.vars_bound p hp'
-                          simp only [stChecked, emitOb_nextSym, hsReq] at hsHav
-                          exact svalBound_mono (Nat.le_trans hsHav (Nat.le_succ _)) hb
-                      · intro p hp
-                        exact ⟨(hwfHav.cells_bound p hp).1, svalBound_mono (Nat.le_succ _) (hwfHav.cells_bound p hp).2⟩
-                    cases hEns : vcgenPure ({ havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs) with
-                        nextSym := (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym + 1,
-                        vars := (fc.retVar, .sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
-                        path := .and (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
-                    | none => simp [hEns] at hvc
-                    | some rEns =>
-                      rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
-                      rcases vcgenPure_wf hwfRet hEns with ⟨hsEns, _, _, _, _, hoEns, hbEns⟩
-                      have hSymLe : stA.nextSym ≤ stEns.nextSym := by
-                        simp only [stChecked, emitOb_nextSym, hsReq, hsT] at hsHav
-                        exact Nat.le_trans hsHav (hsEns.symm ▸ Nat.le_succ _)
-                      refine ⟨Nat.le_trans hsA hSymLe, hlA, hvA, ?_, ?_, ?_⟩
-                      · intro f hf
-                        exact hoEns f (by change f ∈ stHav.obs; rw [hoHav]; exact List.mem_cons_of_mem _ (hoReq f (hoT f (hoA f hf))))
-                      · refine ⟨fun p hp => svalBound_mono hSymLe (hwfA.vars_bound p hp), ?_, ?_⟩
+                    let stChecked0 := emitOb stReq (.isTrue svReq)
+                    have hwfChecked0 : SymWf stChecked0 :=
+                      ⟨by simp only [stChecked0, emitOb, hsReq, hvReq]; exact hwfCall.vars_bound,
+                       by simp only [stChecked0, emitOb, hsReq, hlReq, hcReq]; exact hwfCall.cells_bound,
+                       by simp only [stChecked0, emitOb, hsReq, hpReq]; exact hwfCall.path_bound⟩
+                    cases hDec : checkCallDecreases env name fc (emitOb stReq (.isTrue svReq)) with
+                    | none => simp [hDec] at hvc
+                    | some stChecked =>
+                      simp only [hDec] at hvc
+                      rcases checkCallDecreases_props hwfChecked0 hDec with
+                        ⟨hsDec, hlDec, hvDec, hcDec, hctDec, hpDec, hoDec, hwfChecked⟩
+                      let locArgs := collectLocArgs svArgs
+                      have hlocAll : ∀ l ∈ locArgs, l < stChecked.nextLoc := by
+                        rename_i hcond
+                        have hcond' : noDupLocs (collectLocArgs svArgs) = true ∧ (collectLocArgs svArgs).all (· < stA.nextLoc) = true := by
+                          cases h1 : noDupLocs (collectLocArgs svArgs) <;>
+                          cases h2 : (collectLocArgs svArgs).all (· < stA.nextLoc) <;>
+                          simp_all
+                        have hall := List.all_eq_true.mp hcond'.2
+                        intro l hl
+                        have := hall l hl
+                        simp only [decide_eq_true_eq] at this
+                        rw [hlDec]; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT]; exact this
+                      rcases havocCells_props stChecked locArgs hlocAll hwfChecked with
+                        ⟨hsHav, hlHav, _, _, hoHav, hwfHav, _, _⟩
+                      let stHav := havocCells stChecked locArgs
+                      let retId := stHav.nextSym
+                      have hwfRet : SymWf ({ stHav with
+                          nextSym := retId + 1,
+                          vars := (fc.retVar, .sym retId) :: (fc.params.map Prod.fst).zip svArgs,
+                          path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState) := by
+                        refine ⟨?_, ?_, ⟨sformBound_mono (Nat.le_succ _) hwfHav.path_bound, Nat.lt_succ_self _⟩⟩
                         · intro p hp
-                          have hb := hwfHav.cells_bound p hp
-                          have hlEq : stHav.nextLoc = stA.nextLoc := by
-                            change (havocCells stChecked locArgs).nextLoc = stA.nextLoc
-                            rw [hlHav]; simp only [stChecked, emitOb_nextLoc, hlReq, hlT]
-                          exact ⟨hlEq ▸ hb.1, svalBound_mono (hsEns.symm ▸ Nat.le_succ _) hb.2⟩
-                        · exact ⟨⟨sformBound_mono (hsEns.symm ▸ Nat.le_succ _) hwfHav.path_bound, by rw [hsEns]; exact Nat.lt_succ_self _⟩, by rw [hsEns]; exact hbEns⟩
-                      · change retId < stEns.nextSym
-                        rw [hsEns]; exact Nat.lt_succ_self _
+                          rcases List.mem_cons.mp hp with rfl | hp'
+                          · exact Nat.lt_succ_self _
+                          · have hb := hwfCall.vars_bound p hp'
+                            rw [hsDec] at hsHav; simp only [stChecked0, emitOb_nextSym, hsReq] at hsHav
+                            exact svalBound_mono (Nat.le_trans hsHav (Nat.le_succ _)) hb
+                        · intro p hp
+                          exact ⟨(hwfHav.cells_bound p hp).1, svalBound_mono (Nat.le_succ _) (hwfHav.cells_bound p hp).2⟩
+                      cases hEns : vcgenPure ({ havocCells stChecked (collectLocArgs svArgs) with
+                          nextSym := (havocCells stChecked (collectLocArgs svArgs)).nextSym + 1,
+                          vars := (fc.retVar, .sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
+                          path := .and (havocCells stChecked (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
+                      | none => simp [hEns] at hvc
+                      | some rEns =>
+                        rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
+                        rcases vcgenPure_wf hwfRet hEns with ⟨hsEns, _, _, _, _, hoEns, hbEns⟩
+                        have hSymLe : stA.nextSym ≤ stEns.nextSym := by
+                          rw [hsDec] at hsHav; simp only [stChecked0, emitOb_nextSym, hsReq, hsT] at hsHav
+                          exact Nat.le_trans hsHav (hsEns.symm ▸ Nat.le_succ _)
+                        refine ⟨Nat.le_trans hsA hSymLe, hlA, hvA, ?_, ?_, ?_⟩
+                        · intro f hf
+                          exact hoEns f (by change f ∈ stHav.obs; rw [hoHav]; exact hoDec f (List.mem_cons_of_mem _ (hoReq f (hoT f (hoA f hf)))))
+                        · refine ⟨fun p hp => svalBound_mono hSymLe (hwfA.vars_bound p hp), ?_, ?_⟩
+                          · intro p hp
+                            have hb := hwfHav.cells_bound p hp
+                            have hlEq : stHav.nextLoc = stA.nextLoc := by
+                              change (havocCells stChecked locArgs).nextLoc = stA.nextLoc
+                              rw [hlHav, hlDec]; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT]
+                            exact ⟨hlEq ▸ hb.1, svalBound_mono (hsEns.symm ▸ Nat.le_succ _) hb.2⟩
+                          · exact ⟨⟨sformBound_mono (hsEns.symm ▸ Nat.le_succ _) hwfHav.path_bound, by rw [hsEns]; exact Nat.lt_succ_self _⟩, by rw [hsEns]; exact hbEns⟩
+                        · change retId < stEns.nextSym
+                          rw [hsEns]; exact Nat.lt_succ_self _
       · simp only [hAssume, ↓reduceIte] at hvc
         cases args with
         | cons e1 rest =>
@@ -4057,6 +4249,36 @@ theorem vcgenPure_cells_eq {st st' : SymState} {e : Expr} {sv : SVal}
   | _ => simp [vcgenPure] at hvc
 termination_by sizeOf e
 
+theorem checkCallDecreases_cells_eq {env : VcgEnv} {nm : Ident} {fc : FnContract}
+    {st0 st1 : SymState} (h : checkCallDecreases env nm fc st0 = some st1) :
+    st1.cells = st0.cells := by
+  unfold checkCallDecreases at h
+  cases hcur : env.curDec with
+  | none => simp [hcur] at h; subst h; rfl
+  | some p =>
+    rcases p with ⟨curTy, curSv⟩; simp only [hcur] at h
+    split at h
+    · cases hdec : fc.dec with
+      | none => simp [hdec] at h
+      | some calleeDecE =>
+        simp only [hdec] at h
+        cases hd : vcgenPure st0 calleeDecE with
+        | none => simp [hd] at h
+        | some rd =>
+          rcases rd with ⟨stDec, nextSv⟩; simp only [hd] at h
+          cases hty : inferSValTy stDec nextSv with
+          | none => simp [hty] at h
+          | some nextTy =>
+            cases hops : decOpsForTy curTy with
+            | none => simp [hty, hops] at h
+            | some rops =>
+              rcases rops with ⟨geOp, ltOp, zeroLit⟩
+              simp only [hty, hops] at h
+              split at h
+              · cases h; simpa [emitOb_cells] using vcgenPure_cells_eq hd
+              · cases h
+    · cases h; rfl
+
 /-- `locLookup` on `mergeCells` is `some` whenever `locLookup baseCells l` is `some`. -/
 theorem locLookup_mergeCells_isSome {svc : SVal} {base cellsT cellsE : List (Loc × SVal)}
     {l : Loc} (h : (locLookup base l).isSome = true) :
@@ -4177,11 +4399,17 @@ theorem vcgen_preserves_cell_dom {env : VcgEnv} {st st' : SymState} {e : Expr} {
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
     | some r1 =>
-      rcases r1 with ⟨st1, sv1⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩
-      simp only [locLookup]
-      cases (st1.nextLoc == l)
-      · exact vcgen_preserves_cell_dom h1 h
-      · rfl
+      rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      cases hty : inferSValTy st1 sv1 with
+      | none => simp [hty] at hvc
+      | some elemTy =>
+        simp only [hty] at hvc; split at hvc
+        · cases hvc
+        · rcases hvc with ⟨rfl, _⟩
+          simp only [locLookup, emitOb_nextLoc, emitOb_cells]
+          by_cases hEq : (st1.nextLoc == l) = true
+          · simp [hEq]
+          · simp [hEq]; exact vcgen_preserves_cell_dom h1 h
   | cellGet e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
@@ -4247,13 +4475,7 @@ theorem vcgen_preserves_cell_dom {env : VcgEnv} {st st' : SymState} {e : Expr} {
           | some rC =>
             rcases rC with ⟨stC, svC⟩; simp only [hC] at hvc; split at hvc
             · cases hvc
-            · cases hPre : (match lc.dec with
-                  | none => some (withPath stC (.isTrue svC), none)
-                  | some decE =>
-                    match vcgenPure (withPath stC (.isTrue svC)) decE with
-                    | none => none
-                    | some (stD0, svD0) =>
-                      some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)) with
+            · cases hPre : checkLoopPreDec (withPath stC (.isTrue svC)) lc.dec with
               | none => simp [hPre] at hvc
               | some rPre =>
                 rcases rPre with ⟨stBodyIn, svD0Opt⟩; simp only [hPre] at hvc
@@ -4262,13 +4484,7 @@ theorem vcgen_preserves_cell_dom {env : VcgEnv} {st st' : SymState} {e : Expr} {
                 | some rB =>
                   rcases rB with ⟨stB, _⟩; simp only [hB] at hvc; split at hvc
                   · cases hvc
-                  · cases hPost : (match lc.dec, svD0Opt with
-                        | some decE, some svD0 =>
-                          match vcgenPure stB decE with
-                          | none => none
-                          | some (stD1, svD1) =>
-                            some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                        | _, _ => some stB) with
+                  · cases hPost : checkLoopPostDec stB lc.dec svD0Opt with
                     | none => simp [hPost] at hvc
                     | some stBDec =>
                       simp only [hPost] at hvc
@@ -4308,16 +4524,21 @@ theorem vcgen_preserves_cell_dom {env : VcgEnv} {st st' : SymState} {e : Expr} {
                   | none => simp [hReq] at hvc
                   | some rReq =>
                     rcases rReq with ⟨stReq, svReq⟩; simp only [hReq] at hvc
-                    cases hEns : vcgenPure { havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs) with
-                        nextSym := (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym + 1,
-                        vars := (fc.retVar, .sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
-                        path := .and (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) fc.retTy) } fc.ens with
-                    | none => simp [hEns] at hvc
-                    | some rEns =>
-                      rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, _⟩
-                      apply locLookup_havocCells_isSome
-                      simp only [emitOb_cells, vcgenPure_cells_eq hReq, hcT]
-                      exact vcgenList_preserves_cell_dom hArgs h
+                    cases hDec : checkCallDecreases env name fc (emitOb stReq (.isTrue svReq)) with
+                    | none => simp [hDec] at hvc
+                    | some stChecked =>
+                      simp only [hDec] at hvc
+                      cases hEns : vcgenPure { havocCells stChecked (collectLocArgs svArgs) with
+                          nextSym := (havocCells stChecked (collectLocArgs svArgs)).nextSym + 1,
+                          vars := (fc.retVar, .sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
+                          path := .and (havocCells stChecked (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) fc.retTy) } fc.ens with
+                      | none => simp [hEns] at hvc
+                      | some rEns =>
+                        rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, _⟩
+                        apply locLookup_havocCells_isSome
+                        rw [checkCallDecreases_cells_eq hDec]
+                        simp only [emitOb_cells, vcgenPure_cells_eq hReq, hcT]
+                        exact vcgenList_preserves_cell_dom hArgs h
       · rw [hAssume] at hvc; simp only [↓reduceIte] at hvc
         cases args with
         | cons e1 rest =>
@@ -4419,10 +4640,11 @@ def assumeFunDef : FunDef :=
 def IntrinsicsOk (Φ : FunEnv) : Prop :=
   Φ "assert" = some assertFunDef ∧ Φ "assume" = some assumeFunDef
 
-/- `vcgen` never modifies `st.cellTys`. -/
+/- Whenever `vcgen` preserves `nextLoc` (no new local `cellNew`), it preserves `st.cellTys`. -/
 mutual
-theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
-    (hvc : vcgen env st e = some (st', sv)) : st'.cellTys = st.cellTys := by
+theorem vcgen_cellTys_of_nextLoc_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
+    (hwf : SymWf st) (hvc : vcgen env st e = some (st', sv)) (hloc : st'.nextLoc = st.nextLoc) :
+    st'.cellTys = st.cellTys := by
   cases e with
   | lit _ => simp only [vcgen] at hvc; split at hvc <;> cases hvc; rfl
   | var x => simp only [vcgen] at hvc; cases hlu : assocLookup st.vars x <;> simp [hlu] at hvc; rcases hvc with ⟨rfl, _⟩; rfl
@@ -4432,7 +4654,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
     · cases hvc
     · cases h1 : vcgen env st e1 with
       | none => simp [h1] at hvc
-      | some r1 => rcases r1 with ⟨st1, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_eq h1
+      | some r1 => rcases r1 with ⟨st1, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
   | bin op e1 e2 =>
     by_cases hAnd : op = .and
     · subst hAnd; simp only [vcgen, ↓reduceIte] at hvc
@@ -4443,7 +4665,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
         cases h2 : vcgen env (withPath st1 (.isTrue sv1)) e2 with
         | none => simp [h2] at hvc
         | some r2 => rcases r2 with ⟨_, _⟩; simp only [h2] at hvc; split at hvc; · cases hvc
-                     · cases hvc; simpa using vcgen_cellTys_eq h1
+                     · cases hvc; simpa using vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
     · by_cases hOr : op = .or
       · subst hOr; simp only [vcgen, reduceCtorEq, ↓reduceIte] at hvc
         cases h1 : vcgen env st e1 with
@@ -4453,30 +4675,45 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
           cases h2 : vcgen env (withPath st1 (.isFalse sv1)) e2 with
           | none => simp [h2] at hvc
           | some r2 => rcases r2 with ⟨_, _⟩; simp only [h2] at hvc; split at hvc; · cases hvc
-                       · cases hvc; simpa using vcgen_cellTys_eq h1
+                       · cases hvc; simpa using vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
       · simp only [vcgen, hAnd, hOr, ↓reduceIte] at hvc; split at hvc
         · cases hvc
         · cases h1 : vcgen env st e1 with
           | none => simp [h1] at hvc
           | some r1 =>
             rcases r1 with ⟨st1, _⟩; simp only [h1] at hvc
+            rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, hwf1, _⟩
             cases h2 : vcgen env st1 e2 with
             | none => simp [h2] at hvc
             | some r2 =>
               rcases r2 with ⟨st2, _⟩; simp only [h2] at hvc; cases hvc
-              split <;> exact (vcgen_cellTys_eq h2).trans (vcgen_cellTys_eq h1)
+              rcases vcgen_wf hwf1 h2 with ⟨_, hl2, _, _, _, _⟩
+              by_cases hdiv : isDivOp op <;> simp only [hdiv, ↓reduceIte, Bool.false_eq_true, emitOb_nextLoc, emitOb_cellTys] at hloc ⊢
+              · have h1eq : st1.nextLoc = st.nextLoc := by omega
+                have h2eq : st2.nextLoc = st1.nextLoc := by omega
+                exact (vcgen_cellTys_of_nextLoc_eq hwf1 h2 h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
+              · have h1eq : st1.nextLoc = st.nextLoc := by omega
+                have h2eq : st2.nextLoc = st1.nextLoc := by omega
+                exact (vcgen_cellTys_of_nextLoc_eq hwf1 h2 h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
   | let_ x e1 e2 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
     | some r1 =>
       rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, hwf1, hb1⟩
+      have hwf1' : SymWf { st1 with vars := (x, sv1) :: st1.vars } :=
+        ⟨fun p hp => by rcases List.mem_cons.mp hp with rfl | hp'; exact hb1; exact hwf1.vars_bound p hp',
+         hwf1.cells_bound, hwf1.path_bound⟩
       cases h2 : vcgen env { st1 with vars := (x, sv1) :: st1.vars } e2 with
       | none => simp [h2] at hvc
       | some r2 =>
         rcases r2 with ⟨st2, _⟩; simp [h2] at hvc; rcases hvc with ⟨rfl, _⟩
-        exact (vcgen_cellTys_eq h2).trans (by simpa using vcgen_cellTys_eq h1)
-  | block es => simp only [vcgen] at hvc; exact vcgenBlock_cellTys_eq hvc
+        rcases vcgen_wf hwf1' h2 with ⟨_, hl2, _, _, _, _⟩
+        have h1eq : st1.nextLoc = st.nextLoc := by simp only at hloc hl2; omega
+        have h2eq : st2.nextLoc = st1.nextLoc := by simp only at hloc hl2; omega
+        exact (vcgen_cellTys_of_nextLoc_eq hwf1' h2 h2eq).trans (by simpa using vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
+  | block es => simp only [vcgen] at hvc; exact vcgenBlock_cellTys_of_nextLoc_eq hwf hvc hloc
   | if_ c t e =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st c with
@@ -4491,12 +4728,21 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
         | none => simp [hE] at hvc
         | some rE =>
           rcases rE with ⟨_, _⟩; simp only [hE] at hvc; split at hvc; · cases hvc
-          · cases hvc; simpa using vcgen_cellTys_eq h1
+          · cases hvc; simpa using vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
   | cellNew e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
-    | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; simpa using vcgen_cellTys_eq h1
+    | some r1 =>
+      rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      cases hty : inferSValTy st1 sv1 with
+      | none => simp [hty] at hvc
+      | some elemTy =>
+        simp only [hty] at hvc; split at hvc
+        · cases hvc
+        · rcases hvc with ⟨rfl, _⟩
+          rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, _, _⟩
+          simp only [emitOb_nextLoc] at hloc; omega
   | cellGet e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
@@ -4504,7 +4750,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
     | some r1 =>
       rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
       cases sv1 with
-      | loc l => simp only at hvc; cases hlu : locLookup st1.cells l <;> simp [hlu] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_eq h1
+      | loc l => simp only at hvc; cases hlu : locLookup st1.cells l <;> simp [hlu] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
       | _ => simp at hvc
   | cellSet e1 e2 =>
     simp only [vcgen] at hvc
@@ -4512,6 +4758,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
     | none => simp [h1] at hvc
     | some r1 =>
       rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, hwf1, _⟩
       cases sv1 with
       | loc l =>
         simp only at hvc
@@ -4519,17 +4766,24 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
         | none => simp [h2] at hvc
         | some r2 =>
           rcases r2 with ⟨st2, _⟩; simp only [h2] at hvc
+          rcases vcgen_wf hwf1 h2 with ⟨_, hl2, _, _, _, _⟩
           cases hlu : locLookup st2.cells l <;> simp only [hlu] at hvc
           · cases hvc
           · cases hct : locLookup st2.cellTys l <;> simp [hct] at hvc
-            · rcases hvc with ⟨rfl, _⟩; exact (vcgen_cellTys_eq h2).trans (vcgen_cellTys_eq h1)
-            · rcases hvc with ⟨rfl, _⟩; exact (vcgen_cellTys_eq h2).trans (vcgen_cellTys_eq h1)
+            · rcases hvc with ⟨rfl, _⟩
+              have h1eq : st1.nextLoc = st.nextLoc := by simp only at hloc; omega
+              have h2eq : st2.nextLoc = st1.nextLoc := by simp only at hloc; omega
+              exact (vcgen_cellTys_of_nextLoc_eq hwf1 h2 h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
+            · rcases hvc with ⟨rfl, _⟩
+              have h1eq : st1.nextLoc = st.nextLoc := by simp only [emitOb_nextLoc] at hloc; omega
+              have h2eq : st2.nextLoc = st1.nextLoc := by simp only [emitOb_nextLoc] at hloc; omega
+              simpa [emitOb_cellTys] using (vcgen_cellTys_of_nextLoc_eq hwf1 h2 h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
       | _ => simp at hvc
   | getTag e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
-    | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_eq h1
+    | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; exact vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
   | while_ c b =>
     simp only [vcgen] at hvc
     cases hlc : env.loops c b with
@@ -4548,12 +4802,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
           | none => simp [hC] at hvc
           | some rC =>
             rcases rC with ⟨stC, svC⟩; simp only [hC] at hvc; split at hvc; · cases hvc
-            · cases hPre : (match lc.dec with
-                  | none => some (withPath stC (.isTrue svC), none)
-                  | some decE =>
-                    match vcgenPure (withPath stC (.isTrue svC)) decE with
-                    | none => none
-                    | some (stD0, svD0) => some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)) with
+            · cases hPre : checkLoopPreDec (withPath stC (.isTrue svC)) lc.dec with
               | none => simp [hPre] at hvc
               | some rPre =>
                 rcases rPre with ⟨stBodyIn, svD0Opt⟩; simp only [hPre] at hvc
@@ -4561,12 +4810,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
                 | none => simp [hB] at hvc
                 | some rB =>
                   rcases rB with ⟨stB, _⟩; simp only [hB] at hvc; split at hvc; · cases hvc
-                  · cases hPost : (match lc.dec, svD0Opt with
-                        | some decE, some svD0 =>
-                          match vcgenPure stB decE with
-                          | none => none
-                          | some (stD1, svD1) => some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                        | _, _ => some stB) with
+                  · cases hPost : checkLoopPostDec stB lc.dec svD0Opt with
                     | none => simp [hPost] at hvc
                     | some stBDec =>
                       simp only [hPost] at hvc
@@ -4595,12 +4839,16 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
                   | none => simp [hReq] at hvc
                   | some rReq =>
                     rcases rReq with ⟨stReq, svReq⟩; simp only [hReq] at hvc
-                    cases hEns : vcgenPure ({ havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs) with
-                        nextSym := (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym + 1,
-                        vars := (fc.retVar, .sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
-                        path := .and (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
-                    | none => simp [hEns] at hvc
-                    | some rEns => rcases rEns with ⟨_, _⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, _⟩; simpa using vcgenList_cellTys_eq hArgs
+                    cases hDec : checkCallDecreases env name fc (emitOb stReq (.isTrue svReq)) with
+                    | none => simp [hDec] at hvc
+                    | some stChecked =>
+                      simp only [hDec] at hvc
+                      cases hEns : vcgenPure ({ havocCells stChecked (collectLocArgs svArgs) with
+                          nextSym := (havocCells stChecked (collectLocArgs svArgs)).nextSym + 1,
+                          vars := (fc.retVar, .sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
+                          path := .and (havocCells stChecked (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
+                      | none => simp [hEns] at hvc
+                      | some rEns => rcases rEns with ⟨_, _⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, _⟩; simpa using vcgenList_cellTys_of_nextLoc_eq hwf hArgs hloc
       · simp only [hAssume, ↓reduceIte] at hvc
         cases args with
         | nil => simp at hvc
@@ -4610,7 +4858,7 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
           | nil =>
             cases h1 : vcgen env st e1 with
             | none => simp [h1] at hvc
-            | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; simpa [withPath] using vcgen_cellTys_eq h1
+            | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; simpa [withPath] using vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
     · simp only [hAssert, ↓reduceIte] at hvc
       cases args with
       | nil => simp at hvc
@@ -4620,26 +4868,34 @@ theorem vcgen_cellTys_eq {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVa
         | nil =>
           cases h1 : vcgen env st e1 with
           | none => simp [h1] at hvc
-          | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; simpa [emitOb] using vcgen_cellTys_eq h1
+          | some r1 => rcases r1 with ⟨_, _⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, _⟩; simpa [emitOb] using vcgen_cellTys_of_nextLoc_eq hwf h1 hloc
   | _ => simp [vcgen] at hvc
 termination_by sizeOf e
 
-theorem vcgenBlock_cellTys_eq {env : VcgEnv} {st st' : SymState} {es : List Expr} {sv : SVal}
-    (hvc : vcgenBlock env st es = some (st', sv)) : st'.cellTys = st.cellTys := by
+theorem vcgenBlock_cellTys_of_nextLoc_eq {env : VcgEnv} {st st' : SymState} {es : List Expr} {sv : SVal}
+    (hwf : SymWf st) (hvc : vcgenBlock env st es = some (st', sv)) (hloc : st'.nextLoc = st.nextLoc) :
+    st'.cellTys = st.cellTys := by
   cases es with
   | nil => simp [vcgenBlock] at hvc; rcases hvc with ⟨rfl, _⟩; rfl
   | cons e1 rest =>
     cases rest with
-    | nil => simp only [vcgenBlock] at hvc; exact vcgen_cellTys_eq hvc
+    | nil => simp only [vcgenBlock] at hvc; exact vcgen_cellTys_of_nextLoc_eq hwf hvc hloc
     | cons e2 rest' =>
       simp only [vcgenBlock] at hvc
       cases h1 : vcgen env st e1 with
       | none => simp [h1] at hvc
-      | some r1 => rcases r1 with ⟨_, _⟩; simp only [h1] at hvc; exact (vcgenBlock_cellTys_eq hvc).trans (vcgen_cellTys_eq h1)
+      | some r1 =>
+        rcases r1 with ⟨st1, _⟩; simp only [h1] at hvc
+        rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, hwf1, _⟩
+        rcases vcgenBlock_wf hwf1 hvc with ⟨_, hl2, _, _, _, _⟩
+        have h1eq : st1.nextLoc = st.nextLoc := by omega
+        have h2eq : st'.nextLoc = st1.nextLoc := by omega
+        exact (vcgenBlock_cellTys_of_nextLoc_eq hwf1 hvc h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
 termination_by sizeOf es
 
-theorem vcgenList_cellTys_eq {env : VcgEnv} {st st' : SymState} {es : List Expr} {svs : List SVal}
-    (hvc : vcgenList env st es = some (st', svs)) : st'.cellTys = st.cellTys := by
+theorem vcgenList_cellTys_of_nextLoc_eq {env : VcgEnv} {st st' : SymState} {es : List Expr} {svs : List SVal}
+    (hwf : SymWf st) (hvc : vcgenList env st es = some (st', svs)) (hloc : st'.nextLoc = st.nextLoc) :
+    st'.cellTys = st.cellTys := by
   cases es with
   | nil => simp [vcgenList] at hvc; rcases hvc with ⟨rfl, _⟩; rfl
   | cons e1 rest =>
@@ -4648,9 +4904,15 @@ theorem vcgenList_cellTys_eq {env : VcgEnv} {st st' : SymState} {es : List Expr}
     | none => simp [h1] at hvc
     | some r1 =>
       rcases r1 with ⟨st1, _⟩; simp only [h1] at hvc
+      rcases vcgen_wf hwf h1 with ⟨_, hl1, _, _, hwf1, _⟩
       cases h2 : vcgenList env st1 rest with
       | none => simp [h2] at hvc
-      | some r2 => rcases r2 with ⟨_, _⟩; simp [h2] at hvc; rcases hvc with ⟨rfl, _⟩; exact (vcgenList_cellTys_eq h2).trans (vcgen_cellTys_eq h1)
+      | some r2 =>
+        rcases r2 with ⟨st2, _⟩; simp [h2] at hvc; rcases hvc with ⟨rfl, _⟩
+        rcases vcgenList_wf hwf1 h2 with ⟨_, hl2, _, _, _, _⟩
+        have h1eq : st1.nextLoc = st.nextLoc := by omega
+        have h2eq : st2.nextLoc = st1.nextLoc := by omega
+        exact (vcgenList_cellTys_of_nextLoc_eq hwf1 h2 h2eq).trans (vcgen_cellTys_of_nextLoc_eq hwf h1 h1eq)
 termination_by sizeOf es
 end
 
@@ -4821,13 +5083,19 @@ theorem vcgen_locBound {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
     cases h1 : vcgen env st e1 with
     | none => simp [h1] at hvc
     | some r1 =>
-      rcases r1 with ⟨st1, sv1⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, rfl⟩
-      rcases vcgen_locBound hwf hlw h1 with ⟨hlw1, hlb1⟩
-      refine ⟨⟨fun x svx hlu => svalLocBound_mono (Nat.le_succ _) (hlw1.1 x svx hlu), fun l sv hlu => ?_⟩, Nat.lt_succ_self _⟩
-      simp only [locLookup] at hlu
-      cases hEq : (st1.nextLoc == l)
-      · simp [hEq] at hlu; exact svalLocBound_mono (Nat.le_succ _) (hlw1.2 l sv hlu)
-      · simp [hEq] at hlu; subst hlu; exact svalLocBound_mono (Nat.le_succ _) hlb1
+      rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+      cases hty : inferSValTy st1 sv1 with
+      | none => simp [hty] at hvc
+      | some elemTy =>
+        simp only [hty] at hvc; split at hvc
+        · cases hvc
+        · rcases hvc with ⟨rfl, rfl⟩
+          rcases vcgen_locBound hwf hlw h1 with ⟨hlw1, hlb1⟩
+          refine ⟨⟨fun x svx hlu => svalLocBound_mono (Nat.le_succ _) (hlw1.1 x svx hlu), fun l sv hlu => ?_⟩, Nat.lt_succ_self _⟩
+          simp only [locLookup, emitOb_nextLoc, emitOb_cells] at hlu
+          cases hEq : (st1.nextLoc == l)
+          · simp [hEq] at hlu; exact svalLocBound_mono (Nat.le_succ _) (hlw1.2 l sv hlu)
+          · simp [hEq] at hlu; subst hlu; exact svalLocBound_mono (Nat.le_succ _) hlb1
   | cellGet e1 =>
     simp only [vcgen] at hvc
     cases h1 : vcgen env st e1 with
@@ -4918,12 +5186,7 @@ theorem vcgen_locBound {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
             rcases rC with ⟨stC, svC⟩; simp only [hC] at hvc; split at hvc; · cases hvc
             · rename_i hlocC; simp only [bne_iff_ne, Decidable.not_not] at hlocC
               rcases vcgen_locBound hwfLE hlwLE hC with ⟨hlwC, _⟩
-              cases hPre : (match lc.dec with
-                  | none => some (withPath stC (.isTrue svC), none)
-                  | some decE =>
-                    match vcgenPure (withPath stC (.isTrue svC)) decE with
-                    | none => none
-                    | some (stD0, svD0) => some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)) with
+              cases hPre : checkLoopPreDec (withPath stC (.isTrue svC)) lc.dec with
               | none => simp [hPre] at hvc
               | some rPre =>
                 rcases rPre with ⟨stBodyIn, svD0Opt⟩; simp only [hPre] at hvc
@@ -4931,12 +5194,7 @@ theorem vcgen_locBound {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
                 | none => simp [hB] at hvc
                 | some rB =>
                   rcases rB with ⟨stB, _⟩; simp only [hB] at hvc; split at hvc; · cases hvc
-                  · cases hPost : (match lc.dec, svD0Opt with
-                        | some decE, some svD0 =>
-                          match vcgenPure stB decE with
-                          | none => none
-                          | some (stD1, svD1) => some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                        | _, _ => some stB) with
+                  · cases hPost : checkLoopPostDec stB lc.dec svD0Opt with
                     | none => simp [hPost] at hvc
                     | some stBDec =>
                       simp only [hPost] at hvc
@@ -4977,28 +5235,32 @@ theorem vcgen_locBound {env : VcgEnv} {st st' : SymState} {e : Expr} {sv : SVal}
                       rcases checkCallArgTys_props hTyp with ⟨hsT, hlT', _, hcT', _, hpT, _, _⟩
                       exact ⟨fun p hp => hsT ▸ hbArgs p.2 (List.of_mem_zip hp).2, by rw [hsT, hlT', hcT']; exact hwfA'.cells_bound, hsT ▸ hpT ▸ hwfA'.path_bound⟩
                     rcases vcgenPure_wf hwfCall hReq with ⟨_, hlReq, _, hcReq, _, _, _⟩
-                    cases hEns : vcgenPure ({ havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs) with
-                        nextSym := (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym + 1,
-                        vars := (fc.retVar, .sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
-                        path := .and (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
-                    | none => simp [hEns] at hvc
-                    | some rEns =>
-                      rcases rEns with ⟨_, _⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
-                      have hcellsHav : ∀ l sv, locLookup (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).cells l = some sv → svalLocBound stA.nextLoc sv := by
-                        have hsub : ∀ (s : SymState) (locs : List Loc),
-                            (∀ l sv, locLookup s.cells l = some sv → svalLocBound stA.nextLoc sv) →
-                            (∀ l sv, locLookup (havocCells s locs).cells l = some sv → svalLocBound stA.nextLoc sv) := by
-                          intro s locs
-                          induction locs generalizing s with
-                          | nil => intro hs; exact hs
-                          | cons l0 rest ih =>
-                            intro hs; apply ih; intro l sv hlu
-                            simp only [locLookup] at hlu
-                            cases hEq : (l0 == l)
-                            · simp [hEq] at hlu; exact hs l sv hlu
-                            · simp [hEq] at hlu; subst hlu; trivial
-                        exact hsub _ _ (by simp only [emitOb_cells, hcReq, hcT]; exact hlwA.2)
-                      exact ⟨⟨hlwA.1, hcellsHav⟩, trivial⟩
+                    cases hDec : checkCallDecreases env name fc (emitOb stReq (.isTrue svReq)) with
+                    | none => simp [hDec] at hvc
+                    | some stChecked =>
+                      simp only [hDec] at hvc
+                      cases hEns : vcgenPure ({ havocCells stChecked (collectLocArgs svArgs) with
+                          nextSym := (havocCells stChecked (collectLocArgs svArgs)).nextSym + 1,
+                          vars := (fc.retVar, .sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
+                          path := .and (havocCells stChecked (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
+                      | none => simp [hEns] at hvc
+                      | some rEns =>
+                        rcases rEns with ⟨_, _⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
+                        have hcellsHav : ∀ l sv, locLookup (havocCells stChecked (collectLocArgs svArgs)).cells l = some sv → svalLocBound stA.nextLoc sv := by
+                          have hsub : ∀ (s : SymState) (locs : List Loc),
+                              (∀ l sv, locLookup s.cells l = some sv → svalLocBound stA.nextLoc sv) →
+                              (∀ l sv, locLookup (havocCells s locs).cells l = some sv → svalLocBound stA.nextLoc sv) := by
+                            intro s locs
+                            induction locs generalizing s with
+                            | nil => intro hs; exact hs
+                            | cons l0 rest ih =>
+                              intro hs; apply ih; intro l sv hlu
+                              simp only [locLookup] at hlu
+                              cases hEq : (l0 == l)
+                              · simp [hEq] at hlu; exact hs l sv hlu
+                              · simp [hEq] at hlu; subst hlu; trivial
+                          exact hsub _ _ (by rw [checkCallDecreases_cells_eq hDec]; simp only [emitOb_cells, hcReq, hcT]; exact hlwA.2)
+                        exact ⟨⟨hlwA.1, hcellsHav⟩, trivial⟩
       · simp only [hAssume, ↓reduceIte] at hvc
         cases args with
         | nil => simp at hvc
@@ -5359,7 +5621,7 @@ where
                       fun k hk => (hagL2 k (Nat.lt_of_lt_of_le hk hl1)).trans (hagL1 k hk)
                     have hev1_M2 : evalSVal M2 L2 sv1 = some (.lit (.bool true)) :=
                       evalSVal_lit_iff_id.mpr ((evalSVal_agree_lt hb1 hag2).trans (evalSVal_lit_iff_id.mp hev1))
-                    have hct2 : st2.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_eq h2
+                    have hct2 : st2.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_of_nextLoc_eq (symWf_withPath hwf1 (c := .isTrue sv1) hb1) h2 hlocEq
                     refine ⟨hσ', M2, L2, hM2, hag12, hagL12, ?_, by simp [evalSVal, hev1_M2, hev2]⟩
                     refine ⟨hMatch2.closed_env, hwfOut, hlocEq ▸ hMatch2.loc_bound, hlocEq ▸ hMatch2.loc_inj,
                       (evalSForm_agree_lt hwf1.path_bound hag2).mpr hMatch1.path_holds,
@@ -5448,7 +5710,7 @@ where
                         fun k hk => (hagL2 k (Nat.lt_of_lt_of_le hk hl1)).trans (hagL1 k hk)
                       have hev1_M2 : evalSVal M2 L2 sv1 = some (.lit (.bool false)) :=
                         evalSVal_lit_iff_id.mpr ((evalSVal_agree_lt hb1 hag2).trans (evalSVal_lit_iff_id.mp hev1))
-                      have hct2 : st2.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_eq h2
+                      have hct2 : st2.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_of_nextLoc_eq (symWf_withPath hwf1 (c := .isFalse sv1) hb1) h2 hlocEq
                       refine ⟨hσ', M2, L2, hM2, hag12, hagL12, ?_, by simp [evalSVal, hev1_M2, hev2]⟩
                       refine ⟨hMatch2.closed_env, hwfOut, hlocEq ▸ hMatch2.loc_bound, hlocEq ▸ hMatch2.loc_inj,
                         (evalSForm_agree_lt hwf1.path_bound hag2).mpr hMatch1.path_holds,
@@ -5679,7 +5941,7 @@ where
                       fun k hk => (hagL2 k (Nat.lt_of_lt_of_le hk hl1)).trans (hagL1 k hk)
                     have hevC' : evalSVal M2 L2 svc = some (.lit (.bool true)) :=
                       evalSVal_lit_iff_id.mpr ((evalSVal_agree_lt hbc hag2).trans (evalSVal_lit_iff_id.mp hevC))
-                    have hctT : stT.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_eq hT
+                    have hctT : stT.cellTys = st1.cellTys := by simpa [withPath] using vcgen_cellTys_of_nextLoc_eq (symWf_withPath hwf1 (c := .isTrue svc) hbc) hT hlocT
                     refine ⟨hσ', M2, L2, hM2, hag12, hagL12, ?_, by simp [evalSVal, hevC', hevT]⟩
                     refine ⟨hMatch2.closed_env, hwfOut, hlocT ▸ hMatch2.loc_bound, hlocT ▸ hMatch2.loc_inj,
                       (evalSForm_agree_lt hwf1.path_bound hag2).mpr hMatch1.path_holds,
@@ -5711,7 +5973,7 @@ where
                       fun id hid => hag2 id (Nat.lt_of_lt_of_le hid hsT)
                     have hevC' : evalSVal M2 L2 svc = some (.lit (.bool false)) :=
                       evalSVal_lit_iff_id.mpr ((evalSVal_agree_lt hbc hag1_M2).trans (evalSVal_lit_iff_id.mp hevC))
-                    have hctE : stE.cellTys = st1.cellTys := by simpa using vcgen_cellTys_eq hE
+                    have hctE : stE.cellTys = st1.cellTys := by simpa using vcgen_cellTys_of_nextLoc_eq hwfEIn hE hlocE
                     refine ⟨hσ', M2, L2, hM2, hag12, hagL12, ?_, by simp [evalSVal, hevC', hevE]⟩
                     refine ⟨hMatch2.closed_env, hwfOut, hlocE ▸ hMatch2.loc_bound, hlocE ▸ hMatch2.loc_inj,
                       (evalSForm_agree_lt hwf1.path_bound hag1_M2).mpr hMatch1.path_holds,
@@ -5736,77 +5998,100 @@ where
         cases h1 : vcgen env st e1 with
         | none => simp [h1] at hvc
         | some r1 =>
-          rcases r1 with ⟨st1, sv1⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, rfl⟩
-          rcases vcgen_wf hMatch.wf h1 with ⟨hs1, hl1, hv1, ho1, hwf1, hb1⟩
-          have hlb1 := (vcgen_locBound hMatch.wf hMatch.locWf h1).2
-          have ih1 := go hM hσ hMatch h1 hObs
-          rw [substMany_cellNew]
-          constructor
-          · intro k hk σ' hs
-            rcases stepsN_cellNew_terminal (Or.inr ⟨_, rfl⟩) hs with ⟨k1, hk1, tr, hst1, hEq⟩ | ⟨_, _, _, _, _, _, hEq, _⟩
-            · cases hEq; exact ih1.1 k1 (by omega) σ' hst1
-            · cases hEq
-          · intro k hk v σ' hv hs
-            rcases stepsN_cellNew_terminal (Or.inl hv) hs with ⟨_, _, _, _, hEq⟩ | ⟨k1, hk1, v1, σ1, hv1', hst1, rfl, rfl⟩
-            · subst hEq; cases hv
-            · rcases ih1.2 k1 (by omega) v1 σ1 hv1' hst1 with ⟨hσ1, M1, L1, hM1, hag1, hagL1, hMatch1, hev1⟩
-              have hcl1 : freeVars v1 = [] := (evalSVal_closed hM1 hev1).2
-              let L' : Loc → Loc := fun k => if k == st1.nextLoc then σ1.length else L1 k
-              have hL'lt : ∀ k < st1.nextLoc, L' k = L1 k := fun k hk => by
-                dsimp only [L']; rw [beq_false_of_ne (Nat.ne_of_lt hk)]; rfl
-              have hagL' : ∀ k < st.nextLoc, L' k = L k := fun k hk =>
-                (hL'lt k (Nat.lt_of_lt_of_le hk hl1)).trans (hagL1 k hk)
-              refine ⟨storeClosed_append hσ1 hv1' hcl1, M1, L', hM1, hag1, hagL', ?_, by simp [evalSVal, L']⟩
-              refine ⟨hMatch1.closed_env, ?_, ?_, ?_, hMatch1.path_holds, ?_, ?_, ?_⟩
-              · refine ⟨hwf1.vars_bound, ?_, hwf1.path_bound⟩
-                intro p hp; rcases List.mem_cons.mp hp with rfl | hp'
-                · exact ⟨Nat.lt_succ_self _, hb1⟩
-                · exact ⟨Nat.lt_succ_of_lt (hwf1.cells_bound p hp').1, (hwf1.cells_bound p hp').2⟩
-              · intro k hk
-                simp only at hk
-                by_cases hEq : k = st1.nextLoc
-                · subst hEq; simp [L']
-                · have hlt : k < st1.nextLoc := by omega
-                  rw [hL'lt k hlt]; simp; exact Nat.lt_succ_of_lt (hMatch1.loc_bound k hlt)
-              · intro k1 k2 hk1 hk2 hEqL
-                simp only at hk1 hk2
-                by_cases h1Eq : k1 = st1.nextLoc <;> by_cases h2Eq : k2 = st1.nextLoc
-                · exact h1Eq.trans h2Eq.symm
-                · subst h1Eq
-                  have hlt2 : k2 < st1.nextLoc := by omega
-                  rw [hL'lt k2 hlt2] at hEqL
-                  have hEqL' : σ1.length = L1 k2 := by simpa [L'] using hEqL
-                  exact absurd hEqL' (Nat.ne_of_gt (hMatch1.loc_bound k2 hlt2))
-                · subst h2Eq
-                  have hlt1 : k1 < st1.nextLoc := by omega
-                  rw [hL'lt k1 hlt1] at hEqL
-                  have hEqL' : L1 k1 = σ1.length := by simpa [L'] using hEqL
-                  exact absurd hEqL'.symm (Nat.ne_of_gt (hMatch1.loc_bound k1 hlt1))
-                · have hlt1 : k1 < st1.nextLoc := by omega
-                  have hlt2 : k2 < st1.nextLoc := by omega
-                  rw [hL'lt k1 hlt1, hL'lt k2 hlt2] at hEqL
-                  exact hMatch1.loc_inj k1 k2 hlt1 hlt2 hEqL
-              · intro x svx hlu
-                rcases hMatch1.vars_match x svx hlu with ⟨vx, hρx, hevx, hlbx⟩
-                exact ⟨vx, hρx, (evalSVal_loc_agree_lt hlbx hL'lt).trans hevx, svalLocBound_mono (Nat.le_succ _) hlbx⟩
-              · intro l sv hlu
-                simp only [locLookup] at hlu
-                cases hEq : (st1.nextLoc == l)
-                · simp [hEq] at hlu
-                  rcases hMatch1.cells_match l sv hlu with ⟨v0, hget, hev0, hlb0⟩
-                  have hlt_l : l < st1.nextLoc := (hwf1.cells_bound _ (locLookup_mem hlu)).1
-                  have hlt_σ : L1 l < σ1.length := hMatch1.loc_bound l hlt_l
-                  refine ⟨v0, ?_, (evalSVal_loc_agree_lt hlb0 hL'lt).trans hev0, svalLocBound_mono (Nat.le_succ _) hlb0⟩
-                  rw [hL'lt l hlt_l, List.getElem?_append_left hlt_σ]; exact hget
-                · have hle : st1.nextLoc = l := eq_of_beq hEq
-                  subst hle; simp at hlu; subst hlu
-                  refine ⟨v1, ?_, (evalSVal_loc_agree_lt hlb1 hL'lt).trans hev1, svalLocBound_mono (Nat.le_succ _) hlb1⟩
-                  simp [L', List.getElem?_append_right (Nat.le_refl _)]
-              · intro l ty hlu
-                rcases hMatch1.cells_ty l ty hlu with ⟨hlt_l, v0, hget, hvt⟩
-                have hlt_σ : L1 l < σ1.length := hMatch1.loc_bound l hlt_l
-                refine ⟨Nat.lt_succ_of_lt hlt_l, v0, ?_, hvt⟩
-                rw [hL'lt l hlt_l, List.getElem?_append_left hlt_σ]; exact hget
+          rcases r1 with ⟨st1, sv1⟩; simp only [h1] at hvc
+          cases hty : inferSValTy st1 sv1 with
+          | none => simp [hty] at hvc
+          | some elemTy =>
+            simp only [hty] at hvc; split at hvc
+            · cases hvc
+            · rename_i hModTy
+              simp only [Bool.not_eq_true', Bool.not_eq_false] at hModTy
+              rcases hvc with ⟨rfl, rfl⟩
+              rcases vcgen_wf hMatch.wf h1 with ⟨hs1, hl1, hv1, ho1, hwf1, hb1⟩
+              have hlb1 := (vcgen_locBound hMatch.wf hMatch.locWf h1).2
+              have hObs1 : ValidObs st1.obs :=
+                validObs_mono (fun _ hf => List.mem_cons_of_mem _ hf) (by simpa [emitOb] using hObs)
+              have ih1 := go hM hσ hMatch h1 hObs1
+              rw [substMany_cellNew]
+              constructor
+              · intro k hk σ' hs
+                rcases stepsN_cellNew_terminal (Or.inr ⟨_, rfl⟩) hs with ⟨k1, hk1, tr, hst1, hEq⟩ | ⟨_, _, _, _, _, _, hEq, _⟩
+                · cases hEq; exact ih1.1 k1 (by omega) σ' hst1
+                · cases hEq
+              · intro k hk v σ' hv hs
+                rcases stepsN_cellNew_terminal (Or.inl hv) hs with ⟨_, _, _, _, hEq⟩ | ⟨k1, hk1, v1, σ1, hv1', hst1, rfl, rfl⟩
+                · subst hEq; cases hv
+                · rcases ih1.2 k1 (by omega) v1 σ1 hv1' hst1 with ⟨hσ1, M1, L1, hM1, hag1, hagL1, hMatch1, hev1⟩
+                  have hcl1 : freeVars v1 = [] := (evalSVal_closed hM1 hev1).2
+                  have hvt1 : valHasTy v1 elemTy := by
+                    have hObTy := hObs _ (List.mem_cons_self ..) M1 hM1 hMatch1.path_holds
+                    rcases hObTy with ⟨w, hwId, hwTy⟩
+                    rcases valHasTy_lit_of_modeled hModTy hwTy with ⟨c, rfl⟩
+                    have hwL : evalSVal M1 L1 sv1 = some (.lit c) := evalSVal_lit_iff_id.mpr hwId
+                    rw [hev1] at hwL; cases hwL; exact hwTy
+                  let L' : Loc → Loc := fun k => if k == st1.nextLoc then σ1.length else L1 k
+                  have hL'lt : ∀ k < st1.nextLoc, L' k = L1 k := fun k hk => by
+                    dsimp only [L']; rw [beq_false_of_ne (Nat.ne_of_lt hk)]; rfl
+                  have hagL' : ∀ k < st.nextLoc, L' k = L k := fun k hk =>
+                    (hL'lt k (Nat.lt_of_lt_of_le hk hl1)).trans (hagL1 k hk)
+                  refine ⟨storeClosed_append hσ1 hv1' hcl1, M1, L', hM1, hag1, hagL', ?_, by simp [evalSVal, L']⟩
+                  refine ⟨hMatch1.closed_env, ?_, ?_, ?_, hMatch1.path_holds, ?_, ?_, ?_⟩
+                  · refine ⟨hwf1.vars_bound, ?_, hwf1.path_bound⟩
+                    intro p hp; rcases List.mem_cons.mp hp with rfl | hp'
+                    · exact ⟨Nat.lt_succ_self _, hb1⟩
+                    · exact ⟨Nat.lt_succ_of_lt (hwf1.cells_bound p hp').1, (hwf1.cells_bound p hp').2⟩
+                  · intro k hk
+                    simp only [emitOb_nextLoc] at hk
+                    by_cases hEq : k = st1.nextLoc
+                    · subst hEq; simp [L']
+                    · have hlt : k < st1.nextLoc := by omega
+                      rw [hL'lt k hlt]; simp; exact Nat.lt_succ_of_lt (hMatch1.loc_bound k hlt)
+                  · intro k1 k2 hk1 hk2 hEqL
+                    simp only [emitOb_nextLoc] at hk1 hk2
+                    by_cases h1Eq : k1 = st1.nextLoc <;> by_cases h2Eq : k2 = st1.nextLoc
+                    · exact h1Eq.trans h2Eq.symm
+                    · subst h1Eq
+                      have hlt2 : k2 < st1.nextLoc := by omega
+                      rw [hL'lt k2 hlt2] at hEqL
+                      have hEqL' : σ1.length = L1 k2 := by simpa [L'] using hEqL
+                      exact absurd hEqL' (Nat.ne_of_gt (hMatch1.loc_bound k2 hlt2))
+                    · subst h2Eq
+                      have hlt1 : k1 < st1.nextLoc := by omega
+                      rw [hL'lt k1 hlt1] at hEqL
+                      have hEqL' : L1 k1 = σ1.length := by simpa [L'] using hEqL
+                      exact absurd hEqL'.symm (Nat.ne_of_gt (hMatch1.loc_bound k1 hlt1))
+                    · have hlt1 : k1 < st1.nextLoc := by omega
+                      have hlt2 : k2 < st1.nextLoc := by omega
+                      rw [hL'lt k1 hlt1, hL'lt k2 hlt2] at hEqL
+                      exact hMatch1.loc_inj k1 k2 hlt1 hlt2 hEqL
+                  · intro x svx hlu
+                    rcases hMatch1.vars_match x svx hlu with ⟨vx, hρx, hevx, hlbx⟩
+                    exact ⟨vx, hρx, (evalSVal_loc_agree_lt hlbx hL'lt).trans hevx, svalLocBound_mono (Nat.le_succ _) hlbx⟩
+                  · intro l sv hlu
+                    simp only [locLookup, emitOb_nextLoc, emitOb_cells] at hlu
+                    cases hEq : (st1.nextLoc == l)
+                    · simp [hEq] at hlu
+                      rcases hMatch1.cells_match l sv hlu with ⟨v0, hget, hev0, hlb0⟩
+                      have hlt_l : l < st1.nextLoc := (hwf1.cells_bound _ (locLookup_mem hlu)).1
+                      have hlt_σ : L1 l < σ1.length := hMatch1.loc_bound l hlt_l
+                      refine ⟨v0, ?_, (evalSVal_loc_agree_lt hlb0 hL'lt).trans hev0, svalLocBound_mono (Nat.le_succ _) hlb0⟩
+                      rw [hL'lt l hlt_l, List.getElem?_append_left hlt_σ]; exact hget
+                    · have hle : st1.nextLoc = l := eq_of_beq hEq
+                      subst hle; simp at hlu; subst hlu
+                      refine ⟨v1, ?_, (evalSVal_loc_agree_lt hlb1 hL'lt).trans hev1, svalLocBound_mono (Nat.le_succ _) hlb1⟩
+                      simp [L', List.getElem?_append_right (Nat.le_refl _)]
+                  · intro l ty hlu
+                    simp only [locLookup, emitOb_nextLoc, emitOb_cellTys] at hlu
+                    cases hEq : (st1.nextLoc == l)
+                    · simp [hEq] at hlu
+                      rcases hMatch1.cells_ty l ty hlu with ⟨hlt_l, v0, hget, hvt⟩
+                      have hlt_σ : L1 l < σ1.length := hMatch1.loc_bound l hlt_l
+                      refine ⟨Nat.lt_succ_of_lt hlt_l, v0, ?_, hvt⟩
+                      rw [hL'lt l hlt_l, List.getElem?_append_left hlt_σ]; exact hget
+                    · have hle : st1.nextLoc = l := eq_of_beq hEq
+                      subst hle; simp at hlu; subst hlu
+                      refine ⟨Nat.lt_succ_self _, v1, ?_, hvt1⟩
+                      simp [L', List.getElem?_append_right (Nat.le_refl _)]
       | cellGet e1 =>
         simp only [vcgen] at hvc
         cases h1 : vcgen env st e1 with
@@ -6018,39 +6303,15 @@ where
                 · rename_i hlocC
                   simp only [bne_iff_ne, Decidable.not_not] at hlocC
                   rcases vcgen_wf hwfLE hC with ⟨hsC, _, _, hoC, hwfC, hbC⟩
-                  have hctC : stC.cellTys = stLE.cellTys := vcgen_cellTys_eq hC
+                  have hctC : stC.cellTys = stLE.cellTys := vcgen_cellTys_of_nextLoc_eq hwfLE hC hlocC
                   have hwfB0 : SymWf (withPath stC (.isTrue svC)) := symWf_withPath hwfC (c := .isTrue svC) hbC
-                  cases hPre : (match lc.dec with
-                      | none => some (withPath stC (.isTrue svC), none)
-                      | some decE =>
-                        match vcgenPure (withPath stC (.isTrue svC)) decE with
-                        | none => none
-                        | some (stD0, svD0) =>
-                          some (emitOb stD0 (.isTrue (.bin .geInt svD0 (.lit (.int 0)))), some svD0)) with
+                  cases hPre : checkLoopPreDec (withPath stC (.isTrue svC)) lc.dec with
                   | none => simp [hPre] at hvc
                   | some rPre =>
                     rcases rPre with ⟨stBodyIn, svD0Opt⟩; simp only [hPre] at hvc
-                    have hPreProps : stBodyIn.nextSym = stC.nextSym ∧ stBodyIn.nextLoc = stC.nextLoc ∧
-                        stBodyIn.vars = stC.vars ∧ stBodyIn.cells = stC.cells ∧ stBodyIn.cellTys = stC.cellTys ∧
-                        stBodyIn.path = .and stC.path (.isTrue svC) ∧
-                        (∀ f ∈ stC.obs, f ∈ stBodyIn.obs) ∧ SymWf stBodyIn := by
-                      cases hdc : lc.dec with
-                      | none =>
-                        simp [hdc] at hPre; rcases hPre with ⟨rfl, _⟩
-                        exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwfB0⟩
-                      | some decE =>
-                        simp [hdc] at hPre
-                        cases hd0 : vcgenPure (withPath stC (.isTrue svC)) decE with
-                        | none => simp [hd0] at hPre
-                        | some rd0 =>
-                          rcases rd0 with ⟨stD0, svD0⟩; simp [hd0] at hPre; rcases hPre with ⟨rfl, _⟩
-                          rcases vcgenPure_wf hwfB0 hd0 with ⟨hsd0, hld0, hvd0, hcd0, hpd0, hod0, _⟩
-                          have hctd0 : stD0.cellTys = stC.cellTys := by simpa [withPath] using vcgenPure_cellTys_eq hd0
-                          refine ⟨hsd0, hld0, hvd0, hcd0, hctd0, hpd0, fun f hf => List.mem_cons_of_mem _ (hod0 f hf), ?_⟩
-                          exact ⟨by simp only [emitOb, hsd0, hvd0]; exact hwfB0.vars_bound,
-                            by simp only [emitOb, hsd0, hld0, hcd0]; exact hwfB0.cells_bound,
-                            by simp only [emitOb, hsd0, hpd0]; exact hwfB0.path_bound⟩
-                    rcases hPreProps with ⟨hsPre, hlPre, hvPre, hcPre, hctPre, hpPre, hoPre, hwfBodyIn⟩
+                    rcases checkLoopPreDec_props hwfB0 hPre with
+                      ⟨hsPre, hlPre, hvPre, hcPre, hctPre, hpPre, hoPre, hwfBodyIn⟩
+                    simp only [withPath_nextSym, withPath_nextLoc, withPath_vars, withPath_cells, withPath_cellTys, withPath_path, withPath_obs] at hsPre hlPre hvPre hcPre hctPre hpPre hoPre
                     cases hB : vcgen env stBodyIn b with
                     | none => simp [hB] at hvc
                     | some rB =>
@@ -6060,37 +6321,13 @@ where
                       · rename_i hlocB
                         simp only [bne_iff_ne, Decidable.not_not] at hlocB
                         rcases vcgen_wf hwfBodyIn hB with ⟨hsB, _, _, hoB, hwfB, _⟩
-                        have hctB : stB.cellTys = stBodyIn.cellTys := vcgen_cellTys_eq hB
-                        cases hPost : (match lc.dec, svD0Opt with
-                            | some decE, some svD0 =>
-                              match vcgenPure stB decE with
-                              | none => none
-                              | some (stD1, svD1) =>
-                                some (emitOb stD1 (.isTrue (.bin .ltInt svD1 svD0)))
-                            | _, _ => some stB) with
+                        have hctB : stB.cellTys = stBodyIn.cellTys := vcgen_cellTys_of_nextLoc_eq hwfBodyIn hB (hlocB.trans hlPre.symm)
+                        cases hPost : checkLoopPostDec stB lc.dec svD0Opt with
                         | none => simp [hPost] at hvc
                         | some stBDec =>
                           simp only [hPost] at hvc
-                          have hPostProps : stBDec.nextSym = stB.nextSym ∧ stBDec.nextLoc = stB.nextLoc ∧
-                              stBDec.vars = stB.vars ∧ stBDec.cells = stB.cells ∧ stBDec.cellTys = stB.cellTys ∧
-                              stBDec.path = stB.path ∧
-                              (∀ f ∈ stB.obs, f ∈ stBDec.obs) ∧ SymWf stBDec := by
-                            cases hdc : lc.dec <;> cases hsv0 : svD0Opt <;> simp [hdc, hsv0] at hPost
-                            · subst hPost; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwfB⟩
-                            · subst hPost; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwfB⟩
-                            · subst hPost; exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun _ hf => hf, hwfB⟩
-                            · rename_i decE svD0
-                              cases hd1 : vcgenPure stB decE with
-                              | none => simp [hd1] at hPost
-                              | some rd1 =>
-                                rcases rd1 with ⟨stD1, svD1⟩; simp [hd1] at hPost; subst hPost
-                                rcases vcgenPure_wf hwfB hd1 with ⟨hsd1, hld1, hvd1, hcd1, hpd1, hod1, _⟩
-                                have hctd1 : stD1.cellTys = stB.cellTys := vcgenPure_cellTys_eq hd1
-                                refine ⟨hsd1, hld1, hvd1, hcd1, hctd1, hpd1, fun f hf => List.mem_cons_of_mem _ (hod1 f hf), ?_⟩
-                                exact ⟨by simp only [emitOb, hsd1, hvd1]; exact hwfB.vars_bound,
-                                  by simp only [emitOb, hsd1, hld1, hcd1]; exact hwfB.cells_bound,
-                                  by simp only [emitOb, hsd1, hpd1]; exact hwfB.path_bound⟩
-                          rcases hPostProps with ⟨hsPost, hlPost, hvPost, hcPost, hctPost, hpPost, hoPost, hwfBDec⟩
+                          rcases checkLoopPostDec_props hwfB hPost with
+                            ⟨hsPost, hlPost, hvPost, hcPost, hctPost, hpPost, hoPost, hwfBDec⟩
                           cases hBI : vcgenPure stBDec lc.inv with
                           | none => simp [hBI] at hvc
                           | some rBI =>
@@ -6326,204 +6563,212 @@ where
                         rcases rReq with ⟨stReq, svReq⟩; simp only [hReq] at hvc
                         rcases vcgenPure_wf hwfCall hReq with ⟨hsReq, hlReq, hvReq, hcReq, hpReq, hoReq, _⟩
                         have hctReq : stReq.cellTys = stA.cellTys := (vcgenPure_cellTys_eq hReq).trans hctT
-                        let stChecked := emitOb stReq (.isTrue svReq)
-                        let locArgs := collectLocArgs svArgs
-                        have hlocAll : ∀ l ∈ locArgs, l < stChecked.nextLoc := fun l hl => by
-                          simp only [stChecked, emitOb_nextLoc, hlReq, hlT]; exact hLocBound l hl
-                        have hwfChecked : SymWf stChecked :=
-                          ⟨by simp only [stChecked, emitOb, hsReq, hvReq]; exact hwfCall.vars_bound,
-                           by simp only [stChecked, emitOb, hsReq, hlReq, hcReq]; exact hwfCall.cells_bound,
-                           by simp only [stChecked, emitOb, hsReq, hpReq]; exact hwfCall.path_bound⟩
-                        rcases havocCells_props stChecked locArgs hlocAll hwfChecked with
-                          ⟨hsHav, hlHav, _, hctHav, hoHav, hwfHav, _, _⟩
-                        let stHav := havocCells stChecked locArgs
-                        let retId := stHav.nextSym
-                        have hwfRet : SymWf ({ stHav with
-                            nextSym := retId + 1,
-                            vars := (fc.retVar, .sym retId) :: paramBindings,
-                            path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState) := by
-                          refine ⟨?_, ?_, ⟨sformBound_mono (Nat.le_succ _) hwfHav.path_bound, Nat.lt_succ_self _⟩⟩
-                          · intro p hp
-                            rcases List.mem_cons.mp hp with rfl | hp'
-                            · exact Nat.lt_succ_self _
-                            · have hb := hwfCall.vars_bound p hp'
-                              simp only [stChecked, emitOb_nextSym, hsReq] at hsHav
-                              exact svalBound_mono (Nat.le_trans hsHav (Nat.le_succ _)) hb
-                          · intro p hp
-                            exact ⟨(hwfHav.cells_bound p hp).1, svalBound_mono (Nat.le_succ _) (hwfHav.cells_bound p hp).2⟩
-                        cases hEns : vcgenPure ({ havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs) with
-                            nextSym := (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym + 1,
-                            vars := (fc.retVar, .sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
-                            path := .and (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells (emitOb stReq (.isTrue svReq)) (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
-                        | none => simp [hEns] at hvc
-                        | some rEns =>
-                          rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
-                          rcases vcgenPure_wf hwfRet hEns with ⟨hsEns, _, _, _, _, hoEns, hbEns⟩
-                          have hObsEns : ValidObs stEns.obs := hObs
-                          have hObsHav : ValidObs stHav.obs := validObs_mono hoEns hObsEns
-                          have hObsChecked : ValidObs stChecked.obs := by
-                            intro f hf; exact hObsHav f (by change f ∈ (havocCells stChecked locArgs).obs; rw [hoHav]; exact hf)
-                          have hObsReq : ValidObs stReq.obs := validObs_mono (fun _ hf => List.mem_cons_of_mem _ hf) hObsChecked
-                          have hObsTyped : ValidObs stTyped.obs := validObs_mono hoReq hObsReq
-                          have hObsA : ValidObs stA.obs := validObs_mono hoT hObsTyped
-                          have hSymLe : stA.nextSym ≤ stEns.nextSym := by
-                            simp only [stChecked, emitOb_nextSym, hsReq, hsT] at hsHav
-                            exact Nat.le_trans hsHav (hsEns.symm ▸ Nat.le_succ _)
-                          have hlHavEq : stHav.nextLoc = stA.nextLoc := by
-                            change (havocCells stChecked locArgs).nextLoc = stA.nextLoc
-                            rw [hlHav]; simp only [stChecked, emitOb_nextLoc, hlReq, hlT]
-                          have hwfPost : SymWf ({ nextSym := stEns.nextSym, nextLoc := stA.nextLoc, vars := stA.vars, cells := stHav.cells, cellTys := stA.cellTys, path := .and (.and stHav.path (.hasTy (.sym retId) fc.retTy)) (.isTrue svEns), obs := stEns.obs } : SymState) := by
-                            refine ⟨fun p hp => svalBound_mono hSymLe (hwfA.vars_bound p hp), ?_, ?_⟩
+                        let stChecked0 := emitOb stReq (.isTrue svReq)
+                        have hwfChecked0 : SymWf stChecked0 :=
+                          ⟨by simp only [stChecked0, emitOb, hsReq, hvReq]; exact hwfCall.vars_bound,
+                           by simp only [stChecked0, emitOb, hsReq, hlReq, hcReq]; exact hwfCall.cells_bound,
+                           by simp only [stChecked0, emitOb, hsReq, hpReq]; exact hwfCall.path_bound⟩
+                        cases hDec : checkCallDecreases env name fc (emitOb stReq (.isTrue svReq)) with
+                        | none => simp [hDec] at hvc
+                        | some stChecked =>
+                          simp only [hDec] at hvc
+                          rcases checkCallDecreases_props hwfChecked0 hDec with
+                            ⟨hsDec, hlDec, hvDec, hcDec, hctDec, hpDec, hoDec, hwfChecked⟩
+                          let locArgs := collectLocArgs svArgs
+                          have hlocAll : ∀ l ∈ locArgs, l < stChecked.nextLoc := fun l hl => by
+                            rw [hlDec]; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT]; exact hLocBound l hl
+                          rcases havocCells_props stChecked locArgs hlocAll hwfChecked with
+                            ⟨hsHav, hlHav, _, hctHav, hoHav, hwfHav, _, _⟩
+                          let stHav := havocCells stChecked locArgs
+                          let retId := stHav.nextSym
+                          have hwfRet : SymWf ({ stHav with
+                              nextSym := retId + 1,
+                              vars := (fc.retVar, .sym retId) :: paramBindings,
+                              path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState) := by
+                            refine ⟨?_, ?_, ⟨sformBound_mono (Nat.le_succ _) hwfHav.path_bound, Nat.lt_succ_self _⟩⟩
                             · intro p hp
-                              have hb := hwfHav.cells_bound p hp
-                              exact ⟨hlHavEq ▸ hb.1, svalBound_mono (hsEns.symm ▸ Nat.le_succ _) hb.2⟩
-                            · exact ⟨⟨sformBound_mono (hsEns.symm ▸ Nat.le_succ _) hwfHav.path_bound, by rw [hsEns]; exact Nat.lt_succ_self _⟩, by rw [hsEns]; exact hbEns⟩
-                          rw [substMany_applyDir]
-                          have hPre0 : ∀ v ∈ ([] : List Expr), IsValue v := fun _ h => by cases h
-                          simpa only [List.nil_append] using
-                            goApplyArgs (prefixVals := []) (name := name) hPre0 hM hσ hMatch hArgs hObsA
-                              (fun {MA LA vs σA} hMA hσA hagMA hagLA hMatchA hvsCl hEvArgs => by
-                            have hvsVal : ∀ v ∈ vs, IsValue v := fun v hv => (hvsCl v hv).1
-                            have hTypM := hTypFa MA hMA hObsTyped hMatchA.path_holds
-                            have hLenVs : vs.length = fc.params.length := by
-                              rw [← hEvArgs.length_eq, ← hTypM.length_eq]
-                            have hLocsMap : collectConcreteLocs vs = locArgs.map LA :=
-                              collectConcreteLocs_eq_map hTypM hEvArgs
-                            have hNoDupConc : noDupLocs (collectConcreteLocs vs) = true := by
-                              rw [hLocsMap]
-                              exact noDupLocs_map_inj hNoDupSym hLocBound hMatchA.loc_inj
-                            have hClosedZip : ClosedEnv (zipParams fc.params vs) := by
-                              intro p hp
-                              have hmem : p.2 ∈ vs := (List.of_mem_zip hp).2
-                              exact hvsCl p.2 hmem
-                            have hEvArgsLb : PairwiseRel (fun sv v => evalSVal MA LA sv = some v ∧ svalLocBound stA.nextLoc sv) svArgs vs := by
-                              have : ∀ {svs' vs'}, PairwiseRel (fun sv v => evalSVal MA LA sv = some v) svs' vs' →
-                                  (∀ sv ∈ svs', svalLocBound stA.nextLoc sv) →
-                                  PairwiseRel (fun sv v => evalSVal MA LA sv = some v ∧ svalLocBound stA.nextLoc sv) svs' vs' := by
-                                intro svs' vs' hfa hlb
-                                induction hfa with
-                                | nil => exact .nil
-                                | cons h1 _ ih => exact .cons ⟨h1, hlb _ (List.mem_cons_self ..)⟩ (ih fun s hs => hlb s (List.mem_cons_of_mem _ hs))
-                              exact this hEvArgs hlbArgs
-                            have hMatchCall : StateMatches MA LA { stTyped with vars := paramBindings } (zipParams fc.params vs) σA :=
-                              { closed_env := hClosedZip, wf := hwfCall,
-                                loc_bound := hlT ▸ hMatchA.loc_bound, loc_inj := hlT ▸ hMatchA.loc_inj,
-                                path_holds := hpT ▸ hMatchA.path_holds,
-                                vars_match := by rw [hlT]; exact zipParams_match_of_forall2 hEvArgsLb hTypM.length_eq,
-                                cells_match := by rw [hcT, hlT]; exact hMatchA.cells_match,
-                                cells_ty := by rw [hctT, hlT]; exact hMatchA.cells_ty }
-                            have hReqTrue : evalSVal MA LA svReq = some (.lit (.bool true)) :=
-                              evalSVal_lit_iff_id.mpr (hObsChecked _ (List.mem_cons_self ..) MA hMA (by rw [hpReq]; exact hMatchCall.path_holds))
-                            have hReqSteps : Steps Δ Φ (substMany (zipParams fc.params vs) fc.req) σA (.lit (.bool true)) σA :=
-                              vcgenPure_complete hMA hMatchCall hReq hReqTrue
-                            have hMatchChecked : StateMatches MA LA stChecked (zipParams fc.params vs) σA :=
-                              hMatchCall.of_eq hwfChecked (by simp only [stChecked, emitOb, hlReq])
-                                (by simp only [stChecked, emitOb, hvReq]) (by simp only [stChecked, emitOb, hcReq])
-                                (by simp only [stChecked, emitOb, hctReq, hctT])
-                                (by simp only [stChecked, emitOb, hpReq]; exact hMatchCall.path_holds)
-                            constructor
-                            · intro k hk σ' hs
-                              rcases stepsN_applyDir_vals_terminal hvsVal (Or.inr ⟨_, rfl⟩) hs with ⟨m, hm, fd, hΦ, _, hbody⟩
-                              have hSafe := hCallee name fc fd vs σA hfc hΦ hLenVs hvsCl hσA hNoDupConc hReqSteps
-                              exact hSafe.1 m (by omega) σ' hbody
-                            · intro k hk v σ' hv hs
-                              rcases stepsN_applyDir_vals_terminal hvsVal (Or.inl hv) hs with ⟨m, hm, fd, hΦ, _, hbody⟩
-                              have hSafe := hCallee name fc fd vs σA hfc hΦ hLenVs hvsCl hσA hNoDupConc hReqSteps
-                              rcases hSafe.2 m (by omega) v σ' hv hbody with
-                                ⟨hclV, htyV, hlenGrow, hσ'Cl, hFrame, hCellTys', hEnsSteps⟩
-                              have hbound' : ∀ j < stChecked.nextLoc, LA j < σ'.length := fun j hj =>
-                                Nat.lt_of_lt_of_le (hMatchChecked.loc_bound j hj) hlenGrow
-                              have htys' : ∀ l ty, locLookup stChecked.cellTys l = some ty → l < stChecked.nextLoc ∧ ∃ w, σ'[LA l]? = some w ∧ valHasTy w ty := by
-                                intro l ty hlu
-                                have hluA : locLookup stA.cellTys l = some ty := by
-                                  simp only [stChecked, emitOb, hctReq] at hlu; exact hlu
-                                rcases hMatchA.cells_ty l ty hluA with ⟨hlbA, w0, hget0, hvt0⟩
-                                have hlbC : l < stChecked.nextLoc := by simp only [stChecked, emitOb_nextLoc, hlReq, hlT]; exact hlbA
-                                refine ⟨hlbC, ?_⟩
-                                by_cases hin : l ∈ locArgs
-                                · rcases callArg_cell_ty_mem hTypM hEvArgs hin hluA with ⟨p, hpmem, hpty⟩
-                                  exact hCellTys' p (.loc (LA l)) hpmem ty (LA l) hpty rfl
-                                · have hNotInConc : LA l ∉ collectConcreteLocs vs := by
+                              rcases List.mem_cons.mp hp with rfl | hp'
+                              · exact Nat.lt_succ_self _
+                              · have hb := hwfCall.vars_bound p hp'
+                                rw [hsDec] at hsHav; simp only [stChecked0, emitOb_nextSym, hsReq] at hsHav
+                                exact svalBound_mono (Nat.le_trans hsHav (Nat.le_succ _)) hb
+                            · intro p hp
+                              exact ⟨(hwfHav.cells_bound p hp).1, svalBound_mono (Nat.le_succ _) (hwfHav.cells_bound p hp).2⟩
+                          cases hEns : vcgenPure ({ havocCells stChecked (collectLocArgs svArgs) with
+                              nextSym := (havocCells stChecked (collectLocArgs svArgs)).nextSym + 1,
+                              vars := (fc.retVar, .sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) :: (fc.params.map Prod.fst).zip svArgs,
+                              path := .and (havocCells stChecked (collectLocArgs svArgs)).path (.hasTy (.sym (havocCells stChecked (collectLocArgs svArgs)).nextSym) fc.retTy) } : SymState) fc.ens with
+                          | none => simp [hEns] at hvc
+                          | some rEns =>
+                            rcases rEns with ⟨stEns, svEns⟩; simp [hEns] at hvc; rcases hvc with ⟨rfl, rfl⟩
+                            rcases vcgenPure_wf hwfRet hEns with ⟨hsEns, _, _, _, _, hoEns, hbEns⟩
+                            have hObsEns : ValidObs stEns.obs := hObs
+                            have hObsHav : ValidObs stHav.obs := validObs_mono hoEns hObsEns
+                            have hObsChecked : ValidObs stChecked.obs := by
+                              intro f hf; exact hObsHav f (by change f ∈ (havocCells stChecked locArgs).obs; rw [hoHav]; exact hf)
+                            have hObsChecked0 : ValidObs stChecked0.obs := validObs_mono hoDec hObsChecked
+                            have hObsReq : ValidObs stReq.obs := validObs_mono (fun _ hf => List.mem_cons_of_mem _ hf) hObsChecked0
+                            have hObsTyped : ValidObs stTyped.obs := validObs_mono hoReq hObsReq
+                            have hObsA : ValidObs stA.obs := validObs_mono hoT hObsTyped
+                            have hSymLe : stA.nextSym ≤ stEns.nextSym := by
+                              rw [hsDec] at hsHav; simp only [stChecked0, emitOb_nextSym, hsReq, hsT] at hsHav
+                              exact Nat.le_trans hsHav (hsEns.symm ▸ Nat.le_succ _)
+                            have hlHavEq : stHav.nextLoc = stA.nextLoc := by
+                              change (havocCells stChecked locArgs).nextLoc = stA.nextLoc
+                              rw [hlHav, hlDec]; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT]
+                            have hwfPost : SymWf ({ nextSym := stEns.nextSym, nextLoc := stA.nextLoc, vars := stA.vars, cells := stHav.cells, cellTys := stA.cellTys, path := .and (.and stHav.path (.hasTy (.sym retId) fc.retTy)) (.isTrue svEns), obs := stEns.obs } : SymState) := by
+                              refine ⟨fun p hp => svalBound_mono hSymLe (hwfA.vars_bound p hp), ?_, ?_⟩
+                              · intro p hp
+                                have hb := hwfHav.cells_bound p hp
+                                exact ⟨hlHavEq ▸ hb.1, svalBound_mono (hsEns.symm ▸ Nat.le_succ _) hb.2⟩
+                              · exact ⟨⟨sformBound_mono (hsEns.symm ▸ Nat.le_succ _) hwfHav.path_bound, by rw [hsEns]; exact Nat.lt_succ_self _⟩, by rw [hsEns]; exact hbEns⟩
+                            rw [substMany_applyDir]
+                            have hPre0 : ∀ v ∈ ([] : List Expr), IsValue v := fun _ h => by cases h
+                            simpa only [List.nil_append] using
+                              goApplyArgs (prefixVals := []) (name := name) hPre0 hM hσ hMatch hArgs hObsA
+                                (fun {MA LA vs σA} hMA hσA hagMA hagLA hMatchA hvsCl hEvArgs => by
+                              have hvsVal : ∀ v ∈ vs, IsValue v := fun v hv => (hvsCl v hv).1
+                              have hTypM := hTypFa MA hMA hObsTyped hMatchA.path_holds
+                              have hLenVs : vs.length = fc.params.length := by
+                                rw [← hEvArgs.length_eq, ← hTypM.length_eq]
+                              have hLocsMap : collectConcreteLocs vs = locArgs.map LA :=
+                                collectConcreteLocs_eq_map hTypM hEvArgs
+                              have hNoDupConc : noDupLocs (collectConcreteLocs vs) = true := by
+                                rw [hLocsMap]
+                                exact noDupLocs_map_inj hNoDupSym hLocBound hMatchA.loc_inj
+                              have hClosedZip : ClosedEnv (zipParams fc.params vs) := by
+                                intro p hp
+                                have hmem : p.2 ∈ vs := (List.of_mem_zip hp).2
+                                exact hvsCl p.2 hmem
+                              have hEvArgsLb : PairwiseRel (fun sv v => evalSVal MA LA sv = some v ∧ svalLocBound stA.nextLoc sv) svArgs vs := by
+                                have : ∀ {svs' vs'}, PairwiseRel (fun sv v => evalSVal MA LA sv = some v) svs' vs' →
+                                    (∀ sv ∈ svs', svalLocBound stA.nextLoc sv) →
+                                    PairwiseRel (fun sv v => evalSVal MA LA sv = some v ∧ svalLocBound stA.nextLoc sv) svs' vs' := by
+                                  intro svs' vs' hfa hlb
+                                  induction hfa with
+                                  | nil => exact .nil
+                                  | cons h1 _ ih => exact .cons ⟨h1, hlb _ (List.mem_cons_self ..)⟩ (ih fun s hs => hlb s (List.mem_cons_of_mem _ hs))
+                                exact this hEvArgs hlbArgs
+                              have hMatchCall : StateMatches MA LA { stTyped with vars := paramBindings } (zipParams fc.params vs) σA :=
+                                { closed_env := hClosedZip, wf := hwfCall,
+                                  loc_bound := hlT ▸ hMatchA.loc_bound, loc_inj := hlT ▸ hMatchA.loc_inj,
+                                  path_holds := hpT ▸ hMatchA.path_holds,
+                                  vars_match := by rw [hlT]; exact zipParams_match_of_forall2 hEvArgsLb hTypM.length_eq,
+                                  cells_match := by rw [hcT, hlT]; exact hMatchA.cells_match,
+                                  cells_ty := by rw [hctT, hlT]; exact hMatchA.cells_ty }
+                              have hReqTrue : evalSVal MA LA svReq = some (.lit (.bool true)) :=
+                                evalSVal_lit_iff_id.mpr (hObsChecked0 _ (List.mem_cons_self ..) MA hMA (by rw [hpReq]; exact hMatchCall.path_holds))
+                              have hReqSteps : Steps Δ Φ (substMany (zipParams fc.params vs) fc.req) σA (.lit (.bool true)) σA :=
+                                vcgenPure_complete hMA hMatchCall hReq hReqTrue
+                              have hMatchChecked : StateMatches MA LA stChecked (zipParams fc.params vs) σA :=
+                                hMatchCall.of_eq hwfChecked (by rw [hlDec]; simp only [stChecked0, emitOb, hlReq])
+                                  (by rw [hvDec]; simp only [stChecked0, emitOb, hvReq])
+                                  (by rw [hcDec]; simp only [stChecked0, emitOb, hcReq])
+                                  (by rw [hctDec]; simp only [stChecked0, emitOb, hctReq, hctT])
+                                  (by rw [hpDec]; simp only [stChecked0, emitOb, hpReq]; exact hMatchCall.path_holds)
+                              constructor
+                              · intro k hk σ' hs
+                                rcases stepsN_applyDir_vals_terminal hvsVal (Or.inr ⟨_, rfl⟩) hs with ⟨m, hm, fd, hΦ, _, hbody⟩
+                                have hSafe := hCallee name fc fd vs σA hfc hΦ hLenVs hvsCl hσA hNoDupConc hReqSteps
+                                exact hSafe.1 m (by omega) σ' hbody
+                              · intro k hk v σ' hv hs
+                                rcases stepsN_applyDir_vals_terminal hvsVal (Or.inl hv) hs with ⟨m, hm, fd, hΦ, _, hbody⟩
+                                have hSafe := hCallee name fc fd vs σA hfc hΦ hLenVs hvsCl hσA hNoDupConc hReqSteps
+                                rcases hSafe.2 m (by omega) v σ' hv hbody with
+                                  ⟨hclV, htyV, hlenGrow, hσ'Cl, hFrame, hCellTys', hEnsSteps⟩
+                                have hbound' : ∀ j < stChecked.nextLoc, LA j < σ'.length := fun j hj =>
+                                  Nat.lt_of_lt_of_le (hMatchChecked.loc_bound j hj) hlenGrow
+                                have htys' : ∀ l ty, locLookup stChecked.cellTys l = some ty → l < stChecked.nextLoc ∧ ∃ w, σ'[LA l]? = some w ∧ valHasTy w ty := by
+                                  intro l ty hlu
+                                  have hluA : locLookup stA.cellTys l = some ty := by
+                                    rw [hctDec] at hlu; simp only [stChecked0, emitOb, hctReq] at hlu; exact hlu
+                                  rcases hMatchA.cells_ty l ty hluA with ⟨hlbA, w0, hget0, hvt0⟩
+                                  have hlbC : l < stChecked.nextLoc := by rw [hlDec]; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT]; exact hlbA
+                                  refine ⟨hlbC, ?_⟩
+                                  by_cases hin : l ∈ locArgs
+                                  · rcases callArg_cell_ty_mem hTypM hEvArgs hin hluA with ⟨p, hpmem, hpty⟩
+                                    exact hCellTys' p (.loc (LA l)) hpmem ty (LA l) hpty rfl
+                                  · have hNotInConc : LA l ∉ collectConcreteLocs vs := by
+                                      rw [hLocsMap]; intro hmem
+                                      rcases List.mem_map.mp hmem with ⟨l', hl', hEqL⟩
+                                      have hEq := hMatchA.loc_inj l' l (hLocBound l' hl') hlbA hEqL
+                                      subst hEq; exact hin hl'
+                                    have hFr := hFrame (LA l) (hMatchA.loc_bound l hlbA) hNotInConc
+                                    rw [hFr]; exact ⟨w0, hget0, hvt0⟩
+                                have hframe' : ∀ l sv, locLookup stChecked.cells l = some sv → l ∉ locArgs → σ'[LA l]? = σA[LA l]? := by
+                                  intro l sv hlu hnot
+                                  have hlb : l < stA.nextLoc := by
+                                    have := (hwfChecked.cells_bound _ (locLookup_mem hlu)).1
+                                    rw [hlDec] at this; simp only [stChecked0, emitOb_nextLoc, hlReq, hlT] at this; exact this
+                                  have hNotInConc : LA l ∉ collectConcreteLocs vs := by
                                     rw [hLocsMap]; intro hmem
                                     rcases List.mem_map.mp hmem with ⟨l', hl', hEqL⟩
-                                    have hEq := hMatchA.loc_inj l' l (hLocBound l' hl') hlbA hEqL
-                                    subst hEq; exact hin hl'
-                                  have hFr := hFrame (LA l) (hMatchA.loc_bound l hlbA) hNotInConc
-                                  rw [hFr]; exact ⟨w0, hget0, hvt0⟩
-                              have hframe' : ∀ l sv, locLookup stChecked.cells l = some sv → l ∉ locArgs → σ'[LA l]? = σA[LA l]? := by
-                                intro l sv hlu hnot
-                                have hlb : l < stA.nextLoc := by
-                                  have := (hwfChecked.cells_bound _ (locLookup_mem hlu)).1
-                                  simp only [stChecked, emitOb_nextLoc, hlReq, hlT] at this; exact this
-                                have hNotInConc : LA l ∉ collectConcreteLocs vs := by
-                                  rw [hLocsMap]; intro hmem
-                                  rcases List.mem_map.mp hmem with ⟨l', hl', hEqL⟩
-                                  have hEq := hMatchA.loc_inj l' l (hLocBound l' hl') hlb hEqL
-                                  subst hEq; exact hnot hl'
-                                exact hFrame (LA l) (hMatchA.loc_bound l hlb) hNotInConc
-                              rcases havocCells_extend_model locArgs hMA hMatchChecked hlocAll hbound' hσ'Cl htys' hframe' with
-                                ⟨MHav, hMHav, hagHav, hMatchHav⟩
-                              let MRet := updateModel MHav retId v
-                              have hMRet : ValidModel MRet := validModel_update hMHav hv hclV
-                              have hagRet_Hav : ∀ id < stHav.nextSym, MRet id = MHav id := fun id hid => by
-                                dsimp only [MRet, retId, updateModel]
-                                rw [beq_false_of_ne (Nat.ne_of_lt hid)]; rfl
-                              have hMatchRet : StateMatches MRet LA ({ stHav with
-                                  nextSym := retId + 1,
-                                  vars := (fc.retVar, .sym retId) :: paramBindings,
-                                  path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState)
-                                  ((fc.retVar, v) :: zipParams fc.params vs) σ' := by
-                                refine ⟨fun p hp => by rcases List.mem_cons.mp hp with rfl | hp'; exact ⟨hv, hclV⟩; exact hClosedZip p hp',
-                                  hwfRet, hMatchHav.loc_bound, hMatchHav.loc_inj,
-                                  ⟨(evalSForm_agree_lt hwfHav.path_bound hagRet_Hav).mpr hMatchHav.path_holds,
-                                   ⟨v, by simp [evalSVal, MRet, retId, updateModel], htyV⟩⟩,
-                                  ?_, ?_, hMatchHav.cells_ty⟩
-                                · intro y svy hlu
-                                  simp only [assocLookup] at hlu ⊢
-                                  cases hxy : (fc.retVar == y)
-                                  · simp [hxy] at hlu ⊢
-                                    have hlu0 : assocLookup stChecked.vars y = some svy := by
-                                      simp only [stChecked, emitOb, hvReq]; exact hlu
-                                    rcases hMatchChecked.vars_match y svy hlu0 with ⟨vy, hρy, hevy, hlby⟩
-                                    have hby := hwfChecked.vars_bound _ (assocLookup_mem hlu0)
-                                    have hag0 : ∀ id < stChecked.nextSym, MRet id = MA id := fun id hid =>
-                                      (hagRet_Hav id (Nat.lt_of_lt_of_le hid hsHav)).trans (hagHav id hid)
-                                    exact ⟨vy, hρy, (evalSVal_agree_lt hby hag0).trans hevy, hlHav.symm ▸ hlby⟩
-                                  · simp [hxy] at hlu ⊢; subst hlu
-                                    exact ⟨by simp [evalSVal, MRet, retId, updateModel], trivial⟩
+                                    have hEq := hMatchA.loc_inj l' l (hLocBound l' hl') hlb hEqL
+                                    subst hEq; exact hnot hl'
+                                  exact hFrame (LA l) (hMatchA.loc_bound l hlb) hNotInConc
+                                rcases havocCells_extend_model locArgs hMA hMatchChecked hlocAll hbound' hσ'Cl htys' hframe' with
+                                  ⟨MHav, hMHav, hagHav, hMatchHav⟩
+                                let MRet := updateModel MHav retId v
+                                have hMRet : ValidModel MRet := validModel_update hMHav hv hclV
+                                have hagRet_Hav : ∀ id < stHav.nextSym, MRet id = MHav id := fun id hid => by
+                                  dsimp only [MRet, retId, updateModel]
+                                  rw [beq_false_of_ne (Nat.ne_of_lt hid)]; rfl
+                                have hMatchRet : StateMatches MRet LA ({ stHav with
+                                    nextSym := retId + 1,
+                                    vars := (fc.retVar, .sym retId) :: paramBindings,
+                                    path := .and stHav.path (.hasTy (.sym retId) fc.retTy) } : SymState)
+                                    ((fc.retVar, v) :: zipParams fc.params vs) σ' := by
+                                  refine ⟨fun p hp => by rcases List.mem_cons.mp hp with rfl | hp'; exact ⟨hv, hclV⟩; exact hClosedZip p hp',
+                                    hwfRet, hMatchHav.loc_bound, hMatchHav.loc_inj,
+                                    ⟨(evalSForm_agree_lt hwfHav.path_bound hagRet_Hav).mpr hMatchHav.path_holds,
+                                     ⟨v, by simp [evalSVal, MRet, retId, updateModel], htyV⟩⟩,
+                                    ?_, ?_, hMatchHav.cells_ty⟩
+                                  · intro y svy hlu
+                                    simp only [assocLookup] at hlu ⊢
+                                    cases hxy : (fc.retVar == y)
+                                    · simp [hxy] at hlu ⊢
+                                      have hlu0 : assocLookup stChecked.vars y = some svy := by
+                                        rw [hvDec]; simp only [stChecked0, emitOb, hvReq]; exact hlu
+                                      rcases hMatchChecked.vars_match y svy hlu0 with ⟨vy, hρy, hevy, hlby⟩
+                                      have hby := hwfChecked.vars_bound _ (assocLookup_mem hlu0)
+                                      have hag0 : ∀ id < stChecked.nextSym, MRet id = MA id := fun id hid =>
+                                        (hagRet_Hav id (Nat.lt_of_lt_of_le hid hsHav)).trans (hagHav id hid)
+                                      exact ⟨vy, hρy, (evalSVal_agree_lt hby hag0).trans hevy, hlHav.symm ▸ hlby⟩
+                                    · simp [hxy] at hlu ⊢; subst hlu
+                                      exact ⟨by simp [evalSVal, MRet, retId, updateModel], trivial⟩
+                                  · intro l sv hlu
+                                    rcases hMatchHav.cells_match l sv hlu with ⟨w, hget, hev, hlb⟩
+                                    have hb := (hwfHav.cells_bound _ (locLookup_mem hlu)).2
+                                    exact ⟨w, hget, (evalSVal_agree_lt hb hagRet_Hav).trans hev, hlb⟩
+                                have hEnsTrue : evalSVal MRet LA svEns = some (.lit (.bool true)) :=
+                                  ((vcgenPure_sound hMRet hMatchRet hEns hObsEns).2 (.lit (.bool true)) σ' (.lit _) hEnsSteps).2
+                                have hagFinal : ∀ id < st.nextSym, MRet id = M id := fun id hid => by
+                                  have hidA : id < stA.nextSym := Nat.lt_of_lt_of_le hid hsA
+                                  have hidC : id < stChecked.nextSym := by rw [hsDec]; simp only [stChecked0, emitOb_nextSym, hsReq, hsT]; exact hidA
+                                  have hidH : id < stHav.nextSym := Nat.lt_of_lt_of_le hidC hsHav
+                                  exact (hagRet_Hav id hidH).trans ((hagHav id hidC).trans (hagMA id hid))
+                                have hagA_Ret : ∀ id < stA.nextSym, MRet id = MA id := fun id hid => by
+                                  have hidC : id < stChecked.nextSym := by rw [hsDec]; simp only [stChecked0, emitOb_nextSym, hsReq, hsT]; exact hid
+                                  exact (hagRet_Hav id (Nat.lt_of_lt_of_le hidC hsHav)).trans (hagHav id hidC)
+                                refine ⟨hσ'Cl, MRet, LA, hMRet, hagFinal, hagLA, ?_, by dsimp only [evalSVal, MRet, retId, stHav, locArgs, updateModel]; simp⟩
+                                refine ⟨hMatchA.closed_env, hwfPost, hlHavEq ▸ hMatchHav.loc_bound, hlHavEq ▸ hMatchHav.loc_inj,
+                                  ⟨⟨(evalSForm_agree_lt hwfHav.path_bound hagRet_Hav).mpr hMatchHav.path_holds,
+                                    ⟨v, by dsimp only [evalSVal, MRet, retId, stHav, locArgs, updateModel]; simp, htyV⟩⟩,
+                                   evalSVal_lit_iff_id.mp hEnsTrue⟩,
+                                  ?_, ?_, ?_⟩
+                                · intro x svx hlu
+                                  rcases hMatchA.vars_match x svx hlu with ⟨vx, hρx, hevx, hlbx⟩
+                                  exact ⟨vx, hρx, (evalSVal_agree_lt (hwfA.vars_bound _ (assocLookup_mem hlu)) hagA_Ret).trans hevx, hlbx⟩
                                 · intro l sv hlu
                                   rcases hMatchHav.cells_match l sv hlu with ⟨w, hget, hev, hlb⟩
                                   have hb := (hwfHav.cells_bound _ (locLookup_mem hlu)).2
-                                  exact ⟨w, hget, (evalSVal_agree_lt hb hagRet_Hav).trans hev, hlb⟩
-                              have hEnsTrue : evalSVal MRet LA svEns = some (.lit (.bool true)) :=
-                                ((vcgenPure_sound hMRet hMatchRet hEns hObsEns).2 (.lit (.bool true)) σ' (.lit _) hEnsSteps).2
-                              have hagFinal : ∀ id < st.nextSym, MRet id = M id := fun id hid => by
-                                have hidA : id < stA.nextSym := Nat.lt_of_lt_of_le hid hsA
-                                have hidC : id < stChecked.nextSym := by simp only [stChecked, emitOb_nextSym, hsReq, hsT]; exact hidA
-                                have hidH : id < stHav.nextSym := Nat.lt_of_lt_of_le hidC hsHav
-                                exact (hagRet_Hav id hidH).trans ((hagHav id hidC).trans (hagMA id hid))
-                              have hagA_Ret : ∀ id < stA.nextSym, MRet id = MA id := fun id hid => by
-                                have hidC : id < stChecked.nextSym := by simp only [stChecked, emitOb_nextSym, hsReq, hsT]; exact hid
-                                exact (hagRet_Hav id (Nat.lt_of_lt_of_le hidC hsHav)).trans (hagHav id hidC)
-                              refine ⟨hσ'Cl, MRet, LA, hMRet, hagFinal, hagLA, ?_, by dsimp only [evalSVal, MRet, retId, stHav, stChecked, locArgs, updateModel]; simp⟩
-                              refine ⟨hMatchA.closed_env, hwfPost, hlHavEq ▸ hMatchHav.loc_bound, hlHavEq ▸ hMatchHav.loc_inj,
-                                ⟨⟨(evalSForm_agree_lt hwfHav.path_bound hagRet_Hav).mpr hMatchHav.path_holds,
-                                  ⟨v, by dsimp only [evalSVal, MRet, retId, stHav, stChecked, locArgs, updateModel]; simp, htyV⟩⟩,
-                                 evalSVal_lit_iff_id.mp hEnsTrue⟩,
-                                ?_, ?_, ?_⟩
-                              · intro x svx hlu
-                                rcases hMatchA.vars_match x svx hlu with ⟨vx, hρx, hevx, hlbx⟩
-                                exact ⟨vx, hρx, (evalSVal_agree_lt (hwfA.vars_bound _ (assocLookup_mem hlu)) hagA_Ret).trans hevx, hlbx⟩
-                              · intro l sv hlu
-                                rcases hMatchHav.cells_match l sv hlu with ⟨w, hget, hev, hlb⟩
-                                have hb := (hwfHav.cells_bound _ (locLookup_mem hlu)).2
-                                exact ⟨w, hget, (evalSVal_agree_lt hb hagRet_Hav).trans hev, hlHavEq ▸ hlb⟩
-                              · intro l ty hlu
-                                have hluH : locLookup stHav.cellTys l = some ty := by
-                                  change locLookup (havocCells stChecked locArgs).cellTys l = some ty
-                                  rw [hctHav]; simp only [stChecked, emitOb, hctReq]; exact hlu
-                                rcases hMatchHav.cells_ty l ty hluH with ⟨hlb, w, hget, hvt⟩
-                                exact ⟨hlHavEq ▸ hlb, w, hget, hvt⟩)
+                                  exact ⟨w, hget, (evalSVal_agree_lt hb hagRet_Hav).trans hev, hlHavEq ▸ hlb⟩
+                                · intro l ty hlu
+                                  have hluH : locLookup stHav.cellTys l = some ty := by
+                                    change locLookup (havocCells stChecked locArgs).cellTys l = some ty
+                                    rw [hctHav, hctDec]; simp only [stChecked0, emitOb, hctReq]; exact hlu
+                                  rcases hMatchHav.cells_ty l ty hluH with ⟨hlb, w, hget, hvt⟩
+                                  exact ⟨hlHavEq ▸ hlb, w, hget, hvt⟩)
           · rw [hAssume] at hvc; simp only [↓reduceIte] at hvc
             have hName : name = "assume" := eq_of_beq hAssume
             subst hName
@@ -6582,7 +6827,8 @@ where
               | some r1 =>
                 rcases r1 with ⟨st1, sv1⟩; simp [h1] at hvc; rcases hvc with ⟨rfl, rfl⟩
                 rcases vcgen_wf hMatch.wf h1 with ⟨_, _, _, _, hwf1, _⟩
-                have hObs1 : ValidObs st1.obs := validObs_mono (fun _ hf => List.mem_cons_of_mem _ hf) hObs
+                have hObs1 : ValidObs st1.obs :=
+                validObs_mono (fun _ hf => List.mem_cons_of_mem _ hf) (by simpa [emitOb] using hObs)
                 have ih1 := go hM hσ hMatch h1 hObs1
                 rw [substMany_applyDir]; simp only [List.map]
                 constructor
@@ -6903,39 +7149,20 @@ theorem verifyFn_sound {Δ : AdtEnv} {Φ : FunEnv} {env : VcgEnv}
         ⟨by simp only [withPath, hsReq, hvReq]; exact hMatchInit.wf.vars_bound,
          by simp only [withPath, hsReq, hlReq, hcReq]; exact hMatchInit.wf.cells_bound,
          by simp only [withPath, sformBound, hsReq, hpReq]; exact ⟨hMatchInit.wf.path_bound, hbReq⟩⟩
-      cases hDecOpt : (match fc.dec with
-          | none => some (withPath stReq (.isTrue svReq))
-          | some decE =>
-            match vcgenPure (withPath stReq (.isTrue svReq)) decE with
-            | none => none
-            | some (stDec, svDec) =>
-              some (emitOb stDec (.isTrue (.bin .geInt svDec (.lit (.int 0)))))) with
+      cases hDecOpt : checkLoopPreDec (withPath stReq (.isTrue svReq)) fc.dec with
       | none => simp [hDecOpt] at hver
-      | some stAssumed =>
-        simp only [hDecOpt] at hver
-        have hDecProps : stAssumed.nextSym = initSt.nextSym ∧ stAssumed.nextLoc = initSt.nextLoc ∧
-            stAssumed.vars = initSt.vars ∧ stAssumed.cells = initSt.cells ∧ stAssumed.cellTys = initSt.cellTys ∧
-            stAssumed.path = .and initSt.path (.isTrue svReq) ∧
-            (∀ f ∈ stReq.obs, f ∈ stAssumed.obs) ∧ SymWf stAssumed := by
-          cases hdc : fc.dec with
-          | none =>
-            simp [hdc] at hDecOpt; subst hDecOpt
-            exact ⟨hsReq, hlReq, hvReq, hcReq, hctReq, by simp [withPath, hpReq], fun _ hf => hf, hwfReq0⟩
-          | some decE =>
-            simp [hdc] at hDecOpt
-            cases hd : vcgenPure (withPath stReq (.isTrue svReq)) decE with
-            | none => simp [hd] at hDecOpt
-            | some rd =>
-              rcases rd with ⟨stDec, svDec⟩; simp [hd] at hDecOpt; subst hDecOpt
-              rcases vcgenPure_wf hwfReq0 hd with ⟨hsd, hld, hvd, hcd, hpd, hod, _⟩
-              have hctd : stDec.cellTys = initSt.cellTys := (vcgenPure_cellTys_eq hd).trans hctReq
-              refine ⟨hsd.trans hsReq, hld.trans hlReq, hvd.trans hvReq, hcd.trans hcReq, hctd,
-                by simp only [emitOb, hpd, withPath, hpReq], fun f hf => List.mem_cons_of_mem _ (hod f hf), ?_⟩
-              exact ⟨by simp only [emitOb, hsd, hvd]; exact hwfReq0.vars_bound,
-                by simp only [emitOb, hsd, hld, hcd]; exact hwfReq0.cells_bound,
-                by simp only [emitOb, hsd, hpd]; exact hwfReq0.path_bound⟩
-        rcases hDecProps with ⟨hsA, hlA, hvA, hcA, hctA, hpA, hoA, hwfAssumed⟩
-        cases hBodyVc : vcgen env stAssumed fd.body with
+      | some rDec =>
+        rcases rDec with ⟨stAssumed, curDecOpt⟩; simp only [hDecOpt] at hver
+        rcases checkLoopPreDec_props hwfReq0 hDecOpt with
+          ⟨hsD, hlD, hvD, hcD, hctD, hpD, hoA, hwfAssumed⟩
+        have hsA : stAssumed.nextSym = initSt.nextSym := hsD.trans hsReq
+        have hlA : stAssumed.nextLoc = initSt.nextLoc := hlD.trans hlReq
+        have hvA : stAssumed.vars = initSt.vars := hvD.trans hvReq
+        have hcA : stAssumed.cells = initSt.cells := hcD.trans hcReq
+        have hctA : stAssumed.cellTys = initSt.cellTys := hctD.trans hctReq
+        have hpA : stAssumed.path = .and initSt.path (.isTrue svReq) := by
+          rw [hpD]; simp only [withPath, hpReq]
+        cases hBodyVc : vcgen { env with curFn := fd.name, curDec := curDecOpt } stAssumed fd.body with
         | none => simp [hBodyVc] at hver
         | some rBody =>
           rcases rBody with ⟨stBody, svRet⟩; simp only [hBodyVc] at hver
@@ -6958,7 +7185,9 @@ theorem verifyFn_sound {Δ : AdtEnv} {Φ : FunEnv} {env : VcgEnv}
               ((vcgenPure_sound (Δ := Δ) (Φ := Φ) hM hMatchInit hReqVc hObsReq).2 (.lit (.bool true)) σ (.lit _) hReq).2
             have hMatchAssumed : StateMatches M L stAssumed (zipParams fd.params vs) σ :=
               hMatchInit.of_eq hwfAssumed hlA hvA hcA hctA (by rw [hpA]; exact ⟨hMatchInit.path_holds, evalSVal_lit_iff_id.mp hReqTrue⟩)
-            have hBodySafe := vcgen_sound (Δ := Δ) (Φ := Φ) hIntr hCallee hM hσ hMatchAssumed hBodyVc hObsBody
+            have hCalleeBody : ∀ bound, CalleeSound Δ Φ { env with curFn := fd.name, curDec := curDecOpt } bound :=
+              fun b => by simpa [CalleeSound] using hCallee b
+            have hBodySafe := vcgen_sound (Δ := Δ) (Φ := Φ) hIntr hCalleeBody hM hσ hMatchAssumed hBodyVc hObsBody
             constructor
             · intro σ' hsteps
               rcases steps_to_stepsN hsteps with ⟨n, hn⟩
@@ -7019,7 +7248,7 @@ theorem identity_verified_nonvacuous
                  (.isTrue (.bin .eqInt (.sym 0) (.sym 0)))] := by
     unfold verifyFn
     rw [hInit]
-    simp [idWitnessFd, idWitnessFc, vcgenPure, vcgen, assocLookup, withPath, emitOb,
+    simp [idWitnessFd, idWitnessFc, vcgenPure, vcgen, assocLookup, withPath, emitOb, checkLoopPreDec,
       isModeledScalarTy, isModeledLit, isModeledStrictBinOp, isDivOp]
   have hObs : ValidObs [.imp (.and (.and .tt (.hasTy (.sym 0) .int)) (.isTrue (.lit (.bool true))))
                              (.isTrue (.bin .eqInt (.sym 0) (.sym 0)))] := by
@@ -7051,6 +7280,117 @@ theorem identity_verified_nonvacuous
     intro _ _ _ _ _ _ hfc; simp at hfc
   exact verifyFn_sound hIntr hCalleeEmpty hΦ hInit hVer hObs hM0 hσ
     (fun v hv => by simp at hv; subst hv; exact .lit _) rfl hMatch0 (.refl _ _)
+
+/-- Concrete local `cellNew(0)` + `while (false) invariant true { () }` + `cellGet(c)` witness for T1. -/
+def localCellWhileBody : Expr :=
+  .let_ "c" (.cellNew (.lit (.int 0)))
+    (.block [.while_ (.lit (.bool false)) (.lit .unit), .cellGet (.var "c")])
+
+def localCellWhileFd : FunDef :=
+  { name := "localCellWhile", params := [], retTy := .int, body := localCellWhileBody }
+
+def localCellWhileFc : FnContract :=
+  { params := [], retTy := .int,
+    req := .lit (.bool true), retVar := "__gs_res",
+    ens := .bin .eqInt (.var "__gs_res") (.var "__gs_res") }
+
+def localCellWhileEnv : VcgEnv :=
+  { loops := fun c b =>
+      match c, b with
+      | .lit (.bool false), .lit .unit => some { inv := .lit (.bool true) }
+      | _, _ => none }
+
+set_option maxHeartbeats 400000 in
+/-- **T1 Non-Vacuity Witness (`local_cell_while_verified_nonvacuous`)**:
+    Proves directly in the Lean 4 kernel that a function allocating a local `Cell<Int>`
+    via `cellNew(0)`, running a `while (false) invariant (true)` loop (which havocs `c`),
+    and returning `cellGet(c)` with `ensures __gs_res == __gs_res` succeeds in `verifyFn`
+    AND every generated obligation satisfies `ValidObs` for ALL `ValidModel M`!
+    (This was previously `¬ ValidForm` before `cellNew` recorded `(l, elemTy)` in `cellTys`.) -/
+theorem local_cell_while_verified_nonvacuous :
+    ∃ obs, verifyFn localCellWhileEnv localCellWhileFd localCellWhileFc = some obs ∧ ValidObs obs := by
+  let bodyEnv : VcgEnv := { localCellWhileEnv with curFn := "localCellWhile", curDec := none }
+  let st0 : SymState :=
+    { nextSym := 0, nextLoc := 0, vars := [], cells := [], cellTys := [],
+      path := .and .tt (.isTrue (.lit (.bool true))), obs := [] }
+  let ob0 : SForm := .imp st0.path (.hasTy (.lit (.int 0)) .int)
+  let st1 : SymState :=
+    { nextSym := 0, nextLoc := 1, vars := [("c", .loc 0)],
+      cells := [(0, .lit (.int 0))], cellTys := [(0, .int)],
+      path := st0.path, obs := [ob0] }
+  let ob1 : SForm := .imp st0.path (.isTrue (.lit (.bool true)))
+  let ob2 : SForm :=
+    .imp (.and (.and (.and st0.path (.hasTy (.sym 0) .int))
+                     (.isTrue (.lit (.bool true))))
+               (.isTrue (.lit (.bool false))))
+         (.isTrue (.lit (.bool true)))
+  let st2 : SymState :=
+    { nextSym := 1, nextLoc := 1, vars := [("c", .loc 0)],
+      cells := [(0, .sym 0), (0, .lit (.int 0))], cellTys := [(0, .int)],
+      path := .and (.and (.and st0.path (.hasTy (.sym 0) .int))
+                         (.isTrue (.lit (.bool true))))
+                   (.isFalse (.lit (.bool false))),
+      obs := [ob2, ob1, ob0] }
+  let ob3 : SForm := .imp st2.path (.isTrue (.bin .eqInt (.sym 0) (.sym 0)))
+  have hInit : initFnSymState localCellWhileFd.params = some ({} : SymState) := rfl
+  have hNew : vcgen bodyEnv st0 (.cellNew (.lit (.int 0))) =
+      some ({ st1 with vars := [] }, .loc 0) := by
+    have hLit0 : vcgen bodyEnv st0 (.lit (.int 0)) = some (st0, .lit (.int 0)) := by
+      rw [vcgen]; rfl
+    rw [vcgen, hLit0]; rfl
+  have hWhile : vcgen bodyEnv st1 (.while_ (.lit (.bool false)) (.lit .unit)) =
+      some (st2, .lit .unit) := by
+    have hLitF : ∀ (e0 : VcgEnv) s, vcgen e0 s (.lit (.bool false)) = some (s, .lit (.bool false)) := by
+      intro e0 s; rw [vcgen]; simp only [isModeledLit, ↓reduceIte]
+    have hLitU : ∀ (e0 : VcgEnv) s, vcgen e0 s (.lit .unit) = some (s, .lit .unit) := by
+      intro e0 s; rw [vcgen]; simp only [isModeledLit, ↓reduceIte]
+    rw [vcgen]
+    simp only [bodyEnv, localCellWhileEnv, vcgenPure, isModeledLit, emitOb, havocCells,
+      trackedLocs, locLookup, withPath, hLitF, hLitU, checkLoopPreDec, checkLoopPostDec,
+      st0, st1, st2, ob0, ob1, ob2, List.map, List.foldl, bne_self_eq_false, ↓reduceIte,
+      beq_self_eq_true]
+    rfl
+  have hGet : vcgen bodyEnv st2 (.cellGet (.var "c")) = some (st2, .sym 0) := by
+    have hVarC : vcgen bodyEnv st2 (.var "c") = some (st2, .loc 0) := by
+      rw [vcgen]; simp only [st2, assocLookup, beq_self_eq_true, ↓reduceIte]
+    rw [vcgen]; simp only [hVarC, st2, locLookup, beq_self_eq_true, ↓reduceIte]
+  have hBody : vcgen bodyEnv st0 localCellWhileBody = some ({ st2 with vars := [] }, .sym 0) := by
+    unfold localCellWhileBody
+    rw [vcgen]
+    simp only [hNew]
+    change (match vcgen bodyEnv st1 (.block [.while_ (.lit (.bool false)) (.lit .unit), .cellGet (.var "c")]) with
+      | none => none
+      | some (stB, svB) => some ({ stB with vars := [] }, svB)) = some ({ st2 with vars := [] }, .sym 0)
+    rw [vcgen]
+    rw [vcgenBlock]
+    simp only [hWhile]
+    rw [vcgenBlock]
+    simp only [hGet]
+  have hReq : vcgenPure ({} : SymState) (.lit (.bool true)) = some ({}, .lit (.bool true)) := by
+    simp [vcgenPure, isModeledLit]
+  have hVer : verifyFn localCellWhileEnv localCellWhileFd localCellWhileFc =
+      some [ob3, ob2, ob1, ob0] := by
+    unfold verifyFn
+    rw [hInit]
+    simp only [localCellWhileFd, localCellWhileFc, List.length_nil, bne_self_eq_false, ↓reduceIte,
+      hReq, withPath, checkLoopPreDec]
+    have hBody' : vcgen { localCellWhileEnv with curFn := "localCellWhile", curDec := none }
+        { nextSym := 0, nextLoc := 0, vars := [], cells := [], cellTys := [],
+          path := .and .tt (.isTrue (.lit (.bool true))), obs := [] }
+        localCellWhileBody = some ({ st2 with vars := [] }, .sym 0) := hBody
+    rw [hBody']
+    simp [vcgenPure, assocLookup, isModeledStrictBinOp, isDivOp, emitOb, st2, ob3]
+  refine ⟨[ob3, ob2, ob1, ob0], hVer, ?_⟩
+  intro f hf M _
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hf
+  rcases hf with rfl | rfl | rfl | rfl
+  · intro hP
+    rcases hP with ⟨⟨⟨_, ⟨v0, hev0, ⟨k, rfl⟩⟩⟩, _⟩, _⟩
+    simp only [evalSVal] at hev0
+    simp [evalSForm, evalSVal, hev0, evalBinOp]
+  · intro _; simp [evalSForm, evalSVal]
+  · intro _; simp [evalSForm, evalSVal]
+  · intro _; exact ⟨.lit (.int 0), rfl, ⟨0, rfl⟩⟩
 
 /-- Concrete `safeDiv(a: Int, b: Int): Int requires b != 0` callee witness for R1. -/
 def safeDivWitnessFd : FunDef :=
@@ -7806,6 +8146,8 @@ def svalToSmt2 : SVal → Option String
     | .bitNot => some s!"(bvnot {s})"
     | .neg64 => some s!"(bvneg {s})"
     | .bitNot64 => some s!"(bvnot {s})"
+    | .intToI64 => some s!"((_ sign_extend 32) {s})"
+    | .i64ToInt => some s!"((_ extract 31 0) {s})"
     | _ => none
   | .bin op e1 e2 => do
     let s1 ← svalToSmt2 e1
@@ -7822,9 +8164,9 @@ def svalToSmt2 : SVal → Option String
     | .shlInt => some s!"(bvshl {s1} (bvand {s2} #x0000001f))"
     | .shrInt => some s!"(bvashr {s1} (bvand {s2} #x0000001f))"
     | .ushrInt => some s!"(bvlshr {s1} (bvand {s2} #x0000001f))"
-    | .shl64 => some s!"(bvshl {s1} (bvand {s2} #x000000000000003f))"
-    | .shr64 => some s!"(bvashr {s1} (bvand {s2} #x000000000000003f))"
-    | .ushr64 => some s!"(bvlshr {s1} (bvand {s2} #x000000000000003f))"
+    | .shl64 => some s!"(bvshl {s1} ((_ zero_extend 32) (bvand {s2} #x0000003f)))"
+    | .shr64 => some s!"(bvashr {s1} ((_ zero_extend 32) (bvand {s2} #x0000003f)))"
+    | .ushr64 => some s!"(bvlshr {s1} ((_ zero_extend 32) (bvand {s2} #x0000003f)))"
     | .eqInt | .eq64 | .eqBool | .eqChar => some s!"(= {s1} {s2})"
     | .neInt | .ne64 | .neBool | .neChar => some s!"(not (= {s1} {s2}))"
     | .ltInt | .lt64 => some s!"(bvslt {s1} {s2})"
@@ -7881,50 +8223,127 @@ private def collectSFormSyms : SForm → List SymId
   | .not p => collectSFormSyms p
   | .and p q | .imp p q => collectSFormSyms p ++ collectSFormSyms q
 
-private def collectSymTys : SForm → List (SymId × Ty)
-  | .hasTy (.sym id) ty => [(id, ty)]
-  | .not p => collectSymTys p
-  | .and p q | .imp p q => collectSymTys p ++ collectSymTys q
-  | _ => []
-
 private def tyToSmtSort : Ty → String
   | .int64 => "(_ BitVec 64)"
   | .bool => "Bool"
   | _ => "(_ BitVec 32)"
 
 /-- Emit a self-contained SMT-LIB2 validity query (`(assert (not ob))` + `(check-sat)`)
-    for an obligation `ob : SForm` produced by `CoreGeisha.VCG`. -/
+    for an obligation `ob : SForm` produced by `CoreGeisha.VCG`.
+    Fail-closed (`none`) whenever any symbol lacks an explicit modeled scalar `.hasTy` constraint
+    in `ob` (never silently defaults missing sorts to `.int`). -/
 def emitObSmt2 (ob : SForm) : Option String := do
   let body ← sformToSmt2 ob
   let rawSyms := collectSFormSyms ob
   let uniqueSyms := rawSyms.foldl (fun acc id => if acc.contains id then acc else acc ++ [id]) []
   let tyMap := collectSymTys ob
-  let decls := uniqueSyms.map fun id =>
-    let ty := (tyMap.find? (·.1 == id)).map Prod.snd |>.getD .int
-    s!"(declare-const sym_{id} {tyToSmtSort ty})"
+  let decls ← uniqueSyms.mapM fun id =>
+    match tyMap.find? (·.1 == id) with
+    | some (_, ty) =>
+      if isModeledScalarTy ty then
+        some s!"(declare-const sym_{id} {tyToSmtSort ty})"
+      else none
+    | none => none
   let header := "(set-logic QF_BV)\n" ++ String.intercalate "\n" decls
   some s!"{header}\n(assert (not {body}))\n(check-sat)\n"
+
+/- Normalize `(apply-dir "intToI64" [e])` and `(apply-dir "i64ToInt" [e])` intrinsic calls
+   from dumped `.gscore` into first-class `UnOp.intToI64` / `UnOp.i64ToInt` nodes. -/
+mutual
+private def normalizeCastsExpr : Expr → Expr
+  | .un op e => .un op (normalizeCastsExpr e)
+  | .bin op e1 e2 => .bin op (normalizeCastsExpr e1) (normalizeCastsExpr e2)
+  | .let_ x e1 e2 => .let_ x (normalizeCastsExpr e1) (normalizeCastsExpr e2)
+  | .block es => .block (normalizeCastsList es)
+  | .tuple es => .tuple (normalizeCastsList es)
+  | .if_ c t e => .if_ (normalizeCastsExpr c) (normalizeCastsExpr t) (normalizeCastsExpr e)
+  | .while_ c b => .while_ (normalizeCastsExpr c) (normalizeCastsExpr b)
+  | .cellNew e => .cellNew (normalizeCastsExpr e)
+  | .cellGet e => .cellGet (normalizeCastsExpr e)
+  | .cellSet e1 e2 => .cellSet (normalizeCastsExpr e1) (normalizeCastsExpr e2)
+  | .getTag e => .getTag (normalizeCastsExpr e)
+  | .makeData tn tag es => .makeData tn tag (normalizeCastsList es)
+  | .apply f es => .apply (normalizeCastsExpr f) (normalizeCastsList es)
+  | .applyDir name args =>
+    let args' := normalizeCastsList args
+    match name, args' with
+    | "intToI64", [e1] => .un .intToI64 e1
+    | "i64ToInt", [e1] => .un .i64ToInt e1
+    | _, _ => .applyDir name args'
+  | .lam m ps rt b => .lam m ps rt (normalizeCastsExpr b)
+  | .match_ s arms => .match_ (normalizeCastsExpr s) (normalizeCastsArms arms)
+  | .spawn e => .spawn (normalizeCastsExpr e)
+  | .await e => .await (normalizeCastsExpr e)
+  | .concPrim p es => .concPrim p (normalizeCastsList es)
+  | e => e
+
+private def normalizeCastsList : List Expr → List Expr
+  | [] => []
+  | e :: es => normalizeCastsExpr e :: normalizeCastsList es
+
+private def normalizeCastsArms : List (Pat × Expr) → List (Pat × Expr)
+  | [] => []
+  | (p, e) :: rest => (p, normalizeCastsExpr e) :: normalizeCastsArms rest
+end
+
+/- Collect direct callee names referenced via `.applyDir` in an expression (excluding intrinsics). -/
+mutual
+private def collectCallsExpr : Expr → List Ident
+  | .un _ e | .cellNew e | .cellGet e | .getTag e | .spawn e | .await e => collectCallsExpr e
+  | .bin _ e1 e2 | .let_ _ e1 e2 | .cellSet e1 e2 | .while_ e1 e2 =>
+    collectCallsExpr e1 ++ collectCallsExpr e2
+  | .if_ c t e => collectCallsExpr c ++ collectCallsExpr t ++ collectCallsExpr e
+  | .block es | .tuple es | .makeData _ _ es | .concPrim _ es => collectCallsList es
+  | .apply f es => collectCallsExpr f ++ collectCallsList es
+  | .applyDir name args =>
+    let rest := collectCallsList args
+    if name == "assert" || name == "assume" then rest else name :: rest
+  | .lam _ _ _ b => collectCallsExpr b
+  | .match_ s arms => collectCallsExpr s ++ collectCallsArms arms
+  | _ => []
+
+private def collectCallsList : List Expr → List Ident
+  | [] => []
+  | e :: es => collectCallsExpr e ++ collectCallsList es
+
+private def collectCallsArms : List (Pat × Expr) → List Ident
+  | [] => []
+  | (_, e) :: rest => collectCallsExpr e ++ collectCallsArms rest
+end
+
+/-- Bounded reachability in the direct call graph (fuel = number of functions). -/
+private def canReachFn (graph : List (Ident × List Ident)) (src dst : Ident) : Nat → Bool
+  | 0 => false
+  | fuel + 1 =>
+    let nbrs := (graph.find? (·.1 == src)).map Prod.snd |>.getD []
+    if nbrs.contains dst then true
+    else nbrs.any (fun next => canReachFn graph next dst fuel)
 
 /-- Cross-verify a live `.gscore` program emitted by `geisha verify --dump-core`
     through our machine-checked `VCG.verifyFn`, returning the exact list of
     `(fnName, obligation)` pairs for kernel/SMT discharge in `Main.lean`!
     Rejects fail-closed whenever any user function contains unmodeled constructs
-    (e.g. Float equality, aliased mutable `Cell` calls, unannotated loops). -/
+    (e.g. Float equality, aliased mutable `Cell` calls, unannotated loops, or
+    mutually recursive calls missing `decreases`). -/
 def verifyGscoreProgram (funs : List FunDef) : Except String (Nat × List (Ident × SForm)) := do
-  -- 1. Extract contracts & loop annotations for all user functions
+  -- 1. Normalize cast intrinsics and extract contracts & loop annotations for all user functions
   let extracted := funs.map fun fd =>
-    let (fc, body0, hasC) := extractGscoreFnContract fd
+    let fdNorm : FunDef := { fd with body := normalizeCastsExpr fd.body }
+    let (fc, body0, hasC) := extractGscoreFnContract fdNorm
     let (bodyClean, loops) := collectLoopsExpr body0
-    (fd, fc, bodyClean, loops, hasC)
+    (fdNorm, fc, bodyClean, loops, hasC)
   let contractMap : List (Ident × FnContract) :=
     extracted.map fun (fd, fc, _, _, _) => (fd.name, fc)
   let allLoops : List (Expr × Expr × LoopContract) :=
     extracted.foldl (fun acc (_, _, _, ls, _) => acc ++ ls) []
+  let callGraph : List (Ident × List Ident) :=
+    extracted.map fun (fd, _, bodyClean, _, _) => (fd.name, collectCallsExpr bodyClean)
   let env : VcgEnv := {
     contracts := fun nm => (contractMap.find? (·.1 == nm)).map Prod.snd
     loops := fun c b =>
       (allLoops.find? (fun (c0, b0, _) => reprStr c0 == reprStr c && reprStr b0 == reprStr b)).map
         (fun (_, _, lc) => lc)
+    isSameScc := fun cur nm => nm == cur || canReachFn callGraph nm cur extracted.length
   }
   -- 2. Run `verifyFn` on every non-empty user function (skip trivial `main = ()`)
   let mut verifiedFns : Nat := 0

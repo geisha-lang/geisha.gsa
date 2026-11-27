@@ -200,6 +200,8 @@ private def parseUnOp : String → Except String UnOp
   | "bitNot64" => .ok .bitNot64
   | "negFloat" => .ok .negFloat
   | "negFloat32" => .ok .negFloat32
+  | "intToI64" => .ok .intToI64
+  | "i64ToInt" => .ok .i64ToInt
   | s => .error s!"unknown unary op '{s}'"
 
 private def parseBinOp : String → Except String BinOp
