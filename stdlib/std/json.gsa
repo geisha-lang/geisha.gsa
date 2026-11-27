@@ -217,9 +217,17 @@ def parseNumber(p: Parser): Result Value String = {
         ()
     } else ();
     let dStart = cellGet(p.pos);
-    while (peek(p) >= 48 && peek(p) <= 57) {
+    let firstDigit = peek(p);
+    if (firstDigit == 48) {
         let _ = bump(p);
-        ()
+        if (peek(p) >= 48 && peek(p) <= 57) {
+            cellSet(p.pos, dStart)
+        } else ()
+    } else {
+        while (peek(p) >= 48 && peek(p) <= 57) {
+            let _ = bump(p);
+            ()
+        }
     };
     if (cellGet(p.pos) == dStart) {
         Err("invalid JSON number at byte " + intToStr(start))
@@ -245,10 +253,14 @@ def parseNumber(p: Parser): Result Value String = {
                 let _ = bump(p);
                 ()
             } else ();
+            let eStart = cellGet(p.pos);
             while (peek(p) >= 48 && peek(p) <= 57) {
                 let _ = bump(p);
                 ()
-            }
+            };
+            if (cellGet(p.pos) == eStart) {
+                cellSet(p.pos, start)
+            } else ()
         } else ();
         let endIdx = cellGet(p.pos);
         if (endIdx <= start) {

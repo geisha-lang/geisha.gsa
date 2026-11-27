@@ -3109,6 +3109,8 @@ use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 def main(): Void = {
     printLn("{progress}");
     printLn("{\"msg\":\"not_a_bench\"}");
+    printLn("{\"name\":\"progress\",\"mean_ns\":01,\"ops_per_sec\":0}");
+    printLn("{\"name\":\"bad_num\",\"iters\":1,\"rounds\":1,\"total_ns\":1,\"mean_ns\":-01,\"median_ns\":1,\"min_ns\":1,\"max_ns\":1,\"ops_per_sec\":1}");
     printLn("plain log line");
     let b = bufNew();
     bufPushStr(b, "ctrl_");
@@ -3129,6 +3131,8 @@ assert [b["name"] for b in bs] == ["ok_bench", "ctrl_\x07"], bs
 stderr_text = open(sys.argv[2], encoding="utf-8").read()
 assert "{progress}" in stderr_text, stderr_text
 assert '{"msg":"not_a_bench"}' in stderr_text, stderr_text
+assert '{"name":"progress","mean_ns":01,"ops_per_sec":0}' in stderr_text, stderr_text
+assert '{"name":"bad_num","iters":1,"rounds":1,"total_ns":1,"mean_ns":-01,"median_ns":1,"min_ns":1,"max_ns":1,"ops_per_sec":1}' in stderr_text, stderr_text
 assert "plain log line" in stderr_text, stderr_text
 PY
 

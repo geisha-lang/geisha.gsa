@@ -522,9 +522,21 @@ def execBenchBinDirect(
     }
 }
 
+def isJsonNumber(v: Value): Bool = match v {
+    VFloat(_) -> true,
+    VInt(_) -> true,
+    _ -> false,
+}
+
 def isBenchStatsJsonObj(fields: List (String, Value)): Bool = {
     let hasName = cellNew(false);
+    let hasIters = cellNew(false);
+    let hasRounds = cellNew(false);
+    let hasTotalNs = cellNew(false);
     let hasMeanNs = cellNew(false);
+    let hasMedianNs = cellNew(false);
+    let hasMinNs = cellNew(false);
+    let hasMaxNs = cellNew(false);
     let hasOpsPerSec = cellNew(false);
     let cur = cellNew(fields);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -532,17 +544,37 @@ def isBenchStatsJsonObj(fields: List (String, Value)): Bool = {
             Cons((k, v), rest) -> {
                 if (k == "name") {
                     match v { VStr(_) -> cellSet(hasName, true), _ -> () }
+                } else if (k == "iters") {
+                    match v { VInt(_) -> cellSet(hasIters, true), _ -> () }
+                } else if (k == "rounds") {
+                    match v { VInt(_) -> cellSet(hasRounds, true), _ -> () }
+                } else if (k == "total_ns") {
+                    match v { VInt(_) -> cellSet(hasTotalNs, true), _ -> () }
                 } else if (k == "mean_ns") {
-                    match v { VFloat(_) -> cellSet(hasMeanNs, true), VInt(_) -> cellSet(hasMeanNs, true), _ -> () }
+                    if (isJsonNumber(v)) cellSet(hasMeanNs, true) else ()
+                } else if (k == "median_ns") {
+                    if (isJsonNumber(v)) cellSet(hasMedianNs, true) else ()
+                } else if (k == "min_ns") {
+                    if (isJsonNumber(v)) cellSet(hasMinNs, true) else ()
+                } else if (k == "max_ns") {
+                    if (isJsonNumber(v)) cellSet(hasMaxNs, true) else ()
                 } else if (k == "ops_per_sec") {
-                    match v { VFloat(_) -> cellSet(hasOpsPerSec, true), VInt(_) -> cellSet(hasOpsPerSec, true), _ -> () }
+                    if (isJsonNumber(v)) cellSet(hasOpsPerSec, true) else ()
                 } else ();
                 cellSet(cur, rest)
             },
             Nil -> (),
         }
     };
-    cellGet(hasName) && cellGet(hasMeanNs) && cellGet(hasOpsPerSec)
+    cellGet(hasName)
+    && cellGet(hasIters)
+    && cellGet(hasRounds)
+    && cellGet(hasTotalNs)
+    && cellGet(hasMeanNs)
+    && cellGet(hasMedianNs)
+    && cellGet(hasMinNs)
+    && cellGet(hasMaxNs)
+    && cellGet(hasOpsPerSec)
 }
 
 def collectJsonLines(stdout: String, accRev: Cell (List String)): Int = {
@@ -553,19 +585,26 @@ def collectJsonLines(stdout: String, accRev: Cell (List String)): Int = {
         match cellGet(cur) {
             Cons(line, rest) -> {
                 let t = strTrim(line);
-                let isBenchRec =
+                let benchJsonOpt: Option String =
                     if (strStartsWith(t, "{") && strEndsWith(t, "}")) {
                         match parse(t) {
-                            Ok(VObj(fields)) -> isBenchStatsJsonObj(fields),
-                            _ -> false,
+                            Ok(val) -> match val {
+                                VObj(fields) ->
+                                    if (isBenchStatsJsonObj(fields)) Some(stringify(val))
+                                    else None,
+                                _ -> None,
+                            },
+                            _ -> None,
                         }
-                    } else false;
-                if (isBenchRec) {
-                    cellSet(accRev, Cons(t, cellGet(accRev)));
-                    cellSet(count, cellGet(count) + 1)
-                } else if (strLen(t) > 0) {
-                    eprintLn(line)
-                } else ();
+                    } else None;
+                match benchJsonOpt {
+                    Some(canonicalJson) -> {
+                        cellSet(accRev, Cons(canonicalJson, cellGet(accRev)));
+                        cellSet(count, cellGet(count) + 1)
+                    },
+                    None ->
+                        if (strLen(t) > 0) eprintLn(line) else (),
+                };
                 cellSet(cur, rest)
             },
             Nil -> (),
