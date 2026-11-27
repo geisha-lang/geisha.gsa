@@ -112,6 +112,14 @@ int32_t gs_sys_is_dir(const char *path)
     return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
+int32_t gs_sys_is_symlink(const char *path)
+{
+    if (path == NULL) return 0;
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+    return S_ISLNK(st.st_mode) ? 1 : 0;
+}
+
 int32_t gs_sys_mkdir(const char *path)
 {
     if (path == NULL || path[0] == '\0') return -1;

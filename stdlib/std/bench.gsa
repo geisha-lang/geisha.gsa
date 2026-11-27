@@ -5,6 +5,8 @@ use std.result.{Result, Ok, Err}
 use std.list.listRev
 use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
 use std.str.{intToStr, i64ToStr, floatToStr, parseInt, strContains}
+use std.codec.VStr
+use std.json.stringify
 use sys.time.monotonicNanos
 use sys.env.getEnv
 
@@ -248,23 +250,6 @@ pub def formatOpsPerSec(ops: Float): String =
     else if (ops >= 1000.0) formatFloat2(ops / 1000.0) + " K ops/s"
     else formatFloat2(ops) + " ops/s"
 
-def jsonEscape(s: String): String = {
-    let b = bufNew();
-    let n = strLen(s);
-    let i = cellNew(0);
-    while (cellGet(i) < n) {
-        let ch = strByteAt(s, cellGet(i));
-        if (ch == 34) bufPushStr(b, "\\\"")
-        else if (ch == 92) bufPushStr(b, "\\\\")
-        else if (ch == 10) bufPushStr(b, "\\n")
-        else if (ch == 13) bufPushStr(b, "\\r")
-        else if (ch == 9) bufPushStr(b, "\\t")
-        else bufPushByte(b, ch);
-        cellSet(i, cellGet(i) + 1)
-    };
-    bufToString(b)
-}
-
 /// Format `BenchStats` as a human-readable single-line summary.
 pub def formatStatsText(s: BenchStats): String =
     s.name
@@ -278,10 +263,10 @@ pub def formatStatsText(s: BenchStats): String =
 /// Format `BenchStats` as a compact JSON object string with an optional `"file"` field.
 pub def formatStatsJsonInFile(s: BenchStats, fileOpt: Option String): String = {
     let fileField = match fileOpt {
-        Some(f) if (strLen(f) > 0) -> ",\"file\":\"" + jsonEscape(f) + "\"",
+        Some(f) if (strLen(f) > 0) -> ",\"file\":" + stringify(VStr(f)),
         _ -> "",
     };
-    "{\"name\":\"" + jsonEscape(s.name) + "\""
+    "{\"name\":" + stringify(VStr(s.name))
     + fileField
     + ",\"iters\":" + intToStr(s.iters)
     + ",\"rounds\":" + intToStr(s.rounds)

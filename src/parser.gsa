@@ -906,7 +906,8 @@ def tryParseLambda(p: Parser): Option (Result Form String) = {
                             Err(_) -> { restorePos(p, snap); None },
                             Ok(retOpt) ->
                                 if (eatSym(p, "->")) {
-                                    Some(match parseExpr(p) {
+                                    let bodyRes: Result Form String = parseExpr(p);
+                                    Some(match bodyRes {
                                         Ok(body) -> Ok(mkForm(unionSpan(startSp, body.pos), ExAbs(ps, retOpt, body))),
                                         Err(e) -> Err(e),
                                     })
@@ -1307,11 +1308,11 @@ def parseUnaryExpr(p: Parser): Result Form String = {
             let b0 = strByteAt(s, 0);
             if (b0 == 33 && s != "!=") {
                 consumePrefixChar(p, s, t.span);
-                let operand = parseUnaryExpr(p)?;
+                let operand: Form = parseUnaryExpr(p)?;
                 Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNot, operand)))
             } else if (b0 == 126) {
                 consumePrefixChar(p, s, t.span);
-                let operand = parseUnaryExpr(p)?;
+                let operand: Form = parseUnaryExpr(p)?;
                 Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnBitNot, operand)))
             } else if (b0 == 45 && s != "->") {
                 consumePrefixChar(p, s, t.span);
@@ -1335,7 +1336,7 @@ def parseUnaryExpr(p: Parser): Result Form String = {
                                 }
                             }
                         } else {
-                            let operand = parseUnaryExpr(p)?;
+                            let operand: Form = parseUnaryExpr(p)?;
                             Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
                         },
                     TkFloat(raw) ->
@@ -1345,11 +1346,11 @@ def parseUnaryExpr(p: Parser): Result Form String = {
                             let f = parseFloat("-" + raw)?;
                             Ok(mkForm(fullSp, ExLit(LitFloat(f))))
                         } else {
-                            let operand = parseUnaryExpr(p)?;
+                            let operand: Form = parseUnaryExpr(p)?;
                             Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
                         },
                     _ -> {
-                        let operand = parseUnaryExpr(p)?;
+                        let operand: Form = parseUnaryExpr(p)?;
                         Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
                     },
                 }

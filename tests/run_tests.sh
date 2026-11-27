@@ -3101,6 +3101,61 @@ assert data["ok"] is False, data
 assert "unknown option" in data["error"] and "--target" in data["error"], data
 PY
 
+# 37g: Explicit `main()` printing `{progress}`, non-bench JSON, plain text, and control-char bench name under `--json`
+cat > "$TMP_DIR/t37_progress.gsa" << 'EOF'
+use std.bench.{bench, blackBox}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+
+def main(): Void = {
+    printLn("{progress}");
+    printLn("{\"msg\":\"not_a_bench\"}");
+    printLn("plain log line");
+    let b = bufNew();
+    bufPushStr(b, "ctrl_");
+    bufPushByte(b, 7);
+    let ctrlName = bufToString(b);
+    let _ = bench("ok_bench", () -> { let _ = blackBox(1 + 2); () });
+    let _ = bench(ctrlName, () -> { let _ = blackBox(3 + 4); () });
+    ()
+}
+EOF
+T37_PROG_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_progress.gsa" --iters 10 --warmup 1 --rounds 2 --json --runtime "$GEISHA_RUNTIME" 2>"$TMP_DIR/t37_progress.stderr")"
+python3 - "$T37_PROG_JSON" "$TMP_DIR/t37_progress.stderr" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True, data
+bs = data["benchmarks"]
+assert [b["name"] for b in bs] == ["ok_bench", "ctrl_\x07"], bs
+stderr_text = open(sys.argv[2], encoding="utf-8").read()
+assert "{progress}" in stderr_text, stderr_text
+assert '{"msg":"not_a_bench"}' in stderr_text, stderr_text
+assert "plain log line" in stderr_text, stderr_text
+PY
+
+# 37h: Auto-discovery in `src/` must propagate span-bearing error for parameterized `bench_bad(x)` even when valid `bench_ok` exists
+MIXED_SRC_PROJ="$TMP_DIR/t37_mixed_src_proj"
+mkdir -p "$MIXED_SRC_PROJ/src"
+cat > "$MIXED_SRC_PROJ/geisha.toml" << 'EOF'
+name = "t37_mixed_src_proj"
+version = "0.1.0"
+EOF
+cat > "$MIXED_SRC_PROJ/src/good.gsa" << 'EOF'
+def bench_ok(): Int = 42
+EOF
+cat > "$MIXED_SRC_PROJ/src/bad.gsa" << 'EOF'
+def bench_bad(x: Int): Int = x + 1
+EOF
+if (cd "$MIXED_SRC_PROJ" && "$ABS_GEISHA_37" bench --iters 5 --warmup 1 --rounds 1 --runtime "$ABS_RT_37" >"$TMP_DIR/t37_mixed_src.out" 2>&1); then
+    echo "FAIL [bench_src_autodiscover_param_err]: expected non-zero exit when src/ contains bench_bad(x)" >&2
+    exit 1
+fi
+T37_MIXED_ERR="$(cat "$TMP_DIR/t37_mixed_src.out")"
+if ! printf '%s\n' "$T37_MIXED_ERR" | grep -q "bad.gsa:1:" || ! printf '%s\n' "$T37_MIXED_ERR" | grep -q "bench_bad"; then
+    echo "FAIL [bench_src_autodiscover_param_err]: expected span diagnostic for bad.gsa:1: bench_bad, got:" >&2
+    echo "$T37_MIXED_ERR" >&2
+    exit 1
+fi
+
 echo "PASS [geisha_bench]: polymorphic __blackBox (native+wasm32), standalone/project modes, line-aligned diagnostics, & --json error contract verified"
 PASS=$((PASS + 1))
 
@@ -3378,6 +3433,57 @@ fi
 : > "$FMT_DIR/empty.gsa"
 EMPTY_BYTES="$("$GEISHA_BIN" fmt --stdout "$FMT_DIR/empty.gsa" | wc -c | tr -d ' ')"
 assert_eq "geisha_fmt_stdout_empty_file" "0" "$EMPTY_BYTES"
+
+# 37i. Adjacent postfix `?` (`Ok(nested()? ?)`) must stay separated and remain valid after formatting
+cat > "$FMT_DIR/double_try.gsa" << 'EOF'
+use std.result.{Result, Ok, Err}
+use std.str.intToStr
+
+def nested(): Result (Result Int String) String = Ok(Ok(42))
+
+def unwrapTwice(): Result Int String = Ok(nested()? ?)
+
+def main(): Void = match unwrapTwice() {
+    Ok(n) -> printLn(intToStr(n)),
+    Err(e) -> printLn(e),
+}
+EOF
+"$GEISHA_BIN" check "$FMT_DIR/double_try.gsa" >/dev/null
+"$GEISHA_BIN" fmt --write "$FMT_DIR/double_try.gsa"
+"$GEISHA_BIN" fmt --check "$FMT_DIR/double_try.gsa"
+"$GEISHA_BIN" check "$FMT_DIR/double_try.gsa" >/dev/null
+python3 - "$FMT_DIR/double_try.gsa" << 'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+assert "Ok(nested()? ?)" in src, f"expected separated postfix '?' in:\n{src}"
+assert "nested()??" not in src, f"postfix '?' merged into '??' in:\n{src}"
+PY
+
+# 37j. Directory scan must NOT follow directory/file symlinks outside target tree, and explicit unreadable dir must error
+OUTSIDE_FMT_DIR="$TMP_DIR/t38_outside"
+mkdir -p "$OUTSIDE_FMT_DIR"
+cat > "$OUTSIDE_FMT_DIR/escape.gsa" << 'EOF'
+def   outsideFn(x:Int):Int=x+1
+EOF
+cp "$OUTSIDE_FMT_DIR/escape.gsa" "$OUTSIDE_FMT_DIR/escape.orig.gsa"
+ln -s "$OUTSIDE_FMT_DIR" "$FMT_DIR/src/ext_dir_link"
+ln -s "$OUTSIDE_FMT_DIR/escape.gsa" "$FMT_DIR/src/ext_file_link.gsa"
+"$GEISHA_BIN" fmt --check "$FMT_DIR/src"
+"$GEISHA_BIN" fmt "$FMT_DIR/src"
+diff -u "$OUTSIDE_FMT_DIR/escape.orig.gsa" "$OUTSIDE_FMT_DIR/escape.gsa"
+rm -f "$FMT_DIR/src/ext_dir_link" "$FMT_DIR/src/ext_file_link.gsa"
+
+if [ "$(id -u)" -ne 0 ]; then
+    UNREADABLE_DIR="$TMP_DIR/t38_unreadable"
+    mkdir -p "$UNREADABLE_DIR"
+    chmod 0000 "$UNREADABLE_DIR"
+    if "$GEISHA_BIN" fmt "$UNREADABLE_DIR" >/dev/null 2>&1; then
+        chmod 0755 "$UNREADABLE_DIR"
+        echo "FAIL [geisha_fmt_unreadable_dir]: expected error when readDir fails on explicit directory" >&2
+        exit 1
+    fi
+    chmod 0755 "$UNREADABLE_DIR"
+fi
 
 echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, --stdout, edge regressions, & semantic equivalence verified"
 PASS=$((PASS + 1))
