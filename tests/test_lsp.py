@@ -1099,6 +1099,45 @@ def main() -> int:
         new_ms_al = apply_edits(ms_alias_src, ren_ms_al["result"]["changes"][ms_user_uri])
         assert "use m2.fetchA as loadA" in new_ms_al and "loadA() + fetchA()" in new_ms_al, f"unexpected aliased ModSub rename: {new_ms_al!r}"
 
+        # (d) `open m2` (`UseGlob`) + `def fetchA` in same scope -> rejected (-32602)
+        extra_path = ms_dir / "extra.gsa"
+        extra_src = "pub def fetchA(): Int = 93\n"
+        extra_path.write_text(extra_src, encoding="utf-8")
+        ms_open_target_src = (
+            "pub mod inner {\n"
+            "    open m2\n"
+            "    def fetchA(): Int = 93\n"
+            "    pub def run(): Int = load() + fetchA()\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 4}, "contentChanges": [{"text": ms_open_target_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_open_tgt = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "error" in ren_open_tgt and ren_open_tgt["error"]["code"] == -32602, f"expected -32602 on open m2 conflict: {ren_open_tgt}"
+
+        # (e) `use m2.load` + `open extra` (exporting `fetchA`) in same scope -> rejected (-32602)
+        ms_open_extra_src = (
+            "pub mod inner {\n"
+            "    use m2.load\n"
+            "    open extra\n"
+            "    pub def run(): Int = load() + fetchA()\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 5}, "contentChanges": [{"text": ms_open_extra_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_open_ext = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "error" in ren_open_ext and ren_open_ext["error"]["code"] == -32602, f"expected -32602 on open extra conflict: {ren_open_ext}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
