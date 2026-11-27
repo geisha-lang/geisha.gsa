@@ -31,6 +31,13 @@ jobs:
           - label: darwin-arm64-and-x86_64
             os: macos-15
             cross_x64: "1"
+          - label: windows-x86_64
+            os: windows-latest
+            cross_x64: "0"
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout repository
@@ -52,6 +59,18 @@ jobs:
           brew list llvm >/dev/null 2>&1 || brew install llvm
           brew list lld >/dev/null 2>&1 || brew install lld
           command -v xz >/dev/null 2>&1 || brew install xz
+
+      - name: Set up LLVM/Clang & GNU Make (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if [ -d "/c/Program Files/LLVM/bin" ]; then
+            echo "/c/Program Files/LLVM/bin" >> "$GITHUB_PATH"
+            export PATH="/c/Program Files/LLVM/bin:$PATH"
+          fi
+          if ! command -v make >/dev/null 2>&1; then
+            choco install -y make --no-progress
+            echo "/c/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -85,6 +104,7 @@ jobs:
           name: release-${{ matrix.label }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
@@ -112,6 +132,7 @@ jobs:
           name: geisha-release-bundle
           path: |
             artifacts/*.tar.gz
+            artifacts/*.zip
             artifacts/SHA256SUMS.txt
 
       - name: Publish GitHub Release (on v* tag)
@@ -120,6 +141,7 @@ jobs:
         with:
           files: |
             artifacts/*.tar.gz
+            artifacts/*.zip
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -11,7 +11,17 @@ UNAME_S="$(uname -s)"
 UNAME_M="$(uname -m)"
 HOST_CC_TARGET=""
 HOST_CC_LIBS=""
-if [ "$UNAME_S" = "Darwin" ]; then
+HOST_CC_PTHREAD="-pthread"
+EXE_EXT=""
+IS_WIN=0
+FILE_URL_PREFIX="file://"
+if [ "${OS:-}" = "Windows_NT" ] || case "$UNAME_S" in MINGW*|MSYS*|CYGWIN*) true ;; *) false ;; esac; then
+    IS_WIN=1
+    HOST_CC_LIBS="-lws2_32 -lbcrypt -Wl,/STACK:16777216"
+    HOST_CC_PTHREAD=""
+    EXE_EXT=".exe"
+    FILE_URL_PREFIX="file:///"
+elif [ "$UNAME_S" = "Darwin" ]; then
     export MACOSX_DEPLOYMENT_TARGET=14.0
     case "$UNAME_M" in
         arm64|aarch64) HOST_CC_TARGET="-target arm64-apple-macosx14.0" ;;
@@ -21,7 +31,20 @@ else
     HOST_CC_LIBS="-lm"
 fi
 
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+        PYTHON="python3"
+    else
+        PYTHON="python"
+    fi
+fi
+export GEISHA_TEST_PYTHON="$PYTHON"
+
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/geisha_gsa_tests.XXXXXX")"
+if [ "$IS_WIN" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+    TMP_DIR="$(cygpath -m "$TMP_DIR")"
+fi
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 PASS=0
@@ -30,6 +53,9 @@ assert_eq() {
     name="$1"
     expected="$2"
     actual="$3"
+    if [ "$IS_WIN" = "1" ]; then
+        actual="$(printf '%s' "$actual" | tr -d '\r')"
+    fi
     if [ "$expected" != "$actual" ]; then
         echo "FAIL [$name]: expected '$expected', got '$actual'" >&2
         exit 1
@@ -171,7 +197,7 @@ cat > "$TMP_DIR/t5_conc.gsa" << 'EOF'
 use std.task.{spawn, await}
 use std.sync.{chanNew, chanSend, chanRecv}
 use std.actor.{actorSpawn, actorSend, actorCall, actorStop}
-use std.option.{Some, None}
+use std.option.{Option, Some, None}
 use std.str.intToStr
 
 def main() = {
@@ -661,7 +687,7 @@ fi
 
 # 13. Mode-Polymorphic `Send` Closures & Implicit Mode-Lifted ADTs (Positive + 8 Negative Soundness Checks)
 cat > "$TMP_DIR/t13_send_modes_ok.gsa" << 'EOF'
-use std.option.{Some, None}
+use std.option.{Option, Some, None}
 use std.list.listMap
 use std.str.intToStr
 use std.sync.{chanNew, chanSend, chanRecv}
@@ -1138,7 +1164,7 @@ name = "ui_kit"
 version = "0.1.0"
 
 [deps]
-core_math = { git = "file://$TMP_DIR/repos/core_math.git", version = "0.2.0" }
+core_math = { git = "${FILE_URL_PREFIX}$TMP_DIR/repos/core_math.git", version = "0.2.0" }
 
 [target.native]
 c_sources = ["host/bridge.c"]
@@ -1179,10 +1205,10 @@ git clone --bare -q "$TMP_DIR/repos/ui_kit_work" "$TMP_DIR/repos/ui_kit.git"
 # 18c. Create Static Git Index repo (`$GEISHA_INDEX`)
 mkdir -p "$TMP_DIR/repos/index_work/packages/c" "$TMP_DIR/repos/index_work/packages/u"
 cat > "$TMP_DIR/repos/index_work/packages/c/core_math.toml" << EOF
-git = "file://$TMP_DIR/repos/core_math.git"
+git = "${FILE_URL_PREFIX}$TMP_DIR/repos/core_math.git"
 EOF
 cat > "$TMP_DIR/repos/index_work/packages/u/ui_kit.toml" << EOF
-git = "file://$TMP_DIR/repos/ui_kit.git"
+git = "${FILE_URL_PREFIX}$TMP_DIR/repos/ui_kit.git"
 EOF
 git -C "$TMP_DIR/repos/index_work" init -q
 git -C "$TMP_DIR/repos/index_work" config user.email "test@geisha.local"
@@ -1379,10 +1405,10 @@ if ! grep -q "declare i32 @dot_i8_kernel(ptr, ptr, i32) nounwind" "$TMP_DIR/t20_
 fi
 echo "PASS [extern_noalloc_ir]: zero blocking-section overhead verified in LLVM IR"
 PASS=$((PASS + 1))
-"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module $HOST_CC_PTHREAD \
     -x ir "$TMP_DIR/t20_noalloc.ll" -x c "$TMP_DIR/t20_kernel.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
-    -o "$TMP_DIR/t20_noalloc"
-assert_eq "extern_noalloc_exec" "38" "$("$TMP_DIR/t20_noalloc")"
+    -o "$TMP_DIR/t20_noalloc$EXE_EXT"
+assert_eq "extern_noalloc_exec" "38" "$("$TMP_DIR/t20_noalloc$EXE_EXT")"
 
 # 21. Embedded Static Library (`--no-main --export ... -o libembed.a`) + StableHandle + Multi-Thread C Host + `gcTrim`
 cat > "$TMP_DIR/t21_embed.gsa" << 'EOF'
@@ -1425,9 +1451,9 @@ EOF
     --export eng_new --export eng_add --export eng_label_len --export eng_trim --export eng_free \
     -o "$TMP_DIR/libt21_embed.a" "$TMP_DIR/t21_embed.gsa"
 cat > "$TMP_DIR/t21_host.c" << 'EOF'
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "gs_os_thread.h"
 
 extern void __geisha_init(void);
 extern int64_t eng_new(int32_t init_val, const char *name, void *fv);
@@ -1454,9 +1480,9 @@ int main(void) {
     __geisha_init();
     int64_t h = eng_new(10, "juxu-core", NULL);
     WorkerArg wa = { .handle = h, .out = 0 };
-    pthread_t tid;
-    pthread_create(&tid, NULL, worker_fn, &wa);
-    pthread_join(tid, NULL);
+    gs_thread_t tid;
+    gs_thread_create(&tid, worker_fn, &wa, false);
+    gs_thread_join(tid);
     int32_t final_val = eng_add(h, 5, NULL);
     int32_t llen = eng_label_len(h, NULL);
     eng_free(h, NULL);
@@ -1465,9 +1491,9 @@ int main(void) {
     return 0;
 }
 EOF
-"$CC" $HOST_CC_TARGET -O2 -pthread \
-    "$TMP_DIR/t21_host.c" "$TMP_DIR/libt21_embed.a" $HOST_CC_LIBS -o "$TMP_DIR/t21_host"
-assert_eq "embedded_static_lib_handles_and_threads" "25|30|9" "$("$TMP_DIR/t21_host")"
+"$CC" $HOST_CC_TARGET -O2 -Iruntime/include $HOST_CC_PTHREAD \
+    "$TMP_DIR/t21_host.c" "$TMP_DIR/libt21_embed.a" $HOST_CC_LIBS -o "$TMP_DIR/t21_host$EXE_EXT"
+assert_eq "embedded_static_lib_handles_and_threads" "25|30|9" "$("$TMP_DIR/t21_host$EXE_EXT")"
 
 # 22. iOS & iOS Simulator Cross-Compilation Static Libraries (`--target ios` & `--target ios-sim`)
 if [ -f "./build/libgeisha_runtime_ios.a" ] && [ -f "./build/libgeisha_runtime_ios_sim.a" ]; then
@@ -1829,11 +1855,11 @@ if ! awk '/define .*@runAxpy\(/,/^}/' "$TMP_DIR/t29_ffi_borrow.ll" | grep -q "as
 fi
 echo "PASS [ffi_auto_borrow_ir]: ForeignPtr auto-unwrap + keep-alive barrier verified in LLVM IR"
 PASS=$((PASS + 1))
-"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module $HOST_CC_PTHREAD \
     -x ir "$TMP_DIR/t29_ffi_borrow.ll" -x c "$TMP_DIR/t29_ffi_kernel.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
-    -o "$TMP_DIR/t29_ffi_borrow"
+    -o "$TMP_DIR/t29_ffi_borrow$EXE_EXT"
 # (2*10+1) + (3*10+1) + (4*10+1) + (5*10+1) = 21 + 31 + 41 + 51 = 144
-assert_eq "ffi_auto_borrow_exec" "144" "$("$TMP_DIR/t29_ffi_borrow")"
+assert_eq "ffi_auto_borrow_exec" "144" "$("$TMP_DIR/t29_ffi_borrow$EXE_EXT")"
 
 # 30. Zero-Keyword Generic Deriving (`data T : C1, C2 { ... }` & bodyless `instance C T`)
 cat > "$TMP_DIR/t30_generic_derive.gsa" << 'EOF'
@@ -2057,15 +2083,17 @@ if [ "$OUT_S2" != "v1:42:--warm" ]; then
     echo "FAIL [script_mode_warm]: expected 'v1:42:--warm', got '$OUT_S2'" >&2
     exit 1
 fi
-# Direct executable shebang invocation (`./t32_script.gsa`)
-chmod +x "$TMP_DIR/t32_script.gsa"
-SCRIPT_BIN_DIR="$TMP_DIR/script_bin"
-mkdir -p "$SCRIPT_BIN_DIR"
-ln -sf "$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")" "$SCRIPT_BIN_DIR/geisha"
-OUT_SHEBANG="$(HOME="$SCRIPT_HOME" PATH="$SCRIPT_BIN_DIR:$PATH" GEISHA_RUNTIME="$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --shebang)"
-if [ "$OUT_SHEBANG" != "v1:42:--shebang" ]; then
-    echo "FAIL [script_mode_shebang]: expected 'v1:42:--shebang', got '$OUT_SHEBANG'" >&2
-    exit 1
+# Direct executable shebang invocation (`./t32_script.gsa`) — Unix only
+if [ "$IS_WIN" = "0" ]; then
+    chmod +x "$TMP_DIR/t32_script.gsa"
+    SCRIPT_BIN_DIR="$TMP_DIR/script_bin"
+    mkdir -p "$SCRIPT_BIN_DIR"
+    ln -sf "$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")" "$SCRIPT_BIN_DIR/geisha"
+    OUT_SHEBANG="$(HOME="$SCRIPT_HOME" PATH="$SCRIPT_BIN_DIR:$PATH" GEISHA_RUNTIME="$GEISHA_RUNTIME" "$TMP_DIR/t32_script.gsa" --shebang)"
+    if [ "$OUT_SHEBANG" != "v1:42:--shebang" ]; then
+        echo "FAIL [script_mode_shebang]: expected 'v1:42:--shebang', got '$OUT_SHEBANG'" >&2
+        exit 1
+    fi
 fi
 # Modify imported local dependency -> cache must automatically invalidate!
 cat > "$TMP_DIR/t32_helper.gsa" << 'EOF'
@@ -2212,7 +2240,7 @@ EOF
 
 cat > "$TMP_DIR/t34_cabi.gsa" << 'EOF'
 use std.str.intToStr
-use std.option.{Some, None}
+use std.option.{Option, Some, None}
 use std.sync.{Chan, chanNew, chanSend, chanRecv}
 use sys.ffi.{dlOpenSelf, dlSym}
 
@@ -2314,10 +2342,10 @@ def main(): Void = {
 }
 EOF
 "$GEISHA_BIN" -e -o "$TMP_DIR/t34_cabi.ll" "$TMP_DIR/t34_cabi.gsa"
-"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module $HOST_CC_PTHREAD \
     -x ir "$TMP_DIR/t34_cabi.ll" -x c "$TMP_DIR/t34_cabi_host.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
-    -o "$TMP_DIR/t34_cabi"
-assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1|37|12|ctor-first+ctor-second|second,first,boot-seed" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_cabi")"
+    -o "$TMP_DIR/t34_cabi$EXE_EXT"
+assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1|37|12|ctor-first+ctor-second|second,first,boot-seed" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_cabi$EXE_EXT")"
 
 # Verify `--no-main` C-exported library initializes globals lazily & thread-safely even when C pthreads call exports without `__geisha_init()`
 cat > "$TMP_DIR/t34_lazy_glob.gsa" << 'EOF'
@@ -2349,43 +2377,43 @@ pub extern "gs_lazy_ping" def lazyPing(delta: Int): Int = {
 pub extern "gs_lazy_total" def lazyTotal(): Int = atomicLoad(gLazyHits)
 EOF
 cat > "$TMP_DIR/t34_lazy_glob_host.c" << 'EOF'
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "gs_os_thread.h"
 
 extern int32_t gs_lazy_ping(int32_t delta);
 extern int32_t gs_lazy_total(void);
 
 static volatile int g_go = 0;
+static int32_t g_lens[4] = {0, 0, 0, 0};
 
 static void *worker_fn(void *arg) {
-    int32_t id = (int32_t)(intptr_t)arg;
+    int32_t idx = (int32_t)(intptr_t)arg;
     while (!__atomic_load_n(&g_go, __ATOMIC_ACQUIRE)) {}
-    int32_t len = gs_lazy_ping(id);
-    return (void *)(intptr_t)len;
+    g_lens[idx] = gs_lazy_ping(idx + 1);
+    return NULL;
 }
 
 int main(void) {
-    pthread_t th[4];
+    gs_thread_t th[4];
     for (int i = 0; i < 4; i++) {
-        pthread_create(&th[i], NULL, worker_fn, (void *)(intptr_t)(i + 1));
+        gs_thread_create(&th[i], worker_fn, (void *)(intptr_t)i, false);
     }
     __atomic_store_n(&g_go, 1, __ATOMIC_RELEASE);
     int32_t lens_ok = 1;
     for (int i = 0; i < 4; i++) {
-        void *ret = NULL;
-        pthread_join(th[i], &ret);
-        if ((int32_t)(intptr_t)ret != 8) lens_ok = 0;
+        gs_thread_join(th[i]);
+        if (g_lens[i] != 8) lens_ok = 0;
     }
     printf("%d|%d\n", lens_ok, (int)gs_lazy_total());
     return 0;
 }
 EOF
 "$GEISHA_BIN" -e --no-main -o "$TMP_DIR/t34_lazy_glob.ll" "$TMP_DIR/t34_lazy_glob.gsa"
-"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -Iruntime/include $HOST_CC_PTHREAD \
     -x ir "$TMP_DIR/t34_lazy_glob.ll" -x c "$TMP_DIR/t34_lazy_glob_host.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
-    -o "$TMP_DIR/t34_lazy_glob"
-assert_eq "cabi_no_main_concurrent_lazy_globals" "1|10" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_lazy_glob")"
+    -o "$TMP_DIR/t34_lazy_glob$EXE_EXT"
+assert_eq "cabi_no_main_concurrent_lazy_globals" "1|10" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_lazy_glob$EXE_EXT")"
 
 # Negative checks for `extern data`, `extern init`, and `cFnPtr`
 cat > "$TMP_DIR/t34_bad_cstruct.gsa" << 'EOF'
@@ -2647,7 +2675,11 @@ def main(): Result Void String = {
         + "for _ in range(36):\n"
         + "    sys.stdout.write(chunk); sys.stdout.flush()\n"
         + "    sys.stderr.write(echunk); sys.stderr.flush()\n";
-    let cmd1 = cmdEnv(cmdCwd(command("python3", ["-c", pyDual, "", "arg2"]), baseDir), [("GS_TEST_VAR", "override_val")]);
+    let pyBin = match sys.env.getEnv("GEISHA_TEST_PYTHON") {
+        Some(p) if (strLen(p) > 0) -> p,
+        _ -> "python3",
+    };
+    let cmd1 = cmdEnv(cmdCwd(command(pyBin, ["-c", pyDual, "", "arg2"]), baseDir), [("GS_TEST_VAR", "override_val")]);
     let out1 = run(cmd1)?;
     let dualOk =
         out1.status == Exited(0)
@@ -2657,7 +2689,7 @@ def main(): Result Void String = {
 
     // 3b. `ReplaceEnv` clean environment check
     let outClean = run(cmdEnvMode(
-        command("python3", ["-c", "import os; print(os.environ.get('ONLY_KEY','') + ':' + str(len(os.environ)))"]),
+        command(pyBin, ["-c", "import os; print(os.environ.get('ONLY_KEY','') + ':' + str(len(os.environ)))"]),
         ReplaceEnv([("ONLY_KEY", "pure")])
     ))?;
 
@@ -2763,14 +2795,16 @@ T36_OUT="$("$TMP_DIR/t36_sys_and_toml" "$TMP_DIR/t36_work")"
 assert_eq "literals_sysfs_sysproc_tomlpatch" "57005|384|165|1000000|minOk|4001|priv:exec:neg128|fsOk|dualOk|envOk|hello-geisha-pipe:0|sigToOk|tomlPatchOk" "$T36_OUT"
 
 # Verify exact POSIX file modes on disk (0o600 preserved across writeFileAtomic + rename, and 0o755 via chmod)
-MODES_OUT="$(python3 - "$TMP_DIR/t36_work/secret_moved.toml" "$TMP_DIR/t36_work/script.sh" << 'PY'
+if [ "$IS_WIN" = "0" ]; then
+    MODES_OUT="$("$PYTHON" - "$TMP_DIR/t36_work/secret_moved.toml" "$TMP_DIR/t36_work/script.sh" << 'PY'
 import os, sys
 m1 = oct(os.stat(sys.argv[1]).st_mode & 0o777)
 m2 = oct(os.stat(sys.argv[2]).st_mode & 0o777)
 print(f"{m1}|{m2}")
 PY
 )"
-assert_eq "sysfs_atomic_mode_and_chmod_bits" "0o600|0o755" "$MODES_OUT"
+    assert_eq "sysfs_atomic_mode_and_chmod_bits" "0o600|0o755" "$MODES_OUT"
+fi
 
 # Negative lex/parse checks for malformed radix & separator literals
 for bad_lit in "0x" "0o78" "0b102" "123_" "0x1_0000_0000"; do
@@ -2943,7 +2977,7 @@ fi
 "$GEISHA_BIN" -g -O2 --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t37_dwarf_o2" "$TMP_DIR/t37_dwarf.gsa"
 assert_eq "dwarf_debug_o2_run" "hello geisha:120" "$("$TMP_DIR/t37_dwarf_o2")"
 assert_eq "dwarf_geisha_run_g" "hello geisha:120" "$("$GEISHA_BIN" run -g --runtime "$GEISHA_RUNTIME" "$TMP_DIR/t37_dwarf.gsa")"
-if command -v lldb >/dev/null 2>&1; then
+if [ "$IS_WIN" = "0" ] && command -v lldb >/dev/null 2>&1; then
     LLDB_SCRIPT_PATH="$(pwd)/tools/geisha_lldb.py"
     LLDB_OUT="$(lldb -b \
         -o "command script import $LLDB_SCRIPT_PATH" \
@@ -3166,8 +3200,9 @@ if echo "$T37_DOLLAR_LOG" | grep -q "project_hit=1" || ! echo "$T37_DOLLAR_LOG" 
     exit 1
 fi
 # Wrapper named `clang` that strips `-MD -MF <file>` (produces no `.d`) must never publish C .o or project cache
-mkdir -p "$INC_PROJ/fakebin"
-cat > "$INC_PROJ/fakebin/clang" << EOF
+if [ "$IS_WIN" = "0" ]; then
+    mkdir -p "$INC_PROJ/fakebin"
+    cat > "$INC_PROJ/fakebin/clang" << EOF
 #!/bin/sh
 out=""
 skip=0
@@ -3181,17 +3216,18 @@ for a in "\$@"; do
 done
 eval "exec $CC \$exec_args"
 EOF
-chmod +x "$INC_PROJ/fakebin/clang"
-(cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" >/dev/null)
-assert_eq "inc_cgu_nod_wrapper_build1" "376" "$("$INC_PROJ/build/t37_inc_cgu")"
-cat > "$INC_PROJ/native/num.def" << 'EOF'
+    chmod +x "$INC_PROJ/fakebin/clang"
+    (cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" >/dev/null)
+    assert_eq "inc_cgu_nod_wrapper_build1" "376" "$("$INC_PROJ/build/t37_inc_cgu")"
+    cat > "$INC_PROJ/native/num.def" << 'EOF'
 201
 EOF
-T37_NOD_LOG="$(cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
-assert_eq "inc_cgu_nod_wrapper_build2" "377" "$("$INC_PROJ/build/t37_inc_cgu")"
-if echo "$T37_NOD_LOG" | grep -q "project_hit=1" || ! echo "$T37_NOD_LOG" | grep -q "native_hit=0 "; then
-    echo "FAIL [inc_cgu_nod_wrapper_cache]: no-.d wrapper must skip C .o & project cache, got: $T37_NOD_LOG" >&2
-    exit 1
+    T37_NOD_LOG="$(cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+    assert_eq "inc_cgu_nod_wrapper_build2" "377" "$("$INC_PROJ/build/t37_inc_cgu")"
+    if echo "$T37_NOD_LOG" | grep -q "project_hit=1" || ! echo "$T37_NOD_LOG" | grep -q "native_hit=0 "; then
+        echo "FAIL [inc_cgu_nod_wrapper_cache]: no-.d wrapper must skip C .o & project cache, got: $T37_NOD_LOG" >&2
+        exit 1
+    fi
 fi
 # Reset vendor/dollar/num back so subsequent 37e arithmetic stays exact (200 + 0 + 0)
 cat > "$INC_PROJ/vendor/sysval.h" << 'EOF'
@@ -3920,8 +3956,9 @@ python3 - "$FMT_DIR/edge_cases.gsa" << 'PY'
 import os, sys
 p = sys.argv[1]
 src = open(p, encoding="utf-8").read()
-mode = oct(os.stat(p).st_mode & 0o777)
-assert mode == "0o755", f"expected 0o755 preserved via writeFileAtomic, got {mode}"
+if os.name != "nt":
+    mode = oct(os.stat(p).st_mode & 0o777)
+    assert mode == "0o755", f"expected 0o755 preserved via writeFileAtomic, got {mode}"
 required = [
     "pub data Database { Database(Int64) }",
     "        Option (List Int),\n",
@@ -3982,31 +4019,33 @@ cat > "$OUTSIDE_FMT_DIR/escape.gsa" << 'EOF'
 def   outsideFn(x:Int):Int=x+1
 EOF
 cp "$OUTSIDE_FMT_DIR/escape.gsa" "$OUTSIDE_FMT_DIR/escape.orig.gsa"
-ln -s "$OUTSIDE_FMT_DIR" "$FMT_DIR/src/ext_dir_link"
-ln -s "$OUTSIDE_FMT_DIR/escape.gsa" "$FMT_DIR/src/ext_file_link.gsa"
-"$GEISHA_BIN" fmt --check "$FMT_DIR/src"
-"$GEISHA_BIN" fmt "$FMT_DIR/src"
-diff -u "$OUTSIDE_FMT_DIR/escape.orig.gsa" "$OUTSIDE_FMT_DIR/escape.gsa"
-rm -f "$FMT_DIR/src/ext_dir_link" "$FMT_DIR/src/ext_file_link.gsa"
+if [ "$IS_WIN" = "0" ]; then
+    ln -s "$OUTSIDE_FMT_DIR" "$FMT_DIR/src/ext_dir_link"
+    ln -s "$OUTSIDE_FMT_DIR/escape.gsa" "$FMT_DIR/src/ext_file_link.gsa"
+    "$GEISHA_BIN" fmt --check "$FMT_DIR/src"
+    "$GEISHA_BIN" fmt "$FMT_DIR/src"
+    diff -u "$OUTSIDE_FMT_DIR/escape.orig.gsa" "$OUTSIDE_FMT_DIR/escape.gsa"
+    rm -f "$FMT_DIR/src/ext_dir_link" "$FMT_DIR/src/ext_file_link.gsa"
 
-if [ "$(id -u)" -ne 0 ]; then
-    UNREADABLE_DIR="$TMP_DIR/t38_unreadable"
-    mkdir -p "$UNREADABLE_DIR"
-    chmod 0000 "$UNREADABLE_DIR"
-    if "$GEISHA_BIN" fmt "$UNREADABLE_DIR" >/dev/null 2>&1; then
+    if [ "$(id -u)" -ne 0 ]; then
+        UNREADABLE_DIR="$TMP_DIR/t38_unreadable"
+        mkdir -p "$UNREADABLE_DIR"
+        chmod 0000 "$UNREADABLE_DIR"
+        if "$GEISHA_BIN" fmt "$UNREADABLE_DIR" >/dev/null 2>&1; then
+            chmod 0755 "$UNREADABLE_DIR"
+            echo "FAIL [geisha_fmt_unreadable_dir]: expected error when readDir fails on explicit directory" >&2
+            exit 1
+        fi
         chmod 0755 "$UNREADABLE_DIR"
-        echo "FAIL [geisha_fmt_unreadable_dir]: expected error when readDir fails on explicit directory" >&2
-        exit 1
     fi
-    chmod 0755 "$UNREADABLE_DIR"
 fi
 
 echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, --stdout, edge regressions, & semantic equivalence verified"
 PASS=$((PASS + 1))
 
 # 39. Built-in Language Server (`geisha lsp`) JSON-RPC 2.0 stdio round-trip
-${PYTHON:-python3} tests/test_lsp.py "$GEISHA_BIN"
-${PYTHON:-python3} tests/test_watch.py "$GEISHA_BIN"
+"$PYTHON" tests/test_lsp.py "$GEISHA_BIN"
+"$PYTHON" tests/test_watch.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
 # 40. Wasm32 Size Optimization Mode, --target js (ES Module + .d.ts + [target.js]), & geisha-playground.wasm
@@ -4209,7 +4248,7 @@ EOF
     assert_eq "js_target_main_semantics" '-2147483648|-2147483648|5000050000|42|6|9|12|{"k":[1,true,"ok"]}|1105|fOk|1234|9|77|450000|1:eq:3:255:0:65' "$T37_JS_MAIN"
 
     T37_JS_EXPORTS="$(node --input-type=module -e '
-        import * as mod from "'"$TMP_DIR"'/t37_js.mjs";
+        import * as mod from "'"${FILE_URL_PREFIX}$TMP_DIR"'/t37_js.mjs";
         const pt = mod.makePoint(5, 6);
         const a1 = mod.area({ $: 0, _0: 4 });
         const a2 = mod.area({ $: 1, w: pt.x, h: pt.y });
@@ -4313,7 +4352,7 @@ EOF
         exit 1
     fi
     T37_PROJ_JS_OUT="$(node --input-type=module -e '
-        import { doubleIt } from "'"$JS_PROJ"'/build/t37_js_proj.mjs";
+        import { doubleIt } from "'"${FILE_URL_PREFIX}$JS_PROJ"'/build/t37_js_proj.mjs";
         console.log(String(doubleIt(21)));
     ')"
     assert_eq "js_pkg_build_target_js" "42" "$T37_PROJ_JS_OUT"
@@ -4352,12 +4391,20 @@ EOF
     fi
 fi
 
-# --- Test 41: Portable paths, symlink-safe `removeDirAll`, POSIX `a\b` atomic write, Win64 C ABI & `gc_enter_blocking_capture` root survival ---
+# --- Test 41: Portable paths, symlink/junction-safe `removeDirAll`, POSIX `a\b` atomic write, Win64 C ABI & `gc_enter_blocking_capture` root survival ---
 mkdir -p "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/sub/deep/leaf" "$TMP_DIR/t39_fs/empty_dir"
 printf 'keep-outside-safe' > "$TMP_DIR/t39_outside/secret.txt"
-ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/sub/link_to_outside"
-ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/trailing_sym"
-ln -s "$TMP_DIR/t39_nonexistent_target_xyz" "$TMP_DIR/t39_fs/sub/dangling_link"
+if [ "$IS_WIN" = "1" ]; then
+    WIN_OUTSIDE="$(cygpath -w "$TMP_DIR/t39_outside")"
+    WIN_J1="$(cygpath -w "$TMP_DIR/t39_fs/sub/link_to_outside")"
+    WIN_J2="$(cygpath -w "$TMP_DIR/t39_fs/trailing_sym")"
+    cmd //c mklink //J "$WIN_J1" "$WIN_OUTSIDE" >/dev/null
+    cmd //c mklink //J "$WIN_J2" "$WIN_OUTSIDE" >/dev/null
+else
+    ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/sub/link_to_outside"
+    ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/trailing_sym"
+    ln -s "$TMP_DIR/t39_nonexistent_target_xyz" "$TMP_DIR/t39_fs/sub/dangling_link"
+fi
 
 cat > "$TMP_DIR/t39_win_prep.gsa" << 'EOF'
 use std.path.{
@@ -4366,7 +4413,7 @@ use std.path.{
 }
 use std.result.{Ok, Err}
 use sys.fs.{mkdirAll, writeFile, writeFileAtomic, readFile, fileExists, isDir, removeDir, removeDirAll}
-use sys.env.argAt
+use sys.env.{argAt, hostOs}
 
 def b2s(b: Bool): String = if (b) "1" else "0"
 
@@ -4377,27 +4424,36 @@ def main(): Void = {
     let _ = writeFile(pathJoin(tree, "hello.txt"), "ok");
     let emptyD = pathJoin(base, "empty_dir");
     let rmEmptyOk = removeDir(emptyD) && !isDir(emptyD);
-    // Must remove directory symlink even when passed with trailing `/` WITHOUT touching target!
+    // Must remove directory symlink/junction even when passed with trailing `/` WITHOUT touching target!
     let rmTrailingSymOk = removeDirAll(pathJoin(base, "trailing_sym") + "/") && !fileExists(pathJoin(base, "trailing_sym"));
-    // Must remove directory tree + symlinks (including dangling) WITHOUT touching external symlink target!
+    // Must remove directory tree + symlinks/junctions WITHOUT touching external target!
     let rmTreeOk = removeDirAll(pathJoin(base, "sub")) && !isDir(pathJoin(base, "sub"));
     let outsideIntact = match readFile(outsideFile) {
         Ok(s) -> s == "keep-outside-safe",
         Err(_) -> false,
     };
 
-    // POSIX legal filename containing backslash `a\b` must succeed with writeFileAtomic & std.path
+    // POSIX legal filename containing backslash `a\b` vs Windows separator semantics
     let bsDir = pathJoin(base, "bs_test");
     let _ = mkdirAll(bsDir);
-    let bsFile = pathJoin(bsDir, "a\\b");
-    let bsAtomicOk = match writeFileAtomic(bsFile, "backslash-ok") {
-        Ok(_) -> match readFile(bsFile) {
-            Ok(s) -> s == "backslash-ok",
-            Err(_) -> false,
-        },
-        Err(_) -> false,
-    };
-    let posixBsPathOk = !isAbsPath("\\root\\x") && pathDirname("a\\b") == "." && pathBasename("a\\b") == "a\\b";
+    let isWin = hostOs() == "windows";
+    let bsAtomicOk =
+        if (isWin) {
+            let f = pathJoin(bsDir, "atomic_win.txt");
+            match writeFileAtomic(f, "win-atomic-ok") {
+                Ok(_) -> match readFile(f) { Ok(s) -> s == "win-atomic-ok", Err(_) -> false },
+                Err(_) -> false,
+            }
+        } else {
+            let bsFile = pathJoin(bsDir, "a\\b");
+            match writeFileAtomic(bsFile, "backslash-ok") {
+                Ok(_) -> match readFile(bsFile) { Ok(s) -> s == "backslash-ok", Err(_) -> false },
+                Err(_) -> false,
+            }
+        };
+    let posixBsPathOk =
+        if (isWin) true
+        else !isAbsPath("\\root\\x") && pathDirname("a\\b") == "." && pathBasename("a\\b") == "a\\b";
 
     // Explicit Windows-style path helpers
     let p1 = "C:\\Users\\dev\\app.gsa";
@@ -4424,10 +4480,10 @@ def main(): Void = {
     )
 }
 EOF
-"$GEISHA_BIN" -o "$TMP_DIR/t39_win_prep" "$TMP_DIR/t39_win_prep.gsa"
+"$GEISHA_BIN" -o "$TMP_DIR/t39_win_prep$EXE_EXT" "$TMP_DIR/t39_win_prep.gsa"
 assert_eq "win_paths_symlink_remove_and_posix_backslash" \
     "1|0|1|C:\\Users\\dev|app.gsa|app|C:\\Users\\dev\\app.exe|C:\\|C:\\bin|C:/foo|bar|1|1|1|1|1|1" \
-    "$("$TMP_DIR/t39_win_prep" "$TMP_DIR/t39_fs" "$TMP_DIR/t39_outside/secret.txt")"
+    "$("$TMP_DIR/t39_win_prep$EXE_EXT" "$TMP_DIR/t39_fs" "$TMP_DIR/t39_outside/secret.txt")"
 
 # Verify relative GEISHA_HOME works with `geisha fetch` (git archive --output absolute path)
 REL_HOME_WORK="$TMP_DIR/t39_rel_home_work"
@@ -4450,7 +4506,7 @@ name = "rel_app"
 version = "0.1.0"
 
 [deps]
-rel_dep = { git = "file://$REL_HOME_WORK/dep_repo", version = "0.1.0" }
+rel_dep = { git = "${FILE_URL_PREFIX}$REL_HOME_WORK/dep_repo", version = "0.1.0" }
 EOF
 cat > "$REL_HOME_WORK/app/src/main.gsa" << 'EOF'
 use std.str.intToStr
@@ -4459,8 +4515,962 @@ def main(): Void = printLn(intToStr(ans()))
 EOF
 ABS_GEISHA_39="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
 ABS_RT_39="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
-REL_FETCH_OUT="$(cd "$REL_HOME_WORK/app" && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" fetch >/dev/null && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && ./build/rel_app)"
+REL_FETCH_OUT="$(cd "$REL_HOME_WORK/app" && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" fetch >/dev/null && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && "./build/rel_app$EXE_EXT")"
 assert_eq "relative_geisha_home_fetch_and_build" "42" "$REL_FETCH_OUT"
+
+# Verify upgrading to 32-char slug still reuses legacy full-slug bare repo cache offline
+"${GEISHA_TEST_PYTHON:-python3}" - "$REL_HOME_WORK/app" << 'PYEOF'
+import hashlib, os, re, shutil, sys
+app_dir = sys.argv[1]
+lock_txt = open(os.path.join(app_dir, "geisha.lock"), "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert m, "missing url in geisha.lock"
+canon = m.group(1)
+raw_slug = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in canon)
+short_slug = raw_slug[-32:] if len(raw_slug) > 32 else raw_slug
+h12 = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:12]
+db_root = os.path.join(app_dir, "local-cache", "git", "db")
+short_dir = os.path.join(db_root, f"{short_slug}-{h12}.git")
+legacy_dir = os.path.join(db_root, f"{raw_slug}-{h12}.git")
+assert os.path.isdir(short_dir), f"missing short db dir: {short_dir}"
+if short_dir != legacy_dir:
+    shutil.move(short_dir, legacy_dir)
+PYEOF
+rm -rf "$REL_HOME_WORK/dep_repo" "$REL_HOME_WORK/app/local-cache/cache" "$REL_HOME_WORK/app/build"
+LEGACY_OFFLINE_OUT="$(cd "$REL_HOME_WORK/app" && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && "./build/rel_app$EXE_EXT")"
+assert_eq "pkg_legacy_full_slug_bare_repo_offline_recovery" "42" "$LEGACY_OFFLINE_OUT"
+
+# Verify file:// %20 percent-decoding, %25 round-trip safety, and UNC authority preservation
+cat > "$TMP_DIR/t39_uri_norm.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use std.str.strEndsWith
+use pkg.normalizeGitSpec
+
+def main(): Void = {
+    let uncOk = match normalizeGitSpec("file://filesrv/share/my%20repo") {
+        Ok((canon, clone)) -> canon == "file://filesrv/share/my%20repo" && clone == "//filesrv/share/my repo",
+        Err(_) -> false,
+    };
+    let lhOk = match normalizeGitSpec("file://localhost/tmp/my%20repo") {
+        Ok((canon, clone)) -> strEndsWith(canon, "/my%20repo") && strEndsWith(clone, "/my repo"),
+        Err(_) -> false,
+    };
+    let pctRtOk = match normalizeGitSpec("file:///tmp/dep%2520one") {
+        Ok((canon1, clone1)) ->
+            strEndsWith(canon1, "/dep%2520one") && strEndsWith(clone1, "/dep%20one")
+            && match normalizeGitSpec(canon1) {
+                Ok((canon2, clone2)) -> canon2 == canon1 && clone2 == clone1,
+                Err(_) -> false,
+            },
+        Err(_) -> false,
+    };
+    printLn((if (uncOk) "1" else "0") + "|" + (if (lhOk) "1" else "0") + "|" + (if (pctRtOk) "1" else "0"))
+}
+EOF
+"$GEISHA_BIN" --src-root src -o "$TMP_DIR/t39_uri_norm$EXE_EXT" "$TMP_DIR/t39_uri_norm.gsa"
+assert_eq "pkg_file_uri_pct_decode_and_unc" "1|1|1" "$("$TMP_DIR/t39_uri_norm$EXE_EXT")"
+
+# Two-repo fixture (`dep%20one` vs `dep one`): verify `geisha add file:///.../dep%2520one`
+# writes round-trip-safe URI to geisha.toml and subsequent `fetch` locks `dep%20one` (not `dep one`)!
+PCT_WORK="$TMP_DIR/t39_pct_roundtrip"
+mkdir -p "$PCT_WORK/dep%20one/src" "$PCT_WORK/dep one/src" "$PCT_WORK/app/src"
+cat > "$PCT_WORK/dep%20one/geisha.toml" << 'EOF'
+name = "dep"
+version = "0.1.0"
+EOF
+cat > "$PCT_WORK/dep%20one/src/dep.gsa" << 'EOF'
+pub def val(): Int = 111
+EOF
+git -C "$PCT_WORK/dep%20one" init -q
+git -C "$PCT_WORK/dep%20one" config user.email "ci@geisha.test"
+git -C "$PCT_WORK/dep%20one" config user.name "Geisha CI"
+git -C "$PCT_WORK/dep%20one" add .
+git -C "$PCT_WORK/dep%20one" commit -q -m "literal percent repo"
+git -C "$PCT_WORK/dep%20one" tag v0.1.0
+PCT_SHA_LIT="$(git -C "$PCT_WORK/dep%20one" rev-parse HEAD)"
+
+cat > "$PCT_WORK/dep one/geisha.toml" << 'EOF'
+name = "dep"
+version = "0.1.0"
+EOF
+cat > "$PCT_WORK/dep one/src/dep.gsa" << 'EOF'
+pub def val(): Int = 222
+EOF
+git -C "$PCT_WORK/dep one" init -q
+git -C "$PCT_WORK/dep one" config user.email "ci@geisha.test"
+git -C "$PCT_WORK/dep one" config user.name "Geisha CI"
+git -C "$PCT_WORK/dep one" add .
+git -C "$PCT_WORK/dep one" commit -q -m "space repo"
+git -C "$PCT_WORK/dep one" tag v0.1.0
+
+cat > "$PCT_WORK/app/geisha.toml" << 'EOF'
+name = "pct_app"
+version = "0.1.0"
+EOF
+cat > "$PCT_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use dep.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+PCT_OUT="$(
+    cd "$PCT_WORK/app" &&
+    GEISHA_HOME="$PCT_WORK/ghome" "$ABS_GEISHA_39" add "${FILE_URL_PREFIX}$PCT_WORK/dep%2520one" --as dep --version 0.1.0 >/dev/null &&
+    grep -q 'dep%2520one' geisha.toml &&
+    rm -f geisha.lock &&
+    GEISHA_HOME="$PCT_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$PCT_SHA_LIT" geisha.lock &&
+    GEISHA_HOME="$PCT_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/pct_app$EXE_EXT"
+)"
+assert_eq "pkg_add_file_uri_percent25_no_double_decode" "111" "$PCT_OUT"
+
+# Legacy raw-space geisha.lock + legacy unencoded bare repo compatibility:
+# verify both tag-retag (A -> B without update stays pinned to A) and offline recovery!
+SP_WORK="$TMP_DIR/t39_legacy_space"
+mkdir -p "$SP_WORK/repo name/src" "$SP_WORK/app/src"
+cat > "$SP_WORK/repo name/geisha.toml" << 'EOF'
+name = "sp_dep"
+version = "0.1.0"
+EOF
+cat > "$SP_WORK/repo name/src/sp_dep.gsa" << 'EOF'
+pub def val(): Int = 100
+EOF
+git -C "$SP_WORK/repo name" init -q
+git -C "$SP_WORK/repo name" config user.email "ci@geisha.test"
+git -C "$SP_WORK/repo name" config user.name "Geisha CI"
+git -C "$SP_WORK/repo name" add .
+git -C "$SP_WORK/repo name" commit -q -m "commit A"
+git -C "$SP_WORK/repo name" tag v0.1.0
+SP_SHA_A="$(git -C "$SP_WORK/repo name" rev-parse HEAD)"
+
+cat > "$SP_WORK/app/geisha.toml" << EOF
+name = "sp_app"
+version = "0.1.0"
+
+[deps]
+sp_dep = { git = "${FILE_URL_PREFIX}$SP_WORK/repo name", version = "0.1.0" }
+EOF
+cat > "$SP_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use sp_dep.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+(cd "$SP_WORK/app" && GEISHA_HOME="$SP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+
+# Simulate pre-upgrade legacy geisha.lock (raw unencoded space) + legacy unencoded bare repo dir
+"${GEISHA_TEST_PYTHON:-python3}" - "$SP_WORK/app" "$SP_WORK/ghome" << 'PYEOF'
+import hashlib, os, re, shutil, sys, urllib.parse
+app_dir, ghome = sys.argv[1], sys.argv[2]
+lock_p = os.path.join(app_dir, "geisha.lock")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert m, "missing url in geisha.lock"
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+assert raw_url != enc_url and "repo name" in raw_url, (enc_url, raw_url)
+legacy_lock = re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+open(lock_p, "w", encoding="utf-8").write(legacy_lock)
+open(os.path.join(app_dir, "geisha.lock.legacy"), "w", encoding="utf-8").write(legacy_lock)
+
+def slug_of(u):
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in u)
+
+enc_slug = slug_of(enc_url)
+enc_short = enc_slug[-32:] if len(enc_slug) > 32 else enc_slug
+enc_h12 = hashlib.sha256(enc_url.encode("utf-8")).hexdigest()[:12]
+raw_slug = slug_of(raw_url)
+raw_h12 = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:12]
+db_root = os.path.join(ghome, "git", "db")
+src_db = os.path.join(db_root, f"{enc_short}-{enc_h12}.git")
+dst_db = os.path.join(db_root, f"{raw_slug}-{raw_h12}.git")
+assert os.path.isdir(src_db), f"missing {src_db}"
+shutil.move(src_db, dst_db)
+PYEOF
+
+# 1) Retag v0.1.0 from A -> B in remote; fetch without update must stay pinned to A (100)!
+cat > "$SP_WORK/repo name/src/sp_dep.gsa" << 'EOF'
+pub def val(): Int = 999
+EOF
+git -C "$SP_WORK/repo name" add .
+git -C "$SP_WORK/repo name" commit -q -m "commit B"
+git -C "$SP_WORK/repo name" tag -f v0.1.0
+rm -rf "$SP_WORK/ghome/cache" "$SP_WORK/app/build"
+SP_RETAG_OUT="$(
+    cd "$SP_WORK/app" &&
+    GEISHA_HOME="$SP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$SP_SHA_A" geisha.lock &&
+    GEISHA_HOME="$SP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/sp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_raw_space_lock_pinned_on_retag" "100" "$SP_RETAG_OUT"
+
+# 2) Delete remote & extracted cache, restore legacy raw-space lock -> offline fetch must still recover A (100)!
+rm -rf "$SP_WORK/repo name" "$SP_WORK/ghome/cache" "$SP_WORK/app/build"
+cp "$SP_WORK/app/geisha.lock.legacy" "$SP_WORK/app/geisha.lock"
+SP_OFFLINE_OUT="$(
+    cd "$SP_WORK/app" &&
+    GEISHA_HOME="$SP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$SP_SHA_A" geisha.lock &&
+    GEISHA_HOME="$SP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/sp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_raw_space_bare_repo_offline_recovery" "100" "$SP_OFFLINE_OUT"
+
+# Legacy literal-percent (`repo%20name`) geisha.lock + legacy unencoded bare repo compatibility:
+# verify both tag-retag (A -> B without update stays pinned to A) and offline recovery!
+LP_WORK="$TMP_DIR/t39_legacy_litpct"
+mkdir -p "$LP_WORK/repo%20name/src" "$LP_WORK/app/src"
+cat > "$LP_WORK/repo%20name/geisha.toml" << 'EOF'
+name = "lp_dep"
+version = "0.1.0"
+EOF
+cat > "$LP_WORK/repo%20name/src/lp_dep.gsa" << 'EOF'
+pub def val(): Int = 300
+EOF
+git -C "$LP_WORK/repo%20name" init -q
+git -C "$LP_WORK/repo%20name" config user.email "ci@geisha.test"
+git -C "$LP_WORK/repo%20name" config user.name "Geisha CI"
+git -C "$LP_WORK/repo%20name" add .
+git -C "$LP_WORK/repo%20name" commit -q -m "commit A"
+git -C "$LP_WORK/repo%20name" tag v0.1.0
+LP_SHA_A="$(git -C "$LP_WORK/repo%20name" rev-parse HEAD)"
+
+cat > "$LP_WORK/app/geisha.toml" << EOF
+name = "lp_app"
+version = "0.1.0"
+
+[deps]
+lp_dep = { git = "${FILE_URL_PREFIX}$LP_WORK/repo%2520name", version = "0.1.0" }
+EOF
+cat > "$LP_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use lp_dep.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+(cd "$LP_WORK/app" && GEISHA_HOME="$LP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+
+# Simulate pre-upgrade legacy geisha.lock (`file:///.../repo%20name` unencoded) + legacy bare repo dir
+"${GEISHA_TEST_PYTHON:-python3}" - "$LP_WORK/app" "$LP_WORK/ghome" << 'PYEOF'
+import hashlib, os, re, shutil, sys, urllib.parse
+app_dir, ghome = sys.argv[1], sys.argv[2]
+lock_p = os.path.join(app_dir, "geisha.lock")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert m, "missing url in geisha.lock"
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+assert enc_url.endswith("/repo%2520name") and raw_url.endswith("/repo%20name"), (enc_url, raw_url)
+legacy_lock = re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+open(lock_p, "w", encoding="utf-8").write(legacy_lock)
+open(os.path.join(app_dir, "geisha.lock.legacy"), "w", encoding="utf-8").write(legacy_lock)
+
+def slug_of(u):
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in u)
+
+enc_slug = slug_of(enc_url)
+enc_short = enc_slug[-32:] if len(enc_slug) > 32 else enc_slug
+enc_h12 = hashlib.sha256(enc_url.encode("utf-8")).hexdigest()[:12]
+raw_slug = slug_of(raw_url)
+raw_h12 = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:12]
+db_root = os.path.join(ghome, "git", "db")
+src_db = os.path.join(db_root, f"{enc_short}-{enc_h12}.git")
+dst_db = os.path.join(db_root, f"{raw_slug}-{raw_h12}.git")
+assert os.path.isdir(src_db), f"missing {src_db}"
+shutil.move(src_db, dst_db)
+PYEOF
+
+# 1) Retag v0.1.0 from A -> B in remote; fetch without update must stay pinned to A (300)!
+cat > "$LP_WORK/repo%20name/src/lp_dep.gsa" << 'EOF'
+pub def val(): Int = 888
+EOF
+git -C "$LP_WORK/repo%20name" add .
+git -C "$LP_WORK/repo%20name" commit -q -m "commit B"
+git -C "$LP_WORK/repo%20name" tag -f v0.1.0
+rm -rf "$LP_WORK/ghome/cache" "$LP_WORK/app/build"
+LP_RETAG_OUT="$(
+    cd "$LP_WORK/app" &&
+    GEISHA_HOME="$LP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LP_SHA_A" geisha.lock &&
+    GEISHA_HOME="$LP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/lp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_literal_pct20_lock_pinned_on_retag" "300" "$LP_RETAG_OUT"
+
+# 2) Delete remote & extracted cache, restore legacy lock -> offline fetch must still recover A (300)!
+rm -rf "$LP_WORK/repo%20name" "$LP_WORK/ghome/cache" "$LP_WORK/app/build"
+cp "$LP_WORK/app/geisha.lock.legacy" "$LP_WORK/app/geisha.lock"
+LP_OFFLINE_OUT="$(
+    cd "$LP_WORK/app" &&
+    GEISHA_HOME="$LP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LP_SHA_A" geisha.lock &&
+    GEISHA_HOME="$LP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/lp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_literal_pct20_bare_repo_offline_recovery" "300" "$LP_OFFLINE_OUT"
+
+# Dual-repo shared-history collision in ONE legacy v1 geisha.lock (`repo name` cloned from
+# `repo%20name` + 1 commit, same tag v0.1.0): verify 1st & 2nd fetches keep each package pinned!
+DUAL_WORK="$TMP_DIR/t39_dual_legacy_collision"
+mkdir -p "$DUAL_WORK/repo%20name/src" "$DUAL_WORK/app/src"
+cat > "$DUAL_WORK/repo%20name/geisha.toml" << 'EOF'
+name = "dep_pct"
+version = "0.1.0"
+EOF
+cat > "$DUAL_WORK/repo%20name/src/dep_pct.gsa" << 'EOF'
+pub def val(): Int = 202
+EOF
+git -C "$DUAL_WORK/repo%20name" init -q
+git -C "$DUAL_WORK/repo%20name" config user.email "ci@geisha.test"
+git -C "$DUAL_WORK/repo%20name" config user.name "Geisha CI"
+git -C "$DUAL_WORK/repo%20name" add .
+git -C "$DUAL_WORK/repo%20name" commit -q -m "pct A"
+git -C "$DUAL_WORK/repo%20name" tag v0.1.0
+DUAL_SHA_PCT="$(git -C "$DUAL_WORK/repo%20name" rev-parse HEAD)"
+
+# Clone `repo name` from `repo%20name` so `DUAL_SHA_PCT` ALSO exists in `repo name`'s history!
+git clone -q "$DUAL_WORK/repo%20name" "$DUAL_WORK/repo name"
+git -C "$DUAL_WORK/repo name" config user.email "ci@geisha.test"
+git -C "$DUAL_WORK/repo name" config user.name "Geisha CI"
+rm -f "$DUAL_WORK/repo name/src/dep_pct.gsa"
+cat > "$DUAL_WORK/repo name/geisha.toml" << 'EOF'
+name = "dep_space"
+version = "0.1.0"
+EOF
+cat > "$DUAL_WORK/repo name/src/dep_space.gsa" << 'EOF'
+pub def val(): Int = 101
+EOF
+git -C "$DUAL_WORK/repo name" add -A
+git -C "$DUAL_WORK/repo name" commit -q -m "space A (shared history with pct A)"
+git -C "$DUAL_WORK/repo name" tag -f v0.1.0
+DUAL_SHA_SP="$(git -C "$DUAL_WORK/repo name" rev-parse HEAD)"
+
+cat > "$DUAL_WORK/app/geisha.toml" << EOF
+name = "dual_app"
+version = "0.1.0"
+
+[deps]
+dep_space = { git = "${FILE_URL_PREFIX}$DUAL_WORK/repo name", version = "0.1.0" }
+dep_pct = { git = "${FILE_URL_PREFIX}$DUAL_WORK/repo%2520name", version = "0.1.0" }
+EOF
+cat > "$DUAL_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use dep_space.{val as valSp}
+use dep_pct.{val as valPct}
+def main(): Void = printLn(intToStr(valSp()) + "|" + intToStr(valPct()))
+EOF
+(cd "$DUAL_WORK/app" && GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+
+# Rewrite both entries in geisha.lock & both bare repos to pre-upgrade unencoded form
+"${GEISHA_TEST_PYTHON:-python3}" - "$DUAL_WORK/app" "$DUAL_WORK/ghome" << 'PYEOF'
+import hashlib, os, re, shutil, sys, urllib.parse
+app_dir, ghome = sys.argv[1], sys.argv[2]
+lock_p = os.path.join(app_dir, "geisha.lock")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+urls = re.findall(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert len(urls) == 2, urls
+
+def slug_of(u):
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in u)
+
+db_root = os.path.join(ghome, "git", "db")
+# Move to temp first to avoid colliding during rename, then to legacy full-slug unencoded names
+moves = []
+new_lock = lock_txt
+for idx, enc_url in enumerate(urls):
+    raw_url = urllib.parse.unquote(enc_url)
+    assert raw_url != enc_url
+    new_lock = new_lock.replace(f'"{enc_url}"', f'"{raw_url}"', 1)
+    enc_slug = slug_of(enc_url)
+    enc_short = enc_slug[-32:] if len(enc_slug) > 32 else enc_slug
+    enc_h12 = hashlib.sha256(enc_url.encode("utf-8")).hexdigest()[:12]
+    raw_slug = slug_of(raw_url)
+    raw_h12 = hashlib.sha256(raw_url.encode("utf-8")).hexdigest()[:12]
+    src = os.path.join(db_root, f"{enc_short}-{enc_h12}.git")
+    tmp = os.path.join(db_root, f"tmp_{idx}.git")
+    dst = os.path.join(db_root, f"{raw_slug}-{raw_h12}.git")
+    assert os.path.isdir(src), src
+    shutil.move(src, tmp)
+    moves.append((tmp, dst))
+for tmp, dst in moves:
+    shutil.move(tmp, dst)
+new_lock = re.sub(r'version\s*=\s*\d+', 'version = 1', new_lock, count=1)
+open(lock_p, "w", encoding="utf-8").write(new_lock)
+PYEOF
+
+rm -rf "$DUAL_WORK/ghome/cache" "$DUAL_WORK/app/build"
+# 1st fetch (migration from legacy lock) + 2nd consecutive fetch (post-migration stability,
+# even after remotes retag v0.1.0 to new commits!)
+DUAL_OUT_1="$(
+    cd "$DUAL_WORK/app" &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$DUAL_SHA_SP" geisha.lock &&
+    grep -q "$DUAL_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/dual_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_dual_space_and_pct20_lock_no_collision" "101|202" "$DUAL_OUT_1"
+
+cat > "$DUAL_WORK/repo name/src/dep_space.gsa" << 'EOF'
+pub def val(): Int = 901
+EOF
+git -C "$DUAL_WORK/repo name" add .
+git -C "$DUAL_WORK/repo name" commit -q -m "space B"
+git -C "$DUAL_WORK/repo name" tag -f v0.1.0
+cat > "$DUAL_WORK/repo%20name/src/dep_pct.gsa" << 'EOF'
+pub def val(): Int = 902
+EOF
+git -C "$DUAL_WORK/repo%20name" add .
+git -C "$DUAL_WORK/repo%20name" commit -q -m "pct B"
+git -C "$DUAL_WORK/repo%20name" tag -f v0.1.0
+
+rm -rf "$DUAL_WORK/ghome/cache" "$DUAL_WORK/app/build"
+DUAL_OUT_2="$(
+    cd "$DUAL_WORK/app" &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$DUAL_SHA_SP" geisha.lock &&
+    grep -q "$DUAL_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/dual_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_dual_second_fetch_stable_after_retag" "101|202" "$DUAL_OUT_2"
+
+# Delete both remotes & extracted cache -> two consecutive offline fetches must both preserve 101|202!
+rm -rf "$DUAL_WORK/repo name" "$DUAL_WORK/repo%20name" "$DUAL_WORK/ghome/cache" "$DUAL_WORK/app/build"
+DUAL_OFF_OUT="$(
+    cd "$DUAL_WORK/app" &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$DUAL_SHA_SP" geisha.lock &&
+    grep -q "$DUAL_SHA_PCT" geisha.lock &&
+    rm -rf "$DUAL_WORK/ghome/cache" &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$DUAL_SHA_SP" geisha.lock &&
+    grep -q "$DUAL_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$DUAL_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/dual_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_dual_two_offline_fetches_stable" "101|202" "$DUAL_OFF_OUT"
+
+# Short-path / occupied dbDir collision: if dbDir for `a b` (`file:///.../a%20b`) is already
+# occupied by `a%20b`'s legacy bare repo, fetching `a b` MUST NOT overwrite `a%20b`'s origin!
+OCC_WORK="$TMP_DIR/t39_occ_bare"
+mkdir -p "$OCC_WORK/a%20b/src" "$OCC_WORK/a b/src" "$OCC_WORK/app_pct/src" "$OCC_WORK/app_sp/src"
+cat > "$OCC_WORK/a%20b/geisha.toml" << 'EOF'
+name = "occ_pct"
+version = "0.1.0"
+EOF
+cat > "$OCC_WORK/a%20b/src/occ_pct.gsa" << 'EOF'
+pub def val(): Int = 505
+EOF
+git -C "$OCC_WORK/a%20b" init -q
+git -C "$OCC_WORK/a%20b" config user.email "ci@geisha.test"
+git -C "$OCC_WORK/a%20b" config user.name "Geisha CI"
+git -C "$OCC_WORK/a%20b" add .
+git -C "$OCC_WORK/a%20b" commit -q -m "occ pct"
+git -C "$OCC_WORK/a%20b" tag v0.1.0
+
+cat > "$OCC_WORK/a b/geisha.toml" << 'EOF'
+name = "occ_sp"
+version = "0.1.0"
+EOF
+cat > "$OCC_WORK/a b/src/occ_sp.gsa" << 'EOF'
+pub def val(): Int = 606
+EOF
+git -C "$OCC_WORK/a b" init -q
+git -C "$OCC_WORK/a b" config user.email "ci@geisha.test"
+git -C "$OCC_WORK/a b" config user.name "Geisha CI"
+git -C "$OCC_WORK/a b" add .
+git -C "$OCC_WORK/a b" commit -q -m "occ sp"
+git -C "$OCC_WORK/a b" tag v0.1.0
+
+cat > "$OCC_WORK/app_pct/geisha.toml" << EOF
+name = "app_pct"
+version = "0.1.0"
+
+[deps]
+occ_pct = { git = "${FILE_URL_PREFIX}$OCC_WORK/a%2520b", version = "0.1.0" }
+EOF
+cat > "$OCC_WORK/app_pct/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use occ_pct.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+
+cat > "$OCC_WORK/app_sp/geisha.toml" << EOF
+name = "app_sp"
+version = "0.1.0"
+
+[deps]
+occ_sp = { git = "${FILE_URL_PREFIX}$OCC_WORK/a b", version = "0.1.0" }
+EOF
+cat > "$OCC_WORK/app_sp/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use occ_sp.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+
+(cd "$OCC_WORK/app_pct" && GEISHA_HOME="$OCC_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+# Place `a%20b`'s bare repo at the exact short-slug `dbDir` that `a b` (`file:///.../a%20b`) wants!
+"${GEISHA_TEST_PYTHON:-python3}" - "$OCC_WORK/app_pct" "$OCC_WORK/ghome" << 'PYEOF'
+import hashlib, os, re, shutil, sys, urllib.parse
+app_dir, ghome = sys.argv[1], sys.argv[2]
+lock_p = os.path.join(app_dir, "geisha.lock")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert m, lock_txt
+enc_pct = m.group(1)
+raw_pct = urllib.parse.unquote(enc_pct)  # equals canonUrl of `a b`!
+def slug_of(u):
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in u)
+def short_slug(u):
+    s = slug_of(u)
+    return s[-32:] if len(s) > 32 else s
+db_root = os.path.join(ghome, "git", "db")
+src = os.path.join(db_root, f"{short_slug(enc_pct)}-{hashlib.sha256(enc_pct.encode()).hexdigest()[:12]}.git")
+# Occupy BOTH short-slug dbDir of `a b` AND legacy full-slug dir of `a%20b`
+occ_short = os.path.join(db_root, f"{short_slug(raw_pct)}-{hashlib.sha256(raw_pct.encode()).hexdigest()[:12]}.git")
+occ_full = os.path.join(db_root, f"{slug_of(raw_pct)}-{hashlib.sha256(raw_pct.encode()).hexdigest()[:12]}.git")
+assert os.path.isdir(src), src
+if occ_short != occ_full:
+    shutil.copytree(src, occ_short)
+shutil.move(src, occ_full)
+legacy_lock = re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_pct}"', f'"{raw_pct}"'), count=1)
+open(lock_p, "w", encoding="utf-8").write(legacy_lock)
+PYEOF
+
+# Now fetch `a b` in the SAME GEISHA_HOME -> must allocate disambiguated dir without clobbering `a%20b`!
+OCC_SP_OUT="$(cd "$OCC_WORK/app_sp" && GEISHA_HOME="$OCC_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null && GEISHA_HOME="$OCC_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && "./build/app_sp$EXE_EXT")"
+# Remove `a%20b` remote and clear extracted cache -> `app_pct` must still recover 505 offline!
+rm -rf "$OCC_WORK/a%20b" "$OCC_WORK/ghome/cache" "$OCC_WORK/app_pct/build"
+OCC_PCT_OUT="$(cd "$OCC_WORK/app_pct" && GEISHA_HOME="$OCC_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null && GEISHA_HOME="$OCC_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && "./build/app_pct$EXE_EXT")"
+assert_eq "pkg_short_path_bare_repo_no_overwrite_offline_recovery" "606|505" "$OCC_SP_OUT|$OCC_PCT_OUT"
+
+# Legacy unencoded `geisha.toml` (`file:///.../dep%20one`) + v1 `geisha.lock` when sibling
+# `dep one` also exists on disk: 1st fetch migrates to `dep%2520one` & preserves `dep%20one` SHA,
+# and 2nd consecutive fetch stays pinned to `dep%20one`!
+LTM_WORK="$TMP_DIR/t39_legacy_toml_pct"
+mkdir -p "$LTM_WORK/dep%20one/src" "$LTM_WORK/dep one/src" "$LTM_WORK/app/src"
+cat > "$LTM_WORK/dep%20one/geisha.toml" << 'EOF'
+name = "dep"
+version = "0.1.0"
+EOF
+cat > "$LTM_WORK/dep%20one/src/dep.gsa" << 'EOF'
+pub def val(): Int = 707
+EOF
+git -C "$LTM_WORK/dep%20one" init -q
+git -C "$LTM_WORK/dep%20one" config user.email "ci@geisha.test"
+git -C "$LTM_WORK/dep%20one" config user.name "Geisha CI"
+git -C "$LTM_WORK/dep%20one" add .
+git -C "$LTM_WORK/dep%20one" commit -q -m "litpct A"
+git -C "$LTM_WORK/dep%20one" tag v0.1.0
+LTM_SHA_PCT="$(git -C "$LTM_WORK/dep%20one" rev-parse HEAD)"
+
+cat > "$LTM_WORK/dep one/geisha.toml" << 'EOF'
+name = "dep"
+version = "0.1.0"
+EOF
+cat > "$LTM_WORK/dep one/src/dep.gsa" << 'EOF'
+pub def val(): Int = 808
+EOF
+git -C "$LTM_WORK/dep one" init -q
+git -C "$LTM_WORK/dep one" config user.email "ci@geisha.test"
+git -C "$LTM_WORK/dep one" config user.name "Geisha CI"
+git -C "$LTM_WORK/dep one" add .
+git -C "$LTM_WORK/dep one" commit -q -m "space sibling"
+git -C "$LTM_WORK/dep one" tag v0.1.0
+
+cat > "$LTM_WORK/app/geisha.toml" << EOF
+# Keep this comment untouched: "file:///.../dep%20one"
+name = "ltm_app"
+version = "0.1.0"
+
+[deps]
+dep = { git = "${FILE_URL_PREFIX}$LTM_WORK/dep%2520one", version = "0.1.0" }
+EOF
+cat > "$LTM_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use dep.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+(cd "$LTM_WORK/app" && GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+# Downgrade BOTH geisha.toml and geisha.lock to legacy pre-upgrade unencoded `file:///.../dep%20one`!
+"${GEISHA_TEST_PYTHON:-python3}" - "$LTM_WORK/app" "$LTM_WORK/ghome" << 'PYEOF'
+import hashlib, os, re, shutil, sys, urllib.parse
+app_dir, ghome = sys.argv[1], sys.argv[2]
+lock_p = os.path.join(app_dir, "geisha.lock")
+toml_p = os.path.join(app_dir, "geisha.toml")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+assert m, lock_txt
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+assert enc_url.endswith("/dep%2520one") and raw_url.endswith("/dep%20one"), (enc_url, raw_url)
+legacy_lock = re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+open(lock_p, "w", encoding="utf-8").write(legacy_lock)
+open(os.path.join(app_dir, "geisha.lock.v1"), "w", encoding="utf-8").write(legacy_lock)
+toml_txt = open(toml_p, "r", encoding="utf-8").read()
+open(toml_p, "w", encoding="utf-8").write(toml_txt.replace("dep%2520one", "dep%20one"))
+def slug_of(u):
+    return "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in u)
+enc_slug = slug_of(enc_url)
+enc_short = enc_slug[-32:] if len(enc_slug) > 32 else enc_slug
+db_root = os.path.join(ghome, "git", "db")
+src = os.path.join(db_root, f"{enc_short}-{hashlib.sha256(enc_url.encode()).hexdigest()[:12]}.git")
+dst = os.path.join(db_root, f"{slug_of(raw_url)}-{hashlib.sha256(raw_url.encode()).hexdigest()[:12]}.git")
+shutil.move(src, dst)
+PYEOF
+
+# Fixture 1: Read-only root geisha.toml (with comment) must stay untouched while v2 lock records raw_url!
+cp "$LTM_WORK/app/geisha.toml" "$LTM_WORK/app/geisha.toml.before"
+if [ "$IS_WIN" = "0" ]; then chmod 444 "$LTM_WORK/app/geisha.toml"; fi
+rm -rf "$LTM_WORK/ghome/cache" "$LTM_WORK/app/build"
+LTM_OUT_1="$(
+    cd "$LTM_WORK/app" &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LTM_SHA_PCT" geisha.lock &&
+    grep -q 'raw_url' geisha.lock &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/ltm_app$EXE_EXT"
+)"
+if ! cmp -s "$LTM_WORK/app/geisha.toml.before" "$LTM_WORK/app/geisha.toml"; then
+    echo "FAIL [pkg_legacy_readonly_toml_untouched]: geisha.toml was modified!" >&2
+    exit 1
+fi
+echo "PASS [pkg_legacy_readonly_toml_untouched]: geisha.toml byte-for-byte untouched"
+PASS=$((PASS + 1))
+# Retag dep%20one to B and run 2nd fetch with read-only geisha.toml -> must stay pinned to A (707)!
+cat > "$LTM_WORK/dep%20one/src/dep.gsa" << 'EOF'
+pub def val(): Int = 999
+EOF
+git -C "$LTM_WORK/dep%20one" add .
+git -C "$LTM_WORK/dep%20one" commit -q -m "litpct B"
+git -C "$LTM_WORK/dep%20one" tag -f v0.1.0
+rm -rf "$LTM_WORK/ghome/cache" "$LTM_WORK/app/build"
+LTM_OUT_2="$(
+    cd "$LTM_WORK/app" &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LTM_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/ltm_app$EXE_EXT"
+)"
+if [ "$IS_WIN" = "0" ]; then chmod 644 "$LTM_WORK/app/geisha.toml"; fi
+assert_eq "pkg_legacy_toml_and_v1_lock_litpct_with_space_sibling" "707|707" "$LTM_OUT_1|$LTM_OUT_2"
+
+# Fixture 2: Transitive dependency `mid_pkg` whose immutable geisha.toml references `file:///.../dep%20one`
+mkdir -p "$LTM_WORK/mid_pkg/src" "$LTM_WORK/trans_app/src"
+cat > "$LTM_WORK/mid_pkg/geisha.toml" << EOF
+name = "mid_pkg"
+version = "0.1.0"
+
+[deps]
+dep = { git = "${FILE_URL_PREFIX}$LTM_WORK/dep%20one", version = "0.1.0" }
+EOF
+cat > "$LTM_WORK/mid_pkg/src/mid_pkg.gsa" << 'EOF'
+use dep.val
+pub def midVal(): Int = val() + 1
+EOF
+git -C "$LTM_WORK/mid_pkg" init -q
+git -C "$LTM_WORK/mid_pkg" config user.email "ci@geisha.test"
+git -C "$LTM_WORK/mid_pkg" config user.name "Geisha CI"
+git -C "$LTM_WORK/mid_pkg" add .
+git -C "$LTM_WORK/mid_pkg" commit -q -m "mid init"
+git -C "$LTM_WORK/mid_pkg" tag v0.1.0
+cat > "$LTM_WORK/trans_app/geisha.toml" << EOF
+name = "trans_app"
+version = "0.1.0"
+
+[deps]
+mid_pkg = { git = "${FILE_URL_PREFIX}$LTM_WORK/mid_pkg", version = "0.1.0" }
+EOF
+cat > "$LTM_WORK/trans_app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use mid_pkg.midVal
+def main(): Void = printLn(intToStr(midVal()))
+EOF
+# Seed v1 lock containing `dep%20one` (at A = 707) -> 1st & 2nd fetches must both keep 708 (not 809)!
+cp "$LTM_WORK/app/geisha.lock.v1" "$LTM_WORK/trans_app/geisha.lock"
+LTM_TRANS_OUT="$(
+    cd "$LTM_WORK/trans_app" &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LTM_SHA_PCT" geisha.lock &&
+    rm -rf "$LTM_WORK/ghome/cache" &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LTM_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/trans_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_transitive_litpct_two_fetches_stable" "708" "$LTM_TRANS_OUT"
+
+# Fixture 3: Extracted-cache-only (`cache/p/...`) recovery when remote `dep%20one` & `git/db` are
+# both deleted, v1 lock is restored, and sibling `dep one` (808) still sits on disk!
+rm -rf "$LTM_WORK/dep%20one" "$LTM_WORK/ghome/git" "$LTM_WORK/app/build"
+cp "$LTM_WORK/app/geisha.lock.v1" "$LTM_WORK/app/geisha.lock"
+LTM_CACHE_ONLY_OUT="$(
+    cd "$LTM_WORK/app" &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$LTM_SHA_PCT" geisha.lock &&
+    GEISHA_HOME="$LTM_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/ltm_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_cache_only_litpct_ignores_space_sibling" "707" "$LTM_CACHE_ONLY_OUT"
+
+# Fixture 4: After migrating legacy alias `literal` (`dep%20one` -> 101), adding the space repo
+# via `geisha add` under a new alias `spaced` (`dep one` -> 202) MUST NOT be hijacked by `raw_url`!
+SCP_WORK="$TMP_DIR/t39_scoped_raw_url"
+mkdir -p "$SCP_WORK/dep%20one/src" "$SCP_WORK/dep one/src" "$SCP_WORK/app/src"
+cat > "$SCP_WORK/dep%20one/geisha.toml" << 'EOF'
+name = "lit_pkg"
+version = "0.1.0"
+EOF
+cat > "$SCP_WORK/dep%20one/src/lit_pkg.gsa" << 'EOF'
+pub def val(): Int = 101
+EOF
+git -C "$SCP_WORK/dep%20one" init -q
+git -C "$SCP_WORK/dep%20one" config user.email "ci@geisha.test"
+git -C "$SCP_WORK/dep%20one" config user.name "Geisha CI"
+git -C "$SCP_WORK/dep%20one" add .
+git -C "$SCP_WORK/dep%20one" commit -q -m "lit 101"
+git -C "$SCP_WORK/dep%20one" tag v0.1.0
+SCP_SHA_LIT="$(git -C "$SCP_WORK/dep%20one" rev-parse HEAD)"
+
+cat > "$SCP_WORK/dep one/geisha.toml" << 'EOF'
+name = "sp_pkg"
+version = "0.1.0"
+EOF
+cat > "$SCP_WORK/dep one/src/sp_pkg.gsa" << 'EOF'
+pub def val(): Int = 202
+EOF
+git -C "$SCP_WORK/dep one" init -q
+git -C "$SCP_WORK/dep one" config user.email "ci@geisha.test"
+git -C "$SCP_WORK/dep one" config user.name "Geisha CI"
+git -C "$SCP_WORK/dep one" add .
+git -C "$SCP_WORK/dep one" commit -q -m "sp 202"
+git -C "$SCP_WORK/dep one" tag v0.1.0
+SCP_SHA_SP="$(git -C "$SCP_WORK/dep one" rev-parse HEAD)"
+
+cat > "$SCP_WORK/app/geisha.toml" << EOF
+name = "scp_app"
+version = "0.1.0"
+
+[deps]
+literal = { git = "${FILE_URL_PREFIX}$SCP_WORK/dep%2520one", version = "0.1.0" }
+EOF
+cat > "$SCP_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+(cd "$SCP_WORK/app" && GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+# Downgrade `literal` to legacy unencoded `dep%20one` in geisha.toml + v1 lock, then migrate
+"${GEISHA_TEST_PYTHON:-python3}" - "$SCP_WORK/app" << 'PYEOF'
+import os, re, sys, urllib.parse
+app_dir = sys.argv[1]
+lock_p = os.path.join(app_dir, "geisha.lock")
+toml_p = os.path.join(app_dir, "geisha.toml")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+open(lock_p, "w", encoding="utf-8").write(
+    re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+)
+toml_txt = open(toml_p, "r", encoding="utf-8").read()
+open(toml_p, "w", encoding="utf-8").write(toml_txt.replace("dep%2520one", "dep%20one"))
+PYEOF
+(cd "$SCP_WORK/app" && GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+# Now add the space repo under new alias `spaced` via `geisha add`!
+(cd "$SCP_WORK/app" && GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" add "${FILE_URL_PREFIX}$SCP_WORK/dep%20one" --as spaced --version 0.1.0 >/dev/null)
+cat > "$SCP_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.{val as valLit}
+use spaced.{val as valSp}
+def main(): Void = printLn(intToStr(valLit()) + "|" + intToStr(valSp()))
+EOF
+SCP_OUT="$(
+    cd "$SCP_WORK/app" &&
+    GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$SCP_SHA_LIT" geisha.lock &&
+    grep -q "$SCP_SHA_SP" geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/scp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_raw_url_scoped_no_hijack_new_add_spaced" "101|202" "$SCP_OUT"
+
+# Also verify the direct upgrade order WITHOUT prior `geisha fetch` (`v1 lock -> direct geisha add`):
+mkdir -p "$SCP_WORK/app_direct/src"
+cat > "$SCP_WORK/app_direct/geisha.toml" << EOF
+name = "scp_app_direct"
+version = "0.1.0"
+
+[deps]
+literal = { git = "${FILE_URL_PREFIX}$SCP_WORK/dep%2520one", version = "0.1.0" }
+EOF
+cat > "$SCP_WORK/app_direct/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.{val as valLit}
+use spaced.{val as valSp}
+def main(): Void = printLn(intToStr(valLit()) + "|" + intToStr(valSp()))
+EOF
+(cd "$SCP_WORK/app_direct" && GEISHA_HOME="$SCP_WORK/ghome_dir" "$ABS_GEISHA_39" fetch >/dev/null)
+"${GEISHA_TEST_PYTHON:-python3}" - "$SCP_WORK/app_direct" << 'PYEOF'
+import os, re, sys, urllib.parse
+app_dir = sys.argv[1]
+lock_p = os.path.join(app_dir, "geisha.lock")
+toml_p = os.path.join(app_dir, "geisha.toml")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+open(lock_p, "w", encoding="utf-8").write(
+    re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+)
+toml_txt = open(toml_p, "r", encoding="utf-8").read()
+open(toml_p, "w", encoding="utf-8").write(toml_txt.replace("dep%2520one", "dep%20one"))
+PYEOF
+# Directly run `geisha add` as the FIRST post-upgrade command (NO prior `geisha fetch`!)
+SCP_DIRECT_OUT="$(
+    cd "$SCP_WORK/app_direct" &&
+    GEISHA_HOME="$SCP_WORK/ghome_dir" "$ABS_GEISHA_39" add "${FILE_URL_PREFIX}$SCP_WORK/dep%20one" --as spaced --version 0.1.0 >/dev/null &&
+    grep -q "$SCP_SHA_LIT" geisha.lock &&
+    grep -q "$SCP_SHA_SP" geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome_dir" "$ABS_GEISHA_39" fetch >/dev/null &&
+    grep -q "$SCP_SHA_LIT" geisha.lock &&
+    grep -q "$SCP_SHA_SP" geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome_dir" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/scp_app_direct$EXE_EXT"
+)"
+assert_eq "pkg_legacy_v1_direct_add_spaced_no_prior_fetch" "101|202" "$SCP_DIRECT_OUT"
+
+# Also verify `geisha add <dep one> --as literal` (upserting/replacing an existing migrated alias)
+# bypasses stale `raw_from` and switches `literal` cleanly from 101 -> 202!
+cat > "$SCP_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+SCP_UPSERT_OUT="$(
+    cd "$SCP_WORK/app" &&
+    GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" add "$SCP_WORK/dep one" --as literal --version 0.1.0 >/dev/null &&
+    grep -q "$SCP_SHA_SP" geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+    GEISHA_HOME="$SCP_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/scp_app$EXE_EXT"
+)"
+assert_eq "pkg_legacy_add_upsert_replaces_migrated_alias" "202" "$SCP_UPSERT_OUT"
+
+# Also verify BOTH paths when a comment-only `geisha.local.toml` exists (so `geisha.lock` is NOT
+# rewritten by `add`/`fetch`): explicit `add` marks `url_encoding = "pct"` in `geisha.toml` so
+# subsequent `fetch`/`build` keep 101|202 (new alias) and 202 (upsert) while leaving `geisha.lock` untouched!
+mkdir -p "$SCP_WORK/app_local/src"
+cat > "$SCP_WORK/app_local/geisha.toml" << EOF
+name = "scp_app_local"
+version = "0.1.0"
+
+[deps]
+literal = { git = "${FILE_URL_PREFIX}$SCP_WORK/dep%2520one", version = "0.1.0" }
+EOF
+cat > "$SCP_WORK/app_local/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.{val as valLit}
+use spaced.{val as valSp}
+def main(): Void = printLn(intToStr(valLit()) + "|" + intToStr(valSp()))
+EOF
+(cd "$SCP_WORK/app_local" && GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" fetch >/dev/null)
+"${GEISHA_TEST_PYTHON:-python3}" - "$SCP_WORK/app_local" << 'PYEOF'
+import os, re, sys, urllib.parse
+app_dir = sys.argv[1]
+lock_p = os.path.join(app_dir, "geisha.lock")
+toml_p = os.path.join(app_dir, "geisha.toml")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+m = re.search(r'url\s*=\s*"([^"]+)"', lock_txt)
+enc_url = m.group(1)
+raw_url = urllib.parse.unquote(enc_url)
+open(lock_p, "w", encoding="utf-8").write(
+    re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt.replace(f'"{enc_url}"', f'"{raw_url}"'), count=1)
+)
+toml_txt = open(toml_p, "r", encoding="utf-8").read()
+open(toml_p, "w", encoding="utf-8").write(toml_txt.replace("dep%2520one", "dep%20one"))
+PYEOF
+cp "$SCP_WORK/app_local/geisha.lock" "$SCP_WORK/app_local/geisha.lock.before"
+printf "# comment-only local override file\n" > "$SCP_WORK/app_local/geisha.local.toml"
+SCP_LOC_ADD_OUT="$(
+    cd "$SCP_WORK/app_local" &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" add "$SCP_WORK/dep one" --as spaced --version 0.1.0 >/dev/null &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" fetch >/dev/null &&
+    cmp -s geisha.lock.before geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/scp_app_local$EXE_EXT"
+)"
+assert_eq "pkg_legacy_local_toml_direct_add_spaced_stable" "101|202" "$SCP_LOC_ADD_OUT"
+
+cat > "$SCP_WORK/app_local/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use literal.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+SCP_LOC_UPSERT_OUT="$(
+    cd "$SCP_WORK/app_local" &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" add "$SCP_WORK/dep one" --as literal --version 0.1.0 >/dev/null &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" fetch >/dev/null &&
+    cmp -s geisha.lock.before geisha.lock &&
+    GEISHA_HOME="$SCP_WORK/ghome_loc" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+    "./build/scp_app_local$EXE_EXT"
+)"
+assert_eq "pkg_legacy_local_toml_upsert_replaces_alias_stable" "202" "$SCP_LOC_UPSERT_OUT"
+
+# POSIX filename with literal backslash (`dep\one`) must NOT be mangled by winSlashNorm
+if [ "$IS_WIN" = "0" ]; then
+    BS_WORK="$TMP_DIR/t39_posix_bs"
+    mkdir -p "$BS_WORK/dep\\one/src" "$BS_WORK/app/src"
+    cat > "$BS_WORK/dep\\one/geisha.toml" << 'EOF'
+name = "bs_dep"
+version = "0.1.0"
+EOF
+    cat > "$BS_WORK/dep\\one/src/bs_dep.gsa" << 'EOF'
+pub def val(): Int = 404
+EOF
+    git -C "$BS_WORK/dep\\one" init -q
+    git -C "$BS_WORK/dep\\one" config user.email "ci@geisha.test"
+    git -C "$BS_WORK/dep\\one" config user.name "Geisha CI"
+    git -C "$BS_WORK/dep\\one" add .
+    git -C "$BS_WORK/dep\\one" commit -q -m "bs A"
+    git -C "$BS_WORK/dep\\one" tag v0.1.0
+    BS_SHA_A="$(git -C "$BS_WORK/dep\\one" rev-parse HEAD)"
+
+    cat > "$BS_WORK/app/geisha.toml" << EOF
+name = "bs_app"
+version = "0.1.0"
+
+[deps]
+bs_dep = { git = 'file://$BS_WORK/dep\one', version = "0.1.0" }
+EOF
+    cat > "$BS_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use bs_dep.val
+def main(): Void = printLn(intToStr(val()))
+EOF
+    (cd "$BS_WORK/app" && GEISHA_HOME="$BS_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null)
+    "${GEISHA_TEST_PYTHON:-python3}" - "$BS_WORK/app" << 'PYEOF'
+import os, re, sys
+lock_p = os.path.join(sys.argv[1], "geisha.lock")
+lock_txt = open(lock_p, "r", encoding="utf-8").read()
+open(lock_p, "w", encoding="utf-8").write(re.sub(r'version\s*=\s*\d+', 'version = 1', lock_txt, count=1))
+PYEOF
+    cat > "$BS_WORK/dep\\one/src/bs_dep.gsa" << 'EOF'
+pub def val(): Int = 999
+EOF
+    git -C "$BS_WORK/dep\\one" add .
+    git -C "$BS_WORK/dep\\one" commit -q -m "bs B"
+    git -C "$BS_WORK/dep\\one" tag -f v0.1.0
+    rm -rf "$BS_WORK/ghome/cache" "$BS_WORK/app/build"
+    BS_OUT="$(
+        cd "$BS_WORK/app" &&
+        GEISHA_HOME="$BS_WORK/ghome" "$ABS_GEISHA_39" fetch >/dev/null &&
+        grep -q "$BS_SHA_A" geisha.lock &&
+        GEISHA_HOME="$BS_WORK/ghome" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null &&
+        "./build/bs_app$EXE_EXT"
+    )"
+    assert_eq "pkg_posix_backslash_repo_v1_lock_pinned" "404" "$BS_OUT"
+fi
 
 # Verify Win64 C ABI struct lowering & zero raw `_setjmp` in emitted LLVM IR
 cat > "$TMP_DIR/t39_win64_abi.gsa" << 'EOF'
@@ -4535,11 +5545,11 @@ assert_eq "win64_c_abi_and_blocking_capture" "1|1|1|1|1|1" "$("$TMP_DIR/t39_win6
 
 # Verify `gc_enter_blocking_capture()` preserves callee-saved register GC roots under `-O2` across a blocking FFI call + major GC
 cat > "$TMP_DIR/t39_blocking_roots.c" << 'EOF'
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "gc.h"
+#include "gs_os_thread.h"
 
 static void *collector_thread(void *arg)
 {
@@ -4556,9 +5566,9 @@ __attribute__((noinline)) static void blocking_ffi_clobber_below_sp(void)
     /* Overwrite 512 bytes of stack below caller SP_F while another thread runs major GC */
     volatile uint64_t scratch[64];
     for (int i = 0; i < 64; i++) scratch[i] = 0xDEADBEEFCAFEBABEULL;
-    pthread_t t;
-    if (pthread_create(&t, NULL, collector_thread, NULL) == 0) {
-        pthread_join(t, NULL);
+    gs_thread_t t;
+    if (gs_thread_create(&t, collector_thread, NULL, false) == 0) {
+        gs_thread_join(t);
     }
     (void)scratch[0];
 }
@@ -4599,8 +5609,8 @@ int main(void)
     return ok ? 0 : 1;
 }
 EOF
-"$CC" $HOST_CC_TARGET -O2 -Iruntime/include -pthread "$TMP_DIR/t39_blocking_roots.c" "$GEISHA_RUNTIME" $HOST_CC_LIBS -o "$TMP_DIR/t39_blocking_roots"
-assert_eq "blocking_capture_callee_saved_roots_O2" "1" "$("$TMP_DIR/t39_blocking_roots")"
+"$CC" $HOST_CC_TARGET -O2 -Iruntime/include $HOST_CC_PTHREAD "$TMP_DIR/t39_blocking_roots.c" "$GEISHA_RUNTIME" $HOST_CC_LIBS -o "$TMP_DIR/t39_blocking_roots$EXE_EXT"
+assert_eq "blocking_capture_callee_saved_roots_O2" "1" "$("$TMP_DIR/t39_blocking_roots$EXE_EXT")"
 
 # ---- Test: explicit WASM_LD (including path with spaces) passes unquoted to -fuse-ld= ----
 REAL_WASM_LD=""
@@ -4617,13 +5627,18 @@ for cand in \
     fi
 done
 if [ -n "$REAL_WASM_LD" ] && [ -f build/wasm_rt.o ]; then
-    mkdir -p "$TMP_DIR/ld with space"
-    ln -sf "$REAL_WASM_LD" "$TMP_DIR/ld with space/wasm-ld"
+    if [ "$IS_WIN" = "1" ]; then
+        WASM_LD_TEST_BIN="$(cygpath -m "$REAL_WASM_LD")"
+    else
+        mkdir -p "$TMP_DIR/ld with space"
+        ln -sf "$REAL_WASM_LD" "$TMP_DIR/ld with space/wasm-ld"
+        WASM_LD_TEST_BIN="$TMP_DIR/ld with space/wasm-ld"
+    fi
     cat > "$TMP_DIR/t40_wasm_ld.gsa" <<'EOF'
 pub def add(a: Int, b: Int): Int = a + b
 def main(): Void = ()
 EOF
-    WASM_LD="$TMP_DIR/ld with space/wasm-ld" "$GEISHA_BIN" --target wasm32 --runtime build/wasm_rt.o -o "$TMP_DIR/t40_wasm_ld.wasm" "$TMP_DIR/t40_wasm_ld.gsa"
+    WASM_LD="$WASM_LD_TEST_BIN" "$GEISHA_BIN" --target wasm32 --runtime build/wasm_rt.o -o "$TMP_DIR/t40_wasm_ld.wasm" "$TMP_DIR/t40_wasm_ld.gsa"
     if [ -s "$TMP_DIR/t40_wasm_ld.wasm" ]; then
         assert_eq "wasm_ld_env_with_spaces" "ok" "ok"
     else
@@ -4903,8 +5918,8 @@ if [ -z "$T43_DBG_FN" ] || ! printf "%s\n" "$T43_DBG_FN" | grep -q '@std\.math\.
     echo "FAIL [leaf_inline_disabled_in_debug]: expected -g debug build to preserve @std.math.abs call" >&2
     exit 1
 fi
-"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t43_leaf_simd" "$TMP_DIR/t43_leaf_simd.gsa"
-assert_eq "leaf_inline_native_run" "170.0|142.5|22" "$("$TMP_DIR/t43_leaf_simd")"
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t43_leaf_simd$EXE_EXT" "$TMP_DIR/t43_leaf_simd.gsa"
+assert_eq "leaf_inline_native_run" "170.0|142.5|22" "$("$TMP_DIR/t43_leaf_simd$EXE_EXT")"
 if command -v node >/dev/null 2>&1; then
     "$GEISHA_BIN" --target js -o "$TMP_DIR/t43_leaf_simd.mjs" "$TMP_DIR/t43_leaf_simd.gsa"
     assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
@@ -5267,5 +6282,163 @@ console.log(m.default() + "|" + m._gs_exp() + "|" + m.URL("ok") + "|" + m["featu
 ' "$TMP_DIR/t44_alias_exp.mjs")"
 assert_eq "wasmgc_esm_alias_exports" "101|202|url:ok|9" "$WGC_ALIAS_RES"
 fi
+
+# ---- Test 45: UTF-8 paths/argv/env, worker thread stack reservation & strict ownGroup signal check ----
+cat > "$TMP_DIR/t45_proc_wait.py" << 'PYEOF'
+import os, subprocess, sys, time
+
+mode = sys.argv[1]
+pid = int(sys.argv[2])
+timeout_s = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+deadline = time.monotonic() + timeout_s
+
+def is_exited_or_zombie(p: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        SYNCHRONIZE = 0x00100000
+        ERROR_INVALID_PARAMETER = 87
+        h = kernel32.OpenProcess(SYNCHRONIZE, False, p)
+        if not h:
+            return ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+        try:
+            rc = kernel32.WaitForSingleObject(h, 0)
+            return rc == 0
+        finally:
+            kernel32.CloseHandle(h)
+    else:
+        try:
+            os.kill(p, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(p)], capture_output=True, text=True)
+        st = out.stdout.strip()
+        return (not st) or st.startswith("Z")
+
+while time.monotonic() < deadline:
+    if is_exited_or_zombie(pid):
+        sys.exit(0)
+    time.sleep(0.05)
+
+sys.exit(1)
+PYEOF
+
+cat > "$TMP_DIR/t45_utf8_and_group.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.path.pathJoin
+use std.str.strTrim
+use sys.env.{argAt, getEnv}
+use sys.fs.{writeFile, readFile, fileExists, removeFile}
+use std.task.{sleepMs, spawn as spawnTask, await as awaitTask}
+use sys.proc.{
+    Stdio, Null, Signal, SigTerm, ExitStatus, Exited,
+    command, cmdStdio, cmdOwnGroup, spawn, run as procRun, childSignal, childWait
+}
+
+def b2s(b: Bool): String = if (b) "1" else "0"
+
+def deepRec(n: Int, acc: Cell Int): Int =
+    if (n <= 0) cellGet(acc)
+    else {
+        let r = deepRec(n - 1, acc);
+        cellSet(acc, cellGet(acc) + 1);
+        r + 1
+    }
+
+def waitFileText(path: String, maxTries: Int): Option String = {
+    let i = cellNew(0);
+    let res: Cell (Option String) = cellNew(None);
+    while (cellGet(i) < maxTries && match cellGet(res) { None -> true, Some(_) -> false }) {
+        if (fileExists(path)) {
+            match readFile(path) {
+                Ok(s) if (strLen(strTrim(s)) > 0) -> cellSet(res, Some(strTrim(s))),
+                _ -> (),
+            }
+        } else ();
+        if (match cellGet(res) { None -> true, Some(_) -> false }) {
+            sleepMs(50);
+            cellSet(i, cellGet(i) + 1)
+        } else ()
+    };
+    cellGet(res)
+}
+
+def runChecks(): Result String String = {
+    let dir = argAt(1);
+    let utf8Arg = argAt(2);
+    let waitHelper = argAt(3);
+    let envOk = match getEnv("GS_UTF8_TEST") {
+        Some(v) -> v == "你好Geisha",
+        None -> false,
+    };
+    let argOk = utf8Arg == "参数_λ";
+    let fp = pathJoin(dir, "测试_αβγ.txt");
+    writeFile(fp, "内容-UTF8")?;
+    let fsOk = fileExists(fp) && match readFile(fp) {
+        Ok(s) -> s == "内容-UTF8",
+        Err(_) -> false,
+    } && removeFile(fp) && !fileExists(fp);
+
+    // Worker thread stack reservation & on-demand growth test
+    let t = spawnTask(() -> {
+        let acc = cellNew(0);
+        deepRec(4000, acc)
+    });
+    let thrOk = awaitTask(t) == 4000;
+
+    // Leader spawns a sleeping grandchild that writes its PID to readyFile,
+    // waits for readyFile, writes leaderPidFile, and exits naturally with code 7.
+    // After confirming leader exited, childSignal MUST return Ok(()) and kill the
+    // surviving grandchild BEFORE childWait (not via childWait's KILL_ON_JOB_CLOSE)!
+    let pyBin = match getEnv("GEISHA_TEST_PYTHON") {
+        Some(p) if (strLen(p) > 0) -> p,
+        _ -> "python3",
+    };
+    let readyFile = pathJoin(dir, "gc_ready.pid");
+    let leaderFile = pathJoin(dir, "leader.pid");
+    let gcCode = "import os, sys, time; p = sys.argv[1]; t = p + '.tmp'; open(t, 'w').write(str(os.getpid())); os.replace(t, p); time.sleep(30)";
+    let leaderCode = "import os, subprocess, sys, time\nrf, lf, gc = sys.argv[1], sys.argv[2], sys.argv[3]\nsubprocess.Popen([sys.executable, '-c', gc, rf])\ndeadline = time.monotonic() + 5.0\n"
+        + "while not os.path.exists(rf) and time.monotonic() < deadline: time.sleep(0.02)\n"
+        + "lt = lf + '.tmp'\nopen(lt, 'w').write(str(os.getpid()))\nos.replace(lt, lf)\nsys.exit(7)";
+    let c = spawn(cmdOwnGroup(cmdStdio(command(pyBin, ["-c", leaderCode, readyFile, leaderFile, gcCode]), Null, Null, Null), true))?;
+
+    let gcPid = match waitFileText(readyFile, 100) { Some(s) -> s, None -> "" };
+    let ldrPid = match waitFileText(leaderFile, 100) { Some(s) -> s, None -> "" };
+
+    // 1) Confirm leader has already exited/zombie before calling childSignal
+    let ldrExited = if (strLen(ldrPid) > 0) {
+        let o = procRun(command(pyBin, [waitHelper, "leader", ldrPid, "5.0"]))?;
+        o.status == Exited(0)
+    } else false;
+
+    // 2) childSignal must return Ok(())
+    let sigOk = match childSignal(c, SigTerm) {
+        Ok(_) -> true,
+        Err(_) -> false,
+    };
+
+    // 3) BEFORE childWait(c), confirm grandchild actually exited from childSignal!
+    let gcKilledBeforeWait = if (strLen(gcPid) > 0) {
+        let o = procRun(command(pyBin, [waitHelper, "grandchild", gcPid, "5.0"]))?;
+        o.status == Exited(0)
+    } else false;
+
+    // 4) Finally childWait(c) must preserve leader's natural Exited(7)
+    let st = childWait(c)?;
+    let grpOk = ldrExited && sigOk && gcKilledBeforeWait && st == Exited(7);
+    Ok(b2s(envOk) + "|" + b2s(argOk) + "|" + b2s(fsOk) + "|" + b2s(thrOk) + "|" + b2s(grpOk))
+}
+
+def main(): Void = match runChecks() {
+    Ok(s) -> printLn(s),
+    Err(e) -> printLn("ERR:" + e),
+}
+EOF
+mkdir -p "$TMP_DIR/t45_work"
+"$GEISHA_BIN" -o "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_utf8_and_group.gsa"
+assert_eq "utf8_paths_argv_env_and_own_group_signal" "1|1|1|1|1" "$(GS_UTF8_TEST="你好Geisha" "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_work" "参数_λ" "$TMP_DIR/t45_proc_wait.py")"
 
 echo "All $PASS end-to-end test suites passed!"

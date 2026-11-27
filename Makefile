@@ -24,11 +24,12 @@ ifeq ($(OS),Windows_NT)
   HOST_OS      := windows
   HOST_ARCH    := x86_64
   HOST_ENV     :=
-  HOST_TARGET  :=
-  HOST_LIBS    := -lws2_32 -lbcrypt
+  HOST_TARGET  := -D_CRT_SECURE_NO_WARNINGS
+  HOST_LIBS    := -lws2_32 -lbcrypt -Wl,/STACK:16777216
   HOST_PTHREAD :=
   EXE_EXT      := .exe
   AR           ?= llvm-ar
+  PYTHON       ?= $(shell command -v python3 >/dev/null 2>&1 && echo python3 || echo python)
 else ifeq ($(UNAME_S),Darwin)
   HOST_OS      := darwin
   HOST_ARCH    := $(if $(filter arm64 aarch64,$(UNAME_M)),arm64,x86_64)
@@ -38,6 +39,7 @@ else ifeq ($(UNAME_S),Darwin)
   HOST_PTHREAD := -pthread
   EXE_EXT      :=
   AR           ?= ar
+  PYTHON       ?= python3
 else
   HOST_OS      := linux
   HOST_ARCH    := $(if $(filter aarch64 arm64,$(UNAME_M)),arm64,x86_64)
@@ -47,6 +49,7 @@ else
   HOST_PTHREAD := -pthread
   EXE_EXT      :=
   AR           ?= ar
+  PYTHON       ?= python3
 endif
 
 CFLAGS ?= $(HOST_TARGET) -O2 -Wall -Wextra -Iruntime/include
@@ -112,10 +115,10 @@ $(RUNTIME_IOS_SIM_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitma
 	ar rcs $(RUNTIME_IOS_SIM_LIB) $(BUILD_DIR)/iossim_base.o $(BUILD_DIR)/iossim_gs_sys.o $(BUILD_DIR)/iossim_gc_bitmap.o $(BUILD_DIR)/iossim_gs_conc.o
 
 stdlib-bundle:
-	python3 scripts/gen_stdlib.py
+	$(PYTHON) scripts/gen_stdlib.py
 
 check-docs:
-	python3 scripts/check_agent_docs.py
+	$(PYTHON) scripts/check_agent_docs.py
 
 stage0: $(BUILD_DIR)/geisha0$(EXE_EXT)
 
