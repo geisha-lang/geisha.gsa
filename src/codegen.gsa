@@ -1063,11 +1063,12 @@ def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
     else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
     else llvmSym(fnName)
 
-extern "realpath" def c_dbg_realpath(path: String, resolved: Ptr): Ptr
+// TODO(#12): switch to `gs_sys_realpath` once Windows runtime shim lands
+extern "realpath" def c_realpath(path: String, resolved: Ptr): Ptr
 extern "free" def c_dbg_free(p: Ptr): Void
 
 def resolveDbgCwd(): String = {
-    let p = c_dbg_realpath(".", ptrNull());
+    let p = c_realpath(".", ptrNull());
     if (ptrIsNull(p)) "."
     else {
         let s = ptrToString(p);

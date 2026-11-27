@@ -1114,19 +1114,20 @@ def emitStaticLibFromIr(
 ): Result Void String =
     emitStaticLibFromIrOpt(llText, outArchive, target, rtOverrideOpt, " -O2")
 
-def emitWasmFromIr(
+def emitWasmFromIrOpt(
     llText: String,
     outPath: String,
     compileOnly: Bool,
     tc: TargetCfg,
-    rtOverrideOpt: Option String
+    rtOverrideOpt: Option String,
+    optFlag: String
 ): Result Void String = {
     let wasmCc = resolveWasmCc();
     if (compileOnly) {
         let tmpLl = outPath + ".tmp.ll";
         writeFile(tmpLl, llText)?;
         let cmd =
-            shellQuote(wasmCc) + " --target=wasm32 -O2 -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib -x ir -c "
+            shellQuote(wasmCc) + " --target=wasm32" + optFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib -x ir -c "
             + shellQuote(tmpLl) + " -o " + shellQuote(outPath);
         let rc = shell(cmd);
         let _ = removeFile(tmpLl);
@@ -1138,7 +1139,7 @@ def emitWasmFromIr(
         writeFile(tmpLl, llText)?;
         let cmd =
             shellQuote(wasmCc)
-            + " --target=wasm32 -O2 -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
+            + " --target=wasm32" + optFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
             + resolveWasmLdFlag()
             + shellQuoteArgs(tc.tcCFlags)
             + " -x ir " + shellQuote(tmpLl) + " -x none " + shellQuote(wasmRt)
@@ -1152,6 +1153,15 @@ def emitWasmFromIr(
         else Err("LLVM wasm32 backend failed while linking '" + outPath + "' (ensure lld/wasm-ld is installed)")
     }
 }
+
+def emitWasmFromIr(
+    llText: String,
+    outPath: String,
+    compileOnly: Bool,
+    tc: TargetCfg,
+    rtOverrideOpt: Option String
+): Result Void String =
+    emitWasmFromIrOpt(llText, outPath, compileOnly, tc, rtOverrideOpt, " -O2")
 
 def generateDefaultMacosPlist(
     bundleId: String,
@@ -1410,12 +1420,12 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
         emitNativeObjFromIrOpt(llText, outObj, optFlag)
     },
     cbCompileWasm: (entryFile, rootSpec, extSpecs, tc, compOnly, outOpt, dumpCoreOpt, rtOpt) -> {
-        let llText = compileWithPkgSpecsToIr(
+        let llText = compileWithPkgSpecsToIrDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
-            true, tc.tcExports, false, None
+            true, tc.tcExports, false, None, debugInfo
         )?;
         let outWasm = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + (if (compOnly) ".o" else ".wasm") };
-        emitWasmFromIr(llText, outWasm, compOnly, tc, rtOpt)
+        emitWasmFromIrOpt(llText, outWasm, compOnly, tc, rtOpt, optFlag)
     },
     cbCompileAppleBundle: (target, entryFile, rootSpec, extSpecs, tc, ab, pkgName, pkgVersion, outOpt, dumpCoreOpt, rtOpt) -> {
         let noMainFlag = tc.tcOwnsMain || (target != "macos-app" && ab.abIsExtension);
@@ -1805,7 +1815,7 @@ def runDriver(): Result Int String = {
                         Some(p) -> p,
                         None -> pathStem(inputFile) + (if (opts.optCompileOnly) ".o" else ".wasm"),
                     };
-                    emitWasmFromIr(llText, outP, opts.optCompileOnly, plainTc, opts.optRuntime)?;
+                    emitWasmFromIrOpt(llText, outP, opts.optCompileOnly, plainTc, opts.optRuntime, optFlag)?;
                     Ok(0)
                 } else if (opts.optCompileOnly) {
                     let outObj = match opts.optOutPath {

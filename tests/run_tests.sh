@@ -3004,6 +3004,29 @@ else
     PASS=$((PASS + 1))
 fi
 
+# 38b. Verify single-file vs project-mode (`geisha build -g --target wasm32`) DWARF section parity
+WASM_DBG_PROJ="$TMP_DIR/t38_wasm_dbg"
+mkdir -p "$WASM_DBG_PROJ/src"
+cat > "$WASM_DBG_PROJ/geisha.toml" << 'EOF'
+name = "t38_wasm_dbg"
+version = "0.1.0"
+EOF
+cat > "$WASM_DBG_PROJ/src/main.gsa" << 'EOF'
+pub def addOne(x: Int): Int = x + 1
+def main(): Void = { let _ = addOne(41); () }
+EOF
+ABS_GEISHA_38="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+"$ABS_GEISHA_38" -g -c --target wasm32 -o "$TMP_DIR/t38_single.o" "$WASM_DBG_PROJ/src/main.gsa"
+(cd "$WASM_DBG_PROJ" && "$ABS_GEISHA_38" build -g -c --target wasm32 -o "$TMP_DIR/t38_proj.o")
+for wobj in "$TMP_DIR/t38_single.o" "$TMP_DIR/t38_proj.o"; do
+    if ! grep -aq "debug_info" "$wobj" || ! grep -aq "debug_line" "$wobj"; then
+        echo "FAIL [dwarf_wasm_parity]: missing .debug_info/.debug_line in $wobj" >&2
+        exit 1
+    fi
+done
+echo "PASS [dwarf_wasm_parity]: single-file and project-mode geisha build -g --target wasm32 both emit .debug_info/.debug_line"
+PASS=$((PASS + 1))
+
 # --- Test 37: `geisha bench` microbenchmarking framework & `std.bench` ---
 ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
 ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
