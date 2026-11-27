@@ -38,7 +38,6 @@ MODULES = [
     ("sys.time", "sys/time.gsa"),
     ("sys.net", "sys/net.gsa"),
     ("sys.ffi", "sys/ffi.gsa"),
-    ("sys.objc", "sys/objc.gsa"),
 ]
 
 

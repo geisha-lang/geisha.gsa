@@ -292,30 +292,31 @@ A type `T` is `Send` if:
 
 ---
 
-## 11. C FFI, Objective-C Interop & Compilation Targets
+## 11. C FFI & Compilation Targets
 
-### 11.1 `extern`, Indirect Function Pointers & Pure C ABI
+### 11.1 Unified `extern` C ABI Surface
 ```geisha
+// C import (no body) & typed indirect function pointer call
 extern "strlen" def c_strlen(s: Ptr): Int64
 extern ptr def call_imp(fn: Ptr, obj: Ptr, sel: Ptr): Ptr
 
-@cstruct
-pub data CGPoint { x: Float, y: Float }
+// C ABI value struct
+pub extern data CGPoint { x: Float, y: Float }
 
-@export("my_c_add")
-pub def myAdd(a: Int, b: Int): Int = a + b
+// Pure C ABI export (symmetric with import, distinguished by `= body`)
+pub extern "my_c_add" def myAdd(a: Int, b: Int): Int = a + b
 
-@ctor
-def registerRuntimeClasses(): Void = ()
+// Static constructor (`@llvm.global_ctors`)
+extern init def registerRuntimeClasses(): Void = ()
 ```
-- Multiple `extern` declarations may alias the same C symbol (such as `"objc_msgSend"`) with distinct non-variadic signatures.
+- Multiple `extern` imports may alias the same C symbol (such as `"objc_msgSend"`) with distinct non-variadic signatures.
 - `extern ptr [noalloc] def ...` invokes parameter 0 (`Ptr`) as a typed C function pointer.
-- `@export` / `@export("sym")` emits a pure C ABI symbol without a trailing closure-environment parameter, automatically wrapped in `gc_host_enter`/`gc_host_leave`.
+- `extern ["sym"] def ... = body` emits a pure C ABI symbol without a trailing closure-environment parameter, automatically wrapped in `gc_host_enter`/`gc_host_leave`.
 - `cFnPtr(fn)` obtains a C function pointer (`Ptr`) for an `extern` function or a top-level monomorphic Geisha function (synthesizing a C ABI callback trampoline).
-- `@cstruct` enforces C ABI value-struct layout & calling conventions (ARM64 HFA / SysV AMD64 / `sret` / `byval`) across FFI boundaries.
-- `@ctor` / `@ctor(priority)` registers a `() -> Void` static constructor in `@llvm.global_ctors`.
+- `extern data` enforces C ABI value-struct layout & calling conventions (ARM64 HFA / SysV AMD64 / `sret` / `byval`) across FFI boundaries.
+- `extern init[(priority)] def ...` registers a `() -> Void` static constructor in `@llvm.global_ctors`.
 - `ForeignPtr` parameters in `extern` calls can auto-borrow as `ScopedPtr` with compiler-inserted keep-alives.
-- `gcHandleNew`, `gcHandleGet`, and `gcHandleFree` pin GC-managed values across C/ObjC callbacks.
+- `gcHandleNew`, `gcHandleGet`, and `gcHandleFree` pin GC-managed values across C callbacks.
 
 ### 11.2 Targets
 - `native` (default): Host executable, object file (`-c`), or static/shared library (`--no-main`, `--export <fn>`, `--boot-sym <sym>`).

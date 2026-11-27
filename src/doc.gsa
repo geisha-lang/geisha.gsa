@@ -16,6 +16,7 @@ use ast.{
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct,
     Def, ModuleItem, ModDef, ModSub,
     typeToString, sortUniqueStrings
 }
@@ -163,8 +164,16 @@ def extractDocComment(src: String, startByte: Int): List String = {
     cellGet(docLines)
 }
 
+def formatDefExternPrefix(attrs: List DefAttr): String = match attrs {
+    Nil -> "",
+    Cons(AttrCStruct, _) -> "extern ",
+    Cons(AttrExport(Some(sym)), _) -> "extern \"" + sym + "\" ",
+    Cons(AttrExport(None), _) -> "extern ",
+    Cons(AttrCtor(_), _) -> "extern init ",
+}
+
 def formatDefSig(d: Def): String = {
-    let visPfx = if (isPublicVis(d.vis)) "pub " else "";
+    let visPfx = (if (isPublicVis(d.vis)) "pub " else "") + formatDefExternPrefix(d.attrs);
     match d.item {
         ItAlg(tparams, variants) -> {
             let tpStr = match tparams { Nil -> "", ts -> " " + strJoin(ts, " ") };
