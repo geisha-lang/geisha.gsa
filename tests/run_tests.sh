@@ -3027,6 +3027,311 @@ done
 echo "PASS [dwarf_wasm_parity]: single-file and project-mode geisha build -g --target wasm32 both emit .debug_info/.debug_line"
 PASS=$((PASS + 1))
 
+# 37. Incremental Multi-CGU Build, Content-Addressed `.o` Cache Hit/Invalidation, `c_sources` Cache & `--opt`/`--dev`/`--release`/`--single-cgu`
+INC_PROJ="$TMP_DIR/t37_inc_cgu"
+mkdir -p "$INC_PROJ/src" "$INC_PROJ/native" "$INC_PROJ/vendor"
+cat > "$INC_PROJ/geisha.toml" << 'EOF'
+name = "t37_inc_cgu"
+version = "0.1.0"
+
+[target.native]
+c_sources = ["native/helper.c"]
+c_flags = ["-isystem", "vendor"]
+EOF
+cat > "$INC_PROJ/vendor/sysval.h" << 'EOF'
+#define VENDOR_SYS_BONUS 0
+EOF
+cat > "$INC_PROJ/native/cost\$us.def" << 'EOF'
+0
+EOF
+cat > "$INC_PROJ/native/num.def" << 'EOF'
+100
+EOF
+cat > "$INC_PROJ/native/helper.c" << 'EOF'
+#include <stdint.h>
+#include <sysval.h>
+int32_t c_inc_bonus(void) {
+    int32_t a =
+#include "num.def"
+    ;
+    int32_t b =
+#include "cost$us.def"
+    ;
+    return a + b + VENDOR_SYS_BONUS;
+}
+EOF
+cat > "$INC_PROJ/src/types.gsa" << 'EOF'
+pub data Pair {
+    MkPair { a: Int, b: Int },
+}
+pub def pairSum(p: Pair): Int = p.a + p.b
+pub def pairDiff(p: Pair): Int = p.a - p.b
+pub def pairProd(p: Pair): Int = p.a * p.b
+pub def pairScale(p: Pair, k: Int): Pair = MkPair { a: p.a * k, b: p.b * k }
+pub def pairSwap(p: Pair): Pair = MkPair { a: p.b, b: p.a }
+EOF
+cat > "$INC_PROJ/src/mod_a.gsa" << 'EOF'
+use types.{Pair, MkPair, pairSum, pairScale}
+pub def a1(x: Int): Int = x + 1
+pub def a2(x: Int): Int = a1(x) + 2
+pub def a3(x: Int): Int = a2(x) + 3
+pub def a4(x: Int): Int = a3(x) + 4
+pub def a5(p: Pair): Int = pairSum(pairScale(p, 2)) + a4(0)
+EOF
+cat > "$INC_PROJ/src/mod_b.gsa" << 'EOF'
+use types.{Pair, MkPair, pairSum, pairDiff, pairProd, pairSwap}
+pub def b1(x: Int): Int = x + 10
+pub def b2(x: Int): Int = b1(x) + 20
+pub def b3(x: Int): Int = b2(x) + 30
+pub def b4(x: Int): Int = b3(x) + 40
+pub def b5(p: Pair): Int = pairSum(pairSwap(p)) + pairDiff(p) + pairProd(p) + b4(0)
+EOF
+cat > "$INC_PROJ/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use types.{Pair, MkPair}
+use mod_a.a5
+use mod_b.b5
+
+extern "c_inc_bonus" def cBonus(): Int
+
+pub def m1(x: Int): Int = x + 1
+pub def m2(x: Int): Int = m1(x) + 1
+pub def m3(x: Int): Int = m2(x) + 1
+
+def main(): Void = {
+    let p = MkPair { a: 5, b: 3 };
+    printLn(intToStr(a5(p) + b5(p) + cBonus() + m3(0)))
+}
+EOF
+ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+
+# 37a. Cold --dev (-O0) multi-CGU build
+T37_COLD_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_cold_dev_output" "254" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_COLD_LOG" | grep -q "cgu_hit=0 " || ! echo "$T37_COLD_LOG" | grep -q "native_miss=1 " || ! echo "$T37_COLD_LOG" | grep -q "opt=-O0"; then
+    echo "FAIL [inc_cgu_cold_stats]: unexpected stats: $T37_COLD_LOG" >&2
+    exit 1
+fi
+
+# 37b. Warm unchanged repeat build -> whole-project cache hit
+T37_WARM_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+if ! echo "$T37_WARM_LOG" | grep -q "project_hit=1"; then
+    echo "FAIL [inc_cgu_project_hit]: expected project_hit=1, got: $T37_WARM_LOG" >&2
+    exit 1
+fi
+
+# 37c. Edit single module body (mod_a.gsa) -> only 1 CGU misses, all others + native C .o hit cache
+cat > "$INC_PROJ/src/mod_a.gsa" << 'EOF'
+use types.{Pair, MkPair, pairSum, pairScale}
+pub def a1(x: Int): Int = x + 11
+pub def a2(x: Int): Int = a1(x) + 2
+pub def a3(x: Int): Int = a2(x) + 3
+pub def a4(x: Int): Int = a3(x) + 4
+pub def a5(p: Pair): Int = pairSum(pairScale(p, 2)) + a4(0)
+EOF
+T37_MODA_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_edit_mod_a_output" "264" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_MODA_LOG" | grep -q "cgu_miss=1 " || ! echo "$T37_MODA_LOG" | grep -q "native_hit=1 " || ! echo "$T37_MODA_LOG" | grep -q "native_miss=0 "; then
+    echo "FAIL [inc_cgu_edit_mod_a_stats]: expected cgu_miss=1 & native_hit=1, got: $T37_MODA_LOG" >&2
+    exit 1
+fi
+
+# 37d. Edit non-.h C `#include "num.def"`, `-isystem vendor/sysval.h`, & `cost$us.def` (`$$` in `.d`), plus no-.d wrapper fallback
+cat > "$INC_PROJ/native/num.def" << 'EOF'
+200
+EOF
+T37_C_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_edit_c_def_include_output" "364" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_C_LOG" | grep -q "cgu_miss=0 " || ! echo "$T37_C_LOG" | grep -q "native_miss=1 "; then
+    echo "FAIL [inc_cgu_edit_c_def_stats]: expected cgu_miss=0 & native_miss=1 on num.def edit, got: $T37_C_LOG" >&2
+    exit 1
+fi
+cat > "$INC_PROJ/vendor/sysval.h" << 'EOF'
+#define VENDOR_SYS_BONUS 5
+EOF
+T37_ISYS_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_edit_isystem_header_output" "369" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_ISYS_LOG" | grep -q "project_hit=1" || ! echo "$T37_ISYS_LOG" | grep -q "cgu_miss=0 " || ! echo "$T37_ISYS_LOG" | grep -q "native_miss=1 "; then
+    echo "FAIL [inc_cgu_edit_isystem_stats]: expected -isystem edit to invalidate native & project cache, got: $T37_ISYS_LOG" >&2
+    exit 1
+fi
+cat > "$INC_PROJ/native/cost\$us.def" << 'EOF'
+7
+EOF
+T37_DOLLAR_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_edit_dollar_def_output" "376" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_DOLLAR_LOG" | grep -q "project_hit=1" || ! echo "$T37_DOLLAR_LOG" | grep -q "cgu_miss=0 " || ! echo "$T37_DOLLAR_LOG" | grep -q "native_miss=1 "; then
+    echo "FAIL [inc_cgu_edit_dollar_def_stats]: expected cost\$us.def edit to invalidate native & project cache, got: $T37_DOLLAR_LOG" >&2
+    exit 1
+fi
+# Wrapper named `clang` that strips `-MD -MF <file>` (produces no `.d`) must never publish C .o or project cache
+mkdir -p "$INC_PROJ/fakebin"
+cat > "$INC_PROJ/fakebin/clang" << EOF
+#!/bin/sh
+out=""
+skip=0
+set -- "\$@"
+filtered=""
+for a in "\$@"; do
+    if [ "\$skip" = "1" ]; then skip=0; continue; fi
+    if [ "\$a" = "-MD" ] || [ "\$a" = "-MMD" ]; then continue; fi
+    if [ "\$a" = "-MF" ]; then skip=1; continue; fi
+    exec_args="\$exec_args \$(printf '%s' "\$a" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+done
+eval "exec $CC \$exec_args"
+EOF
+chmod +x "$INC_PROJ/fakebin/clang"
+(cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" >/dev/null)
+assert_eq "inc_cgu_nod_wrapper_build1" "376" "$("$INC_PROJ/build/t37_inc_cgu")"
+cat > "$INC_PROJ/native/num.def" << 'EOF'
+201
+EOF
+T37_NOD_LOG="$(cd "$INC_PROJ" && CC="$INC_PROJ/fakebin/clang" GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_nod_wrapper_build2" "377" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_NOD_LOG" | grep -q "project_hit=1" || ! echo "$T37_NOD_LOG" | grep -q "native_hit=0 "; then
+    echo "FAIL [inc_cgu_nod_wrapper_cache]: no-.d wrapper must skip C .o & project cache, got: $T37_NOD_LOG" >&2
+    exit 1
+fi
+# Reset vendor/dollar/num back so subsequent 37e arithmetic stays exact (200 + 0 + 0)
+cat > "$INC_PROJ/vendor/sysval.h" << 'EOF'
+#define VENDOR_SYS_BONUS 0
+EOF
+cat > "$INC_PROJ/native/cost\$us.def" << 'EOF'
+0
+EOF
+cat > "$INC_PROJ/native/num.def" << 'EOF'
+200
+EOF
+
+# 37e. Edit shared ADT layout in types.gsa -> dependent CGUs cleanly invalidate & recompile
+cat > "$INC_PROJ/src/types.gsa" << 'EOF'
+pub data Pair {
+    MkPair { a: Int, b: Int, c: Int },
+}
+pub def pairSum(p: Pair): Int = p.a + p.b + p.c
+pub def pairDiff(p: Pair): Int = p.a - p.b
+pub def pairProd(p: Pair): Int = p.a * p.b
+pub def pairScale(p: Pair, k: Int): Pair = MkPair { a: p.a * k, b: p.b * k, c: p.c * k }
+pub def pairSwap(p: Pair): Pair = MkPair { a: p.b, b: p.a, c: p.c }
+EOF
+cat > "$INC_PROJ/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use types.{Pair, MkPair}
+use mod_a.a5
+use mod_b.b5
+
+extern "c_inc_bonus" def cBonus(): Int
+
+pub def m1(x: Int): Int = x + 1
+pub def m2(x: Int): Int = m1(x) + 1
+pub def m3(x: Int): Int = m2(x) + 1
+
+def main(): Void = {
+    let p = MkPair { a: 5, b: 3, c: 10 };
+    printLn(intToStr(a5(p) + b5(p) + cBonus() + m3(0)))
+}
+EOF
+T37_TYPE_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_edit_type_layout_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_TYPE_LOG" | grep -q "cgu_miss=0 "; then
+    echo "FAIL [inc_cgu_edit_type_invalidation]: expected CGU invalidation on ADT layout change, got: $T37_TYPE_LOG" >&2
+    exit 1
+fi
+
+# 37f. --release (-O2), --dev -> --release -> --dev round-trip (must NOT false-hit stale O2 bin), --opt=1/3, --single-cgu, --opt=9/unknown-flag rejection, `geisha run --dev script.gsa`, and `geisha check`
+T37_REL_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --release --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_release_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_REL_LOG" | grep -q "opt=-O2"; then
+    echo "FAIL [inc_cgu_release_opt]: expected opt=-O2, got: $T37_REL_LOG" >&2
+    exit 1
+fi
+T37_RT_DEV_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_roundtrip_dev_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_RT_DEV_LOG" | grep -q "project_hit=1"; then
+    echo "FAIL [inc_cgu_roundtrip_dev_false_hit]: --dev after --release must not false-hit stale O2 binary, got: $T37_RT_DEV_LOG" >&2
+    exit 1
+fi
+if ! echo "$T37_RT_DEV_LOG" | grep -q "cgu_miss=0 " || ! echo "$T37_RT_DEV_LOG" | grep -q "opt=-O0"; then
+    echo "FAIL [inc_cgu_roundtrip_dev_relink]: expected cached -O0 CGU relink (cgu_miss=0 opt=-O0), got: $T37_RT_DEV_LOG" >&2
+    exit 1
+fi
+T37_RT_DEV2_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev --runtime "$ABS_RT_37" 2>&1)"
+if ! echo "$T37_RT_DEV2_LOG" | grep -q "project_hit=1"; then
+    echo "FAIL [inc_cgu_roundtrip_dev_warm]: expected project_hit=1 on consecutive --dev, got: $T37_RT_DEV2_LOG" >&2
+    exit 1
+fi
+T37_OPT3_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --opt=3 --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_opt3_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_OPT3_LOG" | grep -q "opt=-O3"; then
+    echo "FAIL [inc_cgu_opt3_stats]: expected opt=-O3, got: $T37_OPT3_LOG" >&2
+    exit 1
+fi
+T37_OPTS_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build -Os --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_opts_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_OPTS_LOG" | grep -q "opt=-Os"; then
+    echo "FAIL [inc_cgu_opts_stats]: expected opt=-Os, got: $T37_OPTS_LOG" >&2
+    exit 1
+fi
+T37_DBG_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev -g --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_debug_flag_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if echo "$T37_DBG_LOG" | grep -q "project_hit=1" || ! echo "$T37_DBG_LOG" | grep -q "cgu_hit=0 "; then
+    echo "FAIL [inc_cgu_debug_cache_sep]: -g must separate CGU/project cache keys from non-debug builds, got: $T37_DBG_LOG" >&2
+    exit 1
+fi
+if [ "$(uname -s)" = "Darwin" ]; then
+    T37_DSYM_DWARF="$INC_PROJ/build/t37_inc_cgu.dSYM/Contents/Resources/DWARF/t37_inc_cgu"
+    if [ ! -f "$T37_DSYM_DWARF" ]; then
+        echo "FAIL [inc_cgu_dsym_created]: expected $T37_DSYM_DWARF after build --dev -g" >&2
+        exit 1
+    fi
+    rm -f "$T37_DSYM_DWARF"
+    T37_DSYM_REBUILD="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev -g --runtime "$ABS_RT_37" 2>&1)"
+    if echo "$T37_DSYM_REBUILD" | grep -q "project_hit=1" || ! echo "$T37_DSYM_REBUILD" | grep -q "cgu_miss=0 "; then
+        echo "FAIL [inc_cgu_dsym_restore]: deleting .dSYM DWARF must bypass project_hit and relink with cgu_miss=0, got: $T37_DSYM_REBUILD" >&2
+        exit 1
+    fi
+    if [ ! -f "$T37_DSYM_DWARF" ]; then
+        echo "FAIL [inc_cgu_dsym_restored_file]: expected $T37_DSYM_DWARF to be restored" >&2
+        exit 1
+    fi
+    T37_DSYM_WARM="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev -g --runtime "$ABS_RT_37" 2>&1)"
+    if ! echo "$T37_DSYM_WARM" | grep -q "project_hit=1"; then
+        echo "FAIL [inc_cgu_dsym_warm]: expected project_hit=1 once .dSYM is present, got: $T37_DSYM_WARM" >&2
+        exit 1
+    fi
+fi
+if (cd "$INC_PROJ" && "$ABS_GEISHA_37" build --opt=9 --runtime "$ABS_RT_37" >/dev/null 2>&1); then
+    echo "FAIL [inc_cgu_bad_opt9]: --opt=9 should be rejected" >&2
+    exit 1
+fi
+if (cd "$INC_PROJ" && "$ABS_GEISHA_37" build --bogus-flag --runtime "$ABS_RT_37" >/dev/null 2>&1); then
+    echo "FAIL [inc_cgu_unknown_flag]: unknown --bogus-flag on build should be rejected" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t37_script.gsa" << 'EOF'
+def main(): Void = printLn("script-dev-ok")
+EOF
+T37_SCR_COLD="$(GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" run --dev --no-cache --runtime "$ABS_RT_37" "$TMP_DIR/t37_script.gsa" 2>&1)"
+if ! echo "$T37_SCR_COLD" | grep -q "script-dev-ok" || ! echo "$T37_SCR_COLD" | grep -q "script_hit=0 opt=-O0"; then
+    echo "FAIL [inc_cgu_run_dev_nocache]: expected script-dev-ok & script_hit=0 opt=-O0, got: $T37_SCR_COLD" >&2
+    exit 1
+fi
+T37_SCR_WARM="$(GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" run --dev --runtime "$ABS_RT_37" "$TMP_DIR/t37_script.gsa" 2>&1)"
+if ! echo "$T37_SCR_WARM" | grep -q "script-dev-ok" || ! echo "$T37_SCR_WARM" | grep -q "script_hit=1 opt=-O0"; then
+    echo "FAIL [inc_cgu_run_dev_warm]: expected script-dev-ok & script_hit=1 opt=-O0, got: $T37_SCR_WARM" >&2
+    exit 1
+fi
+T37_SCGU_LOG="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --single-cgu --no-cache --runtime "$ABS_RT_37" 2>&1)"
+assert_eq "inc_cgu_single_cgu_output" "394" "$("$INC_PROJ/build/t37_inc_cgu")"
+if ! echo "$T37_SCGU_LOG" | grep -q "cgu_total=1 "; then
+    echo "FAIL [inc_cgu_single_cgu_stats]: expected cgu_total=1, got: $T37_SCGU_LOG" >&2
+    exit 1
+fi
+(cd "$INC_PROJ" && "$ABS_GEISHA_37" check >/dev/null)
+echo "PASS [incremental_cgu_cache_and_opt]: multi-CGU parallel cache, single-module & C & ADT invalidation, --dev/--release round-trip, --opt=0..3/9, run --dev, & --single-cgu verified"
+PASS=$((PASS + 1))
+
 # --- Test 37: `geisha bench` microbenchmarking framework & `std.bench` ---
 ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
 ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"

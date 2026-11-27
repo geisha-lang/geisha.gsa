@@ -5,12 +5,12 @@ use std.list.{listRev, listLen}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
-use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strStartsWith}
+use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strIndexOfByte, strStartsWith}
 use diag.{diagGetFile, diagSpanLineCol}
 use ast.{
     Span, emptySpan, typeToString,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
-    Scheme, ScmMono, schemeBody,
+    Scheme, ScmMono, schemeBody, sortUniqueStrings,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
@@ -627,6 +627,22 @@ data ModEmitCtx {
         mcDbgLexFileIds: StrMap Int,
         mcDbgLocCache: StrMap Int,
         mcDbgTypeCache: StrMap Int,
+        mcMultiCgu: Bool,
+        mcIsBootCgu: Bool,
+        mcDefinedInCgu: StrMap Bool,
+        mcUsedFnSet: StrMap Bool,
+        mcUsedFnList: Cell (List (String, String)),
+        mcUsedGlobalSet: StrMap Bool,
+        mcUsedGlobalList: Cell (List String),
+        mcUsedExternSet: StrMap Bool,
+        mcUsedExternList: Cell (List String),
+    },
+}
+
+pub data CguIr {
+    MkCguIr {
+        cguName: String,
+        cguIr: String,
     },
 }
 
@@ -1071,14 +1087,28 @@ def shouldExportSymbol(mctx: ModEmitCtx, fnName: String): Bool =
         strMapContains(mctx.mcWasmExports, fnName)
     }
 
-def geishaFnSym(mctx: ModEmitCtx, fnName: String): String =
-    if (strMapContains(mctx.mcCExportSyms, fnName)) llvmSym("__gs_fn_" + fnName)
-    else llvmSym(fnName)
+def recordUsedGeishaFnSym(mctx: ModEmitCtx, fnName: String, symName: String): String = {
+    if (mctx.mcMultiCgu && !strMapContains(mctx.mcDefinedInCgu, symName) && !strMapContains(mctx.mcUsedFnSet, symName)) {
+        strMapInsert(mctx.mcUsedFnSet, symName, true);
+        cellSet(mctx.mcUsedFnList, Cons((fnName, symName), cellGet(mctx.mcUsedFnList)))
+    } else ();
+    llvmSym(symName)
+}
 
-def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
-    if (strMapContains(mctx.mcCExportSyms, fnName)) llvmSym("__gs_fn_" + fnName)
-    else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
-    else llvmSym(fnName)
+def geishaFnSym(mctx: ModEmitCtx, fnName: String): String = {
+    let rawSym =
+        if (strMapContains(mctx.mcCExportSyms, fnName)) "__gs_fn_" + fnName
+        else fnName;
+    recordUsedGeishaFnSym(mctx, fnName, rawSym)
+}
+
+def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String = {
+    let rawSym =
+        if (strMapContains(mctx.mcCExportSyms, fnName)) "__gs_fn_" + fnName
+        else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) "__gs_exp_" + fnName
+        else fnName;
+    recordUsedGeishaFnSym(mctx, fnName, rawSym)
+}
 
 extern "gs_sys_realpath" def c_realpath(path: String): Ptr
 extern "free" def c_dbg_free(p: Ptr): Void
@@ -1650,10 +1680,22 @@ def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = 
 // Lexical Symbol Table Lookup & Global String Pool
 // ============================================================================
 
-def lookupVarSlot(locals: List (String, VarSlot), globals: StrMap VarSlot, name: String): Option VarSlot =
+def lookupGlobalSlot(mctx: ModEmitCtx, name: String): Option VarSlot =
+    match strMapGet(mctx.mcGlobalSlots, name) {
+        Some(s) -> {
+            if (mctx.mcMultiCgu && !mctx.mcIsBootCgu && !strMapContains(mctx.mcUsedGlobalSet, name)) {
+                strMapInsert(mctx.mcUsedGlobalSet, name, true);
+                cellSet(mctx.mcUsedGlobalList, Cons(name, cellGet(mctx.mcUsedGlobalList)))
+            } else ();
+            Some(s)
+        },
+        None -> None,
+    }
+
+def lookupVarSlot(locals: List (String, VarSlot), mctx: ModEmitCtx, name: String): Option VarSlot =
     match lookupLocalSlot(locals, name) {
         Some(s) -> Some(s),
-        None -> strMapGet(globals, name),
+        None -> lookupGlobalSlot(mctx, name),
     }
 
 def lookupLocalSlot(locals: List (String, VarSlot), name: String): Option VarSlot = match locals {
@@ -2847,7 +2889,13 @@ def tryEmitIntrinsic(
     } else if (name == "cFnPtr") {
         match nthArgTerm(args, 0).tnode {
             TmLit(LitStr(targetName)) -> match strMapGet(mctx.mcExterns, targetName) {
-                Some(ed) -> Some(llvmSym(ed.extLink)),
+                Some(ed) -> {
+                    if (mctx.mcMultiCgu && !strMapContains(mctx.mcUsedExternSet, targetName)) {
+                        strMapInsert(mctx.mcUsedExternSet, targetName, true);
+                        cellSet(mctx.mcUsedExternList, Cons(targetName, cellGet(mctx.mcUsedExternList)))
+                    } else ();
+                    Some(llvmSym(ed.extLink))
+                },
                 None -> Some(ensureCCallbackTrampoline(mctx, targetName)),
             },
             _ -> Some("null"),
@@ -3704,12 +3752,12 @@ def genExpr(
     let exprRes = match tm.tnode {
         TmLit(lit) -> genLit(mctx, lit),
 
-        TmVar(vn) -> match lookupVarSlot(locals, mctx.mcGlobalSlots, vn) {
+        TmVar(vn) -> match lookupVarSlot(locals, mctx, vn) {
             Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
             None -> "0",
         },
 
-        TmGlobalVar(vn) -> match strMapGet(mctx.mcGlobalSlots, vn) {
+        TmGlobalVar(vn) -> match lookupGlobalSlot(mctx, vn) {
             Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
             None -> "0",
         },
@@ -3851,6 +3899,10 @@ def genExpr(
                 Some(intrinVal) -> intrinVal,
                 None -> match strMapGet(mctx.mcExterns, calleeName) {
                     Some(extDef) -> {
+                        if (mctx.mcMultiCgu && !strMapContains(mctx.mcUsedExternSet, calleeName)) {
+                            strMapInsert(mctx.mcUsedExternSet, calleeName, true);
+                            cellSet(mctx.mcUsedExternList, Cons(calleeName, cellGet(mctx.mcUsedExternList)))
+                        } else ();
                         let extParamTys0 = match extDef.extTy {
                             TyArr(_, ps, _) -> ps,
                             _ -> Nil,
@@ -4058,7 +4110,7 @@ def genExpr(
                     while (match cellGet(cf) { Nil -> false, _ -> true }) {
                         match cellGet(cf) {
                             Cons(fvName, r) -> {
-                                match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
+                                match lookupVarSlot(extLocals, mctx, fvName) {
                                     Some(s) -> {
                                         cellSet(fvLlvmRev, Cons(s.vsLlvmTy, cellGet(fvLlvmRev)));
                                         cellSet(fvGeishaRev, Cons(s.vsGeishaTy, cellGet(fvGeishaRev)))
@@ -4095,7 +4147,7 @@ def genExpr(
                         match cellGet(cf2) {
                             Cons(fvName, r) -> {
                                 let i = cellGet(idx);
-                                match lookupVarSlot(extLocals, mctx.mcGlobalSlots, fvName) {
+                                match lookupVarSlot(extLocals, mctx, fvName) {
                                     Some(vs) -> {
                                         let fvVal = emitLoad(fctx, vs.vsLlvmTy, vs.vsPtr);
                                         let fvSlot = emitStructFieldPtr(fctx, envStructTy, clsFvPtr, i);
@@ -4577,13 +4629,14 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
+    let privLinkage = if (mctx.mcMultiCgu) "hidden " else "internal ";
     let paramSigStr = strJoin(listRev(cellGet(paramSigPartsRev)), ", ");
     if (isCExported) {
-        let implHeader = "define internal " + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind";
+        let implHeader = "define " + privLinkage + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind";
         flushFunctionToBuf(out, implHeader, fctx)
     } else if (!mctx.mcIsWasm && isExp) {
         let implSym = llvmSym("__gs_exp_" + fd.fnName);
-        let implHeader = "define internal " + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind";
+        let implHeader = "define " + privLinkage + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind";
         flushFunctionToBuf(out, implHeader, fctx);
         // Emit thread-safe C/Swift host entry trampoline for exported native symbol
         bufPushStr(out, "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind {\nentry:\n");
@@ -4603,7 +4656,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
             bufPushStr(out, "  ret " + retLlvm + " %res\n}\n\n")
         }
     } else {
-        let linkage = if (isExp) "" else "internal ";
+        let linkage = if (isExp) "" else privLinkage;
         let exportAttr =
             if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
             else "";
@@ -5003,7 +5056,8 @@ def emitGlobalsInitOnceHelper(
     if (!curBlockHasTerm(bodyCtx)) emitTermLine(bodyCtx, "ret void") else ();
     flushFunctionToBuf(out, "define internal void @__gs_init_globals_body() nounwind", bodyCtx);
 
-    bufPushStr(out, "define internal void @__gs_init_globals_once() nounwind {\nentry:\n");
+    let onceLinkage = if (mctx.mcMultiCgu) "hidden " else "internal ";
+    bufPushStr(out, "define " + onceLinkage + "void @__gs_init_globals_once() nounwind {\nentry:\n");
     bufPushStr(out, "  %st = load atomic i32, ptr @__gs_globals_init_state acquire, align 4\n");
     bufPushStr(out, "  %done = icmp eq i32 %st, 2\n");
     bufPushStr(out, "  br i1 %done, label %ginit_ok, label %ginit_slow\n");
@@ -5318,6 +5372,15 @@ pub def emitProgramLlvmIrForTargetDebug(
         mcDbgLexFileIds: strMapNew(),
         mcDbgLocCache: strMapNew(),
         mcDbgTypeCache: strMapNew(),
+        mcMultiCgu: false,
+        mcIsBootCgu: true,
+        mcDefinedInCgu: strMapNew(),
+        mcUsedFnSet: strMapNew(),
+        mcUsedFnList: cellNew(Nil),
+        mcUsedGlobalSet: strMapNew(),
+        mcUsedGlobalList: cellNew(Nil),
+        mcUsedExternSet: strMapNew(),
+        mcUsedExternList: cellNew(Nil),
     };
 
     if (debugInfo) {
@@ -5473,3 +5536,591 @@ pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: Li
 
 pub def emitProgramLlvmIr(prog: CoreProgram): String =
     emitProgramLlvmIrTarget(prog, false, Nil)
+
+// ============================================================================
+// Multi-CGU (Codegen Unit) Partitioned LLVM IR Emission
+// ============================================================================
+
+def emitCguTlabHelpers(globalsBuf: StringBuf): Void = {
+    bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
+    bufPushStr(globalsBuf, "@__gs_tls_thread = external thread_local global ptr\n");
+    bufPushStr(globalsBuf, "declare i64 @llvm.cttz.i64(i64, i1 immarg) nounwind willreturn memory(none)\n");
+    bufPushStr(globalsBuf, "define internal noalias nonnull ptr @__gs_tlab_alloc_atomic(i64 %totalBytes, i64 %hdrConst, i64 %byteSz) nounwind {\n");
+    bufPushStr(globalsBuf, "entry:\n");
+    bufPushStr(globalsBuf, "  %self = load ptr, ptr @__gs_tls_thread, align 8\n");
+    bufPushStr(globalsBuf, "  %has_thr = icmp ne ptr %self, null\n");
+    bufPushStr(globalsBuf, "  br i1 %has_thr, label %thr, label %slow\n");
+    bufPushStr(globalsBuf, "thr:\n");
+    bufPushStr(globalsBuf, "  %nurs = load ptr, ptr %self, align 8\n");
+    bufPushStr(globalsBuf, "  %has_nurs = icmp ne ptr %nurs, null\n");
+    bufPushStr(globalsBuf, "  br i1 %has_nurs, label %nurs_ok, label %slow\n");
+    bufPushStr(globalsBuf, "nurs_ok:\n");
+    bufPushStr(globalsBuf, "  %cur = load ptr, ptr %nurs, align 8\n");
+    bufPushStr(globalsBuf, "  %end_p = getelementptr inbounds i8, ptr %nurs, i64 8\n");
+    bufPushStr(globalsBuf, "  %end = load ptr, ptr %end_p, align 8\n");
+    bufPushStr(globalsBuf, "  %next = getelementptr inbounds i8, ptr %cur, i64 %totalBytes\n");
+    bufPushStr(globalsBuf, "  %fits = icmp ule ptr %next, %end\n");
+    bufPushStr(globalsBuf, "  br i1 %fits, label %fast, label %slow\n");
+    bufPushStr(globalsBuf, "fast:\n");
+    bufPushStr(globalsBuf, "  store ptr %next, ptr %nurs, align 8\n");
+    bufPushStr(globalsBuf, "  %cur_i = ptrtoint ptr %cur to i64\n");
+    bufPushStr(globalsBuf, "  %off = and i64 %cur_i, 262143\n");
+    bufPushStr(globalsBuf, "  %slot = lshr i64 %off, 3\n");
+    bufPushStr(globalsBuf, "  %widx = lshr i64 %slot, 6\n");
+    bufPushStr(globalsBuf, "  %bpos = and i64 %slot, 63\n");
+    bufPushStr(globalsBuf, "  %bit = shl i64 1, %bpos\n");
+    bufPushStr(globalsBuf, "  %bmap_base = getelementptr inbounds i8, ptr %nurs, i64 24\n");
+    bufPushStr(globalsBuf, "  %bmap_p = getelementptr inbounds i64, ptr %bmap_base, i64 %widx\n");
+    bufPushStr(globalsBuf, "  %old_w = load i64, ptr %bmap_p, align 8\n");
+    bufPushStr(globalsBuf, "  %new_w = or i64 %old_w, %bit\n");
+    bufPushStr(globalsBuf, "  store i64 %new_w, ptr %bmap_p, align 8\n");
+    bufPushStr(globalsBuf, "  store i64 %hdrConst, ptr %cur, align 8\n");
+    bufPushStr(globalsBuf, "  %res = getelementptr inbounds i8, ptr %cur, i64 8\n");
+    bufPushStr(globalsBuf, "  ret ptr %res\n");
+    bufPushStr(globalsBuf, "slow:\n");
+    bufPushStr(globalsBuf, "  %sres = tail call ptr @gc_alloc_atomic_uninit(i64 %byteSz) cold\n");
+    bufPushStr(globalsBuf, "  ret ptr %sres\n");
+    bufPushStr(globalsBuf, "}\n");
+    bufPushStr(globalsBuf, "define internal noalias nonnull ptr @__gs_tlab_alloc_masked(i64 %totalBytes, i64 %hdrConst, i64 %byteSz, i64 %ptrMask) nounwind {\n");
+    bufPushStr(globalsBuf, "entry:\n");
+    bufPushStr(globalsBuf, "  %self = load ptr, ptr @__gs_tls_thread, align 8\n");
+    bufPushStr(globalsBuf, "  %has_thr = icmp ne ptr %self, null\n");
+    bufPushStr(globalsBuf, "  br i1 %has_thr, label %thr, label %slow\n");
+    bufPushStr(globalsBuf, "thr:\n");
+    bufPushStr(globalsBuf, "  %nurs = load ptr, ptr %self, align 8\n");
+    bufPushStr(globalsBuf, "  %has_nurs = icmp ne ptr %nurs, null\n");
+    bufPushStr(globalsBuf, "  br i1 %has_nurs, label %nurs_ok, label %slow\n");
+    bufPushStr(globalsBuf, "nurs_ok:\n");
+    bufPushStr(globalsBuf, "  %cur = load ptr, ptr %nurs, align 8\n");
+    bufPushStr(globalsBuf, "  %end_p = getelementptr inbounds i8, ptr %nurs, i64 8\n");
+    bufPushStr(globalsBuf, "  %end = load ptr, ptr %end_p, align 8\n");
+    bufPushStr(globalsBuf, "  %next = getelementptr inbounds i8, ptr %cur, i64 %totalBytes\n");
+    bufPushStr(globalsBuf, "  %fits = icmp ule ptr %next, %end\n");
+    bufPushStr(globalsBuf, "  br i1 %fits, label %fast, label %slow\n");
+    bufPushStr(globalsBuf, "fast:\n");
+    bufPushStr(globalsBuf, "  store ptr %next, ptr %nurs, align 8\n");
+    bufPushStr(globalsBuf, "  %cur_i = ptrtoint ptr %cur to i64\n");
+    bufPushStr(globalsBuf, "  %off = and i64 %cur_i, 262143\n");
+    bufPushStr(globalsBuf, "  %slot = lshr i64 %off, 3\n");
+    bufPushStr(globalsBuf, "  %widx = lshr i64 %slot, 6\n");
+    bufPushStr(globalsBuf, "  %bpos = and i64 %slot, 63\n");
+    bufPushStr(globalsBuf, "  %bit = shl i64 1, %bpos\n");
+    bufPushStr(globalsBuf, "  %bmap_base = getelementptr inbounds i8, ptr %nurs, i64 24\n");
+    bufPushStr(globalsBuf, "  %bmap_p = getelementptr inbounds i64, ptr %bmap_base, i64 %widx\n");
+    bufPushStr(globalsBuf, "  %old_w = load i64, ptr %bmap_p, align 8\n");
+    bufPushStr(globalsBuf, "  %new_w = or i64 %old_w, %bit\n");
+    bufPushStr(globalsBuf, "  store i64 %new_w, ptr %bmap_p, align 8\n");
+    bufPushStr(globalsBuf, "  store i64 %hdrConst, ptr %cur, align 8\n");
+    bufPushStr(globalsBuf, "  %res = getelementptr inbounds i8, ptr %cur, i64 8\n");
+    bufPushStr(globalsBuf, "  %m0 = icmp ne i64 %ptrMask, 0\n");
+    bufPushStr(globalsBuf, "  br i1 %m0, label %zloop, label %zdone\n");
+    bufPushStr(globalsBuf, "zloop:\n");
+    bufPushStr(globalsBuf, "  %m = phi i64 [ %ptrMask, %fast ], [ %mnext, %zloop ]\n");
+    bufPushStr(globalsBuf, "  %tz = call i64 @llvm.cttz.i64(i64 %m, i1 true)\n");
+    bufPushStr(globalsBuf, "  %zp = getelementptr inbounds i64, ptr %res, i64 %tz\n");
+    bufPushStr(globalsBuf, "  store i64 0, ptr %zp, align 8\n");
+    bufPushStr(globalsBuf, "  %m1 = sub i64 %m, 1\n");
+    bufPushStr(globalsBuf, "  %mnext = and i64 %m, %m1\n");
+    bufPushStr(globalsBuf, "  %more = icmp ne i64 %mnext, 0\n");
+    bufPushStr(globalsBuf, "  br i1 %more, label %zloop, label %zdone\n");
+    bufPushStr(globalsBuf, "zdone:\n");
+    bufPushStr(globalsBuf, "  ret ptr %res\n");
+    bufPushStr(globalsBuf, "slow:\n");
+    bufPushStr(globalsBuf, "  %sres = tail call ptr @gc_alloc_masked(i64 %byteSz, i64 %ptrMask) cold\n");
+    bufPushStr(globalsBuf, "  ret ptr %sres\n");
+    bufPushStr(globalsBuf, "}\n")
+}
+
+def stripInnerClosureMarker(s: String): String = {
+    let needle = ".inner.closure.";
+    let n = strLen(s);
+    let m = strLen(needle);
+    let i = cellNew(0);
+    let found = cellNew(-1);
+    while (cellGet(i) + m <= n && cellGet(found) < 0) {
+        let pos = cellGet(i);
+        if (strByteAt(s, pos) == 46 && strSlice(s, pos, pos + m) == needle) {
+            cellSet(found, pos)
+        } else ();
+        cellSet(i, pos + 1)
+    };
+    if (cellGet(found) > 0) strSlice(s, 0, cellGet(found)) else s
+}
+
+def lastDotIndex(s: String): Int = {
+    let i = cellNew(strLen(s) - 1);
+    let res = cellNew(-1);
+    while (cellGet(i) >= 0 && cellGet(res) < 0) {
+        let pos = cellGet(i);
+        if (strByteAt(s, pos) == 46) cellSet(res, pos) else ();
+        cellSet(i, pos - 1)
+    };
+    cellGet(res)
+}
+
+def cguBucketForFn(fnName: String): String =
+    match strIndexOfByte(fnName, 36, 0) {
+        Some(_) -> "__mono",
+        None ->
+            if (strStartsWith(fnName, "__inst_")) "__inst"
+            else {
+                let base = stripInnerClosureMarker(fnName);
+                let dot = lastDotIndex(base);
+                if (dot > 0) strSlice(base, 0, dot) else "__root"
+            },
+    }
+
+def emitGeishaFnDeclare(out: StringBuf, fd: FunDef, symName: String): Void = {
+    let funTy = schemeBody(fd.fnScm);
+    let retGeishaTy = match funTy {
+        TyArr(_, _, r) -> r,
+        _ -> TyVoid,
+    };
+    let retLlvm = getFnRetLlvmType(retGeishaTy);
+    let paramTysRev = cellNew(Nil);
+    let cp = cellNew(fd.fnParams);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(vd, r) -> {
+                cellSet(paramTysRev, Cons(getValLlvmType(schemeBody(vd.vscm)), cellGet(paramTysRev)));
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(paramTysRev, Cons("ptr", cellGet(paramTysRev)));
+    let sigStr = strJoin(listRev(cellGet(paramTysRev)), ", ");
+    bufPushStr(out, "declare " + retLlvm + " " + llvmSym(symName) + "(" + sigStr + ") nounwind\n")
+}
+
+def emitSingleCguUnit(
+    cguName: String,
+    isBoot: Bool,
+    cguFnNames: List String,
+    prog: CoreProgram,
+    globalSlots: StrMap VarSlot,
+    multiLinks: StrMap Bool,
+    exportMap: StrMap Bool,
+    hasExplicit: Bool,
+    cExportSymMap: StrMap Bool,
+    isWasm: Bool,
+    targetArch: String,
+    targetOs: String,
+    noMain: Bool,
+    bootSymOpt: Option String,
+    useGlobalsOnce: Bool,
+    debugInfo: Bool,
+    dbgCwd: String
+): CguIr = {
+    let definedInCgu: StrMap Bool = strMapNew();
+    let cd = cellNew(cguFnNames);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) {
+            Cons(fnm, r) -> {
+                let isCExp = strMapContains(cExportSymMap, fnm);
+                if (isCExp) {
+                    strMapInsert(definedInCgu, "__gs_fn_" + fnm, true)
+                } else {
+                    let isExp =
+                        if (isWasm) {
+                            if (hasExplicit) strMapContains(exportMap, fnm)
+                            else isDefaultWasmExport(fnm)
+                        } else strMapContains(exportMap, fnm);
+                    if (!isWasm && isExp) {
+                        strMapInsert(definedInCgu, "__gs_exp_" + fnm, true);
+                        strMapInsert(definedInCgu, fnm, true)
+                    } else {
+                        strMapInsert(definedInCgu, fnm, true)
+                    }
+                };
+                cellSet(cd, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let mctx = MkModEmitCtx {
+        mcStrCnt: cellNew(0),
+        mcStrDecls: bufNew(),
+        mcStrPool: strMapNew(),
+        mcConstPool: strMapNew(),
+        mcConstCnt: cellNew(0),
+        mcSynthFns: bufNew(),
+        mcSynthSet: strMapNew(),
+        mcGlobalSlots: globalSlots,
+        mcFns: prog.coreFns,
+        mcExterns: prog.coreExterns,
+        mcMultiExternLinks: multiLinks,
+        mcAdtReg: prog.coreAdtReg,
+        mcEscape: prog.coreEscape,
+        mcIsWasm: isWasm,
+        mcTargetArch: targetArch,
+        mcTargetOs: targetOs,
+        mcPtrSize: if (isWasm) 4 else 8,
+        mcWasmExports: exportMap,
+        mcHasExplicitExports: hasExplicit,
+        mcCExportSyms: cExportSymMap,
+        mcUseGlobalsOnce: useGlobalsOnce,
+        mcDebug: debugInfo,
+        mcDbgCwd: dbgCwd,
+        mcDbgNextId: cellNew(0),
+        mcDbgDecls: bufNew(),
+        mcDbgCuId: cellNew(-1),
+        mcDbgSubTyId: cellNew(-1),
+        mcDbgFileIds: strMapNew(),
+        mcDbgLexFileIds: strMapNew(),
+        mcDbgLocCache: strMapNew(),
+        mcDbgTypeCache: strMapNew(),
+        mcMultiCgu: true,
+        mcIsBootCgu: isBoot,
+        mcDefinedInCgu: definedInCgu,
+        mcUsedFnSet: strMapNew(),
+        mcUsedFnList: cellNew(Nil),
+        mcUsedGlobalSet: strMapNew(),
+        mcUsedGlobalList: cellNew(Nil),
+        mcUsedExternSet: strMapNew(),
+        mcUsedExternList: cellNew(Nil),
+    };
+
+    if (debugInfo) {
+        let primaryFileId = cellNew(1);
+        let found = cellNew(false);
+        if (isBoot) {
+            match strMapGet(prog.coreFns, "main") {
+                Some(mfd) if (mfd.fnSpan.fileId > 0) -> {
+                    cellSet(primaryFileId, mfd.fnSpan.fileId);
+                    cellSet(found, true)
+                },
+                _ -> (),
+            }
+        } else {
+            let cfn = cellNew(cguFnNames);
+            while (!cellGet(found) && match cellGet(cfn) { Nil -> false, _ -> true }) {
+                match cellGet(cfn) {
+                    Cons(nm, r) -> {
+                        match strMapGet(prog.coreFns, nm) {
+                            Some(fd) if (fd.fnSpan.fileId > 0) -> {
+                                cellSet(primaryFileId, fd.fnSpan.fileId);
+                                cellSet(found, true)
+                            },
+                            _ -> (),
+                        };
+                        cellSet(cfn, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        };
+        dbgInitModule(mctx, cellGet(primaryFileId))
+    } else ();
+
+    let fnsBuf = bufNew();
+    if (isBoot) {
+        if (useGlobalsOnce) {
+            emitGlobalsInitOnceHelper(fnsBuf, mctx, prog.coreGlobals)
+        } else ();
+        if (isWasm) {
+            emitWasmInitFunction(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals)
+        } else if (noMain) {
+            emitNativeCustomBootFunctions(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals, bootSymOpt, useGlobalsOnce)
+        } else {
+            match strMapGet(prog.coreFns, "main") {
+                Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals, useGlobalsOnce),
+                None -> (),
+            }
+        };
+        let cce = cellNew(prog.coreCExports);
+        while (match cellGet(cce) { Nil -> false, _ -> true }) {
+            match cellGet(cce) {
+                Cons((fnm, cSym), r) -> {
+                    match strMapGet(prog.coreFns, fnm) {
+                        Some(fd) -> emitCAbiTrampoline(fnsBuf, mctx, fd, cSym, true),
+                        None -> (),
+                    };
+                    cellSet(cce, r)
+                },
+                Nil -> (),
+            }
+        };
+        emitGlobalCtors(fnsBuf, mctx, prog.coreCtors, useGlobalsOnce)
+    } else {
+        let cf = cellNew(cguFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnm, r) -> {
+                    match strMapGet(prog.coreFns, fnm) {
+                        Some(fd) -> emitTopLevelFunction(fnsBuf, mctx, fd),
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
+    let globalsBuf = bufNew();
+    bufPushStr(globalsBuf, "; ModuleID = 'geisha_cgu_" + cguName + "'\n");
+    bufPushStr(globalsBuf, "source_filename = \"geisha_cgu_" + cguName + "\"\n");
+    if (isWasm) {
+        bufPushStr(globalsBuf, "target datalayout = \"e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20\"\n");
+        bufPushStr(globalsBuf, "target triple = \"wasm32-unknown-unknown\"\n\n")
+    } else {
+        bufPushByte(globalsBuf, 10)
+    };
+
+    if (isBoot) {
+        bufPushStr(globalsBuf, "@__gs_argc = hidden global i32 0\n");
+        bufPushStr(globalsBuf, "@__gs_argv = hidden global ptr null\n");
+        if (useGlobalsOnce) {
+            bufPushStr(globalsBuf, "@__gs_globals_init_state = internal global i32 0\n")
+        } else ()
+    } else {
+        bufPushStr(globalsBuf, "@__gs_argc = external hidden global i32\n");
+        bufPushStr(globalsBuf, "@__gs_argv = external hidden global ptr\n");
+        if (useGlobalsOnce) {
+            bufPushStr(globalsBuf, "declare void @__gs_init_globals_once() nounwind\n")
+        } else ()
+    };
+    if (!isWasm) {
+        emitCguTlabHelpers(globalsBuf)
+    } else ();
+
+    if (isBoot) {
+        let cg = cellNew(prog.coreGlobals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, r) -> {
+                    match strMapGet(globalSlots, g.gvName) {
+                        Some(slot) ->
+                            bufPushStr(globalsBuf, slot.vsPtr + " = hidden global " + slot.vsLlvmTy + " " + llvmZeroValue(slot.vsLlvmTy) + "\n"),
+                        None -> (),
+                    };
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
+        }
+    } else {
+        let usedGlobals = sortUniqueStrings(cellGet(mctx.mcUsedGlobalList));
+        let cg = cellNew(usedGlobals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(gname, r) -> {
+                    match strMapGet(globalSlots, gname) {
+                        Some(slot) ->
+                            bufPushStr(globalsBuf, slot.vsPtr + " = external hidden global " + slot.vsLlvmTy + "\n"),
+                        None -> (),
+                    };
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    bufPushByte(globalsBuf, 10);
+
+    let out = bufNew();
+    bufPushBuf(out, globalsBuf);
+    let declaredSyms: StrMap Bool = strMapNew();
+    emitRuntimeDeclares(out, declaredSyms, prog.coreFns, isWasm);
+    let usedExternNames = sortUniqueStrings(cellGet(mctx.mcUsedExternList));
+    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, usedExternNames, multiLinks, targetArch, targetOs, if (isWasm) 4 else 8);
+
+    // Emit external Geisha function declarations referenced by this CGU (sorted deterministically)
+    let symToFn: StrMap String = strMapNew();
+    let symNamesRev = cellNew(Nil);
+    let cu = cellNew(cellGet(mctx.mcUsedFnList));
+    while (match cellGet(cu) { Nil -> false, _ -> true }) {
+        match cellGet(cu) {
+            Cons((fnName, symName), r) -> {
+                if (!strMapContains(symToFn, symName) && !strMapContains(declaredSyms, symName)) {
+                    strMapInsert(symToFn, symName, fnName);
+                    cellSet(symNamesRev, Cons(symName, cellGet(symNamesRev)))
+                } else ();
+                cellSet(cu, r)
+            },
+            Nil -> (),
+        }
+    };
+    let sortedUsedSyms = sortUniqueStrings(cellGet(symNamesRev));
+    let cs = cellNew(sortedUsedSyms);
+    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+        match cellGet(cs) {
+            Cons(symName, r) -> {
+                match strMapGet(symToFn, symName) {
+                    Some(fnName) -> match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> emitGeishaFnDeclare(out, fd, symName),
+                        None -> (),
+                    },
+                    None -> (),
+                };
+                cellSet(cs, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(out, 10);
+
+    if (bufLen(mctx.mcStrDecls) > 0) {
+        bufPushBuf(out, mctx.mcStrDecls);
+        bufPushByte(out, 10)
+    } else ();
+    if (bufLen(mctx.mcSynthFns) > 0) {
+        bufPushBuf(out, mctx.mcSynthFns)
+    } else ();
+    bufPushBuf(out, fnsBuf);
+    if (debugInfo) {
+        bufPushStr(out, "declare void @llvm.dbg.declare(metadata, metadata, metadata) nounwind readnone speculatable willreturn\n\n");
+        let dwVerId = dbgAllocId(mctx);
+        let diVerId = dbgAllocId(mctx);
+        dbgEmitNode(mctx, dwVerId, "!{i32 7, !\"Dwarf Version\", i32 4}");
+        dbgEmitNode(mctx, diVerId, "!{i32 2, !\"Debug Info Version\", i32 3}");
+        bufPushStr(out, "!llvm.dbg.cu = !{!" + intToStr(cellGet(mctx.mcDbgCuId)) + "}\n");
+        bufPushStr(out, "!llvm.module.flags = !{!" + intToStr(dwVerId) + ", !" + intToStr(diVerId) + "}\n\n");
+        bufPushBuf(out, mctx.mcDbgDecls)
+    } else ();
+    MkCguIr { cguName: cguName, cguIr: bufToString(out) }
+}
+
+pub def emitProgramLlvmIrCgusForTargetDebug(
+    prog: CoreProgram,
+    isWasm: Bool,
+    targetArch: String,
+    targetOs: String,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String,
+    debugInfo: Bool
+): List CguIr = {
+    if (listLen(prog.coreFnNames) <= 16) {
+        [MkCguIr {
+            cguName: "all",
+            cguIr: emitProgramLlvmIrForTargetDebug(prog, isWasm, targetArch, targetOs, exports, noMain, bootSymOpt, debugInfo),
+        }]
+    } else {
+        cellSet(gActiveAdtReg, prog.coreAdtReg);
+        cellSet(gActiveEscape, Some(prog.coreEscape));
+        cellSet(gActivePtrSize, if (isWasm) 4 else 8);
+        cellSet(gUnboxMemo, strMapNew());
+
+        // Partition non-main functions into deterministic module buckets
+        let bucketFnsRev: StrMap (List String) = strMapNew();
+        let bucketNamesRev = cellNew(Nil);
+        let cf = cellNew(prog.coreFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnm, r) -> {
+                    if (fnm != "main") {
+                        let b = cguBucketForFn(fnm);
+                        match strMapGet(bucketFnsRev, b) {
+                            Some(xs) -> strMapInsert(bucketFnsRev, b, Cons(fnm, xs)),
+                            None -> {
+                                strMapInsert(bucketFnsRev, b, [fnm]);
+                                cellSet(bucketNamesRev, Cons(b, cellGet(bucketNamesRev)))
+                            },
+                        }
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        let sortedBuckets = sortUniqueStrings(cellGet(bucketNamesRev));
+        if (listLen(sortedBuckets) <= 1) {
+            [MkCguIr {
+                cguName: "all",
+                cguIr: emitProgramLlvmIrForTargetDebug(prog, isWasm, targetArch, targetOs, exports, noMain, bootSymOpt, debugInfo),
+            }]
+        } else {
+            let exportMap: StrMap Bool = strMapNew();
+            let hasExplicit = match exports { Nil -> false, _ -> true };
+            let ce = cellNew(exports);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(en, r) -> {
+                        strMapInsert(exportMap, en, true);
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let globalSlots: StrMap VarSlot = strMapNew();
+            let cg = cellNew(prog.coreGlobals);
+            while (match cellGet(cg) { Nil -> false, _ -> true }) {
+                match cellGet(cg) {
+                    Cons(g, r) -> {
+                        let gSym = llvmSym("__gval_" + g.gvName);
+                        let valLlvm = getValLlvmType(g.gvTy);
+                        strMapInsert(globalSlots, g.gvName, MkVarSlot {
+                            vsPtr: gSym,
+                            vsLlvmTy: valLlvm,
+                            vsGeishaTy: g.gvTy,
+                        });
+                        cellSet(cg, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let multiLinks = computeMultiExternLinks(prog.coreExterns, prog.coreExternNames);
+            let cExportSymMap: StrMap Bool = strMapNew();
+            let ccem = cellNew(prog.coreCExports);
+            while (match cellGet(ccem) { Nil -> false, _ -> true }) {
+                match cellGet(ccem) {
+                    Cons((_, cSym), r) -> {
+                        strMapInsert(cExportSymMap, cSym, true);
+                        cellSet(ccem, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let hasGlobals = match prog.coreGlobals { Nil -> false, _ -> true };
+            let useGlobalsOnce = !isWasm && hasGlobals;
+            let dbgCwd = if (debugInfo) resolveDbgCwd() else ".";
+
+            let outCgusRev = cellNew(Nil);
+            let cb = cellNew(sortedBuckets);
+            while (match cellGet(cb) { Nil -> false, _ -> true }) {
+                match cellGet(cb) {
+                    Cons(bName, r) -> {
+                        let fnsInBucket = match strMapGet(bucketFnsRev, bName) {
+                            Some(xs) -> listRev(xs),
+                            None -> Nil,
+                        };
+                        let cgu = emitSingleCguUnit(
+                            bName, false, fnsInBucket, prog, globalSlots, multiLinks,
+                            exportMap, hasExplicit, cExportSymMap,
+                            isWasm, targetArch, targetOs, noMain, bootSymOpt, useGlobalsOnce, debugInfo, dbgCwd
+                        );
+                        cellSet(outCgusRev, Cons(cgu, cellGet(outCgusRev)));
+                        cellSet(cb, r)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let bootCgu = emitSingleCguUnit(
+                "__boot", true, Nil, prog, globalSlots, multiLinks,
+                exportMap, hasExplicit, cExportSymMap,
+                isWasm, targetArch, targetOs, noMain, bootSymOpt, useGlobalsOnce, debugInfo, dbgCwd
+            );
+            cellSet(outCgusRev, Cons(bootCgu, cellGet(outCgusRev)));
+            listRev(cellGet(outCgusRev))
+        }
+    }
+}
+
+pub def emitProgramLlvmIrCgusForArch(
+    prog: CoreProgram,
+    isWasm: Bool,
+    targetArch: String,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): List CguIr =
+    emitProgramLlvmIrCgusForTargetDebug(
+        prog, isWasm, targetArch, if (isWasm) "wasm" else "posix", exports, noMain, bootSymOpt, false
+    )
