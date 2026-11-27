@@ -4765,6 +4765,7 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
         bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind !dbg !" + intToStr(trampSp) + " {\nentry:\n");
         bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
         bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
+        bufPushStr(out, "  call void @gs_sys_normalize_args(ptr @__gs_argc, ptr @__gs_argv)\n");
         bufPushStr(out, "  %anchor = alloca i64, align 8\n");
         bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
         bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
@@ -4775,6 +4776,7 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
         bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind {\nentry:\n");
         bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
         bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
+        bufPushStr(out, "  call void @gs_sys_normalize_args(ptr @__gs_argc, ptr @__gs_argv)\n");
         bufPushStr(out, "  %anchor = alloca i64, align 8\n");
         bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
         bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
@@ -4848,6 +4850,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("putChar", "declare void @putChar(i8, ptr) nounwind")
     ] else [
         ("gc_init_with_stack", "declare void @gc_init_with_stack(i64, ptr) nounwind"),
+        ("gs_sys_normalize_args", "declare void @gs_sys_normalize_args(ptr, ptr) nounwind"),
         ("gc_enable_generational", "declare void @gc_enable_generational() nounwind"),
         ("gc_register_root", "declare void @gc_register_root(ptr) nounwind"),
         ("gc_run_globals_init_once", "declare void @gc_run_globals_init_once(ptr, ptr) nounwind"),

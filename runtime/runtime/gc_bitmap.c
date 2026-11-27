@@ -10,17 +10,98 @@
 
 #include "../include/gc_bitmap.h"
 #include "../include/gs_conc.h"
+#include "../include/gs_os_thread.h"
 
-#include <pthread.h>
-#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#else
 #include <sys/mman.h>
-
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
 #endif
+#endif
+
+static inline void *gc_vm_alloc_pages(size_t size)
+{
+#if defined(_WIN32)
+    return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    return (p == MAP_FAILED) ? NULL : p;
+#endif
+}
+
+static inline void gc_vm_free_pages(void *ptr, size_t size)
+{
+#if defined(_WIN32)
+    (void)size;
+    if (ptr != NULL) VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+    if (ptr != NULL) munmap(ptr, size);
+#endif
+}
+
+static inline void *gc_vm_alloc_aligned(size_t size, size_t align, void **raw_out)
+{
+#if defined(_WIN32)
+    void *raw = VirtualAlloc(NULL, size * 2u, MEM_RESERVE, PAGE_NOACCESS);
+    if (raw == NULL) return NULL;
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t aligned = (raw_addr + align - 1u) & ~(uintptr_t)(align - 1u);
+    if (VirtualAlloc((void *)aligned, size, MEM_COMMIT, PAGE_READWRITE) == NULL) {
+        VirtualFree(raw, 0, MEM_RELEASE);
+        return NULL;
+    }
+    *raw_out = raw;
+    return (void *)aligned;
+#else
+    void *raw = mmap(NULL, size * 2u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (raw == MAP_FAILED) return NULL;
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t aligned = (raw_addr + align - 1u) & ~(uintptr_t)(align - 1u);
+    size_t lead = aligned - raw_addr;
+    size_t tail = (raw_addr + size * 2u) - (aligned + size);
+    if (lead > 0) munmap(raw, lead);
+    if (tail > 0) munmap((void *)(aligned + size), tail);
+    *raw_out = (void *)aligned;
+    return (void *)aligned;
+#endif
+}
+
+static inline void gc_vm_free_aligned(void *aligned, void *raw_base, size_t size)
+{
+#if defined(_WIN32)
+    (void)aligned;
+    (void)size;
+    if (raw_base != NULL) VirtualFree(raw_base, 0, MEM_RELEASE);
+#else
+    (void)raw_base;
+    if (aligned != NULL) munmap(aligned, size);
+#endif
+}
+
+static void *gs_aligned_alloc64(size_t n)
+{
+#if defined(_WIN32)
+    return _aligned_malloc(n, 64u);
+#else
+    void *raw = NULL;
+    if (posix_memalign(&raw, 64u, n) != 0) return NULL;
+    return raw;
+#endif
+}
+
+static void gs_aligned_free(void *p)
+{
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 
 #if defined(__clang__)
 #define GC_NO_SANITIZE_STACK __attribute__((no_sanitize("address", "thread"), noinline))
@@ -76,7 +157,7 @@ static const uint16_t _class_slot_sizes[GC_NUM_CLASSES] = {
 static uint8_t _words_to_class[513];
 /* Precomputed 32-bit reciprocal multipliers for O(1) division: slot_idx = (off * mul) >> 32 */
 static uint32_t _class_inv_mul[GC_NUM_CLASSES];
-static pthread_once_t _tables_once = PTHREAD_ONCE_INIT;
+static gs_once_t _tables_once = GS_ONCE_INIT;
 
 typedef struct gc_nursery_t {
     uintptr_t cur;
@@ -88,6 +169,7 @@ typedef struct gc_nursery_t {
     bool owned;
     struct gc_nursery_t *next;
     struct gc_nursery_t *prev;
+    void *raw_base;
 } gc_nursery_t;
 
 typedef struct gc_thread_t {
@@ -116,16 +198,16 @@ _Static_assert(offsetof(gc_nursery_t, cur) == 0, "inline TLAB assumes cur at off
 _Static_assert(offsetof(gc_nursery_t, end) == 8, "inline TLAB assumes end at offset 8 of gc_nursery_t");
 _Static_assert(offsetof(gc_nursery_t, alloc_bits) == 24, "inline TLAB assumes alloc_bits at offset 24 of gc_nursery_t");
 
-static pthread_mutex_t _gc_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t _stw_park_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t _stw_resume_cv = PTHREAD_COND_INITIALIZER;
+static gs_mutex_t _gc_mu = GS_MUTEX_INIT;
+static gs_cond_t _stw_park_cv = GS_COND_INIT;
+static gs_cond_t _stw_resume_cv = GS_COND_INIT;
 static bool _stw_in_progress = false;
 
 _Thread_local gc_thread_t *__gs_tls_thread = NULL;
 #define _tls_thread __gs_tls_thread
 static gc_thread_t *_threads_head = NULL;
-static pthread_key_t _host_thr_key;
-static pthread_once_t _host_key_once = PTHREAD_ONCE_INIT;
+static gs_tls_key_t _host_thr_key;
+static gs_once_t _host_key_once = GS_ONCE_INIT;
 
 /* Non-moving 256 KB aligned bump-pointer nurseries + O(1) hash table */
 static gc_nursery_t *_nurseries_head = NULL;
@@ -177,7 +259,7 @@ static void drain_large_cache_locked(void)
         _large_cache_buckets[b] = NULL;
         while (p != NULL) {
             void *next = *(void **)p;
-            munmap(p, msz);
+            gc_vm_free_pages(p, msz);
             p = next;
         }
     }
@@ -208,11 +290,11 @@ static void gc_drain_cleanups_unlocked(void)
     if (__builtin_expect(__atomic_load_n(&_cleanup_pending_head, __ATOMIC_ACQUIRE) == NULL, 1)) {
         return;
     }
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     gc_cleanup_entry_t *list = _cleanup_pending_head;
     _cleanup_pending_head = NULL;
     _cleanup_pending_tail = NULL;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 
     while (list != NULL) {
         gc_cleanup_entry_t *next = list->next;
@@ -241,9 +323,9 @@ static size_t _init_threshold_bytes = MIN_GC_THRESHOLD_BYTES;
 static bool _gc_heap_inited = false;
 static bool _thresholds_custom = false;
 
-static pthread_mutex_t _ginit_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t _ginit_cv = PTHREAD_COND_INITIALIZER;
-static pthread_t _ginit_owner;
+static gs_mutex_t _ginit_mu = GS_MUTEX_INIT;
+static gs_cond_t _ginit_cv = GS_COND_INIT;
+static gs_thread_id_t _ginit_owner;
 
 static void **_global_roots[MAX_GLOBAL_ROOTS];
 static size_t _global_roots_count = 0;
@@ -292,7 +374,7 @@ static void init_size_tables_once(void)
 
 static inline void init_size_tables(void)
 {
-    pthread_once(&_tables_once, init_size_tables_once);
+    gs_once_run(&_tables_once, init_size_tables_once);
 }
 
 static inline size_t fast_slot_index(size_t off, uint8_t cls)
@@ -338,7 +420,9 @@ static inline gc_page_t *page_list_pop(gc_page_t **head)
 
 static inline void release_page_memory(void *addr, size_t len)
 {
-#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
+#if defined(_WIN32)
+    VirtualAlloc(addr, len, MEM_RESET, PAGE_READWRITE);
+#elif defined(__APPLE__) && defined(MADV_FREE_REUSABLE)
     madvise(addr, len, MADV_FREE_REUSABLE);
 #elif defined(__APPLE__) && defined(MADV_FREE)
     madvise(addr, len, MADV_FREE);
@@ -441,7 +525,7 @@ static void reclaim_empty_chunks_locked(size_t keep_min_chunks)
             }
             *pp = ch->next;
             chunk_table_remove_locked(ch);
-            munmap((void *)ch->base, GC_CHUNK_SIZE);
+            gc_vm_free_aligned((void *)ch->base, ch->raw_base, GC_CHUNK_SIZE);
         } else {
             pp = &ch->next;
         }
@@ -533,21 +617,18 @@ static inline gc_nursery_t *find_nursery(uintptr_t addr)
 
 static gc_nursery_t *alloc_nursery_locked(void)
 {
-    void *raw = mmap(NULL, GC_NURSERY_SIZE * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (raw == MAP_FAILED) return NULL;
-    uintptr_t raw_addr = (uintptr_t)raw;
-    uintptr_t aligned = (raw_addr + GC_NURSERY_SIZE - 1) & ~(uintptr_t)(GC_NURSERY_SIZE - 1);
-    size_t lead = aligned - raw_addr;
-    size_t tail = (raw_addr + GC_NURSERY_SIZE * 2) - (aligned + GC_NURSERY_SIZE);
-    if (lead > 0) munmap(raw, lead);
-    if (tail > 0) munmap((void *)(aligned + GC_NURSERY_SIZE), tail);
+    void *raw_base = NULL;
+    void *aligned_ptr = gc_vm_alloc_aligned(GC_NURSERY_SIZE, GC_NURSERY_SIZE, &raw_base);
+    if (aligned_ptr == NULL) return NULL;
+    uintptr_t aligned = (uintptr_t)aligned_ptr;
 
     gc_nursery_t *n = (gc_nursery_t *)calloc(1, sizeof(gc_nursery_t));
     if (n == NULL) {
-        munmap((void *)aligned, GC_NURSERY_SIZE);
+        gc_vm_free_aligned(aligned_ptr, raw_base, GC_NURSERY_SIZE);
         return NULL;
     }
     n->base = aligned;
+    n->raw_base = raw_base;
     n->cur = aligned;
     n->end = aligned + GC_NURSERY_SIZE;
     n->live_count = 0;
@@ -579,19 +660,16 @@ static inline gc_chunk_t *find_chunk(uintptr_t addr)
 
 static bool alloc_chunk_locked(void)
 {
-    void *raw = mmap(NULL, GC_CHUNK_SIZE * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (raw == MAP_FAILED) {
+    void *raw_base = NULL;
+    void *aligned_ptr = gc_vm_alloc_aligned(GC_CHUNK_SIZE, GC_CHUNK_SIZE, &raw_base);
+    if (aligned_ptr == NULL) {
         return false;
     }
-    uintptr_t raw_addr = (uintptr_t)raw;
-    uintptr_t aligned = (raw_addr + GC_CHUNK_SIZE - 1) & ~(uintptr_t)(GC_CHUNK_SIZE - 1);
-    size_t lead = aligned - raw_addr;
-    size_t tail = (raw_addr + GC_CHUNK_SIZE * 2) - (aligned + GC_CHUNK_SIZE);
-    if (lead > 0) munmap(raw, lead);
-    if (tail > 0) munmap((void *)(aligned + GC_CHUNK_SIZE), tail);
+    uintptr_t aligned = (uintptr_t)aligned_ptr;
 
     gc_chunk_t *chunk = (gc_chunk_t *)aligned;
     chunk->base = aligned;
+    chunk->raw_base = raw_base;
     size_t meta_bytes = sizeof(gc_chunk_t);
     size_t first_page = (meta_bytes + GC_PAGE_SIZE - 1) >> GC_PAGE_SHIFT;
     chunk->first_data_page = first_page;
@@ -751,60 +829,60 @@ static void retire_thread_local_pages_locked(gc_thread_t *t)
 
 void gc_enable_generational(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     __atomic_store_n(&_generational_enabled, true, __ATOMIC_RELEASE);
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 size_t gc_collection_count(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t c = _minor_collections + _major_collections;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return c;
 }
 
 size_t gc_minor_collection_count(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t c = _minor_collections;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return c;
 }
 
 size_t gc_major_collection_count(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t c = _major_collections;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return c;
 }
 
 size_t gc_heap_live_bytes(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t b = _last_live_bytes;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return b;
 }
 
 void gc_register_root(void **slot)
 {
     if (slot == NULL) return;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     for (size_t i = 0; i < _global_roots_count; i++) {
         if (_global_roots[i] == slot) {
-            pthread_mutex_unlock(&_gc_mu);
+            gs_mutex_unlock(&_gc_mu);
             return;
         }
     }
     if (_global_roots_count >= MAX_GLOBAL_ROOTS) {
-        pthread_mutex_unlock(&_gc_mu);
+        gs_mutex_unlock(&_gc_mu);
         fprintf(stderr, "GC fatal: MAX_GLOBAL_ROOTS (%u) exceeded\n", (unsigned)MAX_GLOBAL_ROOTS);
         abort();
     }
     _global_roots[_global_roots_count++] = slot;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_run_globals_init_once(int32_t *state, void (*init_fn)(void))
@@ -814,44 +892,44 @@ void gc_run_globals_init_once(int32_t *state, void (*init_fn)(void))
         return;
     }
 
-    pthread_mutex_lock(&_ginit_mu);
+    gs_mutex_lock(&_ginit_mu);
     int32_t cur = __atomic_load_n(state, __ATOMIC_RELAXED);
     if (cur == 2) {
-        pthread_mutex_unlock(&_ginit_mu);
+        gs_mutex_unlock(&_ginit_mu);
         return;
     }
-    pthread_t self = pthread_self();
+    gs_thread_id_t self = gs_thread_self_id();
     if (cur == 1) {
-        if (pthread_equal(_ginit_owner, self)) {
+        if (gs_thread_id_equal(_ginit_owner, self)) {
             /* Re-entrant entry on the initializing thread */
-            pthread_mutex_unlock(&_ginit_mu);
+            gs_mutex_unlock(&_ginit_mu);
             return;
         }
-        pthread_mutex_unlock(&_ginit_mu);
+        gs_mutex_unlock(&_ginit_mu);
 
         /* Cooperate with STW GC while waiting for the initializing thread to finish */
         jmp_buf regs;
-        _setjmp(regs);
+        GS_SAVE_REGS(regs);
         gc_enter_blocking(&regs);
-        pthread_mutex_lock(&_ginit_mu);
+        gs_mutex_lock(&_ginit_mu);
         while (__atomic_load_n(state, __ATOMIC_RELAXED) == 1) {
-            pthread_cond_wait(&_ginit_cv, &_ginit_mu);
+            gs_cond_wait(&_ginit_cv, &_ginit_mu);
         }
-        pthread_mutex_unlock(&_ginit_mu);
+        gs_mutex_unlock(&_ginit_mu);
         gc_leave_blocking();
         return;
     }
 
     __atomic_store_n(state, 1, __ATOMIC_RELAXED);
     _ginit_owner = self;
-    pthread_mutex_unlock(&_ginit_mu);
+    gs_mutex_unlock(&_ginit_mu);
 
     init_fn();
 
-    pthread_mutex_lock(&_ginit_mu);
+    gs_mutex_lock(&_ginit_mu);
     __atomic_store_n(state, 2, __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&_ginit_cv);
-    pthread_mutex_unlock(&_ginit_mu);
+    gs_cond_broadcast(&_ginit_cv);
+    gs_mutex_unlock(&_ginit_mu);
 }
 
 static void compute_default_thresholds(size_t init_size_words, size_t *minor_out, size_t *major_out)
@@ -885,9 +963,9 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
     size_t minor_b = 0, major_b = 0;
     compute_default_thresholds(init_size_words, &minor_b, &major_b);
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
-        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        gs_cond_wait(&_stw_resume_cv, &_gc_mu);
     }
 
     if (!_gc_heap_inited) {
@@ -898,7 +976,7 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
         }
         if (_chunks_head == NULL) {
             if (!alloc_chunk_locked()) {
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
                 fprintf(stderr, "GC initial chunk allocation failed\n");
                 abort();
             }
@@ -919,7 +997,7 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
     if (_tls_thread == NULL) {
         gc_thread_t *main_thr = (gc_thread_t *)calloc(1, sizeof(gc_thread_t));
         if (main_thr == NULL) {
-            pthread_mutex_unlock(&_gc_mu);
+            gs_mutex_unlock(&_gc_mu);
             abort();
         }
         main_thr->root_start = (uintptr_t)stack_anchor;
@@ -930,7 +1008,7 @@ void gc_init_with_stack(size_t init_size_words, void *stack_anchor)
         _tls_thread->root_start = (uintptr_t)stack_anchor;
         __atomic_store_n(&_tls_thread->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_init(size_t init_size_words)
@@ -952,13 +1030,13 @@ void gc_thread_attach(void *stack_anchor)
     thr->root_start = (uintptr_t)stack_anchor;
     __atomic_store_n(&thr->state, THR_RUNNING, __ATOMIC_RELEASE);
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
-        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        gs_cond_wait(&_stw_resume_cv, &_gc_mu);
     }
     link_thread_locked(thr);
     _tls_thread = thr;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_thread_detach(void)
@@ -967,7 +1045,7 @@ void gc_thread_detach(void)
     if (thr == NULL) {
         return;
     }
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     if (thr->nursery != NULL) {
         thr->nursery->owned = false;
         thr->nursery = NULL;
@@ -988,9 +1066,9 @@ void gc_thread_detach(void)
     }
     unlink_thread_locked(thr);
     if (_stw_in_progress && all_threads_parked_locked()) {
-        pthread_cond_signal(&_stw_park_cv);
+        gs_cond_signal(&_stw_park_cv);
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     _tls_thread = NULL;
     free(thr->remset);
     free(thr);
@@ -1007,23 +1085,23 @@ __attribute__((noinline)) void gc_safepoint_slow(void)
     }
 
     jmp_buf regs;
-    _setjmp(regs);
+    GS_SAVE_REGS(regs);
     uintptr_t sp_here = current_stack_sp();
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     if (_stw_in_progress) {
         memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
         self->safepoint_sp = sp_here;
         __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
         if (all_threads_parked_locked()) {
-            pthread_cond_signal(&_stw_park_cv);
+            gs_cond_signal(&_stw_park_cv);
         }
         while (_stw_in_progress) {
-            pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+            gs_cond_wait(&_stw_resume_cv, &_gc_mu);
         }
         __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 /* Lock-free fast path for entering C FFI / blocking syscalls */
@@ -1040,11 +1118,11 @@ void gc_enter_blocking(void *jmp_buf_on_stack)
     self->safepoint_sp = sp_here;
     __atomic_store_n(&self->state, THR_BLOCKED, __ATOMIC_SEQ_CST);
     if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
-        pthread_mutex_lock(&_gc_mu);
+        gs_mutex_lock(&_gc_mu);
         if (_stw_in_progress && all_threads_parked_locked()) {
-            pthread_cond_signal(&_stw_park_cv);
+            gs_cond_signal(&_stw_park_cv);
         }
-        pthread_mutex_unlock(&_gc_mu);
+        gs_mutex_unlock(&_gc_mu);
     }
 }
 
@@ -1067,11 +1145,11 @@ __attribute__((used)) void __gs_enter_blocking_regs(
     self->safepoint_sp = caller_sp;
     __atomic_store_n(&self->state, THR_BLOCKED, __ATOMIC_SEQ_CST);
     if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
-        pthread_mutex_lock(&_gc_mu);
+        gs_mutex_lock(&_gc_mu);
         if (_stw_in_progress && all_threads_parked_locked()) {
-            pthread_cond_signal(&_stw_park_cv);
+            gs_cond_signal(&_stw_park_cv);
         }
-        pthread_mutex_unlock(&_gc_mu);
+        gs_mutex_unlock(&_gc_mu);
     }
 }
 
@@ -1155,7 +1233,7 @@ __attribute__((naked, noinline)) void gc_enter_blocking_capture(void)
 __attribute__((noinline)) void gc_enter_blocking_capture(void)
 {
     jmp_buf regs;
-    _setjmp(regs);
+    GS_SAVE_REGS(regs);
     gc_enter_blocking(&regs);
 }
 #endif
@@ -1169,18 +1247,18 @@ void gc_leave_blocking(void)
     }
     __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
-        pthread_mutex_lock(&_gc_mu);
+        gs_mutex_lock(&_gc_mu);
         if (_stw_in_progress) {
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
             if (all_threads_parked_locked()) {
-                pthread_cond_signal(&_stw_park_cv);
+                gs_cond_signal(&_stw_park_cv);
             }
             while (_stw_in_progress) {
-                pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+                gs_cond_wait(&_stw_resume_cv, &_gc_mu);
             }
             __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
         }
-        pthread_mutex_unlock(&_gc_mu);
+        gs_mutex_unlock(&_gc_mu);
     }
 }
 
@@ -1209,7 +1287,7 @@ void gc_write_barrier(void *container_ptr)
 
     /* Slow path (entered at most once per old-gen object per Minor GC): verify heap membership under `_gc_mu` */
     bool valid_old_heap = false;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     gc_nursery_t *nurs = find_nursery(addr);
     if (nurs != NULL) {
         uintptr_t hdr_addr = addr - Header_size;
@@ -1234,7 +1312,7 @@ void gc_write_barrier(void *container_ptr)
             valid_old_heap = (lo != NULL && lo->marked);
         }
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 
     if (!valid_old_heap) {
         return;
@@ -1313,7 +1391,7 @@ static gc_page_t *acquire_page_for_class_locked(size_t cls, gc_thread_t *self, j
     if (_bytes_alloc_since_gc >= _gc_threshold_bytes) {
         if (self != NULL) {
             if (!*regs_saved) {
-                _setjmp(*regs);
+                GS_SAVE_REGS(*regs);
                 *regs_saved = true;
             }
             memcpy(&self->safepoint_regs, regs, sizeof(jmp_buf));
@@ -1341,7 +1419,7 @@ static gc_page_t *acquire_page_for_class_locked(size_t cls, gc_thread_t *self, j
             /* Last resort: force major GC and retry */
             if (self != NULL) {
                 if (!*regs_saved) {
-                    _setjmp(*regs);
+                    GS_SAVE_REGS(*regs);
                     *regs_saved = true;
                 }
                 memcpy(&self->safepoint_regs, regs, sizeof(jmp_buf));
@@ -1383,26 +1461,26 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
     size_t hdr_offset = (sizeof(gc_large_t) + Header_size + 15u) & ~(size_t)15u;
     size_t map_size = (hdr_offset + payload_words * WORD_SIZE + GC_PAGE_SIZE - 1) & ~(GC_PAGE_SIZE - 1);
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
             self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
-            if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
+            if (all_threads_parked_locked()) gs_cond_signal(&_stw_park_cv);
         }
-        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        gs_cond_wait(&_stw_resume_cv, &_gc_mu);
         if (self != NULL) __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
 
     if (_bytes_alloc_since_gc + map_size >= _gc_threshold_bytes) {
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
@@ -1424,13 +1502,13 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
         }
     }
     if (raw == NULL) {
-        raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        raw = gc_vm_alloc_pages(map_size);
     }
-    if (raw == MAP_FAILED) {
+    if (raw == NULL) {
         drain_large_cache_locked();
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
@@ -1438,9 +1516,9 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
         }
         gc_collect_locked(self, true);
         drain_large_cache_locked();
-        raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        if (raw == MAP_FAILED) {
-            pthread_mutex_unlock(&_gc_mu);
+        raw = gc_vm_alloc_pages(map_size);
+        if (raw == NULL) {
+            gs_mutex_unlock(&_gc_mu);
             fprintf(stderr, "GC out of memory allocating large object (%zu bytes)\n", size_bytes);
             abort();
         }
@@ -1463,7 +1541,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
 
     _large_total_bytes += map_size;
     _bytes_alloc_since_gc += map_size;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 
     if (from_cache) {
@@ -1485,19 +1563,19 @@ __attribute__((noinline)) static void *alloc_small_slow(
     bool regs_saved = false;
     uintptr_t sp_here = current_stack_sp();
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
             self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
-            if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
+            if (all_threads_parked_locked()) gs_cond_signal(&_stw_park_cv);
         }
-        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        gs_cond_wait(&_stw_resume_cv, &_gc_mu);
         if (self != NULL) __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
 
@@ -1516,7 +1594,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
                  : acquire_page_for_class_locked(cls, self, &regs, &regs_saved, sp_here);
 
     if (p == NULL) {
-        pthread_mutex_unlock(&_gc_mu);
+        gs_mutex_unlock(&_gc_mu);
         fprintf(stderr, "GC out of memory allocating %zu bytes\n", size_bytes);
         abort();
     }
@@ -1540,7 +1618,7 @@ __attribute__((noinline)) static void *alloc_small_slow(
     header_t *hdr = (header_t *)slot_raw;
     *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
 
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 
     void *payload = (void *)(hdr + 1);
@@ -1562,26 +1640,26 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
     uintptr_t sp_here = current_stack_sp();
     size_t total_bytes = (payload_words + 1) * WORD_SIZE;
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     while (_stw_in_progress) {
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
             self->safepoint_sp = sp_here;
             __atomic_store_n(&self->state, THR_PARKED, __ATOMIC_SEQ_CST);
-            if (all_threads_parked_locked()) pthread_cond_signal(&_stw_park_cv);
+            if (all_threads_parked_locked()) gs_cond_signal(&_stw_park_cv);
         }
-        pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+        gs_cond_wait(&_stw_resume_cv, &_gc_mu);
         if (self != NULL) __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
     }
 
     if (_bytes_alloc_since_gc >= _gc_threshold_bytes) {
         if (self != NULL) {
             if (!regs_saved) {
-                _setjmp(regs);
+                GS_SAVE_REGS(regs);
                 regs_saved = true;
             }
             memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
@@ -1599,7 +1677,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
     if (n == NULL) {
         n = alloc_nursery_locked();
         if (n == NULL) {
-            pthread_mutex_unlock(&_gc_mu);
+            gs_mutex_unlock(&_gc_mu);
             size_t cls = _words_to_class[payload_words + 1];
             return alloc_small_slow(size_bytes, payload_words, cls, noscan, zero_init, has_mask, ptr_mask);
         }
@@ -1616,7 +1694,7 @@ __attribute__((noinline)) static void *alloc_nursery_slow(
     n->alloc_bits[slot >> 6] |= (1ULL << (slot & 63u));
     header_t *hdr = (header_t *)cur;
     *hdr = make_gc_header(payload_words, noscan, has_mask, ptr_mask);
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 
     void *payload = (void *)(hdr + 1);
@@ -1964,7 +2042,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     }
 
     while (!all_threads_parked_locked()) {
-        pthread_cond_wait(&_stw_park_cv, &_gc_mu);
+        gs_cond_wait(&_stw_park_cv, &_gc_mu);
     }
 
     /* Decide Minor vs Major GC */
@@ -2166,7 +2244,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                     else _nurseries_head = n->next;
                     if (n->next != NULL) n->next->prev = n->prev;
                     nursery_table_remove_locked(n);
-                    munmap((void *)n->base, GC_NURSERY_SIZE);
+                    gc_vm_free_aligned((void *)n->base, n->raw_base, GC_NURSERY_SIZE);
                     free(n);
                 }
             } else {
@@ -2230,7 +2308,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
                 _large_cache_buckets[b] = (void *)lo;
                 _large_cache_bytes += msz;
             } else {
-                munmap(lo, msz);
+                gc_vm_free_pages(lo, msz);
             }
         }
         lo = next;
@@ -2290,7 +2368,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     }
     __atomic_store_n(&__gs_gc_stw_requested, 0, __ATOMIC_SEQ_CST);
     _stw_in_progress = false;
-    pthread_cond_broadcast(&_stw_resume_cv);
+    gs_cond_broadcast(&_stw_resume_cv);
 }
 
 void gc_collect_major(void)
@@ -2298,15 +2376,15 @@ void gc_collect_major(void)
     gc_thread_t *self = _tls_thread;
     jmp_buf regs;
     uintptr_t sp_here = current_stack_sp();
-    _setjmp(regs);
+    GS_SAVE_REGS(regs);
 
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     if (self != NULL) {
         memcpy(&self->safepoint_regs, &regs, sizeof(jmp_buf));
         self->safepoint_sp = sp_here;
     }
     gc_collect_locked(self, true);
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 }
 
@@ -2315,7 +2393,7 @@ void geisha_rt_init(void)
     init_size_tables();
     size_t minor_b = 0, major_b = 0;
     compute_default_thresholds(131072u, &minor_b, &major_b);
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     if (!_gc_heap_inited) {
         if (!_thresholds_custom) {
             _init_threshold_bytes = minor_b;
@@ -2324,7 +2402,7 @@ void geisha_rt_init(void)
         }
         if (_chunks_head == NULL) {
             if (!alloc_chunk_locked()) {
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
                 fprintf(stderr, "GC initial chunk allocation failed\n");
                 abort();
             }
@@ -2332,10 +2410,10 @@ void geisha_rt_init(void)
         __atomic_store_n(&_generational_enabled, true, __ATOMIC_RELEASE);
         _gc_heap_inited = true;
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
-static void host_thread_destructor(void *ptr)
+static void GS_TLS_DTOR_CC host_thread_destructor(void *ptr)
 {
     gc_thread_t *thr = (gc_thread_t *)ptr;
     if (thr != NULL) {
@@ -2344,9 +2422,11 @@ static void host_thread_destructor(void *ptr)
     }
 }
 
+static bool _host_thr_key_valid = false;
+
 static void init_host_thr_key(void)
 {
-    pthread_key_create(&_host_thr_key, host_thread_destructor);
+    _host_thr_key_valid = gs_tls_key_create(&_host_thr_key, host_thread_destructor);
 }
 
 int64_t gc_host_enter(void *stack_anchor)
@@ -2356,13 +2436,13 @@ int64_t gc_host_enter(void *stack_anchor)
         int32_t prev = __atomic_load_n(&self->state, __ATOMIC_ACQUIRE);
         if (prev == THR_IDLE) {
             if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
-                pthread_mutex_lock(&_gc_mu);
+                gs_mutex_lock(&_gc_mu);
                 while (_stw_in_progress) {
-                    pthread_cond_wait(&_stw_resume_cv, &_gc_mu);
+                    gs_cond_wait(&_stw_resume_cv, &_gc_mu);
                 }
                 self->root_start = (uintptr_t)stack_anchor;
                 __atomic_store_n(&self->state, THR_RUNNING, __ATOMIC_SEQ_CST);
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
                 return 3;
             }
             self->root_start = (uintptr_t)stack_anchor;
@@ -2378,10 +2458,13 @@ int64_t gc_host_enter(void *stack_anchor)
         }
         return 1;
     }
-    pthread_once(&_host_key_once, init_host_thr_key);
+    gs_once_run(&_host_key_once, init_host_thr_key);
     geisha_rt_init();
     gc_thread_attach(stack_anchor);
-    pthread_setspecific(_host_thr_key, _tls_thread);
+    if (!_host_thr_key_valid || !gs_tls_set(_host_thr_key, _tls_thread)) {
+        /* Cannot register thread-exit destructor: return token 0 so gc_host_leave detaches immediately. */
+        return 0;
+    }
     return 3;
 }
 
@@ -2394,11 +2477,11 @@ void gc_host_leave(int64_t token)
             self->safepoint_sp = 0;
             __atomic_store_n(&self->state, THR_IDLE, __ATOMIC_SEQ_CST);
             if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_ACQUIRE) != 0, 0)) {
-                pthread_mutex_lock(&_gc_mu);
+                gs_mutex_lock(&_gc_mu);
                 if (_stw_in_progress && all_threads_parked_locked()) {
-                    pthread_cond_signal(&_stw_park_cv);
+                    gs_cond_signal(&_stw_park_cv);
                 }
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
             }
         }
     } else if (token == 0) {
@@ -2414,7 +2497,7 @@ void gc_host_leave(int64_t token)
 int64_t gc_handle_new(void *obj)
 {
     if (obj == NULL) return 0;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t idx = 0;
     if (_handle_free_len > 0) {
         idx = _handle_free[--_handle_free_len];
@@ -2425,7 +2508,7 @@ int64_t gc_handle_new(void *obj)
             while (ncap <= next) ncap *= 2u;
             void **ns = (void **)realloc(_handle_slots, ncap * sizeof(void *));
             if (ns == NULL) {
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
                 abort();
             }
             if (_handle_cap == 0) ns[0] = NULL;
@@ -2436,33 +2519,33 @@ int64_t gc_handle_new(void *obj)
         idx = next;
     }
     _handle_slots[idx] = obj;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return (int64_t)idx;
 }
 
 void *gc_handle_get(int64_t handle)
 {
     if (handle <= 0) return NULL;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     void *res = NULL;
     if ((size_t)handle <= _handle_used) {
         res = _handle_slots[(size_t)handle];
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return res;
 }
 
 void gc_handle_free(int64_t handle)
 {
     if (handle <= 0) return;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     if ((size_t)handle <= _handle_used && _handle_slots[(size_t)handle] != NULL) {
         _handle_slots[(size_t)handle] = NULL;
         if (_handle_free_len >= _handle_free_cap) {
             size_t ncap = (_handle_free_cap == 0) ? 64u : (_handle_free_cap * 2u);
             size_t *nf = (size_t *)realloc(_handle_free, ncap * sizeof(size_t));
             if (nf == NULL) {
-                pthread_mutex_unlock(&_gc_mu);
+                gs_mutex_unlock(&_gc_mu);
                 abort();
             }
             _handle_free = nf;
@@ -2470,24 +2553,24 @@ void gc_handle_free(int64_t handle)
         }
         _handle_free[_handle_free_len++] = (size_t)handle;
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_set_thresholds(size_t minor_bytes, size_t major_bytes)
 {
     if (minor_bytes < 64u * 1024u) minor_bytes = 64u * 1024u;
     if (major_bytes < minor_bytes * 2u) major_bytes = minor_bytes * 2u;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     _init_threshold_bytes = minor_bytes;
     _gc_threshold_bytes = minor_bytes;
     _major_threshold_bytes = major_bytes;
     _thresholds_custom = true;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_set_mem_limit(size_t soft_limit_bytes)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     _soft_mem_limit_bytes = soft_limit_bytes;
     if (soft_limit_bytes == 0) {
         _large_cache_limit_bytes = LARGE_CACHE_DEFAULT_TOTAL_BYTES;
@@ -2500,20 +2583,20 @@ void gc_set_mem_limit(size_t soft_limit_bytes)
             drain_large_cache_locked();
         }
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 void gc_trim(void)
 {
     geisha_rt_init();
     gc_collect_major();
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     drain_large_cache_locked();
     reclaim_empty_chunks_locked(1);
     for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
         release_page_memory((void *)p->base, GC_PAGE_SIZE);
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 }
 
 /* ============================================================================
@@ -2527,7 +2610,7 @@ int64_t gc_cleanup_register(void *owner, gc_cleanup_fn fn, void *arg, size_t ext
     if (e == NULL) abort();
 
     bool trigger_gc = false;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     int64_t tok = _cleanup_next_token++;
     e->token = tok;
     e->owner = owner;
@@ -2545,7 +2628,7 @@ int64_t gc_cleanup_register(void *owner, gc_cleanup_fn fn, void *arg, size_t ext
     if (_external_bytes_since_gc >= _external_gc_threshold && !_stw_in_progress) {
         trigger_gc = true;
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
 
     if (trigger_gc) {
         volatile void *keep_owner = owner;
@@ -2559,7 +2642,7 @@ bool gc_cleanup_cancel(int64_t token)
 {
     if (token <= 0) return false;
     gc_cleanup_entry_t *found = NULL;
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     for (gc_cleanup_entry_t *e = _cleanup_active_head; e != NULL; e = e->next) {
         if (e->token == token) {
             if (e->prev != NULL) e->prev->next = e->next;
@@ -2574,7 +2657,7 @@ bool gc_cleanup_cancel(int64_t token)
             break;
         }
     }
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     if (found != NULL) {
         free(found);
         return true;
@@ -2584,9 +2667,9 @@ bool gc_cleanup_cancel(int64_t token)
 
 size_t gc_external_live_bytes(void)
 {
-    pthread_mutex_lock(&_gc_mu);
+    gs_mutex_lock(&_gc_mu);
     size_t v = _external_bytes_live;
-    pthread_mutex_unlock(&_gc_mu);
+    gs_mutex_unlock(&_gc_mu);
     return v;
 }
 
@@ -2609,11 +2692,11 @@ void *gc_foreign_ptr_new(void *raw_ptr, gc_cleanup_fn fn, size_t external_bytes)
 void *gc_foreign_ptr_alloc(int64_t size_bytes)
 {
     if (size_bytes <= 0) size_bytes = 1;
-    void *raw = NULL;
     size_t n = ((size_t)size_bytes + 63u) & ~(size_t)63u;
-    if (posix_memalign(&raw, 64u, n) != 0 || raw == NULL) abort();
+    void *raw = gs_aligned_alloc64(n);
+    if (raw == NULL) abort();
     memset(raw, 0, n);
-    return gc_foreign_ptr_new(raw, free, n);
+    return gc_foreign_ptr_new(raw, gs_aligned_free, n);
 }
 
 void *gc_foreign_ptr_get(void *fp_void)
@@ -2654,8 +2737,8 @@ void *gc_arena_alloc(void *arena_void, int64_t size_bytes)
     if (b == NULL || b->used + n > b->cap) {
         size_t blk_cap = (n > ARENA_DEFAULT_BLOCK_SIZE) ? n : ARENA_DEFAULT_BLOCK_SIZE;
         size_t hdr_sz = (sizeof(gc_arena_block_t) + 63u) & ~(size_t)63u;
-        unsigned char *raw = NULL;
-        if (posix_memalign((void **)&raw, 64u, hdr_sz + blk_cap) != 0 || raw == NULL) {
+        unsigned char *raw = (unsigned char *)gs_aligned_alloc64(hdr_sz + blk_cap);
+        if (raw == NULL) {
             abort();
         }
         b = (gc_arena_block_t *)raw;
@@ -2677,7 +2760,7 @@ void gc_arena_destroy(void *arena_void)
     gc_arena_block_t *b = a->head;
     while (b != NULL) {
         gc_arena_block_t *next = b->next;
-        free(b);
+        gs_aligned_free(b);
         b = next;
     }
     free(a);

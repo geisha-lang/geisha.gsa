@@ -8,6 +8,7 @@ use std.str.{strStartsWith, strEndsWith, strTrim, strSplitChar, strJoin, intToSt
 use std.path.{pathJoin, pathDirname, pathStem}
 use std.codec.{Value, VObj, VStr, VInt, VFloat}
 use std.json.{parse, stringify}
+use sys.env.hostOs
 use sys.fs.{fileExists, isDir, readFile, removeFile, mkdirAll, readDir}
 use sys.io.eprintLn
 use ast.{
@@ -656,7 +657,8 @@ def runSingleBenchFile(
             _ -> {
                 let stem = pathStem(bf);
                 let pidStr = intToStr(c_bench_getpid());
-                let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr);
+                let exeExt = if (hostOs() == "windows") ".exe" else "";
+                let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr + exeExt);
                 let harnessSrc = synthesizeBenchHarnessSource(src, selectedFns);
                 cbs.cbCompileNativeExeSource(
                     bf, harnessSrc, rootSpec, extSpecs, benchTc, Some(outBin), rtOverrideOpt
@@ -686,7 +688,8 @@ def runSingleBenchFile(
         // File defines explicit `main()`
         let stem = pathStem(bf);
         let pidStr = intToStr(c_bench_getpid());
-        let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr);
+        let exeExt = if (hostOs() == "windows") ".exe" else "";
+        let outBin = pathJoin(buildDir, "bench_" + stem + "_" + pidStr + exeExt);
         cbs.cbCompileNativeExe(bf, rootSpec, extSpecs, benchTc, Some(outBin), None, rtOverrideOpt, Some(pathJoin(buildDir, "cache")))?;
         let passFilter = match bOpts.bFilter {
             None -> false,
