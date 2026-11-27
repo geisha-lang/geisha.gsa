@@ -19,7 +19,8 @@ use ast.{
     OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl, MkVarDecl,
-    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    emptySpan
 }
 use infer.{
     VariantInfo, AdtInfo, mangleType, applyExplicitSubst, buildPairMap, findVariantByName
@@ -416,7 +417,7 @@ def scanSendDemandsInTerm(
                         let vset: StrMap Bool = strMapNew();
                         requireTermSend(
                             fnName,
-                            MkTerm { tscm: ScmSlot, tnode: TmVar(fvName) },
+                            MkTerm { tspan: emptySpan(), tscm: ScmSlot, tnode: TmVar(fvName) },
                             paramSet, letRhs, localCls, vset,
                             paramShared, clsReqShared, retReqShared, changed
                         )

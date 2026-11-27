@@ -27,7 +27,7 @@ use ast.{
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
     Item, ItForm, ItExtern,
     DefAttr, AttrExport, AttrCtor, AttrCStruct,
-    Def
+    Def, Span, emptySpan
 }
 use infer.{
     VariantInfo, AdtInfo, ConceptInfo, InstanceInfo, InferOutput,
@@ -43,7 +43,7 @@ pub data ClosureSpec {
 }
 
 pub data TaggedTerm {
-    MkTerm { tscm: Scheme, tnode: Term },
+    MkTerm { tspan: Span, tscm: Scheme, tnode: Term },
 }
 
 pub data CoreArm {
@@ -72,6 +72,7 @@ pub data Term {
 pub data FunDef {
     MkFunDef {
         fnName: String,
+        fnSpan: Span,
         fnScm: Scheme,
         fnParams: List VarDecl,
         fnFvs: List VarDecl,
@@ -80,7 +81,7 @@ pub data FunDef {
 }
 
 pub data GlobalValDef {
-    MkGlobalValDef { gvName: String, gvTy: Type, gvInit: TaggedTerm },
+    MkGlobalValDef { gvName: String, gvSpan: Span, gvTy: Type, gvInit: TaggedTerm },
 }
 
 pub data ExternDef {
@@ -291,7 +292,7 @@ def sanitizePhantomTerm(tm: TaggedTerm): TaggedTerm = {
                 defaultPhantomTypeList(targs)
             ),
     };
-    MkTerm { tscm: nscm, tnode: nnode }
+    MkTerm { tspan: tm.tspan, tscm: nscm, tnode: nnode }
 }
 
 def sanitizePhantomList(es: List TaggedTerm): List TaggedTerm = match es {
@@ -367,10 +368,11 @@ def removeLiftedClosure(ctx: KCtx, parent: String, child: String): Void = {
     }
 }
 
-def defineFn(ctx: KCtx, name: String, scm: Scheme, params: List VarDecl, fvs: List VarDecl, body: TaggedTerm): (String, List String) = {
+def defineFn(ctx: KCtx, name: String, fnSpan: Span, scm: Scheme, params: List VarDecl, fvs: List VarDecl, body: TaggedTerm): (String, List String) = {
     if (!strMapContains(ctx.kGlobalFns, name)) {
         let fd = MkFunDef {
             fnName: name,
+            fnSpan: fnSpan,
             fnScm: scm,
             fnParams: params,
             fnFvs: fvs,
@@ -688,7 +690,7 @@ def transLambda(ctx: KCtx, params: List VarDecl, bodyForm: Form, capFv: Bool): (
     (params, fvs, bodyTerm)
 }
 
-def etaWrapGlobalFn(ctx: KCtx, fnName: String, fnScm: Scheme): Term = match schemeBody(fnScm) {
+def etaWrapGlobalFn(ctx: KCtx, sp: Span, fnName: String, fnScm: Scheme): Term = match schemeBody(fnScm) {
     TyArr(_, paramTys, retTy) -> {
         let clsId = makeClsName(ctx, "eta");
         let paramsRev = cellNew(Nil);
@@ -701,7 +703,7 @@ def etaWrapGlobalFn(ctx: KCtx, fnName: String, fnScm: Scheme): Term = match sche
                     let i = cellGet(idx);
                     let pid = ".eta_arg" + intToStr(i);
                     cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
-                    cellSet(argsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(argsRev)));
+                    cellSet(argsRev, Cons(MkTerm { tspan: sp, tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(argsRev)));
                     cellSet(idx, i + 1);
                     cellSet(cur, r)
                 },
@@ -709,15 +711,16 @@ def etaWrapGlobalFn(ctx: KCtx, fnName: String, fnScm: Scheme): Term = match sche
             }
         };
         let callBody = MkTerm {
+            tspan: sp,
             tscm: ScmMono(retTy),
             tnode: TmApplyDir(MkVarDecl { vname: fnName, vscm: fnScm }, listRev(cellGet(argsRev))),
         };
-        let _ = defineFn(ctx, clsId, fnScm, listRev(cellGet(paramsRev)), Nil, callBody);
+        let _ = defineFn(ctx, clsId, sp, fnScm, listRev(cellGet(paramsRev)), Nil, callBody);
         let tmp = kFresh(ctx);
         TmMakeCls(
             MkVarDecl { vname: tmp, vscm: fnScm },
             MkClosureSpec { clsEntry: clsId, clsFvs: Nil },
-            MkTerm { tscm: fnScm, tnode: TmVar(tmp) }
+            MkTerm { tspan: sp, tscm: fnScm, tnode: TmVar(tmp) }
         )
     },
     _ -> TmVar(fnName),
@@ -873,17 +876,17 @@ def collectAstFreeLocalsList(
 def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
     let tform = form.ty;
     match form.node {
-        ExLit(l) -> MkTerm { tscm: tform, tnode: TmLit(l) },
-        ExTuple(es) -> MkTerm { tscm: tform, tnode: TmTuple(transformFormList(ctx, es)) },
-        ExBlock(es) -> MkTerm { tscm: tform, tnode: TmBlock(transformFormList(ctx, es)) },
-        ExUn(op, e) -> MkTerm { tscm: tform, tnode: TmUn(op, transformForm(ctx, e)) },
-        ExBin(op, l, r) -> MkTerm { tscm: tform, tnode: TmBin(op, transformForm(ctx, l), transformForm(ctx, r)) },
-        ExIf(c, t, e) -> MkTerm { tscm: tform, tnode: TmIf(transformForm(ctx, c), transformForm(ctx, t), transformForm(ctx, e)) },
-        ExWhile(c, b) -> MkTerm { tscm: tform, tnode: TmWhile(transformForm(ctx, c), transformForm(ctx, b)) },
+        ExLit(l) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmLit(l) },
+        ExTuple(es) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmTuple(transformFormList(ctx, es)) },
+        ExBlock(es) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmBlock(transformFormList(ctx, es)) },
+        ExUn(op, e) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmUn(op, transformForm(ctx, e)) },
+        ExBin(op, l, r) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmBin(op, transformForm(ctx, l), transformForm(ctx, r)) },
+        ExIf(c, t, e) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmIf(transformForm(ctx, c), transformForm(ctx, t), transformForm(ctx, e)) },
+        ExWhile(c, b) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(transformForm(ctx, c), transformForm(ctx, b)) },
         ExTry(e) -> transformForm(ctx, e),
 
         ExStructInit(cname, namedFields) -> match strMapGet(ctx.kCtorMap, cname) {
-            None -> MkTerm { tscm: tform, tnode: TmLit(LitInt(0)) },
+            None -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmLit(LitInt(0)) },
             Some((adtName, vinfo)) -> {
                 let declNames = match vinfo.fieldNames {
                     Some(ns) -> ns,
@@ -910,6 +913,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                 };
                 let targs = extractTypeArgs(schemeBody(tform));
                 MkTerm {
+                    tspan: form.pos,
                     tscm: tform,
                     tnode: TmMakeData(adtName, vinfo.tag, listRev(cellGet(termsRev)), listRev(cellGet(ftysRev)), targs),
                 }
@@ -934,6 +938,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
             let transElems = transformFormList(ctx, elems);
             let revElems = listRev(transElems);
             let acc = cellNew(MkTerm {
+                tspan: form.pos,
                 tscm: ScmMono(listTy),
                 tnode: TmMakeData("List", nilTag, Nil, Nil, targs),
             });
@@ -942,6 +947,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                 match cellGet(cur) {
                     Cons(ht, r) -> {
                         cellSet(acc, MkTerm {
+                            tspan: form.pos,
                             tscm: ScmMono(listTy),
                             tnode: TmMakeData("List", consTag, [ht, cellGet(acc)], [elemTy, listTy], targs),
                         });
@@ -980,9 +986,9 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         let arm = MkCoreArm {
                             caPat: PatCtor(vinfo.vname, pats),
                             caGuard: None,
-                            caBody: MkTerm { tscm: tform, tnode: TmVar(resId) },
+                            caBody: MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(resId) },
                         };
-                        MkTerm { tscm: tform, tnode: TmMatch(baseTerm, [arm]) }
+                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmMatch(baseTerm, [arm]) }
                     },
                     Nil -> transformForm(ctx, base),
                 },
@@ -997,7 +1003,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                     match vinfo.fieldTypes {
                         Nil -> {
                             let targs = extractTypeArgs(schemeBody(tform));
-                            MkTerm { tscm: tform, tnode: TmMakeData(adtName, vinfo.tag, Nil, Nil, targs) }
+                            MkTerm { tspan: form.pos, tscm: tform, tnode: TmMakeData(adtName, vinfo.tag, Nil, Nil, targs) }
                         },
                         _ -> match schemeBody(tform) {
                             TyArr(_, paramTys, retTy) -> {
@@ -1012,7 +1018,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                             let i = cellGet(idx);
                                             let pid = ".ctor_arg" + intToStr(i);
                                             cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
-                                            cellSet(fieldsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(fieldsRev)));
+                                            cellSet(fieldsRev, Cons(MkTerm { tspan: form.pos, tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(fieldsRev)));
                                             cellSet(idx, i + 1);
                                             cellSet(cur, r)
                                         },
@@ -1021,21 +1027,23 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                 };
                                 let targs = extractTypeArgs(retTy);
                                 let body = MkTerm {
+                                    tspan: form.pos,
                                     tscm: ScmMono(retTy),
                                     tnode: TmMakeData(adtName, vinfo.tag, listRev(cellGet(fieldsRev)), paramTys, targs),
                                 };
-                                let _ = defineFn(ctx, clsId, tform, listRev(cellGet(paramsRev)), Nil, body);
+                                let _ = defineFn(ctx, clsId, form.pos, tform, listRev(cellGet(paramsRev)), Nil, body);
                                 let tmp = kFresh(ctx);
                                 MkTerm {
+                                    tspan: form.pos,
                                     tscm: tform,
                                     tnode: TmMakeCls(
                                         MkVarDecl { vname: tmp, vscm: tform },
                                         MkClosureSpec { clsEntry: clsId, clsFvs: Nil },
-                                        MkTerm { tscm: tform, tnode: TmVar(tmp) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(tmp) }
                                     ),
                                 }
                             },
-                            _ -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                            _ -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(varName) },
                         },
                     },
                 None -> {
@@ -1051,7 +1059,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                 while (match cellGet(cf) { Nil -> false, _ -> true }) {
                                     match cellGet(cf) {
                                         Cons(fvd, r) -> {
-                                            cellSet(allArgsRev, Cons(MkTerm { tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(allArgsRev)));
+                                            cellSet(allArgsRev, Cons(MkTerm { tspan: form.pos, tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(allArgsRev)));
                                             cellSet(fvIdsRev, Cons(fvd.vname, cellGet(fvIdsRev)));
                                             cellSet(cf, r)
                                         },
@@ -1066,7 +1074,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                             let i = cellGet(idx);
                                             let pid = ".poly_eta_arg" + intToStr(i);
                                             cellSet(paramsRev, Cons(MkVarDecl { vname: pid, vscm: ScmMono(pt) }, cellGet(paramsRev)));
-                                            cellSet(allArgsRev, Cons(MkTerm { tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(allArgsRev)));
+                                            cellSet(allArgsRev, Cons(MkTerm { tspan: form.pos, tscm: ScmMono(pt), tnode: TmVar(pid) }, cellGet(allArgsRev)));
                                             cellSet(idx, i + 1);
                                             cellSet(cp, r)
                                         },
@@ -1074,37 +1082,39 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                     }
                                 };
                                 let callBody = MkTerm {
+                                    tspan: form.pos,
                                     tscm: ScmMono(retTy),
                                     tnode: TmApplyDir(MkVarDecl { vname: liftedFnId, vscm: liftedScm }, listRev(cellGet(allArgsRev))),
                                 };
-                                let _ = defineFn(ctx, etaId, tform, listRev(cellGet(paramsRev)), fvDecls, callBody);
+                                let _ = defineFn(ctx, etaId, form.pos, tform, listRev(cellGet(paramsRev)), fvDecls, callBody);
                                 let tmp = kFresh(ctx);
                                 MkTerm {
+                                    tspan: form.pos,
                                     tscm: tform,
                                     tnode: TmMakeCls(
                                         MkVarDecl { vname: tmp, vscm: tform },
                                         MkClosureSpec { clsEntry: etaId, clsFvs: listRev(cellGet(fvIdsRev)) },
-                                        MkTerm { tscm: tform, tnode: TmVar(tmp) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(tmp) }
                                     ),
                                 }
                             },
-                            _ -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                            _ -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(varName) },
                         },
                         None -> {
                             // 3. Lexical local vs top-level global val vs first-class top-level function
                             match assocLookupScheme(cellGet(ctx.kLocalEnv), varName) {
-                                Some(_) -> MkTerm { tscm: tform, tnode: TmVar(varName) },
+                                Some(_) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(varName) },
                                 None ->
                                     if (strMapContains(ctx.kGlobalValSet, varName)) {
-                                        MkTerm { tscm: tform, tnode: TmGlobalVar(varName) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmGlobalVar(varName) }
                                     } else if (isFnScheme(tform)) {
                                         let target = match lookupDirectTarget(ctx, varName) {
                                             Some(t) -> t,
                                             None -> varName,
                                         };
-                                        MkTerm { tscm: tform, tnode: etaWrapGlobalFn(ctx, target, tform) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: etaWrapGlobalFn(ctx, form.pos, target, tform) }
                                     } else {
-                                        MkTerm { tscm: tform, tnode: TmVar(varName) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(varName) }
                                     },
                             }
                         },
@@ -1192,7 +1202,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         cellSet(ctx.kCurrentFn, parentFn);
 
                         let allParams = listAppend(fvDecls, lps);
-                        let _ = defineFn(ctx, clsFnId, liftedScm, allParams, Nil, lbd);
+                        let _ = defineFn(ctx, clsFnId, val.pos, liftedScm, allParams, Nil, lbd);
                         let expTerm = transformForm(ctx, exp);
                         cellSet(ctx.kPolyLifted, savedPoly);
                         expTerm
@@ -1211,10 +1221,10 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         cellSet(ctx.kLocalDirect, savedDirect);
 
                         let (clsName, clsFvs) = match fv1 {
-                            Nil -> defineFn(ctx, clsFnId, scm, ps1, Nil, bd1),
+                            Nil -> defineFn(ctx, clsFnId, val.pos, scm, ps1, Nil, bd1),
                             _ -> {
                                 let (ps2, fv2, bd2) = transLambda(ctx, ps, bd, true);
-                                defineFn(ctx, clsFnId, scm, ps2, fv2, bd2)
+                                defineFn(ctx, clsFnId, val.pos, scm, ps2, fv2, bd2)
                             },
                         };
 
@@ -1237,7 +1247,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                     },
                 };
                 cellSet(ctx.kLocalEnv, savedEnv);
-                MkTerm { tscm: tform, tnode: resNode }
+                MkTerm { tspan: form.pos, tscm: tform, tnode: resNode }
             }
         },
 
@@ -1263,6 +1273,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                     };
                     let targs = extractTypeArgs(schemeBody(tform));
                     MkTerm {
+                        tspan: form.pos,
                         tscm: tform,
                         tnode: TmMakeData(adtName, vinfo.tag, argTerms, listRev(cellGet(ftysRev)), targs),
                     }
@@ -1280,7 +1291,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                             while (match cellGet(cf) { Nil -> false, _ -> true }) {
                                 match cellGet(cf) {
                                     Cons(fvd, r) -> {
-                                        cellSet(fvArgsRev, Cons(MkTerm { tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(fvArgsRev)));
+                                        cellSet(fvArgsRev, Cons(MkTerm { tspan: form.pos, tscm: fvd.vscm, tnode: TmVar(fvd.vname) }, cellGet(fvArgsRev)));
                                         cellSet(cf, r)
                                     },
                                     Nil -> (),
@@ -1288,6 +1299,7 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                             };
                             let allArgs = listAppend(listRev(cellGet(fvArgsRev)), transformFormList(ctx, args));
                             MkTerm {
+                                tspan: form.pos,
                                 tscm: tform,
                                 tnode: TmApplyDir(MkVarDecl { vname: liftedFnId, vscm: liftedScm }, allArgs),
                             }
@@ -1321,21 +1333,22 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                                         }
                                                     } else ();
                                                     MkTerm {
+                                                        tspan: form.pos,
                                                         tscm: tform,
                                                         tnode: TmApplyDir(
                                                             MkVarDecl { vname: "cFnPtr", vscm: callee.ty },
-                                                            [MkTerm { tscm: argF.ty, tnode: TmLit(LitStr(fnNm)) }]
+                                                            [MkTerm { tspan: form.pos, tscm: argF.ty, tnode: TmLit(LitStr(fnNm)) }]
                                                         ),
                                                     }
                                                 },
                                                 _ -> {
                                                     let argTerms = transformFormList(ctx, args);
-                                                    MkTerm { tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
+                                                    MkTerm { tspan: form.pos, tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
                                                 },
                                             },
                                             _ -> {
                                                 let argTerms = transformFormList(ctx, args);
-                                                MkTerm { tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
+                                                MkTerm { tspan: form.pos, tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
                                             },
                                         }
                                     } else if (!strMapContains(ctx.kGlobalValSet, directName)) {
@@ -1345,16 +1358,17 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                                         };
                                         let argTerms = transformFormList(ctx, args);
                                         MkTerm {
+                                            tspan: form.pos,
                                             tscm: tform,
                                             tnode: TmApplyDir(MkVarDecl { vname: target, vscm: callee.ty }, argTerms),
                                         }
                                     } else {
                                         let ct = transformForm(ctx, callee);
-                                        MkTerm { tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
+                                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
                                     },
                                 None -> {
                                     let ct = transformForm(ctx, callee);
-                                    MkTerm { tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
+                                    MkTerm { tspan: form.pos, tscm: tform, tnode: TmApplyCls(ct, transformFormList(ctx, args)) }
                                 },
                             }
                         },
@@ -1386,21 +1400,22 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                     Nil -> (),
                 }
             };
-            MkTerm { tscm: tform, tnode: TmMatch(scrutTerm, listRev(cellGet(armsRev))) }
+            MkTerm { tspan: form.pos, tscm: tform, tnode: TmMatch(scrutTerm, listRev(cellGet(armsRev))) }
         },
 
         ExAbs(ps, _, bd) -> {
             let frName = kFresh(ctx);
             let tmpFnId = makeClsName(ctx, frName);
             let (lps, fvs, lbd) = transLambda(ctx, ps, bd, true);
-            let (clsName, clsFvs) = defineFn(ctx, tmpFnId, tform, lps, fvs, lbd);
+            let (clsName, clsFvs) = defineFn(ctx, tmpFnId, form.pos, tform, lps, fvs, lbd);
             let clsVar = kFresh(ctx);
             MkTerm {
+                tspan: form.pos,
                 tscm: tform,
                 tnode: TmMakeCls(
                     MkVarDecl { vname: clsVar, vscm: tform },
                     MkClosureSpec { clsEntry: clsName, clsFvs: clsFvs },
-                    MkTerm { tscm: tform, tnode: TmVar(clsVar) }
+                    MkTerm { tspan: form.pos, tscm: tform, tnode: TmVar(clsVar) }
                 ),
             }
         },
@@ -1637,7 +1652,7 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                             Some((mangled, specScm, optInst)) -> {
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 pushDiscovered(discovered, optInst);
-                                Some(MkTerm { tscm: specScm, tnode: TmVar(mangled) })
+                                Some(MkTerm { tspan: tm.tspan, tscm: specScm, tnode: TmVar(mangled) })
                             },
                             None -> None,
                         },
@@ -1652,17 +1667,18 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                             Some((mangled, specScm, inst)) -> {
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 cellSet(discovered, Cons(inst, cellGet(discovered)));
-                                MkTerm { tscm: specScm, tnode: TmVar(mangled) }
+                                MkTerm { tspan: tm.tspan, tscm: specScm, tnode: TmVar(mangled) }
                             },
                             None -> tm,
                         }
                     } else tm,
             }
         },
-        TmTuple(es) -> MkTerm { tscm: tm.tscm, tnode: TmTuple(rewriteTermList(ctx, es, discovered)) },
-        TmBlock(es) -> MkTerm { tscm: tm.tscm, tnode: TmBlock(rewriteTermList(ctx, es, discovered)) },
-        TmMakeCls(vd, cls, body) -> MkTerm { tscm: tm.tscm, tnode: TmMakeCls(vd, cls, rewriteCallsInTerm(ctx, body, discovered)) },
+        TmTuple(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmTuple(rewriteTermList(ctx, es, discovered)) },
+        TmBlock(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBlock(rewriteTermList(ctx, es, discovered)) },
+        TmMakeCls(vd, cls, body) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmMakeCls(vd, cls, rewriteCallsInTerm(ctx, body, discovered)) },
         TmApplyCls(c, args) -> MkTerm {
+            tspan: tm.tspan,
             tscm: tm.tscm,
             tnode: TmApplyCls(rewriteCallsInTerm(ctx, c, discovered), rewriteTermList(ctx, args, discovered)),
         },
@@ -1689,23 +1705,23 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                         Some((mangled, specScm, optInst)) -> {
                             strMapInsert(ctx.kTopDirect, mangled, mangled);
                             pushDiscovered(discovered, optInst);
-                            Some(MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) })
+                            Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) })
                         },
                         None -> match args {
                             Cons(a0, Cons(b0, Nil)) ->
                                 if (isBuiltinOpPrimitive(schemeBody(a0.tscm))) {
                                     if (fnName == "eq") {
-                                        Some(MkTerm { tscm: tm.tscm, tnode: TmBin(OpEq, a0, b0) })
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpEq, a0, b0) })
                                     } else if (fnName == "compare") {
                                         let boolScm = ScmMono(TyCon("Bool"));
                                         let intScm = ScmMono(TyCon("Int"));
-                                        let ltCond = MkTerm { tscm: boolScm, tnode: TmBin(OpLt, a0, b0) };
-                                        let eqCond = MkTerm { tscm: boolScm, tnode: TmBin(OpEq, a0, b0) };
-                                        let negOne = MkTerm { tscm: intScm, tnode: TmLit(LitInt(0 - 1)) };
-                                        let zero = MkTerm { tscm: intScm, tnode: TmLit(LitInt(0)) };
-                                        let posOne = MkTerm { tscm: intScm, tnode: TmLit(LitInt(1)) };
-                                        let innerIf = MkTerm { tscm: intScm, tnode: TmIf(eqCond, zero, posOne) };
-                                        Some(MkTerm { tscm: tm.tscm, tnode: TmIf(ltCond, negOne, innerIf) })
+                                        let ltCond = MkTerm { tspan: tm.tspan, tscm: boolScm, tnode: TmBin(OpLt, a0, b0) };
+                                        let eqCond = MkTerm { tspan: tm.tspan, tscm: boolScm, tnode: TmBin(OpEq, a0, b0) };
+                                        let negOne = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmLit(LitInt(0 - 1)) };
+                                        let zero = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmLit(LitInt(0)) };
+                                        let posOne = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmLit(LitInt(1)) };
+                                        let innerIf = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmIf(eqCond, zero, posOne) };
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmIf(ltCond, negOne, innerIf) })
                                     } else None
                                 } else None,
                             _ -> None,
@@ -1721,9 +1737,9 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                         Some((mangled, specScm, inst)) -> {
                             strMapInsert(ctx.kTopDirect, mangled, mangled);
                             cellSet(discovered, Cons(inst, cellGet(discovered)));
-                            MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) }
+                            MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) }
                         },
-                        None -> MkTerm { tscm: tm.tscm, tnode: TmApplyDir(calleeDecl, args) },
+                        None -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(calleeDecl, args) },
                     }
                 },
             }
@@ -1742,15 +1758,15 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
             if (isTypeConcrete(opTy) && isTypeConcrete(rTy) && !isPrimBin) {
                 let argTys = [opTy, rTy];
                 match bop {
-                    OpAnd -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
-                    OpOr -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                    OpAnd -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                    OpOr -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) },
                     OpEq -> match resolveConceptCall(ctx, "eq", argTys, nodeTy) {
                         Some((mangled, specScm, optInst)) -> {
                             strMapInsert(ctx.kTopDirect, mangled, mangled);
                             pushDiscovered(discovered, optInst);
-                            MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
+                            MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
                         },
-                        None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                        None -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) },
                     },
                     OpNe -> {
                         let boolTy = TyCon("Bool");
@@ -1759,18 +1775,19 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 pushDiscovered(discovered, optInst);
                                 let eqCall = MkTerm {
+                                    tspan: tm.tspan,
                                     tscm: ScmMono(boolTy),
                                     tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]),
                                 };
-                                MkTerm { tscm: tm.tscm, tnode: TmUn(UnNot, eqCall) }
+                                MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(UnNot, eqCall) }
                             },
-                            None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                            None -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) },
                         }
                     },
-                    OpLt -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
-                    OpLe -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
-                    OpGt -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
-                    OpGe -> rewriteOrdBinOp(ctx, bop, l, r, argTys, tm.tscm, discovered),
+                    OpLt -> rewriteOrdBinOp(ctx, tm.tspan, bop, l, r, argTys, tm.tscm, discovered),
+                    OpLe -> rewriteOrdBinOp(ctx, tm.tspan, bop, l, r, argTys, tm.tscm, discovered),
+                    OpGt -> rewriteOrdBinOp(ctx, tm.tspan, bop, l, r, argTys, tm.tscm, discovered),
+                    OpGe -> rewriteOrdBinOp(ctx, tm.tspan, bop, l, r, argTys, tm.tscm, discovered),
                     _ -> {
                         let mname = match bop {
                             OpAdd -> "$op$plus",
@@ -1790,19 +1807,19 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                             Some((mangled, specScm, optInst)) -> {
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 pushDiscovered(discovered, optInst);
-                                MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
+                                MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]) }
                             },
-                            None -> MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) },
+                            None -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) },
                         }
                     },
                 }
-            } else MkTerm { tscm: tm.tscm, tnode: TmBin(bop, l, r) }
+            } else MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(bop, l, r) }
         },
         TmUn(uop, rawE) -> {
             let e = rewriteCallsInTerm(ctx, rawE, discovered);
             let opTy = schemeBody(e.tscm);
             match uop {
-                UnNot -> MkTerm { tscm: tm.tscm, tnode: TmUn(UnNot, e) },
+                UnNot -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(UnNot, e) },
                 _ ->
                     if (isTypeConcrete(opTy) && !isBuiltinOpPrimitive(opTy)) {
                         let mname = match uop {
@@ -1814,19 +1831,21 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                             Some((mangled, specScm, optInst)) -> {
                                 strMapInsert(ctx.kTopDirect, mangled, mangled);
                                 pushDiscovered(discovered, optInst);
-                                MkTerm { tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [e]) }
+                                MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [e]) }
                             },
-                            None -> MkTerm { tscm: tm.tscm, tnode: TmUn(uop, e) },
+                            None -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(uop, e) },
                         }
-                    } else MkTerm { tscm: tm.tscm, tnode: TmUn(uop, e) },
+                    } else MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(uop, e) },
             }
         },
-        TmGetTag(e) -> MkTerm { tscm: tm.tscm, tnode: TmGetTag(rewriteCallsInTerm(ctx, e, discovered)) },
+        TmGetTag(e) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmGetTag(rewriteCallsInTerm(ctx, e, discovered)) },
         TmLet(vd, v, b) -> MkTerm {
+            tspan: tm.tspan,
             tscm: tm.tscm,
             tnode: TmLet(vd, rewriteCallsInTerm(ctx, v, discovered), rewriteCallsInTerm(ctx, b, discovered)),
         },
         TmIf(c, t, e) -> MkTerm {
+            tspan: tm.tspan,
             tscm: tm.tscm,
             tnode: TmIf(
                 rewriteCallsInTerm(ctx, c, discovered),
@@ -1835,6 +1854,7 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
             ),
         },
         TmWhile(c, b) -> MkTerm {
+            tspan: tm.tspan,
             tscm: tm.tscm,
             tnode: TmWhile(rewriteCallsInTerm(ctx, c, discovered), rewriteCallsInTerm(ctx, b, discovered)),
         },
@@ -1852,9 +1872,10 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                     Nil -> (),
                 }
             };
-            MkTerm { tscm: tm.tscm, tnode: TmMatch(ns, listRev(cellGet(rev))) }
+            MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmMatch(ns, listRev(cellGet(rev))) }
         },
         TmMakeData(tn, tg, fs, ftys, targs) -> MkTerm {
+            tspan: tm.tspan,
             tscm: tm.tscm,
             tnode: TmMakeData(tn, tg, rewriteTermList(ctx, fs, discovered), ftys, targs),
         },
@@ -1863,6 +1884,7 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
 
 def rewriteOrdBinOp(
     ctx: KCtx,
+    sp: Span,
     bop: BinOp,
     l: TaggedTerm,
     r: TaggedTerm,
@@ -1876,13 +1898,14 @@ def rewriteOrdBinOp(
             strMapInsert(ctx.kTopDirect, mangled, mangled);
             pushDiscovered(discovered, optInst);
             let cmpCall = MkTerm {
+                tspan: sp,
                 tscm: ScmMono(intTy),
                 tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, [l, r]),
             };
-            let zero = MkTerm { tscm: ScmMono(intTy), tnode: TmLit(LitInt(0)) };
-            MkTerm { tscm: tscm, tnode: TmBin(bop, cmpCall, zero) }
+            let zero = MkTerm { tspan: sp, tscm: ScmMono(intTy), tnode: TmLit(LitInt(0)) };
+            MkTerm { tspan: sp, tscm: tscm, tnode: TmBin(bop, cmpCall, zero) }
         },
-        None -> MkTerm { tscm: tscm, tnode: TmBin(bop, l, r) },
+        None -> MkTerm { tspan: sp, tscm: tscm, tnode: TmBin(bop, l, r) },
     }
 }
 
@@ -1980,7 +2003,7 @@ def specializeTerm(tm: TaggedTerm, typeSub: StrMap Type, fnRename: StrMap String
             applyExplicitSubstListCore(targs, typeSub)
         ),
     };
-    MkTerm { tscm: nscm, tnode: nnode }
+    MkTerm { tspan: tm.tspan, tscm: nscm, tnode: nnode }
 }
 
 def specializeVarDecls(vds: List VarDecl, sub: StrMap Type): List VarDecl = {
@@ -2020,6 +2043,7 @@ def buildSpecializedFunDef(orig: FunDef, newName: String, sub: StrMap Type, fnRe
     let specBody = sanitizePhantomTerm(specializeTerm(orig.fnBody, sub, fnRename));
     MkFunDef {
         fnName: newName,
+        fnSpan: orig.fnSpan,
         fnScm: ScmMono(specTy),
         fnParams: specParams,
         fnFvs: specFvs,
@@ -2171,6 +2195,7 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                     if (isMono) {
                         let cleanFd = MkFunDef {
                             fnName: fd.fnName,
+                            fnSpan: fd.fnSpan,
                             fnScm: ScmMono(defaultPhantomType(schemeBody(fd.fnScm))),
                             fnParams: sanitizeVarDecls(fd.fnParams),
                             fnFvs: sanitizeVarDecls(fd.fnFvs),
@@ -2196,7 +2221,7 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                 let cleanTy = defaultPhantomType(g.gvTy);
                 let cleanInit = sanitizePhantomTerm(g.gvInit);
                 let rwInit = rewriteCallsInTerm(ctx, cleanInit, initDiscovered);
-                cellSet(newGlobalsRev, Cons(MkGlobalValDef { gvName: g.gvName, gvTy: cleanTy, gvInit: rwInit }, cellGet(newGlobalsRev)));
+                cellSet(newGlobalsRev, Cons(MkGlobalValDef { gvName: g.gvName, gvSpan: g.gvSpan, gvTy: cleanTy, gvInit: rwInit }, cellGet(newGlobalsRev)));
                 cellSet(curG, r)
             },
             Nil -> (),
@@ -2218,6 +2243,7 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                     let rwBody = rewriteCallsInTerm(ctx, fd.fnBody, disc);
                     strMapInsert(ctx.kGlobalFns, fnId, MkFunDef {
                         fnName: fd.fnName,
+                        fnSpan: fd.fnSpan,
                         fnScm: fd.fnScm,
                         fnParams: fd.fnParams,
                         fnFvs: fd.fnFvs,
@@ -4225,13 +4251,14 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
                         match f.node {
                             ExAbs(ps, _, bd) -> {
                                 let (lps, _, lbd) = transLambda(ctx, ps, bd, false);
-                                let _ = defineFn(ctx, d.ident, f.ty, lps, Nil, lbd);
+                                let _ = defineFn(ctx, d.ident, d.dpos, f.ty, lps, Nil, lbd);
                                 ()
                             },
                             _ -> {
                                 let initTerm = transformForm(ctx, f);
                                 cellSet(ctx.kGlobalValsRev, Cons(MkGlobalValDef {
                                     gvName: d.ident,
+                                    gvSpan: d.dpos,
                                     gvTy: schemeBody(f.ty),
                                     gvInit: initTerm,
                                 }, cellGet(ctx.kGlobalValsRev)))

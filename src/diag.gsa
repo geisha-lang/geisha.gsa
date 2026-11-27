@@ -7,7 +7,7 @@
 //     hint: ...
 
 use std.option.{Option, Some, None}
-use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr, vecSet}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.Span
@@ -17,13 +17,17 @@ pub data SourceFile {
 }
 
 def gDiagFiles: Cell (Vec SourceFile) = cellNew(vecNew())
+def gDiagLineTables: Cell (Vec (Option (Vec Int))) = cellNew(vecNew())
 
-pub def diagReset(): Void =
-    cellSet(gDiagFiles, vecNew())
+pub def diagReset(): Void = {
+    cellSet(gDiagFiles, vecNew());
+    cellSet(gDiagLineTables, vecNew())
+}
 
 pub def diagRegisterFile(path: String, src: String): Int = {
     let fs = cellGet(gDiagFiles);
     vecPush(fs, MkSourceFile { sfPath: path, sfContent: src });
+    vecPush(cellGet(gDiagLineTables), None);
     vecLen(fs)
 }
 
@@ -35,6 +39,57 @@ pub def diagGetFile(fileId: Int): Option SourceFile = {
 
 pub def diagRegisteredFiles(): Vec SourceFile =
     cellGet(gDiagFiles)
+
+def buildLineStarts(src: String): Vec Int = {
+    let starts: Vec Int = vecNew();
+    vecPush(starts, 0);
+    let n = strLen(src);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        if (strByteAt(src, idx) == 10) {
+            vecPush(starts, idx + 1)
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    starts
+}
+
+def getOrBuildLineStarts(fileId: Int, src: String): Vec Int = {
+    let tbls = cellGet(gDiagLineTables);
+    let idx = fileId - 1;
+    match vecGetOr(tbls, idx, None) {
+        Some(v) -> v,
+        None -> {
+            let v = buildLineStarts(src);
+            vecSet(tbls, idx, Some(v));
+            v
+        },
+    }
+}
+
+/// Fast O(log L) 1-based `(line, col)` lookup for a `Span` using cached per-file line tables.
+/// Returns `(0, 0)` when `sp.fileId` is invalid or unregistered.
+pub def diagSpanLineCol(sp: Span): (Int, Int) =
+    match diagGetFile(sp.fileId) {
+        None -> (0, 0),
+        Some(sf) -> {
+            let src = sf.sfContent;
+            let n = strLen(src);
+            let pos = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
+            let starts = getOrBuildLineStarts(sp.fileId, src);
+            let lo = cellNew(0);
+            let hi = cellNew(vecLen(starts) - 1);
+            while (cellGet(lo) < cellGet(hi)) {
+                let mid = (cellGet(lo) + cellGet(hi) + 1) / 2;
+                if (vecGetOr(starts, mid, 0) <= pos) cellSet(lo, mid)
+                else cellSet(hi, mid - 1)
+            };
+            let lineIdx = cellGet(lo);
+            let lineStart = vecGetOr(starts, lineIdx, 0);
+            (lineIdx + 1, (pos - lineStart) + 1)
+        },
+    }
 
 def shortDiagKind(kind: String): String =
     if (kind == "Type error") "type"
