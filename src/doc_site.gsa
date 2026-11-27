@@ -16,7 +16,8 @@ extern "gs_sys_lstat_kind" def c_site_lstat_kind(path: String): Int
 extern "gs_sys_getpid" def c_site_getpid(): Int
 extern "gs_sys_fopen" def c_site_fopen(path: String, mode: String): Ptr
 extern "fclose" def c_site_fclose(fp: Ptr): Int
-extern "gs_sys_file_mode" def c_site_file_mode(path: String): Int
+extern "gs_sys_write_excl" def c_site_write_excl(path: String, buf: String, len: Int64, mode: Int): Int
+extern "gs_sys_copy_file_acl" def c_site_copy_file_acl(src: String, dst: String): Int
 
 def gSiteTmpSeq: Cell Int = cellNew(0)
 
@@ -1377,36 +1378,72 @@ def checkExistingFileWritable(path: String): Result Void String = {
     }
 }
 
-// Write `content` to a brand-new short unique sibling temporary file, verify full byte length,
-// and optionally inherit `preserveMode` (>= 0) before atomic `renameFile` replacement.
-def writeVerifiedTempFile(targetPath: String, content: String, preserveMode: Int): Result String String = {
+// Atomically create a brand-new short unique sibling temporary file with `O_CREAT|O_EXCL` at
+// restrictive mode `0600` (never exposing new contents of a `0600`/ACL-protected file as `0644`),
+// write all bytes, verify full length, and clone mode + OS ACLs from `targetPath` when replacing
+// an existing file (or set standard `0644` for brand-new files).
+def writeVerifiedTempFile(targetPath: String, content: String, copyFromExisting: Bool): Result String String = {
+    let dir = pathDirname(targetPath);
+    let pidStr = intToStr(c_site_getpid());
     let wantLen = strLen(content);
-    let tmpPath = allocUniqueSiblingPath(targetPath, "gst")?;
-    match writeFile(tmpPath, content) {
-        Err(e) -> {
-            let _ = removeFile(tmpPath);
-            Err(e)
-        },
-        Ok(()) -> match readFile(tmpPath) {
-            Err(e) -> {
-                let _ = removeFile(tmpPath);
-                Err("failed to verify staged doc output file: " + e)
-            },
-            Ok(chk) ->
-                if (strLen(chk) != wantLen) {
+    let wantLen64 = intToI64(wantLen);
+
+    let createdPath = cellNew("");
+    let errOpt: Cell (Option String) = cellNew(None);
+    let created = cellNew(false);
+    let attempts = cellNew(0);
+    while (!cellGet(created) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        if (cellGet(attempts) >= 10000) {
+            cellSet(errOpt, Some("exhausted unique temp path attempts in directory: " + dir))
+        } else {
+            cellSet(attempts, cellGet(attempts) + 1);
+            let seq = cellGet(gSiteTmpSeq) + 1;
+            cellSet(gSiteTmpSeq, seq);
+            let p = pathJoin(dir, ".gst_" + pidStr + "_" + intToStr(seq));
+            let rc = c_site_write_excl(p, content, wantLen64, 0o600);
+            if (rc == 0) {
+                cellSet(createdPath, p);
+                cellSet(created, true)
+            } else if (rc == 1) {
+                // Atomic EEXIST collision: retry with next sequence number
+                ()
+            } else {
+                cellSet(errOpt, Some("failed to atomically write staged doc output file for: " + targetPath))
+            }
+        }
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> {
+            let tmpPath = cellGet(createdPath);
+            match readFile(tmpPath) {
+                Err(e) -> {
                     let _ = removeFile(tmpPath);
-                    Err("short write detected for doc output file: " + targetPath)
-                } else if (preserveMode >= 0) {
-                    match chmod(tmpPath, preserveMode) {
-                        Ok(()) -> Ok(tmpPath),
-                        Err(ce) -> {
-                            let _ = removeFile(tmpPath);
-                            Err(ce)
-                        },
-                    }
-                } else {
-                    Ok(tmpPath)
+                    Err("failed to verify staged doc output file: " + e)
                 },
+                Ok(chk) ->
+                    if (strLen(chk) != wantLen) {
+                        let _ = removeFile(tmpPath);
+                        Err("short write detected for doc output file: " + targetPath)
+                    } else if (copyFromExisting) {
+                        if (c_site_copy_file_acl(targetPath, tmpPath) != 0) {
+                            let _ = removeFile(tmpPath);
+                            Err("failed to preserve permissions/ACL from: " + targetPath)
+                        } else Ok(tmpPath)
+                    } else {
+                        // Brand-new file: grant standard readable permissions on POSIX
+                        if (hostOs() != "windows") {
+                            match chmod(tmpPath, 0o644) {
+                                Ok(()) -> Ok(tmpPath),
+                                Err(ce) -> {
+                                    let _ = removeFile(tmpPath);
+                                    Err(ce)
+                                },
+                            }
+                        } else Ok(tmpPath)
+                    },
+            }
         },
     }
 }
@@ -1608,12 +1645,9 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                         else Ok(());
                     match writableRes {
                         Err(e) -> cellSet(stageErrOpt, Some(e)),
-                        Ok(()) -> {
-                            let preserveMode = if (k == 1) c_site_file_mode(full) else -1;
-                            match writeVerifiedTempFile(full, content, preserveMode) {
-                                Err(e) -> cellSet(stageErrOpt, Some(e)),
-                                Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
-                            }
+                        Ok(()) -> match writeVerifiedTempFile(full, content, k == 1) {
+                            Err(e) -> cellSet(stageErrOpt, Some(e)),
+                            Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
                         },
                     }
                 };

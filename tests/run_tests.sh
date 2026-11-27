@@ -7045,6 +7045,16 @@ EOF
         echo "FAIL [doc_preserve_file_mode]: expected 0o600 preserved on replacement, got $T44_MODE_AFTER" >&2
         exit 1
     fi
+    if [ "$UNAME_S" = "Darwin" ]; then
+        chmod 644 "$T44_LONG_HTML"
+        if chmod +a "user:nobody deny read" "$T44_LONG_HTML" 2>/dev/null; then
+            (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+            if ! ls -le "$T44_LONG_HTML" | grep -q "user:nobody deny read"; then
+                echo "FAIL [doc_preserve_macos_acl]: expected macOS ACL 'user:nobody deny read' preserved after replacement" >&2
+                exit 1
+            fi
+        fi
+    fi
     rm -f "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa"
 
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
@@ -7053,6 +7063,18 @@ EOF
     (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_BS_OUT" --no-stdlib) >/dev/null
     if [ ! -f "$T44_BS_OUT/index.html" ]; then
         echo "FAIL [doc_posix_backslash_outdir]: expected POSIX literal backslash outDir to succeed" >&2
+        exit 1
+    fi
+fi
+if [ "$T44_IS_WIN" -eq 1 ]; then
+    # Verify Windows explicit DACL preservation across atomic replacement
+    T44_WIN_HTML="$T44_CASE_SITE/modules/caseproj.Reader.html"
+    T44_WIN_HTML_W="$(cygpath -w "$T44_WIN_HTML")"
+    icacls "$T44_WIN_HTML_W" /inheritance:d >/dev/null
+    icacls "$T44_WIN_HTML_W" /deny "*S-1-5-7:(R)" >/dev/null
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if ! icacls "$T44_WIN_HTML_W" | grep -qi "DENY"; then
+        echo "FAIL [doc_preserve_win_dacl]: expected explicit Windows DACL DENY ACE preserved after replacement" >&2
         exit 1
     fi
 fi

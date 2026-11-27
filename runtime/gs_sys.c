@@ -407,12 +407,87 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
     return (chmod(path, (mode_t)(mode & 07777)) == 0) ? 0 : -1;
 }
 
+#ifdef __APPLE__
+#include <copyfile.h>
+#elif defined(__linux__)
+#include <sys/xattr.h>
+#endif
+
 int32_t gs_sys_file_mode(const char *path)
 {
     if (path == NULL || path[0] == '\0') return -1;
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
     return (int32_t)(st.st_mode & 07777);
+}
+
+/* Atomically create a brand-new file with O_CREAT|O_EXCL|O_NOFOLLOW at restrictive `mode` (default 0600),
+ * write all `len` bytes, and close. Returns: 0 = ok, 1 = EEXIST (caller may pick next name), -1 = error. */
+int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_t mode)
+{
+    if (path == NULL || path[0] == '\0' || len < 0 || (len > 0 && buf == NULL)) return -1;
+    mode_t m = (mode >= 0) ? (mode_t)(mode & 07777) : (mode_t)0600;
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, m);
+    if (fd < 0) {
+        if (errno == EEXIST) return 1;
+        return -1;
+    }
+    if (fchmod(fd, m) != 0) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    int64_t rem = len;
+    while (rem > 0) {
+        ssize_t n = write(fd, p, (size_t)rem);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            unlink(path);
+            return -1;
+        }
+        if (n == 0) {
+            close(fd);
+            unlink(path);
+            return -1;
+        }
+        p += n;
+        rem -= (int64_t)n;
+    }
+    if (close(fd) != 0) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Copy POSIX permission bits AND platform ACLs (macOS copyfile COPYFILE_ACL, Linux POSIX ACL xattr)
+ * from `src` to `dst`. Fails closed (-1) if permission or ACL preservation fails. */
+int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
+{
+    if (src == NULL || dst == NULL || src[0] == '\0' || dst[0] == '\0') return -1;
+    struct stat st;
+    if (lstat(src, &st) != 0) return -1;
+    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
+#ifdef __APPLE__
+    if (copyfile(src, dst, NULL, COPYFILE_ACL) != 0) return -1;
+#elif defined(__linux__)
+    ssize_t sz = getxattr(src, "system.posix_acl_access", NULL, 0);
+    if (sz < 0) {
+        if (errno != ENODATA && errno != ENOTSUP && errno != EOPNOTSUPP) return -1;
+    } else if (sz > 0) {
+        void *abuf = malloc((size_t)sz);
+        if (abuf == NULL) return -1;
+        ssize_t got = getxattr(src, "system.posix_acl_access", abuf, (size_t)sz);
+        if (got < 0 || setxattr(dst, "system.posix_acl_access", abuf, (size_t)got, 0) != 0) {
+            free(abuf);
+            return -1;
+        }
+        free(abuf);
+    }
+#endif
+    return 0;
 }
 
 int64_t gs_sys_file_mtime_ms(const char *path)

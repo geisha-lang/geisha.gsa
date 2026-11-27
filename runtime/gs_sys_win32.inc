@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
 #include <fcntl.h>
 #include <io.h>
@@ -19,6 +20,7 @@
 #if defined(_MSC_VER) || defined(__clang__)
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 int64_t gs_sys_rand_seed(void);
@@ -796,6 +798,81 @@ int32_t gs_sys_file_mode(const char *path)
 {
     (void)path;
     return -1;
+}
+
+int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_t mode)
+{
+    (void)mode;
+    if (path == NULL || path[0] == '\0' || len < 0 || (len > 0 && buf == NULL)) return -1;
+    wchar_t *wp = gs_utf8_to_wide(path);
+    if (wp == NULL) return -1;
+    HANDLE h = CreateFileW(wp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        free(wp);
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return 1;
+        return -1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    int64_t rem = len;
+    int ok = 1;
+    while (rem > 0) {
+        DWORD chunk = (rem > 0x40000000LL) ? (DWORD)0x40000000U : (DWORD)rem;
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, NULL) || written == 0) {
+            ok = 0;
+            break;
+        }
+        p += written;
+        rem -= (int64_t)written;
+    }
+    if (!CloseHandle(h)) ok = 0;
+    if (!ok) {
+        DeleteFileW(wp);
+        free(wp);
+        return -1;
+    }
+    free(wp);
+    return 0;
+}
+
+int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
+{
+    if (src == NULL || dst == NULL || src[0] == '\0' || dst[0] == '\0') return -1;
+    wchar_t *wsrc = gs_utf8_to_wide(src);
+    wchar_t *wdst = gs_utf8_to_wide(dst);
+    if (wsrc == NULL || wdst == NULL) {
+        free(wsrc);
+        free(wdst);
+        return -1;
+    }
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD grc = GetNamedSecurityInfoW(wsrc, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd);
+    if (grc != ERROR_SUCCESS) {
+        free(wsrc);
+        free(wdst);
+        return -1;
+    }
+    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+    DWORD rev = 0;
+    SECURITY_INFORMATION secInfo = DACL_SECURITY_INFORMATION;
+    if (GetSecurityDescriptorControl(sd, &ctrl, &rev)) {
+        if (ctrl & SE_DACL_PROTECTED) secInfo |= PROTECTED_DACL_SECURITY_INFORMATION;
+        else secInfo |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+    }
+    DWORD src_rc = SetNamedSecurityInfoW(wdst, SE_FILE_OBJECT, secInfo, NULL, NULL, dacl, NULL);
+    LocalFree(sd);
+    DWORD attrs = GetFileAttributesW(wsrc);
+    if (src_rc == ERROR_SUCCESS && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+        DWORD dattrs = GetFileAttributesW(wdst);
+        if (dattrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(wdst, dattrs | FILE_ATTRIBUTE_READONLY);
+        }
+    }
+    free(wsrc);
+    free(wdst);
+    return (src_rc == ERROR_SUCCESS) ? 0 : -1;
 }
 
 static int64_t gs_filetime_to_unix_ms(FILETIME ft)

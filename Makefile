@@ -25,7 +25,7 @@ ifeq ($(OS),Windows_NT)
   HOST_ARCH    := x86_64
   HOST_ENV     :=
   HOST_TARGET  := -D_CRT_SECURE_NO_WARNINGS
-  HOST_LIBS    := -lws2_32 -lbcrypt -Wl,/STACK:16777216
+  HOST_LIBS    := -lws2_32 -lbcrypt -ladvapi32 -Wl,/STACK:16777216
   HOST_PTHREAD :=
   EXE_EXT      := .exe
   AR           ?= llvm-ar
