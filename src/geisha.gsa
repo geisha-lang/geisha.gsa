@@ -27,6 +27,7 @@ use core_dump.dumpCoreProgramSExpr
 use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch}
 use doc.cmdDoc
 use bench.cmdBench
+use fmt.cmdFmt
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
@@ -95,6 +96,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "test"
     || w == "bench"
     || w == "doc"
+    || w == "fmt"
     || w == "guide"
 
 def isSupportedTarget(t: String): Bool =
@@ -186,7 +188,7 @@ def parseCliArgs(): Result CliOpts String = {
                     cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
                     cellSet(i, cellGet(i) + 1)
                 }
-            } else if (sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "guide") {
+            } else if (sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "fmt" || sub == "guide") {
                 if (a == "-h" || a == "--help") {
                     cellSet(showHelp, true)
                 } else {
@@ -1457,6 +1459,7 @@ def printUsage(): Void = {
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
     printLn("  geisha bench [file|filter]     Run microbenchmarks (--iters N --warmup N --rounds N --filter <pat> --json)");
     printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
+    printLn("  geisha fmt [options] [paths..] Format .gsa files in-place (--check, --write, --stdout)");
     printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
     printLn("");
     printLn("Direct Compiler Usage:");
@@ -1551,6 +1554,7 @@ def runDriver(): Result Int String = {
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
             Some("bench") -> cmdBench(opts.optSubArgs, opts.optJson, opts.optRuntime, cbs),
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
+            Some("fmt") -> cmdFmt(opts.optSubArgs),
             Some("guide") -> { printLn(embeddedAgentGuide()); Ok(0) },
             Some(other) -> Err("unknown subcommand: " + other),
             None -> {

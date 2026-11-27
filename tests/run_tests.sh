@@ -3104,4 +3104,173 @@ PY
 echo "PASS [geisha_bench]: polymorphic __blackBox (native+wasm32), standalone/project modes, line-aligned diagnostics, & --json error contract verified"
 PASS=$((PASS + 1))
 
+# 38. `geisha fmt`: Canonical formatter, comment preservation, full syntax, idempotency, `--check` & project scan
+FMT_DIR="$TMP_DIR/t38_fmt"
+mkdir -p "$FMT_DIR/src/sub"
+cat > "$FMT_DIR/geisha.toml" << 'EOF'
+name = "t37_fmt"
+version = "0.1.0"
+EOF
+
+cat > "$FMT_DIR/src/main.gsa" << 'EOF'
+#!/usr/bin/env -S geisha run
+
+
+// Top file comment
+/// Module-level doc comment
+use std.option.{ Option,Some,None }
+use std.result.{Result,Ok,Err}
+use std.str.{intToStr,parseInt}
+open std.generic
+
+/* Multi-line
+   block comment */
+/// Record with deriving
+pub data User:Eq,Ord{
+name:String,
+  age:Int,
+}
+
+pub data Wrapper a(a)
+pub data Pipe(Int):Eq
+
+pub data Shape{
+Circle(Int),
+  Rect{w:Int,h:Int},
+Empty,
+}
+
+pub type PairInt=(Int,Int)
+
+pub concept Combinable a:Eq a{
+def (<+>)(x:a,y:a):a
+}
+
+pub instance Combinable Int{
+def (<+>)(x,y)=x+y
+}
+
+extern "abs" def c_abs(x:Int):Int
+
+/// Helper with match, guards, destructuring, lambdas, `?`, radix literals & inline comments
+pub def compute(
+xs:List (Int,String),
+u:User
+):Result Int String={
+let acc=cellNew(0x0A_00);// trailing comment
+let (a,b)=(1_000,0o10);
+let mask=0b1010_0101;
+let f=(v:Int)->v*2;
+let i=cellNew(0);
+while(cellGet(i)<2){
+cellSet(acc,cellGet(acc)+f(cellGet(i)));
+cellSet(i,cellGet(i)+1)
+};
+let v=parseInt("42")?;
+let sh=Rect{w:3,h:4};
+let s=match sh{
+Rect{w:rw,h:rh} if(rw>0)->rw*rh,
+Rect{w:_,h:_}->0,
+Circle(r)->r*r,
+Empty-> -1,
+};
+let cond=if(a>b)(if(!false)s else 0)else -1;
+Ok(cellGet(acc)+a+b+mask+v+cond+c_abs(-5)+(3<+>4)+u.age)
+}
+
+def main():Void={
+let u=User{name:"Ada",age:30};
+let res=match compute([(1,"a")],u){
+Ok(n)->intToStr(n),
+Err(e)->e,
+};
+printLn(res)
+}
+EOF
+
+# Unformatted helper in subdirectory to verify recursive project discovery
+cat > "$FMT_DIR/src/sub/helper.gsa" << 'EOF'
+/// Submodule helper
+pub def   addPair( p: (Int,Int) ):Int={
+let (x,y)=p;
+x+y   /* inline */
+}
+EOF
+
+# 37a. Typecheck & run BEFORE formatting
+"$GEISHA_BIN" check "$FMT_DIR/src/main.gsa" >/dev/null
+"$GEISHA_BIN" -o "$FMT_DIR/before_bin" "$FMT_DIR/src/main.gsa"
+BEFORE_OUT="$("$FMT_DIR/before_bin")"
+
+# 37b. `--check` must fail (non-zero) on unformatted project
+if (cd "$FMT_DIR" && "$ABS_GEISHA_36" fmt --check >/dev/null 2>&1); then
+    echo "FAIL [geisha_fmt_check_dirty]: expected non-zero exit code on unformatted project" >&2
+    exit 1
+fi
+
+# 37c. Default `geisha fmt` (project scan) formats all `.gsa` files in-place
+(cd "$FMT_DIR" && "$ABS_GEISHA_36" fmt)
+# `--check` must now exit 0
+(cd "$FMT_DIR" && "$ABS_GEISHA_36" fmt --check)
+
+# 37d. Idempotency: second `fmt --write` produces byte-for-byte identical files
+cp "$FMT_DIR/src/main.gsa" "$FMT_DIR/main.pass1.gsa"
+cp "$FMT_DIR/src/sub/helper.gsa" "$FMT_DIR/helper.pass1.gsa"
+"$GEISHA_BIN" fmt --write "$FMT_DIR/src/main.gsa" "$FMT_DIR/src/sub/helper.gsa"
+diff -u "$FMT_DIR/main.pass1.gsa" "$FMT_DIR/src/main.gsa"
+diff -u "$FMT_DIR/helper.pass1.gsa" "$FMT_DIR/src/sub/helper.gsa"
+
+# 37e. Verify comments, shebang, radix literals, and canonical spacing were preserved/applied
+python3 - "$FMT_DIR/src/main.gsa" "$FMT_DIR/src/sub/helper.gsa" << 'PY'
+import sys
+main_src = open(sys.argv[1], encoding="utf-8").read()
+helper_src = open(sys.argv[2], encoding="utf-8").read()
+required_main = [
+    "#!/usr/bin/env -S geisha run",
+    "// Top file comment",
+    "/// Module-level doc comment",
+    "use std.option.{Option, Some, None}",
+    "/* Multi-line\n   block comment */",
+    "pub data User : Eq, Ord {",
+    "pub data Wrapper a (a)",
+    "pub data Pipe(Int) : Eq",
+    "pub concept Combinable a : Eq a {",
+    "    def (<+>)(x: a, y: a): a",
+    "    xs: List (Int, String),",
+    "): Result Int String = {",
+    "    let acc = cellNew(0x0A_00); // trailing comment",
+    "    let (a, b) = (1_000, 0o10);",
+    "    let mask = 0b1010_0101;",
+    "    let f = (v: Int) -> v * 2;",
+    "    while (cellGet(i) < 2) {",
+    "    let cond = if (a > b) (if (!false) s else 0) else -1;",
+    "    Ok(cellGet(acc) + a + b + mask + v + cond + c_abs(-5) + (3 <+> 4) + u.age)",
+]
+for needle in required_main:
+    assert needle in main_src, f"missing expected formatted snippet in main.gsa: {needle!r}\n---\n{main_src}"
+assert "\n\n\n" not in main_src, "consecutive blank lines were not collapsed"
+assert "pub def addPair(p: (Int, Int)): Int = {" in helper_src, f"unexpected helper.gsa:\n{helper_src}"
+assert "x + y /* inline */" in helper_src, f"inline block comment lost in helper.gsa:\n{helper_src}"
+PY
+
+# 37f. Typecheck & run AFTER formatting — must produce identical output
+"$GEISHA_BIN" check "$FMT_DIR/src/main.gsa" >/dev/null
+"$GEISHA_BIN" check "$FMT_DIR/src/sub/helper.gsa" >/dev/null
+"$GEISHA_BIN" -o "$FMT_DIR/after_bin" "$FMT_DIR/src/main.gsa"
+AFTER_OUT="$("$FMT_DIR/after_bin")"
+assert_eq "geisha_fmt_semantic_equivalence" "$BEFORE_OUT" "$AFTER_OUT"
+
+# 37g. Syntax-broken file must be rejected without modifying the file
+cat > "$FMT_DIR/broken.gsa" << 'EOF'
+def broken(x: Int = {
+EOF
+cp "$FMT_DIR/broken.gsa" "$FMT_DIR/broken.orig.gsa"
+if "$GEISHA_BIN" fmt "$FMT_DIR/broken.gsa" >/dev/null 2>&1; then
+    echo "FAIL [geisha_fmt_broken_rejected]: expected non-zero exit on syntax error" >&2
+    exit 1
+fi
+diff -u "$FMT_DIR/broken.orig.gsa" "$FMT_DIR/broken.gsa"
+echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, project scan, & semantic equivalence verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
