@@ -2192,7 +2192,11 @@ EOF
 cat > "$TMP_DIR/t34_cabi.gsa" << 'EOF'
 use std.str.intToStr
 use std.option.{Some, None}
+use std.sync.{Chan, chanNew, chanSend, chanRecv}
 use sys.ffi.{dlOpenSelf, dlSym}
+
+extern "gc_collect_major" def gcCollectMajor(): Void
+extern "gc_trim" def gcTrim(): Void
 
 pub extern data CGPoint { x: Float, y: Float }
 pub extern data CGSize { w: Float, h: Float }
@@ -2212,9 +2216,20 @@ extern ptr def callRectSumPtr(fnPtr: Ptr, r: CGRect): Float
 def (@)(a: Int, b: Int): Int = a * 10 + b
 
 def gCtorLog: Cell Int = cellNew(0)
+def gCtorChan: Chan String = chanNew(8)
+def gCtorItems: Cell (List String) = cellNew(["boot-seed"])
 
-extern init(200) def initSecond(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 2)
-extern init(100) def initFirst(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 1)
+extern init(200) def initSecond(): Void = {
+    cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 2);
+    let _ = chanSend(gCtorChan, "ctor-second");
+    cellSet(gCtorItems, Cons("second", cellGet(gCtorItems)))
+}
+
+extern init(100) def initFirst(): Void = {
+    cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 1);
+    let _ = chanSend(gCtorChan, "ctor-first");
+    cellSet(gCtorItems, Cons("first", cellGet(gCtorItems)))
+}
 
 pub extern "gs_pure_add" def pureAdd(a: Int, b: Int): Int = a + b
 pub extern def defaultNameMul(a: Int, b: Int): Int = a * b
@@ -2253,10 +2268,27 @@ def main(): Void = {
         Some(_) -> 1,
         None -> 0,
     };
+    // Force multiple Minor & Major GC sweeps after `extern init` + `gc_init_with_stack`
+    // to verify global roots (`gCtorChan`, `gCtorItems`, `gCtorLog`) survive intact.
+    let churn = cellNew(0);
+    while (cellGet(churn) < 2000) {
+        let k = cellGet(churn);
+        let _ = "churn-heap-payload-" + intToStr(k);
+        cellSet(churn, k + 1)
+    };
+    gcCollectMajor();
+    gcTrim();
+    let ch1 = match chanRecv(gCtorChan) { Some(s) -> s, None -> "missing1" };
+    let ch2 = match chanRecv(gCtorChan) { Some(s) -> s, None -> "missing2" };
+    let itemsDesc = match cellGet(gCtorItems) {
+        Cons(a, Cons(b, Cons(c, Nil))) -> a + "," + b + "," + c,
+        _ -> "bad-items",
+    };
     printLn(
         intToStr(cellGet(gCtorLog)) + "|"
         + intToStr(s1) + "|" + intToStr(s2) + "|" + intToStr(cbRes) + "|"
-        + intToStr(bSum) + "|" + intToStr(mSum) + "|" + intToStr(expOk) + "|" + intToStr(dlOk) + "|" + intToStr(atOp) + "|" + intToStr(gsCallMul)
+        + intToStr(bSum) + "|" + intToStr(mSum) + "|" + intToStr(expOk) + "|" + intToStr(dlOk) + "|" + intToStr(atOp) + "|" + intToStr(gsCallMul) + "|"
+        + ch1 + "+" + ch2 + "|" + itemsDesc
     )
 }
 EOF
@@ -2264,7 +2296,75 @@ EOF
 "$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
     -x ir "$TMP_DIR/t34_cabi.ll" -x c "$TMP_DIR/t34_cabi_host.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
     -o "$TMP_DIR/t34_cabi"
-assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1|37|12" "$("$TMP_DIR/t34_cabi")"
+assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1|37|12|ctor-first+ctor-second|second,first,boot-seed" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_cabi")"
+
+# Verify `--no-main` C-exported library initializes globals lazily & thread-safely even when C pthreads call exports without `__geisha_init()`
+cat > "$TMP_DIR/t34_lazy_glob.gsa" << 'EOF'
+use std.str.intToStr
+use std.sync.{AtomicInt, atomicNew, atomicAdd, atomicLoad}
+
+extern "gc_collect_major" def gcCollectMajor(): Void
+
+def makeHeavySeed(): String = {
+    let i = cellNew(0);
+    let acc = cellNew("lazy");
+    while (cellGet(i) < 600) {
+        let k = cellGet(i);
+        cellSet(acc, "seed-" + intToStr(k));
+        cellSet(i, k + 1)
+    };
+    gcCollectMajor();
+    cellGet(acc)
+}
+
+def gLazySeed: String = makeHeavySeed()
+def gLazyHits: AtomicInt = atomicNew(0)
+
+pub extern "gs_lazy_ping" def lazyPing(delta: Int): Int = {
+    let _ = atomicAdd(gLazyHits, delta);
+    strLen(gLazySeed)
+}
+
+pub extern "gs_lazy_total" def lazyTotal(): Int = atomicLoad(gLazyHits)
+EOF
+cat > "$TMP_DIR/t34_lazy_glob_host.c" << 'EOF'
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+
+extern int32_t gs_lazy_ping(int32_t delta);
+extern int32_t gs_lazy_total(void);
+
+static volatile int g_go = 0;
+
+static void *worker_fn(void *arg) {
+    int32_t id = (int32_t)(intptr_t)arg;
+    while (!__atomic_load_n(&g_go, __ATOMIC_ACQUIRE)) {}
+    int32_t len = gs_lazy_ping(id);
+    return (void *)(intptr_t)len;
+}
+
+int main(void) {
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&th[i], NULL, worker_fn, (void *)(intptr_t)(i + 1));
+    }
+    __atomic_store_n(&g_go, 1, __ATOMIC_RELEASE);
+    int32_t lens_ok = 1;
+    for (int i = 0; i < 4; i++) {
+        void *ret = NULL;
+        pthread_join(th[i], &ret);
+        if ((int32_t)(intptr_t)ret != 8) lens_ok = 0;
+    }
+    printf("%d|%d\n", lens_ok, (int)gs_lazy_total());
+    return 0;
+}
+EOF
+"$GEISHA_BIN" -e --no-main -o "$TMP_DIR/t34_lazy_glob.ll" "$TMP_DIR/t34_lazy_glob.gsa"
+"$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
+    -x ir "$TMP_DIR/t34_lazy_glob.ll" -x c "$TMP_DIR/t34_lazy_glob_host.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
+    -o "$TMP_DIR/t34_lazy_glob"
+assert_eq "cabi_no_main_concurrent_lazy_globals" "1|10" "$(GEISHA_GC_HEAP_WORDS=4096 "$TMP_DIR/t34_lazy_glob")"
 
 # Negative checks for `extern data`, `extern init`, and `cFnPtr`
 cat > "$TMP_DIR/t34_bad_cstruct.gsa" << 'EOF'

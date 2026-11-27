@@ -16,6 +16,7 @@ void gc_init(size_t init_size_words);
 void gc_init_with_stack(size_t init_size_words, void *stack_anchor);
 void gc_enable_generational(void);
 void gc_register_root(void **slot);
+void gc_run_globals_init_once(int32_t *state, void (*init_fn)(void));
 
 /* Multicore thread lifecycle & cooperative safepoint / lock-free blocking-section protocol */
 void gc_thread_attach(void *stack_anchor);

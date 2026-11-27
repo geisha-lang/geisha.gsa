@@ -321,9 +321,14 @@ void gc_init_with_stack(int64_t heap_words, void *stack_anchor)
 
 void gc_register_root(void **slot)
 {
-    if (slot != NULL && gs_root_count < MAX_WASM_ROOTS) {
-        gs_roots[gs_root_count++] = slot;
+    if (slot == NULL) return;
+    for (uint32_t i = 0; i < gs_root_count; i++) {
+        if (gs_roots[i] == slot) return;
     }
+    if (gs_root_count >= MAX_WASM_ROOTS) {
+        __builtin_trap();
+    }
+    gs_roots[gs_root_count++] = slot;
 }
 
 /* ---- Frame-boundary Mark-Sweep GC (safe to call from JS between WASM entry points) ---- */
