@@ -4630,4 +4630,142 @@ EOF
     fi
 fi
 
+echo "[Test 41] Numeric parsing/round-trip, IntMap avalanche, NaN != NaN, JS sys/path externs & zeroed arrayNew..."
+cat > "$TMP_DIR/t41_semantics.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.str.{parseInt, parseInt64, parseFloat, floatToStr, i64ToStr, intToStr, boolToStr}
+use std.map.{intMapNew, intMapInsert, intMapGet}
+use std.codec.{Value, VFloat, VInt, VObj}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use std.toml.{parse as tomlParse, stringify as tomlStringify}
+use std.path.pathJoin
+use sys.io.{print, eprint}
+
+def isErrRes(r: Result a b): Bool = match r {
+    Err(_) -> true,
+    Ok(_) -> false,
+}
+
+def main(): Void = {
+    // 1. Strict Int64 & Int overflow checks (including 2^64 wrap-to-zero regression)
+    let ov1 = isErrRes(parseInt64("9223372036854775808"));
+    let ov2 = isErrRes(parseInt64("-9223372036854775809"));
+    let ov3 = isErrRes(parseInt64("18446744073709551616"));
+    let ov4 = isErrRes(parseInt("18446744073709551616"));
+    let ov5 = isErrRes(jsonParse("18446744073709551616"));
+    let ov6 = isErrRes(tomlParse("x = 18446744073709551616\n"));
+    let ov7 = isErrRes(tomlParse("x = 0x1_0000_0000_0000_0000\n"));
+    let okMin = match parseInt64("-9223372036854775808") {
+        Ok(v) -> i64ToStr(v) == "-9223372036854775808",
+        Err(_) -> false,
+    };
+    let okMax = match parseInt64("9223372036854775807") {
+        Ok(v) -> i64ToStr(v) == "9223372036854775807",
+        Err(_) -> false,
+    };
+
+    // 2. Float lossless round-trip (tiny, >= 2^31, 0.1+0.2, -0.0) & JSON non-finite handling
+    let tiny = 0.0000001;
+    let huge = 1234567890123.5;
+    let ulp = 0.1 + 0.2;
+    let negZ = -0.0;
+    let rtTiny = match jsonParse(jsonStringify(VFloat(tiny))) {
+        Ok(VFloat(x)) -> floatToBits64(x) == floatToBits64(tiny),
+        _ -> false,
+    };
+    let rtHuge = match jsonParse(jsonStringify(VFloat(huge))) {
+        Ok(VFloat(x)) -> floatToBits64(x) == floatToBits64(huge),
+        _ -> false,
+    };
+    let rtUlp = match parseFloat(floatToStr(ulp)) {
+        Ok(x) -> floatToBits64(x) == floatToBits64(ulp),
+        _ -> false,
+    };
+    let rtNegZ = floatToStr(negZ) == "-0.0";
+    let nanVal = mathSqrt(-1.0);
+    let jsonNan = jsonStringify(VFloat(nanVal)) == "null" && isErrRes(jsonParse("1e500"));
+    let tomlRt = match tomlParse(tomlStringify(VObj([("a", VFloat(tiny)), ("b", VFloat(huge)), ("c", VFloat(nanVal))]))) {
+        Ok(VObj(Cons((_, VFloat(a)), Cons((_, VFloat(b)), Cons((_, VFloat(c)), Nil))))) ->
+            floatToBits64(a) == floatToBits64(tiny) && floatToBits64(b) == floatToBits64(huge) && (c != c),
+        _ -> false,
+    };
+
+    // 3. IEEE-754 NaN != NaN & NaN == NaN consistency across backends
+    let nanOk = (nanVal != nanVal) && !(nanVal == nanVal);
+    let nan32 = floatToF32(nanVal);
+    let nan32Ok = (nan32 != nan32) && !(nan32 == nan32);
+
+    // 4. IntMap hash distribution on consecutive & stride-16 keys
+    let mp = intMapNew();
+    let i = cellNew(0);
+    while (cellGet(i) < 1024) {
+        let k = cellGet(i) * 16;
+        intMapInsert(mp, k, cellGet(i) + 1);
+        cellSet(i, cellGet(i) + 1)
+    };
+    let mapOk = match (intMapGet(mp, 0), intMapGet(mp, 16368), intMapGet(mp, 16384)) {
+        (Some(1), Some(1024), None) -> true,
+        _ -> false,
+    };
+
+    // 5. arrayNew zero-bit-pattern specialization (small + large > 4096B) & -0.0 preservation
+    let smallZ = arrayNew(16, 0);
+    let largeZ = arrayNew(2048, intToI64(0));
+    let negZeroArr = arrayNew(4, -0.0);
+    let arrOk =
+        arrayGet(smallZ, 0) == 0 && arrayGet(smallZ, 15) == 0
+        && arrayGet(largeZ, 0) == intToI64(0) && arrayGet(largeZ, 2047) == intToI64(0)
+        && floatToBits64(arrayGet(negZeroArr, 3)) == floatToBits64(-0.0);
+
+    // 6. std.path & sys.io across native and JS targets
+    let pOk = strLen(pathJoin("a", "b")) == 3;
+    let allOk =
+        ov1 && ov2 && ov3 && ov4 && ov5 && ov6 && ov7 && okMin && okMax
+        && rtTiny && rtHuge && rtUlp && rtNegZ && jsonNan && tomlRt
+        && nanOk && nan32Ok && mapOk && arrOk && pOk;
+    eprint("");
+    print(boolToStr(allOk) + "\n")
+}
+EOF
+"$GEISHA_BIN" --src-root src -o "$TMP_DIR/t41_semantics" "$TMP_DIR/t41_semantics.gsa"
+assert_eq "semantics_native_O2" "true" "$("$TMP_DIR/t41_semantics")"
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --src-root src --target js -o "$TMP_DIR/t41_semantics.mjs" "$TMP_DIR/t41_semantics.gsa"
+    assert_eq "semantics_js_esm" "true" "$(node "$TMP_DIR/t41_semantics.mjs")"
+fi
+if [ "${WASM_AVAILABLE:-0}" = "1" ] && command -v node >/dev/null 2>&1; then
+    cat > "$TMP_DIR/t41_wasm_sem.gsa" << 'EOF'
+use std.result.{Result, Ok, Err}
+use std.str.{parseInt64, parseFloat, floatToStr}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use std.codec.{Value, VFloat}
+
+pub def checkWasmSemantics(): Int = {
+    let ov = match parseInt64("18446744073709551616") { Err(_) -> true, Ok(_) -> false };
+    let tiny = 0.0000001;
+    let huge = 1234567890123.5;
+    let ulp = 0.1 + 0.2;
+    let rt1 = match jsonParse(jsonStringify(VFloat(tiny))) { Ok(VFloat(x)) -> floatToBits64(x) == floatToBits64(tiny), _ -> false };
+    let rt2 = match jsonParse(jsonStringify(VFloat(huge))) { Ok(VFloat(x)) -> floatToBits64(x) == floatToBits64(huge), _ -> false };
+    let rt3 = match parseFloat(floatToStr(ulp)) { Ok(x) -> floatToBits64(x) == floatToBits64(ulp), _ -> false };
+    let nanVal = mathSqrt(-1.0);
+    let nanOk = (nanVal != nanVal) && !(nanVal == nanVal);
+    let zArr = arrayNew(2048, intToI64(0));
+    let arrOk = arrayGet(zArr, 2047) == intToI64(0);
+    if (ov && rt1 && rt2 && rt3 && nanOk && arrOk) 1 else 0
+}
+EOF
+    "$GEISHA_BIN" --src-root src --target wasm32 --runtime "${WASM_RT:-build/wasm_rt.o}" --export checkWasmSemantics -o "$TMP_DIR/t41_wasm_sem.wasm" "$TMP_DIR/t41_wasm_sem.gsa"
+    T41_WASM_OUT="$(node -e '
+        const fs = require("fs");
+        (async () => {
+            const m = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]), { env: { gs_log: () => {} } });
+            if (typeof m.instance.exports.__geisha_init === "function") m.instance.exports.__geisha_init();
+            console.log(m.instance.exports.checkWasmSemantics());
+        })();
+    ' "$TMP_DIR/t41_wasm_sem.wasm")"
+    assert_eq "semantics_wasm32" "1" "$T41_WASM_OUT"
+fi
+
 echo "All $PASS end-to-end test suites passed!"

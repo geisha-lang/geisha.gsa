@@ -44,6 +44,59 @@ void putF32(const float f, void *fv)
     fflush(stdout);
 }
 
+int32_t gs_fmt_f64(double f, char *buf, int32_t cap)
+{
+    if (buf == NULL || cap <= 0) return 0;
+    uint64_t bits = 0;
+    memcpy(&bits, &f, sizeof(bits));
+    const char *special = NULL;
+    if ((bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL) {
+        if ((bits & 0x000FFFFFFFFFFFFFULL) != 0ULL) {
+            special = "NaN";
+        } else {
+            special = (bits >> 63) ? "-inf" : "inf";
+        }
+    } else if ((bits & 0x7FFFFFFFFFFFFFFFULL) == 0ULL) {
+        special = (bits >> 63) ? "-0.0" : "0.0";
+    }
+    if (special != NULL) {
+        int32_t n = (int32_t)strlen(special);
+        if (n > cap) n = cap;
+        memcpy(buf, special, (size_t)n);
+        return n;
+    }
+
+    char tmp[64];
+    int n = snprintf(tmp, sizeof(tmp) - 4, "%.15g", f);
+    for (int i = 0; i < n; i++) {
+        if (tmp[i] == ',') tmp[i] = '.';
+    }
+    if (n <= 0 || strtod(tmp, NULL) != f) {
+        n = snprintf(tmp, sizeof(tmp) - 4, "%.17g", f);
+        for (int i = 0; i < n; i++) {
+            if (tmp[i] == ',') tmp[i] = '.';
+        }
+    }
+    if (n <= 0) return 0;
+
+    int has_dot_or_exp = 0;
+    for (int i = 0; i < n; i++) {
+        char c = tmp[i];
+        if (c == '.' || c == 'e' || c == 'E') {
+            has_dot_or_exp = 1;
+            break;
+        }
+    }
+    if (!has_dot_or_exp && (size_t)(n + 2) < sizeof(tmp)) {
+        tmp[n++] = '.';
+        tmp[n++] = '0';
+        tmp[n] = '\0';
+    }
+    int32_t out_n = (n > cap) ? cap : (int32_t)n;
+    memcpy(buf, tmp, (size_t)out_n);
+    return out_n;
+}
+
 int32_t gs_str_cmp(const char *a, const char *b)
 {
     if (a == b) return 0;

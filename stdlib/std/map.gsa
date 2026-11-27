@@ -113,8 +113,11 @@ pub data IntMap v {
     MkIntMap(Cell (MutArray (List (Int, v))), Cell Int),
 }
 
-def hashIntKey(k: Int): Int =
-    ((k * 265443576) ^ (k >>> 16)) & 2147483647
+def hashIntKey(k: Int): Int = {
+    let h1 = (k ^ (k >>> 16)) * 73244475;
+    let h2 = (h1 ^ (h1 >>> 16)) * 73244475;
+    (h2 ^ (h2 >>> 16)) & 2147483647
+}
 
 pub def intMapNew(): IntMap v =
     MkIntMap(cellNew(arrayNew(16, Nil)), cellNew(0))

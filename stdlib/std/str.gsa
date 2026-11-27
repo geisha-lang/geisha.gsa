@@ -7,6 +7,7 @@ use std.list.listRev
 use std.buf.{bufNew, bufPushByte, bufPushStr, bufPushInt, bufToString}
 
 extern "strtod" def c_strtod(s: String, endptr: Ptr): Float
+extern "gs_fmt_f64" def c_fmt_f64(f: Float, buf: Ptr, cap: Int): Int
 
 pub def strIsEmpty(s: String): Bool = strLen(s) == 0
 
@@ -92,47 +93,11 @@ pub def i64ToHex16(bits: Int64): String = {
 
 pub def floatToHex16(f: Float): String = i64ToHex16(floatToBits64(f))
 
+/// Format IEEE-754 `Float` with lossless round-trip precision (`NaN`, `inf`, `-inf`, `-0.0`, scientific notation for tiny/huge magnitudes).
 pub def floatToStr(f: Float): String = {
-    let bits = floatToBits64(f);
-    let expMask = (intToI64(2047)) << 52;
-    let fracMask = (intToI64(1) << 52) - intToI64(1);
-    if ((bits & expMask) == expMask) {
-        if ((bits & fracMask) != intToI64(0)) "NaN"
-        else if (bits < intToI64(0)) "-inf"
-        else "inf"
-    } else {
-        let b = bufNew();
-        let val = cellNew(f);
-        if (floatToBits64(cellGet(val)) < intToI64(0)) {
-            bufPushByte(b, 45);
-            cellSet(val, -cellGet(val))
-        } else ();
-        let v = cellGet(val);
-        let whole = floatToInt(v);
-        bufPushInt(b, whole);
-        bufPushByte(b, 46);
-        let frac = cellNew(v - intToFloat(whole));
-        let i = cellNew(0);
-        let digits = arrayNew(6, 0);
-        while (cellGet(i) < 6) {
-            let scaled = cellGet(frac) * 10.0;
-            let d = floatToInt(scaled);
-            let clamped = if (d < 0) 0 else if (d > 9) 9 else d;
-            arraySet(digits, cellGet(i), clamped);
-            cellSet(frac, scaled - intToFloat(clamped));
-            cellSet(i, cellGet(i) + 1)
-        };
-        let lastNonZero = cellNew(5);
-        while (cellGet(lastNonZero) > 0 && arrayGet(digits, cellGet(lastNonZero)) == 0) {
-            cellSet(lastNonZero, cellGet(lastNonZero) - 1)
-        };
-        let k = cellNew(0);
-        while (cellGet(k) <= cellGet(lastNonZero)) {
-            bufPushByte(b, 48 + arrayGet(digits, cellGet(k)));
-            cellSet(k, cellGet(k) + 1)
-        };
-        bufToString(b)
-    }
+    let scratch = ptrAllocBytes(64);
+    let n = c_fmt_f64(f, scratch, 64);
+    ptrSliceToString(scratch, n)
 }
 
 pub def boolToStr(v: Bool): String = if (v) "true" else "false"
@@ -224,6 +189,7 @@ pub def strTrim(s: String): String = {
     strSlice(s, cellGet(lo), cellGet(hi))
 }
 
+/// Parse a signed 64-bit decimal integer with strict range checking (`[-9223372036854775808, 9223372036854775807]`).
 pub def parseInt64(raw: String): Result Int64 String = {
     let s = strTrim(raw);
     let len = strLen(s);
@@ -236,21 +202,42 @@ pub def parseInt64(raw: String): Result Int64 String = {
         else {
             let acc = cellNew(intToI64(0));
             let i = cellNew(start);
-            let ok = cellNew(true);
+            let invalid = cellNew(false);
+            let overflow = cellNew(false);
             let ten = intToI64(10);
-            while (cellGet(i) < len && cellGet(ok)) {
+            let maxI64 = (intToI64(2147483647) << 32) | ((intToI64(65535) << 16) | intToI64(65535));
+            let maxDiv10 = maxI64 / ten;
+            let minDiv10 = intToI64(0) - maxDiv10;
+            let seven64 = intToI64(7);
+            let eight64 = intToI64(8);
+            while (cellGet(i) < len && !cellGet(invalid)) {
                 let b = strByteAt(s, cellGet(i));
                 if (!isDigitByte(b)) {
-                    cellSet(ok, false)
+                    cellSet(invalid, true)
                 } else {
-                    let digit = intToI64(b - 48);
-                    let next = if (neg) cellGet(acc) * ten - digit else cellGet(acc) * ten + digit;
-                    cellSet(acc, next);
+                    if (!cellGet(overflow)) {
+                        let digit = intToI64(b - 48);
+                        let cur = cellGet(acc);
+                        if (neg) {
+                            if (cur < minDiv10 || (cur == minDiv10 && digit > eight64)) {
+                                cellSet(overflow, true)
+                            } else {
+                                cellSet(acc, cur * ten - digit)
+                            }
+                        } else {
+                            if (cur > maxDiv10 || (cur == maxDiv10 && digit > seven64)) {
+                                cellSet(overflow, true)
+                            } else {
+                                cellSet(acc, cur * ten + digit)
+                            }
+                        }
+                    } else ();
                     cellSet(i, cellGet(i) + 1)
                 }
             };
-            if (cellGet(ok)) Ok(cellGet(acc))
-            else Err("invalid integer: " + raw)
+            if (cellGet(invalid)) Err("invalid integer: " + raw)
+            else if (cellGet(overflow)) Err("integer overflow: " + raw)
+            else Ok(cellGet(acc))
         }
     }
 }

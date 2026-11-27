@@ -579,6 +579,12 @@ int32_t gs_str_cmp(const char *a, const char *b)
 
 /* ---- Freestanding `strtod` and entropy seed for `std.str` / `std.rand` ---- */
 
+static const double gs_exact_pow10[23] = {
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
+    1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+    1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+};
+
 double strtod(const char *s, char **endptr)
 {
     if (s == NULL) {
@@ -592,19 +598,36 @@ double strtod(const char *s, char **endptr)
     if (*p == '-') { neg = 1; p++; }
     else if (*p == '+') { p++; }
 
-    double val = 0.0;
+    uint64_t mant = 0;
+    int sig_digits = 0;
+    int dec_exp = 0;
     int any = 0;
     while (*p >= '0' && *p <= '9') {
-        val = val * 10.0 + (double)(*p - '0');
+        int d = *p - '0';
+        if (mant != 0 || d != 0) {
+            if (sig_digits < 19) {
+                mant = mant * 10ULL + (uint64_t)d;
+                sig_digits++;
+            } else {
+                dec_exp++;
+            }
+        }
         p++;
         any = 1;
     }
     if (*p == '.') {
         p++;
-        double scale = 0.1;
         while (*p >= '0' && *p <= '9') {
-            val += (double)(*p - '0') * scale;
-            scale *= 0.1;
+            int d = *p - '0';
+            if (mant != 0 || d != 0) {
+                if (sig_digits < 19) {
+                    mant = mant * 10ULL + (uint64_t)d;
+                    sig_digits++;
+                    dec_exp--;
+                }
+            } else {
+                dec_exp--;
+            }
             p++;
             any = 1;
         }
@@ -613,31 +636,47 @@ double strtod(const char *s, char **endptr)
         if (endptr != NULL) *endptr = (char *)s;
         return 0.0;
     }
+    int exp = 0;
     if (*p == 'e' || *p == 'E') {
         const char *ep = p + 1;
         int eneg = 0;
         if (*ep == '-') { eneg = 1; ep++; }
         else if (*ep == '+') { ep++; }
-        int exp = 0;
+        int ev = 0;
         int eany = 0;
         while (*ep >= '0' && *ep <= '9') {
-            if (exp < 1000) exp = exp * 10 + (*ep - '0');
+            if (ev < 10000) ev = ev * 10 + (*ep - '0');
             ep++;
             eany = 1;
         }
         if (eany) {
             p = ep;
-            double factor = 1.0;
-            double base = eneg ? 0.1 : 10.0;
-            while (exp > 0) {
-                if (exp & 1) factor *= base;
-                base *= base;
-                exp >>= 1;
-            }
-            val *= factor;
+            exp = eneg ? -ev : ev;
         }
     }
     if (endptr != NULL) *endptr = (char *)p;
+    if (mant == 0ULL) return neg ? -0.0 : 0.0;
+
+    int total_exp = dec_exp + exp;
+    double val = (double)mant;
+    if (total_exp >= 0 && total_exp <= 22) {
+        val *= gs_exact_pow10[total_exp];
+    } else if (total_exp < 0 && total_exp >= -22) {
+        val /= gs_exact_pow10[-total_exp];
+    } else {
+        int e = total_exp;
+        int eneg = 0;
+        if (e < 0) { eneg = 1; e = -e; }
+        double factor = 1.0;
+        double base = eneg ? 0.1 : 10.0;
+        unsigned int ue = (unsigned int)(e > 400 ? 400 : e);
+        while (ue > 0u) {
+            if (ue & 1u) factor *= base;
+            base *= base;
+            ue >>= 1u;
+        }
+        val *= factor;
+    }
     return neg ? -val : val;
 }
 
@@ -710,16 +749,223 @@ void putNumber(const int32_t n, void *fv)
     gs_wasm_host_log(buf, pos);
 }
 
+void *memset(void *dst, int c, size_t n)
+{
+    unsigned char *d = (unsigned char *)dst;
+    unsigned char b = (unsigned char)c;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = b;
+    }
+    return dst;
+}
+
+static double wasm_pow10(int exp)
+{
+    double factor = 1.0;
+    double base = (exp < 0) ? 0.1 : 10.0;
+    unsigned int e = (exp < 0) ? (unsigned int)(-exp) : (unsigned int)exp;
+    while (e > 0u) {
+        if (e & 1u) factor *= base;
+        base *= base;
+        e >>= 1u;
+    }
+    return factor;
+}
+
+static int wasm_render_sig(int neg, uint64_t sig, int prec, int exp10, char *out)
+{
+    char digits[20];
+    for (int i = prec - 1; i >= 0; i--) {
+        digits[i] = (char)('0' + (sig % 10ULL));
+        sig /= 10ULL;
+    }
+    if (sig > 0ULL) {
+        /* Rounding carried from 999..9 to 1000..0 */
+        digits[0] = '1';
+        for (int i = 1; i < prec; i++) digits[i] = '0';
+        exp10 += 1;
+    }
+
+    int len = prec;
+    while (len > 1 && digits[len - 1] == '0') {
+        len--;
+    }
+
+    int pos = 0;
+    if (neg) out[pos++] = '-';
+
+    if (exp10 >= -4 && exp10 < prec) {
+        if (exp10 >= 0) {
+            int int_digits = exp10 + 1;
+            for (int i = 0; i < int_digits; i++) {
+                out[pos++] = (i < len) ? digits[i] : '0';
+            }
+            out[pos++] = '.';
+            if (len > int_digits) {
+                for (int i = int_digits; i < len; i++) {
+                    out[pos++] = digits[i];
+                }
+            } else {
+                out[pos++] = '0';
+            }
+        } else {
+            out[pos++] = '0';
+            out[pos++] = '.';
+            int zeros = -exp10 - 1;
+            for (int i = 0; i < zeros; i++) out[pos++] = '0';
+            for (int i = 0; i < len; i++) out[pos++] = digits[i];
+        }
+    } else {
+        out[pos++] = digits[0];
+        if (len > 1) {
+            out[pos++] = '.';
+            for (int i = 1; i < len; i++) out[pos++] = digits[i];
+        }
+        out[pos++] = 'e';
+        int e = exp10;
+        if (e < 0) {
+            out[pos++] = '-';
+            e = -e;
+        } else {
+            out[pos++] = '+';
+        }
+        if (e >= 100) {
+            out[pos++] = (char)('0' + (e / 100));
+            e %= 100;
+            out[pos++] = (char)('0' + (e / 10));
+            out[pos++] = (char)('0' + (e % 10));
+        } else {
+            out[pos++] = (char)('0' + (e / 10));
+            out[pos++] = (char)('0' + (e % 10));
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+static uint64_t wasm_extract_sig(double abs_f, int exp10, int prec)
+{
+    if (prec <= 15) {
+        int shift = (prec - 1) - exp10;
+        double scaled = abs_f;
+        if (shift > 300) {
+            scaled *= wasm_pow10(300);
+            scaled *= wasm_pow10(shift - 300);
+        } else if (shift < -300) {
+            scaled *= wasm_pow10(-300);
+            scaled *= wasm_pow10(shift + 300);
+        } else if (shift >= 0 && shift <= 22) {
+            scaled *= gs_exact_pow10[shift];
+        } else if (shift < 0 && shift >= -22) {
+            scaled /= gs_exact_pow10[-shift];
+        } else {
+            scaled *= wasm_pow10(shift);
+        }
+        return (uint64_t)(scaled + 0.5);
+    } else {
+        /* Split 17 digits into top 9 (< 1e9 < 2^30) + bottom 8 so double never loses low digits */
+        int shift9 = 8 - exp10;
+        double scaled9 = abs_f;
+        if (shift9 > 300) {
+            scaled9 *= wasm_pow10(300);
+            scaled9 *= wasm_pow10(shift9 - 300);
+        } else if (shift9 < -300) {
+            scaled9 *= wasm_pow10(-300);
+            scaled9 *= wasm_pow10(shift9 + 300);
+        } else if (shift9 >= 0 && shift9 <= 22) {
+            scaled9 *= gs_exact_pow10[shift9];
+        } else if (shift9 < 0 && shift9 >= -22) {
+            scaled9 /= gs_exact_pow10[-shift9];
+        } else {
+            scaled9 *= wasm_pow10(shift9);
+        }
+        uint64_t hi = (uint64_t)scaled9;
+        double rem = (scaled9 - (double)hi) * 1e8;
+        if (rem < 0.0) rem = 0.0;
+        uint64_t lo = (uint64_t)(rem + 0.5);
+        return hi * 100000000ULL + lo;
+    }
+}
+
+int32_t gs_fmt_f64(double f, char *buf, int32_t cap)
+{
+    if (buf == NULL || cap <= 0) return 0;
+    union { double d; uint64_t u; } u;
+    u.d = f;
+    const char *special = NULL;
+    if ((u.u & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL) {
+        if ((u.u & 0x000FFFFFFFFFFFFFULL) != 0ULL) {
+            special = "NaN";
+        } else {
+            special = (u.u >> 63) ? "-inf" : "inf";
+        }
+    } else if ((u.u & 0x7FFFFFFFFFFFFFFFULL) == 0ULL) {
+        special = (u.u >> 63) ? "-0.0" : "0.0";
+    }
+    if (special != NULL) {
+        int32_t n = (int32_t)gs_strlen(special);
+        if (n > cap) n = cap;
+        gs_memcpy(buf, special, n);
+        return n;
+    }
+
+    int neg = (u.u >> 63) != 0ULL;
+    double abs_f = neg ? -f : f;
+    double m = abs_f;
+    int exp10 = 0;
+    while (m >= 1e64) { m *= 1e-64; exp10 += 64; }
+    while (m >= 1e8) { m *= 1e-8; exp10 += 8; }
+    while (m >= 10.0) { m *= 0.1; exp10 += 1; }
+    while (m < 1e-63) { m *= 1e64; exp10 -= 64; }
+    while (m < 1e-7) { m *= 1e8; exp10 -= 8; }
+    while (m < 1.0) { m *= 10.0; exp10 -= 1; }
+
+    char tmp[48];
+    uint64_t sig15 = wasm_extract_sig(abs_f, exp10, 15);
+    int n = wasm_render_sig(neg, sig15, 15, exp10, tmp);
+    if (strtod(tmp, NULL) != f) {
+        uint64_t sig17 = wasm_extract_sig(abs_f, exp10, 17);
+        n = wasm_render_sig(neg, sig17, 17, exp10, tmp);
+        if (strtod(tmp, NULL) != f) {
+            char alt[48];
+            for (int delta = 1; delta <= 4; delta++) {
+                int n_up = wasm_render_sig(neg, sig17 + (uint64_t)delta, 17, exp10, alt);
+                if (strtod(alt, NULL) == f) {
+                    gs_memcpy(tmp, alt, n_up + 1);
+                    n = n_up;
+                    break;
+                }
+                if (sig17 >= (uint64_t)delta) {
+                    int n_dn = wasm_render_sig(neg, sig17 - (uint64_t)delta, 17, exp10, alt);
+                    if (strtod(alt, NULL) == f) {
+                        gs_memcpy(tmp, alt, n_dn + 1);
+                        n = n_dn;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    int32_t out_n = (n > cap) ? cap : (int32_t)n;
+    gs_memcpy(buf, tmp, out_n);
+    return out_n;
+}
+
 void putFloat(const double f, void *fv)
 {
-    (void)f;
     (void)fv;
+    char buf[48];
+    int32_t n = gs_fmt_f64(f, buf, (int32_t)sizeof(buf));
+    gs_wasm_host_log(buf, n);
 }
 
 void putF32(const float f, void *fv)
 {
-    (void)f;
     (void)fv;
+    char buf[48];
+    int32_t n = gs_fmt_f64((double)f, buf, (int32_t)sizeof(buf));
+    gs_wasm_host_log(buf, n);
 }
 
 /* ---- JS/WASM interop bridge exports (exported by linker unless `--slim-runtime`) ---- */

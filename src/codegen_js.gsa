@@ -273,6 +273,7 @@ data JsEmitCtx {
         jcProg: CoreProgram,
         jcBuf: StringBuf,
         jcTmpCnt: Cell Int,
+        jcUsedIdents: StrMap Bool,
         jcIndent: Cell Int,
         jcCurFnName: String,
         jcTcoActive: Bool,
@@ -311,14 +312,23 @@ def lookupLocalJs(locals: List (String, String), name: String): Option String = 
 
 def bindLocalJs(ctx: JsEmitCtx, locals: List (String, String), origName: String): (String, List (String, String)) = {
     let base = jsLocalIdent(origName);
-    let jsName = match lookupLocalJs(locals, origName) {
-        None -> base,
-        Some(_) -> {
-            let n = cellGet(ctx.jcTmpCnt) + 1;
-            cellSet(ctx.jcTmpCnt, n);
-            base + "_" + intToStr(n)
-        },
-    };
+    let jsName =
+        if (!strMapContains(ctx.jcUsedIdents, base)) {
+            strMapInsert(ctx.jcUsedIdents, base, true);
+            base
+        } else {
+            let cand = cellNew("");
+            while (strLen(cellGet(cand)) == 0) {
+                let n = cellGet(ctx.jcTmpCnt) + 1;
+                cellSet(ctx.jcTmpCnt, n);
+                let c = base + "_" + intToStr(n);
+                if (!strMapContains(ctx.jcUsedIdents, c)) {
+                    strMapInsert(ctx.jcUsedIdents, c, true);
+                    cellSet(cand, c)
+                } else ()
+            };
+            cellGet(cand)
+        };
     (jsName, Cons((origName, jsName), locals))
 }
 
@@ -967,11 +977,16 @@ def emitExternCallJs(ext: ExternDef, argExprs: List String): String =
         let link = ext.extLink;
         let joined = strJoin(argExprs, ", ");
         if (link == "strtod") "_gs_strtod(" + nthStr(argExprs, 0) + ")"
+        else if (link == "gs_fmt_f64") "_gs_fmt_f64(" + joined + ")"
         else if (link == "gs_sys_rand_seed") "_gs_rand_seed()"
         else if (link == "gs_sys_time_now_ms") "BigInt(Date.now())"
         else if (link == "gs_sys_time_mono_ms") "BigInt(Math.trunc(performance.now()))"
         else if (link == "gs_sys_time_mono_ns") "BigInt(Math.trunc(performance.now() * 1e6))"
-        else if (link == "write") "_gs_sys_write(" + joined + ")"
+        else if (link == "gs_sys_fd_write" || link == "write") "_gs_sys_write(" + joined + ")"
+        else if (link == "gs_sys_host_os") "_gs_host_os()"
+        else if (link == "gs_sys_host_arch") "_gs_host_arch()"
+        else if (link == "gs_sys_exe_path") "_gs_exe_path()"
+        else if (link == "getenv") "_gs_getenv(" + nthStr(argExprs, 0) + ")"
         else if (link == "exit") "_gs_sys_exit(" + nthStr(argExprs, 0) + ")"
         else if (strStartsWith(link, "js:")) {
             let jsPath = strSlice(link, 3, strLen(link));
@@ -1403,12 +1418,18 @@ def emitJsRuntimePrelude(out: StringBuf): Void = {
     bufPushStr(out, "function _gs_handleNew(v) { if (v === null || v === undefined) return 0n; const h = _gs_nextHandle++; _gs_handles.set(h, v); return h; }\n");
     bufPushStr(out, "function _gs_handleGet(h) { return _gs_handles.has(h) ? _gs_handles.get(h) : null; }\n");
     bufPushStr(out, "function _gs_handleFree(h) { _gs_handles.delete(h); }\n");
+    bufPushStr(out, "function _gs_cstrPtr(s) { const b = _gs_enc.encode(String(s)); const z = new Uint8Array(b.length + 1); z.set(b, 0); z[b.length] = 0; return { buf: z, off: 0 }; }\n");
     bufPushStr(out, "function _gs_strtod(s) { const v = Number.parseFloat(_gs_toJsStr(s)); return Number.isNaN(v) ? 0.0 : v; }\n");
+    bufPushStr(out, "function _gs_fmt_f64(f, p, cap) { let s; if (Number.isNaN(f)) s = \"NaN\"; else if (f === Infinity) s = \"inf\"; else if (f === -Infinity) s = \"-inf\"; else if (Object.is(f, -0)) s = \"-0.0\"; else { s = f.toString(); if (!s.includes(\".\") && !s.includes(\"e\") && !s.includes(\"E\")) s += \".0\"; } const b = _gs_enc.encode(s); const n = Math.min(b.length, Math.max(0, cap | 0)); p.buf.set(b.subarray(0, n), p.off); return n | 0; }\n");
     bufPushStr(out, "let _gs_seed = 0x243f6a8885a308d3n;\n");
     bufPushStr(out, "function _gs_rand_seed() { _gs_seed = BigInt.asIntN(64, _gs_seed + 0x9e3779b97f4a7c15n); return _gs_seed; }\n");
+    bufPushStr(out, "function _gs_host_os() { if (typeof process !== \"undefined\" && typeof process.platform === \"string\") { const p = process.platform; return _gs_cstrPtr(p === \"win32\" ? \"windows\" : (p === \"darwin\" ? \"macos\" : (p === \"linux\" ? \"linux\" : p))); } return _gs_cstrPtr(\"js\"); }\n");
+    bufPushStr(out, "function _gs_host_arch() { if (typeof process !== \"undefined\" && typeof process.arch === \"string\") { const a = process.arch; return _gs_cstrPtr(a === \"x64\" ? \"x86_64\" : a); } return _gs_cstrPtr(\"js\"); }\n");
+    bufPushStr(out, "function _gs_exe_path() { return (typeof process !== \"undefined\" && Array.isArray(process.argv) && typeof process.argv[1] === \"string\") ? _gs_cstrPtr(process.argv[1]) : null; }\n");
+    bufPushStr(out, "function _gs_getenv(name) { const k = _gs_toJsStr(name); if (typeof process !== \"undefined\" && process.env && Object.prototype.hasOwnProperty.call(process.env, k) && process.env[k] !== undefined) return _gs_cstrPtr(process.env[k]); return null; }\n");
     bufPushStr(out, "function _gs_printLn(s) { const t = _gs_toJsStr(s); if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t); else console.log(t); }\n");
     bufPushStr(out, "function _gs_putStr(s) { const t = _gs_toJsStr(s); if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(t); else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t); else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(t); else console.log(t); }\n");
-    bufPushStr(out, "function _gs_sys_write(fd, s, n) { const t = _gs_dec.decode(s.subarray(0, Number(n))); if (fd === 2 && typeof process !== \"undefined\" && process.stderr) process.stderr.write(t); else _gs_putStr(t); return BigInt(n); }\n");
+    bufPushStr(out, "function _gs_sys_write(fd, s, n) { const len = Math.max(0, Math.min(s.length, Number(n))); const t = _gs_dec.decode(s.subarray(0, len)); if (fd === 2) { if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(t); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(t); else console.error(t); } else { _gs_putStr(t); } return BigInt(len); }\n");
     bufPushStr(out, "function _gs_sys_exit(c) { if (typeof process !== \"undefined\" && typeof process.exit === \"function\") process.exit(c | 0); throw new Error(\"Geisha exit(\" + (c | 0) + \")\"); }\n");
     bufPushStr(out, "function _gs_sysArgc() { return (typeof process !== \"undefined\" && Array.isArray(process.argv)) ? Math.max(0, process.argv.length - 1) | 0 : 0; }\n");
     bufPushStr(out, "function _gs_sysArgv(i) { return (typeof process !== \"undefined\" && Array.isArray(process.argv) && i >= 0 && i + 1 < process.argv.length) ? _gs_enc.encode(process.argv[i + 1]) : _gs_emptyStr; }\n");
@@ -1425,12 +1446,14 @@ def emitJsFunction(prog: CoreProgram, out: StringBuf, fd: FunDef): Void = {
     let paramsRev: Cell (List String) = cellNew(Nil);
     let initLocals: Cell (List (String, String)) = cellNew(Nil);
     let tmpCnt = cellNew(0);
+    let usedIdents: StrMap Bool = strMapNew();
     let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
     let tco = !hasFvs && hasSelfTailCall(fd.fnName, fd.fnBody);
     let tmpCtx = MkJsEmitCtx {
         jcProg: prog,
         jcBuf: out,
         jcTmpCnt: tmpCnt,
+        jcUsedIdents: usedIdents,
         jcIndent: cellNew(1),
         jcCurFnName: fd.fnName,
         jcTcoActive: tco,
@@ -1457,6 +1480,7 @@ def emitJsFunction(prog: CoreProgram, out: StringBuf, fd: FunDef): Void = {
         jcProg: prog,
         jcBuf: out,
         jcTmpCnt: tmpCnt,
+        jcUsedIdents: usedIdents,
         jcIndent: cellNew(1),
         jcCurFnName: fd.fnName,
         jcTcoActive: tco,
@@ -1759,6 +1783,7 @@ pub def emitProgramJs(prog: CoreProgram, exports: List String, noMain: Bool): St
         jcProg: prog,
         jcBuf: out,
         jcTmpCnt: cellNew(0),
+        jcUsedIdents: strMapNew(),
         jcIndent: cellNew(1),
         jcCurFnName: "__geisha_init",
         jcTcoActive: false,
