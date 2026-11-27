@@ -13,7 +13,7 @@ use ast.{
     ConstraintSpec, MkConstraint,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
-    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr, OpLt, OpGe,
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl, MkVarDecl,
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
@@ -1072,6 +1072,14 @@ def parseAtomExpr(p: Parser): Result Form String = {
                         let kwTok = bumpTok(p);
                         let decExpr = parseExpr(p)?;
                         let callSp = unionSpan(kwTok.span, decExpr.pos);
+                        match cellGet(decsRev) {
+                            Cons(_, _) -> Err(formatSpanDiagHint(
+                                "Parse error", callSp,
+                                "at most one `decreases` clause is allowed per `while` loop",
+                                "combine termination measures into a single non-negative `Int` expression"
+                            ))?,
+                            Nil -> (),
+                        };
                         cellSet(decsRev, Cons((callSp, decExpr), cellGet(decsRev)))
                     },
                     _ -> cellSet(moreClauses, false),
@@ -1528,6 +1536,14 @@ def parseFnContractClauses(p: Parser): Result FnContract String = {
                 let kwTok = bumpTok(p);
                 let decExpr = parseExpr(p)?;
                 let callSp = unionSpan(kwTok.span, decExpr.pos);
+                match cellGet(decRev) {
+                    Cons(_, _) -> Err(formatSpanDiagHint(
+                        "Parse error", callSp,
+                        "at most one `decreases` clause is allowed per function",
+                        "combine termination measures into a single non-negative `Int` expression"
+                    ))?,
+                    Nil -> (),
+                };
                 cellSet(decRev, Cons((callSp, decExpr), cellGet(decRev)))
             },
             _ -> cellSet(moreSpecs, false),
@@ -2575,18 +2591,54 @@ def sequenceVoidBeforeResult(ctx: TryCtx, stmt: Form, cont: Form): Form = {
                 cellGet(acc)
             },
             ExWhile(wcond, wbody) -> {
-                let innerBody = match wbody.node {
-                    ExLoopContract(_, _, b) -> b,
-                    _ -> wbody,
+                let (invs, decs, innerBody) = match wbody.node {
+                    ExLoopContract(is, ds, b) -> (is, ds, b),
+                    _ -> (Nil, Nil, wbody),
                 };
                 let loopName = freshTryHelper(ctx, "try_while");
                 let callLoop = mkForm(sPos, ExApply(mkForm(sPos, ExVar(loopName)), Nil));
+                let mkAssertForm = (asp: Span, condF: Form) -> mkForm(asp, ExApply(mkForm(asp, ExVar("assert")), [condF]));
+                let mkAssumeForm = (asp: Span, condF: Form) -> mkForm(asp, ExApply(mkForm(asp, ExVar("assume")), [condF]));
+                let prependInvs = (invList: List (Span, Form), useAssume: Bool, tailF: Form) -> {
+                    let rev = listRev(invList);
+                    let acc = cellNew(tailF);
+                    let ci = cellNew(rev);
+                    while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                        match cellGet(ci) {
+                            Cons((isp, ie), r) -> {
+                                let chk = if (useAssume) mkAssumeForm(isp, ie) else mkAssertForm(isp, ie);
+                                cellSet(acc, mkForm(sp, ExBlock([chk, cellGet(acc)])));
+                                cellSet(ci, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellGet(acc)
+                };
                 let condBinds = cellNew(Nil);
                 let cleanCond = extractValueTries(ctx, wcond, condBinds);
-                let step = sequenceVoidBeforeResult(ctx, innerBody, callLoop);
-                let lamBody = wrapTryBinds(ctx, cellGet(condBinds), mkForm(sp, ExIf(cleanCond, step, cont)));
+                let step = match decs {
+                    Cons((dsp, decExpr), _) -> {
+                        let decName = freshTryHelper(ctx, "try_dec");
+                        let decVar = mkForm(dsp, ExVar(decName));
+                        let zeroLit = mkForm(dsp, ExLit(LitInt(0)));
+                        let geZero = mkAssertForm(dsp, mkForm(dsp, ExBin(OpGe, decVar, zeroLit)));
+                        let ltPrev = mkAssertForm(dsp, mkForm(dsp, ExBin(OpLt, decExpr, decVar)));
+                        let backCont = mkForm(sp, ExBlock([ltPrev, prependInvs(invs, false, callLoop)]));
+                        let bodyRun = sequenceVoidBeforeResult(ctx, innerBody, backCont);
+                        let withGe = mkForm(sp, ExBlock([geZero, bodyRun]));
+                        mkForm(sp, ExLet(MkVarDecl { vname: decName, vscm: ScmSlot }, decExpr, withGe))
+                    },
+                    Nil -> {
+                        let backCont = prependInvs(invs, false, callLoop);
+                        sequenceVoidBeforeResult(ctx, innerBody, backCont)
+                    },
+                };
+                let branchBody = wrapTryBinds(ctx, cellGet(condBinds), mkForm(sp, ExIf(cleanCond, step, cont)));
+                let lamBody = prependInvs(invs, true, branchBody);
                 let lam = mkForm(sp, ExAbs(Nil, None, lamBody));
-                mkForm(sp, ExLet(MkVarDecl { vname: loopName, vscm: ScmSlot }, lam, callLoop))
+                let loopLet = mkForm(sp, ExLet(MkVarDecl { vname: loopName, vscm: ScmSlot }, lam, callLoop));
+                prependInvs(invs, false, loopLet)
             },
             ExIf(c, t, e) -> {
                 let joinName = freshTryHelper(ctx, "try_join");

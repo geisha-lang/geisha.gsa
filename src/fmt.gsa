@@ -1029,7 +1029,7 @@ pub def formatSource(src: String): String = {
                         let firstCode = vecGetOr(ln, fc, emptyFTok());
                         if (isContractClauseWord(firstCode.raw)) {
                             clearHanging(top);
-                            top.baseIndent + 1
+                            top.bodyIndent + 1
                         } else {
                             if (isDeclOrStmtKeyword(firstCode.raw)) {
                                 clearHanging(top)

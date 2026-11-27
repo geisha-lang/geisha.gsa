@@ -314,6 +314,36 @@ def renderModuleItems(src: String, items: List ModuleItem, showAll: Bool, out: C
                             },
                             _ -> (),
                         },
+                        ItInstance(_, _, _, methods) -> {
+                            let cm = cellNew(methods);
+                            while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                                match cellGet(cm) {
+                                    Cons(m, rm) -> {
+                                        match m.implBody.node {
+                                            ExAbs(_, _, mbody) -> {
+                                                let clines = formatContractLinesFromSrc(src, mbody);
+                                                match clines {
+                                                    Nil -> (),
+                                                    _ -> {
+                                                        cellSet(out, listAppend(cellGet(out), [prefix + "    def " + m.implName]));
+                                                        let cc = cellNew(clines);
+                                                        while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                                                            match cellGet(cc) {
+                                                                Cons(cl, rc) -> { cellSet(out, listAppend(cellGet(out), [prefix + "    " + cl])); cellSet(cc, rc) },
+                                                                Nil -> (),
+                                                            }
+                                                        }
+                                                    },
+                                                }
+                                            },
+                                            _ -> (),
+                                        };
+                                        cellSet(cm, rm)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
                         _ -> (),
                     };
                 } else ();

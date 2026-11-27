@@ -1342,6 +1342,25 @@ def hoverForWordInScope(doc: DocState, inf: InferOutput, locals: List LocalBind,
     }
 }
 
+def appendDefContractsToSig(doc: DocState, d: Def, baseSig: String): String =
+    match d.item {
+        ItForm(f) -> match f.node {
+            ExAbs(_, _, body) -> {
+                let srcForDef =
+                    if (d.dpos.fileId > 0 && d.dpos.fileId <= vecLen(doc.dsFiles)) {
+                        vecGetOr(doc.dsFiles, d.dpos.fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }).sfContent
+                    } else doc.dsText;
+                let clines = formatContractLinesFromSrc(srcForDef, body);
+                match clines {
+                    Nil -> baseSig,
+                    _ -> baseSig + "\n" + strJoin(clines, "\n"),
+                }
+            },
+            _ -> baseSig,
+        },
+        _ -> baseSig,
+    }
+
 def handleHover(ss: ServerState, params: Value): Value = {
     let uriOpt = match objGet(params, "textDocument") {
         Some(td) -> objGetStr(td, "uri"),
@@ -1363,12 +1382,13 @@ def handleHover(ss: ServerState, params: Value): Value = {
                                 let rng = Some(makeLspRange(doc.dsText, f.pos.start, f.pos.end));
                                 match f.node {
                                     ExVar(qname) -> {
-                                        let docStr = match lookupDefExact(inf.defs, qname) {
-                                            Some(d) -> docForDef(doc.dsFiles, d),
-                                            None -> "",
-                                        };
                                         let label = shortSymName(qname);
-                                        Some(makeHoverResult(formatHoverBlock(label + ": " + tyStr, docStr), rng))
+                                        let baseSig = label + ": " + tyStr;
+                                        let (sig, docStr) = match lookupDefExact(inf.defs, qname) {
+                                            Some(d) -> (appendDefContractsToSig(doc, d, baseSig), docForDef(doc.dsFiles, d)),
+                                            None -> (baseSig, ""),
+                                        };
+                                        Some(makeHoverResult(formatHoverBlock(sig, docStr), rng))
                                     },
                                     ExStructInit(qname, _) -> {
                                         let docStr = match lookupDefExact(inf.defs, qname) {
@@ -1395,10 +1415,11 @@ def handleHover(ss: ServerState, params: Value): Value = {
                             },
                             None -> match lookupDefAtOffset(inf.defs, doc.dsFileId, off) {
                                 Some(d) -> {
-                                    let sig = match d.item {
+                                    let baseSig = match d.item {
                                         ItForm(f) -> d.ident + ": " + formatScheme(f.ty),
                                         _ -> formatDefSig(d),
                                     };
+                                    let sig = appendDefContractsToSig(doc, d, baseSig);
                                     let docStr = docForDef(doc.dsFiles, d);
                                     Some(makeHoverResult(formatHoverBlock(sig, docStr), Some(makeLspRange(doc.dsText, d.dpos.start, d.dpos.end))))
                                 },

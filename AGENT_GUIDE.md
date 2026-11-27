@@ -56,7 +56,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 - **Contracts & Static Verification**:
   - Function contracts (contextual clauses between signature and `=`): `requires <Bool>`, `ensures <Bool>` / `ensures res -> <Bool>` / `ensures |res| <Bool>`, `decreases <Int>`.
   - Loop contracts (between `while (cond)` and body): `invariant <Bool>`, `decreases <Int>`.
-  - Contracts are purity-checked (only pure expressions and read-only lookups such as `cellGet`/`arrayLen`/`arrayGet`/`immArrayLen`/`immArrayGet`), erased at zero cost by default (`--contracts=erase`), optionally compiled to runtime checks (`--contracts=check`), and statically proved via `geisha verify`.
+  - Contracts are purity-checked (only pure expressions and read-only lookups such as `cellGet`/`arrayLen`/`arrayGet`/`immArrayLen`/`immArrayGet`), erased at zero cost by default (`--contracts=erase`), optionally compiled to runtime checks (`--contracts=check`), and statically proved via `geisha verify`. Note: `assert(cond)` is also completely erased under the default `--contracts=erase`, so never place required side effects inside `assert(...)`.
 - Operators: `+`, `-`, `*`, `/` (works on `Int`, `Float`, `Float32`, and `String` concatenation via `+`), `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, `>>>`, `~`. Custom symbolic operators can be defined with `def (<op>)(a, b) = ...`.
 
 ### Functions, Bindings & Control Flow

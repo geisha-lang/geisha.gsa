@@ -472,3 +472,57 @@ echo "PASS [e2e_suite_translation_validation]: all $E2E_COUNT positive E2E langu
 "$GEISHA_BIN" --src-root . --dump-core "$TMP_DIR/compiler.gscore" -e -o "$TMP_DIR/compiler.ll" src/geisha.gsa
 "$CHECKER_BIN" "$TMP_DIR/compiler.gscore"
 echo "PASS [self_hosted_compiler_verified]: entire src/geisha.gsa compiler verified by Lean 4 geisha-check"
+
+# 12. Lean 4 VCG Soundness Self-Check + Live Compiler-to-Lean Cross-Verification
+"$CHECKER_BIN" --verify-vcg
+
+cat > "$TMP_DIR/vcg_pos.gsa" << 'EOF'
+def safeDiv(a: Int, b: Int): Int
+    requires b != 0
+    = a / b
+
+def maskedShift(x: Int, k: Int): Int =
+    x << k
+
+def main(): Void = {
+    let _ = safeDiv(10, 2);
+    let _ = maskedShift(1, 35);
+    ()
+}
+EOF
+if command -v z3 >/dev/null 2>&1; then
+    "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_pos.gscore" "$TMP_DIR/vcg_pos.gsa" >/dev/null
+else
+    "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_pos.gscore" "$TMP_DIR/vcg_pos.gsa" >/dev/null 2>&1 || true
+    test -s "$TMP_DIR/vcg_pos.gscore"
+fi
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_pos.gscore"
+
+cat > "$TMP_DIR/vcg_neg_float.gsa" << 'EOF'
+def cmpFloat(x: Float, y: Float): Bool = x == y
+def main(): Void = { let _ = cmpFloat(1.0, 1.0); () }
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_neg_float.gscore" "$TMP_DIR/vcg_neg_float.gsa" >/dev/null 2>&1 || true
+test -s "$TMP_DIR/vcg_neg_float.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_neg_float.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_neg_float]: Lean VCG accepted unmodeled Float equality!" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/vcg_neg_while.gsa" << 'EOF'
+def unannotatedLoop(n: Int): Int = {
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(i)
+}
+def main(): Void = { let _ = unannotatedLoop(3); () }
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_neg_while.gscore" "$TMP_DIR/vcg_neg_while.gsa" >/dev/null 2>&1 || true
+test -s "$TMP_DIR/vcg_neg_while.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_neg_while.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_neg_while]: Lean VCG accepted unannotated while loop!" >&2
+    exit 1
+fi
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed negative)"

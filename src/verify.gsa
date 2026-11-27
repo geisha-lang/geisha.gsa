@@ -19,9 +19,9 @@ use sys.proc.{command, runTimeout, ExitStatus, Exited}
 use pkg.geishaHomeDir
 use ast.{
     Span, emptySpan,
-    Type, TyVoid, TyCon, TyArr, TyComp,
-    Scheme, schemeBody,
-    Lit, LitInt, LitBool, LitUnit,
+    Type, TyVoid, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, ScmMono, schemeBody,
+    Lit, LitInt, LitChar, LitBool, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
     OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
@@ -111,6 +111,7 @@ data VerifyCtx {
         vcCtorFieldTypes: StrMap (List Type),
         vcAdtVariantCount: StrMap Int,
         vcAdtTypeParams: StrMap (List String),
+        vcAdtReg: StrMap AdtInfo,
         vcCallGraph: StrMap (List String),
         vcCurFn: String,
         vcCurDecExpr: Option TaggedTerm,
@@ -187,7 +188,7 @@ def freshSym(ctx: VerifyCtx, base: String): String = {
 def freshLoc(ctx: VerifyCtx, base: String): String = {
     let id = cellGet(ctx.vcNextSym);
     cellSet(ctx.vcNextSym, id + 1);
-    "loc_" + sanitizeSmtIdent(base) + "_" + intToStr(id)
+    "__hloc_" + sanitizeSmtIdent(base) + "_" + intToStr(id)
 }
 
 def bvLitForBits(n: Int, bits: Int): String =
@@ -508,6 +509,29 @@ def canReachFn(graph: StrMap (List String), start: String, target: String): Bool
 // Scanning Modified Cells, Arrays, and Impure Calls in Loops / Branches
 // ============================================================================
 
+def bindPatEffectVars(pat: Pattern, stVars: List (String, String)): List (String, String) = match pat {
+    PatVar(vn) -> assocSet(stVars, vn, "__pat_" + vn),
+    PatCtor(_, subPats) -> bindPatEffectVarsList(subPats, stVars),
+    PatStruct(_, namedPats) -> {
+        let cur = cellNew(namedPats);
+        let acc = cellNew(stVars);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, p), r) -> { cellSet(acc, bindPatEffectVars(p, cellGet(acc))); cellSet(cur, r) },
+                Nil -> (),
+            }
+        };
+        cellGet(acc)
+    },
+    PatTuple(subPats) -> bindPatEffectVarsList(subPats, stVars),
+    _ -> stVars,
+}
+
+def bindPatEffectVarsList(pats: List Pattern, stVars: List (String, String)): List (String, String) = match pats {
+    Nil -> stVars,
+    Cons(p, r) -> bindPatEffectVarsList(r, bindPatEffectVars(p, stVars)),
+}
+
 def scanEffectsInTerm(
     t: TaggedTerm,
     stVars: List (String, String),
@@ -543,13 +567,24 @@ def scanEffectsInTerm(
             && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew"
             && nm != "assert" && nm != "assume"
             && nm != "__gs_requires" && nm != "__gs_ensures" && nm != "__gs_invariant" && nm != "__gs_decreases") {
-            // Any user/extern call inside a loop may mutate Cell/MutArray arguments
+            // Any user/extern call inside a loop may mutate Cell/MutArray (directly or wrapped in Tuple/ADT)
             let ca = cellNew(args);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
                 match cellGet(ca) {
                     Cons(a, ra) -> {
                         let aty = schemeBody(a.tscm);
-                        if (isCellType(aty) || isMutArrayType(aty)) cellSet(hasOpaqueCall, true) else ();
+                        let isPureScalar = match aty {
+                            TyCon("Int") -> true,
+                            TyCon("Int64") -> true,
+                            TyCon("Bool") -> true,
+                            TyCon("Char") -> true,
+                            TyCon("Float") -> true,
+                            TyCon("Float32") -> true,
+                            TyCon("String") -> true,
+                            TyCon("Void") -> true,
+                            _ -> false,
+                        };
+                        if (!isPureScalar) cellSet(hasOpaqueCall, true) else ();
                         cellSet(ca, ra)
                     },
                     Nil -> (),
@@ -573,8 +608,14 @@ def scanEffectsInTerm(
     TmUn(_, e) -> scanEffectsInTerm(e, stVars, modCells, modArrs, hasOpaqueCall),
     TmLet(vd, v, b) -> {
         scanEffectsInTerm(v, stVars, modCells, modArrs, hasOpaqueCall);
-        // Shadowed local variable must not alias outer locId
-        let innerVars = assocSet(stVars, vd.vname, "__local_" + vd.vname);
+        // S4: Propagate alias when `let alias = outerCellOrArr`, otherwise shadow outer name
+        let innerVars = match v.tnode {
+            TmVar(srcName) -> match assocGet(stVars, srcName) {
+                Some(loc) -> assocSet(stVars, vd.vname, loc),
+                None -> assocSet(stVars, vd.vname, "__local_" + vd.vname),
+            },
+            _ -> assocSet(stVars, vd.vname, "__local_" + vd.vname),
+        };
         scanEffectsInTerm(b, innerVars, modCells, modArrs, hasOpaqueCall)
     },
     TmIf(c, th, el) -> {
@@ -592,8 +633,9 @@ def scanEffectsInTerm(
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(a, r) -> {
-                    match a.caGuard { Some(g) -> scanEffectsInTerm(g, stVars, modCells, modArrs, hasOpaqueCall), None -> () };
-                    scanEffectsInTerm(a.caBody, stVars, modCells, modArrs, hasOpaqueCall);
+                    let armVars = bindPatEffectVars(a.caPat, stVars);
+                    match a.caGuard { Some(g) -> scanEffectsInTerm(g, armVars, modCells, modArrs, hasOpaqueCall), None -> () };
+                    scanEffectsInTerm(a.caBody, armVars, modCells, modArrs, hasOpaqueCall);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -716,6 +758,34 @@ def decodeBvLiteral(s: String): String =
                 i64ToStr(signed)
             } else s
         } else s
+    } else if (strStartsWith(s, "(_ bv")) {
+        let rest = trimLine(strSlice(s, 5, strLen(s)));
+        match strIndexOfByte(rest, 32, 0) {
+            Some(spIdx) -> {
+                let decStr = strSlice(rest, 0, spIdx);
+                let wStr = trimLine(strSlice(rest, spIdx + 1, strLen(rest)));
+                let acc: Cell Int64 = cellNew(intToI64(0));
+                let i = cellNew(0);
+                let ok = cellNew(strLen(decStr) > 0);
+                while (cellGet(i) < strLen(decStr) && cellGet(ok)) {
+                    let ch = strByteAt(decStr, cellGet(i));
+                    if (ch >= 48 && ch <= 57) {
+                        cellSet(acc, cellGet(acc) * intToI64(10) + intToI64(ch - 48));
+                        cellSet(i, cellGet(i) + 1)
+                    } else cellSet(ok, false)
+                };
+                if (cellGet(ok)) {
+                    let u = cellGet(acc);
+                    if (wStr == "32") {
+                        let half = intToI64(2147483647) + intToI64(1);
+                        let full = half + half;
+                        let signed = if (u >= half) u - full else u;
+                        i64ToStr(signed)
+                    } else i64ToStr(u)
+                } else s
+            },
+            None -> s,
+        }
     } else s
 
 def cleanSmtVal(raw: String): String = {
@@ -728,7 +798,7 @@ def cleanSmtVal(raw: String): String = {
     let s = trimLine(strSlice(t, 0, cellGet(end)));
     if (strStartsWith(s, "(- ")) {
         "-" + trimLine(strSlice(s, 3, strLen(s)))
-    } else if (strStartsWith(s, "#x") || strStartsWith(s, "#b")) {
+    } else if (strStartsWith(s, "#x") || strStartsWith(s, "#b") || strStartsWith(s, "(_ bv")) {
         decodeBvLiteral(s)
     } else s
 }
@@ -805,7 +875,7 @@ def parseSmtModel(out: String, userVars: List (String, String)): List (String, S
     while (match cellGet(cu) { Nil -> false, _ -> true }) {
         match cellGet(cu) {
             Cons((srcName, smtSym), r) -> {
-                if (!strMapContains(seenNames, srcName) && !strStartsWith(srcName, "loc_")) {
+                if (!strMapContains(seenNames, srcName) && !strStartsWith(srcName, "__hloc_")) {
                     match strMapGet(symVals, smtSym) {
                         Some(v) -> {
                             strMapInsert(seenNames, srcName, true);
@@ -1121,29 +1191,39 @@ def bindSubPatterns(
                     Cons(t0, rt) -> { cellSet(cft, rt); t0 },
                     Nil -> TyCon("Int"),
                 };
-                let fSort = match typeToSmtSort(fTy) {
-                    Some(sr) -> sr,
-                    None -> "(_ BitVec 32)",
+                let fSortOpt = match typeToSmtSort(fTy) {
+                    Some(sr) -> Some(sr),
+                    None -> match adtVariantCountForType(ctx, fTy) {
+                        Some(_) -> Some("(_ BitVec 32)"),
+                        None -> None,
+                    },
                 };
                 let fValOpt: Option String = match cellGet(cf) {
                     Cons(fv, rf) -> { cellSet(cf, rf); fv },
-                    Nil -> {
-                        // Deterministic projection symbol so repeated `match x` yields identical field symbols
-                        let projSym = sanitizeSmtIdent(scrutSym) + "_c" + intToStr(ctorTag) + "_f" + intToStr(curIdx);
-                        let decl = "(declare-const " + projSym + " " + fSort + ")";
-                        let s0 = cellGet(curSt);
-                        let path1 = match adtVariantCountForType(ctx, fTy) {
-                            Some(nv) if (nv > 0) -> Cons("(bvult " + projSym + " " + bvLitForBits(nv, 32) + ")", s0.stPath),
-                            _ -> s0.stPath,
-                        };
-                        cellSet(curSt, MkSymState {
-                            stDecls: ensureDeclOnce(s0.stDecls, decl),
-                            stVars: s0.stVars, stCells: s0.stCells, stLocSorts: s0.stLocSorts,
-                            stArrLens: s0.stArrLens, stArrMems: s0.stArrMems,
-                            stDataTags: s0.stDataTags, stDataFields: s0.stDataFields,
-                            stPath: path1, stUserVars: s0.stUserVars,
-                        });
-                        Some(projSym)
+                    Nil -> match fSortOpt {
+                        Some(fSort) -> {
+                            // Deterministic projection symbol so repeated `match x` yields identical field symbols
+                            let projSym = sanitizeSmtIdent(scrutSym) + "_c" + intToStr(ctorTag) + "_f" + intToStr(curIdx);
+                            let decl = "(declare-const " + projSym + " " + fSort + ")";
+                            let s0 = cellGet(curSt);
+                            let path0 = match fTy {
+                                TyCon("Char") -> Cons("(bvult " + projSym + " #x00000100)", s0.stPath),
+                                _ -> s0.stPath,
+                            };
+                            let path1 = match adtVariantCountForType(ctx, fTy) {
+                                Some(nv) if (nv > 0) -> Cons("(bvult " + projSym + " " + bvLitForBits(nv, 32) + ")", path0),
+                                _ -> path0,
+                            };
+                            cellSet(curSt, MkSymState {
+                                stDecls: ensureDeclOnce(s0.stDecls, decl),
+                                stVars: s0.stVars, stCells: s0.stCells, stLocSorts: s0.stLocSorts,
+                                stArrLens: s0.stArrLens, stArrMems: s0.stArrMems,
+                                stDataTags: s0.stDataTags, stDataFields: s0.stDataFields,
+                                stPath: path1, stUserVars: s0.stUserVars,
+                            });
+                            Some(projSym)
+                        },
+                        None -> None,
                     },
                 };
                 let (st1, pc) = bindPatternInSym(ctx, cellGet(curSt), p, fValOpt, fTy);
@@ -1172,27 +1252,35 @@ def evalContractTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm): (SymState, Op
 def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymState, Option String) =
     match t.tnode {
         TmLit(LitInt(n)) -> (st, Some(bvLitForBits(n, typeBitWidth(schemeBody(t.tscm))))),
+        TmLit(LitChar(cp)) -> (st, Some(bvLitForBits(cp & 255, 32))),
         TmLit(LitBool(b)) -> (st, Some(if (b) "true" else "false")),
         TmLit(LitUnit) -> (st, Some("#x00000000")),
         TmLit(_) -> (st, None),
         TmVar(v) -> match assocGet(st.stVars, v) {
             Some(s) -> (st, Some(s)),
-            None -> match typeToSmtSort(schemeBody(t.tscm)) {
-                Some(sort) -> {
-                    let sym = freshSym(ctx, v);
-                    let decl = "(declare-const " + sym + " " + sort + ")";
-                    let st2 = MkSymState {
-                        stDecls: Cons(decl, st.stDecls),
-                        stVars: assocSet(st.stVars, v, sym),
-                        stCells: st.stCells, stLocSorts: st.stLocSorts,
-                        stArrLens: st.stArrLens, stArrMems: st.stArrMems,
-                        stDataTags: st.stDataTags, stDataFields: st.stDataFields,
-                        stPath: st.stPath,
-                        stUserVars: assocSet(st.stUserVars, v, sym),
-                    };
-                    (st2, Some(sym))
-                },
-                None -> (st, None),
+            None -> {
+                let vty = schemeBody(t.tscm);
+                match typeToSmtSort(vty) {
+                    Some(sort) -> {
+                        let sym = freshSym(ctx, v);
+                        let decl = "(declare-const " + sym + " " + sort + ")";
+                        let path1 = match vty {
+                            TyCon("Char") -> Cons("(bvult " + sym + " #x00000100)", st.stPath),
+                            _ -> st.stPath,
+                        };
+                        let st2 = MkSymState {
+                            stDecls: Cons(decl, st.stDecls),
+                            stVars: assocSet(st.stVars, v, sym),
+                            stCells: st.stCells, stLocSorts: st.stLocSorts,
+                            stArrLens: st.stArrLens, stArrMems: st.stArrMems,
+                            stDataTags: st.stDataTags, stDataFields: st.stDataFields,
+                            stPath: path1,
+                            stUserVars: assocSet(st.stUserVars, v, sym),
+                        };
+                        (st2, Some(sym))
+                    },
+                    None -> (st, None),
+                }
             },
         },
         TmGlobalVar(_) -> (st, None),
@@ -1221,69 +1309,89 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                 _ -> (st1, None),
             }
         },
+        TmBin(OpAnd, l, r) -> {
+            let falseTerm = MkTerm { tspan: t.tspan, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(false)) };
+            evalIf(ctx, st, l, r, falseTerm, emitObs)
+        },
+        TmBin(OpOr, l, r) -> {
+            let trueTerm = MkTerm { tspan: t.tspan, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) };
+            evalIf(ctx, st, l, trueTerm, r, emitObs)
+        },
         TmBin(op, l, r) -> {
             let (st1, lv) = evalTerm(ctx, st, l, emitObs);
-            let st1ForR = match (op, lv) {
-                (OpAnd, Some(ls)) -> stWithPath(st1, ls),
-                (OpOr, Some(ls)) -> stWithPath(st1, "(not " + ls + ")"),
-                _ -> st1,
-            };
-            let (st2Raw, rv) = evalTerm(ctx, st1ForR, r, emitObs);
-            let st2 = MkSymState {
-                stDecls: st2Raw.stDecls, stVars: st2Raw.stVars,
-                stCells: st2Raw.stCells, stLocSorts: st2Raw.stLocSorts,
-                stArrLens: st2Raw.stArrLens, stArrMems: st2Raw.stArrMems,
-                stDataTags: st2Raw.stDataTags, stDataFields: st2Raw.stDataFields,
-                stPath: st1.stPath, stUserVars: st2Raw.stUserVars,
-            };
+            let (st2, rv) = evalTerm(ctx, st1, r, emitObs);
             let lty = schemeBody(l.tscm);
             let bits = typeBitWidth(lty);
-            let isBv = match typeToSmtSort(lty) {
-                Some("(_ BitVec 32)") -> true,
-                Some("(_ BitVec 64)") -> true,
-                _ -> false,
-            };
+            let isScalarModeled = match typeToSmtSort(lty) { Some(_) -> true, None -> false };
+            let isChar = match lty { TyCon("Char") -> true, _ -> false };
+            let isSignedInt = match lty { TyCon("Int") -> true, TyCon("Int64") -> true, _ -> false };
+            // A4: Always check div/rem-by-zero BEFORE matching `(lv, rv)` so an unmodeled dividend or divisor never skips the check!
+            let isDivOrRem = match op { OpDiv -> true, OpRem -> true, _ -> false };
+            if (isSignedInt && isDivOrRem && emitObs && ctx.vcCheckImplicit) {
+                let msg = match op {
+                    OpDiv -> "possible division by zero in `" + ctx.vcCurFn + "`",
+                    _ -> "possible remainder by zero in `" + ctx.vcCurFn + "`",
+                };
+                match rv {
+                    Some(rs) -> dischargeObligation(
+                        ctx, st2, "div_by_zero", t.tspan, msg,
+                        "(not (= " + rs + " " + bvZero(bits) + "))", None
+                    ),
+                    None -> recordUnknown(
+                        ctx, "div_by_zero", t.tspan, msg,
+                        "divisor expression is not modeled in SMT"
+                    ),
+                }
+            } else ();
             match (lv, rv) {
-                (Some(ls), Some(rs)) -> match op {
-                    OpAdd if (isBv) -> (st2, Some("(bvadd " + ls + " " + rs + ")")),
-                    OpSub if (isBv) -> (st2, Some("(bvsub " + ls + " " + rs + ")")),
-                    OpMul if (isBv) -> (st2, Some("(bvmul " + ls + " " + rs + ")")),
-                    OpDiv if (isBv) -> {
-                        if (emitObs && ctx.vcCheckImplicit) {
-                            dischargeObligation(
-                                ctx, st2, "div_by_zero", t.tspan,
-                                "possible division by zero in `" + ctx.vcCurFn + "`",
-                                "(not (= " + rs + " " + bvZero(bits) + "))", None
-                            )
-                        } else ();
-                        (st2, Some("(bvsdiv " + ls + " " + rs + ")"))
-                    },
-                    OpRem if (isBv) -> {
-                        if (emitObs && ctx.vcCheckImplicit) {
-                            dischargeObligation(
-                                ctx, st2, "div_by_zero", t.tspan,
-                                "possible remainder by zero in `" + ctx.vcCurFn + "`",
-                                "(not (= " + rs + " " + bvZero(bits) + "))", None
-                            )
-                        } else ();
-                        (st2, Some("(bvsrem " + ls + " " + rs + ")"))
-                    },
-                    OpBitAnd if (isBv) -> (st2, Some("(bvand " + ls + " " + rs + ")")),
-                    OpBitOr if (isBv) -> (st2, Some("(bvor " + ls + " " + rs + ")")),
-                    OpBitXor if (isBv) -> (st2, Some("(bvxor " + ls + " " + rs + ")")),
-                    OpShl if (isBv) -> (st2, Some("(bvshl " + ls + " " + rs + ")")),
-                    OpShr if (isBv) -> (st2, Some("(bvashr " + ls + " " + rs + ")")),
-                    OpUshr if (isBv) -> (st2, Some("(bvlshr " + ls + " " + rs + ")")),
-                    OpAnd -> (st2, Some("(and " + ls + " " + rs + ")")),
-                    OpOr -> (st2, Some("(or " + ls + " " + rs + ")")),
-                    OpEq -> (st2, Some("(= " + ls + " " + rs + ")")),
-                    OpNe -> (st2, Some("(not (= " + ls + " " + rs + "))")),
-                    OpLt if (isBv) -> (st2, Some("(bvslt " + ls + " " + rs + ")")),
-                    OpLe if (isBv) -> (st2, Some("(bvsle " + ls + " " + rs + ")")),
-                    OpGt if (isBv) -> (st2, Some("(bvsgt " + ls + " " + rs + ")")),
-                    OpGe if (isBv) -> (st2, Some("(bvsge " + ls + " " + rs + ")")),
-                    _ -> (st2, None),
-                },
+                (Some(ls), Some(rs)) ->
+                    if (isSignedInt) {
+                        match op {
+                            OpAdd -> (st2, Some("(bvadd " + ls + " " + rs + ")")),
+                            OpSub -> (st2, Some("(bvsub " + ls + " " + rs + ")")),
+                            OpMul -> (st2, Some("(bvmul " + ls + " " + rs + ")")),
+                            OpDiv -> (st2, Some("(bvsdiv " + ls + " " + rs + ")")),
+                            OpRem -> (st2, Some("(bvsrem " + ls + " " + rs + ")")),
+                            OpBitAnd -> (st2, Some("(bvand " + ls + " " + rs + ")")),
+                            OpBitOr -> (st2, Some("(bvor " + ls + " " + rs + ")")),
+                            OpBitXor -> (st2, Some("(bvxor " + ls + " " + rs + ")")),
+                            OpShl -> {
+                                let shAmt = if (bits == 64) "((_ zero_extend 32) (bvand " + rs + " #x0000003f))" else "(bvand " + rs + " #x0000001f)";
+                                (st2, Some("(bvshl " + ls + " " + shAmt + ")"))
+                            },
+                            OpShr -> {
+                                let shAmt = if (bits == 64) "((_ zero_extend 32) (bvand " + rs + " #x0000003f))" else "(bvand " + rs + " #x0000001f)";
+                                (st2, Some("(bvashr " + ls + " " + shAmt + ")"))
+                            },
+                            OpUshr -> {
+                                let shAmt = if (bits == 64) "((_ zero_extend 32) (bvand " + rs + " #x0000003f))" else "(bvand " + rs + " #x0000001f)";
+                                (st2, Some("(bvlshr " + ls + " " + shAmt + ")"))
+                            },
+                            OpEq -> (st2, Some("(= " + ls + " " + rs + ")")),
+                            OpNe -> (st2, Some("(not (= " + ls + " " + rs + "))")),
+                            OpLt -> (st2, Some("(bvslt " + ls + " " + rs + ")")),
+                            OpLe -> (st2, Some("(bvsle " + ls + " " + rs + ")")),
+                            OpGt -> (st2, Some("(bvsgt " + ls + " " + rs + ")")),
+                            OpGe -> (st2, Some("(bvsge " + ls + " " + rs + ")")),
+                            _ -> (st2, None),
+                        }
+                    } else if (isChar) {
+                        match op {
+                            OpEq -> (st2, Some("(= " + ls + " " + rs + ")")),
+                            OpNe -> (st2, Some("(not (= " + ls + " " + rs + "))")),
+                            OpLt -> (st2, Some("(bvult " + ls + " " + rs + ")")),
+                            OpLe -> (st2, Some("(bvule " + ls + " " + rs + ")")),
+                            OpGt -> (st2, Some("(bvugt " + ls + " " + rs + ")")),
+                            OpGe -> (st2, Some("(bvuge " + ls + " " + rs + ")")),
+                            _ -> (st2, None),
+                        }
+                    } else if (isScalarModeled) {
+                        match op {
+                            OpEq -> (st2, Some("(= " + ls + " " + rs + ")")),
+                            OpNe -> (st2, Some("(not (= " + ls + " " + rs + "))")),
+                            _ -> (st2, None),
+                        }
+                    } else (st2, None),
                 _ -> (st2, None),
             }
         },
@@ -1325,7 +1433,34 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                 None -> (st1, None),
             }
         },
-        TmMakeCls(_, _, body) -> evalTerm(ctx, st, body, emitObs),
+        TmMakeCls(vd, cls, body) -> {
+            if (strStartsWith(vd.vname, ".try_while_") && emitObs && ctx.vcCurFn != cls.clsEntry) {
+                let hasExplicitInv = match strMapGet(ctx.vcSpecs, cls.clsEntry) {
+                    Some(cspec) -> {
+                        let inner = match cspec.fsBody.tnode {
+                            TmMakeCls(_, _, b) -> b,
+                            _ -> cspec.fsBody,
+                        };
+                        match inner.tnode {
+                            TmBlock(Cons(firstStmt, _)) -> match firstStmt.tnode {
+                                TmApplyDir(avd, _) -> avd.vname == "assume",
+                                _ -> false,
+                            },
+                            _ -> false,
+                        }
+                    },
+                    None -> false,
+                };
+                if (!hasExplicitInv) {
+                    recordUnknown(
+                        ctx, "invariant", t.tspan,
+                        "while loop containing `?` in `" + ctx.vcCurFn + "` has no `invariant`",
+                        "add an explicit `invariant` clause to verify loops containing `?`"
+                    )
+                } else ()
+            } else ();
+            evalTerm(ctx, st, body, emitObs)
+        },
         TmApplyCls(callee, args) -> {
             let (st1, _) = evalTerm(ctx, st, callee, emitObs);
             let (st2, _) = evalArgs(ctx, st1, args, emitObs);
@@ -1386,6 +1521,13 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                                 (st2.stDecls, ls)
                             },
                             None -> {
+                                if (emitObs && ctx.vcCheckImplicit) {
+                                    recordUnknown(
+                                        ctx, "bounds", valT.tspan,
+                                        "array length non-negativity could not be verified in `" + ctx.vcCurFn + "`",
+                                        "array length expression is not modeled in SMT"
+                                    )
+                                } else ();
                                 let fl = freshSym(ctx, vname + "_len");
                                 (Cons("(declare-const " + fl + " (_ BitVec 32))", st2.stDecls), fl)
                             },
@@ -1601,7 +1743,10 @@ def evalMatch(
     let declsAcc = cellNew(st1.stDecls);
     let uvarsAcc = cellNew(st1.stUserVars);
     let mergedPath = cellNew(st1.stPath);
+    let curCells = cellNew(st1.stCells);
+    let curArrMems = cellNew(st1.stArrMems);
     let prevNegs: Cell (List String) = cellNew(Nil);
+    let hasUnknownPrev = cellNew(false);
     let armResultsRev: Cell (List (Option String, Option String)) = cellNew(Nil);
     let anyMut = cellNew(false);
     let cur = cellNew(arms);
@@ -1611,8 +1756,8 @@ def evalMatch(
             Cons(arm, rest) -> {
                 let armBase = MkSymState {
                     stDecls: cellGet(declsAcc), stVars: st1.stVars,
-                    stCells: st1.stCells, stLocSorts: st1.stLocSorts,
-                    stArrLens: st1.stArrLens, stArrMems: st1.stArrMems,
+                    stCells: cellGet(curCells), stLocSorts: st1.stLocSorts,
+                    stArrLens: st1.stArrLens, stArrMems: cellGet(curArrMems),
                     stDataTags: st1.stDataTags, stDataFields: st1.stDataFields,
                     stPath: listAppend(cellGet(prevNegs), st1.stPath),
                     stUserVars: cellGet(uvarsAcc),
@@ -1623,9 +1768,31 @@ def evalMatch(
                     Some(pc) -> stWithPath(stPat, pc),
                     None -> stPat,
                 };
+                let armVars = bindPatEffectVars(arm.caPat, st1.stVars);
                 let (stAfterGuard, guardCondOpt) = match arm.caGuard {
                     Some(g) -> {
                         let (sg, gv) = evalTerm(ctx, stAfterPat, g, emitObs);
+                        // A3: If guard mutates any Cell/Array, propagate havoc to subsequent arms & match exit!
+                        let gmc: Cell (List String) = cellNew(Nil);
+                        let gma: Cell (List String) = cellNew(Nil);
+                        let goc = cellNew(false);
+                        scanEffectsInTerm(g, armVars, gmc, gma, goc);
+                        if (cellGet(goc) || match (cellGet(gmc), cellGet(gma)) { (Nil, Nil) -> false, _ -> true }) {
+                            cellSet(anyMut, true);
+                            let hCells = if (cellGet(goc)) assocKeysUnique(cellGet(curCells)) else cellGet(gmc);
+                            let hArrs = if (cellGet(goc)) assocKeysUnique(cellGet(curArrMems)) else cellGet(gma);
+                            let stGuardHavoc = havocLocs(ctx, MkSymState {
+                                stDecls: sg.stDecls, stVars: st1.stVars,
+                                stCells: cellGet(curCells), stLocSorts: st1.stLocSorts,
+                                stArrLens: st1.stArrLens, stArrMems: cellGet(curArrMems),
+                                stDataTags: st1.stDataTags, stDataFields: st1.stDataFields,
+                                stPath: st1.stPath, stUserVars: sg.stUserVars,
+                            }, hCells, hArrs, "mguard");
+                            cellSet(declsAcc, stGuardHavoc.stDecls);
+                            cellSet(curCells, stGuardHavoc.stCells);
+                            cellSet(curArrMems, stGuardHavoc.stArrMems);
+                            cellSet(hasUnknownPrev, true)
+                        } else ();
                         match gv {
                             Some(gs) -> (stWithPath(sg, gs), Some(gs)),
                             None -> (sg, None),
@@ -1645,7 +1812,7 @@ def evalMatch(
                 cellSet(uvarsAcc, stBodyOut.stUserVars);
                 // Propagate branch-local facts (e.g. `let` equalities & callee `ensures`) guarded by arm reach condition
                 let extraCnt = listLen(stBodyOut.stPath) - armPrePathLen;
-                if (extraCnt > 0) {
+                if (extraCnt > 0 && !cellGet(hasUnknownPrev)) {
                     let reachCondOpt: Option String = match fullArmCond {
                         Some(fc) -> {
                             let rc = cellNew(fc);
@@ -1687,7 +1854,9 @@ def evalMatch(
                 let mc: Cell (List String) = cellNew(Nil);
                 let ma: Cell (List String) = cellNew(Nil);
                 let oc = cellNew(false);
-                scanEffectsInTerm(arm.caBody, st1.stVars, mc, ma, oc);
+                let armVars = bindPatEffectVars(arm.caPat, st1.stVars);
+                match arm.caGuard { Some(g) -> scanEffectsInTerm(g, armVars, mc, ma, oc), None -> () };
+                scanEffectsInTerm(arm.caBody, armVars, mc, ma, oc);
                 if (cellGet(oc) || match (cellGet(mc), cellGet(ma)) { (Nil, Nil) -> false, _ -> true }) {
                     cellSet(anyMut, true)
                 } else ();
@@ -1695,7 +1864,7 @@ def evalMatch(
                 match fullArmCond {
                     Some("true") -> (),
                     Some(fc) -> cellSet(prevNegs, Cons("(not " + fc + ")", cellGet(prevNegs))),
-                    None -> (),
+                    None -> cellSet(hasUnknownPrev, true),
                 };
                 cellSet(cur, rest)
             },
@@ -1766,6 +1935,112 @@ def evalArgs(ctx: VerifyCtx, st: SymState, args: List TaggedTerm, emitObs: Bool)
     };
     (cellGet(curSt), listRev(cellGet(valsRev)))
 }
+
+def typeContainsMutableRec(ctx: VerifyCtx, ty: Type, visited: List String): Bool =
+    if (isCellType(ty) || isMutArrayType(ty)) {
+        true
+    } else match ty {
+        TyArr(_, _, _) -> true,
+        TyTuple(ts) -> {
+            let found = cellNew(false);
+            let cur = cellNew(ts);
+            while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(t, r) -> {
+                        if (typeContainsMutableRec(ctx, t, visited)) cellSet(found, true) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(found)
+        },
+        _ -> {
+            let (headOpt, targs) = adtHeadNameAndArgs(ty);
+            let found = cellNew(false);
+            let ca = cellNew(targs);
+            while (!cellGet(found) && match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(ta, ra) -> {
+                        if (typeContainsMutableRec(ctx, ta, visited)) cellSet(found, true) else ();
+                        cellSet(ca, ra)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(found)) {
+                true
+            } else match headOpt {
+                Some(adtName) ->
+                    if (listHasStr(visited, adtName)) {
+                        false
+                    } else match strMapGet(ctx.vcAdtReg, adtName) {
+                        Some(info) -> {
+                            let nextVis = Cons(adtName, visited);
+                            let cv = cellNew(info.variants);
+                            while (!cellGet(found) && match cellGet(cv) { Nil -> false, _ -> true }) {
+                                match cellGet(cv) {
+                                    Cons(v, rv) -> {
+                                        let cf = cellNew(v.fieldTypes);
+                                        while (!cellGet(found) && match cellGet(cf) { Nil -> false, _ -> true }) {
+                                            match cellGet(cf) {
+                                                Cons(ft, rf) -> {
+                                                    if (typeContainsMutableRec(ctx, ft, nextVis)) cellSet(found, true) else ();
+                                                    cellSet(cf, rf)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        cellSet(cv, rv)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            cellGet(found)
+                        },
+                        None -> false,
+                    },
+                None -> false,
+            }
+        },
+    }
+
+def collectMutLocsFromSym(
+    st: SymState,
+    sym: String,
+    cellsOut: Cell (List String),
+    arrsOut: Cell (List String),
+    unknownOut: Cell Bool,
+    visited: List String
+): Void =
+    if (listHasStr(visited, sym)) {
+        ()
+    } else match assocGet(st.stCells, sym) {
+        Some(_) -> cellSet(cellsOut, addUnique(cellGet(cellsOut), sym)),
+        None -> match assocGet(st.stArrMems, sym) {
+            Some(_) -> cellSet(arrsOut, addUnique(cellGet(arrsOut), sym)),
+            None -> match assocGetFields(st.stDataFields, sym) {
+                Some(fields) -> {
+                    let nextVis = Cons(sym, visited);
+                    let cf = cellNew(fields);
+                    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                        match cellGet(cf) {
+                            Cons(Some(fsym), r) -> {
+                                collectMutLocsFromSym(st, fsym, cellsOut, arrsOut, unknownOut, nextVis);
+                                cellSet(cf, r)
+                            },
+                            Cons(None, r) -> {
+                                cellSet(unknownOut, true);
+                                cellSet(cf, r)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+                None -> cellSet(unknownOut, true),
+            },
+        },
+    }
 
 def evalApplyDir(
     ctx: VerifyCtx,
@@ -1845,7 +2120,7 @@ def evalApplyDir(
                             None -> (st2, None),
                         }
                     },
-                    _ -> {
+                _ -> {
                         if (emitObs && ctx.vcCheckImplicit) {
                             recordUnknown(ctx, "bounds", sp, "array index bounds on `" + arrLabel + "` could not be verified", "array or index expression is not modeled in SMT")
                         } else ();
@@ -1890,7 +2165,7 @@ def evalApplyDir(
                             _ -> (havocLocs(ctx, st3, Nil, [loc], "aset"), Some("#x00000000")),
                         }
                     },
-                    _ -> {
+                _ -> {
                         if (emitObs && ctx.vcCheckImplicit) {
                             recordUnknown(ctx, "bounds", sp, "array index bounds on `" + arrLabel + "` could not be verified", "array or index expression is not modeled in SMT")
                         } else ();
@@ -1929,6 +2204,28 @@ def evalApplyDir(
             },
             Nil -> (st, Some("#x00000000")),
         }
+    } else if (nm == "intToI64") {
+        match args {
+            Cons(a0, _) -> {
+                let (st1, av) = evalTerm(ctx, st, a0, emitObs);
+                match av {
+                    Some(s) -> (st1, Some("((_ sign_extend 32) " + s + ")")),
+                    None -> (st1, None),
+                }
+            },
+            Nil -> (st, None),
+        }
+    } else if (nm == "i64ToInt") {
+        match args {
+            Cons(a0, _) -> {
+                let (st1, av) = evalTerm(ctx, st, a0, emitObs);
+                match av {
+                    Some(s) -> (st1, Some("((_ extract 31 0) " + s + ")")),
+                    None -> (st1, None),
+                }
+            },
+            Nil -> (st, None),
+        }
     } else if (nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases") {
         (st, Some("#x00000000"))
     } else {
@@ -1942,6 +2239,7 @@ def evalApplyDir(
         let (st1, argVals) = evalArgs(ctx, st, args, emitObs);
         let passedCellLocs: Cell (List String) = cellNew(Nil);
         let passedMutArrLocs: Cell (List String) = cellNew(Nil);
+        let unknownMutContainer = cellNew(false);
         match strMapGet(ctx.vcSpecs, nm) {
             Some(callee) -> {
                 let calleeVars: Cell (List (String, String)) = cellNew(Nil);
@@ -1957,6 +2255,7 @@ def evalApplyDir(
                             let pty = schemeBody(pvd.vscm);
                             let isMutParam = isCellType(pty) || isMutArrayType(pty);
                             let isImmArrParam = isArrayType(pty) && !isMutArrayType(pty);
+                            let hasNestedMut = !isMutParam && typeContainsMutableRec(ctx, pty, Nil);
                             match avOpt {
                                 Some(asmt) -> {
                                     cellSet(calleeVars, assocSet(cellGet(calleeVars), pvd.vname, asmt));
@@ -1968,13 +2267,50 @@ def evalApplyDir(
                                         };
                                         if (isCellType(pty)) cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), asmt))
                                         else cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), asmt))
+                                    } else if (hasNestedMut) {
+                                        let embCells: Cell (List String) = cellNew(Nil);
+                                        let embArrs: Cell (List String) = cellNew(Nil);
+                                        collectMutLocsFromSym(st1, asmt, embCells, embArrs, unknownMutContainer, Nil);
+                                        let cec = cellNew(cellGet(embCells));
+                                        while (match cellGet(cec) { Nil -> false, _ -> true }) {
+                                            match cellGet(cec) {
+                                                Cons(cloc, r) -> {
+                                                    if (listHasStr(cellGet(seenMutLocs), cloc) || listHasStr(cellGet(seenImmLocs), cloc)) {
+                                                        cellSet(hasMutAlias, true)
+                                                    } else {
+                                                        cellSet(seenMutLocs, Cons(cloc, cellGet(seenMutLocs)))
+                                                    };
+                                                    cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), cloc));
+                                                    cellSet(cec, r)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        let cea = cellNew(cellGet(embArrs));
+                                        while (match cellGet(cea) { Nil -> false, _ -> true }) {
+                                            match cellGet(cea) {
+                                                Cons(aloc, r) -> {
+                                                    if (listHasStr(cellGet(seenMutLocs), aloc) || listHasStr(cellGet(seenImmLocs), aloc)) {
+                                                        cellSet(hasMutAlias, true)
+                                                    } else {
+                                                        cellSet(seenMutLocs, Cons(aloc, cellGet(seenMutLocs)))
+                                                    };
+                                                    cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), aloc));
+                                                    cellSet(cea, r)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        }
                                     } else if (isImmArrParam) {
                                         if (listHasStr(cellGet(seenMutLocs), asmt)) cellSet(hasMutAlias, true)
                                         else cellSet(seenImmLocs, Cons(asmt, cellGet(seenImmLocs)))
                                     } else ()
                                 },
                                 None ->
-                                    if (isMutParam) cellSet(hasMutAlias, true) else (),
+                                    if (isMutParam || hasNestedMut) {
+                                        cellSet(unknownMutContainer, true);
+                                        cellSet(hasMutAlias, true)
+                                    } else (),
                             };
                             cellSet(cp, rp);
                             cellSet(ca, ra);
@@ -1983,6 +2319,9 @@ def evalApplyDir(
                         _ -> (),
                     }
                 };
+                if (cellGet(unknownMutContainer)) {
+                    cellSet(hasMutAlias, true)
+                } else ();
                 if (emitObs && cellGet(hasMutAlias)) {
                     recordFailed(
                         ctx, "aliasing", sp,
@@ -2027,8 +2366,9 @@ def evalApplyDir(
                         (Some(_), Some(curVal)) -> match callee.fsDecreases {
                             Some((_, calleeDecExpr)) -> {
                                 let (stDec, nextValOpt) = evalTerm(ctx, calleeSt, calleeDecExpr, false);
+                                let decZero = bvZero(typeBitWidth(schemeBody(calleeDecExpr.tscm)));
                                 let decGoal = match nextValOpt {
-                                    Some(nextVal) -> Some("(and (bvsge " + curVal + " #x00000000) (bvslt " + nextVal + " " + curVal + "))"),
+                                    Some(nextVal) -> Some("(and (bvsge " + curVal + " " + decZero + ") (bvslt " + nextVal + " " + curVal + "))"),
                                     None -> None,
                                 };
                                 dischargeOptGoal(
@@ -2047,66 +2387,83 @@ def evalApplyDir(
                     }
                 } else ();
 
-                // Conservatively havoc any passed Cell or MutArray parameters (callee may mutate them)
-                let stAfterMut = havocLocs(ctx, st1, cellGet(passedCellLocs), cellGet(passedMutArrLocs), "call");
+                // Conservatively havoc any passed Cell or MutArray parameters (including wrapped in Tuple/ADT)
+                let havocCellList = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
+                let havocArrList = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stArrMems) else cellGet(passedMutArrLocs);
+                let stAfterMut = havocLocs(ctx, st1, havocCellList, havocArrList, "call");
 
-                // Allocate fresh return symbol and assume callee postconditions (ONLY when no mutable aliasing violated callee's assumption)
-                let rsort = match typeToSmtSort(retTy) { Some(s) -> s, None -> "(_ BitVec 32)" };
-                let rsym = freshSym(ctx, nm + "_ret");
-                let rdecl = "(declare-const " + rsym + " " + rsort + ")";
-                let initPath = match adtVariantCountForType(ctx, retTy) {
-                    Some(nv) if (nv > 0) -> Cons("(bvult " + rsym + " " + bvLitForBits(nv, 32) + ")", stAfterMut.stPath),
-                    _ -> stAfterMut.stPath,
+                // Allocate fresh return symbol ONLY for modeled types (fail-closed `None` for Float/String/Ptr/closures)
+                let retSortOpt = match typeToSmtSort(retTy) {
+                    Some(s) -> Some(s),
+                    None -> match adtVariantCountForType(ctx, retTy) {
+                        Some(_) -> Some("(_ BitVec 32)"),
+                        None -> None,
+                    },
                 };
-                let pathAcc = cellNew(initPath);
-                let declsAcc = cellNew(Cons(rdecl, stAfterMut.stDecls));
-                let ce = cellNew(if (cellGet(hasMutAlias)) Nil else callee.fsEnsures);
-                while (match cellGet(ce) { Nil -> false, _ -> true }) {
-                    match cellGet(ce) {
-                        Cons(ec, re) -> {
-                            let ensVars = match ec.ecBind {
-                                Some(bname) -> assocSet(cellGet(calleeVars), bname, rsym),
-                                None -> cellGet(calleeVars),
-                            };
-                            let ensSt = MkSymState {
-                                stDecls: cellGet(declsAcc),
-                                stVars: ensVars,
-                                stCells: stAfterMut.stCells,
-                                stLocSorts: stAfterMut.stLocSorts,
-                                stArrLens: stAfterMut.stArrLens,
-                                stArrMems: stAfterMut.stArrMems,
-                                stDataTags: stAfterMut.stDataTags,
-                                stDataFields: stAfterMut.stDataFields,
-                                stPath: cellGet(pathAcc),
-                                stUserVars: stAfterMut.stUserVars,
-                            };
-                            let (stEnsOut, evOpt) = evalTerm(ctx, ensSt, ec.ecExpr, false);
-                            cellSet(declsAcc, stEnsOut.stDecls);
-                            match evOpt {
-                                Some(es) -> cellSet(pathAcc, Cons(es, cellGet(pathAcc))),
-                                None -> (),
-                            };
-                            cellSet(ce, re)
-                        },
-                        Nil -> (),
-                    }
-                };
-                let stOut = MkSymState {
-                    stDecls: cellGet(declsAcc),
-                    stVars: stAfterMut.stVars,
-                    stCells: stAfterMut.stCells,
-                    stLocSorts: stAfterMut.stLocSorts,
-                    stArrLens: stAfterMut.stArrLens,
-                    stArrMems: stAfterMut.stArrMems,
-                    stDataTags: stAfterMut.stDataTags,
-                    stDataFields: stAfterMut.stDataFields,
-                    stPath: cellGet(pathAcc),
-                    stUserVars: stAfterMut.stUserVars,
-                };
-                (stOut, Some(rsym))
+                match retSortOpt {
+                    Some(rsort) -> {
+                        let rsym = freshSym(ctx, nm + "_ret");
+                        let rdecl = "(declare-const " + rsym + " " + rsort + ")";
+                        let initPath0 = match retTy {
+                            TyCon("Char") -> Cons("(bvult " + rsym + " #x00000100)", stAfterMut.stPath),
+                            _ -> stAfterMut.stPath,
+                        };
+                        let initPath = match adtVariantCountForType(ctx, retTy) {
+                            Some(nv) if (nv > 0) -> Cons("(bvult " + rsym + " " + bvLitForBits(nv, 32) + ")", initPath0),
+                            _ -> initPath0,
+                        };
+                        let pathAcc = cellNew(initPath);
+                        let declsAcc = cellNew(Cons(rdecl, stAfterMut.stDecls));
+                        let ce = cellNew(if (cellGet(hasMutAlias)) Nil else callee.fsEnsures);
+                        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                            match cellGet(ce) {
+                                Cons(ec, re) -> {
+                                    let ensVars = match ec.ecBind {
+                                        Some(bname) -> assocSet(cellGet(calleeVars), bname, rsym),
+                                        None -> cellGet(calleeVars),
+                                    };
+                                    let ensSt = MkSymState {
+                                        stDecls: cellGet(declsAcc),
+                                        stVars: ensVars,
+                                        stCells: stAfterMut.stCells,
+                                        stLocSorts: stAfterMut.stLocSorts,
+                                        stArrLens: stAfterMut.stArrLens,
+                                        stArrMems: stAfterMut.stArrMems,
+                                        stDataTags: stAfterMut.stDataTags,
+                                        stDataFields: stAfterMut.stDataFields,
+                                        stPath: cellGet(pathAcc),
+                                        stUserVars: stAfterMut.stUserVars,
+                                    };
+                                    let (stEnsOut, evOpt) = evalTerm(ctx, ensSt, ec.ecExpr, false);
+                                    cellSet(declsAcc, stEnsOut.stDecls);
+                                    match evOpt {
+                                        Some(es) -> cellSet(pathAcc, Cons(es, cellGet(pathAcc))),
+                                        None -> (),
+                                    };
+                                    cellSet(ce, re)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let stOut = MkSymState {
+                            stDecls: cellGet(declsAcc),
+                            stVars: stAfterMut.stVars,
+                            stCells: stAfterMut.stCells,
+                            stLocSorts: stAfterMut.stLocSorts,
+                            stArrLens: stAfterMut.stArrLens,
+                            stArrMems: stAfterMut.stArrMems,
+                            stDataTags: stAfterMut.stDataTags,
+                            stDataFields: stAfterMut.stDataFields,
+                            stPath: cellGet(pathAcc),
+                            stUserVars: stAfterMut.stUserVars,
+                        };
+                        (stOut, Some(rsym))
+                    },
+                    None -> (stAfterMut, None),
+                }
             },
             None -> {
-                // Unknown/extern function: havoc any Cell/MutArray arguments
+                // Unknown/extern function: havoc any Cell/MutArray arguments (including wrapped in Tuple/ADT)
                 let ca = cellNew(args);
                 let cav = cellNew(argVals);
                 while (match (cellGet(ca), cellGet(cav)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
@@ -2117,8 +2474,11 @@ def evalApplyDir(
                                 Some(loc) ->
                                     if (isCellType(aty)) cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), loc))
                                     else if (isMutArrayType(aty)) cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), loc))
-                                    else (),
-                                None -> (),
+                                    else if (typeContainsMutableRec(ctx, aty, Nil)) {
+                                        collectMutLocsFromSym(st1, loc, passedCellLocs, passedMutArrLocs, unknownMutContainer, Nil)
+                                    } else (),
+                                None ->
+                                    if (typeContainsMutableRec(ctx, aty, Nil)) cellSet(unknownMutContainer, true) else (),
                             };
                             cellSet(ca, ra);
                             cellSet(cav, rav)
@@ -2126,7 +2486,9 @@ def evalApplyDir(
                         _ -> (),
                     }
                 };
-                let stOut = havocLocs(ctx, st1, cellGet(passedCellLocs), cellGet(passedMutArrLocs), "ext");
+                let havocCells = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
+                let havocArrs = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stArrMems) else cellGet(passedMutArrLocs);
+                let stOut = havocLocs(ctx, st1, havocCells, havocArrs, "ext");
                 (stOut, None)
             },
         }
@@ -2165,7 +2527,7 @@ def evalWhile(
                             };
                             cellSet(cur, r)
                         },
-                        _ -> {
+                _ -> {
                             cellSet(restBody, MkTerm { tspan: body.tspan, tscm: body.tscm, tnode: TmBlock(Cons(s, r)) });
                             cellSet(taking, false)
                         },
@@ -2186,6 +2548,7 @@ def evalWhile(
     let modCellsCell: Cell (List String) = cellNew(Nil);
     let modArrsCell: Cell (List String) = cellNew(Nil);
     let hasOpaque = cellNew(false);
+    scanEffectsInTerm(cond, st.stVars, modCellsCell, modArrsCell, hasOpaque);
     scanEffectsInTerm(actualBody, st.stVars, modCellsCell, modArrsCell, hasOpaque);
     let modCells = if (cellGet(hasOpaque)) assocKeysUnique(st.stCells) else cellGet(modCellsCell);
     let modArrs = if (cellGet(hasOpaque)) assocKeysUnique(st.stArrMems) else cellGet(modArrsCell);
@@ -2407,15 +2770,30 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
                     cellSet(cells, assocSet(cellGet(cells), loc, cSym));
                     cellSet(uvars, assocSet(cellGet(uvars), pvd.vname, cSym))
                 } else {
-                    let sort = match typeToSmtSort(pty) { Some(s) -> s, None -> "(_ BitVec 32)" };
-                    let pSym = freshSym(ctx, pvd.vname);
-                    cellSet(decls, Cons("(declare-const " + pSym + " " + sort + ")", cellGet(decls)));
-                    match adtVariantCountForType(ctx, pty) {
-                        Some(nv) if (nv > 0) -> cellSet(path, Cons("(bvult " + pSym + " " + bvLitForBits(nv, 32) + ")", cellGet(path))),
-                        _ -> (),
+                    let sortOpt = match typeToSmtSort(pty) {
+                        Some(s) -> Some(s),
+                        None -> match adtVariantCountForType(ctx, pty) {
+                            Some(_) -> Some("(_ BitVec 32)"),
+                            None -> None,
+                        },
                     };
-                    cellSet(vars, assocSet(cellGet(vars), pvd.vname, pSym));
-                    cellSet(uvars, assocSet(cellGet(uvars), pvd.vname, pSym))
+                    match sortOpt {
+                        Some(sort) -> {
+                            let pSym = freshSym(ctx, pvd.vname);
+                            cellSet(decls, Cons("(declare-const " + pSym + " " + sort + ")", cellGet(decls)));
+                            match pty {
+                                TyCon("Char") -> cellSet(path, Cons("(bvult " + pSym + " #x00000100)", cellGet(path))),
+                                _ -> (),
+                            };
+                            match adtVariantCountForType(ctx, pty) {
+                                Some(nv) if (nv > 0) -> cellSet(path, Cons("(bvult " + pSym + " " + bvLitForBits(nv, 32) + ")", cellGet(path))),
+                                _ -> (),
+                            };
+                            cellSet(vars, assocSet(cellGet(vars), pvd.vname, pSym));
+                            cellSet(uvars, assocSet(cellGet(uvars), pvd.vname, pSym))
+                        },
+                        None -> (),
+                    }
                 };
                 cellSet(cp, r)
             },
@@ -2443,6 +2821,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
         vcCtorFieldTypes: ctx.vcCtorFieldTypes,
         vcAdtVariantCount: ctx.vcAdtVariantCount,
         vcAdtTypeParams: ctx.vcAdtTypeParams,
+        vcAdtReg: ctx.vcAdtReg,
         vcCallGraph: ctx.vcCallGraph,
         vcCurFn: spec.fsName,
         vcCurDecExpr: match spec.fsDecreases { Some((_, de)) -> Some(de), None -> None },
@@ -2473,11 +2852,21 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
         }
     };
 
-    // Evaluate entry `decreases` measure (checking its well-formedness)
+    // Evaluate entry `decreases` measure (checking its well-formedness AND entry non-negativity, matching core.gsa)
     let decValOpt: Option String = match spec.fsDecreases {
-        Some((_, decE)) -> {
+        Some((dsp, decE)) -> {
             let (stD, dv) = evalContractTerm(fnCtxBase, cellGet(curSt), decE);
             cellSet(curSt, stD);
+            let decZero = bvZero(typeBitWidth(schemeBody(decE.tscm)));
+            let entryGoal = match dv {
+                Some(d) -> Some("(bvsge " + d + " " + decZero + ")"),
+                None -> None,
+            };
+            dischargeOptGoal(
+                fnCtxBase, stD, "decreases", dsp,
+                "entry termination measure may be negative in `" + spec.fsName + "`",
+                entryGoal, None
+            );
             dv
         },
         None -> None,
@@ -2490,6 +2879,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
         vcCtorFieldTypes: ctx.vcCtorFieldTypes,
         vcAdtVariantCount: ctx.vcAdtVariantCount,
         vcAdtTypeParams: ctx.vcAdtTypeParams,
+        vcAdtReg: ctx.vcAdtReg,
         vcCallGraph: ctx.vcCallGraph,
         vcCurFn: spec.fsName,
         vcCurDecExpr: match spec.fsDecreases { Some((_, de)) -> Some(de), None -> None },
@@ -2646,6 +3036,7 @@ pub def verifyCoreProgram(
         vcCtorFieldTypes: ctorFtys,
         vcAdtVariantCount: adtCounts,
         vcAdtTypeParams: adtTps,
+        vcAdtReg: prog.coreAdtReg,
         vcCallGraph: callGraph,
         vcCurFn: "",
         vcCurDecExpr: None,

@@ -1932,6 +1932,8 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
     || name == "__blackBox"
     || name == "__gs_contract_fail"
+    || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
+    || name == "assert" || name == "assume"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"

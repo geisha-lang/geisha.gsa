@@ -478,6 +478,96 @@ def main() -> int:
                 "}\n"
                 "def main() = { let _ = bad(5); () }\n",
             ),
+            (
+                "s1_bad_shift32_unmasked",
+                "def badShift32(x: Int): Int\n"
+                "    requires x == 32\n"
+                "    ensures r -> r == 0\n"
+                "= 1 << x\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s1_bad_shift64_unmasked",
+                "def badShift64(x: Int): Int64\n"
+                "    requires x == 64\n"
+                "    ensures r -> r == intToI64(0)\n"
+                "= intToI64(1) << x\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s2_short_circuit_and_no_side_effect",
+                "def f(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let _ = false && { cellSet(c, 42); true };\n"
+                "    assert(cellGet(c) == 42)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s2_short_circuit_or_no_side_effect",
+                "def f(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let _ = true || { cellSet(c, 42); false };\n"
+                "    assert(cellGet(c) == 42)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s3_float_nan_eq_unmodeled",
+                "def nanEq(x: Float): Bool\n"
+                "    ensures r -> r\n"
+                "= x == x\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s4_while_let_alias_cell_mutation",
+                "def f(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let i = cellNew(0);\n"
+                "    while (cellGet(i) < 1)\n"
+                "        invariant 0 <= cellGet(i) && cellGet(i) <= 1\n"
+                "    {\n"
+                "        let alias = c;\n"
+                "        cellSet(alias, 99);\n"
+                "        cellSet(i, cellGet(i) + 1)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s4_while_match_alias_cell_mutation",
+                "use std.option.{Option, Some, None}\n"
+                "def f(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let i = cellNew(0);\n"
+                "    while (cellGet(i) < 1)\n"
+                "        invariant 0 <= cellGet(i) && cellGet(i) <= 1\n"
+                "    {\n"
+                "        match Some(c) {\n"
+                "            Some(alias) -> cellSet(alias, 99),\n"
+                "            None -> (),\n"
+                "        };\n"
+                "        cellSet(i, cellGet(i) + 1)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "s4_while_cond_side_effect",
+                "def f(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let i = cellNew(0);\n"
+                "    while ({ cellSet(c, 99); cellGet(i) < 1 })\n"
+                "        invariant 0 <= cellGet(i) && cellGet(i) <= 1\n"
+                "    {\n"
+                "        cellSet(i, cellGet(i) + 1)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
         ]
 
         for name, code in adversarial_cases:
@@ -487,7 +577,238 @@ def main() -> int:
             assert rj.returncode == 1, f"adversarial case [{name}] MUST fail (exit 1), got {rj.returncode}:\n{rj.stdout}\n{rj.stderr}"
             jp = json.loads(rj.stdout)
             assert jp["ok"] is False and (jp["failed"] + jp["unknown"]) > 0, f"adversarial case [{name}] vacuously passed: {jp}"
-        print(f"PASS [smt_verify_adversarial_14]: all {len(adversarial_cases)} soundness counterexamples rejected")
+        print(f"PASS [smt_verify_adversarial]: all {len(adversarial_cases)} soundness counterexamples rejected")
+
+        # Positive S1-S4 semantic alignment tests
+        s_pos_file = tmp / "s1_s4_positive.gsa"
+        s_pos_file.write_text(
+            "def shift32Masked(x: Int): Int\n"
+            "    requires x == 32\n"
+            "    ensures r -> r == 1\n"
+            "= 1 << x\n"
+            "\n"
+            "def shift64Masked(x: Int): Int64\n"
+            "    requires x == 64\n"
+            "    ensures r -> r == intToI64(1)\n"
+            "= intToI64(1) << x\n"
+            "\n"
+            "def convRoundTrip(x: Int): Int\n"
+            "    ensures r -> r == x\n"
+            "= i64ToInt(intToI64(x))\n"
+            "\n"
+            "def charOrder(): Bool\n"
+            "    ensures r -> r\n"
+            "= 'a' < 'z'\n"
+            "\n"
+            "def shortCircuitPreservesCell(): Void = {\n"
+            "    let c = cellNew(0);\n"
+            "    let _ = false && { cellSet(c, 42); true };\n"
+            "    assert(cellGet(c) == 0)\n"
+            "}\n"
+            "\n"
+            "def main() = ()\n",
+            encoding="utf-8",
+        )
+        rp = run([geisha, "verify", "--json", "--solver", z3_bin, str(s_pos_file)])
+        assert rp.returncode == 0, f"positive S1-S4 tests failed:\n{rp.stdout}\n{rp.stderr}"
+        jp_pos = json.loads(rp.stdout)
+        assert jp_pos["ok"] is True and jp_pos["failed"] == 0 and jp_pos["unknown"] == 0, f"unexpected: {jp_pos}"
+        print("PASS [smt_verify_s1_s4_positive]: masked shifts, intToI64/i64ToInt, Char cmp, short-circuit verified")
+
+        # Astra A1-A6 regression tests
+        a_adv_cases = [
+            (
+                "a1_try_while_unannotated",
+                "use std.result.{Result, Ok, Err}\n"
+                "def step(x: Int): Result Int String = if (x > 0) Ok(x - 1) else Err(\"neg\")\n"
+                "def loopTry(n: Int): Result Int String = {\n"
+                "    let c = cellNew(n);\n"
+                "    while (cellGet(c) > 0) {\n"
+                "        let nxt = step(cellGet(c))?;\n"
+                "        cellSet(c, nxt)\n"
+                "    };\n"
+                "    Ok(cellGet(c))\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a2_wrapped_cell_tuple_havoc",
+                "def mutatePair(p: (Cell Int, Int)): Void = {\n"
+                "    let (c, _) = p;\n"
+                "    cellSet(c, 99)\n"
+                "}\n"
+                "def caller(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    mutatePair((c, 7));\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a2_wrapped_cell_adt_havoc",
+                "data Wrap { MkWrap(Cell Int) }\n"
+                "def mutateWrap(w: Wrap): Void = match w {\n"
+                "    MkWrap(c) -> cellSet(c, 99),\n"
+                "}\n"
+                "def caller(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    mutateWrap(MkWrap(c));\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a2_wrapped_cell_alias",
+                "def twoPairs(p1: (Cell Int, Int), p2: (Cell Int, Int)): Int\n"
+                "    ensures r -> r == 1\n"
+                "= 1\n"
+                "def caller(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    twoPairs((c, 1), (c, 2))\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a3_match_guard_mutation",
+                "def guardMut(x: Int): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    match x {\n"
+                "        _ if ({ cellSet(c, 99); false }) -> (),\n"
+                "        _ -> assert(cellGet(c) == 0),\n"
+                "    }\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a4_unmodeled_dividend_div_zero",
+                "def f(x: Float): Int = floatToInt(x) / 0\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a4_unmodeled_divisor",
+                "def f(x: Float): Int = 10 / floatToInt(x)\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a4_unmodeled_array_new_len",
+                "def f(x: Float): Int = {\n"
+                "    let a = arrayNew(floatToInt(x), 0);\n"
+                "    arrayLen(a)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "a5_entry_decreases_negative",
+                "def negDec(n: Int): Int\n"
+                "    decreases n\n"
+                "= if (n <= 0) 0 else negDec(n - 1)\n"
+                "def main() = ()\n",
+            ),
+        ]
+        for name, code in a_adv_cases:
+            f = tmp / f"{name}.gsa"
+            f.write_text(code, encoding="utf-8")
+            rj = run([geisha, "verify", "--json", "--solver", z3_bin, str(f)])
+            assert rj.returncode == 1, f"Astra adversarial case [{name}] MUST fail (exit 1), got {rj.returncode}:\n{rj.stdout}\n{rj.stderr}"
+            jp = json.loads(rj.stdout)
+            assert jp["ok"] is False and (jp["failed"] + jp["unknown"]) > 0, f"Astra case [{name}] vacuously passed: {jp}"
+        print(f"PASS [smt_verify_a1_a5_adversarial]: all {len(a_adv_cases)} Astra A1-A5 soundness cases rejected")
+
+        # A1 runtime 3-path test for `while` with `?` under `--contracts=check`
+        a1_rt = tmp / "a1_try_while_rt.gsa"
+        a1_rt.write_text(
+            "use std.result.{Result, Ok, Err}\n"
+            "def maybeStep(x: Int): Result Int String = if (x == 2) Err(\"stop\") else Ok(x - 1)\n"
+            "def runLoop(n: Int): Result Int String\n"
+            "    ensures r -> true\n"
+            "= {\n"
+            "    let c = cellNew(n);\n"
+            "    while (cellGet(c) > 0)\n"
+            "        invariant cellGet(c) >= 0\n"
+            "        decreases cellGet(c)\n"
+            "    {\n"
+            "        let nxt = maybeStep(cellGet(c))?;\n"
+            "        cellSet(c, nxt)\n"
+            "    };\n"
+            "    Ok(cellGet(c))\n"
+            "}\n"
+            "def main(): Void = {\n"
+            "    // 0 iterations: entry invariant holds, decreases not checked\n"
+            "    let _ = runLoop(0);\n"
+            "    // early Err exit on x==2: skips back-edge invariant/decreases\n"
+            "    let _ = runLoop(2);\n"
+            "    // normal iteration 1 -> 0: checks decreases & back-edge invariant\n"
+            "    let _ = runLoop(1);\n"
+            "    ()\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        a1_bin = tmp / "a1_try_while_rt"
+        rc_a1 = run([geisha, "--contracts=check", "-o", str(a1_bin), str(a1_rt)])
+        assert rc_a1.returncode == 0, f"A1 runtime compile failed:\n{rc_a1.stdout}\n{rc_a1.stderr}"
+        rr_a1 = run([str(a1_bin)])
+        assert rr_a1.returncode == 0, f"A1 runtime 3-path test failed:\n{rr_a1.stdout}\n{rr_a1.stderr}"
+
+        # A5 duplicate `decreases` compile error (def & while)
+        for kind, code in [
+            ("dup_def_dec", "def f(n: Int): Int\n    decreases n\n    decreases n + 1\n= n\ndef main() = ()\n"),
+            ("dup_while_dec", "def f(n: Int): Void = {\n    let i = cellNew(n);\n    while (cellGet(i) > 0)\n        decreases cellGet(i)\n        decreases cellGet(i) + 1\n    { cellSet(i, cellGet(i) - 1) }\n}\ndef main() = ()\n"),
+        ]:
+            df = tmp / f"{kind}.gsa"
+            df.write_text(code, encoding="utf-8")
+            rc_d = run([geisha, "check", str(df)])
+            assert rc_d.returncode != 0 and "at most one `decreases` clause" in (rc_d.stdout + rc_d.stderr), (
+                f"A5 {kind} should fail with duplicate decreases diagnostic, got:\n{rc_d.stdout}\n{rc_d.stderr}"
+            )
+
+        # A6: user var named `loc_count` appears in counterexample, `doc` shows instance contracts, `fmt` indents while/instance contracts idempotently
+        a6_loc = tmp / "a6_loc_count.gsa"
+        a6_loc.write_text(
+            "def checkLoc(loc_count: Int): Int\n"
+            "    ensures r -> r > 0\n"
+            "= loc_count\n"
+            "def main() = ()\n",
+            encoding="utf-8",
+        )
+        r_loc = run([geisha, "verify", "--json", "--solver", z3_bin, str(a6_loc)])
+        assert r_loc.returncode == 1
+        assert "loc_count" in r_loc.stdout, f"A6: expected `loc_count` in counterexample model, got:\n{r_loc.stdout}"
+
+        a6_doc = tmp / "a6_inst_doc.gsa"
+        a6_doc.write_text(
+            "pub concept SafeDiv a {\n"
+            "    def sdiv(x: a, y: a): a\n"
+            "}\n"
+            "pub instance SafeDiv Int {\n"
+            "    def sdiv(x, y)\n"
+            "        requires y != 0\n"
+            "    = x / y\n"
+            "}\n"
+            "def main() = ()\n",
+            encoding="utf-8",
+        )
+        r_doc = run([geisha, "doc", str(a6_doc)])
+        assert r_doc.returncode == 0 and "requires y != 0" in r_doc.stdout, f"A6 doc missing instance contract:\n{r_doc.stdout}\n{r_doc.stderr}"
+
+        a6_fmt = tmp / "a6_fmt.gsa"
+        a6_fmt.write_text(
+            "def f(n: Int): Void = {\n"
+            "    let i = cellNew(0);\n"
+            "    while (cellGet(i) < n)\n"
+            "        invariant cellGet(i) >= 0\n"
+            "    {\n"
+            "        cellSet(i, cellGet(i) + 1)\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        r_fmt1 = run([geisha, "fmt", "--stdout", str(a6_fmt)])
+        assert r_fmt1.returncode == 0 and "        invariant cellGet(i) >= 0" in r_fmt1.stdout, f"A6 fmt indent wrong:\n{r_fmt1.stdout}\n{r_fmt1.stderr}"
+        a6_fmt2 = tmp / "a6_fmt2.gsa"
+        a6_fmt2.write_text(r_fmt1.stdout, encoding="utf-8")
+        r_fmt2 = run([geisha, "fmt", "--stdout", str(a6_fmt2)])
+        assert r_fmt2.returncode == 0 and r_fmt2.stdout == r_fmt1.stdout, f"A6 fmt not idempotent:\n{r_fmt1.stdout}\n---\n{r_fmt2.stdout}"
+        print("PASS [smt_verify_a1_a6_polish]: A1 runtime 3-path, A5 duplicate decreases, A6 loc_count/doc/fmt verified")
 
     return 0
 

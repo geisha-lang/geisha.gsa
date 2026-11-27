@@ -1114,6 +1114,13 @@ def loadAndVerifyProgram(
         };
     let inf = inferProgram(rawDefs)?;
     let coreProg = lowerToCoreMode(inf, "keep")?;
+    match opts.optDumpCore {
+        Some(dumpPath) -> {
+            let sexp = dumpCoreProgramSExpr(coreProg)?;
+            writeFile(dumpPath, sexp)?
+        },
+        None -> (),
+    };
     verifyCoreProgram(coreProg, entryFile, scopeDir, opts.optJson, opts.optSolver, opts.optTimeoutMs, !opts.optNoImplicit)
 }
 
