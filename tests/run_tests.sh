@@ -7082,6 +7082,24 @@ EOF
                 exit 1
             fi
         fi
+        # Paired old-vs-new ACL test: existing ACL-free page must NOT pick up newly added parent
+        # file_inherit ACL on regeneration, while a brand-new page created in the same run MUST inherit it.
+        T44_MIX_SITE="$TMP_DIR/t44_mac_mix_site"
+        (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_MIX_SITE" --no-stdlib) >/dev/null
+        if chmod +a "user:nobody deny read,file_inherit" "$T44_MIX_SITE/modules" 2>/dev/null; then
+            cat > "$T44_PROJ/src/fresh_acl_mod.gsa" << 'EOF'
+/// Brand-new module for paired ACL test.
+pub def freshAcl(): Int = 1
+EOF
+            (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_MIX_SITE" --no-stdlib) >/dev/null
+            rm -f "$T44_PROJ/src/fresh_acl_mod.gsa"
+            T44_OLD_ACL="$(ls -le "$T44_MIX_SITE/modules/docdemo.math.html" | grep 'user:nobody' || true)"
+            T44_NEW_ACL="$(ls -le "$T44_MIX_SITE/modules/docdemo.fresh_acl_mod.html" | grep 'user:nobody' || true)"
+            if [ -n "$T44_OLD_ACL" ] || [ -z "$T44_NEW_ACL" ]; then
+                echo "FAIL [doc_paired_old_new_acl]: old page must stay ACL-free (got '$T44_OLD_ACL') while new page inherits ACL (got '$T44_NEW_ACL')" >&2
+                exit 1
+            fi
+        fi
     fi
 
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists

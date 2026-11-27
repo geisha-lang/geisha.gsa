@@ -941,7 +941,7 @@ int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
     static volatile LONG gs_win_tmpl_seq = 0;
     const char *s1 = strrchr(path, '\\');
     const char *s2 = strrchr(path, '/');
-    const char *sep = (s1 > s2) ? s1 : s2;
+    const char *sep = (s1 != NULL && (s2 == NULL || s1 > s2)) ? s1 : s2;
     size_t pfx_len = (sep != NULL) ? (size_t)(sep - path + 1) : 0;
     unsigned long pid = (unsigned long)GetCurrentProcessId();
     char *tmpl = (char *)malloc(pfx_len + 64);

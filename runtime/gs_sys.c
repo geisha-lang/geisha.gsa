@@ -408,7 +408,7 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
 }
 
 #ifdef __APPLE__
-#include <copyfile.h>
+#include <sys/acl.h>
 #elif defined(__linux__)
 #include <sys/xattr.h>
 #endif
@@ -475,14 +475,40 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
     if (dst_st.st_uid != st.st_uid || dst_st.st_gid != st.st_gid) {
         if (chown(dst, st.st_uid, st.st_gid) != 0) return -1;
     }
-    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
 #ifdef __APPLE__
-    if (copyfile(src, dst, NULL, COPYFILE_ACL) != 0) return -1;
+    /* Copy exact macOS extended ACL (including inherited entries), or clear `dst`'s ACL when
+     * `src` has no extended ACL (acl_get_file returns NULL with ENOENT). */
+    errno = 0;
+    acl_t src_acl = acl_get_file(src, ACL_TYPE_EXTENDED);
+    if (src_acl != NULL) {
+        int set_rc = acl_set_file(dst, ACL_TYPE_EXTENDED, src_acl);
+        acl_free(src_acl);
+        if (set_rc != 0) return -1;
+    } else if (errno == ENOENT) {
+        acl_t empty_acl = acl_init(0);
+        if (empty_acl == NULL) return -1;
+        int clr_rc = acl_set_file(dst, ACL_TYPE_EXTENDED, empty_acl);
+        int clr_err = errno;
+        acl_free(empty_acl);
+        if (clr_rc != 0 && clr_err != ENOTSUP && clr_err != EOPNOTSUPP) return -1;
+    } else if (errno != ENOTSUP && errno != EOPNOTSUPP) {
+        return -1;
+    }
+    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
 #elif defined(__linux__)
     ssize_t sz = getxattr(src, "system.posix_acl_access", NULL, 0);
     if (sz < 0) {
-        if (errno != ENODATA && errno != ENOTSUP && errno != EOPNOTSUPP) return -1;
+        if (errno == ENODATA) {
+            if (removexattr(dst, "system.posix_acl_access") != 0 &&
+                errno != ENODATA && errno != ENOTSUP && errno != EOPNOTSUPP) {
+                return -1;
+            }
+        } else if (errno != ENOTSUP && errno != EOPNOTSUPP) {
+            return -1;
+        }
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
     } else if (sz > 0) {
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
         void *abuf = malloc((size_t)sz);
         if (abuf == NULL) return -1;
         ssize_t got = getxattr(src, "system.posix_acl_access", abuf, (size_t)sz);
@@ -491,7 +517,11 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
             return -1;
         }
         free(abuf);
+    } else {
+        if (chmod(dst, st.st_mode & 07777) != 0) return -1;
     }
+#else
+    if (chmod(dst, st.st_mode & 07777) != 0) return -1;
 #endif
     return 0;
 }
