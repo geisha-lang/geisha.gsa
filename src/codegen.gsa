@@ -5,8 +5,11 @@ use std.list.{listRev, listLen}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
-use std.str.{intToStr, i64ToStr, floatToHex16, strJoin}
+use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strStartsWith}
+use sys.env.getEnv
+use diag.{diagGetFile, diagSpanLineCol}
 use ast.{
+    Span, emptySpan, typeToString,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, schemeBody,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
@@ -577,6 +580,12 @@ data FnEmitCtx {
         fcCurBlk: Cell Int,
         fcPendingLet: Cell (Option String),
         fcDummyBlk: BasicBlockBuf,
+        fcDebug: Bool,
+        fcSubprogramId: Int,
+        fcSrcFileId: Int,
+        fcDiFileId: Int,
+        fcDefLine: Int,
+        fcCurLocId: Cell Int,
     },
 }
 
@@ -602,6 +611,16 @@ data ModEmitCtx {
         mcHasExplicitExports: Bool,
         mcCExportSyms: StrMap Bool,
         mcUseGlobalsOnce: Bool,
+        mcDebug: Bool,
+        mcDbgCwd: String,
+        mcDbgNextId: Cell Int,
+        mcDbgDecls: StringBuf,
+        mcDbgCuId: Cell Int,
+        mcDbgSubTyId: Cell Int,
+        mcDbgFileIds: StrMap Int,
+        mcDbgLexFileIds: StrMap Int,
+        mcDbgLocCache: StrMap Int,
+        mcDbgTypeCache: StrMap Int,
     },
 }
 
@@ -1039,6 +1058,377 @@ def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
     else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
     else llvmSym(fnName)
 
+// ============================================================================
+// DWARF Debug Info Metadata Emitter (LLVM 20 `#dbg_declare` + `!DILocation`)
+// ============================================================================
+
+def escapeDbgStr(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i));
+        if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else bufPushByte(b, ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def splitDbgPath(path: String, cwd: String): (String, String) = {
+    let n = strLen(path);
+    if (n == 0) (if (strLen(cwd) > 0) cwd else ".", "<unknown>")
+    else if (strByteAt(path, 0) == 60) (".", path)
+    else {
+        let lastSlash = cellNew(-1);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            if (strByteAt(path, cellGet(i)) == 47) cellSet(lastSlash, cellGet(i)) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        let sl = cellGet(lastSlash);
+        if (sl < 0) {
+            (if (strLen(cwd) > 0) cwd else ".", path)
+        } else {
+            let rawDir = if (sl == 0) "/" else strSlice(path, 0, sl);
+            let base = strSlice(path, sl + 1, n);
+            let fullDir =
+                if (strLen(rawDir) > 0 && strByteAt(rawDir, 0) != 47 && strLen(cwd) > 0) cwd + "/" + rawDir
+                else rawDir;
+            (fullDir, base)
+        }
+    }
+}
+
+def dbgAllocId(mctx: ModEmitCtx): Int = {
+    let id = cellGet(mctx.mcDbgNextId);
+    cellSet(mctx.mcDbgNextId, id + 1);
+    id
+}
+
+def dbgEmitNode(mctx: ModEmitCtx, id: Int, body: String): Void = {
+    bufPushStr(mctx.mcDbgDecls, "!");
+    bufPushStr(mctx.mcDbgDecls, intToStr(id));
+    bufPushStr(mctx.mcDbgDecls, " = ");
+    bufPushStr(mctx.mcDbgDecls, body);
+    bufPushByte(mctx.mcDbgDecls, 10)
+}
+
+def dbgGetOrCreateFile(mctx: ModEmitCtx, fileId: Int): Int = {
+    let key = intToStr(fileId);
+    match strMapGet(mctx.mcDbgFileIds, key) {
+        Some(id) -> id,
+        None -> {
+            let sfPath = match diagGetFile(fileId) {
+                Some(sf) -> sf.sfPath,
+                None -> "<unknown>",
+            };
+            let (dir, fname) = splitDbgPath(sfPath, mctx.mcDbgCwd);
+            let id = dbgAllocId(mctx);
+            dbgEmitNode(mctx, id, "!DIFile(filename: \"" + escapeDbgStr(fname) + "\", directory: \"" + escapeDbgStr(dir) + "\")");
+            strMapInsert(mctx.mcDbgFileIds, key, id);
+            id
+        },
+    }
+}
+
+def dbgInitModule(mctx: ModEmitCtx, primaryFileId: Int): Void =
+    if (mctx.mcDebug) {
+        let cuId = dbgAllocId(mctx);
+        let fileNodeId = dbgGetOrCreateFile(mctx, primaryFileId);
+        let subTyId = dbgAllocId(mctx);
+        dbgEmitNode(mctx, cuId, "distinct !DICompileUnit(language: DW_LANG_C99, file: !" + intToStr(fileNodeId) + ", producer: \"geisha\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)");
+        dbgEmitNode(mctx, subTyId, "!DISubroutineType(types: !{null})");
+        cellSet(mctx.mcDbgCuId, cuId);
+        cellSet(mctx.mcDbgSubTyId, subTyId)
+    } else ()
+
+def dbgCreateSubprogram(mctx: ModEmitCtx, displayName: String, linkageName: String, sp: Span): (Int, Int, Int) = {
+    let diFileId = dbgGetOrCreateFile(mctx, sp.fileId);
+    let (line0, _) = diagSpanLineCol(sp);
+    let ln = if (line0 > 0) line0 else 1;
+    let spId = dbgAllocId(mctx);
+    let body =
+        "distinct !DISubprogram(name: \"" + escapeDbgStr(displayName)
+        + "\", linkageName: \"" + escapeDbgStr(linkageName)
+        + "\", scope: !" + intToStr(diFileId)
+        + ", file: !" + intToStr(diFileId)
+        + ", line: " + intToStr(ln)
+        + ", type: !" + intToStr(cellGet(mctx.mcDbgSubTyId))
+        + ", scopeLine: " + intToStr(ln)
+        + ", spFlags: DISPFlagDefinition, unit: !" + intToStr(cellGet(mctx.mcDbgCuId)) + ")";
+    dbgEmitNode(mctx, spId, body);
+    (spId, diFileId, ln)
+}
+
+def dbgGetOrCreateScopeForFile(mctx: ModEmitCtx, fctx: FnEmitCtx, srcFileId: Int): Int =
+    if (srcFileId == 0 || srcFileId == fctx.fcSrcFileId) fctx.fcSubprogramId
+    else {
+        let key = intToStr(fctx.fcSubprogramId) + ":" + intToStr(srcFileId);
+        match strMapGet(mctx.mcDbgLexFileIds, key) {
+            Some(id) -> id,
+            None -> {
+                let diFileId = dbgGetOrCreateFile(mctx, srcFileId);
+                let id = dbgAllocId(mctx);
+                dbgEmitNode(mctx, id, "!DILexicalBlockFile(scope: !" + intToStr(fctx.fcSubprogramId) + ", file: !" + intToStr(diFileId) + ", discriminator: 0)");
+                strMapInsert(mctx.mcDbgLexFileIds, key, id);
+                id
+            },
+        }
+    }
+
+def dbgGetOrCreateLoc(mctx: ModEmitCtx, fctx: FnEmitCtx, sp: Span): Int = {
+    let scopeId = dbgGetOrCreateScopeForFile(mctx, fctx, sp.fileId);
+    let (line0, col0) = diagSpanLineCol(sp);
+    let ln = if (line0 > 0) line0 else fctx.fcDefLine;
+    let col = if (line0 > 0) col0 else 1;
+    let key = intToStr(scopeId) + ":" + intToStr(ln) + ":" + intToStr(col);
+    match strMapGet(mctx.mcDbgLocCache, key) {
+        Some(id) -> id,
+        None -> {
+            let id = dbgAllocId(mctx);
+            dbgEmitNode(mctx, id, "!DILocation(line: " + intToStr(ln) + ", column: " + intToStr(col) + ", scope: !" + intToStr(scopeId) + ")");
+            strMapInsert(mctx.mcDbgLocCache, key, id);
+            id
+        },
+    }
+}
+
+def dbgEmitStructType(
+    mctx: ModEmitCtx,
+    structId: Int,
+    typeName: String,
+    fieldNames: List String,
+    fieldTys: List Type
+): Void = {
+    let memIdsRev: Cell (List String) = cellNew(Nil);
+    let off = cellNew(0);
+    let maxAl = cellNew(1);
+    let idx = cellNew(0);
+    let cf = cellNew(fieldTys);
+    let cn = cellNew(fieldNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(ft, rft) -> {
+                let fname = match cellGet(cn) {
+                    Cons(nm, rnm) -> { cellSet(cn, rnm); nm },
+                    Nil -> "_" + intToStr(cellGet(idx)),
+                };
+                let (fsz, fal) = typeSizeAndAlignFor(ft, mctx.mcPtrSize);
+                let alignedOff = alignUp(cellGet(off), fal);
+                let fDbgTy = dbgTypeForGeishaType(mctx, ft);
+                let memId = dbgAllocId(mctx);
+                let offClause = if (alignedOff > 0) ", offset: " + intToStr(alignedOff * 8) else "";
+                dbgEmitNode(
+                    mctx,
+                    memId,
+                    "!DIDerivedType(tag: DW_TAG_member, name: \"" + escapeDbgStr(fname)
+                    + "\", scope: !" + intToStr(structId)
+                    + ", baseType: !" + intToStr(fDbgTy)
+                    + ", size: " + intToStr(fsz * 8)
+                    + offClause + ")"
+                );
+                cellSet(memIdsRev, Cons("!" + intToStr(memId), cellGet(memIdsRev)));
+                cellSet(off, alignedOff + fsz);
+                if (fal > cellGet(maxAl)) cellSet(maxAl, fal) else ();
+                cellSet(idx, cellGet(idx) + 1);
+                cellSet(cf, rft)
+            },
+            Nil -> (),
+        }
+    };
+    let totalBytes = alignUp(cellGet(off), cellGet(maxAl));
+    let totalBits = if (totalBytes > 0) totalBytes * 8 else 8;
+    let elemsId = dbgAllocId(mctx);
+    dbgEmitNode(mctx, elemsId, "!{" + strJoin(listRev(cellGet(memIdsRev)), ", ") + "}");
+    dbgEmitNode(
+        mctx,
+        structId,
+        "distinct !DICompositeType(tag: DW_TAG_structure_type, name: \"" + escapeDbgStr(typeName)
+        + "\", size: " + intToStr(totalBits)
+        + ", elements: !" + intToStr(elemsId) + ")"
+    )
+}
+
+def dbgTypeForGeishaType(mctx: ModEmitCtx, ty: Type): Int = {
+    let key = typeToString(ty);
+    match strMapGet(mctx.mcDbgTypeCache, key) {
+        Some(id) -> id,
+        None -> {
+            let ptrBits = mctx.mcPtrSize * 8;
+            match ty {
+                TyVoid -> {
+                    let id = dbgAllocId(mctx);
+                    dbgEmitNode(mctx, id, "!DIBasicType(name: \"Void\", size: 8, encoding: DW_ATE_unsigned)");
+                    strMapInsert(mctx.mcDbgTypeCache, key, id);
+                    id
+                },
+                TyCon(n) ->
+                    if (n == "Int") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Int\", size: 32, encoding: DW_ATE_signed)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Int64") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Int64\", size: 64, encoding: DW_ATE_signed)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Float") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Float\", size: 64, encoding: DW_ATE_float)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Float32") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Float32\", size: 32, encoding: DW_ATE_float)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Bool") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Bool\", size: 8, encoding: DW_ATE_boolean)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Char") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Char\", size: 8, encoding: DW_ATE_signed_char)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "Void") {
+                        let id = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, id, "!DIBasicType(name: \"Void\", size: 8, encoding: DW_ATE_unsigned)");
+                        strMapInsert(mctx.mcDbgTypeCache, key, id);
+                        id
+                    } else if (n == "String") {
+                        let charId = dbgTypeForGeishaType(mctx, TyCon("Char"));
+                        let ptrId = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(charId) + ", size: " + intToStr(ptrBits) + ")");
+                        let tdId = dbgAllocId(mctx);
+                        dbgEmitNode(mctx, tdId, "!DIDerivedType(tag: DW_TAG_typedef, name: \"String\", baseType: !" + intToStr(ptrId) + ")");
+                        strMapInsert(mctx.mcDbgTypeCache, key, tdId);
+                        tdId
+                    } else {
+                        dbgTypeForAdtOrOpaque(mctx, ty, key, ptrBits)
+                    },
+                TyTuple(elems) -> {
+                    let structId = dbgAllocId(mctx);
+                    strMapInsert(mctx.mcDbgTypeCache, key, structId);
+                    dbgEmitStructType(mctx, structId, key, Nil, elems);
+                    structId
+                },
+                TyComp(_, elemTy) -> {
+                    let base = getCompBaseName(ty);
+                    if (base == "Cell") {
+                        let ptrId = dbgAllocId(mctx);
+                        strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
+                        let innerId = dbgTypeForGeishaType(mctx, elemTy);
+                        dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(innerId) + ", size: " + intToStr(ptrBits) + ")");
+                        ptrId
+                    } else if (base == "MutArray" || base == "ImmArray") {
+                        let ptrId = dbgAllocId(mctx);
+                        strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
+                        let structId = dbgAllocId(mctx);
+                        dbgEmitStructType(mctx, structId, "gs_array<" + typeToString(elemTy) + ">", ["len"], [TyCon("Int64")]);
+                        dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
+                        ptrId
+                    } else {
+                        dbgTypeForAdtOrOpaque(mctx, ty, key, ptrBits)
+                    }
+                },
+                _ -> {
+                    let id = dbgAllocId(mctx);
+                    dbgEmitNode(mctx, id, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: " + intToStr(ptrBits) + ")");
+                    strMapInsert(mctx.mcDbgTypeCache, key, id);
+                    id
+                },
+            }
+        },
+    }
+}
+
+def dbgTypeForAdtOrOpaque(mctx: ModEmitCtx, ty: Type, key: String, ptrBits: Int): Int =
+    match unboxedAdtFields(ty) {
+        Some(fs) -> {
+            let structId = dbgAllocId(mctx);
+            strMapInsert(mctx.mcDbgTypeCache, key, structId);
+            let adtBase = getCompBaseName(ty);
+            let fnames = match strMapGet(mctx.mcAdtReg, adtBase) {
+                Some(ainfo) -> match ainfo.variants {
+                    Cons(v, _) -> match v.fieldNames { Some(ns) -> ns, None -> Nil },
+                    Nil -> Nil,
+                },
+                None -> Nil,
+            };
+            dbgEmitStructType(mctx, structId, key, fnames, fs);
+            structId
+        },
+        None ->
+            if (isAdtGeishaType(ty)) {
+                let ptrId = dbgAllocId(mctx);
+                strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
+                let structId = dbgAllocId(mctx);
+                let adtBase = getCompBaseName(ty);
+                let targs = extractTypeArgs(ty);
+                let (storageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtBase, targs, mctx.mcPtrSize);
+                let payTy =
+                    if (strStartsWith(storageTy, "{ i32, [") && !strStartsWith(storageTy, "{ i32, [0")) {
+                        // `{ i32, [N x i64] }` has 8-byte aligned payload; `{ i32, [N x i32] }` has 4-byte aligned payload
+                        let slen = strLen(storageTy);
+                        if (slen >= 6 && strByteAt(storageTy, slen - 5) == 54 && strByteAt(storageTy, slen - 4) == 52) TyCon("Int64")
+                        else TyCon("Int")
+                    } else TyCon("Int");
+                dbgEmitStructType(mctx, structId, "gs_adt<" + key + ">", ["tag", "payload"], [TyCon("Int"), payTy]);
+                dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
+                ptrId
+            } else {
+                let id = dbgAllocId(mctx);
+                dbgEmitNode(mctx, id, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: null, size: " + intToStr(ptrBits) + ")");
+                strMapInsert(mctx.mcDbgTypeCache, key, id);
+                id
+            },
+    }
+
+def dbgEmitLocalVar(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    varName: String,
+    varTy: Type,
+    slotPtr: String,
+    sp: Span,
+    argNum: Int
+): Void =
+    if (mctx.mcDebug && fctx.fcDebug && fctx.fcSubprogramId >= 0 && strLen(varName) > 0 && strByteAt(varName, 0) != 46) {
+        let bb = vecGetOr(fctx.fcBlocks, cellGet(fctx.fcCurBlk), fctx.fcDummyBlk);
+        if (!cellGet(bb.bbTerm)) {
+            let varDbgTy = dbgTypeForGeishaType(mctx, varTy);
+            let (line0, _) = diagSpanLineCol(sp);
+            let ln = if (line0 > 0) line0 else fctx.fcDefLine;
+            let argClause = if (argNum > 0) ", arg: " + intToStr(argNum) else "";
+            let varId = dbgAllocId(mctx);
+            dbgEmitNode(
+                mctx,
+                varId,
+                "!DILocalVariable(name: \"" + escapeDbgStr(varName) + "\"" + argClause
+                + ", scope: !" + intToStr(fctx.fcSubprogramId)
+                + ", file: !" + intToStr(fctx.fcDiFileId)
+                + ", line: " + intToStr(ln)
+                + ", type: !" + intToStr(varDbgTy) + ")"
+            );
+            let locId = dbgGetOrCreateLoc(mctx, fctx, sp);
+            bufPushStr(bb.bbInstrs, "    #dbg_declare(ptr ");
+            bufPushStr(bb.bbInstrs, slotPtr);
+            bufPushStr(bb.bbInstrs, ", !");
+            bufPushStr(bb.bbInstrs, intToStr(varId));
+            bufPushStr(bb.bbInstrs, ", !DIExpression(), !");
+            bufPushStr(bb.bbInstrs, intToStr(locId));
+            bufPushStr(bb.bbInstrs, ")\n")
+        } else ()
+    } else ()
+
 def newFnEmitCtx(fnName: String): FnEmitCtx = {
     let blks: Vec BasicBlockBuf = vecNew();
     let entryBb = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
@@ -1052,8 +1442,55 @@ def newFnEmitCtx(fnName: String): FnEmitCtx = {
         fcCurBlk: cellNew(0),
         fcPendingLet: cellNew(None),
         fcDummyBlk: entryBb,
+        fcDebug: false,
+        fcSubprogramId: -1,
+        fcSrcFileId: 0,
+        fcDiFileId: -1,
+        fcDefLine: 1,
+        fcCurLocId: cellNew(-1),
     }
 }
+
+def dbgGetOrCreatePrologueLoc(mctx: ModEmitCtx, scopeId: Int): Int = {
+    let key = intToStr(scopeId) + ":0:0";
+    match strMapGet(mctx.mcDbgLocCache, key) {
+        Some(id) -> id,
+        None -> {
+            let id = dbgAllocId(mctx);
+            dbgEmitNode(mctx, id, "!DILocation(line: 0, column: 0, scope: !" + intToStr(scopeId) + ")");
+            strMapInsert(mctx.mcDbgLocCache, key, id);
+            id
+        },
+    }
+}
+
+def newFnEmitCtxDebug(mctx: ModEmitCtx, fnName: String, displayName: String, linkageName: String, sp: Span): FnEmitCtx =
+    if (!mctx.mcDebug) newFnEmitCtx(fnName)
+    else {
+        let blks: Vec BasicBlockBuf = vecNew();
+        let entryBb = MkBlockBuf { bbLabel: "entry", bbInstrs: bufNew(), bbTerm: cellNew(false) };
+        vecPush(blks, entryBb);
+        let (spId, diFileId, defLine) = dbgCreateSubprogram(mctx, displayName, linkageName, sp);
+        let fctx = MkFnEmitCtx {
+            fcName: fnName,
+            fcRegCnt: cellNew(0),
+            fcBlkCnt: cellNew(0),
+            fcAllocas: bufNew(),
+            fcBlocks: blks,
+            fcCurBlk: cellNew(0),
+            fcPendingLet: cellNew(None),
+            fcDummyBlk: entryBb,
+            fcDebug: true,
+            fcSubprogramId: spId,
+            fcSrcFileId: sp.fileId,
+            fcDiFileId: diFileId,
+            fcDefLine: defLine,
+            fcCurLocId: cellNew(-1),
+        };
+        let prologueLoc = dbgGetOrCreatePrologueLoc(mctx, spId);
+        cellSet(fctx.fcCurLocId, prologueLoc);
+        fctx
+    }
 
 def freshReg(fctx: FnEmitCtx): String = {
     let n = cellGet(fctx.fcRegCnt) + 1;
@@ -1091,6 +1528,13 @@ def emitLine(fctx: FnEmitCtx, line: String): Void = {
     if (!cellGet(bb.bbTerm)) {
         bufPushStr(bb.bbInstrs, "  ");
         bufPushStr(bb.bbInstrs, line);
+        if (fctx.fcDebug) {
+            let loc = cellGet(fctx.fcCurLocId);
+            if (loc >= 0) {
+                bufPushStr(bb.bbInstrs, ", !dbg !");
+                bufPushStr(bb.bbInstrs, intToStr(loc))
+            } else ()
+        } else ();
         bufPushByte(bb.bbInstrs, 10)
     } else ()
 }
@@ -1100,6 +1544,13 @@ def emitTermLine(fctx: FnEmitCtx, line: String): Void = {
     if (!cellGet(bb.bbTerm)) {
         bufPushStr(bb.bbInstrs, "  ");
         bufPushStr(bb.bbInstrs, line);
+        if (fctx.fcDebug) {
+            let loc = cellGet(fctx.fcCurLocId);
+            if (loc >= 0) {
+                bufPushStr(bb.bbInstrs, ", !dbg !");
+                bufPushStr(bb.bbInstrs, intToStr(loc))
+            } else ()
+        } else ();
         bufPushByte(bb.bbInstrs, 10);
         cellSet(bb.bbTerm, true)
     } else ()
@@ -1143,6 +1594,10 @@ def emitStore(fctx: FnEmitCtx, llvmTy: String, val: String, ptrVal: String): Voi
 
 def flushFunctionToBuf(out: StringBuf, header: String, fctx: FnEmitCtx): Void = {
     bufPushStr(out, header);
+    if (fctx.fcDebug && fctx.fcSubprogramId >= 0) {
+        bufPushStr(out, " !dbg !");
+        bufPushStr(out, intToStr(fctx.fcSubprogramId))
+    } else ();
     bufPushStr(out, " {\nentry:\n");
     bufPushBuf(out, fctx.fcAllocas);
     let entryBb = vecGetOr(fctx.fcBlocks, 0, fctx.fcDummyBlk);
@@ -1654,7 +2109,7 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
 
 def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
     Cons(h, t) -> if (idx == 0) h else nthArgTerm(t, idx - 1),
-    Nil -> MkTerm { tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
+    Nil -> MkTerm { tspan: emptySpan(), tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
 }
 
 def tryEmitIntrinsic(
@@ -3182,7 +3637,12 @@ def genExpr(
     let directLetVar = cellGet(fctx.fcPendingLet);
     cellSet(fctx.fcPendingLet, None);
 
-    match tm.tnode {
+    let prevLoc = cellGet(fctx.fcCurLocId);
+    if (fctx.fcDebug && tm.tspan.fileId != 0) {
+        cellSet(fctx.fcCurLocId, dbgGetOrCreateLoc(mctx, fctx, tm.tspan))
+    } else ();
+
+    let exprRes = match tm.tnode {
         TmLit(lit) -> genLit(mctx, lit),
 
         TmVar(vn) -> match lookupVarSlot(locals, mctx.mcGlobalSlots, vn) {
@@ -3282,6 +3742,7 @@ def genExpr(
             let vGeishaTy = schemeBody(vd.vscm);
             let vLlvmTy = getValLlvmType(vGeishaTy);
             let slotPtr = emitEntryAlloca(fctx, vLlvmTy);
+            dbgEmitLocalVar(mctx, fctx, vd.vname, vGeishaTy, slotPtr, tm.tspan, 0);
             emitStore(fctx, vLlvmTy, initVal, slotPtr);
             let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: vLlvmTy, vsGeishaTy: vGeishaTy };
             genExpr(mctx, fctx, exp, Cons((vd.vname, slot), locals), inTail)
@@ -3813,7 +4274,9 @@ def genExpr(
             }
             }
         },
-    }
+    };
+    cellSet(fctx.fcCurLocId, prevLoc);
+    exprRes
 }
 
 // ============================================================================
@@ -3970,7 +4433,13 @@ def termHasCall(tm: TaggedTerm): Bool = match tm.tnode {
 }
 
 def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
-    let fctx = newFnEmitCtx(fd.fnName);
+    let isCExported = strMapContains(mctx.mcCExportSyms, fd.fnName);
+    let isExp = !isCExported && shouldExportSymbol(mctx, fd.fnName);
+    let linkageName =
+        if (isCExported) "__gs_fn_" + fd.fnName
+        else if (!mctx.mcIsWasm && isExp) "__gs_exp_" + fd.fnName
+        else fd.fnName;
+    let fctx = newFnEmitCtxDebug(mctx, fd.fnName, fd.fnName, linkageName, fd.fnSpan);
     let funTy = schemeBody(fd.fnScm);
     let retGeishaTy = match funTy {
         TyArr(_, _, r) -> r,
@@ -3992,6 +4461,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
                 cellSet(paramSigPartsRev, Cons(pLlvmTy + " " + argReg, cellGet(paramSigPartsRev)));
 
                 let slotPtr = emitEntryAlloca(fctx, pLlvmTy);
+                dbgEmitLocalVar(mctx, fctx, vd.vname, pGeishaTy, slotPtr, fd.fnSpan, i + 1);
                 emitStore(fctx, pLlvmTy, argReg, slotPtr);
                 let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: pLlvmTy, vsGeishaTy: pGeishaTy };
                 cellSet(localsRev, Cons((vd.vname, slot), cellGet(localsRev)));
@@ -4031,6 +4501,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
                         let slotPtr = emitEntryAlloca(fctx, elemTy);
                         let fPtr = emitStructFieldPtr(fctx, fvStructTy, "%fvs", i);
                         let fvVal = emitLoad(fctx, elemTy, fPtr);
+                        dbgEmitLocalVar(mctx, fctx, vd.vname, schemeBody(vd.vscm), slotPtr, fd.fnSpan, 0);
                         emitStore(fctx, elemTy, fvVal, slotPtr);
                         let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: elemTy, vsGeishaTy: schemeBody(vd.vscm) };
                         cellSet(localsRev, Cons((vd.vname, slot), cellGet(localsRev)));
@@ -4044,7 +4515,7 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         },
     };
 
-    let allowTail = !fnHasStackAlloc(mctx.mcEscape, fd.fnName);
+    let allowTail = !mctx.mcDebug && !fnHasStackAlloc(mctx.mcEscape, fd.fnName);
     if (termHasCall(fd.fnBody)) emitGcSafepointPoll(mctx, fctx) else ();
     let bodyVal = genExpr(mctx, fctx, fd.fnBody, listRev(cellGet(localsRev)), allowTail);
     if (!curBlockHasTerm(fctx)) {
@@ -4052,8 +4523,6 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
-    let isCExported = strMapContains(mctx.mcCExportSyms, fd.fnName);
-    let isExp = !isCExported && shouldExportSymbol(mctx, fd.fnName);
     let paramSigStr = strJoin(listRev(cellGet(paramSigPartsRev)), ", ");
     if (isCExported) {
         let implHeader = "define internal " + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind";
@@ -4152,7 +4621,7 @@ def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDe
 }
 
 def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef, useGlobalsOnce: Bool): Void = {
-    let fctx = newFnEmitCtx("main");
+    let fctx = newFnEmitCtxDebug(mctx, "main", "main", "__geisha_main", mainFd.fnSpan);
     if (useGlobalsOnce) {
         emitLine(fctx, "call void @__gs_init_globals_once()")
     } else {
@@ -4181,15 +4650,31 @@ def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals:
     flushFunctionToBuf(out, "define internal void @__geisha_main() nounwind", fctx);
 
     // Emit C entry trampoline `@main(i32 %argc, ptr %argv)` with stack anchor strictly above `@__geisha_main`
-    bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind {\nentry:\n");
-    bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
-    bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
-    bufPushStr(out, "  %anchor = alloca i64, align 8\n");
-    bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
-    bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
-    bufPushStr(out, "  call void @gc_enable_generational()\n");
-    bufPushStr(out, "  call void @__geisha_main()\n");
-    bufPushStr(out, "  ret i32 0\n}\n\n")
+    if (mctx.mcDebug) {
+        let (trampSp, _, trampLn) = dbgCreateSubprogram(mctx, "main_entry", "main", mainFd.fnSpan);
+        let trampLoc = dbgAllocId(mctx);
+        dbgEmitNode(mctx, trampLoc, "!DILocation(line: " + intToStr(trampLn) + ", column: 1, scope: !" + intToStr(trampSp) + ")");
+        let dbgSuffix = ", !dbg !" + intToStr(trampLoc);
+        bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind !dbg !" + intToStr(trampSp) + " {\nentry:\n");
+        bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
+        bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
+        bufPushStr(out, "  %anchor = alloca i64, align 8\n");
+        bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
+        bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
+        bufPushStr(out, "  call void @gc_enable_generational()\n");
+        bufPushStr(out, "  call void @__geisha_main()" + dbgSuffix + "\n");
+        bufPushStr(out, "  ret i32 0" + dbgSuffix + "\n}\n\n")
+    } else {
+        bufPushStr(out, "define i32 @main(i32 %argc, ptr %argv) nounwind {\nentry:\n");
+        bufPushStr(out, "  store i32 %argc, ptr @__gs_argc\n");
+        bufPushStr(out, "  store ptr %argv, ptr @__gs_argv\n");
+        bufPushStr(out, "  %anchor = alloca i64, align 8\n");
+        bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
+        bufPushStr(out, "  call void @gc_init_with_stack(i64 131072, ptr %anchor)\n");
+        bufPushStr(out, "  call void @gc_enable_generational()\n");
+        bufPushStr(out, "  call void @__geisha_main()\n");
+        bufPushStr(out, "  ret i32 0\n}\n\n")
+    }
 }
 
 def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: StrMap FunDef, isWasm: Bool): Void = {
@@ -4573,13 +5058,14 @@ def emitNativeCustomBootFunctions(
     }
 }
 
-pub def emitProgramLlvmIrForArch(
+pub def emitProgramLlvmIrForArchDebug(
     prog: CoreProgram,
     isWasm: Bool,
     targetArch: String,
     exports: List String,
     noMain: Bool,
-    bootSymOpt: Option String
+    bootSymOpt: Option String,
+    debugInfo: Bool
 ): String = {
     cellSet(gActiveAdtReg, prog.coreAdtReg);
     cellSet(gActiveEscape, Some(prog.coreEscape));
@@ -4739,6 +5225,11 @@ pub def emitProgramLlvmIrForArch(
         }
     };
 
+    let dbgCwd = match getEnv("PWD") {
+        Some(p) -> p,
+        None -> ".",
+    };
+
     let mctx = MkModEmitCtx {
         mcStrCnt: cellNew(0),
         mcStrDecls: bufNew(),
@@ -4760,7 +5251,44 @@ pub def emitProgramLlvmIrForArch(
         mcHasExplicitExports: hasExplicit,
         mcCExportSyms: cExportSymMap,
         mcUseGlobalsOnce: useGlobalsOnce,
+        mcDebug: debugInfo,
+        mcDbgCwd: dbgCwd,
+        mcDbgNextId: cellNew(0),
+        mcDbgDecls: bufNew(),
+        mcDbgCuId: cellNew(-1),
+        mcDbgSubTyId: cellNew(-1),
+        mcDbgFileIds: strMapNew(),
+        mcDbgLexFileIds: strMapNew(),
+        mcDbgLocCache: strMapNew(),
+        mcDbgTypeCache: strMapNew(),
     };
+
+    if (debugInfo) {
+        let primaryFileId = cellNew(1);
+        match strMapGet(prog.coreFns, "main") {
+            Some(mfd) if (mfd.fnSpan.fileId > 0) -> cellSet(primaryFileId, mfd.fnSpan.fileId),
+            _ -> {
+                let cfn = cellNew(prog.coreFnNames);
+                let found = cellNew(false);
+                while (!cellGet(found) && match cellGet(cfn) { Nil -> false, _ -> true }) {
+                    match cellGet(cfn) {
+                        Cons(nm, r) -> {
+                            match strMapGet(prog.coreFns, nm) {
+                                Some(fd) if (fd.fnSpan.fileId > 0) -> {
+                                    cellSet(primaryFileId, fd.fnSpan.fileId);
+                                    cellSet(found, true)
+                                },
+                                _ -> (),
+                            };
+                            cellSet(cfn, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+        };
+        dbgInitModule(mctx, cellGet(primaryFileId))
+    } else ();
 
     let fnsBuf = bufNew();
     if (useGlobalsOnce) {
@@ -4827,8 +5355,27 @@ pub def emitProgramLlvmIrForArch(
     } else ();
 
     bufPushBuf(out, fnsBuf);
+    if (debugInfo) {
+        let dwVerId = dbgAllocId(mctx);
+        let diVerId = dbgAllocId(mctx);
+        dbgEmitNode(mctx, dwVerId, "!{i32 7, !\"Dwarf Version\", i32 4}");
+        dbgEmitNode(mctx, diVerId, "!{i32 2, !\"Debug Info Version\", i32 3}");
+        bufPushStr(out, "!llvm.dbg.cu = !{!" + intToStr(cellGet(mctx.mcDbgCuId)) + "}\n");
+        bufPushStr(out, "!llvm.module.flags = !{!" + intToStr(dwVerId) + ", !" + intToStr(diVerId) + "}\n\n");
+        bufPushBuf(out, mctx.mcDbgDecls)
+    } else ();
     bufToString(out)
 }
+
+pub def emitProgramLlvmIrForArch(
+    prog: CoreProgram,
+    isWasm: Bool,
+    targetArch: String,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): String =
+    emitProgramLlvmIrForArchDebug(prog, isWasm, targetArch, exports, noMain, bootSymOpt, false)
 
 pub def emitProgramLlvmIrOpts(
     prog: CoreProgram,

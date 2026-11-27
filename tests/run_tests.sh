@@ -2817,4 +2817,114 @@ fi
 echo "PASS [syslib_literals_toml_patch]: 0x/0o/0b/_ literals, sys.fs atomic writes, sys.proc poll/timeout/signals, std.toml.patch, & geisha.local.toml verified"
 PASS=$((PASS + 1))
 
+# 37. DWARF Debug Info (`-g` / `--debug`, `-O0`, LLVM 20 verifier, macOS dSYM / Linux ELF, LLDB + geisha_lldb.py)
+cat > "$TMP_DIR/t37_dwarf.gsa" << 'EOF'
+use std.str.intToStr
+use std.vec.{Vec, vecNew, vecPush, vecLen}
+
+data Pair {
+    MkPair { px: Int, py: Int },
+}
+
+data Shape {
+    Circle(Int),
+    Rect(Int, Int),
+}
+
+def makeAdder(base: Int): Int -> Int = {
+    let offset = base + 1;
+    (x: Int) -> x + offset
+}
+
+def fact(n: Int): Int = {
+    if (n <= 1) 1
+    else {
+        let sub = fact(n - 1);
+        n * sub
+    }
+}
+
+def inspectAll(p: Pair, s: String, sh: Shape, v: Vec Int): Int = {
+    let f = makeAdder(10);
+    let y = f(5);
+    let n = vecLen(v);
+    let f4 = fact(4);
+    p.px + p.py + y + n + f4
+}
+
+def main(): Void = {
+    let p = MkPair { px: 10, py: 20 };
+    let msg = "hello geisha";
+    let sh = Circle(7);
+    let v = vecNew();
+    vecPush(v, 100);
+    vecPush(v, 200);
+    vecPush(v, 300);
+    let ans = inspectAll(p, msg, sh, v);
+    printLn(msg + ":" + intToStr(ans))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t37_nodbg.ll" "$TMP_DIR/t37_dwarf.gsa"
+if grep -q "!DICompileUnit" "$TMP_DIR/t37_nodbg.ll"; then
+    echo "FAIL [dwarf_opt_in]: unexpected DWARF metadata emitted without -g" >&2
+    exit 1
+fi
+"$GEISHA_BIN" -g -e -o "$TMP_DIR/t37_dbg.ll" "$TMP_DIR/t37_dwarf.gsa"
+for tok in "!DICompileUnit" "!DISubprogram" "!DILocation" "#dbg_declare" "!DILocalVariable"; do
+    if ! grep -q "$tok" "$TMP_DIR/t37_dbg.ll"; then
+        echo "FAIL [dwarf_ir_metadata]: missing $tok in -g IR" >&2
+        exit 1
+    fi
+done
+OPT_BIN=""
+for cand in /opt/homebrew/opt/llvm@20/bin/opt /opt/homebrew/opt/llvm/bin/opt /usr/lib/llvm-20/bin/opt opt-20 opt; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        OPT_BIN="$cand"
+        break
+    fi
+done
+if [ -n "$OPT_BIN" ]; then
+    "$OPT_BIN" -passes=verify -disable-output "$TMP_DIR/t37_dbg.ll"
+fi
+"$GEISHA_BIN" -g --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t37_dwarf" "$TMP_DIR/t37_dwarf.gsa"
+assert_eq "dwarf_debug_run" "hello geisha:73" "$("$TMP_DIR/t37_dwarf")"
+if [ "$UNAME_S" = "Darwin" ] && [ ! -d "$TMP_DIR/t37_dwarf.dSYM" ]; then
+    echo "FAIL [dwarf_macos_dsym]: expected $TMP_DIR/t37_dwarf.dSYM to be generated" >&2
+    exit 1
+fi
+"$GEISHA_BIN" -g -O2 --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t37_dwarf_o2" "$TMP_DIR/t37_dwarf.gsa"
+assert_eq "dwarf_debug_o2_run" "hello geisha:73" "$("$TMP_DIR/t37_dwarf_o2")"
+if command -v lldb >/dev/null 2>&1; then
+    LLDB_SCRIPT_PATH="$(pwd)/tools/geisha_lldb.py"
+    LLDB_OUT="$(lldb -b \
+        -o "command script import $LLDB_SCRIPT_PATH" \
+        -o "b t37_dwarf.gsa:15" \
+        -o "b t37_dwarf.gsa:22" \
+        -o "b t37_dwarf.gsa:31" \
+        -o "run" \
+        -o "frame variable" \
+        -o "c" \
+        -o "frame variable" \
+        -o "c" \
+        -o "bt" \
+        -o "frame variable" \
+        -o "c" \
+        -o "c" \
+        -o "c" \
+        -o "frame variable" \
+        "$TMP_DIR/t37_dwarf" 2>&1 || true)"
+    for needle in "t37_dwarf.gsa:22" "t37_dwarf.gsa:31" "px = 10, py = 20" "\"hello geisha\"" "Vec(len=3) [100, 200, 300]" "Shape(tag=0, payload=7)" "(int) offset = 11" "(int) x = 5"; do
+        if ! printf "%s" "$LLDB_OUT" | grep -Fq "$needle"; then
+            echo "FAIL [dwarf_lldb_e2e]: missing '$needle' in LLDB output:" >&2
+            printf "%s\n" "$LLDB_OUT" >&2
+            exit 1
+        fi
+    done
+    echo "PASS [dwarf_lldb_e2e]: LLDB breakpoints, recursive bt, closure captures, Pair/String/Vec/Shape formatters verified"
+    PASS=$((PASS + 1))
+else
+    echo "PASS [dwarf_ir_and_build]: DWARF IR metadata and debug build verified (lldb not installed)"
+    PASS=$((PASS + 1))
+fi
+
 echo "All $PASS end-to-end test suites passed!"

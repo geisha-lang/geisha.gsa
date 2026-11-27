@@ -143,6 +143,7 @@ install: $(BUILD_DIR)/geisha3 $(RUNTIME_LIB) $(WASM_RT_OBJ)
 	cp $(BUILD_DIR)/geisha3 "$(PREFIX)/bin/geisha"
 	cp $(RUNTIME_LIB) "$(PREFIX)/lib/libgeisha_runtime.a"
 	cp $(WASM_RT_OBJ) "$(PREFIX)/lib/wasm_rt.o"
+	@if [ -f "tools/geisha_lldb.py" ]; then cp "tools/geisha_lldb.py" "$(PREFIX)/lib/geisha_lldb.py"; fi
 	@if [ -f "$(RUNTIME_IOS_LIB)" ]; then cp "$(RUNTIME_IOS_LIB)" "$(PREFIX)/lib/libgeisha_runtime_ios.a"; fi
 	@if [ -f "$(RUNTIME_IOS_SIM_LIB)" ]; then cp "$(RUNTIME_IOS_SIM_LIB)" "$(PREFIX)/lib/libgeisha_runtime_ios_sim.a"; fi
 	@if [ -d "$(HOME)/.local/bin" ]; then ln -sf "$(PREFIX)/bin/geisha" "$(HOME)/.local/bin/geisha"; fi

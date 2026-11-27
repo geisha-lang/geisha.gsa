@@ -47,6 +47,9 @@ package_one() {
     if [ -f "$BUILD_DIR/wasm_rt.o" ]; then
         cp "$BUILD_DIR/wasm_rt.o" "$stage_root/lib/wasm_rt.o"
     fi
+    if [ -f "tools/geisha_lldb.py" ]; then
+        cp "tools/geisha_lldb.py" "$stage_root/lib/geisha_lldb.py"
+    fi
     cp README.md "$stage_root/README.md"
 
     tarball="$DIST_DIR/${stem}.tar.gz"
