@@ -5178,6 +5178,74 @@ if ! printf '%s\n' "$WGC_BAD_EXT_ERR" | grep -q "WasmGC target does not support 
 fi
 echo "PASS [wasmgc_reject_unsupported_extern]: rejected unsupported extern 'abs' with codegen diagnostic"
 PASS=$((PASS + 1))
+
+# 44c. WasmGC edge regressions: ptrOffset64/scopedPtrOffset64 overflow trap, raw fd_write UTF-8 byte preservation, reserved export collision diag, and #/% output filenames
+cat > "$TMP_DIR/t44_edge.gsa" << 'EOF'
+extern "gs_sys_fd_write" def raw_write(fd: Int, buf: String, n: Int64): Int64
+
+pub def testOffset64Valid(): Int = {
+    let p = ptrAllocBytes(16);
+    let p1 = ptrOffset64(p, intToI64(8));
+    ptrWriteU32Le(p1, 0, 777);
+    let p0 = ptrOffset64(p1, intToI64(-8));
+    ptrReadU32Le(p0, 8)
+}
+
+pub def testPtrOffset64Overflow(): Int = {
+    let p = ptrAllocBytes(16);
+    let _ = ptrOffset64(p, bitShl64(intToI64(1), 32));
+    0
+}
+
+pub def testScopedOffset64Overflow(): Int = {
+    let fp = foreignPtrAlloc(intToI64(16));
+    withForeignPtr(fp, (sp: ScopedPtr) -> {
+        let _ = scopedPtrOffset64(sp, bitShl64(intToI64(1), 31));
+        0
+    })
+}
+
+pub def writeHalfUtf8(): Int64 = raw_write(1, "é", intToI64(1))
+
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/test#output%20.wasm" "$TMP_DIR/t44_edge.gsa"
+WGC_EDGE_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { testOffset64Valid, testPtrOffset64Overflow, testScopedOffset64Overflow } = await import(pathToFileURL(process.argv[1]).href);
+let t1 = false, t2 = false;
+try { testPtrOffset64Overflow(); } catch (e) { t1 = true; }
+try { testScopedOffset64Overflow(); } catch (e) { t2 = true; }
+console.log(testOffset64Valid() + "|" + t1 + "|" + t2);
+' "$TMP_DIR/test#output%20.mjs")"
+assert_eq "wasmgc_offset64_and_special_filename" "777|true|true" "$WGC_EDGE_RES"
+
+WGC_RAW_BYTE_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { writeHalfUtf8 } = await import(pathToFileURL(process.argv[1]).href);
+const rc = writeHalfUtf8();
+if (rc !== 1n) { process.stderr.write("BAD_RC=" + rc); process.exit(1); }
+' "$TMP_DIR/test#output%20.mjs" | od -An -tx1 | tr -d ' \n')"
+assert_eq "wasmgc_fd_write_raw_utf8_byte" "c3" "$WGC_RAW_BYTE_RES"
+
+cat > "$TMP_DIR/t44_bad_exp1.gsa" << 'EOF'
+pub def __geisha_init(): Int = 1
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_exp1.wasm" "$TMP_DIR/t44_bad_exp1.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_reserved_export_init]: expected reserved export '__geisha_init' to fail" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t44_bad_exp2.gsa" << 'EOF'
+pub def instantiate(): Int = 1
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_exp2.wasm" "$TMP_DIR/t44_bad_exp2.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_reserved_export_inst]: expected reserved export 'instantiate' to fail" >&2
+    exit 1
+fi
+echo "PASS [wasmgc_reject_reserved_exports]: rejected reserved exports '__geisha_init' and 'instantiate'"
+PASS=$((PASS + 1))
 fi
 
 echo "All $PASS end-to-end test suites passed!"

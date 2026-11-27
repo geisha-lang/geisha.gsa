@@ -1157,6 +1157,46 @@ def getOrCreateHelper(wm: WgcModule, name: String): Int = match strMapGet(wm.wmH
                 bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
                 setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
                 id
+            } else if (name == "ptrOffset64") {
+                // (p: (ref null 1), d: i64) -> (ref null 1)
+                // Checks signed i32 range for d AND final offset in [0, array.len(p.buf)]
+                let fty = internFuncType(wm, [WTRefNull(1), WTI64], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                let minI32_64 = intToI64(-2147483647 - 1);
+                let maxI32_64 = intToI64(2147483647);
+                // if (ref.is_null p) return null
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xD1);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0xD0); emitSleb(c, 1); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                // if (d < INT32_MIN || d > INT32_MAX) unreachable
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, minI32_64); bufPushByte(c, 0x53);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, maxI32_64); bufPushByte(c, 0x55);
+                bufPushByte(c, 0x72);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                // buf = p.buf (local 2)
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x21); emitUleb(c, 2);
+                // next64 = i64.extend_i32_s(p.off) + d (local 3)
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0xAC); // i64.extend_i32_s
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x7C); // i64.add
+                bufPushByte(c, 0x22); emitUleb(c, 3);
+                // if (next64 < 0 || next64 > i64.extend_i32_s(array.len(buf))) unreachable
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(0)); bufPushByte(c, 0x53);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0xAC);
+                bufPushByte(c, 0x55);
+                bufPushByte(c, 0x72);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                // return struct.new 1 (buf, i32.wrap_i64(next64))
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xA7);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI64)], c));
+                id
             } else if (name == "ptrByteAt") {
                 let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTI32]);
                 let id = allocDefinedFn(wm, fty);
@@ -2189,10 +2229,13 @@ def tryEmitBuiltinWgc(
         bufPushByte(c, 0x10); emitUleb(c, h);
         true
     } else if (name == "ptrOffset64" || name == "scopedPtrOffset64") {
+        let aOff = nthArgTerm(args, 1);
         emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
-        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
-        bufPushByte(c, 0xA7);
-        let h = getOrCreateHelper(wm, "ptrOffset");
+        emitTermAsVal(fctx, aOff, locals);
+        let h = match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrOffset64"),
+            _ -> getOrCreateHelper(wm, "ptrOffset"),
+        };
         bufPushByte(c, 0x10); emitUleb(c, h);
         true
     } else if (name == "ptrByteAt" || name == "scopedPtrByteAt") {
@@ -3272,6 +3315,43 @@ pub def writeWasmGcBinary(path: String, buf: StringBuf): Result Void String = ma
     },
 }
 
+def isReservedWgcExportName(nm: String): Bool =
+    nm == "__geisha_init"
+    || nm == "__geisha_str_len"
+    || nm == "__geisha_str_get"
+    || nm == "__geisha_str_new"
+    || nm == "__geisha_str_set"
+    || nm == "instantiate"
+    || nm == "wasmExports"
+
+def hexDigitUpper(nib: Int): Int =
+    if (nib < 10) 48 + nib else 55 + nib
+
+def isUrlPathSegmentUnreserved(b: Int): Bool =
+    (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || (b >= 48 && b <= 57)
+    || b == 45 || b == 95 || b == 46 || b == 126
+    || b == 33 || b == 39 || b == 40 || b == 41 || b == 42
+
+def urlEncodePathSegment(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i)) & 255;
+        if (isUrlPathSegmentUnreserved(ch)) {
+            bufPushByte(b, ch)
+        } else {
+            bufPushByte(b, 37); // '%'
+            bufPushByte(b, hexDigitUpper((ch >>> 4) & 15));
+            bufPushByte(b, hexDigitUpper(ch & 15))
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
 pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool): Result StringBuf String = {
     let wm = newWgcModule(prog);
 
@@ -3334,7 +3414,10 @@ pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool)
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
             Cons((fnName, expName), r) -> {
-                match strMapGet(wm.wmFnIdxMap, fnName) {
+                if (isReservedWgcExportName(expName)) {
+                    let sp = match strMapGet(prog.coreFns, fnName) { Some(fd) -> fd.fnSpan, None -> emptySpan() };
+                    setWgcErr(wm, sp, "WasmGC target cannot export '" + expName + "' because it conflicts with a reserved WasmGC runtime/glue export")
+                } else match strMapGet(wm.wmFnIdxMap, fnName) {
                     Some(fi) -> {
                         if (!strMapContains(expSeen, expName)) {
                             strMapInsert(expSeen, expName, true);
@@ -3446,14 +3529,14 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
     bufPushStr(out, "      time_mono_ms() { return BigInt(Math.trunc(performance.now())); },\n");
     bufPushStr(out, "      time_mono_ns() { return BigInt(Math.trunc(performance.now() * 1e6)); },\n");
     bufPushStr(out, "      rand_seed() { _gs_seed = BigInt.asIntN(64, _gs_seed + 0x9e3779b97f4a7c15n); return _gs_seed; },\n");
-    bufPushStr(out, "      fd_write(fd, r, n) { const u = _gs_fromWasmBytes(r); const len = Math.max(0, Math.min(u.length, Number(n))); const t = _gs_dec.decode(u.subarray(0, len)); if (fd === 2) { if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(t); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(t); else console.error(t); } else { _gs_putStr(t); } return BigInt(len); },\n");
+    bufPushStr(out, "      fd_write(fd, r, n) { const u = _gs_fromWasmBytes(r); const len = Math.max(0, Math.min(u.length, Number(n))); const slice = u.subarray(0, len); if (fd === 2) { if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(slice); else console.error(_gs_dec.decode(slice)); } else { if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(_gs_dec.decode(slice)); else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(slice); else console.log(_gs_dec.decode(slice)); } return BigInt(len); },\n");
     bufPushStr(out, "      exit(c) { if (typeof process !== \"undefined\" && typeof process.exit === \"function\") process.exit(c | 0); throw new Error(\"Geisha exit(\" + (c | 0) + \")\"); },\n");
     bufPushStr(out, "    },\n");
     bufPushStr(out, "    ...(extra || {}),\n");
     bufPushStr(out, "  };\n");
     bufPushStr(out, "}\n\n");
     bufPushStr(out, "async function _gs_loadBytes() {\n");
-    bufPushStr(out, "  const url = new URL(\"./" + wasmBasename + "\", import.meta.url);\n");
+    bufPushStr(out, "  const url = new URL(\"./" + urlEncodePathSegment(wasmBasename) + "\", import.meta.url);\n");
     bufPushStr(out, "  if (typeof process !== \"undefined\" && process.versions && process.versions.node) {\n");
     bufPushStr(out, "    const { readFile } = await import(\"node:fs/promises\");\n");
     bufPushStr(out, "    return await readFile(url);\n");
