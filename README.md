@@ -1,13 +1,16 @@
-# Geisha (`geisha.gsa`)
+# Geisha
 
-> **High-clarity types. Systems at altitude.**
-> Named after the **Geisha (Gesha)** coffee varietal—prized for tea-like clarity and floral precision—Geisha is a self-hosting, statically typed functional-imperative language compiled via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with machine-checked Core semantics in **Lean 4** and a decentralized Git/MVS package manager.
+> **Clarity, all the way down.**
+
+Geisha (`.gsa`) is a self-hosting, statically typed functional-systems language with Hindley-Milner inference, scoped zero-copy memory, compile-time race freedom, and a **Lean 4**–verified core—compiling via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with a built-in Git/MVS package manager.
+
+<sub>Named after the Gesha coffee varietal—prized not for dark-roast weight, but for transparency and a clean finish, with nothing muddy between origin and cup.</sub>
 
 ---
 
 ## Why Geisha?
 
-Geisha (`.gsa`) combines **ML-style expressiveness** with **predictable systems control**:
+Light as ML on the surface; exact to the metal underneath:
 
 - **Hindley-Milner + Open Concepts**: Full type inference, algebraic data types, Maranget exhaustive pattern matching, multi-parameter Concepts with functional dependencies, and zero-keyword `Generic` deriving (`data User : Eq, Show { ... }`).
 - **Compile-Time Data-Race Freedom**: Coinductive `Send` checking and a 3-point closure capture-mode lattice (`shared <: local <: scoped`), plus `Actor s` for encapsulating `!Send` mutable state behind a sequential mailbox.
