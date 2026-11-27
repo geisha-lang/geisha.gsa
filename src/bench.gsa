@@ -585,26 +585,19 @@ def collectJsonLines(stdout: String, accRev: Cell (List String)): Int = {
         match cellGet(cur) {
             Cons(line, rest) -> {
                 let t = strTrim(line);
-                let benchJsonOpt: Option String =
+                let isBenchRec =
                     if (strStartsWith(t, "{") && strEndsWith(t, "}")) {
                         match parse(t) {
-                            Ok(val) -> match val {
-                                VObj(fields) ->
-                                    if (isBenchStatsJsonObj(fields)) Some(stringify(val))
-                                    else None,
-                                _ -> None,
-                            },
-                            _ -> None,
+                            Ok(VObj(fields)) -> isBenchStatsJsonObj(fields),
+                            _ -> false,
                         }
-                    } else None;
-                match benchJsonOpt {
-                    Some(canonicalJson) -> {
-                        cellSet(accRev, Cons(canonicalJson, cellGet(accRev)));
-                        cellSet(count, cellGet(count) + 1)
-                    },
-                    None ->
-                        if (strLen(t) > 0) eprintLn(line) else (),
-                };
+                    } else false;
+                if (isBenchRec) {
+                    cellSet(accRev, Cons(t, cellGet(accRev)));
+                    cellSet(count, cellGet(count) + 1)
+                } else if (strLen(t) > 0) {
+                    eprintLn(line)
+                } else ();
                 cellSet(cur, rest)
             },
             Nil -> (),

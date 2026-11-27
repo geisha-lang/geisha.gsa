@@ -3101,9 +3101,9 @@ assert data["ok"] is False, data
 assert "unknown option" in data["error"] and "--target" in data["error"], data
 PY
 
-# 37g: Explicit `main()` printing `{progress}`, non-bench JSON, plain text, and control-char bench name under `--json`
+# 37g: Explicit `main()` printing `{progress}`, non-bench JSON, plain text, control-char bench name, and >2^31 ns stats under `--json`
 cat > "$TMP_DIR/t37_progress.gsa" << 'EOF'
-use std.bench.{bench, blackBox}
+use std.bench.{bench, blackBox, BenchStats, formatStatsJson}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 
 def main(): Void = {
@@ -3118,6 +3118,18 @@ def main(): Void = {
     let ctrlName = bufToString(b);
     let _ = bench("ok_bench", () -> { let _ = blackBox(1 + 2); () });
     let _ = bench(ctrlName, () -> { let _ = blackBox(3 + 4); () });
+    let largeStats = BenchStats {
+        name: "large_2_2s",
+        iters: 1,
+        rounds: 1,
+        totalNs: intToI64(1000000) * intToI64(2214) + intToI64(861000),
+        meanNs: 2214861000.0,
+        medianNs: 2214861000.0,
+        minNs: 2214861000.0,
+        maxNs: 2214861000.0,
+        opsPerSec: 0.451495,
+    };
+    printLn(formatStatsJson(largeStats));
     ()
 }
 EOF
@@ -3127,7 +3139,13 @@ import json, sys
 data = json.loads(sys.argv[1])
 assert data["ok"] is True, data
 bs = data["benchmarks"]
-assert [b["name"] for b in bs] == ["ok_bench", "ctrl_\x07"], bs
+assert [b["name"] for b in bs] == ["ok_bench", "ctrl_\x07", "large_2_2s"], bs
+lg = bs[2]
+assert lg["total_ns"] == 2214861000, lg
+assert lg["mean_ns"] == 2214861000.0, lg
+assert lg["median_ns"] == 2214861000.0, lg
+assert lg["min_ns"] == 2214861000.0, lg
+assert lg["max_ns"] == 2214861000.0, lg
 stderr_text = open(sys.argv[2], encoding="utf-8").read()
 assert "{progress}" in stderr_text, stderr_text
 assert '{"msg":"not_a_bench"}' in stderr_text, stderr_text
