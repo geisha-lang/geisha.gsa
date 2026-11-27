@@ -169,7 +169,7 @@ version = "0.1.0"
 # src_dir = "src"
 
 [deps]
-kagura = { git = "github.com/geisha-lang/kagura", version = "0.1.0" }
+crema = { git = "github.com/geisha-lang/crema", version = "0.1.0" }
 local_lib = { path = "../local_lib" }
 
 [target.native]

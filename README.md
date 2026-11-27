@@ -1,99 +1,112 @@
-# geisha.gsa
+# Geisha (`geisha.gsa`)
 
-Self-hosting compiler and decentralized package manager for the **Geisha** programming language, written in Geisha and targeting **LLVM 20 opaque-pointer IR** (`native` & `wasm32`).
+> **High-clarity types. Systems at altitude.**
+> Named after the **Geisha (Gesha)** coffee varietal—prized for tea-like clarity and floral precision—Geisha is a self-hosting, statically typed functional-imperative language compiled via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with machine-checked Core semantics in **Lean 4** and a decentralized Git/MVS package manager.
 
-## Architecture
+---
 
-`geisha.gsa` implements the complete Geisha language pipeline and zero-server package manager in pure Geisha (`src/`) linked with a small portable C11 runtime (`runtime/`):
+## Why Geisha?
+
+Geisha (`.gsa`) combines **ML-style expressiveness** with **predictable systems control**:
+
+- **Hindley-Milner + Open Concepts**: Full type inference, algebraic data types, Maranget exhaustive pattern matching, multi-parameter Concepts with functional dependencies, and zero-keyword `Generic` deriving (`data User : Eq, Show { ... }`).
+- **Compile-Time Data-Race Freedom**: Coinductive `Send` checking and a 3-point closure capture-mode lattice (`shared <: local <: scoped`), plus `Actor s` for encapsulating `!Send` mutable state behind a sequential mailbox.
+- **Zero-Copy Scoped Regions**: `ForeignPtr`, `ScopedPtr`, and `Arena` enforce deterministic FFI/scratch lifetimes statically—preventing use-after-return at compile time.
+- **Escape Analysis + Generational Bitmap GC**: 2-phase interprocedural escape analysis promotes non-escaping `Cell`s to the stack; escaping objects use a 256 KB TLAB nursery + 31 size classes with exact 40-bit pointer masks.
+- **Zero-Server Package Manager**: Dependencies are addressed by Git URL (or `$GEISHA_INDEX`), resolved deterministically with **Minimal Version Selection (MVS)**, and pinned by SHA-256 in `geisha.lock`.
+- **Agent-Native Tooling**: Built-in `geisha guide`, `geisha doc`, `geisha check --json`, and compact 1D diagnostics (`file:line:col: error[kind]: ...`).
+- **Machine-Checked Core**: Core Geisha's type safety, data-race freedom, exhaustiveness, stack-escape safety, `$Scoped` regions, and generational GC invariants are proved in **Lean 4** with zero `sorry`s (`formal/`).
+
+---
+
+## Quick Taste
+
+```geisha
+use std.result.{Result, Ok, Err}
+use std.str.intToStr
+
+pub data Shape : Eq {
+    Circle(Float),
+    Rect { w: Float, h: Float },
+}
+
+def area(s: Shape): Float = match s {
+    Circle(r) -> 3.141592653589793 * r * r,
+    Rect { w, h } -> w * h,
+}
+
+def main(): Void = {
+    let items = [Circle(2.0), Rect { w: 3.0, h: 4.0 }];
+    let total = parTabulate(2, i -> if (i == 0) 10 else 20);
+    printLn("sum = " + intToStr(immArrayGet(total, 0) + immArrayGet(total, 1)))
+}
+```
+
+Or run standalone scripts directly without a `geisha.toml`:
+
+```sh
+geisha eval 'printLn("Hello, Geisha!")'
+geisha run hello.gsa
+```
+
+---
+
+## Documentation
+
+| Document | Description |
+| --- | --- |
+| [**Language Specification**](docs/SPEC.md) | Complete normative reference for syntax, types, Concepts, `$Scoped` regions, `Send` concurrency, FFI, and `geisha.toml` |
+| [**Getting Started**](docs/GETTING_STARTED.md) | Installation, script mode, projects, and a hands-on tour of Geisha |
+| [**Packages & Targets**](docs/PACKAGES_AND_TARGETS.md) | Decentralized Git/MVS packages, `geisha.local.toml`, `[[target.native.when]]`, `wasm32`, `ios` / `ios-sim` |
+| [**Agent Quick Reference**](AGENT_GUIDE.md) | Compact syntax, pitfalls, and `std.*`/`sys.*` index (also built into `geisha guide`) |
+| [**Formal Semantics (`formal/`)**](formal/SPEC.md) | Machine-checked Lean 4 proofs of Core Geisha & `--dump-core` validation |
+
+---
+
+## Compiler Architecture
+
+`geisha.gsa` implements the complete compiler pipeline and package manager in pure Geisha (`src/`) linked with a portable C11 runtime (`runtime/`):
 
 | Module | Responsibility |
 | --- | --- |
-| `src/ast.gsa` | Core AST, Hindley-Milner `Type`/`Scheme`, patterns, module items, and 15-level Scala/Swift-style operator precedence table |
-| `src/lexer.gsa` | Linear-time tokenizer with newline tracking (`hadNewline`), nested block comments, escapes, and custom symbolic operators |
-| `src/parser.gsa` | Recursive-descent + Pratt expression parser, `(op)` operator sections, destructuring `let`, and `Result` early-return `?` desugaring |
-| `src/stdlib_bundle.gsa` | Embedded `std.*` and `sys.*` standard library sources (including `std.codec`, `std.json`, `std.toml`, and `std.sha256`, generated from `stdlib/` via `scripts/gen_stdlib.py`) |
-| `src/loader.gsa` | Path-as-module demand-driven `use`/`open` loader (no `mod.gsa` or `mod` lists needed), sibling umbrella modules (`foo.gsa` + `foo/*.gsa`), hermetic package-scoped dependencies, and cross-package Concept/Instance Orphan Rule checking |
-| `src/infer.gsa` | Hindley-Milner type inference, open Concepts & Instances (including arithmetic/comparison/bitwise operator overloading), `Send` checking, `.field` resolution, mutual recursion backfill, and Maranget exhaustiveness checking |
-| `src/core.gsa` | K-conversion, polymorphic local lambda lifting, deterministic closure conversion, demand-driven worklist monomorphization, static Concept dispatch, concurrent closure `Send` verification, and 2-phase interprocedural escape analysis |
-| `src/codegen.gsa` | Static LP64 / Wasm32 ABI layout calculator and LLVM 20 opaque-pointer textual IR (`.ll`) emitter |
-| `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), content-addressed global cache (`~/.geisha/cache`), and declarative native/wasm32 C/ObjC & web asset builder |
-| `src/geisha.gsa` | Unified CLI entry point (`init`, `add`, `remove`, `fetch`, `update`, `build`, `run`, `test`, plus direct compiler flags) |
+| `src/ast.gsa` | Core AST, Hindley-Milner `Type`/`Scheme`, patterns, module items, and 13-level operator precedence |
+| `src/lexer.gsa` | Linear-time tokenizer with `hadNewline` tracking, shebang skipping, block comments, escapes, and symbolic ops |
+| `src/parser.gsa` | Recursive-descent + Pratt parser, `(op)` sections, destructuring `let`, script mode, and `?` desugaring |
+| `src/diag.gsa` | Compact 1D span diagnostics (`file:line:col: error[kind]: ...` + `near:` + `hint:`) |
+| `src/loader.gsa` | Path-as-module `use`/`open` loader, sibling umbrella modules, hermetic package scoping, and Orphan Rule checking |
+| `src/infer.gsa` | HM type inference, open Concepts/Instances, `Generic` deriving, `$Scoped` & `Send` checking, and Maranget exhaustiveness |
+| `src/core.gsa` | K-conversion, lambda lifting, closure conversion, worklist monomorphization, static Concept dispatch, and 2-phase escape analysis |
+| `src/codegen.gsa` | LP64 / Wasm32 ABI layout calculator, 40-bit pointer masks, and LLVM 20 opaque-pointer IR (`.ll`) emitter |
+| `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/iOS builder |
+| `src/doc.gsa` | Built-in `geisha doc` signature & `///` doc-comment extractor |
+| `src/geisha.gsa` | Unified CLI driver (`init`, `add`, `remove`, `fetch`, `update`, `build`, `check`, `run`, `eval`, `test`, `doc`, `guide`) |
 
-## Bootstrapping & Fixed-Point Verification
+---
 
-Run the 3-stage bootstrap and verify the fixed point (`stage2.ll == stage3.ll`). When `STAGE0` is omitted, `Makefile` automatically compiles `bootstrap/stage0.ll.xz` (portable LP64 LLVM IR seed) into `build/geisha0` first:
+## Bootstrapping, Installation & Verification
+
+Run the 3-stage bootstrap and verify the fixed point (`stage2.ll == stage3.ll`). When `STAGE0` is omitted, `Makefile` compiles `bootstrap/stage0.ll.xz` into `build/geisha0` automatically:
 
 ```sh
 make runtime wasm-runtime bootstrap
 ```
 
-Or bootstrap from an existing installed `geisha` binary:
-
-```sh
-make bootstrap STAGE0=/path/to/previous/geisha
-```
-
-Package a self-contained relocatable release archive (`dist/geisha-<version>-<os>-<arch>.tar.gz`):
-
-```sh
-make dist VERSION=v0.1.0
-```
-
-Install the self-hosted toolchain (`geisha`, `libgeisha_runtime.a`, `wasm_rt.o`) to `~/.geisha`:
+Install the toolchain (`geisha`, `libgeisha_runtime.a`, `wasm_rt.o`) to `~/.geisha`:
 
 ```sh
 make install
 ```
 
-Run the end-to-end language & package manager test suite:
+Run checks, tests, and Lean 4 formal verification:
 
 ```sh
-make test
+make check-docs    # Verify AGENT_GUIDE.md, stdlib_bundle.gsa, guide_bundle.gsa, and CLI docs
+make test          # End-to-end language & package manager test suite
+make verify-core   # Lean 4 Core Geisha proofs + --dump-core validation
 ```
 
-## Decentralized Package Manager (`geisha.toml`)
-
-Geisha requires **no centralized registry server**: packages are addressed directly by Git URLs (or short names via a static Git index `$GEISHA_INDEX`), resolved deterministically with **Minimal Version Selection (MVS)** over treeless bare clones (`--filter=blob:none`), and pinned with SHA-256 content hashes in `geisha.lock`:
-
-```toml
-# geisha.toml
-name = "my_app"
-version = "0.1.0"
-
-[deps]
-kagura = { git = "github.com/geisha-lang/kagura", version = "0.1.0" }
-
-[target.native]
-c_sources  = ["host/native/macos_host.m"]
-c_flags    = ["-fobjc-arc"]
-link_flags = ["-framework", "Cocoa", "-framework", "QuartzCore"]
-exports    = ["app_init", "app_step"]
-owns_main  = true
-
-[target.wasm32]
-exports    = ["app_init", "app_step"]
-web_assets = ["host/web/runtime.js"]
-```
+Package a relocatable release archive (`dist/geisha-<version>-<os>-<arch>.tar.gz`):
 
 ```sh
-# Initialize a binary or library project (creates geisha.toml + src/main.gsa)
-geisha init my_app
-geisha init --lib my_lib
-
-# Add dependencies by Git URL, owner/repo shorthand, short index name, or local path
-geisha add github.com/geisha-lang/kagura
-geisha add kagura --path ../kagura
-
-# Build, run, and test (offline once cached in ~/.geisha/cache/p/)
-geisha build
-geisha build --target wasm32
-geisha run
-geisha test
-```
-
-For multi-repo local development without touching `geisha.toml` or `geisha.lock`, place an untracked `geisha.local.toml` in the project root:
-
-```toml
-[overrides]
-"github.com/geisha-lang/kagura" = { path = "../kagura" }
+make dist VERSION=v0.2.0
 ```

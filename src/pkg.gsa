@@ -808,7 +808,7 @@ pub def normalizeGitSpec(rawSpec: String): Result (String, String) String = {
         let ap = absPath(s);
         Ok(("file://" + ap, ap))
     } else if (strStartsWith(s, "git@")) {
-        // e.g. `git@github.com:geisha-lang/kagura.git`
+        // e.g. `git@github.com:geisha-lang/crema.git`
         let afterAt = strSlice(s, 4, strLen(s));
         let canon = match strIndexOfByte(afterAt, 58, 0) {
             Some(idx) ->

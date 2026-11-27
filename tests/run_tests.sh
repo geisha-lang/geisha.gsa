@@ -1011,7 +1011,7 @@ def main(): Void = {
         && hMulti == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         && hStream == hMulti;
 
-    let doc = "# Sample TOML v1.0\nname = \"kagura\"\nport = 0x1f_90\n\n[deps]\n\"github.com/geisha-lang/codec\" = { git = 'github.com/geisha-lang/codec', version = \"0.2.0\" }\n\n[target.native]\nowns_main = true\nexports = [\n  \"kagura_init\", # inline comment\n  \"kagura_step\",\n]\n\n[[pkg]]\nname = \"codec\"\nsha256 = \"9f86d081\"\n";
+    let doc = "# Sample TOML v1.0\nname = \"crema\"\nport = 0x1f_90\n\n[deps]\n\"github.com/geisha-lang/codec\" = { git = 'github.com/geisha-lang/codec', version = \"0.2.0\" }\n\n[target.native]\nowns_main = true\nexports = [\n  \"crema_init\", # inline comment\n  \"crema_step\",\n]\n\n[[pkg]]\nname = \"codec\"\nsha256 = \"9f86d081\"\n";
 
     let dec = succeed((nm) -> (pt) -> (du) -> (om) -> (ex) -> (ls) -> MkManifestSample {
         msName: nm, msPort: pt, msDepUrl: du, msOwnsMain: om, msExports: ex, msLockSha: ls
@@ -1042,7 +1042,7 @@ def main(): Void = {
 }
 EOF
 "$GEISHA_BIN" -o "$TMP_DIR/t16_toml_sha" "$TMP_DIR/t16_toml_sha.gsa"
-assert_eq "stdlib_sha256_and_toml_roundtrip" "sha-ok|kagura|8080|github.com/geisha-lang/codec|9f86d081" "$("$TMP_DIR/t16_toml_sha")"
+assert_eq "stdlib_sha256_and_toml_roundtrip" "sha-ok|crema|8080|github.com/geisha-lang/codec|9f86d081" "$("$TMP_DIR/t16_toml_sha")"
 
 # 17. `mod`-free demand-driven module loader + sibling umbrella (`stage.gsa` + `stage/ik.gsa`) + module aliasing + dead-file skip
 mkdir -p "$TMP_DIR/modfree/src/stage"
