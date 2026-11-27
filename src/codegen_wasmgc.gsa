@@ -3462,6 +3462,55 @@ pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool)
 // Companion ES Module Glue (`.mjs`) & TypeScript Declarations (`.d.ts`)
 // ============================================================================
 
+def isValidJsIdentName(s: String): Bool = {
+    let n = strLen(s);
+    if (n == 0) false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let b = strByteAt(s, cellGet(i)) & 255;
+            let isStart = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 36;
+            let isCont = isStart || (b >= 48 && b <= 57);
+            if (cellGet(i) == 0) {
+                if (!isStart) cellSet(ok, false) else ()
+            } else {
+                if (!isCont) cellSet(ok, false) else ()
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+def jsEscapeStringLit(s: String): String = {
+    let b = bufNew();
+    bufPushByte(b, 34); // '"'
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i)) & 255;
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else if (ch < 32 || ch == 127) {
+            bufPushStr(b, "\\x");
+            bufPushByte(b, hexDigitUpper((ch >>> 4) & 15));
+            bufPushByte(b, hexDigitUpper(ch & 15))
+        } else {
+            bufPushByte(b, ch)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 34);
+    bufToString(b)
+}
+
+def formatEsmExportName(s: String): String =
+    if (isValidJsIdentName(s)) s else jsEscapeStringLit(s)
+
 def wgcArgFromJs(ty: Type, expr: String): String = match ty {
     TyCon("String") -> "_gs_toWasmStr(" + expr + ")",
     TyCon("Bool") -> "(" + expr + " ? 1 : 0)",
@@ -3588,13 +3637,13 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
                         };
                         let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
                         cellSet(expIdx, cellGet(expIdx) + 1);
-                        let callExpr = "wasmExports[\"" + expName + "\"](" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
+                        let callExpr = "wasmExports[" + jsEscapeStringLit(expName) + "](" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
                         if (isVoidTy(retTy)) {
                             bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { " + callExpr + "; }\n")
                         } else {
                             bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { return " + wgcRetToJs(retTy, callExpr) + "; }\n")
                         };
-                        bufPushStr(out, "export { " + localFn + " as " + expName + " };\n")
+                        bufPushStr(out, "export { " + localFn + " as " + formatEsmExportName(expName) + " };\n")
                     },
                     None -> (),
                 };
@@ -3665,7 +3714,7 @@ pub def emitProgramWasmGcDts(prog: CoreProgram, exports: List String, noMain: Bo
                         let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
                         cellSet(expIdx, cellGet(expIdx) + 1);
                         bufPushStr(out, "declare function " + localFn + "(" + strJoin(listRev(cellGet(pRev)), ", ") + "): " + wgcTypeToTs(retTy) + ";\n");
-                        bufPushStr(out, "export { " + localFn + " as " + expName + " };\n")
+                        bufPushStr(out, "export { " + localFn + " as " + formatEsmExportName(expName) + " };\n")
                     },
                     None -> (),
                 };

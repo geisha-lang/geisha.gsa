@@ -1323,6 +1323,7 @@ def compileWithPkgSpecsToWasmGc(
     if (tc.tcEmitDts) {
         let dtsCode = emitProgramWasmGcDts(coreProg, effExports, tc.tcOwnsMain);
         writeFile(gluePathForWasmOut(outWasmPath, ".d.ts"), dtsCode)?;
+        writeFile(gluePathForWasmOut(outWasmPath, ".d.mts"), dtsCode)?;
         Ok(())
     } else Ok(())
 }

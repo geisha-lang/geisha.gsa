@@ -5038,10 +5038,10 @@ WGC_HOST_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '2p')"
 assert_eq "wasmgc_full_e2e_main" '6|72|5000050000|42|6|25|wasmgc:6|{"a":[1,true,"ok"]}|56872|77' "$WGC_MAIN_LINE"
 assert_eq "wasmgc_full_e2e_host" '42|Hello, WasmGC!|1032' "$WGC_HOST_LINE"
 
-# Verify --no-dts skips .d.ts
+# Verify --no-dts skips .d.ts and .d.mts
 "$GEISHA_BIN" --target wasm-gc --no-dts -o "$TMP_DIR/t44_nodts.wasm" "$TMP_DIR/t44_wasmgc.gsa"
-if [ -f "$TMP_DIR/t44_nodts.d.ts" ]; then
-    echo "FAIL [wasmgc_no_dts]: expected --no-dts to omit .d.ts" >&2
+if [ -f "$TMP_DIR/t44_nodts.d.ts" ] || [ -f "$TMP_DIR/t44_nodts.d.mts" ]; then
+    echo "FAIL [wasmgc_no_dts]: expected --no-dts to omit .d.ts and .d.mts" >&2
     exit 1
 fi
 
@@ -5251,15 +5251,20 @@ cat > "$TMP_DIR/t44_alias_exp.gsa" << 'EOF'
 pub def default(): Int = 101
 pub def _gs_exp(): Int = 202
 pub def URL(s: String): String = "url:" + s
+pub extern "feature-v2" def feature(): Int = 9
 def main(): Void = ()
 EOF
 "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_alias_exp.wasm" "$TMP_DIR/t44_alias_exp.gsa"
+if [ ! -f "$TMP_DIR/t44_alias_exp.d.mts" ] || [ ! -f "$TMP_DIR/t44_alias_exp.d.ts" ]; then
+    echo "FAIL [wasmgc_dmts_missing]: expected both .d.mts and .d.ts outputs" >&2
+    exit 1
+fi
 WGC_ALIAS_RES="$(node --input-type=module -e '
 import { pathToFileURL } from "node:url";
 const m = await import(pathToFileURL(process.argv[1]).href);
-console.log(m.default() + "|" + m._gs_exp() + "|" + m.URL("ok"));
+console.log(m.default() + "|" + m._gs_exp() + "|" + m.URL("ok") + "|" + m["feature-v2"]());
 ' "$TMP_DIR/t44_alias_exp.mjs")"
-assert_eq "wasmgc_esm_alias_exports" "101|202|url:ok" "$WGC_ALIAS_RES"
+assert_eq "wasmgc_esm_alias_exports" "101|202|url:ok|9" "$WGC_ALIAS_RES"
 fi
 
 echo "All $PASS end-to-end test suites passed!"
