@@ -3279,6 +3279,28 @@ if echo "$T37_DBG_LOG" | grep -q "project_hit=1" || ! echo "$T37_DBG_LOG" | grep
     echo "FAIL [inc_cgu_debug_cache_sep]: -g must separate CGU/project cache keys from non-debug builds, got: $T37_DBG_LOG" >&2
     exit 1
 fi
+if [ "$(uname -s)" = "Darwin" ]; then
+    T37_DSYM_DWARF="$INC_PROJ/build/t37_inc_cgu.dSYM/Contents/Resources/DWARF/t37_inc_cgu"
+    if [ ! -f "$T37_DSYM_DWARF" ]; then
+        echo "FAIL [inc_cgu_dsym_created]: expected $T37_DSYM_DWARF after build --dev -g" >&2
+        exit 1
+    fi
+    rm -f "$T37_DSYM_DWARF"
+    T37_DSYM_REBUILD="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev -g --runtime "$ABS_RT_37" 2>&1)"
+    if echo "$T37_DSYM_REBUILD" | grep -q "project_hit=1" || ! echo "$T37_DSYM_REBUILD" | grep -q "cgu_miss=0 "; then
+        echo "FAIL [inc_cgu_dsym_restore]: deleting .dSYM DWARF must bypass project_hit and relink with cgu_miss=0, got: $T37_DSYM_REBUILD" >&2
+        exit 1
+    fi
+    if [ ! -f "$T37_DSYM_DWARF" ]; then
+        echo "FAIL [inc_cgu_dsym_restored_file]: expected $T37_DSYM_DWARF to be restored" >&2
+        exit 1
+    fi
+    T37_DSYM_WARM="$(cd "$INC_PROJ" && GEISHA_CACHE_STATS=1 "$ABS_GEISHA_37" build --dev -g --runtime "$ABS_RT_37" 2>&1)"
+    if ! echo "$T37_DSYM_WARM" | grep -q "project_hit=1"; then
+        echo "FAIL [inc_cgu_dsym_warm]: expected project_hit=1 once .dSYM is present, got: $T37_DSYM_WARM" >&2
+        exit 1
+    fi
+fi
 if (cd "$INC_PROJ" && "$ABS_GEISHA_37" build --opt=9 --runtime "$ABS_RT_37" >/dev/null 2>&1); then
     echo "FAIL [inc_cgu_bad_opt9]: --opt=9 should be rejected" >&2
     exit 1

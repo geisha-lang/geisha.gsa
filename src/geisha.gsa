@@ -2586,7 +2586,11 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
             0, 24
         );
         let projDepsPath = pathJoin(projCacheDir, "p_" + projKey + ".deps");
-        let canSkipWhole = !noCache && match dumpCoreOpt { None -> true, Some(_) -> false } && fileExists(outBin) && verifyProjectDeps(projDepsPath, projKey, outBin);
+        let dsymReady =
+            if (debugInfo && currentHostOs() == "macos") {
+                fileExists(outBin + ".dSYM/Contents/Resources/DWARF/" + pathBasename(outBin))
+            } else true;
+        let canSkipWhole = !noCache && match dumpCoreOpt { None -> true, Some(_) -> false } && fileExists(outBin) && dsymReady && verifyProjectDeps(projDepsPath, projKey, outBin);
         if (canSkipWhole) {
             match getEnv("GEISHA_CACHE_STATS") {
                 Some("1") -> eprintLn("[geisha-cache] project_hit=1 opt=" + optFlagForLevel(effOpt)),
