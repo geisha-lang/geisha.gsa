@@ -4046,4 +4046,254 @@ EOF
     fi
 fi
 
+# --- Test 41: Portable paths, symlink-safe `removeDirAll`, POSIX `a\b` atomic write, Win64 C ABI & `gc_enter_blocking_capture` root survival ---
+mkdir -p "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/sub/deep/leaf" "$TMP_DIR/t39_fs/empty_dir"
+printf 'keep-outside-safe' > "$TMP_DIR/t39_outside/secret.txt"
+ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/sub/link_to_outside"
+ln -s "$TMP_DIR/t39_outside" "$TMP_DIR/t39_fs/trailing_sym"
+ln -s "$TMP_DIR/t39_nonexistent_target_xyz" "$TMP_DIR/t39_fs/sub/dangling_link"
+
+cat > "$TMP_DIR/t39_win_prep.gsa" << 'EOF'
+use std.path.{
+    isAbsPath, pathDirname, pathBasename, pathJoin,
+    isAbsPathWin, pathJoinWin, pathDirnameWin, pathBasenameWin, pathStemWin, pathWithExtWin
+}
+use std.result.{Ok, Err}
+use sys.fs.{mkdirAll, writeFile, writeFileAtomic, readFile, fileExists, isDir, removeDir, removeDirAll}
+use sys.env.argAt
+
+def b2s(b: Bool): String = if (b) "1" else "0"
+
+def main(): Void = {
+    let base = argAt(1);
+    let outsideFile = argAt(2);
+    let tree = pathJoin(base, "sub/deep/leaf");
+    let _ = writeFile(pathJoin(tree, "hello.txt"), "ok");
+    let emptyD = pathJoin(base, "empty_dir");
+    let rmEmptyOk = removeDir(emptyD) && !isDir(emptyD);
+    // Must remove directory symlink even when passed with trailing `/` WITHOUT touching target!
+    let rmTrailingSymOk = removeDirAll(pathJoin(base, "trailing_sym") + "/") && !fileExists(pathJoin(base, "trailing_sym"));
+    // Must remove directory tree + symlinks (including dangling) WITHOUT touching external symlink target!
+    let rmTreeOk = removeDirAll(pathJoin(base, "sub")) && !isDir(pathJoin(base, "sub"));
+    let outsideIntact = match readFile(outsideFile) {
+        Ok(s) -> s == "keep-outside-safe",
+        Err(_) -> false,
+    };
+
+    // POSIX legal filename containing backslash `a\b` must succeed with writeFileAtomic & std.path
+    let bsDir = pathJoin(base, "bs_test");
+    let _ = mkdirAll(bsDir);
+    let bsFile = pathJoin(bsDir, "a\\b");
+    let bsAtomicOk = match writeFileAtomic(bsFile, "backslash-ok") {
+        Ok(_) -> match readFile(bsFile) {
+            Ok(s) -> s == "backslash-ok",
+            Err(_) -> false,
+        },
+        Err(_) -> false,
+    };
+    let posixBsPathOk = !isAbsPath("\\root\\x") && pathDirname("a\\b") == "." && pathBasename("a\\b") == "a\\b";
+
+    // Explicit Windows-style path helpers
+    let p1 = "C:\\Users\\dev\\app.gsa";
+    let p2 = "C:\\";
+    let p3 = "C:/foo/bar/";
+    printLn(
+        b2s(isAbsPathWin(p1)) + "|"
+        + b2s(isAbsPathWin("C:rel")) + "|"
+        + b2s(isAbsPathWin("\\root\\x")) + "|"
+        + pathDirnameWin(p1) + "|"
+        + pathBasenameWin(p1) + "|"
+        + pathStemWin(p1) + "|"
+        + pathWithExtWin(p1, "exe") + "|"
+        + pathDirnameWin(p2) + "|"
+        + pathJoinWin(p2, "bin") + "|"
+        + pathDirnameWin(p3) + "|"
+        + pathBasenameWin(p3) + "|"
+        + b2s(rmEmptyOk) + "|"
+        + b2s(rmTrailingSymOk) + "|"
+        + b2s(rmTreeOk) + "|"
+        + b2s(outsideIntact) + "|"
+        + b2s(bsAtomicOk) + "|"
+        + b2s(posixBsPathOk)
+    )
+}
+EOF
+"$GEISHA_BIN" -o "$TMP_DIR/t39_win_prep" "$TMP_DIR/t39_win_prep.gsa"
+assert_eq "win_paths_symlink_remove_and_posix_backslash" \
+    "1|0|1|C:\\Users\\dev|app.gsa|app|C:\\Users\\dev\\app.exe|C:\\|C:\\bin|C:/foo|bar|1|1|1|1|1|1" \
+    "$("$TMP_DIR/t39_win_prep" "$TMP_DIR/t39_fs" "$TMP_DIR/t39_outside/secret.txt")"
+
+# Verify relative GEISHA_HOME works with `geisha fetch` (git archive --output absolute path)
+REL_HOME_WORK="$TMP_DIR/t39_rel_home_work"
+mkdir -p "$REL_HOME_WORK/dep_repo/src" "$REL_HOME_WORK/app/src"
+cat > "$REL_HOME_WORK/dep_repo/geisha.toml" << 'EOF'
+name = "rel_dep"
+version = "0.1.0"
+EOF
+cat > "$REL_HOME_WORK/dep_repo/src/rel_dep.gsa" << 'EOF'
+pub def ans(): Int = 42
+EOF
+git -C "$REL_HOME_WORK/dep_repo" init -q
+git -C "$REL_HOME_WORK/dep_repo" config user.email "ci@geisha.test"
+git -C "$REL_HOME_WORK/dep_repo" config user.name "Geisha CI"
+git -C "$REL_HOME_WORK/dep_repo" add .
+git -C "$REL_HOME_WORK/dep_repo" commit -q -m "init"
+git -C "$REL_HOME_WORK/dep_repo" tag v0.1.0
+cat > "$REL_HOME_WORK/app/geisha.toml" << EOF
+name = "rel_app"
+version = "0.1.0"
+
+[deps]
+rel_dep = { git = "file://$REL_HOME_WORK/dep_repo", version = "0.1.0" }
+EOF
+cat > "$REL_HOME_WORK/app/src/main.gsa" << 'EOF'
+use std.str.intToStr
+use rel_dep.ans
+def main(): Void = printLn(intToStr(ans()))
+EOF
+ABS_GEISHA_39="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_39="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+REL_FETCH_OUT="$(cd "$REL_HOME_WORK/app" && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" fetch >/dev/null && env PWD="$TMP_DIR" GEISHA_HOME="local-cache" "$ABS_GEISHA_39" build --runtime "$ABS_RT_39" >/dev/null && ./build/rel_app)"
+assert_eq "relative_geisha_home_fetch_and_build" "42" "$REL_FETCH_OUT"
+
+# Verify Win64 C ABI struct lowering & zero raw `_setjmp` in emitted LLVM IR
+cat > "$TMP_DIR/t39_win64_abi.gsa" << 'EOF'
+use std.option.None
+use std.result.{Ok, Err}
+use loader.{loadSingleSourceProgramWithPkgsNamed, MkPkgSpec}
+use infer.inferProgram
+use core.lowerToCore
+use codegen.emitProgramLlvmIrForTarget
+
+def containsSub(hay: String, needle: String): Bool = {
+    let hn = strLen(hay);
+    let nn = strLen(needle);
+    if (nn == 0) true
+    else if (nn > hn) false
+    else {
+        let i = cellNew(0);
+        let found = cellNew(false);
+        while (cellGet(i) <= hn - nn && !cellGet(found)) {
+            if (strSlice(hay, cellGet(i), cellGet(i) + nn) == needle) cellSet(found, true)
+            else cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(found)
+    }
+}
+
+def main(): Void = {
+    let src =
+        "extern data Box8 { x: Float }\n"
+        + "extern data Vec3 { a: Int, b: Int, c: Int }\n"
+        + "extern data Pair16 { x: Float, y: Float }\n"
+        + "extern \"c_box8\" def c_box8(v: Box8): Box8\n"
+        + "extern \"c_vec3\" def c_vec3(v: Vec3): Vec3\n"
+        + "extern \"c_pair16\" def c_pair16(v: Pair16): Pair16\n"
+        + "def main(): Void = {\n"
+        + "    let _ = c_box8(Box8 { x: 1.0 });\n"
+        + "    let _ = c_vec3(Vec3 { a: 1, b: 2, c: 3 });\n"
+        + "    let _ = c_pair16(Pair16 { x: 1.0, y: 2.0 });\n"
+        + "    ()\n"
+        + "}\n";
+    let spec = MkPkgSpec { pkgId: "", pkgName: "", srcRoots: Nil, deps: Nil };
+    match loadSingleSourceProgramWithPkgsNamed("win64.gsa", src, spec, Nil, Nil) {
+        Err(e) -> printLn("LOAD_ERR:" + e),
+        Ok(defs) -> match inferProgram(defs) {
+            Err(e) -> printLn("INF_ERR:" + e),
+            Ok(inf) -> match lowerToCore(inf) {
+                Err(e) -> printLn("CORE_ERR:" + e),
+                Ok(cp) -> {
+                    let ir = emitProgramLlvmIrForTarget(cp, false, "x86_64", "windows", Nil, false, None);
+                    let okBox8 = containsSub(ir, "declare i64 @c_box8(i64)");
+                    let okVec3 = containsSub(ir, "declare void @c_vec3(ptr sret({ i32, i32, i32 }) align 4, ptr)");
+                    let okPair16 = containsSub(ir, "declare void @c_pair16(ptr sret({ double, double }) align 8, ptr)");
+                    let noByval = !containsSub(ir, "byval(");
+                    let noSetjmp = !containsSub(ir, "@_setjmp");
+                    let hasCapture = containsSub(ir, "call void @gc_enter_blocking_capture()");
+                    printLn(
+                        (if (okBox8) "1" else "0") + "|"
+                        + (if (okVec3) "1" else "0") + "|"
+                        + (if (okPair16) "1" else "0") + "|"
+                        + (if (noByval) "1" else "0") + "|"
+                        + (if (noSetjmp) "1" else "0") + "|"
+                        + (if (hasCapture) "1" else "0")
+                    )
+                },
+            },
+        },
+    }
+}
+EOF
+"$GEISHA_BIN" --src-root src -o "$TMP_DIR/t39_win64_abi" "$TMP_DIR/t39_win64_abi.gsa"
+assert_eq "win64_c_abi_and_blocking_capture" "1|1|1|1|1|1" "$("$TMP_DIR/t39_win64_abi")"
+
+# Verify `gc_enter_blocking_capture()` preserves callee-saved register GC roots under `-O2` across a blocking FFI call + major GC
+cat > "$TMP_DIR/t39_blocking_roots.c" << 'EOF'
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "gc.h"
+
+static void *collector_thread(void *arg)
+{
+    (void)arg;
+    gc_thread_attach(__builtin_frame_address(0));
+    gc_collect_major();
+    gc_collect_major();
+    gc_thread_detach();
+    return NULL;
+}
+
+__attribute__((noinline)) static void blocking_ffi_clobber_below_sp(void)
+{
+    /* Overwrite 512 bytes of stack below caller SP_F while another thread runs major GC */
+    volatile uint64_t scratch[64];
+    for (int i = 0; i < 64; i++) scratch[i] = 0xDEADBEEFCAFEBABEULL;
+    pthread_t t;
+    if (pthread_create(&t, NULL, collector_thread, NULL) == 0) {
+        pthread_join(t, NULL);
+    }
+    (void)scratch[0];
+}
+
+__attribute__((noinline)) static int test_reg_roots(void)
+{
+    /* Allocate 4 distinct heap objects whose only live references are kept in callee-saved GPRs */
+    uint64_t *a = (uint64_t *)gc_alloc_atomic(32);
+    uint64_t *b = (uint64_t *)gc_alloc_atomic(32);
+    uint64_t *c = (uint64_t *)gc_alloc_atomic(32);
+    uint64_t *d = (uint64_t *)gc_alloc_atomic(32);
+    a[0] = 0x1111222233334444ULL;
+    b[0] = 0x5555666677778888ULL;
+    c[0] = 0x9999AAAABBBBCCCCULL;
+    d[0] = 0xDDDDEEEEFFFF0001ULL;
+
+    /* Force pointers into registers across the blocking capture + FFI call */
+    __asm__ volatile("" : "+r"(a), "+r"(b), "+r"(c), "+r"(d) :: "memory");
+    gc_enter_blocking_capture();
+    blocking_ffi_clobber_below_sp();
+    gc_leave_blocking();
+
+    int ok = gc_is_obj_marked(a) && gc_is_obj_marked(b) && gc_is_obj_marked(c) && gc_is_obj_marked(d)
+          && a[0] == 0x1111222233334444ULL
+          && b[0] == 0x5555666677778888ULL
+          && c[0] == 0x9999AAAABBBBCCCCULL
+          && d[0] == 0xDDDDEEEEFFFF0001ULL;
+    return ok ? 1 : 0;
+}
+
+int main(void)
+{
+    uint64_t anchor = 0;
+    gc_init_with_stack(131072, &anchor);
+    gc_enable_generational();
+    int ok = test_reg_roots();
+    printf("%d\n", ok);
+    return ok ? 0 : 1;
+}
+EOF
+"$CC" $HOST_CC_TARGET -O2 -Iruntime/include -pthread "$TMP_DIR/t39_blocking_roots.c" "$GEISHA_RUNTIME" $HOST_CC_LIBS -o "$TMP_DIR/t39_blocking_roots"
+assert_eq "blocking_capture_callee_saved_roots_O2" "1" "$("$TMP_DIR/t39_blocking_roots")"
+
 echo "All $PASS end-to-end test suites passed!"

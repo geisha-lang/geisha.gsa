@@ -20,14 +20,14 @@ use std.sha256.{sha256New, sha256Update, sha256FinishHex, sha256Hex}
 use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
 use std.toml.{parse as tomlParse, stringify as tomlStringify}
 use sys.env.{getEnv}
-use sys.fs.{fileExists, isDir, mkdirAll, readDir, readFile, writeFile, removeFile}
+use sys.fs.{fileExists, isDir, mkdirAll, readDir, readFile, writeFile, removeFile, renameFile, removeDirAll}
 use sys.io.eprintLn
-use sys.proc.shell
+use sys.proc.{ExitStatus, Exited, command, cmdCwd, cmdEnv, run as procRun, spawn as procSpawn, childWait}
 use ast.{sortUniqueStrings, listContainsStr, addUniqueStr}
 use loader.{PkgSpec, MkPkgSpec}
 
-extern "getpid" def c_getpid(): Int
-extern "realpath" def c_realpath(path: String, resolved: Ptr): Ptr
+extern "gs_sys_getpid" def c_getpid(): Int
+extern "gs_sys_realpath" def c_realpath(path: String): Ptr
 extern "free" def c_free(ptr: Ptr): Void
 
 // ============================================================================
@@ -231,12 +231,18 @@ pub def geishaHomeDir(): String = match getEnv("GEISHA_HOME") {
     Some(h) if (strLen(h) > 0) -> h,
     _ -> match getEnv("HOME") {
         Some(home) if (strLen(home) > 0) -> pathJoin(home, ".geisha"),
-        _ -> "/tmp/.geisha",
+        _ -> match getEnv("USERPROFILE") {
+            Some(up) if (strLen(up) > 0) -> pathJoin(up, ".geisha"),
+            _ -> match getEnv("TEMP") {
+                Some(tmp) if (strLen(tmp) > 0) -> pathJoin(tmp, ".geisha"),
+                _ -> "/tmp/.geisha",
+            },
+        },
     },
 }
 
 pub def absPath(p: String): String = {
-    let rp = c_realpath(p, ptrNull());
+    let rp = c_realpath(p);
     if (ptrIsNull(rp)) {
         let fullP =
             if (isAbsPath(p)) p
@@ -258,26 +264,45 @@ pub def absPath(p: String): String = {
     }
 }
 
-def execCapture(cmd: String): Result String String = {
-    let tmpDir = pathJoin(geishaHomeDir(), "tmp");
-    let _ = mkdirAll(tmpDir);
-    let seq = cellGet(cmdSeqCounter) + 1;
-    cellSet(cmdSeqCounter, seq);
-    let prefix = pathJoin(tmpDir, "cmd_" + intToStr(c_getpid()) + "_" + intToStr(seq));
-    let outFile = prefix + ".out";
-    let errFile = prefix + ".err";
-    let fullCmd = "(" + cmd + ") > " + shellQuote(outFile) + " 2> " + shellQuote(errFile);
-    let rc = shell(fullCmd);
-    let outStr = match readFile(outFile) { Ok(s) -> s, Err(_) -> "" };
-    let errStr = match readFile(errFile) { Ok(s) -> s, Err(_) -> "" };
-    let _ = removeFile(outFile);
-    let _ = removeFile(errFile);
-    if (rc == 0) Ok(outStr)
-    else {
-        let detail = strTrim(if (strLen(errStr) > 0) errStr else outStr);
-        Err(if (strLen(detail) > 0) detail else "command failed (exit " + intToStr(rc) + "): " + cmd)
+def runCmdCapture(
+    program: String,
+    args: List String,
+    envVars: List (String, String),
+    cwdOpt: Option String
+): Result String String = {
+    let c0 = command(program, args);
+    let c1 = match envVars { Nil -> c0, _ -> cmdEnv(c0, envVars) };
+    let c2 = match cwdOpt { None -> c1, Some(d) -> cmdCwd(c1, d) };
+    let out = procRun(c2)?;
+    match out.status {
+        Exited(0) -> Ok(out.stdout),
+        Exited(code) -> {
+            let detail = strTrim(if (strLen(out.stderr) > 0) out.stderr else out.stdout);
+            Err(if (strLen(detail) > 0) detail else "command failed (exit " + intToStr(code) + "): " + program)
+        },
+        _ -> Err("command terminated by signal: " + program),
     }
 }
+
+def runCmdStatus(program: String, args: List String, cwdOpt: Option String): Int = {
+    let c0 = command(program, args);
+    let c1 = match cwdOpt { None -> c0, Some(d) -> cmdCwd(c0, d) };
+    match procSpawn(c1) {
+        Err(_) -> 1,
+        Ok(child) -> match childWait(child) {
+            Ok(Exited(code)) -> code,
+            _ -> 1,
+        },
+    }
+}
+
+def gitCapture(args: List String, noPrompt: Bool): Result String String =
+    runCmdCapture(
+        "git",
+        args,
+        if (noPrompt) [("GIT_TERMINAL_PROMPT", "0")] else Nil,
+        None
+    )
 
 def copyFileBytes(srcPath: String, dstPath: String): Result Void String = {
     let content = readFile(srcPath)?;
@@ -503,6 +528,18 @@ def toolDisabledByEnv(toolName: String): Bool = match getEnv("GEISHA_DISABLE_TOO
     None -> false,
 }
 
+def isOkResult(r: Result String String): Bool = match r {
+    Ok(_) -> true,
+    Err(_) -> false,
+}
+
+def toolExistsOnHost(toolName: String): Bool =
+    if (pkgHostOs() == "windows") {
+        isOkResult(runCmdCapture("where", [toolName], Nil, None))
+    } else {
+        isOkResult(runCmdCapture("/bin/sh", ["-c", "command -v " + shellQuote(toolName)], Nil, None))
+    }
+
 def evalWhenPredicates(rfs: List (String, Value)): Bool = {
     let osOk = match asStrOpt(lookupVal(rfs, "os")) {
         None -> true,
@@ -512,12 +549,12 @@ def evalWhenPredicates(rfs: List (String, Value)): Bool = {
         if (!osOk) false
         else match asStrOpt(lookupVal(rfs, "tool")) {
             None -> true,
-            Some(t) -> !toolDisabledByEnv(t) && shell("command -v " + shellQuote(t) + " >/dev/null 2>&1") == 0,
+            Some(t) -> !toolDisabledByEnv(t) && toolExistsOnHost(t),
         };
     if (!toolOk) false
     else match asStrOpt(optFieldAlt(rfs, "pkg_config", "pkg-config")) {
         None -> true,
-        Some(pc) -> shell("pkg-config --exists " + shellQuote(pc) + " >/dev/null 2>&1") == 0,
+        Some(pc) -> isOkResult(runCmdCapture("pkg-config", ["--exists", pc], Nil, None)),
     }
 }
 
@@ -608,11 +645,11 @@ def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOp
                                 let pcLFlgs = cellNew(Nil);
                                 match asStrOpt(optFieldAlt(rfs, "pkg_config", "pkg-config")) {
                                     Some(pc) -> {
-                                        match execCapture("pkg-config --cflags " + shellQuote(pc)) {
+                                        match runCmdCapture("pkg-config", ["--cflags", pc], Nil, None) {
                                             Ok(out) -> cellSet(pcCFlgs, splitWsTokens(out)),
                                             Err(_) -> (),
                                         };
-                                        match execCapture("pkg-config --libs " + shellQuote(pc)) {
+                                        match runCmdCapture("pkg-config", ["--libs", pc], Nil, None) {
                                             Ok(out) -> cellSet(pcLFlgs, splitWsTokens(out)),
                                             Err(_) -> (),
                                         }
@@ -995,13 +1032,13 @@ def resolveBareNameFromIndex(pkgName: String): Result (String, String) String = 
 
     let synced =
         if (isDir(pathJoin(idxDir, ".git"))) {
-            match execCapture("git -C " + shellQuote(idxDir) + " pull --ff-only --quiet") {
+            match gitCapture(["-C", idxDir, "pull", "--ff-only", "--quiet"], true) {
                 Ok(_) -> true,
                 Err(_) -> true,
             }
         } else {
             let _ = mkdirAll(pathDirname(idxDir));
-            match execCapture("git clone --depth=1 --quiet " + shellQuote(idxUrl) + " " + shellQuote(idxDir)) {
+            match gitCapture(["clone", "--depth=1", "--quiet", idxUrl, idxDir], true) {
                 Ok(_) -> true,
                 Err(_) -> false,
             }
@@ -1037,7 +1074,7 @@ def resolveBareNameFromIndex(pkgName: String): Result (String, String) String = 
             // Fallback to official `github.com/geisha-lang/<pkgName>` if reachable!
             let officialCanon = "github.com/geisha-lang/" + pkgName;
             let officialClone = "https://" + officialCanon + ".git";
-            match execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote --heads " + shellQuote(officialClone)) {
+            match gitCapture(["ls-remote", "--heads", officialClone], true) {
                 Ok(_) -> Ok((officialCanon, officialClone)),
                 Err(_) -> Err(
                     "Package '" + pkgName + "' not found in index (" + idxUrl
@@ -1058,25 +1095,25 @@ def ensureBareRepo(canonUrl: String, cloneUrl: String): Result String String = {
     let dbDir = pathJoin(pathJoin(geishaHomeDir(), "git/db"), slug + "-" + h12 + ".git");
     if (!isDir(dbDir)) {
         mkdirAll(dbDir)?;
-        let _ = execCapture("git init --bare --quiet " + shellQuote(dbDir))?;
-        let _ = execCapture("git -C " + shellQuote(dbDir) + " remote add origin " + shellQuote(cloneUrl))?;
+        let _ = gitCapture(["init", "--bare", "--quiet", dbDir], false)?;
+        let _ = gitCapture(["-C", dbDir, "remote", "add", "origin", cloneUrl], false)?;
         Ok(dbDir)
     } else {
-        let _ = execCapture("git -C " + shellQuote(dbDir) + " remote set-url origin " + shellQuote(cloneUrl));
+        let _ = gitCapture(["-C", dbDir, "remote", "set-url", "origin", cloneUrl], false);
         Ok(dbDir)
     }
 }
 
 def bareHasCommit(dbDir: String, rev: String): Bool =
     if (strLen(rev) < 7) false
-    else match execCapture("git -C " + shellQuote(dbDir) + " rev-parse --verify --quiet " + shellQuote(rev + "^{commit}")) {
+    else match gitCapture(["-C", dbDir, "rev-parse", "--verify", "--quiet", rev + "^{commit}"], false) {
         Ok(_) -> true,
         Err(_) -> false,
     }
 
 def tryFetchSingleTag(dbDir: String, tagStr: String): Result String String = {
-    let _ = execCapture("GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(dbDir) + " fetch --filter=blob:none --depth=1 --force origin tag " + shellQuote(tagStr))?;
-    let out = execCapture("git -C " + shellQuote(dbDir) + " rev-parse FETCH_HEAD^{commit}")?;
+    let _ = gitCapture(["-C", dbDir, "fetch", "--filter=blob:none", "--depth=1", "--force", "origin", "tag", tagStr], true)?;
+    let out = gitCapture(["-C", dbDir, "rev-parse", "FETCH_HEAD^{commit}"], false)?;
     Ok(strTrim(out))
 }
 
@@ -1096,14 +1133,14 @@ def resolveExplicitRefRev(dbDir: String, refSpec: String): Result String String 
     if (strLen(refSpec) == 40 && bareHasCommit(dbDir, refSpec)) {
         Ok(refSpec)
     } else {
-        let _ = execCapture("GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(dbDir) + " fetch --filter=blob:none --depth=1 origin " + shellQuote(refSpec))?;
-        let out = execCapture("git -C " + shellQuote(dbDir) + " rev-parse FETCH_HEAD^{commit}")?;
+        let _ = gitCapture(["-C", dbDir, "fetch", "--filter=blob:none", "--depth=1", "origin", refSpec], true)?;
+        let out = gitCapture(["-C", dbDir, "rev-parse", "FETCH_HEAD^{commit}"], false)?;
         Ok(strTrim(out))
     }
 }
 
 def queryRemoteLatestTagOrHead(cloneUrl: String): Result (Option String, String) String = {
-    let tagsOut = execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs " + shellQuote(cloneUrl))?;
+    let tagsOut = gitCapture(["ls-remote", "--tags", "--refs", cloneUrl], true)?;
     let lines = strSplitChar(tagsOut, '\n');
     let bestVer: Cell (Option String) = cellNew(None);
     let bestSha = cellNew("");
@@ -1146,7 +1183,7 @@ def queryRemoteLatestTagOrHead(cloneUrl: String): Result (Option String, String)
     match cellGet(bestVer) {
         Some(v) -> Ok((Some(v), cellGet(bestSha))),
         None -> {
-            let headOut = execCapture("GIT_TERMINAL_PROMPT=0 git ls-remote " + shellQuote(cloneUrl) + " HEAD")?;
+            let headOut = gitCapture(["ls-remote", cloneUrl, "HEAD"], true)?;
             let firstLine = match strSplitChar(headOut, '\n') { Cons(h, _) -> strTrim(h), Nil -> "" };
             match strIndexOfByte(firstLine, 9, 0) {
                 Some(idx) -> Ok((None, strSlice(firstLine, 0, idx))),
@@ -1158,7 +1195,7 @@ def queryRemoteLatestTagOrHead(cloneUrl: String): Result (Option String, String)
 
 def readManifestFromBare(dbDir: String, rev: String, subdir: String, fallbackName: String): Result Manifest String = {
     let relPath = if (strLen(subdir) > 0) subdir + "/geisha.toml" else "geisha.toml";
-    match execCapture("git -C " + shellQuote(dbDir) + " show " + shellQuote(rev + ":" + relPath)) {
+    match gitCapture(["-C", dbDir, "show", rev + ":" + relPath], false) {
         Ok(rawToml) -> parseManifestToml(rawToml, fallbackName),
         Err(_) -> Ok(emptyManifest(fallbackName)),
     }
@@ -1236,30 +1273,43 @@ def materializeCachedTree(
 
             let seq = cellGet(cmdSeqCounter) + 1;
             cellSet(cmdSeqCounter, seq);
-            let stageDir = pathJoin(pathJoin(geishaHomeDir(), "tmp"), "stage_" + intToStr(c_getpid()) + "_" + intToStr(seq));
-            let _ = shell("rm -rf " + shellQuote(stageDir));
+            let tmpDir = pathJoin(geishaHomeDir(), "tmp");
+            let _ = mkdirAll(tmpDir);
+            let stageName = "stage_" + intToStr(c_getpid()) + "_" + intToStr(seq);
+            let stageTarName = stageName + ".tar";
+            let stageDir = pathJoin(tmpDir, stageName);
+            let stageTar = pathJoin(tmpDir, stageTarName);
+            let _ = removeDirAll(stageDir);
+            let _ = removeFile(stageTar);
             mkdirAll(stageDir)?;
 
+            let stageTarAbs = pathJoin(absPath(tmpDir), stageTarName);
             let treeSpec = if (strLen(subdir) > 0) rev + ":" + subdir else rev;
-            let archiveCmd =
-                "git -C " + shellQuote(dbDir) + " archive --format=tar " + shellQuote(treeSpec)
-                + " | tar -x -C " + shellQuote(stageDir);
-            match execCapture(archiveCmd) {
+            let extractRes = match gitCapture(["-C", dbDir, "archive", "--format=tar", "--output=" + stageTarAbs, treeSpec], false) {
+                Err(e) -> Err(e),
+                Ok(_) -> {
+                    let tarRes = runCmdCapture("tar", ["-xf", stageTarName, "-C", stageName], Nil, Some(tmpDir));
+                    let _ = removeFile(stageTar);
+                    tarRes
+                },
+            };
+            match extractRes {
                 Err(e) -> {
-                    let _ = shell("rm -rf " + shellQuote(stageDir));
+                    let _ = removeFile(stageTar);
+                    let _ = removeDirAll(stageDir);
                     Err("failed to extract '" + canonUrl + "' at " + treeSpec + ": " + e)
                 },
                 Ok(_) -> {
                     let actualSha = match sha256Dir(stageDir) {
                         Ok(s) -> s,
                         Err(he) -> {
-                            let _ = shell("rm -rf " + shellQuote(stageDir));
+                            let _ = removeDirAll(stageDir);
                             returnMatErr(he)?
                         },
                     };
                     match expectedShaOpt {
                         Some(expSha) if (strLen(expSha) > 0 && expSha != actualSha) -> {
-                            let _ = shell("rm -rf " + shellQuote(stageDir));
+                            let _ = removeDirAll(stageDir);
                             Err(
                                 "Lockfile sha256 mismatch for '" + name + "' (" + canonUrl + " @ " + rev + "):\n"
                                 + "  geisha.lock sha256: " + expSha + "\n"
@@ -1269,17 +1319,19 @@ def materializeCachedTree(
                         _ -> {
                             let finalDir = pathJoin(cacheBase, cacheDirNameFor(name, ver, rev, actualSha));
                             if (isDir(finalDir) && fileExists(pathJoin(finalDir, ".geisha-ok"))) {
-                                let _ = shell("rm -rf " + shellQuote(stageDir));
+                                let _ = removeDirAll(stageDir);
                                 Ok((finalDir, actualSha))
                             } else {
-                                let _ = shell("rm -rf " + shellQuote(finalDir));
-                                let mvRc = shell("mv " + shellQuote(stageDir) + " " + shellQuote(finalDir));
-                                if (mvRc != 0) {
-                                    let _ = shell("rm -rf " + shellQuote(stageDir));
-                                    Err("failed to move extracted package into cache: " + finalDir)
-                                } else {
-                                    writeFile(pathJoin(finalDir, ".geisha-ok"), actualSha + "\n")?;
-                                    Ok((finalDir, actualSha))
+                                let _ = removeDirAll(finalDir);
+                                match renameFile(stageDir, finalDir) {
+                                    Err(_) -> {
+                                        let _ = removeDirAll(stageDir);
+                                        Err("failed to move extracted package into cache: " + finalDir)
+                                    },
+                                    Ok(_) -> {
+                                        writeFile(pathJoin(finalDir, ".geisha-ok"), actualSha + "\n")?;
+                                        Ok((finalDir, actualSha))
+                                    },
                                 }
                             }
                         },
@@ -2788,20 +2840,7 @@ pub def cmdRun(
         },
     };
 
-    let cmdBuf = bufNew();
-    bufPushStr(cmdBuf, shellQuote(binPath));
-    let cur = cellNew(appArgs);
-    while (match cellGet(cur) { Nil -> false, _ -> true }) {
-        match cellGet(cur) {
-            Cons(a, r) -> {
-                bufPushByte(cmdBuf, 32);
-                bufPushStr(cmdBuf, shellQuote(a));
-                cellSet(cur, r)
-            },
-            Nil -> (),
-        }
-    };
-    let rc = shell(bufToString(cmdBuf));
+    let rc = runCmdStatus(binPath, appArgs, None);
     match singleFileOpt {
         Some(_) -> { let _ = removeFile(binPath); () },
         None -> (),
@@ -2919,7 +2958,7 @@ def runTestFilesRec(
         let stem = pathStem(tf);
         let outBin = pathJoin(buildDir, "test_" + stem);
         cbs.cbCompileNativeExe(tf, testRootSpec, allExtSpecs, testTc, Some(outBin), None, rtOverrideOpt)?;
-        let rc = shell("cd " + shellQuote(projDir) + " && " + shellQuote(outBin));
+        let rc = runCmdStatus(outBin, Nil, Some(projDir));
         if (rc != 0) Err("test suite failed: " + tf)
         else runTestFilesRec(rest, projDir, buildDir, testRootSpec, allExtSpecs, testTc, rtOverrideOpt, cbs, acc + 1)
     },

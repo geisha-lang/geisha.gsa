@@ -858,7 +858,7 @@ static void compute_default_thresholds(size_t init_size_words, size_t *minor_out
 {
     const char *env_words = getenv("GEISHA_GC_HEAP_WORDS");
     if (env_words != NULL) {
-        long parsed = atol(env_words);
+        long long parsed = strtoll(env_words, NULL, 10);
         if (parsed >= 32) {
             init_size_words = (size_t)parsed;
         }
@@ -1047,6 +1047,118 @@ void gc_enter_blocking(void *jmp_buf_on_stack)
         pthread_mutex_unlock(&_gc_mu);
     }
 }
+
+/* Helper invoked by the naked `gc_enter_blocking_capture` stub with the caller's exact
+ * `caller_sp` (SP_F, strictly above any subsequent FFI call frame) and a snapshot of the
+ * caller's untouched callee-saved GPRs. */
+__attribute__((used)) void __gs_enter_blocking_regs(
+    uintptr_t caller_sp, const uintptr_t *regs, size_t nregs)
+{
+    gc_thread_t *self = _tls_thread;
+    if (self == NULL) {
+        return;
+    }
+    memset(&self->safepoint_regs, 0, sizeof(jmp_buf));
+    size_t max_words = sizeof(jmp_buf) / sizeof(uintptr_t);
+    size_t copy_words = (nregs < max_words) ? nregs : max_words;
+    if (regs != NULL && copy_words > 0) {
+        memcpy(&self->safepoint_regs, regs, copy_words * sizeof(uintptr_t));
+    }
+    self->safepoint_sp = caller_sp;
+    __atomic_store_n(&self->state, THR_BLOCKED, __ATOMIC_SEQ_CST);
+    if (__builtin_expect(__atomic_load_n(&__gs_gc_stw_requested, __ATOMIC_SEQ_CST) != 0, 0)) {
+        pthread_mutex_lock(&_gc_mu);
+        if (_stw_in_progress && all_threads_parked_locked()) {
+            pthread_cond_signal(&_stw_park_cv);
+        }
+        pthread_mutex_unlock(&_gc_mu);
+    }
+}
+
+#if defined(__APPLE__)
+#define GS_ASM_SYM(name) "_" #name
+#else
+#define GS_ASM_SYM(name) #name
+#endif
+
+/* Platform-agnostic zero-arg blocking-section entry: captures the caller's untouched
+ * callee-saved GPRs and exact `SP_F` without clobbering registers or exposing a dead
+ * callee frame to concurrent STW stack scanning. */
+#if defined(__aarch64__)
+__attribute__((naked, noinline)) void gc_enter_blocking_capture(void)
+{
+    __asm__ volatile(
+        "mov x0, sp\n\t"
+        "sub sp, sp, #112\n\t"
+        "stp x19, x20, [sp, #0]\n\t"
+        "stp x21, x22, [sp, #16]\n\t"
+        "stp x23, x24, [sp, #32]\n\t"
+        "stp x25, x26, [sp, #48]\n\t"
+        "stp x27, x28, [sp, #64]\n\t"
+        "str x29,      [sp, #80]\n\t"
+        "str x30,      [sp, #96]\n\t"
+        "mov x1, sp\n\t"
+        "mov x2, #11\n\t"
+        "bl " GS_ASM_SYM(__gs_enter_blocking_regs) "\n\t"
+        "ldr x30,      [sp, #96]\n\t"
+        "add sp, sp, #112\n\t"
+        "ret\n\t"
+    );
+}
+#elif defined(__x86_64__) && defined(_WIN32)
+__asm__(
+    ".text\n\t"
+    ".globl gc_enter_blocking_capture\n\t"
+    ".def gc_enter_blocking_capture; .scl 2; .type 32; .endef\n\t"
+    ".p2align 4\n\t"
+    "gc_enter_blocking_capture:\n\t"
+    ".seh_proc gc_enter_blocking_capture\n\t"
+    "subq $104, %rsp\n\t"
+    ".seh_stackalloc 104\n\t"
+    ".seh_endprologue\n\t"
+    "leaq 112(%rsp), %rcx\n\t"
+    "movq %rbx, 32(%rsp)\n\t"
+    "movq %rbp, 40(%rsp)\n\t"
+    "movq %rdi, 48(%rsp)\n\t"
+    "movq %rsi, 56(%rsp)\n\t"
+    "movq %r12, 64(%rsp)\n\t"
+    "movq %r13, 72(%rsp)\n\t"
+    "movq %r14, 80(%rsp)\n\t"
+    "movq %r15, 88(%rsp)\n\t"
+    "leaq 32(%rsp), %rdx\n\t"
+    "movl $8, %r8d\n\t"
+    "call " GS_ASM_SYM(__gs_enter_blocking_regs) "\n\t"
+    "addq $104, %rsp\n\t"
+    "ret\n\t"
+    ".seh_endproc\n"
+);
+#elif defined(__x86_64__)
+__attribute__((naked, noinline)) void gc_enter_blocking_capture(void)
+{
+    __asm__ volatile(
+        "leaq 8(%rsp), %rdi\n\t"
+        "subq $56, %rsp\n\t"
+        "movq %rbx,  0(%rsp)\n\t"
+        "movq %rbp,  8(%rsp)\n\t"
+        "movq %r12, 16(%rsp)\n\t"
+        "movq %r13, 24(%rsp)\n\t"
+        "movq %r14, 32(%rsp)\n\t"
+        "movq %r15, 40(%rsp)\n\t"
+        "movq %rsp, %rsi\n\t"
+        "movl $6, %edx\n\t"
+        "call " GS_ASM_SYM(__gs_enter_blocking_regs) "\n\t"
+        "addq $56, %rsp\n\t"
+        "ret\n\t"
+    );
+}
+#else
+__attribute__((noinline)) void gc_enter_blocking_capture(void)
+{
+    jmp_buf regs;
+    _setjmp(regs);
+    gc_enter_blocking(&regs);
+}
+#endif
 
 /* Lock-free fast path for leaving C FFI / blocking syscalls */
 void gc_leave_blocking(void)

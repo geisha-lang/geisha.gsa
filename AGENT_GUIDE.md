@@ -128,7 +128,7 @@ pub def printShow(x: a): Void = ... // or with explicit scheme:
   - **C import**: `extern [noalloc] ["c_sym"] def fn(x: Int): Ptr` (multiple typed declarations may alias the same symbol such as `"objc_msgSend"`); `ForeignPtr` auto-borrows as `ScopedPtr` at `extern` boundaries with compiler keep-alive.
   - **Indirect C function pointer call**: `extern ptr [noalloc] def call_fp(fp: Ptr, ...): Ret` invokes parameter 0 (`Ptr`) with exact C ABI signature.
   - **Pure C ABI export**: `pub extern ["c_sym"] def fn(x: Int): Int = ...` (symmetric with import, distinguished by `= body`; omits trailing `%fvs` closure param and wraps in `gc_host_enter`/`gc_host_leave`).
-  - **C ABI value struct**: `pub extern data CGPoint { x: Float, y: Float }` enforces C ABI struct layout & calling convention (ARM64 HFA / SysV AMD64 / `sret` / `byval`).
+  - **C ABI value struct**: `pub extern data CGPoint { x: Float, y: Float }` enforces C ABI struct layout & calling convention (ARM64 HFA / SysV AMD64 / Win64 x64 / `sret` / `byval`).
   - **Static constructor**: `extern init[(priority)] def setup(): Void = ...` emits `@llvm.global_ctors` (e.g. registering Objective-C subclasses before `main`/`NSExtensionMain`).
   - **C function pointer / callback**: `cFnPtr(fn)` returns `Ptr` for an `extern` function or synthesizes a thread-safe C ABI callback trampoline for a monomorphic top-level Geisha function.
 
@@ -144,7 +144,7 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.list` — singly-linked `List a` (`listLen`, `listRev`, `listAppend`, ...)
 - `std.control` — higher-order combinators (`fmap`, ...)
 - `std.bits` — bitwise utilities
-- `std.path` — path manipulation (`pathJoin`, `pathDirname`, `pathBasename`, `pathStem`, ...)
+- `std.path` — host-OS-aware path manipulation (`isAbsPath`, `pathJoin`, `pathDirname`, `pathBasename`, `pathStem`, `pathWithExt`) plus explicit Windows-style `*Win` variants (`isAbsPathWin`, `pathJoinWin`, `pathDirnameWin`, `pathBasenameWin`, `pathStemWin`, `pathWithExtWin`)
 - `std.char` — ASCII/byte classification (`isDigitByte`, `isUpperByte`, `isLowerByte`, ...)
 - `std.buf` — mutable `StringBuf` (`bufNew`, `bufPushStr`, `bufPushByte`, `bufToString`)
 - `std.str` — string utilities (`intToStr`, `parseInt`, `parseFloat`, `strJoin`, `strSplitChar`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, ...)
@@ -164,7 +164,7 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 
 ### `sys.*`
 - `sys.io` — stdout/stderr/stdin (`eprintLn`, ...)
-- `sys.fs` — files, directories, atomic writes, permissions/mtime, and zero-copy `Mmap` (`readFile`, `writeFile`, `writeFileAtomic`, `writeFileAtomicMode`, `renameFile`, `chmod`, `fileMtimeMs`, `fileExists`, `isDir`, `mkdirAll`, `readDir`, `removeFile`, `withMmap`)
+- `sys.fs` — files, directories, atomic writes, permissions/mtime, and zero-copy `Mmap` (`readFile`, `writeFile`, `writeFileAtomic`, `writeFileAtomicMode`, `renameFile`, `chmod`, `fileMtimeMs`, `fileExists`, `isDir`, `mkdirAll`, `readDir`, `removeFile`, `removeDir`, `removeDirAll`, `withMmap`)
 - `sys.env` — CLI args and env vars (`argCount`, `argAt`, `getEnv`)
 - `sys.proc` — structured subprocesses, pipes, timeouts, signals, and shell execution (`Command`, `command`, `spawn`, `run`, `runTimeout`, `childSignal`, `Pipe`, `exit`, `shell`)
 - `sys.time` — monotonic/wall clock and sleep

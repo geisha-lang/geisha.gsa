@@ -9,8 +9,11 @@ extern "fopen" def c_fopen(path: String, mode: String): Ptr
 extern "fclose" def c_fclose(fp: Ptr): Int
 extern "fread" def c_fread(buf: Ptr, size: Int64, nitems: Int64, fp: Ptr): Int64
 extern "fwrite" def c_fwrite(buf: String, size: Int64, nitems: Int64, fp: Ptr): Int64
-extern "access" def c_access(path: String, mode: Int): Int
+extern "gs_sys_file_exists" def c_file_exists(path: String): Int
 extern "remove" def c_remove(path: String): Int
+extern "gs_sys_rmdir" def c_rmdir(path: String): Int
+extern "gs_sys_lstat_kind" def c_lstat_kind(path: String): Int
+extern "gs_sys_host_os" def c_fs_host_os(): Ptr
 extern "gs_sys_is_dir" def c_is_dir(path: String): Int
 extern "gs_sys_mkdir" def c_mkdir(path: String): Int
 extern "gs_sys_dir_open" def c_dir_open(path: String): Ptr
@@ -25,7 +28,7 @@ extern "gs_sys_chmod" def c_chmod(path: String, mode: Int): Int
 extern "gs_sys_file_mtime_ms" def c_file_mtime_ms(path: String): Int64
 
 pub def fileExists(path: String): Bool =
-    c_access(path, 0) == 0
+    c_file_exists(path) != 0
 
 pub def isDir(path: String): Bool =
     c_is_dir(path) != 0
@@ -34,15 +37,31 @@ pub def mkdir(path: String): Result Void String =
     if (c_mkdir(path) == 0) Ok(())
     else Err("failed to create directory: " + path)
 
+def isWinHost(): Bool = {
+    let p = c_fs_host_os();
+    !ptrIsNull(p) && ptrToString(p) == "windows"
+}
+
+def isHostPathSepByte(winHost: Bool, b: Int): Bool =
+    b == 47 || (winHost && b == 92)
+
+def isAsciiLetterByte(b: Int): Bool =
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+
+def hasWinDrivePrefix(p: String): Bool =
+    strLen(p) >= 2 && isAsciiLetterByte(strByteAt(p, 0)) && strByteAt(p, 1) == 58
+
 pub def mkdirAll(path: String): Result Void String = {
     let n = strLen(path);
     if (n == 0) Err("empty directory path")
     else {
-        let i = cellNew(1);
+        let winHost = isWinHost();
+        let startIdx = if (winHost && hasWinDrivePrefix(path)) 3 else 1;
+        let i = cellNew(startIdx);
         let failed = cellNew(false);
         while (cellGet(i) < n && !cellGet(failed)) {
             let idx = cellGet(i);
-            if (strByteAt(path, idx) == 47) {
+            if (isHostPathSepByte(winHost, strByteAt(path, idx))) {
                 let prefix = ptrSliceFromStr(path, 0, idx);
                 if (strLen(prefix) > 0 && !isDir(prefix)) {
                     if (c_mkdir(prefix) != 0) cellSet(failed, true) else ()
@@ -51,6 +70,7 @@ pub def mkdirAll(path: String): Result Void String = {
             cellSet(i, idx + 1)
         };
         if (cellGet(failed)) Err("failed to create parent directories for: " + path)
+        else if (isDir(path)) Ok(())
         else mkdir(path)
     }
 }
@@ -127,6 +147,59 @@ pub def writeFile(path: String, content: String): Result Void String = {
 
 pub def removeFile(path: String): Bool =
     c_remove(path) == 0
+
+/// Remove an empty directory at `path`.
+pub def removeDir(path: String): Bool =
+    c_rmdir(path) == 0
+
+def trimTrailingHostSep(winHost: Bool, path: String): String = {
+    let minLen =
+        if (winHost && hasWinDrivePrefix(path)) {
+            if (strLen(path) >= 3 && isHostPathSepByte(winHost, strByteAt(path, 2))) 3 else 2
+        } else if (strLen(path) > 0 && isHostPathSepByte(winHost, strByteAt(path, 0))) {
+            1
+        } else {
+            0
+        };
+    let hi = cellNew(strLen(path));
+    while (cellGet(hi) > minLen && isHostPathSepByte(winHost, strByteAt(path, cellGet(hi) - 1))) {
+        cellSet(hi, cellGet(hi) - 1)
+    };
+    ptrSliceFromStr(path, 0, cellGet(hi))
+}
+
+/// Recursively remove a file or directory tree at `path` without following symlinks.
+/// Symbolic links (including directory symlinks with trailing slashes and dangling symlinks)
+/// are unlinked as leaf entries. Returns `true` if `path` no longer exists on disk.
+pub def removeDirAll(path: String): Bool = {
+    let winHost = isWinHost();
+    let target = trimTrailingHostSep(winHost, path);
+    let kind = c_lstat_kind(target);
+    if (kind == 0) true
+    else if (kind < 0) false
+    else if (kind != 2) removeFile(target)
+    else match readDir(target) {
+        Err(_) -> false,
+        Ok(entries) -> {
+            let cur = cellNew(entries);
+            let ok = cellNew(true);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(name, rest) -> {
+                        let sep =
+                            if (strLen(target) > 0 && isHostPathSepByte(winHost, strByteAt(target, strLen(target) - 1))) ""
+                            else "/";
+                        let child = strConcat(strConcat(target, sep), name);
+                        if (!removeDirAll(child)) cellSet(ok, false) else ();
+                        cellSet(cur, rest)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(ok)) removeDir(target) else false
+        },
+    }
+}
 
 /// Atomically write `content` to `path` via a same-directory temporary file (`fsync` + `rename`).
 /// Preserves existing permissions when `path` already exists, or creates with `0o666 & ~umask`.

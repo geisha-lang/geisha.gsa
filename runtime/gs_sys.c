@@ -102,7 +102,70 @@ const char *gs_sys_exe_path(void)
     return resolved_buf[0] != '\0' ? resolved_buf : NULL;
 }
 
+int32_t gs_sys_getpid(void)
+{
+    return (int32_t)getpid();
+}
+
+char *gs_sys_realpath(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return NULL;
+    return realpath(path, NULL);
+}
+
+int64_t gs_sys_fd_write(int32_t fd, const void *buf, int64_t len)
+{
+    if (fd < 0 || buf == NULL || len <= 0) return 0;
+    const unsigned char *p = (const unsigned char *)buf;
+    int64_t rem = len;
+    while (rem > 0) {
+        size_t chunk = (rem > (int64_t)0x40000000LL) ? (size_t)0x40000000ULL : (size_t)rem;
+        ssize_t n = write(fd, p, chunk);
+        if (n > 0) {
+            p += n;
+            rem -= (int64_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return len;
+}
+
 /* ---- Filesystem helpers (`sys.fs`) ---- */
+
+int32_t gs_sys_file_exists(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return 0;
+    return (access(path, F_OK) == 0) ? 1 : 0;
+}
+
+int32_t gs_sys_rmdir(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return -1;
+    return (rmdir(path) == 0) ? 0 : -1;
+}
+
+/* Non-following entry classification for safe recursive deletion (`lstat`):
+ *   0 = does not exist (ENOENT / ENOTDIR)
+ *  -1 = error
+ *   1 = regular file or non-directory non-symlink entry
+ *   2 = real directory (not a symlink)
+ *   3 = symbolic link (never recurse into symlink targets)
+ */
+int32_t gs_sys_lstat_kind(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) return 0;
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode)) return 3;
+    if (S_ISDIR(st.st_mode)) return 2;
+    return 1;
+}
 
 int32_t gs_sys_is_dir(const char *path)
 {
@@ -207,7 +270,13 @@ int32_t gs_sys_write_atomic(const char *path, const void *buf, int64_t len, int3
     char *tmp_path = (char *)malloc(plen + 40);
     if (tmp_path == NULL) return -1;
 
+#ifdef _WIN32
+    const char *slash_f = strrchr(path, '/');
+    const char *slash_b = strrchr(path, '\\');
+    const char *slash = (slash_b != NULL && (slash_f == NULL || slash_b > slash_f)) ? slash_b : slash_f;
+#else
     const char *slash = strrchr(path, '/');
+#endif
     int fd = -1;
     uint64_t rng = (uint64_t)gs_sys_rand_seed();
     for (int attempt = 0; attempt < 32; attempt++) {

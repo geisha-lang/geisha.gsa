@@ -611,6 +611,7 @@ data ModEmitCtx {
         mcEscape: EscapeInfo,
         mcIsWasm: Bool,
         mcTargetArch: String,
+        mcTargetOs: String,
         mcPtrSize: Int,
         mcWasmExports: StrMap Bool,
         mcHasExplicitExports: Bool,
@@ -750,7 +751,7 @@ def classifyX64Eightbyte(leaves: List (Int, Int, String), ebStart: Int, totalSz:
     }
 }
 
-def classifyCAbiParam(arch: String, ptrSize: Int, ty: Type): CAbiParamMode =
+def classifyCAbiParam(arch: String, targetOs: String, ptrSize: Int, ty: Type): CAbiParamMode =
     if (!isCStructType(ty)) CAbiDirect(getValLlvmType(ty))
     else {
         let sLlvm = getValLlvmType(ty);
@@ -769,6 +770,14 @@ def classifyCAbiParam(arch: String, ptrSize: Int, ty: Type): CAbiParamMode =
                     else if (sz <= 16) CAbiDirect("[2 x i64]")
                     else CAbiIndirectPtr(sLlvm, aln, false),
             }
+        } else if (arch == "x86_64" && targetOs == "windows") {
+            // Win64 x64 C ABI: only power-of-2 sizes (1, 2, 4, 8 bytes) are passed directly in integer registers;
+            // all other aggregate sizes (3, 5, 6, 7, >8 bytes) are passed indirectly by pointer (no `byval`).
+            if (sz == 1) CAbiDirect("i8")
+            else if (sz == 2) CAbiDirect("i16")
+            else if (sz == 4) CAbiDirect("i32")
+            else if (sz == 8) CAbiDirect("i64")
+            else CAbiIndirectPtr(sLlvm, aln, false)
         } else if (arch == "x86_64") {
             if (sz > 16) CAbiIndirectPtr(sLlvm, aln, true)
             else if (sz <= 8) CAbiDirect(classifyX64Eightbyte(leaves, 0, sz))
@@ -782,7 +791,7 @@ def classifyCAbiParam(arch: String, ptrSize: Int, ty: Type): CAbiParamMode =
         }
     }
 
-def classifyCAbiRet(arch: String, ptrSize: Int, ty: Type): CAbiRetMode =
+def classifyCAbiRet(arch: String, targetOs: String, ptrSize: Int, ty: Type): CAbiRetMode =
     if (isVoidGeishaType(ty)) CAbiRetVoid
     else if (!isCStructType(ty)) CAbiRetDirect(getValLlvmType(ty))
     else {
@@ -802,6 +811,14 @@ def classifyCAbiRet(arch: String, ptrSize: Int, ty: Type): CAbiRetMode =
                     else if (sz <= 16) CAbiRetDirect("[2 x i64]")
                     else CAbiRetSret(sLlvm, aln),
             }
+        } else if (arch == "x86_64" && targetOs == "windows") {
+            // Win64 x64 C ABI: only 1, 2, 4, 8 byte structs are returned in RAX;
+            // all other sizes (3, 5, 6, 7, >8 bytes) use hidden `sret` pointer in RCX.
+            if (sz == 1) CAbiRetDirect("i8")
+            else if (sz == 2) CAbiRetDirect("i16")
+            else if (sz == 4) CAbiRetDirect("i32")
+            else if (sz == 8) CAbiRetDirect("i64")
+            else CAbiRetSret(sLlvm, aln)
         } else if (arch == "x86_64") {
             if (sz > 16) CAbiRetSret(sLlvm, aln)
             else if (sz <= 8) CAbiRetDirect(classifyX64Eightbyte(leaves, 0, sz))
@@ -815,9 +832,9 @@ def classifyCAbiRet(arch: String, ptrSize: Int, ty: Type): CAbiRetMode =
         }
     }
 
-def cAbiDeclParamStrings(arch: String, ptrSize: Int, paramTys: List Type, retTy: Type): (String, List String) = {
+def cAbiDeclParamStrings(arch: String, targetOs: String, ptrSize: Int, paramTys: List Type, retTy: Type): (String, List String) = {
     let partsRev = cellNew(Nil);
-    let retMode = classifyCAbiRet(arch, ptrSize, retTy);
+    let retMode = classifyCAbiRet(arch, targetOs, ptrSize, retTy);
     let retStr = match retMode {
         CAbiRetVoid -> "void",
         CAbiRetDirect(rt) -> rt,
@@ -830,7 +847,7 @@ def cAbiDeclParamStrings(arch: String, ptrSize: Int, paramTys: List Type, retTy:
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(pt, r) -> {
-                match classifyCAbiParam(arch, ptrSize, pt) {
+                match classifyCAbiParam(arch, targetOs, ptrSize, pt) {
                     CAbiDirect(lt) -> cellSet(partsRev, Cons(lt, cellGet(partsRev))),
                     CAbiPair(t0, t1) -> {
                         cellSet(partsRev, Cons(t0, cellGet(partsRev)));
@@ -904,7 +921,7 @@ def emitCAbiTrampoline(
         TyArr(_, _, r) -> r,
         _ -> TyVoid,
     };
-    let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcPtrSize, retGeishaTy);
+    let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcTargetOs, mctx.mcPtrSize, retGeishaTy);
     let sigPartsRev = cellNew(Nil);
     let sretRegOpt = match retMode {
         CAbiRetSret(sTy, aln) -> {
@@ -939,7 +956,7 @@ def emitCAbiTrampoline(
                 let i = cellGet(pIdx);
                 let pTy = schemeBody(vd.vscm);
                 let gsTy = getValLlvmType(pTy);
-                let gsVal = match classifyCAbiParam(mctx.mcTargetArch, mctx.mcPtrSize, pTy) {
+                let gsVal = match classifyCAbiParam(mctx.mcTargetArch, mctx.mcTargetOs, mctx.mcPtrSize, pTy) {
                     CAbiDirect(cTy) -> {
                         let reg = "%carg" + intToStr(i);
                         cellSet(sigPartsRev, Cons(cTy + " " + reg, cellGet(sigPartsRev)));
@@ -1063,12 +1080,11 @@ def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
     else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
     else llvmSym(fnName)
 
-// TODO(#12): switch to `gs_sys_realpath` once Windows runtime shim lands
-extern "realpath" def c_realpath(path: String, resolved: Ptr): Ptr
+extern "gs_sys_realpath" def c_realpath(path: String): Ptr
 extern "free" def c_dbg_free(p: Ptr): Void
 
 def resolveDbgCwd(): String = {
-    let p = c_realpath(".", ptrNull());
+    let p = c_realpath(".");
     if (ptrIsNull(p)) "."
     else {
         let s = ptrToString(p);
@@ -3856,7 +3872,7 @@ def genExpr(
                             TyArr(_, _, r) -> r,
                             _ -> retGeishaTy,
                         };
-                        let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcPtrSize, extRetTy);
+                        let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcTargetOs, mctx.mcPtrSize, extRetTy);
                         let callArgPartsRev = cellNew(Nil);
                         let fnSigPartsRev = cellNew(Nil);
                         let keepAliveFpsRev = cellNew(Nil);
@@ -3888,7 +3904,7 @@ def genExpr(
                                         },
                                         _ -> rawVal,
                                     };
-                                    match classifyCAbiParam(mctx.mcTargetArch, mctx.mcPtrSize, expectedTy) {
+                                    match classifyCAbiParam(mctx.mcTargetArch, mctx.mcTargetOs, mctx.mcPtrSize, expectedTy) {
                                         CAbiDirect(cTy) -> {
                                             let cVal =
                                                 if (isCStructType(expectedTy)) emitMarshalStructToDirect(fctx, expectedTy, passVal, cTy)
@@ -3925,9 +3941,7 @@ def genExpr(
                         let sigParamsStr = strJoin(listRev(cellGet(fnSigPartsRev)), ", ");
                         let useBlocking = !mctx.mcIsWasm && !extDef.extNoAlloc;
                         if (useBlocking) {
-                            let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
-                            emitLine(fctx, "call i32 @_setjmp(ptr " + jbPtr + ")");
-                            emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")")
+                            emitLine(fctx, "call void @gc_enter_blocking_capture()")
                         } else ();
 
                         let callRetLlvm = match retMode {
@@ -4798,8 +4812,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gc_alloc_masked", "declare noalias nonnull ptr @gc_alloc_masked(i64, i64) nounwind"),
         ("gc_write_barrier", "declare void @gc_write_barrier(ptr) cold nounwind"),
         ("gc_safepoint_slow", "declare void @gc_safepoint_slow() cold nounwind"),
-        ("_setjmp", "declare i32 @_setjmp(ptr) returns_twice"),
-        ("gc_enter_blocking", "declare void @gc_enter_blocking(ptr) nounwind"),
+        ("gc_enter_blocking_capture", "declare void @gc_enter_blocking_capture() nounwind"),
         ("gc_leave_blocking", "declare void @gc_leave_blocking() nounwind"),
         ("gs_str_cmp", "declare i32 @gs_str_cmp(ptr, ptr) nounwind willreturn memory(argmem: read)"),
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
@@ -4923,6 +4936,7 @@ def emitUserExternDeclares(
     externNames: List String,
     multiLinks: StrMap Bool,
     targetArch: String,
+    targetOs: String,
     ptrSize: Int
 ): Void = {
     let cur = cellNew(externNames);
@@ -4938,7 +4952,7 @@ def emitUserExternDeclares(
                             } else {
                                 match ed.extTy {
                                     TyArr(_, ps, ret) -> {
-                                        let (rTy, pTys) = cAbiDeclParamStrings(targetArch, ptrSize, ps, ret);
+                                        let (rTy, pTys) = cAbiDeclParamStrings(targetArch, targetOs, ptrSize, ps, ret);
                                         bufPushStr(out, "declare ");
                                         bufPushStr(out, rTy);
                                         bufPushByte(out, 32);
@@ -5102,10 +5116,11 @@ def emitNativeCustomBootFunctions(
     }
 }
 
-pub def emitProgramLlvmIrForArchDebug(
+pub def emitProgramLlvmIrForTargetDebug(
     prog: CoreProgram,
     isWasm: Bool,
     targetArch: String,
+    targetOs: String,
     exports: List String,
     noMain: Bool,
     bootSymOpt: Option String,
@@ -5287,6 +5302,7 @@ pub def emitProgramLlvmIrForArchDebug(
         mcEscape: prog.coreEscape,
         mcIsWasm: isWasm,
         mcTargetArch: targetArch,
+        mcTargetOs: targetOs,
         mcPtrSize: if (isWasm) 4 else 8,
         mcWasmExports: exportMap,
         mcHasExplicitExports: hasExplicit,
@@ -5384,7 +5400,7 @@ pub def emitProgramLlvmIrForArchDebug(
     bufPushBuf(out, globalsBuf);
     let declaredSyms: StrMap Bool = strMapNew();
     emitRuntimeDeclares(out, declaredSyms, prog.coreFns, isWasm);
-    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames, multiLinks, targetArch, if (isWasm) 4 else 8);
+    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames, multiLinks, targetArch, targetOs, if (isWasm) 4 else 8);
 
     if (bufLen(mctx.mcStrDecls) > 0) {
         bufPushBuf(out, mctx.mcStrDecls);
@@ -5408,6 +5424,30 @@ pub def emitProgramLlvmIrForArchDebug(
     } else ();
     bufToString(out)
 }
+
+pub def emitProgramLlvmIrForTarget(
+    prog: CoreProgram,
+    isWasm: Bool,
+    targetArch: String,
+    targetOs: String,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): String =
+    emitProgramLlvmIrForTargetDebug(prog, isWasm, targetArch, targetOs, exports, noMain, bootSymOpt, false)
+
+pub def emitProgramLlvmIrForArchDebug(
+    prog: CoreProgram,
+    isWasm: Bool,
+    targetArch: String,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String,
+    debugInfo: Bool
+): String =
+    emitProgramLlvmIrForTargetDebug(
+        prog, isWasm, targetArch, if (isWasm) "wasm" else "posix", exports, noMain, bootSymOpt, debugInfo
+    )
 
 pub def emitProgramLlvmIrForArch(
     prog: CoreProgram,

@@ -23,6 +23,7 @@ void gc_thread_attach(void *stack_anchor);
 void gc_thread_detach(void);
 void gc_safepoint_slow(void);
 void gc_enter_blocking(void *jmp_buf_on_stack);
+void gc_enter_blocking_capture(void);
 void gc_leave_blocking(void);
 
 /* Allocation APIs */

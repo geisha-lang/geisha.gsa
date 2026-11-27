@@ -649,6 +649,11 @@ int64_t gs_sys_rand_seed(void)
     return (int64_t)gs_wasm_seed_counter;
 }
 
+const char *gs_sys_host_os(void)
+{
+    return "wasm";
+}
+
 /* ---- Runtime traps ---- */
 
 void gs_match_fail(void) { __builtin_trap(); }
