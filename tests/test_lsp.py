@@ -467,6 +467,49 @@ def main() -> int:
         b_clean = client.wait_diag_for(b_uri)
         assert b_clean == [], f"expected dependency error attributed to a.gsa rather than b.gsa, got: {b_clean}"
 
+        # 11d. Directory symlink project: unsaved overlay still hits canonical path & preserves client symlink URI
+        real_proj = root / "real_sym_proj"
+        (real_proj / "src").mkdir(parents=True)
+        (real_proj / "geisha.toml").write_text('name = "sym_proj"\nversion = "0.1.0"\n', encoding="utf-8")
+        (real_proj / "src" / "dep.gsa").write_text("pub def msg(): Int = 1\n", encoding="utf-8")
+        app_src = "use dep.msg\n\ndef main(): Void = {\n    let s: String = msg();\n    ()\n}\n"
+        (real_proj / "src" / "app.gsa").write_text(app_src, encoding="utf-8")
+        link_proj = root / "link_sym_proj"
+        os.symlink(real_proj, link_proj)
+        # Deliberately construct non-resolved symlink URIs (just like VS Code opening a symlinked folder)
+        dep_link_uri = "file://" + str(link_proj / "src" / "dep.gsa")
+        app_link_uri = "file://" + str(link_proj / "src" / "app.gsa")
+
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": dep_link_uri, "languageId": "geisha", "version": 1, "text": "pub def msg(): Int = 1\n"},
+        })
+        assert client.wait_diag_for(dep_link_uri) == []
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": app_link_uri, "languageId": "geisha", "version": 1, "text": app_src},
+        })
+        app_init = client.wait_diag_for(app_link_uri)
+        assert len(app_init) == 1 and "Int" in app_init[0]["message"], f"expected Int/String error via symlink, got: {app_init}"
+
+        # Unsaved edit via symlink URI updates canonical overlay -> app.gsa via symlink clears!
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": dep_link_uri, "version": 2},
+            "contentChanges": [{"text": "pub def msg(): String = \"ok\"\n"}],
+        })
+        assert client.wait_diag_for(dep_link_uri) == []
+        assert client.wait_diag_for(app_link_uri) == [], "expected symlinked app.gsa to clear via canonicalized overlay"
+
+        # Unsaved error in symlinked dep.gsa -> diagnostic preserves client's symlink URI
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": dep_link_uri, "version": 3},
+            "contentChanges": [{"text": "pub def msg(): String = 123\n"}],
+        })
+        dep_link_err = client.wait_diag_for(dep_link_uri)
+        assert len(dep_link_err) == 1 and dep_link_err[0]["range"]["start"]["line"] == 0, f"expected error on symlink URI {dep_link_uri}: {dep_link_err}"
+        assert client.wait_diag_for(app_link_uri) == []
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

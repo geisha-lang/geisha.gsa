@@ -13,7 +13,7 @@ use std.result.{Result, Ok, Err}
 use std.list.{listRev, listAppend, listLen}
 use std.control.{fmap}
 use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
-use std.path.{pathJoin, pathStem, pathDirname}
+use std.path.{pathJoin, pathStem, pathDirname, pathBasename}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains, strMapRemove}
 use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
@@ -77,6 +77,9 @@ def defaultRootPkg(srcRoots: List String): PkgSpec = MkPkgSpec {
 // Optional In-Memory Source Overlays (used by `geisha lsp` for unsaved buffers)
 // ============================================================================
 
+extern "realpath" def c_loader_realpath(path: String, resolved: Ptr): Ptr
+extern "free" def c_loader_free(p: Ptr): Void
+
 def gLoaderOverlays: Cell (StrMap String) = cellNew(strMapNew())
 
 def normalizeOverlayPath(path: String): String = {
@@ -112,22 +115,42 @@ def normalizeOverlayPath(path: String): String = {
     bufToString(b)
 }
 
+def resolveRealPathRec(p: String): String = {
+    let rp = c_loader_realpath(p, ptrNull());
+    if (!ptrIsNull(rp)) {
+        let b = bufNew();
+        bufPushStr(b, ptrToString(rp));
+        let res = bufToString(b);
+        c_loader_free(rp);
+        res
+    } else {
+        let parent = pathDirname(p);
+        let base = pathBasename(p);
+        if (parent != p && parent != "" && parent != "." && parent != "/") {
+            pathJoin(resolveRealPathRec(parent), base)
+        } else p
+    }
+}
+
+pub def loaderCanonicalPath(path: String): String =
+    normalizeOverlayPath(resolveRealPathRec(path))
+
 pub def loaderClearOverlays(): Void =
     cellSet(gLoaderOverlays, strMapNew())
 
 pub def loaderSetOverlay(path: String, src: String): Void =
-    strMapInsert(cellGet(gLoaderOverlays), normalizeOverlayPath(path), src)
+    strMapInsert(cellGet(gLoaderOverlays), loaderCanonicalPath(path), src)
 
 pub def loaderRemoveOverlay(path: String): Void = {
-    let _ = strMapRemove(cellGet(gLoaderOverlays), normalizeOverlayPath(path));
+    let _ = strMapRemove(cellGet(gLoaderOverlays), loaderCanonicalPath(path));
     ()
 }
 
 def overlayFileExists(path: String): Bool =
-    strMapContains(cellGet(gLoaderOverlays), normalizeOverlayPath(path)) || fileExists(path)
+    strMapContains(cellGet(gLoaderOverlays), loaderCanonicalPath(path)) || fileExists(path)
 
 def overlayReadFile(path: String): Result String String =
-    match strMapGet(cellGet(gLoaderOverlays), normalizeOverlayPath(path)) {
+    match strMapGet(cellGet(gLoaderOverlays), loaderCanonicalPath(path)) {
         Some(src) -> Ok(src),
         None -> readFile(path),
     }

@@ -41,7 +41,7 @@ use diag.{
 use parser.parseFileModuleInFile
 use loader.{
     PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed,
-    loaderSetOverlay, loaderRemoveOverlay
+    loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay
 }
 use infer.{InferOutput, inferProgram, preludePrimSpecs}
 use core.lowerToCore
@@ -461,11 +461,18 @@ data DocState {
 data ServerState {
     MkServerState {
         ssDocs: StrMap DocState,
+        ssCanonToUri: StrMap String,
         ssOpenUris: Cell (List String),
         ssShuttingDown: Cell Bool,
         ssRootDir: Cell (Option String),
     },
 }
+
+def resolveClientUriForPath(ss: ServerState, path: String): String =
+    match strMapGet(ss.ssCanonToUri, loaderCanonicalPath(path)) {
+        Some(clientUri) -> clientUri,
+        None -> pathToUri(path),
+    }
 
 def trackOpenUri(ss: ServerState, uri: String): Void = {
     let cur = cellGet(ss.ssOpenUris);
@@ -538,15 +545,16 @@ def getSourceFileFromVec(files: Vec SourceFile, fileId: Int): Option SourceFile 
     if (fileId <= 0 || fileId > vecLen(files)) None
     else Some(vecGetOr(files, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
 
-def buildDiagWithTarget(docUri: String, docPath: String, docText: String, errMsg: String, files: Vec SourceFile): (String, Value) =
+def buildDiagWithTarget(ss: ServerState, docUri: String, docPath: String, docText: String, errMsg: String, files: Vec SourceFile): (String, Value) =
     match diagLastError() {
         Some(rec) -> {
             let fullMsg = match rec.drHint {
                 Some(h) -> rec.drMsg + "\nhint: " + h,
                 None -> rec.drMsg,
             };
+            let docCanon = loaderCanonicalPath(docPath);
             match getSourceFileFromVec(files, rec.drFileId) {
-                Some(sf) if (sf.sfPath == docPath) ->
+                Some(sf) if (sf.sfPath == docPath || loaderCanonicalPath(sf.sfPath) == docCanon) ->
                     (docUri, VObj([
                         ("range", makeLspRange(docText, rec.drStart, rec.drEnd)),
                         ("severity", VInt(intToI64(1))),
@@ -555,7 +563,7 @@ def buildDiagWithTarget(docUri: String, docPath: String, docText: String, errMsg
                         ("message", VStr(fullMsg)),
                     ])),
                 Some(sf) if (strLen(sf.sfPath) > 0 && (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath))) ->
-                    (pathToUri(sf.sfPath), VObj([
+                    (resolveClientUriForPath(ss, sf.sfPath), VObj([
                         ("range", makeLspRange(sf.sfContent, rec.drStart, rec.drEnd)),
                         ("severity", VInt(intToI64(1))),
                         ("code", VStr(rec.drKind)),
@@ -658,7 +666,7 @@ def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): 
             ]))
         },
         Err(errMsg) -> {
-            let (targetUri, diagObj) = buildDiagWithTarget(uri, path, text, errMsg, filesSnap);
+            let (targetUri, diagObj) = buildDiagWithTarget(ss, uri, path, text, errMsg, filesSnap);
             let foreignOpt = if (targetUri != uri) Some(targetUri) else None;
             clearStaleForeignDiag(prevDocOpt, uri, foreignOpt);
             let keepInf = match prevDocOpt {
@@ -715,6 +723,7 @@ def refreshOtherOpenDocs(ss: ServerState, skipUri: String): Void = {
 
 def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int): Void = {
     let path = uriToPath(uri);
+    strMapInsert(ss.ssCanonToUri, loaderCanonicalPath(path), uri);
     loaderSetOverlay(path, text);
     trackOpenUri(ss, uri);
     analyzeSingleDoc(ss, uri, text, version);
@@ -2059,8 +2068,10 @@ def handleDidClose(ss: ServerState, params: Value): Void =
         Some(td) -> match objGetStr(td, "uri") {
             Some(uri) -> {
                 let prevOpt = strMapGet(ss.ssDocs, uri);
+                let path = uriToPath(uri);
                 clearStaleForeignDiag(prevOpt, uri, None);
-                loaderRemoveOverlay(uriToPath(uri));
+                let _ = strMapRemove(ss.ssCanonToUri, loaderCanonicalPath(path));
+                loaderRemoveOverlay(path);
                 untrackOpenUri(ss, uri);
                 let _ = strMapRemove(ss.ssDocs, uri);
                 sendRpcNotification("textDocument/publishDiagnostics", VObj([
@@ -2102,6 +2113,7 @@ pub def cmdLsp(args: List String): Result Int String = {
     validateLspArgs(args)?;
     let ss = MkServerState {
         ssDocs: strMapNew(),
+        ssCanonToUri: strMapNew(),
         ssOpenUris: cellNew(Nil),
         ssShuttingDown: cellNew(false),
         ssRootDir: cellNew(None),
