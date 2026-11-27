@@ -17,6 +17,7 @@ use parser.parseFileModuleInFile
 use pkg.findProjectRoot
 
 extern "gs_sys_write_atomic" def c_fmt_write_atomic(path: String, buf: String, len: Int64, mode: Int): Int
+extern "gs_sys_is_symlink" def c_fmt_is_symlink(path: String): Int
 
 def writeFileAtomicSafe(path: String, content: String): Result Void String =
     if (c_fmt_write_atomic(path, content, intToI64(strLen(content)), -1) == 0) Ok(())
@@ -731,7 +732,11 @@ def formatLineTokens(
                     FtComma -> false,
                     FtSemi -> false,
                     FtDot -> false,
-                    FtQuestion -> false,
+                    FtQuestion -> match prev.kind {
+                        FtQuestion -> true,
+                        FtSym -> true,
+                        _ -> false,
+                    },
                     FtRParen -> false,
                     FtRBracket -> false,
                     FtRBrace -> match prev.kind {
@@ -786,7 +791,7 @@ def formatLineTokens(
                     },
                     FtSym ->
                         if (cur.raw == ":") {
-                            curIsHeaderColon
+                            curIsHeaderColon || match prev.kind { FtQuestion -> true, _ -> false }
                         } else if (cur.raw == "*" && match prev.kind { FtDot -> true, _ -> false }) {
                             false
                         } else match prev.kind {
@@ -1182,29 +1187,36 @@ def shouldSkipDirName(name: String): Bool =
     || name == "target"
     || name == "node_modules"
 
-def collectGsaFilesRec(dir: String, out: Cell (List String)): Void =
-    match readDir(dir) {
-        Err(_) -> (),
-        Ok(entries) -> {
-            let cur = cellNew(entries);
-            while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                match cellGet(cur) {
-                    Cons(name, r) -> {
-                        if (!shouldSkipDirName(name)) {
-                            let full = if (dir == ".") name else pathJoin(dir, name);
-                            if (isDir(full)) {
-                                collectGsaFilesRec(full, out)
-                            } else if (strEndsWith(name, ".gsa")) {
-                                cellSet(out, Cons(full, cellGet(out)))
-                            } else ()
-                        } else ();
-                        cellSet(cur, r)
-                    },
-                    Nil -> (),
-                }
-            }
-        },
+def collectGsaFilesRec(dir: String, out: Cell (List String)): Result Void String = {
+    let entries = readDir(dir)?;
+    let cur = cellNew(entries);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(name, r) -> {
+                if (!shouldSkipDirName(name)) {
+                    let full = if (dir == ".") name else pathJoin(dir, name);
+                    if (c_fmt_is_symlink(full) != 0) {
+                        ()
+                    } else if (isDir(full)) {
+                        match collectGsaFilesRec(full, out) {
+                            Ok(_) -> (),
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                        }
+                    } else if (strEndsWith(name, ".gsa")) {
+                        cellSet(out, Cons(full, cellGet(out)))
+                    } else ()
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
     }
+}
 
 def collectTargetFiles(paths: List String): Result (List String) String = {
     let acc: Cell (List String) = cellNew(Nil);
@@ -1214,7 +1226,7 @@ def collectTargetFiles(paths: List String): Result (List String) String = {
                 Some(d) -> d,
                 None -> ".",
             };
-            collectGsaFilesRec(root, acc);
+            collectGsaFilesRec(root, acc)?;
             Ok(sortUniqueStrings(cellGet(acc)))
         },
         _ -> {
@@ -1224,7 +1236,10 @@ def collectTargetFiles(paths: List String): Result (List String) String = {
                 match cellGet(cur) {
                     Cons(p, r) -> {
                         if (isDir(p)) {
-                            collectGsaFilesRec(p, acc)
+                            match collectGsaFilesRec(p, acc) {
+                                Ok(_) -> (),
+                                Err(e) -> cellSet(errOpt, Some(e)),
+                            }
                         } else if (fileExists(p)) {
                             cellSet(acc, Cons(p, cellGet(acc)))
                         } else {
@@ -1249,7 +1264,12 @@ def formatOneFile(path: String): Result (String, String) String = {
     let fid = diagRegisterFile(path, src);
     let _ = parseFileModuleInFile(src, Nil, fid)?;
     let formatted = formatSource(src);
-    Ok((src, formatted))
+    diagReset();
+    let fid2 = diagRegisterFile(path, formatted);
+    match parseFileModuleInFile(formatted, Nil, fid2) {
+        Ok(_) -> Ok((src, formatted)),
+        Err(e) -> Err("internal formatter error: formatted output for '" + path + "' failed to parse:\n" + e),
+    }
 }
 
 pub def cmdFmt(args: List String): Result Int String = {
