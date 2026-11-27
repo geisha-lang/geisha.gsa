@@ -23,7 +23,7 @@ use loader.{
 }
 use infer.inferProgram
 use core.{lowerToCore, lowerToCoreOpt, lowerToCoreMode, lowerToCoreOptMode, lowerToCoreForCheck}
-use core_dump.dumpCoreProgramSExpr
+use core_dump.{dumpCoreProgramSExpr, dumpCoreProgramSExprWithRoots}
 use codegen.{CguIr, MkCguIr, emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForTarget, emitProgramLlvmIrForTargetDebug, emitProgramLlvmIrCgusForTargetDebug}
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
 use codegen_wasmgc.{emitProgramWasmGc, writeWasmGcBinary, emitProgramWasmGcGlue, emitProgramWasmGcDts}
@@ -31,7 +31,7 @@ use doc.cmdDoc
 use bench.cmdBench
 use fmt.cmdFmt
 use lsp.cmdLsp
-use verify.verifyCoreProgram
+use verify.{verifyCoreProgram, collectUserVerifyFnNames}
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
@@ -1116,7 +1116,8 @@ def loadAndVerifyProgram(
     let coreProg = lowerToCoreMode(inf, "keep")?;
     match opts.optDumpCore {
         Some(dumpPath) -> {
-            let sexp = dumpCoreProgramSExpr(coreProg)?;
+            let userRoots = collectUserVerifyFnNames(coreProg, entryFile, scopeDir);
+            let sexp = dumpCoreProgramSExprWithRoots(coreProg, userRoots)?;
             writeFile(dumpPath, sexp)?
         },
         None -> (),

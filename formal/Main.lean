@@ -23,8 +23,45 @@ def main (args : List String) : IO UInt32 := do
       | .error err =>
         IO.eprintln s!"VCG ERROR ({path}): {err}"
         return 1
-      | .ok msg =>
-        IO.println s!"{msg}: {path}"
+      | .ok (fnCount, obs) =>
+        let mut closedProved : Nat := 0
+        let mut smtProved : Nat := 0
+        for (fnName, ob) in obs do
+          if !sformHasSym ob then
+            match evalSFormClosed ob with
+            | some true => closedProved := closedProved + 1
+            | some false =>
+              IO.eprintln s!"VCG REFUTED (Lean kernel) in '{fnName}': obligation evaluated to false"
+              return 1
+            | none =>
+              IO.eprintln s!"VCG UNKNOWN (Lean kernel) in '{fnName}': closed obligation could not be decided"
+              return 1
+          else
+            match emitObSmt2 ob with
+            | none =>
+              IO.eprintln s!"VCG FAIL-CLOSED in '{fnName}': obligation could not be exported to SMT-LIB2"
+              return 1
+            | some smtScript =>
+              let child ← IO.Process.spawn {
+                cmd := "z3"
+                args := #["-in"]
+                stdin := .piped
+                stdout := .piped
+                stderr := .piped
+              }
+              let (stdin, child) ← child.takeStdin
+              stdin.putStr smtScript
+              stdin.flush
+              let stdout ← child.stdout.readToEnd
+              let stderr ← child.stderr.readToEnd
+              let exitCode ← child.wait
+              let firstLine := (stdout.splitOn "\n").headD "" |>.trimAscii.toString
+              if exitCode == 0 && firstLine == "unsat" then
+                smtProved := smtProved + 1
+              else
+                IO.eprintln s!"VCG REFUTED/UNKNOWN (Z3: '{firstLine}', exit {exitCode}) in '{fnName}': {stderr.trimAscii.toString}"
+                return 1
+        IO.println s!"VERIFIED VCG GSCORE OK ({fnCount} functions, {obs.length} VCs proved: {closedProved} in Lean kernel, {smtProved} via Z3): {path}"
         return 0
   | [path] =>
     let src ← IO.FS.readFile path

@@ -490,17 +490,12 @@ def main(): Void = {
     ()
 }
 EOF
-if command -v z3 >/dev/null 2>&1; then
-    "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_pos.gscore" "$TMP_DIR/vcg_pos.gsa" >/dev/null
-else
-    "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_pos.gscore" "$TMP_DIR/vcg_pos.gsa" >/dev/null 2>&1 || true
-    test -s "$TMP_DIR/vcg_pos.gscore"
-fi
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_pos.gscore" "$TMP_DIR/vcg_pos.gsa" >/dev/null
 "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_pos.gscore"
 
 cat > "$TMP_DIR/vcg_neg_float.gsa" << 'EOF'
 def cmpFloat(x: Float, y: Float): Bool = x == y
-def main(): Void = { let _ = cmpFloat(1.0, 1.0); () }
+def main(): Void = ()
 EOF
 "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_neg_float.gscore" "$TMP_DIR/vcg_neg_float.gsa" >/dev/null 2>&1 || true
 test -s "$TMP_DIR/vcg_neg_float.gscore"
@@ -517,7 +512,7 @@ def unannotatedLoop(n: Int): Int = {
     };
     cellGet(i)
 }
-def main(): Void = { let _ = unannotatedLoop(3); () }
+def main(): Void = ()
 EOF
 "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_neg_while.gscore" "$TMP_DIR/vcg_neg_while.gsa" >/dev/null 2>&1 || true
 test -s "$TMP_DIR/vcg_neg_while.gscore"
@@ -525,4 +520,53 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_neg_while.gscore" 2>/dev/null; then
     echo "FAIL [vcg_cross_neg_while]: Lean VCG accepted unannotated while loop!" >&2
     exit 1
 fi
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed negative)"
+
+# R2 + R5: Modeled but contract-violating programs (even uncalled by `main`) MUST be rejected by BOTH `geisha verify` AND `geisha-check --verify-vcg`!
+cat > "$TMP_DIR/vcg_bad_ens.gsa" << 'EOF'
+def badEns(x: Int): Int
+    ensures r -> r != 7
+= x
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_bad_ens.gscore" "$TMP_DIR/vcg_bad_ens.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_cross_bad_ens_compiler]: geisha verify accepted violated ensures!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_bad_ens.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bad_ens.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_bad_ens_lean]: Lean geisha-check --verify-vcg accepted violated ensures!" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/vcg_div_zero.gsa" << 'EOF'
+def divZero(): Int = 1 / 0
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_div_zero.gscore" "$TMP_DIR/vcg_div_zero.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_cross_div_zero_compiler]: geisha verify accepted 1 / 0!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_div_zero.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_div_zero.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_div_zero_lean]: Lean geisha-check --verify-vcg accepted 1 / 0!" >&2
+    exit 1
+fi
+
+cat > "$TMP_DIR/vcg_zero_bad_inv.gsa" << 'EOF'
+def zeroBadInv(): Void = {
+    while (false)
+        invariant false
+    { () }
+}
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_zero_bad_inv.gscore" "$TMP_DIR/vcg_zero_bad_inv.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_cross_zero_inv_compiler]: geisha verify accepted entry invariant false!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_zero_bad_inv.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_zero_bad_inv.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_cross_zero_inv_lean]: Lean geisha-check --verify-vcg accepted entry invariant false!" >&2
+    exit 1
+fi
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv)"

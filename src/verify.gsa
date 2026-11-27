@@ -510,7 +510,7 @@ def canReachFn(graph: StrMap (List String), start: String, target: String): Bool
 // ============================================================================
 
 def bindPatEffectVars(pat: Pattern, stVars: List (String, String)): List (String, String) = match pat {
-    PatVar(vn) -> assocSet(stVars, vn, "__pat_" + vn),
+    PatVar(vn) -> assocSet(stVars, vn, "__may_alias"),
     PatCtor(_, subPats) -> bindPatEffectVarsList(subPats, stVars),
     PatStruct(_, namedPats) -> {
         let cur = cellNew(namedPats);
@@ -545,6 +545,7 @@ def scanEffectsInTerm(
             match args {
                 Cons(cArg, _) -> match cArg.tnode {
                     TmVar(cn) -> match assocGet(stVars, cn) {
+                        Some("__may_alias") -> cellSet(hasOpaqueCall, true),
                         Some(loc) -> cellSet(modCells, addUnique(cellGet(modCells), loc)),
                         None -> cellSet(hasOpaqueCall, true),
                     },
@@ -556,6 +557,7 @@ def scanEffectsInTerm(
             match args {
                 Cons(aArg, _) -> match aArg.tnode {
                     TmVar(an) -> match assocGet(stVars, an) {
+                        Some("__may_alias") -> cellSet(hasOpaqueCall, true),
                         Some(loc) -> cellSet(modArrs, addUnique(cellGet(modArrs), loc)),
                         None -> cellSet(hasOpaqueCall, true),
                     },
@@ -608,13 +610,17 @@ def scanEffectsInTerm(
     TmUn(_, e) -> scanEffectsInTerm(e, stVars, modCells, modArrs, hasOpaqueCall),
     TmLet(vd, v, b) -> {
         scanEffectsInTerm(v, stVars, modCells, modArrs, hasOpaqueCall);
-        // S4: Propagate alias when `let alias = outerCellOrArr`, otherwise shadow outer name
+        // S4 & R3: Propagate direct `TmVar` alias; only fresh `cellNew`/`arrayNew`/`arrayNewZeroed`
+        // allocations are disjoint (`__fresh_`); any other expression (e.g. `if (b) c1 else c2`)
+        // may alias an outer mutable location and is bound to `__may_alias`.
         let innerVars = match v.tnode {
             TmVar(srcName) -> match assocGet(stVars, srcName) {
                 Some(loc) -> assocSet(stVars, vd.vname, loc),
-                None -> assocSet(stVars, vd.vname, "__local_" + vd.vname),
+                None -> assocSet(stVars, vd.vname, "__may_alias"),
             },
-            _ -> assocSet(stVars, vd.vname, "__local_" + vd.vname),
+            TmApplyDir(avd, _) if (avd.vname == "cellNew" || avd.vname == "arrayNew" || avd.vname == "arrayNewZeroed") ->
+                assocSet(stVars, vd.vname, "__fresh_" + vd.vname),
+            _ -> assocSet(stVars, vd.vname, "__may_alias"),
         };
         scanEffectsInTerm(b, innerVars, modCells, modArrs, hasOpaqueCall)
     },
@@ -2993,6 +2999,27 @@ def isUserFnToVerify(fd: FunDef, entryFile: String, scopeDir: String): Bool =
             else true,
         None -> false,
     }
+
+pub def collectUserVerifyFnNames(prog: CoreProgram, entryFile: String, scopeDir: String): List String = {
+    let outRev: Cell (List String) = cellNew(Nil);
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(nm, r) -> {
+                match strMapGet(prog.coreFns, nm) {
+                    Some(fd) ->
+                        if (isUserFnToVerify(fd, entryFile, scopeDir)) {
+                            cellSet(outRev, Cons(nm, cellGet(outRev)))
+                        } else (),
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(outRev))
+}
 
 pub def verifyCoreProgram(
     prog: CoreProgram,

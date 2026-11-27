@@ -704,6 +704,41 @@ def main() -> int:
                 "= if (n <= 0) 0 else negDec(n - 1)\n"
                 "def main() = ()\n",
             ),
+            (
+                "r3_while_indirect_if_alias",
+                "def indirectAlias(n: Int): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let i = cellNew(0);\n"
+                "    while (cellGet(i) < n)\n"
+                "        invariant cellGet(i) >= 0\n"
+                "    {\n"
+                "        let alias = if (true) c else c;\n"
+                "        cellSet(alias, 99);\n"
+                "        cellSet(i, cellGet(i) + 1)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
+            (
+                "r3_while_match_pat_alias",
+                "use std.option.{Option, Some, None}\n"
+                "def patAlias(n: Int): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let i = cellNew(0);\n"
+                "    while (cellGet(i) < n)\n"
+                "        invariant cellGet(i) >= 0\n"
+                "    {\n"
+                "        match Some(c) {\n"
+                "            Some(alias) -> cellSet(alias, 99),\n"
+                "            None -> (),\n"
+                "        };\n"
+                "        cellSet(i, cellGet(i) + 1)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 0)\n"
+                "}\n"
+                "def main() = ()\n",
+            ),
         ]
         for name, code in a_adv_cases:
             f = tmp / f"{name}.gsa"
