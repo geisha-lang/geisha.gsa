@@ -1063,6 +1063,22 @@ def emitLlvmMemcpy(fctx: FnEmitCtx, dst: String, src: String, len64: String): Vo
 def emitLlvmMemmove(fctx: FnEmitCtx, dst: String, src: String, len64: String): Void =
     emitLine(fctx, "call void @llvm.memmove.p0.p0.i64(ptr " + dst + ", ptr " + src + ", i64 " + len64 + ", i1 false)")
 
+def emitLlvmMemsetZero(fctx: FnEmitCtx, dst: String, len64: String): Void =
+    emitLine(fctx, "call void @llvm.memset.p0.i64(ptr " + dst + ", i8 0, i64 " + len64 + ", i1 false)")
+
+def isAllZeroBitsTerm(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(LitInt(n)) -> n == 0,
+    TmLit(LitBool(b)) -> !b,
+    TmLit(LitChar(c)) -> (c & 255) == 0,
+    TmLit(LitFloat(f)) -> floatToBits64(f) == intToI64(0),
+    TmLit(LitUnit) -> true,
+    TmApplyDir(vd, Cons(arg, Nil)) ->
+        if (vd.vname == "intToI64" || vd.vname == "intToFloat" || vd.vname == "intToF32" || vd.vname == "floatToF32" || vd.vname == "intToChar" || vd.vname == "i64ToInt")
+            isAllZeroBitsTerm(arg)
+        else false,
+    _ -> false,
+}
+
 def isDefaultWasmExport(fnName: String): Bool = {
     let n = strLen(fnName);
     if (n == 0 || fnName == "main") false
@@ -2043,7 +2059,7 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
             OpMul -> emitAssign(fctx, "fmul double " + lhs + ", " + rhs),
             OpDiv -> emitAssign(fctx, "fdiv double " + lhs + ", " + rhs),
             OpEq -> emitAssign(fctx, "fcmp oeq double " + lhs + ", " + rhs),
-            OpNe -> emitAssign(fctx, "fcmp one double " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "fcmp une double " + lhs + ", " + rhs),
             OpLt -> emitAssign(fctx, "fcmp olt double " + lhs + ", " + rhs),
             OpLe -> emitAssign(fctx, "fcmp ole double " + lhs + ", " + rhs),
             OpGt -> emitAssign(fctx, "fcmp ogt double " + lhs + ", " + rhs),
@@ -2057,7 +2073,7 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
             OpMul -> emitAssign(fctx, "fmul float " + lhs + ", " + rhs),
             OpDiv -> emitAssign(fctx, "fdiv float " + lhs + ", " + rhs),
             OpEq -> emitAssign(fctx, "fcmp oeq float " + lhs + ", " + rhs),
-            OpNe -> emitAssign(fctx, "fcmp one float " + lhs + ", " + rhs),
+            OpNe -> emitAssign(fctx, "fcmp une float " + lhs + ", " + rhs),
             OpLt -> emitAssign(fctx, "fcmp olt float " + lhs + ", " + rhs),
             OpLe -> emitAssign(fctx, "fcmp ole float " + lhs + ", " + rhs),
             OpGt -> emitAssign(fctx, "fcmp ogt float " + lhs + ", " + rhs),
@@ -2272,45 +2288,89 @@ def tryEmitIntrinsic(
         let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
         let elemSz = if (rawSz < 1) 1 else rawSz;
 
-        let badBlk = appendBlock(fctx, "arr.bad_len");
-        let allocBlk = appendBlock(fctx, "arr.alloc");
-        let condBlk = appendBlock(fctx, "arr.init.cond");
-        let bodyBlk = appendBlock(fctx, "arr.init.body");
-        let doneBlk = appendBlock(fctx, "arr.init.done");
+        if (isNoscanElemType(elemTy) && isAllZeroBitsTerm(a1)) {
+            let badBlk = appendBlock(fctx, "arr.bad_len");
+            let allocBlk = appendBlock(fctx, "arr.alloc");
+            let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+            emitCondBr(fctx, isNeg, badBlk, allocBlk);
 
-        let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
-        emitCondBr(fctx, isNeg, badBlk, allocBlk);
+            setInsertBlock(fctx, badBlk);
+            emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+            emitTermLine(fctx, "unreachable");
 
-        setInsertBlock(fctx, badBlk);
-        emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
-        emitTermLine(fctx, "unreachable");
+            setInsertBlock(fctx, allocBlk);
+            let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+            let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+            let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+            if (mctx.mcIsWasm) {
+                let arrPtr = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + totalBytes + ")");
+                emitStore(fctx, "i64", len64, arrPtr);
+                let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+                emitLlvmMemsetZero(fctx, elemsBase, dataBytes);
+                Some(arrPtr)
+            } else {
+                let lgBlk = appendBlock(fctx, "arr.zero.large");
+                let smBlk = appendBlock(fctx, "arr.zero.small");
+                let doneBlk = appendBlock(fctx, "arr.zero.done");
+                let isLarge = emitAssign(fctx, "icmp ugt i64 " + totalBytes + ", 4088");
+                emitCondBr(fctx, isLarge, lgBlk, smBlk);
 
-        setInsertBlock(fctx, allocBlk);
-        let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
-        let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
-        let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
-        let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic_uninit" else "@gc_alloc";
-        let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
-        emitStore(fctx, "i64", len64, arrPtr);
-        let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
-        let idxSlot = emitEntryAlloca(fctx, "i64");
-        emitStore(fctx, "i64", "0", idxSlot);
-        emitBr(fctx, condBlk);
+                setInsertBlock(fctx, lgBlk);
+                let lgPtr = emitAssign(fctx, "call ptr @gc_alloc_atomic(i64 " + totalBytes + ")");
+                emitStore(fctx, "i64", len64, lgPtr);
+                emitBr(fctx, doneBlk);
 
-        setInsertBlock(fctx, condBlk);
-        let curIdx = emitLoad(fctx, "i64", idxSlot);
-        let more = emitAssign(fctx, "icmp slt i64 " + curIdx + ", " + len64);
-        emitCondBr(fctx, more, bodyBlk, doneBlk);
+                setInsertBlock(fctx, smBlk);
+                let smPtr = emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + totalBytes + ")");
+                emitStore(fctx, "i64", len64, smPtr);
+                let smElems = emitGep(fctx, "i8", smPtr, "8");
+                emitLlvmMemsetZero(fctx, smElems, dataBytes);
+                emitBr(fctx, doneBlk);
 
-        setInsertBlock(fctx, bodyBlk);
-        let slotPtr = emitGep(fctx, elemLlvm, elemsBase, curIdx);
-        emitStore(fctx, elemLlvm, initVal, slotPtr);
-        let nextIdx = emitAssign(fctx, "add i64 " + curIdx + ", 1");
-        emitStore(fctx, "i64", nextIdx, idxSlot);
-        emitBr(fctx, condBlk);
+                setInsertBlock(fctx, doneBlk);
+                Some(emitAssign(fctx, "phi ptr [ " + lgPtr + ", %" + blockLabel(fctx, lgBlk) + " ], [ " + smPtr + ", %" + blockLabel(fctx, smBlk) + " ]"))
+            }
+        } else {
+            let badBlk = appendBlock(fctx, "arr.bad_len");
+            let allocBlk = appendBlock(fctx, "arr.alloc");
+            let condBlk = appendBlock(fctx, "arr.init.cond");
+            let bodyBlk = appendBlock(fctx, "arr.init.body");
+            let doneBlk = appendBlock(fctx, "arr.init.done");
 
-        setInsertBlock(fctx, doneBlk);
-        Some(arrPtr)
+            let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+            emitCondBr(fctx, isNeg, badBlk, allocBlk);
+
+            setInsertBlock(fctx, badBlk);
+            emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+            emitTermLine(fctx, "unreachable");
+
+            setInsertBlock(fctx, allocBlk);
+            let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
+            let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
+            let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
+            let allocFn = if (isNoscanElemType(elemTy)) "@gc_alloc_atomic_uninit" else "@gc_alloc";
+            let arrPtr = emitAssign(fctx, "call ptr " + allocFn + "(i64 " + totalBytes + ")");
+            emitStore(fctx, "i64", len64, arrPtr);
+            let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
+            let idxSlot = emitEntryAlloca(fctx, "i64");
+            emitStore(fctx, "i64", "0", idxSlot);
+            emitBr(fctx, condBlk);
+
+            setInsertBlock(fctx, condBlk);
+            let curIdx = emitLoad(fctx, "i64", idxSlot);
+            let more = emitAssign(fctx, "icmp slt i64 " + curIdx + ", " + len64);
+            emitCondBr(fctx, more, bodyBlk, doneBlk);
+
+            setInsertBlock(fctx, bodyBlk);
+            let slotPtr = emitGep(fctx, elemLlvm, elemsBase, curIdx);
+            emitStore(fctx, elemLlvm, initVal, slotPtr);
+            let nextIdx = emitAssign(fctx, "add i64 " + curIdx + ", 1");
+            emitStore(fctx, "i64", nextIdx, idxSlot);
+            emitBr(fctx, condBlk);
+
+            setInsertBlock(fctx, doneBlk);
+            Some(arrPtr)
+        }
     } else if (name == "arrayNewZeroed") {
         let len32 = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let elemTy = match retTy {
@@ -4808,6 +4868,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg) nounwind"),
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
         ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
         ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),
@@ -4879,6 +4940,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
+        ("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg) nounwind"),
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
         ("llvm.ctpop.i64", "declare i64 @llvm.ctpop.i64(i64) nounwind willreturn memory(none)"),
         ("llvm.cttz.i32", "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind willreturn memory(none)"),

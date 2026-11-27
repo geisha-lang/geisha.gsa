@@ -373,18 +373,31 @@ def parseRadixInt64(digits: String, radix: Int): Result Int64 String = {
     else {
         let acc = cellNew(intToI64(0));
         let rad64 = intToI64(radix);
+        let maxI64 = (intToI64(2147483647) << 32) | ((intToI64(65535) << 16) | intToI64(65535));
+        let maxDiv = maxI64 / rad64;
+        let maxMod = maxI64 % rad64;
         let i = cellNew(0);
-        let ok = cellNew(true);
-        while (cellGet(i) < n && cellGet(ok)) {
+        let invalid = cellNew(false);
+        let overflow = cellNew(false);
+        while (cellGet(i) < n && !cellGet(invalid)) {
             let hv = hexVal(strByteAt(digits, cellGet(i)));
-            if (hv < 0 || hv >= radix) cellSet(ok, false)
+            if (hv < 0 || hv >= radix) cellSet(invalid, true)
             else {
-                cellSet(acc, cellGet(acc) * rad64 + intToI64(hv));
+                if (!cellGet(overflow)) {
+                    let d64 = intToI64(hv);
+                    let cur = cellGet(acc);
+                    if (cur > maxDiv || (cur == maxDiv && d64 > maxMod)) {
+                        cellSet(overflow, true)
+                    } else {
+                        cellSet(acc, cur * rad64 + d64)
+                    }
+                } else ();
                 cellSet(i, cellGet(i) + 1)
             }
         };
-        if (cellGet(ok)) Ok(cellGet(acc))
-        else Err("invalid radix integer: " + digits)
+        if (cellGet(invalid)) Err("invalid radix integer: " + digits)
+        else if (cellGet(overflow)) Err("integer overflow: " + digits)
+        else Ok(cellGet(acc))
     }
 }
 
@@ -869,7 +882,16 @@ def emitInlineValue(b: StringBuf, v: Value): Void = match v {
     VBool(true) -> bufPushStr(b, "true"),
     VBool(false) -> bufPushStr(b, "false"),
     VInt(n) -> bufPushStr(b, i64ToStr(n)),
-    VFloat(f) -> bufPushStr(b, floatToStr(f)),
+    VFloat(f) -> {
+        let bits = floatToBits64(f);
+        let expMask = (intToI64(2047)) << 52;
+        let fracMask = (intToI64(1) << 52) - intToI64(1);
+        if ((bits & expMask) == expMask && (bits & fracMask) != intToI64(0)) {
+            bufPushStr(b, "nan")
+        } else {
+            bufPushStr(b, floatToStr(f))
+        }
+    },
     VStr(s) -> emitTomlString(b, s),
     VArr(xs) -> {
         bufPushByte(b, 91);

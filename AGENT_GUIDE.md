@@ -147,9 +147,9 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.path` — host-OS-aware path manipulation (`isAbsPath`, `pathJoin`, `pathDirname`, `pathBasename`, `pathStem`, `pathWithExt`) plus explicit Windows-style `*Win` variants (`isAbsPathWin`, `pathJoinWin`, `pathDirnameWin`, `pathBasenameWin`, `pathStemWin`, `pathWithExtWin`)
 - `std.char` — ASCII/byte classification (`isDigitByte`, `isUpperByte`, `isLowerByte`, ...)
 - `std.buf` — mutable `StringBuf` (`bufNew`, `bufPushStr`, `bufPushByte`, `bufToString`)
-- `std.str` — string utilities (`intToStr`, `parseInt`, `parseFloat`, `strJoin`, `strSplitChar`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, ...)
+- `std.str` — string & numeric utilities (`intToStr`, `i64ToStr`, round-trip `floatToStr`, overflow-checked `parseInt` / `parseInt64`, `parseFloat`, `strJoin`, `strSplitChar`, `strStartsWith`, `strEndsWith`, `strIndexOfByte`, ...)
 - `std.vec` — growable `Vec a` (`vecNew`, `vecPush`, `vecLen`, `vecGetOr`, ...)
-- `std.map` — hash map `StrMap v` (`strMapNew`, `strMapGet`, `strMapInsert`, `strMapContains`, ...)
+- `std.map` — hash maps `StrMap v` & `IntMap v` (`strMapNew`, `strMapGet`, `strMapInsert`, `intMapNew`, `intMapGet`, `intMapInsert`, ...)
 - `std.sync` — mutexes, channels, atomics
 - `std.task` — structured concurrency tasks & parallel execution
 - `std.actor` — typed message-passing actors

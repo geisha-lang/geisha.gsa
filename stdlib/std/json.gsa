@@ -269,7 +269,14 @@ def parseNumber(p: Parser): Result Value String = {
             let raw = ptrSliceFromStr(p.src, start, endIdx - start);
             if (cellGet(isFloat)) {
                 match parseFloat(raw) {
-                    Ok(f) -> Ok(VFloat(f)),
+                    Ok(f) -> {
+                        let expMask = (intToI64(2047)) << 52;
+                        if ((floatToBits64(f) & expMask) == expMask) {
+                            Err("JSON number overflow: " + raw)
+                        } else {
+                            Ok(VFloat(f))
+                        }
+                    },
                     Err(e) -> Err(e),
                 }
             } else {
@@ -460,7 +467,11 @@ def emitValue(b: StringBuf, v: Value, pretty: Bool, indent: Int): Void = match v
     VBool(true) -> bufPushStr(b, "true"),
     VBool(false) -> bufPushStr(b, "false"),
     VInt(n) -> bufPushStr(b, i64ToStr(n)),
-    VFloat(f) -> bufPushStr(b, floatToStr(f)),
+    VFloat(f) -> {
+        let expMask = (intToI64(2047)) << 52;
+        if ((floatToBits64(f) & expMask) == expMask) bufPushStr(b, "null")
+        else bufPushStr(b, floatToStr(f))
+    },
     VStr(s) -> emitJsonString(b, s),
     VArr(Nil) -> bufPushStr(b, "[]"),
     VArr(xs) -> {
