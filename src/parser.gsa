@@ -21,6 +21,7 @@ use ast.{
     Form, MkForm, mkForm,
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, MkEnsuresClause, FnContract, MkFnContract, hasFnContract,
     FieldDecl, MkFieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
     FunDep, MkFunDep,
@@ -1056,8 +1057,32 @@ def parseAtomExpr(p: Parser): Result Form String = {
             }?;
             let cond = parseExpr(p)?;
             let _ = expectRParen(p)?;
-            let body = parseExpr(p)?;
-            Ok(mkForm(unionSpan(t.span, body.pos), ExWhile(cond, body)))
+            let invsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let decsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let moreClauses = cellNew(true);
+            while (cellGet(moreClauses)) {
+                match peekTok(p).kind {
+                    TkIdent(w) if (w == "invariant") -> {
+                        let kwTok = bumpTok(p);
+                        let invExpr = parseExpr(p)?;
+                        let callSp = unionSpan(kwTok.span, invExpr.pos);
+                        cellSet(invsRev, Cons((callSp, invExpr), cellGet(invsRev)))
+                    },
+                    TkIdent(w) if (w == "decreases") -> {
+                        let kwTok = bumpTok(p);
+                        let decExpr = parseExpr(p)?;
+                        let callSp = unionSpan(kwTok.span, decExpr.pos);
+                        cellSet(decsRev, Cons((callSp, decExpr), cellGet(decsRev)))
+                    },
+                    _ -> cellSet(moreClauses, false),
+                }
+            };
+            let rawBody = parseExpr(p)?;
+            let body = match (cellGet(invsRev), cellGet(decsRev)) {
+                (Nil, Nil) -> rawBody,
+                (ir, dr) -> mkForm(rawBody.pos, ExLoopContract(listRev(ir), listRev(dr), rawBody)),
+            };
+            Ok(mkForm(unionSpan(t.span, rawBody.pos), ExWhile(cond, body)))
         },
         TkLet -> {
             let _ = bumpTok(p);
@@ -1463,6 +1488,62 @@ def parseExternParam(p: Parser): Result Type String = {
     }
 }
 
+def parseFnContractClauses(p: Parser): Result FnContract String = {
+    let reqRev: Cell (List (Span, Form)) = cellNew(Nil);
+    let ensRev: Cell (List EnsuresClause) = cellNew(Nil);
+    let decRev: Cell (List (Span, Form)) = cellNew(Nil);
+    let moreSpecs = cellNew(true);
+    while (cellGet(moreSpecs)) {
+        match peekTok(p).kind {
+            TkIdent(w) if (w == "requires") -> {
+                let kwTok = bumpTok(p);
+                let reqExpr = parseExpr(p)?;
+                let callSp = unionSpan(kwTok.span, reqExpr.pos);
+                cellSet(reqRev, Cons((callSp, reqExpr), cellGet(reqRev)))
+            },
+            TkIdent(w) if (w == "ensures") -> {
+                let kwTok = bumpTok(p);
+                let bindOpt: Option String = match peekTok(p).kind {
+                    TkSym(s) if (s == "|") -> {
+                        let _ = bumpTok(p);
+                        let rname = parseIdent(p)?;
+                        let _ = expectSym(p, "|")?;
+                        Some(rname)
+                    },
+                    TkIdent(rname) -> match peekAt(p, 1).kind {
+                        TkSym(s) if (s == "->") -> {
+                            let _ = bumpTok(p);
+                            let _ = bumpTok(p);
+                            Some(rname)
+                        },
+                        _ -> None,
+                    },
+                    _ -> None,
+                };
+                let ensExpr = parseExpr(p)?;
+                let callSp = unionSpan(kwTok.span, ensExpr.pos);
+                cellSet(ensRev, Cons(MkEnsuresClause { ecBind: bindOpt, ecSpan: callSp, ecExpr: ensExpr }, cellGet(ensRev)))
+            },
+            TkIdent(w) if (w == "decreases") -> {
+                let kwTok = bumpTok(p);
+                let decExpr = parseExpr(p)?;
+                let callSp = unionSpan(kwTok.span, decExpr.pos);
+                cellSet(decRev, Cons((callSp, decExpr), cellGet(decRev)))
+            },
+            _ -> cellSet(moreSpecs, false),
+        }
+    };
+    Ok(MkFnContract {
+        fcRequires: listRev(cellGet(reqRev)),
+        fcEnsures: listRev(cellGet(ensRev)),
+        fcDecreases: listRev(cellGet(decRev)),
+    })
+}
+
+def wrapFnContractBody(fc: FnContract, rawBody: Form): Form =
+    if (!hasFnContract(fc)) rawBody
+    else mkForm(rawBody.pos, ExContract(fc, rawBody))
+
 def parseFormDefBody(p: Parser, vis: Visibility, startSp: Span): Result Def String = {
     let _ = bumpTok(p); // consume `def`
     let name = parseCallableIdent(p)?;
@@ -1472,15 +1553,17 @@ def parseFormDefBody(p: Parser, vis: Visibility, startSp: Span): Result Def Stri
             let ps = parseParamSeq(p)?;
             let _ = expectRParen(p)?;
             let retScmOpt: Option Scheme = if (eatSym(p, ":")) Some(parseTypeScheme(p)?) else None;
+            let fc = parseFnContractClauses(p)?;
             let _ = expectSym(p, "=")?;
-            let body = parseExpr(p)?;
+            let rawBody = parseExpr(p)?;
+            let body = wrapFnContractBody(fc, rawBody);
             let (retTy, fnScmAnn) = match retScmOpt {
                 Some(ScmMono(t)) -> (Some(t), None),
                 Some(poly) -> (None, Some(poly)),
                 None -> (None, None),
             };
-            let fullSp = unionSpan(startSp, body.pos);
-            let form = MkForm { pos: body.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
+            let fullSp = unionSpan(startSp, rawBody.pos);
+            let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
             Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: Nil, item: ItForm(form) })
         },
         _ -> {
@@ -1612,7 +1695,7 @@ def parseDataDefBody(p: Parser, vis: Visibility, startSp: Span, attrs: List DefA
     Ok(MkDef { ident: dname, dpos: fullSp, vis: vis, attrs: attrs, item: ItAlg(tparams, cellGet(variants)) })
 }
 
-def tryParseExternExportHeader(p: Parser): Option (String, List VarDecl, Option Scheme) = {
+def tryParseExternExportHeader(p: Parser): Option (String, List VarDecl, Option Scheme, FnContract) = {
     let snap = savePos(p);
     match peekTok(p).kind {
         TkDef -> {
@@ -1636,9 +1719,12 @@ def tryParseExternExportHeader(p: Parser): Option (String, List VarDecl, Option 
                                         } else Ok(None);
                                     match retRes {
                                         Err(_) -> { restorePos(p, snap); None },
-                                        Ok(retScmOpt) ->
-                                            if (eatSym(p, "=")) Some((name, ps, retScmOpt))
-                                            else { restorePos(p, snap); None },
+                                        Ok(retScmOpt) -> match parseFnContractClauses(p) {
+                                            Err(_) -> { restorePos(p, snap); None },
+                                            Ok(fc) ->
+                                                if (eatSym(p, "=")) Some((name, ps, retScmOpt, fc))
+                                                else { restorePos(p, snap); None },
+                                        },
                                     }
                                 },
                             },
@@ -1759,15 +1845,16 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                 if (!cellGet(isNoAlloc) && !cellGet(isFnPtr)) tryParseExternExportHeader(p)
                                 else None;
                             match exportHdrOpt {
-                                Some((name, ps, retScmOpt)) -> {
-                                    let body = parseExpr(p)?;
+                                Some((name, ps, retScmOpt, fc)) -> {
+                                    let rawBody = parseExpr(p)?;
+                                    let body = wrapFnContractBody(fc, rawBody);
                                     let (retTy, fnScmAnn) = match retScmOpt {
                                         Some(ScmMono(t)) -> (Some(t), None),
                                         Some(poly) -> (None, Some(poly)),
                                         None -> (None, None),
                                     };
-                                    let fullSp = unionSpan(startSp, body.pos);
-                                    let form = MkForm { pos: body.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
+                                    let fullSp = unionSpan(startSp, rawBody.pos);
+                                    let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
                                     Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: [AttrExport(linkOpt)], item: ItForm(form) })
                                 },
                                 None -> {
@@ -1896,9 +1983,11 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                                         let mps = parseParamSeq(p)?;
                                         let _ = expectRParen(p)?;
                                         let mret = if (eatSym(p, ":")) Some(parseTypeExpr(p)?) else None;
+                                        let mfc = parseFnContractClauses(p)?;
                                         let _ = expectSym(p, "=")?;
-                                        let mbody = parseExpr(p)?;
-                                        let lam = mkForm(unionSpan(mSp, mbody.pos), ExAbs(mps, mret, mbody));
+                                        let rawMBody = parseExpr(p)?;
+                                        let mbody = wrapFnContractBody(mfc, rawMBody);
+                                        let lam = mkForm(unionSpan(mSp, rawMBody.pos), ExAbs(mps, mret, mbody));
                                         cellSet(impls, listAppend(cellGet(impls), [MkMethodImpl { implName: mname, implBody: lam }]));
                                         let _ = eatComma(p);
                                         skipSemis(p)
@@ -2222,6 +2311,8 @@ pub def formContainsTry(f: Form): Bool = match f.node {
     ExAbs(_, _, b) -> formContainsTry(b),
     ExBin(_, l, r) -> formContainsTry(l) || formContainsTry(r),
     ExWhile(c, b) -> formContainsTry(c) || formContainsTry(b),
+    ExContract(_, b) -> formContainsTry(b),
+    ExLoopContract(_, _, b) -> formContainsTry(b),
     ExLet(_, v, b) -> formContainsTry(v) || formContainsTry(b),
     ExIf(c, t, e) -> formContainsTry(c) || formContainsTry(t) || formContainsTry(e),
     ExMatch(s, arms) -> formContainsTry(s) || armsContainTry(arms),
@@ -2314,6 +2405,8 @@ def desugarNonResultExpr(ctx: TryCtx, f: Form): Form = {
     let n = match f.node {
         ExAbs(ps, rt, body) -> ExAbs(ps, rt, desugarResultScope(ctx, body)),
         ExWhile(c, b) -> ExWhile(desugarNonResultExpr(ctx, c), desugarNonResultExpr(ctx, b)),
+        ExContract(fc, b) -> ExContract(fc, desugarResultScope(ctx, b)),
+        ExLoopContract(invs, decs, b) -> ExLoopContract(invs, decs, desugarNonResultExpr(ctx, b)),
         ExIf(c, t, e) -> ExIf(desugarNonResultExpr(ctx, c), desugarNonResultExpr(ctx, t), desugarNonResultExpr(ctx, e)),
         ExLet(vd, v, b) -> ExLet(vd, desugarNonResultExpr(ctx, v), desugarNonResultExpr(ctx, b)),
         ExMatch(s, arms) -> {
@@ -2482,11 +2575,15 @@ def sequenceVoidBeforeResult(ctx: TryCtx, stmt: Form, cont: Form): Form = {
                 cellGet(acc)
             },
             ExWhile(wcond, wbody) -> {
+                let innerBody = match wbody.node {
+                    ExLoopContract(_, _, b) -> b,
+                    _ -> wbody,
+                };
                 let loopName = freshTryHelper(ctx, "try_while");
                 let callLoop = mkForm(sPos, ExApply(mkForm(sPos, ExVar(loopName)), Nil));
                 let condBinds = cellNew(Nil);
                 let cleanCond = extractValueTries(ctx, wcond, condBinds);
-                let step = sequenceVoidBeforeResult(ctx, wbody, callLoop);
+                let step = sequenceVoidBeforeResult(ctx, innerBody, callLoop);
                 let lamBody = wrapTryBinds(ctx, cellGet(condBinds), mkForm(sp, ExIf(cleanCond, step, cont)));
                 let lam = mkForm(sp, ExAbs(Nil, None, lamBody));
                 mkForm(sp, ExLet(MkVarDecl { vname: loopName, vscm: ScmSlot }, lam, callLoop))
@@ -2581,6 +2678,8 @@ def desugarResultScope(ctx: TryCtx, f: Form): Form =
             let rebuilt = MkForm { pos: f.pos, ty: f.ty, annot: f.annot, node: ExIf(cc, ct, ce) };
             wrapTryBinds(ctx, cellGet(binds), rebuilt)
         },
+        ExContract(fc, innerBody) ->
+            MkForm { pos: f.pos, ty: f.ty, annot: f.annot, node: ExContract(fc, desugarResultScope(ctx, innerBody)) },
         ExMatch(scrut, arms) -> {
             let binds = cellNew(Nil);
             let cs = extractValueTries(ctx, scrut, binds);

@@ -1931,6 +1931,7 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "scopedPtrCopyBytes"
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
     || name == "__blackBox"
+    || name == "__gs_contract_fail"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"

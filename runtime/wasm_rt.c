@@ -698,6 +698,7 @@ const char *gs_sys_host_os(void)
 void gs_match_fail(void) { __builtin_trap(); }
 void gs_bounds_fail(int32_t idx, int32_t len) { (void)idx; (void)len; __builtin_trap(); }
 void gs_div_zero_fail(void) { __builtin_trap(); }
+void gs_contract_fail(const char *msg) { (void)msg; __builtin_trap(); }
 
 /* ---- Optional host logging bridge (dropped by --gc-sections if unused) ---- */
 

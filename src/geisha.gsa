@@ -22,7 +22,7 @@ use loader.{
     loadSingleSourceProgramWithPkgsNamed, loadProjectProgramWithPkgs
 }
 use infer.inferProgram
-use core.{lowerToCore, lowerToCoreOpt, lowerToCoreForCheck}
+use core.{lowerToCore, lowerToCoreOpt, lowerToCoreMode, lowerToCoreOptMode, lowerToCoreForCheck}
 use core_dump.dumpCoreProgramSExpr
 use codegen.{CguIr, MkCguIr, emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForTarget, emitProgramLlvmIrForTargetDebug, emitProgramLlvmIrCgusForTargetDebug}
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
@@ -31,6 +31,7 @@ use doc.cmdDoc
 use bench.cmdBench
 use fmt.cmdFmt
 use lsp.cmdLsp
+use verify.verifyCoreProgram
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
@@ -103,8 +104,34 @@ data CliOpts {
         optJson: Bool,
         optSingleCgu: Bool,
         optNoCache: Bool,
+        optContracts: String,
+        optSolver: String,
+        optTimeoutMs: Int,
+        optNoImplicit: Bool,
         optHelp: Bool,
     },
+}
+
+def gContractMode: Cell String = cellNew("erase")
+
+def parsePosIntStr(s: String): Option Int = {
+    let n = strLen(s);
+    if (n == 0) None
+    else {
+        let acc = cellNew(0);
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let ch = strByteAt(s, cellGet(i));
+            if (ch >= 48 && ch <= 57) {
+                cellSet(acc, cellGet(acc) * 10 + (ch - 48));
+                cellSet(i, cellGet(i) + 1)
+            } else {
+                cellSet(ok, false)
+            }
+        };
+        if (cellGet(ok)) Some(cellGet(acc)) else None
+    }
 }
 
 def isSubcommandWord(w: String): Bool =
@@ -115,6 +142,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "update"
     || w == "build"
     || w == "check"
+    || w == "verify"
     || w == "run"
     || w == "eval"
     || w == "test"
@@ -180,6 +208,10 @@ def parseCliArgs(): Result CliOpts String = {
         let rtPath: Cell (Option String) = cellNew(None);
         let inPath: Cell (Option String) = cellNew(None);
         let jsonOut = cellNew(false);
+        let contractMode = cellNew("erase");
+        let solverBin = cellNew("z3");
+        let timeoutMs = cellNew(5000);
+        let noImplicit = cellNew(false);
         let showHelp = cellNew(false);
         let restArgsRev: Cell (List String) = cellNew(Nil);
         let afterDashDash = cellNew(false);
@@ -206,6 +238,17 @@ def parseCliArgs(): Result CliOpts String = {
                 } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && a == "--runtime") {
                     if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing path after '--runtime'"))
                     else { cellSet(rtPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+                } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && a == "--contracts") {
+                    if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing mode after '--contracts' (expected erase|check)"))
+                    else {
+                        let cm = argAt(cellGet(i) + 1);
+                        if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 2) }
+                        else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
+                    }
+                } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && strStartsWith(a, "--contracts=")) {
+                    let cm = strSlice(a, 12, strLen(a));
+                    if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 1) }
+                    else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
                 } else {
                     cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
                     cellSet(i, cellGet(i) + 1)
@@ -340,7 +383,30 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--no-cache") {
                 cellSet(noCache, true);
                 cellSet(i, cellGet(i) + 1)
-            } else if ((sub == "run" || sub == "check") && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
+            } else if (a == "--contracts") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing mode after '--contracts' (expected erase|check)"))
+                else {
+                    let cm = argAt(cellGet(i) + 1);
+                    if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 2) }
+                    else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
+                }
+            } else if (strStartsWith(a, "--contracts=")) {
+                let cm = strSlice(a, 12, strLen(a));
+                if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 1) }
+                else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
+            } else if (a == "--solver") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing solver binary after '--solver'"))
+                else { cellSet(solverBin, argAt(cellGet(i) + 1)); cellSet(i, cellGet(i) + 2) }
+            } else if (a == "--timeout") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing milliseconds after '--timeout'"))
+                else match parsePosIntStr(argAt(cellGet(i) + 1)) {
+                    Some(ms) -> { cellSet(timeoutMs, ms); cellSet(i, cellGet(i) + 2) },
+                    None -> cellSet(errOpt, Some("Invalid integer after '--timeout'")),
+                }
+            } else if (a == "--no-implicit") {
+                cellSet(noImplicit, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if ((sub == "run" || sub == "check" || sub == "verify") && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
                 cellSet(inPath, Some(a));
                 cellSet(i, cellGet(i) + 1)
             } else if ((sub == "build" || sub == "test" || sub == "check") && strLen(a) > 0 && strByteAt(a, 0) == 45) {
@@ -378,6 +444,10 @@ def parseCliArgs(): Result CliOpts String = {
                 optJson: cellGet(jsonOut),
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
+                optContracts: cellGet(contractMode),
+                optSolver: cellGet(solverBin),
+                optTimeoutMs: cellGet(timeoutMs),
+                optNoImplicit: cellGet(noImplicit),
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -401,6 +471,7 @@ def parseCliArgs(): Result CliOpts String = {
         let libPathsRev: Cell (List String) = cellNew(Nil);
         let pkgFlagsRev: Cell (List (String, String)) = cellNew(Nil);
         let depFlagsRev: Cell (List (String, String, String)) = cellNew(Nil);
+        let contractMode = cellNew("erase");
         let rtPath: Cell (Option String) = cellNew(None);
         let inPath: Cell (Option String) = cellNew(None);
         let showHelp = cellNew(false);
@@ -512,6 +583,17 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--no-cache") {
                 cellSet(noCache, true);
                 cellSet(i, cellGet(i) + 1)
+            } else if (a == "--contracts") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing mode after '--contracts' (expected erase|check)"))
+                else {
+                    let cm = argAt(cellGet(i) + 1);
+                    if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 2) }
+                    else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
+                }
+            } else if (strStartsWith(a, "--contracts=")) {
+                let cm = strSlice(a, 12, strLen(a));
+                if (cm == "erase" || cm == "check") { cellSet(contractMode, cm); cellSet(i, cellGet(i) + 1) }
+                else cellSet(errOpt, Some("Invalid '--contracts' mode '" + cm + "' (expected erase|check)"))
             } else if (strLen(a) > 0 && strByteAt(a, 0) == 45) {
                 cellSet(errOpt, Some("Unknown option: '" + a + "'"))
             } else {
@@ -547,6 +629,10 @@ def parseCliArgs(): Result CliOpts String = {
                 optJson: false,
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
+                optContracts: cellGet(contractMode),
+                optSolver: "z3",
+                optTimeoutMs: 5000,
+                optNoImplicit: false,
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -738,7 +824,7 @@ def compileLoadedDefsToIrForArchDebug(
     debugInfo: Bool
 ): Result String String = {
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCoreOpt(inf, true, !debugInfo)?;
+    let coreProg = lowerToCoreOptMode(inf, true, !debugInfo, cellGet(gContractMode))?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     Ok(emitProgramLlvmIrForTargetDebug(
         coreProg, isWasm, targetArch, if (isWasm) "wasm" else currentHostOs(), exports, noMain, bootSymOpt, debugInfo
@@ -1010,6 +1096,46 @@ def runCheckSubcmd(opts: CliOpts): Result Int String = {
     }
 }
 
+def loadAndVerifyProgram(
+    entryFile: String,
+    scopeDir: String,
+    useProjectLoader: Bool,
+    rootSpec: PkgSpec,
+    extSpecs: List PkgSpec,
+    libPaths: List String,
+    opts: CliOpts
+): Result Int String = {
+    let rawDefs =
+        if (useProjectLoader) {
+            loadProjectProgramWithPkgs(entryFile, rootSpec, extSpecs, libPaths)?
+        } else {
+            let src = readFile(entryFile)?;
+            loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
+        };
+    let inf = inferProgram(rawDefs)?;
+    let coreProg = lowerToCoreMode(inf, "keep")?;
+    verifyCoreProgram(coreProg, entryFile, scopeDir, opts.optJson, opts.optSolver, opts.optTimeoutMs, !opts.optNoImplicit)
+}
+
+def runVerifySubcmd(opts: CliOpts): Result Int String =
+    match opts.optInput {
+        Some(inputFile) -> {
+            let useProjLoader = match opts.optSrcRoot { Some(_) -> true, None -> false };
+            let scopeDir = match opts.optSrcRoot { Some(sr) -> sr, None -> inputFile };
+            let (rootSpec, extSpecs) = buildCliPkgGraph(inputFile, opts.optSrcRoot, opts.optPkgFlags, opts.optDepFlags);
+            loadAndVerifyProgram(inputFile, scopeDir, useProjLoader, rootSpec, extSpecs, opts.optLibPaths, opts)
+        },
+        None -> match findProjectRoot(".") {
+            None -> Err("no geisha.toml found and no .gsa file specified (usage: geisha verify [file.gsa] [--json] [--solver z3] [--timeout 5000] [--no-implicit])"),
+            Some(projDir) -> {
+                let (rootMf, rootSpec, resolvedPkgs) = resolveProjectGraph(projDir, false, None, true)?;
+                let entryFile = resolveDefaultEntryFile(projDir, rootMf)?;
+                let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
+                loadAndVerifyProgram(entryFile, projDir, true, rootSpec, extSpecs, opts.optLibPaths, opts)
+            },
+        },
+    }
+
 def emitNativeExecutableFromIrDebug(
     llText: String,
     outBin: String,
@@ -1271,7 +1397,7 @@ def compileWithPkgSpecsToJs(
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCore(inf)?;
+    let coreProg = lowerToCoreMode(inf, cellGet(gContractMode))?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let effExports = match tc.tcExports {
         Nil -> collectRootPubFnNames(rawDefs, coreProg),
@@ -1686,7 +1812,7 @@ def compileLoadedDefsToCgusForArchDebug(
     singleCgu: Bool
 ): Result (List CguIr) String = {
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCoreOpt(inf, true, !debugInfo)?;
+    let coreProg = lowerToCoreOptMode(inf, true, !debugInfo, cellGet(gContractMode))?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let targetOs = if (isWasm) "wasm" else currentHostOs();
     if (singleCgu) {
@@ -2141,7 +2267,7 @@ def compileCgusToCachedObjs(
     let ccFp =
         if (target == "wasm32") resolveWasmCc()
         else resolveNativeCc() + "|" + currentHostOs() + "|" + currentHostArch();
-    let keyPrefix = "cgu-v3|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
+    let keyPrefix = "cgu-v3|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
     let pidStr = intToStr(c_getpid());
 
     let objsRev = cellNew(Nil);
@@ -2684,6 +2810,7 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
                 + "|" + resolveNativeCc()
                 + "|O" + effOpt
                 + "|dbg" + (if (debugInfo) "1" else "0")
+                + "|contracts:" + cellGet(gContractMode)
                 + "|" + (if (singleCgu) "scgu" else "mcgu")
                 + "|" + entryFile + "|" + outBin + "\n"
                 + serializeProjGraphForKey(rootSpec, extSpecs, tc)
@@ -3072,7 +3199,7 @@ def runEvalSubcmd(rawArgs: List String, rtOverrideOpt: Option String): Result In
             let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
             mkdirAll(cacheDir)?;
             let key = strSlice(
-                sha256Hex("eval\n" + scriptCompilerFingerprint(rtArchive) + "\n" + code),
+                sha256Hex("eval\n" + scriptCompilerFingerprint(rtArchive) + "|contracts:" + cellGet(gContractMode) + "\n" + code),
                 0,
                 24
             );
@@ -3115,6 +3242,7 @@ def printUsage(): Void = {
     printLn("  geisha update [alias]          Re-resolve remote tags/revs and update geisha.lock");
     printLn("  geisha build [options]         Compile current geisha.toml project");
     printLn("  geisha check [file.gsa]        Fast frontend type/exhaustiveness/Send check (--json)");
+    printLn("  geisha verify [file.gsa]       SMT static contract & safety verifier (--json --solver z3 --timeout 5000 --no-implicit)");
     printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
     printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
@@ -3132,6 +3260,7 @@ def printUsage(): Void = {
     printLn("  -g, --debug                    Emit DWARF debug info (defaults to -O0, disables TCO, runs dsymutil on macOS)");
     printLn("  -O<0|1|2|3|s|z>, --opt <lvl>   Set LLVM optimization level (--dev=-O0, --release=-O2; default: -O2, or -O0 with -g)");
     printLn("  --dump-core <file>             Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
+    printLn("  --contracts=<erase|check>      Contract compilation mode: erase (default, zero overhead) or check (runtime assertions)");
     printLn("  --target <target>              native | wasm32 | wasm-gc | js | ios | ios-sim | macos-app | ios-app | ios-sim-app");
     printLn("  --export <fn>                  Export function symbol on native, wasm32, wasm-gc, or js (repeatable)");
     printLn("  --opt[=]<0|1|2|3|s|z>          Optimization level (also -O0..-O3, -Os, -Oz, --dev, --release)");
@@ -3158,6 +3287,7 @@ def runDriver(): Result Int String = {
         printUsage();
         Ok(0)
     } else {
+        cellSet(gContractMode, opts.optContracts);
         let isTestSub = match opts.optSubcmd { Some("test") -> true, _ -> false };
         let effOptLevel = match opts.optLevel {
             Some(lvl) -> lvl,
@@ -3197,9 +3327,10 @@ def runDriver(): Result Int String = {
                 Ok(0)
             },
             Some("check") -> runCheckSubcmd(opts),
+            Some("verify") -> runVerifySubcmd(opts),
             Some("run") -> match opts.optInput {
                 Some(gsaFile) ->
-                    if (opts.optDebug) runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
+                    if (opts.optDebug || opts.optContracts != "erase") runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
                     else runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, effOptLevel, opts.optDebug, opts.optNoCache),
                 None ->
                     if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {

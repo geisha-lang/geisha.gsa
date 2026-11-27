@@ -12,7 +12,7 @@ use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     ConstraintSpec, FunDep,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
-    VarDecl, Expr, ExAbs,
+    VarDecl, Expr, ExAbs, ExContract, FnContract, EnsuresClause,
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
@@ -172,6 +172,42 @@ def formatDefExternPrefix(attrs: List DefAttr): String = match attrs {
     Cons(AttrCtor(_), _) -> "extern init ",
 }
 
+pub def formatContractLinesFromSrc(src: String, body: ast.Form): List String =
+    match body.node {
+        ExContract(fc, _) -> {
+            let n = strLen(src);
+            let sliceSpan = (sp: ast.Span) -> {
+                let s = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
+                let e = if (sp.end < s) s else if (sp.end > n) n else sp.end;
+                strSlice(src, s, e)
+            };
+            let outRev: Cell (List String) = cellNew(Nil);
+            let cr = cellNew(fc.fcRequires);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((sp, _), r) -> { cellSet(outRev, Cons("    " + sliceSpan(sp), cellGet(outRev))); cellSet(cr, r) },
+                    Nil -> (),
+                }
+            };
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> { cellSet(outRev, Cons("    " + sliceSpan(ec.ecSpan), cellGet(outRev))); cellSet(ce, r) },
+                    Nil -> (),
+                }
+            };
+            let cd = cellNew(fc.fcDecreases);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons((sp, _), r) -> { cellSet(outRev, Cons("    " + sliceSpan(sp), cellGet(outRev))); cellSet(cd, r) },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(outRev))
+        },
+        _ -> Nil,
+    }
+
 pub def formatDefSig(d: Def): String = {
     let visPfx = (if (isPublicVis(d.vis)) "pub " else "") + formatDefExternPrefix(d.attrs);
     match d.item {
@@ -264,6 +300,22 @@ def renderModuleItems(src: String, items: List ModuleItem, showAll: Bool, out: C
                         }
                     };
                     cellSet(out, listAppend(cellGet(out), [prefix + formatDefSig(d)]));
+                    match d.item {
+                        ItForm(f) -> match f.node {
+                            ExAbs(_, _, body) -> {
+                                let clines = formatContractLinesFromSrc(src, body);
+                                let cc = cellNew(clines);
+                                while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                                    match cellGet(cc) {
+                                        Cons(cl, rc) -> { cellSet(out, listAppend(cellGet(out), [prefix + cl])); cellSet(cc, rc) },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            _ -> (),
+                        },
+                        _ -> (),
+                    };
                 } else ();
                 cellSet(cur, r)
             },

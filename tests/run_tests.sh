@@ -6440,4 +6440,7 @@ mkdir -p "$TMP_DIR/t45_work"
 "$GEISHA_BIN" -o "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_utf8_and_group.gsa"
 assert_eq "utf8_paths_argv_env_and_own_group_signal" "1|1|1|1|1" "$(GS_UTF8_TEST="你好Geisha" "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_work" "参数_λ" "$TMP_DIR/t45_proc_wait.py")"
 
+# 46. Contracts (M1) & SMT Static Verifier (`geisha verify`, M2)
+python3 tests/test_verify.py "$GEISHA_BIN"
+PASS=$((PASS + 1))
 echo "All $PASS end-to-end test suites passed!"

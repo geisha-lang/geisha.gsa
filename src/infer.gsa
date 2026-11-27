@@ -27,6 +27,7 @@ use ast.{
     Form, MkForm,
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, MkEnsuresClause, FnContract, MkFnContract,
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
@@ -322,6 +323,19 @@ def zonkForm(subst: StrMap Type, f: Form): Form = {
         ExTry(e) -> ExTry(zonkForm(subst, e)),
         ExIf(c, t, e) -> ExIf(zonkForm(subst, c), zonkForm(subst, t), zonkForm(subst, e)),
         ExWhile(c, b) -> ExWhile(zonkForm(subst, c), zonkForm(subst, b)),
+        ExContract(fc, b) -> {
+            let zReqs = fmap((p) -> match p { (sp, e) -> (sp, zonkForm(subst, e)) }, fc.fcRequires);
+            let zDecs = fmap((p) -> match p { (sp, e) -> (sp, zonkForm(subst, e)) }, fc.fcDecreases);
+            let zEns = fmap((ec: EnsuresClause) -> MkEnsuresClause {
+                ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: zonkForm(subst, ec.ecExpr),
+            }, fc.fcEnsures);
+            ExContract(MkFnContract { fcRequires: zReqs, fcEnsures: zEns, fcDecreases: zDecs }, zonkForm(subst, b))
+        },
+        ExLoopContract(invs, decs, b) -> {
+            let zInvs = fmap((p) -> match p { (sp, e) -> (sp, zonkForm(subst, e)) }, invs);
+            let zDecs = fmap((p) -> match p { (sp, e) -> (sp, zonkForm(subst, e)) }, decs);
+            ExLoopContract(zInvs, zDecs, zonkForm(subst, b))
+        },
         ExAbs(ps, rt, body) -> {
             let nps = cellNew(Nil);
             let cur = cellNew(ps);
@@ -1253,6 +1267,8 @@ pub def preludePrimSpecs(): List (String, String) = [
         ("gcHandleNew", "forall a. a -> Int64"),
         ("gcHandleGet", "forall a. Int64 -> a"),
         ("__blackBox", "forall a. a -> a"),
+        ("assert", "Bool -> Void"),
+        ("assume", "Bool -> Void"),
         ("gcHandleFree", "Int64 -> Void"),
         ("gcTrim", "() -> Void"),
         ("gcSetThresholds", "(Int64, Int64) -> Void"),
@@ -3098,6 +3114,89 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
             unifyTypes(ctx.subst, TyVoid, schemeBody(ib.ty), ib.pos)?;
             Ok(MkForm { pos: sp, ty: ScmMono(TyVoid), annot: f.annot, node: ExWhile(ic, ib) })
         },
+        ExContract(fc, body) -> {
+            let infReqsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let cr = cellNew(fc.fcRequires);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((csp, ce), r) -> {
+                        let ie = inferForm(ctx, env, ce)?;
+                        unifyTypes(ctx.subst, TyCon("Bool"), schemeBody(ie.ty), ie.pos)?;
+                        cellSet(infReqsRev, Cons((csp, ie), cellGet(infReqsRev)));
+                        cellSet(cr, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let infDecsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let cd = cellNew(fc.fcDecreases);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons((csp, ce), r) -> {
+                        let ie = inferForm(ctx, env, ce)?;
+                        unifyTypes(ctx.subst, TyCon("Int"), schemeBody(ie.ty), ie.pos)?;
+                        cellSet(infDecsRev, Cons((csp, ie), cellGet(infDecsRev)));
+                        cellSet(cd, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let infBody = inferForm(ctx, env, body)?;
+            let retTy = zonkType(ctx.subst, schemeBody(infBody.ty));
+            let infEnsRev: Cell (List EnsuresClause) = cellNew(Nil);
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> {
+                        let ensEnv = match ec.ecBind {
+                            Some(bname) -> envExtend(env, bname, ScmMono(retTy)),
+                            None -> env,
+                        };
+                        let ie = inferForm(ctx, ensEnv, ec.ecExpr)?;
+                        unifyTypes(ctx.subst, TyCon("Bool"), schemeBody(ie.ty), ie.pos)?;
+                        cellSet(infEnsRev, Cons(MkEnsuresClause { ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: ie }, cellGet(infEnsRev)));
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let infFc = MkFnContract {
+                fcRequires: listRev(cellGet(infReqsRev)),
+                fcEnsures: listRev(cellGet(infEnsRev)),
+                fcDecreases: listRev(cellGet(infDecsRev)),
+            };
+            Ok(MkForm { pos: sp, ty: infBody.ty, annot: f.annot, node: ExContract(infFc, infBody) })
+        },
+        ExLoopContract(invs, decs, body) -> {
+            let infInvsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let ci = cellNew(invs);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) {
+                    Cons((csp, ce), r) -> {
+                        let ie = inferForm(ctx, env, ce)?;
+                        unifyTypes(ctx.subst, TyCon("Bool"), schemeBody(ie.ty), ie.pos)?;
+                        cellSet(infInvsRev, Cons((csp, ie), cellGet(infInvsRev)));
+                        cellSet(ci, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let infDecsRev: Cell (List (Span, Form)) = cellNew(Nil);
+            let cd = cellNew(decs);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons((csp, ce), r) -> {
+                        let ie = inferForm(ctx, env, ce)?;
+                        unifyTypes(ctx.subst, TyCon("Int"), schemeBody(ie.ty), ie.pos)?;
+                        cellSet(infDecsRev, Cons((csp, ie), cellGet(infDecsRev)));
+                        cellSet(cd, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let infBody = inferForm(ctx, env, body)?;
+            Ok(MkForm { pos: sp, ty: infBody.ty, annot: f.annot, node: ExLoopContract(listRev(cellGet(infInvsRev)), listRev(cellGet(infDecsRev)), infBody) })
+        },
         ExBlock(items) -> {
             let total = listLen(items);
             let idx = cellNew(0);
@@ -3316,6 +3415,8 @@ def closureCapturesScoped(ctx: InferCtx, env: TypeEnv, f: Form, boundNames: List
         || closureCapturesScoped(ctx, env, e, boundNames),
     ExWhile(c, b) ->
         closureCapturesScoped(ctx, env, c, boundNames) || closureCapturesScoped(ctx, env, b, boundNames),
+    ExContract(_, b) -> closureCapturesScoped(ctx, env, b, boundNames),
+    ExLoopContract(_, _, b) -> closureCapturesScoped(ctx, env, b, boundNames),
     ExLet(vd, val, body) ->
         closureCapturesScoped(ctx, env, val, boundNames)
         || closureCapturesScoped(ctx, env, body, Cons(vd.vname, boundNames)),
@@ -3378,6 +3479,8 @@ def checkClosureCaptures(
         checkClosureCaptures(ctx, env, c, boundNames, modeVar, lamSpan)?;
         checkClosureCaptures(ctx, env, b, boundNames, modeVar, lamSpan)
     },
+    ExContract(_, b) -> checkClosureCaptures(ctx, env, b, boundNames, modeVar, lamSpan),
+    ExLoopContract(_, _, b) -> checkClosureCaptures(ctx, env, b, boundNames, modeVar, lamSpan),
     ExLet(vd, val, b) -> {
         checkClosureCaptures(ctx, env, val, boundNames, modeVar, lamSpan)?;
         checkClosureCaptures(ctx, env, b, Cons(vd.vname, boundNames), modeVar, lamSpan)
@@ -3696,12 +3799,392 @@ def checkExhaustivenessInForm(ctx: InferCtx, f: Form): Result Void String = matc
         checkExhaustivenessInForm(ctx, e)
     },
     ExWhile(c, b) -> { checkExhaustivenessInForm(ctx, c)?; checkExhaustivenessInForm(ctx, b) },
+    ExContract(fc, b) -> {
+        let cr = cellNew(fc.fcRequires);
+        while (match cellGet(cr) { Nil -> false, _ -> true }) {
+            match cellGet(cr) { Cons((_, e), r) -> { checkExhaustivenessInForm(ctx, e)?; cellSet(cr, r) }, Nil -> () }
+        };
+        let cd = cellNew(fc.fcDecreases);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { checkExhaustivenessInForm(ctx, e)?; cellSet(cd, r) }, Nil -> () }
+        };
+        let ce = cellNew(fc.fcEnsures);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) { Cons(ec, r) -> { checkExhaustivenessInForm(ctx, ec.ecExpr)?; cellSet(ce, r) }, Nil -> () }
+        };
+        checkExhaustivenessInForm(ctx, b)
+    },
+    ExLoopContract(invs, decs, b) -> {
+        let ci = cellNew(invs);
+        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) { Cons((_, e), r) -> { checkExhaustivenessInForm(ctx, e)?; cellSet(ci, r) }, Nil -> () }
+        };
+        let cd = cellNew(decs);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { checkExhaustivenessInForm(ctx, e)?; cellSet(cd, r) }, Nil -> () }
+        };
+        checkExhaustivenessInForm(ctx, b)
+    },
     _ -> Ok(()),
 }
 
 def checkExhaustivenessInList(ctx: InferCtx, es: List Form): Result Void String = match es {
     Nil -> Ok(()),
     Cons(h, t) -> { checkExhaustivenessInForm(ctx, h)?; checkExhaustivenessInList(ctx, t) },
+}
+
+def isImpureContractPrim(nm: String): Bool =
+    nm == "cellNew" || nm == "cellSet"
+    || nm == "arrayNew" || nm == "arrayNewZeroed" || nm == "arraySet" || nm == "arrayClearSlot" || nm == "arrayFreeze"
+    || nm == "printLn" || nm == "putNumber" || nm == "putFloat" || nm == "putF32" || nm == "putChar"
+    || nm == "ptrAllocBytes" || nm == "ptrAllocBytes64" || nm == "ptrSetByte"
+    || nm == "ptrWriteU16Le" || nm == "ptrWriteU32Le" || nm == "ptrWriteI64Le" || nm == "ptrWriteF32Le" || nm == "ptrWriteF64Le"
+    || nm == "ptrWriteI64Le64" || nm == "ptrWriteF32Le64" || nm == "ptrWriteF64Le64"
+    || nm == "ptrCopyBytes" || nm == "ptrCopyBytes64" || nm == "ptrCopyFromStr"
+    || nm == "foreignPtrAlloc" || nm == "arenaAlloc"
+    || nm == "scopedPtrSetByte" || nm == "scopedPtrWriteI32Le" || nm == "scopedPtrWriteI64Le"
+    || nm == "scopedPtrWriteF32Le" || nm == "scopedPtrWriteF64Le" || nm == "scopedPtrCopyBytes"
+    || nm == "taskSpawn" || nm == "actorSpawn" || nm == "actorSend" || nm == "actorCall"
+    || nm == "chanSend" || nm == "chanRecv" || nm == "mvarPut" || nm == "mvarTake"
+    || nm == "atomicStore" || nm == "atomicAdd" || nm == "atomicCas"
+    || nm == "gcHandleNew" || nm == "gcHandleFree" || nm == "gcTrim" || nm == "gcSetThresholds"
+    || nm == "assert" || nm == "assume"
+
+def collectDirectImpurityAndCalls(
+    f: Form,
+    bound: List String,
+    isImpure: Cell Bool,
+    callees: Cell (List String)
+): Void = match f.node {
+    ExWhile(_, _) -> cellSet(isImpure, true),
+    ExApply(callee, args) -> {
+        match callee.node {
+            ExVar(nm) ->
+                if (isImpureContractPrim(nm)) cellSet(isImpure, true)
+                else if (listContainsStr(bound, nm)) cellSet(isImpure, true)
+                else cellSet(callees, addUniqueStr(cellGet(callees), nm)),
+            _ -> {
+                cellSet(isImpure, true);
+                collectDirectImpurityAndCalls(callee, bound, isImpure, callees)
+            },
+        };
+        let ca = cellNew(args);
+        while (match cellGet(ca) { Nil -> false, _ -> true }) {
+            match cellGet(ca) {
+                Cons(a, r) -> { collectDirectImpurityAndCalls(a, bound, isImpure, callees); cellSet(ca, r) },
+                Nil -> (),
+            }
+        }
+    },
+    ExTuple(es) -> collectDirectList(es, bound, isImpure, callees),
+    ExList(es) -> collectDirectList(es, bound, isImpure, callees),
+    ExBlock(es) -> collectDirectList(es, bound, isImpure, callees),
+    ExStructInit(_, fs) -> {
+        let cf = cellNew(fs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons((_, v), r) -> { collectDirectImpurityAndCalls(v, bound, isImpure, callees); cellSet(cf, r) },
+                Nil -> (),
+            }
+        }
+    },
+    ExAbs(ps, _, b) -> collectDirectImpurityAndCalls(b, extendBoundWithVarDecls(ps, bound), isImpure, callees),
+    ExBin(_, l, r) -> {
+        collectDirectImpurityAndCalls(l, bound, isImpure, callees);
+        collectDirectImpurityAndCalls(r, bound, isImpure, callees)
+    },
+    ExUn(_, e) -> collectDirectImpurityAndCalls(e, bound, isImpure, callees),
+    ExField(e, _) -> collectDirectImpurityAndCalls(e, bound, isImpure, callees),
+    ExTry(e) -> collectDirectImpurityAndCalls(e, bound, isImpure, callees),
+    ExLet(vd, v, b) -> {
+        collectDirectImpurityAndCalls(v, bound, isImpure, callees);
+        collectDirectImpurityAndCalls(b, Cons(vd.vname, bound), isImpure, callees)
+    },
+    ExIf(c, t, e) -> {
+        collectDirectImpurityAndCalls(c, bound, isImpure, callees);
+        collectDirectImpurityAndCalls(t, bound, isImpure, callees);
+        collectDirectImpurityAndCalls(e, bound, isImpure, callees)
+    },
+    ExMatch(scrut, arms) -> {
+        collectDirectImpurityAndCalls(scrut, bound, isImpure, callees);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let ab = extendBoundWithPattern(a.pat, bound);
+                    match a.guard { Some(g) -> collectDirectImpurityAndCalls(g, ab, isImpure, callees), None -> () };
+                    collectDirectImpurityAndCalls(a.body, ab, isImpure, callees);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    ExContract(_, b) -> collectDirectImpurityAndCalls(b, bound, isImpure, callees),
+    ExLoopContract(_, _, b) -> collectDirectImpurityAndCalls(b, bound, isImpure, callees),
+    _ -> (),
+}
+
+def collectDirectList(es: List Form, bound: List String, isImpure: Cell Bool, callees: Cell (List String)): Void = {
+    let cur = cellNew(es);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, r) -> { collectDirectImpurityAndCalls(h, bound, isImpure, callees); cellSet(cur, r) },
+            Nil -> (),
+        }
+    }
+}
+
+def buildImpureFnSet(ctx: InferCtx, defs: List Def): StrMap Bool = {
+    let impure: StrMap Bool = strMapNew();
+    let fnNamesRev: Cell (List String) = cellNew(Nil);
+    let callGraph: StrMap (List String) = strMapNew();
+    let cd = cellNew(defs);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItExtern(_, _, _, _) -> strMapInsert(impure, d.ident, true),
+                    ItForm(f) -> {
+                        let imp = cellNew(false);
+                        let cs: Cell (List String) = cellNew(Nil);
+                        collectDirectImpurityAndCalls(f, Nil, imp, cs);
+                        if (cellGet(imp)) strMapInsert(impure, d.ident, true) else ();
+                        strMapInsert(callGraph, d.ident, cellGet(cs));
+                        cellSet(fnNamesRev, Cons(d.ident, cellGet(fnNamesRev)))
+                    },
+                    _ -> (),
+                };
+                cellSet(cd, r)
+            },
+            Nil -> (),
+        }
+    };
+    // Connect every Concept method name to all registered instance implementations so
+    // any impure instance method taints the Concept method during transitive closure.
+    let ci = cellNew(cellGet(ctx.instanceReg));
+    while (match cellGet(ci) { Nil -> false, _ -> true }) {
+        match cellGet(ci) {
+            Cons(inst, ri) -> {
+                match strMapGet(ctx.conceptReg, inst.conceptName) {
+                    Some(cinfo) -> {
+                        let cm = cellNew(cinfo.methods);
+                        while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                            match cellGet(cm) {
+                                Cons((mname, _), rm) -> {
+                                    match strMapGet(inst.methodImpls, mname) {
+                                        Some(implFn) -> {
+                                            let prev = match strMapGet(callGraph, mname) { Some(xs) -> xs, None -> Nil };
+                                            strMapInsert(callGraph, mname, addUniqueStr(prev, implFn));
+                                            cellSet(fnNamesRev, addUniqueStr(cellGet(fnNamesRev), mname))
+                                        },
+                                        None -> (),
+                                    };
+                                    cellSet(cm, rm)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(ci, ri)
+            },
+            Nil -> (),
+        }
+    };
+    // Transitive closure fixed point
+    let fnNames = listRev(cellGet(fnNamesRev));
+    let changed = cellNew(true);
+    while (cellGet(changed)) {
+        cellSet(changed, false);
+        let cf = cellNew(fnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(nm, r) -> {
+                    if (!strMapContains(impure, nm)) {
+                        match strMapGet(callGraph, nm) {
+                            Some(cs) -> {
+                                let cc = cellNew(cs);
+                                let hit = cellNew(false);
+                                while (match cellGet(cc) { Nil -> false, _ -> !cellGet(hit) }) {
+                                    match cellGet(cc) {
+                                        Cons(callee, rc) -> {
+                                            if (strMapContains(impure, callee)) cellSet(hit, true) else ();
+                                            cellSet(cc, rc)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                if (cellGet(hit)) {
+                                    strMapInsert(impure, nm, true);
+                                    cellSet(changed, true)
+                                } else ()
+                            },
+                            None -> (),
+                        }
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    impure
+}
+
+def checkPureExpr(impure: StrMap Bool, bound: List String, f: Form): Result Void String = match f.node {
+    ExWhile(_, _) ->
+        Err(formatSpanDiagHint("Purity error", f.pos, "`while` loop is not allowed inside a contract specification", "contracts (`requires`, `ensures`, `invariant`, `decreases`) must be pure and terminating")),
+    ExApply(callee, args) -> {
+        let calleeChk: Result Void String = match callee.node {
+            ExVar(nm) ->
+                if (isImpureContractPrim(nm)) {
+                    Err(formatSpanDiagHint("Purity error", f.pos, "side-effecting primitive `" + nm + "` is not allowed inside a contract specification", "only pure expressions and read-only lookups (`cellGet`, `arrayLen`, `arrayGet`, `immArrayLen`, `immArrayGet`) are permitted in contracts"))
+                } else if (listContainsStr(bound, nm)) {
+                    Err(formatSpanDiagHint("Purity error", f.pos, "calling higher-order local function `" + nm + "` is not allowed inside a contract specification", "contract specifications cannot invoke arbitrary closures with unknown side effects"))
+                } else if (strMapContains(impure, nm)) {
+                    Err(formatSpanDiagHint("Purity error", f.pos, "impure function `" + nm + "` is not allowed inside a contract specification", "`" + nm + "` directly or transitively performs mutation, I/O, extern FFI, or looping"))
+                } else Ok(()),
+            _ -> Err(formatSpanDiagHint("Purity error", f.pos, "indirect function call is not allowed inside a contract specification", "only calls to statically known pure functions are permitted in contracts")),
+        };
+        calleeChk?;
+        checkPureExprList(impure, bound, args)
+    },
+    ExTuple(es) -> checkPureExprList(impure, bound, es),
+    ExList(es) -> checkPureExprList(impure, bound, es),
+    ExBlock(es) -> checkPureExprList(impure, bound, es),
+    ExStructInit(_, fs) -> checkPureExprNamed(impure, bound, fs),
+    ExAbs(ps, _, b) -> checkPureExpr(impure, extendBoundWithVarDecls(ps, bound), b),
+    ExBin(_, l, r) -> { checkPureExpr(impure, bound, l)?; checkPureExpr(impure, bound, r) },
+    ExUn(_, e) -> checkPureExpr(impure, bound, e),
+    ExField(e, _) -> checkPureExpr(impure, bound, e),
+    ExTry(e) -> checkPureExpr(impure, bound, e),
+    ExLet(vd, v, b) -> { checkPureExpr(impure, bound, v)?; checkPureExpr(impure, Cons(vd.vname, bound), b) },
+    ExIf(c, t, e) -> { checkPureExpr(impure, bound, c)?; checkPureExpr(impure, bound, t)?; checkPureExpr(impure, bound, e) },
+    ExMatch(scrut, arms) -> {
+        checkPureExpr(impure, bound, scrut)?;
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let ab = extendBoundWithPattern(a.pat, bound);
+                    match a.guard { Some(g) -> checkPureExpr(impure, ab, g)?, None -> () };
+                    checkPureExpr(impure, ab, a.body)?;
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(())
+    },
+    ExContract(_, b) -> checkPureExpr(impure, bound, b),
+    ExLoopContract(_, _, b) -> checkPureExpr(impure, bound, b),
+    _ -> Ok(()),
+}
+
+def checkPureExprList(impure: StrMap Bool, bound: List String, es: List Form): Result Void String = match es {
+    Nil -> Ok(()),
+    Cons(h, t) -> { checkPureExpr(impure, bound, h)?; checkPureExprList(impure, bound, t) },
+}
+
+def checkPureExprNamed(impure: StrMap Bool, bound: List String, fs: List (String, Form)): Result Void String = match fs {
+    Nil -> Ok(()),
+    Cons((_, v), t) -> { checkPureExpr(impure, bound, v)?; checkPureExprNamed(impure, bound, t) },
+}
+
+def checkContractPurityInForm(impure: StrMap Bool, bound: List String, f: Form): Result Void String = match f.node {
+    ExContract(fc, b) -> {
+        let cr = cellNew(fc.fcRequires);
+        while (match cellGet(cr) { Nil -> false, _ -> true }) {
+            match cellGet(cr) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cr, r) }, Nil -> () }
+        };
+        let cd = cellNew(fc.fcDecreases);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cd, r) }, Nil -> () }
+        };
+        let ce = cellNew(fc.fcEnsures);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) {
+                Cons(ec, r) -> {
+                    let eb = match ec.ecBind { Some(bn) -> Cons(bn, bound), None -> bound };
+                    checkPureExpr(impure, eb, ec.ecExpr)?;
+                    cellSet(ce, r)
+                },
+                Nil -> (),
+            }
+        };
+        checkContractPurityInForm(impure, bound, b)
+    },
+    ExLoopContract(invs, decs, b) -> {
+        let ci = cellNew(invs);
+        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(ci, r) }, Nil -> () }
+        };
+        let cd = cellNew(decs);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cd, r) }, Nil -> () }
+        };
+        checkContractPurityInForm(impure, bound, b)
+    },
+    ExApply(callee, args) -> { checkContractPurityInForm(impure, bound, callee)?; checkContractPurityInList(impure, bound, args) },
+    ExTuple(es) -> checkContractPurityInList(impure, bound, es),
+    ExList(es) -> checkContractPurityInList(impure, bound, es),
+    ExBlock(es) -> checkContractPurityInList(impure, bound, es),
+    ExStructInit(_, fs) -> checkContractPurityInNamed(impure, bound, fs),
+    ExAbs(ps, _, b) -> checkContractPurityInForm(impure, extendBoundWithVarDecls(ps, bound), b),
+    ExBin(_, l, r) -> { checkContractPurityInForm(impure, bound, l)?; checkContractPurityInForm(impure, bound, r) },
+    ExUn(_, e) -> checkContractPurityInForm(impure, bound, e),
+    ExField(e, _) -> checkContractPurityInForm(impure, bound, e),
+    ExTry(e) -> checkContractPurityInForm(impure, bound, e),
+    ExLet(vd, v, b) -> { checkContractPurityInForm(impure, bound, v)?; checkContractPurityInForm(impure, Cons(vd.vname, bound), b) },
+    ExIf(c, t, e) -> { checkContractPurityInForm(impure, bound, c)?; checkContractPurityInForm(impure, bound, t)?; checkContractPurityInForm(impure, bound, e) },
+    ExWhile(c, b) -> { checkContractPurityInForm(impure, bound, c)?; checkContractPurityInForm(impure, bound, b) },
+    ExMatch(scrut, arms) -> {
+        checkContractPurityInForm(impure, bound, scrut)?;
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let ab = extendBoundWithPattern(a.pat, bound);
+                    match a.guard { Some(g) -> checkContractPurityInForm(impure, ab, g)?, None -> () };
+                    checkContractPurityInForm(impure, ab, a.body)?;
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(())
+    },
+    _ -> Ok(()),
+}
+
+def checkContractPurityInList(impure: StrMap Bool, bound: List String, es: List Form): Result Void String = match es {
+    Nil -> Ok(()),
+    Cons(h, t) -> { checkContractPurityInForm(impure, bound, h)?; checkContractPurityInList(impure, bound, t) },
+}
+
+def checkContractPurityInNamed(impure: StrMap Bool, bound: List String, fs: List (String, Form)): Result Void String = match fs {
+    Nil -> Ok(()),
+    Cons((_, v), t) -> { checkContractPurityInForm(impure, bound, v)?; checkContractPurityInNamed(impure, bound, t) },
+}
+
+def checkAllContractPurity(ctx: InferCtx, defs: List Def): Result Void String = {
+    let impure = buildImpureFnSet(ctx, defs);
+    let cd = cellNew(defs);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> checkContractPurityInForm(impure, Nil, f)?,
+                    _ -> (),
+                };
+                cellSet(cd, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(())
 }
 
 def checkExhaustivenessInNamed(ctx: InferCtx, fs: List (String, Form)): Result Void String = match fs {
@@ -4772,6 +5255,8 @@ def formCallsMutableAlloc(f: Form): Bool = match f.node {
     ExTry(e) -> formCallsMutableAlloc(e),
     ExIf(c, t, e) -> formCallsMutableAlloc(c) || formCallsMutableAlloc(t) || formCallsMutableAlloc(e),
     ExWhile(c, b) -> formCallsMutableAlloc(c) || formCallsMutableAlloc(b),
+    ExContract(_, b) -> formCallsMutableAlloc(b),
+    ExLoopContract(_, _, b) -> formCallsMutableAlloc(b),
     ExLet(_, v, b) -> formCallsMutableAlloc(v) || formCallsMutableAlloc(b),
     ExMatch(s, arms) -> {
         if (formCallsMutableAlloc(s)) true
@@ -4818,6 +5303,8 @@ def formRefsAnySet(f: Form, bound: List String, targetSet: StrMap Bool): Bool = 
     ExTry(e) -> formRefsAnySet(e, bound, targetSet),
     ExIf(c, t, e) -> formRefsAnySet(c, bound, targetSet) || formRefsAnySet(t, bound, targetSet) || formRefsAnySet(e, bound, targetSet),
     ExWhile(c, b) -> formRefsAnySet(c, bound, targetSet) || formRefsAnySet(b, bound, targetSet),
+    ExContract(_, b) -> formRefsAnySet(b, bound, targetSet),
+    ExLoopContract(_, _, b) -> formRefsAnySet(b, bound, targetSet),
     ExLet(vd, v, b) -> formRefsAnySet(v, bound, targetSet) || formRefsAnySet(b, Cons(vd.vname, bound), targetSet),
     ExMatch(s, arms) -> {
         if (formRefsAnySet(s, bound, targetSet)) true
@@ -5044,6 +5531,19 @@ def eraseFormModes(modeAdtSet: StrMap Bool, f: Form): Form = {
         ExTry(e) -> ExTry(eraseFormModes(modeAdtSet, e)),
         ExIf(c, t, e) -> ExIf(eraseFormModes(modeAdtSet, c), eraseFormModes(modeAdtSet, t), eraseFormModes(modeAdtSet, e)),
         ExWhile(c, b) -> ExWhile(eraseFormModes(modeAdtSet, c), eraseFormModes(modeAdtSet, b)),
+        ExContract(fc, b) -> {
+            let nReqs = fmap((p) -> match p { (sp, e) -> (sp, eraseFormModes(modeAdtSet, e)) }, fc.fcRequires);
+            let nDecs = fmap((p) -> match p { (sp, e) -> (sp, eraseFormModes(modeAdtSet, e)) }, fc.fcDecreases);
+            let nEns = fmap((ec: EnsuresClause) -> MkEnsuresClause {
+                ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: eraseFormModes(modeAdtSet, ec.ecExpr),
+            }, fc.fcEnsures);
+            ExContract(MkFnContract { fcRequires: nReqs, fcEnsures: nEns, fcDecreases: nDecs }, eraseFormModes(modeAdtSet, b))
+        },
+        ExLoopContract(invs, decs, b) -> {
+            let nInvs = fmap((p) -> match p { (sp, e) -> (sp, eraseFormModes(modeAdtSet, e)) }, invs);
+            let nDecs = fmap((p) -> match p { (sp, e) -> (sp, eraseFormModes(modeAdtSet, e)) }, decs);
+            ExLoopContract(nInvs, nDecs, eraseFormModes(modeAdtSet, b))
+        },
         ExAbs(ps, rt, b) -> {
             let nps = fmap((vd: VarDecl) -> MkVarDecl { vname: vd.vname, vscm: eraseSchemeModes(modeAdtSet, vd.vscm) }, ps);
             let nrt = fmap((t: Type) -> eraseTypeModes(modeAdtSet, t), rt);
@@ -5562,5 +6062,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
         }
     };
 
-    Ok(eraseInferOutput(ctx, listRev(cellGet(finalRev))))
+    let finalDefs = listRev(cellGet(finalRev));
+    checkAllContractPurity(ctx, finalDefs)?;
+    Ok(eraseInferOutput(ctx, finalDefs))
 }

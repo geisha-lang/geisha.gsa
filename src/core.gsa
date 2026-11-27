@@ -14,7 +14,7 @@ use ast.{
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     ConstraintSpec, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
     listContainsStr, sortUniqueStrings, typeToString, typesEqual,
-    Lit, LitInt, LitStr,
+    Lit, LitInt, LitStr, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
     OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
@@ -25,6 +25,7 @@ use ast.{
     Form, Expr,
     ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, FnContract,
     Item, ItForm, ItExtern,
     DefAttr, AttrExport, AttrCtor, AttrCStruct,
     Def, Span, emptySpan
@@ -33,6 +34,7 @@ use infer.{
     VariantInfo, AdtInfo, ConceptInfo, InstanceInfo, InferOutput,
     mangleType, applyExplicitSubst, buildPairMap, matchInstancePatList, isConcreteTypeSend
 }
+use diag.{diagGetFile, diagSpanLineCol}
 
 // ============================================================================
 // Core IR Data Types (Distinct single-variant field names across project)
@@ -106,6 +108,7 @@ pub data CoreProgram {
         coreCExports: List (String, String),
         coreCtors: List (String, Int),
         coreAdtReg: StrMap AdtInfo,
+        coreAdtNames: List String,
         coreEscape: EscapeInfo,
     },
 }
@@ -325,6 +328,7 @@ data KCtx {
         kConceptReg: StrMap ConceptInfo,
         kInstanceReg: List InstanceInfo,
         kConceptMethods: StrMap (String, Int),
+        kContractMode: String,
         kErr: Cell (Option String),
     },
 }
@@ -820,6 +824,39 @@ def collectAstFreeLocals(
         collectAstFreeLocals(localEnv, c, boundNames, seen, outKeys);
         collectAstFreeLocals(localEnv, b, boundNames, seen, outKeys)
     },
+    ExContract(fc, b) -> {
+        let cr = cellNew(fc.fcRequires);
+        while (match cellGet(cr) { Nil -> false, _ -> true }) {
+            match cellGet(cr) { Cons((_, e), r) -> { collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys); cellSet(cr, r) }, Nil -> () }
+        };
+        let cd = cellNew(fc.fcDecreases);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys); cellSet(cd, r) }, Nil -> () }
+        };
+        let ce = cellNew(fc.fcEnsures);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) {
+                Cons(ec, r) -> {
+                    let eb = match ec.ecBind { Some(bn) -> Cons(bn, boundNames), None -> boundNames };
+                    collectAstFreeLocals(localEnv, ec.ecExpr, eb, seen, outKeys);
+                    cellSet(ce, r)
+                },
+                Nil -> (),
+            }
+        };
+        collectAstFreeLocals(localEnv, b, boundNames, seen, outKeys)
+    },
+    ExLoopContract(invs, decs, b) -> {
+        let ci = cellNew(invs);
+        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) { Cons((_, e), r) -> { collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys); cellSet(ci, r) }, Nil -> () }
+        };
+        let cd = cellNew(decs);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) { Cons((_, e), r) -> { collectAstFreeLocals(localEnv, e, boundNames, seen, outKeys); cellSet(cd, r) }, Nil -> () }
+        };
+        collectAstFreeLocals(localEnv, b, boundNames, seen, outKeys)
+    },
     ExLet(vd, val, body) -> {
         let nextBound = Cons(vd.vname, boundNames);
         collectAstFreeLocals(localEnv, val, nextBound, seen, outKeys);
@@ -882,7 +919,211 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
         ExUn(op, e) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmUn(op, transformForm(ctx, e)) },
         ExBin(op, l, r) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmBin(op, transformForm(ctx, l), transformForm(ctx, r)) },
         ExIf(c, t, e) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmIf(transformForm(ctx, c), transformForm(ctx, t), transformForm(ctx, e)) },
-        ExWhile(c, b) -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(transformForm(ctx, c), transformForm(ctx, b)) },
+        ExWhile(c, b) -> {
+            let tc = transformForm(ctx, c);
+            match b.node {
+                ExLoopContract(invs, decs, innerBody) ->
+                    if (ctx.kContractMode == "erase") {
+                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(tc, transformForm(ctx, innerBody)) }
+                    } else if (ctx.kContractMode == "check") {
+                        let invChecksRev: Cell (List TaggedTerm) = cellNew(Nil);
+                        let ci = cellNew(invs);
+                        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                            match cellGet(ci) {
+                                Cons((isp, ie), r) -> {
+                                    cellSet(invChecksRev, Cons(mkContractCheckTerm(isp, "invariant", transformForm(ctx, ie)), cellGet(invChecksRev)));
+                                    cellSet(ci, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let invChecks = listRev(cellGet(invChecksRev));
+                        let tb = transformForm(ctx, innerBody);
+                        // Wrap loop body with decreases nonneg + strict decrease checks + invariant checks
+                        let bodyWithDec = match decs {
+                            Nil -> MkTerm { tspan: b.pos, tscm: b.ty, tnode: TmBlock(listAppend([tb], invChecks)) },
+                            Cons((dsp, de), _) -> {
+                                let dName = "__gs_dec_" + intToStr(kUnique(ctx));
+                                let dVd = MkVarDecl { vname: dName, vscm: ScmMono(TyCon("Int")) };
+                                let dVar = MkTerm { tspan: dsp, tscm: ScmMono(TyCon("Int")), tnode: TmVar(dName) };
+                                let dBefore = transformForm(ctx, de);
+                                let dAfter = transformForm(ctx, de);
+                                let nonNegChk = mkDecreasesCheckTerm(dsp, dVar);
+                                let decCond = MkTerm { tspan: dsp, tscm: ScmMono(TyCon("Bool")), tnode: TmBin(OpLt, dAfter, dVar) };
+                                let stepChk = mkContractCheckTerm(dsp, "decreases", decCond);
+                                let innerSeq = MkTerm {
+                                    tspan: b.pos, tscm: b.ty,
+                                    tnode: TmBlock(listAppend([nonNegChk, tb, stepChk], invChecks)),
+                                };
+                                MkTerm { tspan: b.pos, tscm: b.ty, tnode: TmLet(dVd, dBefore, innerSeq) }
+                            },
+                        };
+                        let wTerm = MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(tc, bodyWithDec) };
+                        match invChecks {
+                            Nil -> wTerm,
+                            _ -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmBlock(listAppend(invChecks, [wTerm])) },
+                        }
+                    } else {
+                        // `keep` mode for `geisha verify`: canonical order [invs..., decs..., innerBody]
+                        let stmtsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                        let ci = cellNew(invs);
+                        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                            match cellGet(ci) {
+                                Cons((isp, ie), r) -> {
+                                    let ivd = MkVarDecl { vname: "__gs_invariant", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyVoid)) };
+                                    cellSet(stmtsRev, Cons(MkTerm { tspan: isp, tscm: ScmMono(TyVoid), tnode: TmApplyDir(ivd, [transformForm(ctx, ie)]) }, cellGet(stmtsRev)));
+                                    cellSet(ci, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let cd = cellNew(decs);
+                        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                            match cellGet(cd) {
+                                Cons((dsp, de), r) -> {
+                                    let dvd = MkVarDecl { vname: "__gs_decreases", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyVoid)) };
+                                    cellSet(stmtsRev, Cons(MkTerm { tspan: dsp, tscm: ScmMono(TyVoid), tnode: TmApplyDir(dvd, [transformForm(ctx, de)]) }, cellGet(stmtsRev)));
+                                    cellSet(cd, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let tb = transformForm(ctx, innerBody);
+                        let loopBody = MkTerm { tspan: b.pos, tscm: b.ty, tnode: TmBlock(listAppend(listRev(cellGet(stmtsRev)), [tb])) };
+                        MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(tc, loopBody) }
+                    },
+                _ -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmWhile(tc, transformForm(ctx, b)) },
+            }
+        },
+        ExContract(fc, innerBody) ->
+            if (ctx.kContractMode == "erase") {
+                transformForm(ctx, innerBody)
+            } else if (ctx.kContractMode == "check") {
+                let prefixRev: Cell (List TaggedTerm) = cellNew(Nil);
+                let cr = cellNew(fc.fcRequires);
+                while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                    match cellGet(cr) {
+                        Cons((rsp, re), r) -> {
+                            cellSet(prefixRev, Cons(mkContractCheckTerm(rsp, "requires", transformForm(ctx, re)), cellGet(prefixRev)));
+                            cellSet(cr, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let cd = cellNew(fc.fcDecreases);
+                while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                    match cellGet(cd) {
+                        Cons((dsp, de), r) -> {
+                            cellSet(prefixRev, Cons(mkDecreasesCheckTerm(dsp, transformForm(ctx, de)), cellGet(prefixRev)));
+                            cellSet(cd, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let tBody = transformForm(ctx, innerBody);
+                let bodyWithEns = match fc.fcEnsures {
+                    Nil -> tBody,
+                    ensList -> {
+                        let resVd = MkVarDecl { vname: "__gs_res", vscm: tBody.tscm };
+                        let resVar = MkTerm { tspan: innerBody.pos, tscm: tBody.tscm, tnode: TmVar("__gs_res") };
+                        let ensChecksRev: Cell (List TaggedTerm) = cellNew(Nil);
+                        let ce = cellNew(ensList);
+                        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                            match cellGet(ce) {
+                                Cons(ec, r) -> {
+                                    let savedEnv = cellGet(ctx.kLocalEnv);
+                                    let chk = match ec.ecBind {
+                                        Some(bn) -> {
+                                            cellSet(ctx.kLocalEnv, Cons((bn, tBody.tscm), savedEnv));
+                                            let te = transformForm(ctx, ec.ecExpr);
+                                            cellSet(ctx.kLocalEnv, savedEnv);
+                                            let bvd = MkVarDecl { vname: bn, vscm: tBody.tscm };
+                                            MkTerm { tspan: ec.ecSpan, tscm: ScmMono(TyVoid), tnode: TmLet(bvd, resVar, mkContractCheckTerm(ec.ecSpan, "ensures", te)) }
+                                        },
+                                        None -> mkContractCheckTerm(ec.ecSpan, "ensures", transformForm(ctx, ec.ecExpr)),
+                                    };
+                                    cellSet(ensChecksRev, Cons(chk, cellGet(ensChecksRev)));
+                                    cellSet(ce, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let after = MkTerm {
+                            tspan: innerBody.pos, tscm: tBody.tscm,
+                            tnode: TmBlock(listAppend(listRev(cellGet(ensChecksRev)), [resVar])),
+                        };
+                        MkTerm { tspan: innerBody.pos, tscm: tBody.tscm, tnode: TmLet(resVd, tBody, after) }
+                    },
+                };
+                match cellGet(prefixRev) {
+                    Nil -> bodyWithEns,
+                    pr -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmBlock(listAppend(listRev(pr), [bodyWithEns])) },
+                }
+            } else {
+                // `keep` mode for `geisha verify`
+                let prefixRev: Cell (List TaggedTerm) = cellNew(Nil);
+                let cr = cellNew(fc.fcRequires);
+                while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                    match cellGet(cr) {
+                        Cons((rsp, re), r) -> {
+                            let rvd = MkVarDecl { vname: "__gs_requires", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyVoid)) };
+                            cellSet(prefixRev, Cons(MkTerm { tspan: rsp, tscm: ScmMono(TyVoid), tnode: TmApplyDir(rvd, [transformForm(ctx, re)]) }, cellGet(prefixRev)));
+                            cellSet(cr, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let cd = cellNew(fc.fcDecreases);
+                while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                    match cellGet(cd) {
+                        Cons((dsp, de), r) -> {
+                            let dvd = MkVarDecl { vname: "__gs_decreases", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyVoid)) };
+                            cellSet(prefixRev, Cons(MkTerm { tspan: dsp, tscm: ScmMono(TyVoid), tnode: TmApplyDir(dvd, [transformForm(ctx, de)]) }, cellGet(prefixRev)));
+                            cellSet(cd, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let tBody = transformForm(ctx, innerBody);
+                let bodyWithEns = match fc.fcEnsures {
+                    Nil -> tBody,
+                    ensList -> {
+                        let resVd = MkVarDecl { vname: "__gs_res", vscm: tBody.tscm };
+                        let resVar = MkTerm { tspan: innerBody.pos, tscm: tBody.tscm, tnode: TmVar("__gs_res") };
+                        let ensStmtsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                        let ce = cellNew(ensList);
+                        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                            match cellGet(ce) {
+                                Cons(ec, r) -> {
+                                    let evd = MkVarDecl { vname: "__gs_ensures", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyVoid)) };
+                                    let savedEnv = cellGet(ctx.kLocalEnv);
+                                    let st = match ec.ecBind {
+                                        Some(bn) -> {
+                                            cellSet(ctx.kLocalEnv, Cons((bn, tBody.tscm), savedEnv));
+                                            let te = transformForm(ctx, ec.ecExpr);
+                                            cellSet(ctx.kLocalEnv, savedEnv);
+                                            let callE = MkTerm { tspan: ec.ecSpan, tscm: ScmMono(TyVoid), tnode: TmApplyDir(evd, [te]) };
+                                            let bvd = MkVarDecl { vname: bn, vscm: tBody.tscm };
+                                            MkTerm { tspan: ec.ecSpan, tscm: ScmMono(TyVoid), tnode: TmLet(bvd, resVar, callE) }
+                                        },
+                                        None -> MkTerm { tspan: ec.ecSpan, tscm: ScmMono(TyVoid), tnode: TmApplyDir(evd, [transformForm(ctx, ec.ecExpr)]) },
+                                    };
+                                    cellSet(ensStmtsRev, Cons(st, cellGet(ensStmtsRev)));
+                                    cellSet(ce, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let after = MkTerm {
+                            tspan: innerBody.pos, tscm: tBody.tscm,
+                            tnode: TmBlock(listAppend(listRev(cellGet(ensStmtsRev)), [resVar])),
+                        };
+                        MkTerm { tspan: innerBody.pos, tscm: tBody.tscm, tnode: TmLet(resVd, tBody, after) }
+                    },
+                };
+                MkTerm { tspan: form.pos, tscm: tform, tnode: TmBlock(listAppend(listRev(cellGet(prefixRev)), [bodyWithEns])) }
+            },
+        ExLoopContract(_, _, innerBody) -> transformForm(ctx, innerBody),
         ExTry(e) -> transformForm(ctx, e),
 
         ExStructInit(cname, namedFields) -> match strMapGet(ctx.kCtorMap, cname) {
@@ -2192,6 +2433,13 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                         Nil -> isTypeConcrete(schemeBody(fd.fnScm)),
                         _ -> false,
                     };
+                    let isSeedPoly = ctx.kContractMode == "keep" && !isMono && match (schemeTypeParams(fd.fnScm), schemeConstraints(fd.fnScm)) {
+                        (Cons(_, _), Nil) -> match diagGetFile(fd.fnSpan.fileId) {
+                            Some(sf) -> !(strLen(sf.sfPath) >= 7 && strByteAt(sf.sfPath, 0) == 60),
+                            None -> false,
+                        },
+                        _ -> false,
+                    };
                     if (isMono) {
                         let cleanFd = MkFunDef {
                             fnName: fd.fnName,
@@ -2202,6 +2450,27 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                             fnBody: sanitizePhantomTerm(fd.fnBody),
                         };
                         strMapInsert(ctx.kGlobalFns, fnm, cleanFd);
+                        vecPush(queue, fnm)
+                    } else if (isSeedPoly) {
+                        let tps = schemeTypeParams(fd.fnScm);
+                        let tsub: StrMap Type = strMapNew();
+                        let ct = cellNew(tps);
+                        while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                            match cellGet(ct) {
+                                Cons(tv, rt) -> { strMapInsert(tsub, tv, TyCon("Int")); cellSet(ct, rt) },
+                                Nil -> (),
+                            }
+                        };
+                        let emptyRen: StrMap String = strMapNew();
+                        let specFn = MkFunDef {
+                            fnName: fd.fnName,
+                            fnSpan: fd.fnSpan,
+                            fnScm: ScmMono(defaultPhantomType(applyExplicitSubst(schemeBody(fd.fnScm), tsub))),
+                            fnParams: sanitizeVarDecls(specializeVarDecls(fd.fnParams, tsub)),
+                            fnFvs: sanitizeVarDecls(specializeVarDecls(fd.fnFvs, tsub)),
+                            fnBody: sanitizePhantomTerm(specializeTerm(fd.fnBody, tsub, emptyRen)),
+                        };
+                        strMapInsert(ctx.kGlobalFns, fnm, specFn);
                         vecPush(queue, fnm)
                     } else ()
                 },
@@ -4689,10 +4958,224 @@ def inlineTinyLeafFns(
 }
 
 // ============================================================================
-// Top-Level Entry Point (`lowerToCore`)
+// Contract Lowering (`erase` | `check` | `keep`)
 // ============================================================================
 
-pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Result CoreProgram String = {
+def mkUnitTerm(sp: Span): TaggedTerm =
+    MkTerm { tspan: sp, tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
+
+def formatContractLoc(sp: Span): String =
+    match diagGetFile(sp.fileId) {
+        Some(sf) -> {
+            let (ln, col) = diagSpanLineCol(sp);
+            sf.sfPath + ":" + intToStr(ln) + ":" + intToStr(col)
+        },
+        None -> "<unknown>",
+    }
+
+def mkContractFailCall(sp: Span, kind: String): TaggedTerm = {
+    let msg = kind + " violated at " + formatContractLoc(sp);
+    let failDecl = MkVarDecl {
+        vname: "__gs_contract_fail",
+        vscm: ScmMono(TyArr(TyVoid, [TyCon("String")], TyVoid)),
+    };
+    let msgTerm = MkTerm { tspan: sp, tscm: ScmMono(TyCon("String")), tnode: TmLit(LitStr(msg)) };
+    MkTerm { tspan: sp, tscm: ScmMono(TyVoid), tnode: TmApplyDir(failDecl, [msgTerm]) }
+}
+
+def mkContractCheckTerm(sp: Span, kind: String, cond: TaggedTerm): TaggedTerm =
+    MkTerm {
+        tspan: sp,
+        tscm: ScmMono(TyVoid),
+        tnode: TmIf(cond, mkUnitTerm(sp), mkContractFailCall(sp, kind)),
+    }
+
+def mkDecreasesCheckTerm(sp: Span, expr: TaggedTerm): TaggedTerm = {
+    let zero = MkTerm { tspan: sp, tscm: ScmMono(TyCon("Int")), tnode: TmLit(LitInt(0)) };
+    let cond = MkTerm { tspan: sp, tscm: ScmMono(TyCon("Bool")), tnode: TmBin(OpGe, expr, zero) };
+    mkContractCheckTerm(sp, "decreases", cond)
+}
+
+def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
+    if (mode == "keep") t
+    else {
+        let sp = t.tspan;
+        let scm = t.tscm;
+        match t.tnode {
+            TmApplyDir(vd, args) -> {
+                let nm = vd.vname;
+                if (nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "assert") {
+                    if (mode == "check") {
+                        match args {
+                            Cons(cond0, _) -> {
+                                let cond = lowerContractsInTerm(cond0, mode);
+                                let lbl =
+                                    if (nm == "__gs_requires") "requires"
+                                    else if (nm == "__gs_ensures") "ensures"
+                                    else if (nm == "__gs_invariant") "invariant"
+                                    else "assert";
+                                mkContractCheckTerm(sp, lbl, cond)
+                            },
+                            Nil -> mkUnitTerm(sp),
+                        }
+                    } else mkUnitTerm(sp)
+                } else if (nm == "__gs_decreases") {
+                    if (mode == "check") {
+                        match args {
+                            Cons(d0, _) -> mkDecreasesCheckTerm(sp, lowerContractsInTerm(d0, mode)),
+                            Nil -> mkUnitTerm(sp),
+                        }
+                    } else mkUnitTerm(sp)
+                } else if (nm == "assume") {
+                    mkUnitTerm(sp)
+                } else {
+                    MkTerm { tspan: sp, tscm: scm, tnode: TmApplyDir(vd, lowerContractsInList(args, mode)) }
+                }
+            },
+            TmTuple(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmTuple(lowerContractsInList(es, mode)) },
+            TmBlock(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBlock(lowerContractsInList(es, mode)) },
+            TmMakeCls(vd, cs, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmMakeCls(vd, cs, lowerContractsInTerm(b, mode)) },
+            TmApplyCls(c, args) -> MkTerm { tspan: sp, tscm: scm, tnode: TmApplyCls(lowerContractsInTerm(c, mode), lowerContractsInList(args, mode)) },
+            TmBin(op, l, r) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBin(op, lowerContractsInTerm(l, mode), lowerContractsInTerm(r, mode)) },
+            TmUn(op, e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmUn(op, lowerContractsInTerm(e, mode)) },
+            TmLet(vd, v, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmLet(vd, lowerContractsInTerm(v, mode), lowerContractsInTerm(b, mode)) },
+            TmIf(c, th, el) -> MkTerm { tspan: sp, tscm: scm, tnode: TmIf(lowerContractsInTerm(c, mode), lowerContractsInTerm(th, mode), lowerContractsInTerm(el, mode)) },
+            TmWhile(c, b) -> {
+                let lc = lowerContractsInTerm(c, mode);
+                if (mode == "check") {
+                    // Extract leading invariant checks to run both before the loop and at each iteration
+                    let invChecksRev: Cell (List TaggedTerm) = cellNew(Nil);
+                    let restStmts: Cell (List TaggedTerm) = cellNew(Nil);
+                    match b.tnode {
+                        TmBlock(stmts) -> {
+                            let cur = cellNew(stmts);
+                            let taking = cellNew(true);
+                            while (cellGet(taking)) {
+                                match cellGet(cur) {
+                                    Cons(st, r) -> match st.tnode {
+                                        TmApplyDir(vd, args) if (vd.vname == "__gs_invariant") -> {
+                                            match args {
+                                                Cons(ic, _) -> cellSet(invChecksRev, Cons(mkContractCheckTerm(st.tspan, "invariant", lowerContractsInTerm(ic, mode)), cellGet(invChecksRev))),
+                                                Nil -> (),
+                                            };
+                                            cellSet(cur, r)
+                                        },
+                                        _ -> {
+                                            cellSet(restStmts, Cons(st, r));
+                                            cellSet(taking, false)
+                                        },
+                                    },
+                                    Nil -> cellSet(taking, false),
+                                }
+                            }
+                        },
+                        _ -> cellSet(restStmts, [b]),
+                    };
+                    match cellGet(invChecksRev) {
+                        Nil -> MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode)) },
+                        invsR -> {
+                            let invs = listRev(invsR);
+                            let loweredRest = lowerContractsInList(cellGet(restStmts), mode);
+                            let loopBody = MkTerm { tspan: b.tspan, tscm: b.tscm, tnode: TmBlock(listAppend(loweredRest, invs)) };
+                            let wTerm = MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, loopBody) };
+                            MkTerm { tspan: sp, tscm: scm, tnode: TmBlock(listAppend(invs, [wTerm])) }
+                        },
+                    }
+                } else {
+                    MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode)) }
+                }
+            },
+            TmMatch(s, arms) -> {
+                let rev = cellNew(Nil);
+                let cur = cellNew(arms);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(a, r) -> {
+                            let ng = match a.caGuard { Some(g) -> Some(lowerContractsInTerm(g, mode)), None -> None };
+                            let nb = lowerContractsInTerm(a.caBody, mode);
+                            cellSet(rev, Cons(MkCoreArm { caPat: a.caPat, caGuard: ng, caBody: nb }, cellGet(rev)));
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                MkTerm { tspan: sp, tscm: scm, tnode: TmMatch(lowerContractsInTerm(s, mode), listRev(cellGet(rev))) }
+            },
+            TmMakeData(adt, tag, fs, ftys, targs) ->
+                MkTerm { tspan: sp, tscm: scm, tnode: TmMakeData(adt, tag, lowerContractsInList(fs, mode), ftys, targs) },
+            TmGetTag(e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmGetTag(lowerContractsInTerm(e, mode)) },
+            _ -> t,
+        }
+    }
+
+def lowerContractsInList(ts: List TaggedTerm, mode: String): List TaggedTerm = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(ts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, r) -> {
+                cellSet(rev, Cons(lowerContractsInTerm(h, mode), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def lowerContractsInProgramFns(
+    fns: StrMap FunDef,
+    fnNames: List String,
+    globals: List GlobalValDef,
+    mode: String
+): (StrMap FunDef, List GlobalValDef) =
+    if (mode == "keep") (fns, globals)
+    else {
+        let outFns: StrMap FunDef = strMapNew();
+        let cf = cellNew(fnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(nm, r) -> {
+                    match strMapGet(fns, nm) {
+                        Some(fd) -> strMapInsert(outFns, nm, MkFunDef {
+                            fnName: fd.fnName,
+                            fnSpan: fd.fnSpan,
+                            fnScm: fd.fnScm,
+                            fnParams: fd.fnParams,
+                            fnFvs: fd.fnFvs,
+                            fnBody: lowerContractsInTerm(fd.fnBody, mode),
+                        }),
+                        None -> (),
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        let outGlobalsRev: Cell (List GlobalValDef) = cellNew(Nil);
+        let cg = cellNew(globals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, r) -> {
+                    cellSet(outGlobalsRev, Cons(MkGlobalValDef {
+                        gvName: g.gvName,
+                        gvSpan: g.gvSpan,
+                        gvTy: g.gvTy,
+                        gvInit: lowerContractsInTerm(g.gvInit, mode),
+                    }, cellGet(outGlobalsRev)));
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
+        };
+        (outFns, listRev(cellGet(outGlobalsRev)))
+    }
+
+// ============================================================================
+// Top-Level Entry Point (`lowerToCore`, `lowerToCoreOpt`, `lowerToCoreMode`, `lowerToCoreOptMode`, `lowerToCoreForCheck`)
+// ============================================================================
+
+pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, contractMode: String): Result CoreProgram String = {
     let ctorMap: StrMap (String, VariantInfo) = strMapNew();
     let ai = cellNew(0);
     while (cellGet(ai) < vecLen(inf.adtNames)) {
@@ -4753,6 +5236,7 @@ pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Resu
         kConceptReg: inf.conceptReg,
         kInstanceReg: inf.instanceReg,
         kConceptMethods: inf.conceptMethods,
+        kContractMode: contractMode,
         kErr: cellNew(None),
     };
 
@@ -4841,10 +5325,11 @@ pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Resu
     match cellGet(ctx.kErr) {
         Some(emsg) -> Err(emsg),
         None -> {
-            let (concreteFns, concreteNames, concreteGlobals0) = runMonomorphizationWorklist(ctx);
+            let (concreteFns0, concreteNames, concreteGlobals0) = runMonomorphizationWorklist(ctx);
+            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames, concreteGlobals0, contractMode);
             let concreteGlobals =
-                if (runInline) inlineTinyLeafFns(concreteFns, concreteNames, concreteGlobals0, ctx.kExterns)
-                else concreteGlobals0;
+                if (runInline && contractMode != "keep") inlineTinyLeafFns(concreteFns, concreteNames, concreteGlobals1, ctx.kExterns)
+                else concreteGlobals1;
             verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
             let escapeInfo =
                 if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames)
@@ -4853,6 +5338,13 @@ pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Resu
                     escFnStackVars: strMapNew(),
                     escFnHasStack: strMapNew(),
                 };
+
+            let adtNamesListRev: Cell (List String) = cellNew(Nil);
+            let anIdx = cellNew(0);
+            while (cellGet(anIdx) < vecLen(inf.adtNames)) {
+                cellSet(adtNamesListRev, Cons(vecGetOr(inf.adtNames, cellGet(anIdx), ""), cellGet(adtNamesListRev)));
+                cellSet(anIdx, cellGet(anIdx) + 1)
+            };
 
             Ok(MkCoreProgram {
                 coreFns: concreteFns,
@@ -4863,6 +5355,7 @@ pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Resu
                 coreCExports: listRev(cellGet(cExportsRev)),
                 coreCtors: listRev(cellGet(ctorsRev)),
                 coreAdtReg: inf.adtReg,
+                coreAdtNames: listRev(cellGet(adtNamesListRev)),
                 coreEscape: escapeInfo,
             })
         },
@@ -4870,9 +5363,15 @@ pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Resu
 }
 
 pub def lowerToCore(inf: InferOutput): Result CoreProgram String =
-    lowerToCoreOpt(inf, true, true)
+    lowerToCoreOptMode(inf, true, true, "erase")
+
+pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Result CoreProgram String =
+    lowerToCoreOptMode(inf, runEscape, runInline, "erase")
+
+pub def lowerToCoreMode(inf: InferOutput, contractMode: String): Result CoreProgram String =
+    lowerToCoreOptMode(inf, true, contractMode != "keep", contractMode)
 
 pub def lowerToCoreForCheck(inf: InferOutput): Result Void String = {
-    let _ = lowerToCoreOpt(inf, false, false)?;
+    let _ = lowerToCoreOptMode(inf, false, false, "erase")?;
     Ok(())
 }

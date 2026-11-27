@@ -28,6 +28,7 @@ use ast.{
     MatchArm, Form,
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, FnContract,
     VariantBody, VarStruct, VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     Def, UseSpec, useSpecLocalName,
@@ -46,7 +47,7 @@ use loader.{
 }
 use infer.{InferOutput, inferProgram, preludePrimSpecs}
 use core.lowerToCoreForCheck
-use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
+use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig, formatContractLinesFromSrc}
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, sanitizeIdentAlias}
 
@@ -996,6 +997,32 @@ def searchFormAt(src: String, f: Form, fileId: Int, off: Int, locals: List Local
             searchFormAt(src, c, fileId, off, locals, best);
             searchFormAt(src, b, fileId, off, locals, best)
         },
+        ExContract(fc, b) -> {
+            let cr = cellNew(fc.fcRequires);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cr, r) }, Nil -> () }
+            };
+            let cd = cellNew(fc.fcDecreases);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cd, r) }, Nil -> () }
+            };
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) { Cons(ec, r) -> { searchFormAt(src, ec.ecExpr, fileId, off, locals, best); cellSet(ce, r) }, Nil -> () }
+            };
+            searchFormAt(src, b, fileId, off, locals, best)
+        },
+        ExLoopContract(invs, decs, b) -> {
+            let ci = cellNew(invs);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(ci, r) }, Nil -> () }
+            };
+            let cd = cellNew(decs);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cd, r) }, Nil -> () }
+            };
+            searchFormAt(src, b, fileId, off, locals, best)
+        },
         ExMatch(scrut, arms) -> {
             searchFormAt(src, scrut, fileId, off, locals, best);
             let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
@@ -1286,9 +1313,26 @@ def hoverForWordInScope(doc: DocState, inf: InferOutput, locals: List LocalBind,
         },
         None -> match lookupDefLoose(inf.defs, word) {
             Some(d) -> {
-                let sig = match d.item {
+                let baseSig = match d.item {
                     ItForm(f) -> shortSymName(d.ident) + ": " + formatScheme(f.ty),
                     _ -> formatDefSig(d),
+                };
+                let sig = match d.item {
+                    ItForm(f) -> match f.node {
+                        ExAbs(_, _, body) -> {
+                            let srcForDef =
+                                if (d.dpos.fileId > 0 && d.dpos.fileId <= vecLen(doc.dsFiles)) {
+                                    vecGetOr(doc.dsFiles, d.dpos.fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }).sfContent
+                                } else doc.dsText;
+                            let clines = formatContractLinesFromSrc(srcForDef, body);
+                            match clines {
+                                Nil -> baseSig,
+                                _ -> baseSig + "\n" + strJoin(clines, "\n"),
+                            }
+                        },
+                        _ -> baseSig,
+                    },
+                    _ -> baseSig,
                 };
                 let docStr = docForDef(doc.dsFiles, d);
                 Some(makeHoverResult(formatHoverBlock(sig, docStr), wrng))

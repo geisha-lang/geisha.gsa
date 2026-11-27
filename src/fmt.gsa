@@ -57,6 +57,9 @@ data FTok {
 
 def emptyFTok(): FTok = MkFTok { kind: FtNewline, raw: "" }
 
+def isContractClauseWord(w: String): Bool =
+    w == "requires" || w == "ensures" || w == "invariant" || w == "decreases"
+
 def isKeywordWord(w: String): Bool =
     w == "def"
     || w == "extern"
@@ -707,11 +710,23 @@ def formatLineTokens(
                 _ -> false,
             };
 
+        let isEnsuresPipeOpen =
+            match cellGet(prevTokOpt) {
+                Some(prev) -> prev.raw == "|" && idx >= 2 && vecGetOr(line, idx - 2, emptyFTok()).raw == "ensures",
+                None -> false,
+            };
+        let isEnsuresPipeClose =
+            cur.raw == "|" && idx >= 3
+            && vecGetOr(line, idx - 2, emptyFTok()).raw == "|"
+            && vecGetOr(line, idx - 3, emptyFTok()).raw == "ensures";
+
         // Decide whether to emit a space before `cur`
         let needSpace = match cellGet(prevTokOpt) {
             None -> false,
             Some(prev) ->
-                if (cellGet(prevWasUnary)) {
+                if (isEnsuresPipeOpen || isEnsuresPipeClose) {
+                    false
+                } else if (cellGet(prevWasUnary)) {
                     // Keep space between consecutive unary prefix operators (e.g. `~ -x`, `- -x`, `! !b`)
                     match cur.kind {
                         FtSym -> true,
@@ -1012,17 +1027,22 @@ pub def formatSource(src: String): String = {
                     } else {
                         let fc = lineFirstCodeIdx(ln);
                         let firstCode = vecGetOr(ln, fc, emptyFTok());
-                        if (isDeclOrStmtKeyword(firstCode.raw)) {
-                            clearHanging(top)
-                        } else if (firstCode.raw == "else") {
-                            cellSet(top.ifHanging, false);
-                            cellSet(top.contHanging, false)
-                        } else if (isBinaryContStartTok(firstCode, cellGet(prevLineEndedWithValue))) {
-                            if ((top.delim == 0 || top.delim == 123) && !cellGet(top.eqHanging) && !cellGet(top.ifHanging)) {
-                                cellSet(top.contHanging, true)
-                            } else ()
-                        } else ();
-                        frameIndent(top)
+                        if (isContractClauseWord(firstCode.raw)) {
+                            clearHanging(top);
+                            top.baseIndent + 1
+                        } else {
+                            if (isDeclOrStmtKeyword(firstCode.raw)) {
+                                clearHanging(top)
+                            } else if (firstCode.raw == "else") {
+                                cellSet(top.ifHanging, false);
+                                cellSet(top.contHanging, false)
+                            } else if (isBinaryContStartTok(firstCode, cellGet(prevLineEndedWithValue))) {
+                                if ((top.delim == 0 || top.delim == 123) && !cellGet(top.eqHanging) && !cellGet(top.ifHanging)) {
+                                    cellSet(top.contHanging, true)
+                                } else ()
+                            } else ();
+                            frameIndent(top)
+                        }
                     };
 
                 pushIndent(out, lineIndent);

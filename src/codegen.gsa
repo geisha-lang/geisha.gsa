@@ -2218,7 +2218,14 @@ def tryEmitIntrinsic(
     locals: List (String, VarSlot),
     directLetVar: Option String
 ): Option String = {
-    if (name == "__blackBox") {
+    if (name == "__gs_contract_fail") {
+        let a0 = nthArgTerm(args, 0);
+        let msgVal = genExpr(mctx, fctx, a0, locals, false);
+        emitLine(fctx, "call void @gs_contract_fail(ptr " + msgVal + ")");
+        Some("0")
+    } else if (name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases" || name == "assert" || name == "assume") {
+        Some("0")
+    } else if (name == "__blackBox") {
         let a0 = nthArgTerm(args, 0);
         let argVal = genExpr(mctx, fctx, a0, locals, false);
         let valTy = schemeBody(a0.tscm);
@@ -4863,6 +4870,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_contract_fail", "declare void @gs_contract_fail(ptr) cold noreturn nounwind"),
         ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
         ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
@@ -4935,6 +4943,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_contract_fail", "declare void @gs_contract_fail(ptr) cold noreturn nounwind"),
         ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
         ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
