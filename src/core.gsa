@@ -8,7 +8,7 @@ use std.list.{listRev, listAppend, listLen}
 use std.control.{fmap, (>>=)}
 use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
-use std.str.intToStr
+use std.str.{intToStr, strStartsWith}
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
@@ -4125,10 +4125,574 @@ pub def isRecursiveAdt(esc: EscapeInfo, adtName: String): Bool =
     strMapContains(esc.escRecAdts, adtName)
 
 // ============================================================================
+// Tiny Non-Recursive Leaf Inliner (`inlineTinyLeafFns`)
+// ============================================================================
+
+def typeBlocksInline(ty: Type): Bool = match ty {
+    TyVar(_) -> true,
+    TyVoid -> false,
+    TyCon(n) ->
+        n == "ScopedPtr" || n == "Arena"
+        || n == "$Local" || n == "$Shared" || n == "$Scoped",
+    TyArr(_, _, _) -> true,
+    TyTuple(es) -> typeListBlocksInline(es),
+    TyComp(b, a) -> {
+        let blockedHead = match b {
+            TyCon(bn) -> bn == "Cell" || bn == "ScopedPtr" || bn == "Arena",
+            _ -> false,
+        };
+        blockedHead || typeBlocksInline(b) || typeBlocksInline(a)
+    },
+}
+
+def typeListBlocksInline(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> typeBlocksInline(h) || typeListBlocksInline(t),
+}
+
+def varDeclListBlocksInline(vds: List VarDecl): Bool = match vds {
+    Nil -> false,
+    Cons(vd, r) -> typeBlocksInline(schemeBody(vd.vscm)) || varDeclListBlocksInline(r),
+}
+
+def isInlineSafeIntrinsic(name: String): Bool =
+    name == "arrayLen" || name == "arrayGet" || name == "arraySet"
+    || name == "immArrayLen" || name == "immArrayGet"
+    || name == "strLen" || name == "strByteAt"
+    || name == "bitAnd" || name == "bitAnd64" || name == "bitOr" || name == "bitOr64"
+    || name == "bitXor" || name == "bitXor64" || name == "bitNot" || name == "bitNot64"
+    || name == "bitShl" || name == "bitShr" || name == "bitUshr"
+    || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
+    || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
+    || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
+    || name == "intToFloat" || name == "floatToInt"
+    || name == "floatToF32" || name == "f32ToFloat" || name == "intToF32" || name == "f32ToInt"
+    || name == "f32ToBits32" || name == "bits32ToF32"
+    || name == "mathExp" || name == "mathLog" || name == "mathSqrt" || name == "mathSin" || name == "mathCos"
+    || name == "mathTanh" || name == "mathPow" || name == "mathAbs" || name == "mathFloor" || name == "mathCeil" || name == "mathFma"
+    || name == "mathExpF32" || name == "mathLogF32" || name == "mathSqrtF32" || name == "mathSinF32" || name == "mathCosF32"
+    || name == "mathTanhF32" || name == "mathPowF32" || name == "mathAbsF32" || name == "mathFloorF32" || name == "mathCeilF32" || name == "mathFmaF32"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64"
+    || name == "ptrByteAt" || name == "ptrSetByte"
+
+def leafPatOk(pat: Pattern): Bool = match pat {
+    PatWild -> true,
+    PatLit(_) -> true,
+    PatVar(_) -> true,
+    PatTuple(ps) -> leafPatListOk(ps),
+    PatCtor(_, ps) -> leafPatListOk(ps),
+    PatStruct(_, _) -> false,
+}
+
+def leafPatListOk(ps: List Pattern): Bool = match ps {
+    Nil -> true,
+    Cons(p, r) -> leafPatOk(p) && leafPatListOk(r),
+}
+
+def leafTermCost(tm: TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Int = {
+    let ty = schemeBody(tm.tscm);
+    if (!isTypeConcrete(ty) || typeBlocksInline(ty)) -1
+    else match tm.tnode {
+        TmLit(_) -> 1,
+        TmVar(_) -> 1,
+        TmGlobalVar(_) -> -1,
+        TmMakeCls(_, _, _) -> -1,
+        TmApplyCls(_, _) -> -1,
+        TmWhile(_, _) -> -1,
+        TmTuple(es) -> {
+            let c = leafTermListCost(es, fns, externs);
+            if (c < 0) -1 else 1 + c
+        },
+        TmBlock(es) -> {
+            let c = leafTermListCost(es, fns, externs);
+            if (c < 0) -1 else 1 + c
+        },
+        TmApplyDir(vd, args) ->
+            if (strMapContains(fns, vd.vname) || strMapContains(externs, vd.vname) || !isInlineSafeIntrinsic(vd.vname)) -1
+            else {
+                let c = leafTermListCost(args, fns, externs);
+                if (c < 0) -1 else 1 + c
+            },
+        TmBin(_, l, r) -> {
+            let cl = leafTermCost(l, fns, externs);
+            let cr = leafTermCost(r, fns, externs);
+            if (cl < 0 || cr < 0) -1 else 1 + cl + cr
+        },
+        TmUn(_, e1) -> {
+            let c1 = leafTermCost(e1, fns, externs);
+            if (c1 < 0) -1 else 1 + c1
+        },
+        TmLet(vd, e1, e2) ->
+            if (typeBlocksInline(schemeBody(vd.vscm))) -1
+            else {
+                let c1 = leafTermCost(e1, fns, externs);
+                let c2 = leafTermCost(e2, fns, externs);
+                if (c1 < 0 || c2 < 0) -1 else 1 + c1 + c2
+            },
+        TmIf(cnd, thn, els) -> {
+            let cc = leafTermCost(cnd, fns, externs);
+            let ct = leafTermCost(thn, fns, externs);
+            let ce = leafTermCost(els, fns, externs);
+            if (cc < 0 || ct < 0 || ce < 0) -1 else 1 + cc + ct + ce
+        },
+        TmMatch(scrut, arms) ->
+            if (listLen(arms) > 4) -1
+            else {
+                let cs = leafTermCost(scrut, fns, externs);
+                let ca = leafArmListCost(arms, fns, externs);
+                if (cs < 0 || ca < 0) -1 else 1 + cs + ca
+            },
+        TmMakeData(_, _, args, fTys, tArgs) ->
+            if (typeListBlocksInline(fTys) || typeListBlocksInline(tArgs)) -1
+            else {
+                let c = leafTermListCost(args, fns, externs);
+                if (c < 0) -1 else 1 + c
+            },
+        TmGetTag(e1) -> {
+            let c1 = leafTermCost(e1, fns, externs);
+            if (c1 < 0) -1 else 1 + c1
+        },
+    }
+}
+
+def leafTermListCost(es: List TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Int = match es {
+    Nil -> 0,
+    Cons(h, t) -> {
+        let ch = leafTermCost(h, fns, externs);
+        if (ch < 0) -1
+        else {
+            let ct = leafTermListCost(t, fns, externs);
+            if (ct < 0) -1 else ch + ct
+        }
+    },
+}
+
+def leafArmListCost(arms: List CoreArm, fns: StrMap FunDef, externs: StrMap ExternDef): Int = match arms {
+    Nil -> 0,
+    Cons(a, r) ->
+        if (!leafPatOk(a.caPat)) -1
+        else {
+            let cg = match a.caGuard {
+                Some(g) -> leafTermCost(g, fns, externs),
+                None -> 0,
+            };
+            let cb = leafTermCost(a.caBody, fns, externs);
+            if (cg < 0 || cb < 0) -1
+            else {
+                let cr = leafArmListCost(r, fns, externs);
+                if (cr < 0) -1 else 1 + cg + cb + cr
+            }
+        },
+}
+
+def isEligibleTinyLeafFn(fd: FunDef, fns: StrMap FunDef, externs: StrMap ExternDef): Bool =
+    if (fd.fnName == "main" || strStartsWith(fd.fnName, "__ctor_")) false
+    else match fd.fnFvs {
+        Cons(_, _) -> false,
+        Nil -> {
+            let fnTy = schemeBody(fd.fnScm);
+            match fnTy {
+                TyArr(_, _, retTy) ->
+                    if (!isTypeConcrete(fnTy) || typeBlocksInline(retTy) || varDeclListBlocksInline(fd.fnParams)) false
+                    else {
+                        let cost = leafTermCost(fd.fnBody, fns, externs);
+                        cost >= 1 && cost <= 14
+                    },
+                _ -> false,
+            }
+        },
+    }
+
+def inlineModPrefix(fnName: String): String = {
+    let n = strLen(fnName);
+    let lastDot = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(fnName, cellGet(i));
+        if (b == 36) cellSet(i, n)
+        else {
+            if (b == 46) cellSet(lastDot, cellGet(i)) else ();
+            cellSet(i, cellGet(i) + 1)
+        }
+    };
+    let d = cellGet(lastDot);
+    if (d > 0) strSlice(fnName, 0, d) else ""
+}
+
+def canInlineIntoCaller(callerName: String, calleeName: String): Bool =
+    strStartsWith(calleeName, "std.")
+    || strStartsWith(calleeName, "__inst_")
+    || inlineModPrefix(callerName) == inlineModPrefix(calleeName)
+
+def lookupInlineEnv(env: List (String, String), name: String): String = match env {
+    Nil -> name,
+    Cons((k, v), r) -> if (k == name) v else lookupInlineEnv(r, name),
+}
+
+def alphaClonePat(pat: Pattern, pref: String, env: List (String, String)): (Pattern, List (String, String)) = match pat {
+    PatWild -> (PatWild, env),
+    PatLit(l) -> (PatLit(l), env),
+    PatVar(v) -> {
+        let fv = pref + v;
+        (PatVar(fv), Cons((v, fv), env))
+    },
+    PatTuple(ps) -> {
+        let (ps2, env2) = alphaClonePatList(ps, pref, env);
+        (PatTuple(ps2), env2)
+    },
+    PatCtor(cn, ps) -> {
+        let (ps2, env2) = alphaClonePatList(ps, pref, env);
+        (PatCtor(cn, ps2), env2)
+    },
+    PatStruct(cn, fs) -> (PatStruct(cn, fs), env),
+}
+
+def alphaClonePatList(
+    ps: List Pattern,
+    pref: String,
+    env: List (String, String)
+): (List Pattern, List (String, String)) = match ps {
+    Nil -> (Nil, env),
+    Cons(p, r) -> {
+        let (p2, env1) = alphaClonePat(p, pref, env);
+        let (r2, env2) = alphaClonePatList(r, pref, env1);
+        (Cons(p2, r2), env2)
+    },
+}
+
+def alphaCloneTerm(tm: TaggedTerm, pref: String, env: List (String, String), sp: Span): TaggedTerm = {
+    let nd = match tm.tnode {
+        TmLit(l) -> TmLit(l),
+        TmVar(v) -> TmVar(lookupInlineEnv(env, v)),
+        TmGlobalVar(g) -> TmGlobalVar(g),
+        TmTuple(es) -> TmTuple(alphaCloneTermList(es, pref, env, sp)),
+        TmBlock(es) -> TmBlock(alphaCloneTermList(es, pref, env, sp)),
+        TmMakeCls(vd, cls, body) -> TmMakeCls(vd, cls, alphaCloneTerm(body, pref, env, sp)),
+        TmApplyCls(c, args) -> TmApplyCls(alphaCloneTerm(c, pref, env, sp), alphaCloneTermList(args, pref, env, sp)),
+        TmApplyDir(vd, args) -> TmApplyDir(vd, alphaCloneTermList(args, pref, env, sp)),
+        TmBin(op, l, r) -> TmBin(op, alphaCloneTerm(l, pref, env, sp), alphaCloneTerm(r, pref, env, sp)),
+        TmUn(op, e1) -> TmUn(op, alphaCloneTerm(e1, pref, env, sp)),
+        TmLet(vd, e1, e2) -> {
+            let e1c = alphaCloneTerm(e1, pref, env, sp);
+            let fv = pref + vd.vname;
+            let vd2 = MkVarDecl { vname: fv, vscm: vd.vscm };
+            let e2c = alphaCloneTerm(e2, pref, Cons((vd.vname, fv), env), sp);
+            TmLet(vd2, e1c, e2c)
+        },
+        TmIf(c, t, e) -> TmIf(alphaCloneTerm(c, pref, env, sp), alphaCloneTerm(t, pref, env, sp), alphaCloneTerm(e, pref, env, sp)),
+        TmWhile(c, b) -> TmWhile(alphaCloneTerm(c, pref, env, sp), alphaCloneTerm(b, pref, env, sp)),
+        TmMatch(s, arms) -> TmMatch(alphaCloneTerm(s, pref, env, sp), alphaCloneArmList(arms, pref, env, sp)),
+        TmMakeData(cn, tag, args, fTys, tArgs) ->
+            TmMakeData(cn, tag, alphaCloneTermList(args, pref, env, sp), fTys, tArgs),
+        TmGetTag(e1) -> TmGetTag(alphaCloneTerm(e1, pref, env, sp)),
+    };
+    MkTerm { tspan: sp, tscm: tm.tscm, tnode: nd }
+}
+
+def alphaCloneTermList(
+    es: List TaggedTerm,
+    pref: String,
+    env: List (String, String),
+    sp: Span
+): List TaggedTerm = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(alphaCloneTerm(h, pref, env, sp), alphaCloneTermList(t, pref, env, sp)),
+}
+
+def alphaCloneArmList(
+    arms: List CoreArm,
+    pref: String,
+    env: List (String, String),
+    sp: Span
+): List CoreArm = match arms {
+    Nil -> Nil,
+    Cons(a, r) -> {
+        let (pat2, envArm) = alphaClonePat(a.caPat, pref, env);
+        let g2 = match a.caGuard {
+            Some(g) -> Some(alphaCloneTerm(g, pref, envArm, sp)),
+            None -> None,
+        };
+        let b2 = alphaCloneTerm(a.caBody, pref, envArm, sp);
+        Cons(MkCoreArm { caPat: pat2, caGuard: g2, caBody: b2 }, alphaCloneArmList(r, pref, env, sp))
+    },
+}
+
+def inlineParamsMatchArgs(ps: List VarDecl, args: List TaggedTerm): Bool = match (ps, args) {
+    (Nil, Nil) -> true,
+    (Cons(p, pr), Cons(a, ar)) ->
+        typesEqual(schemeBody(p.vscm), schemeBody(a.tscm)) && inlineParamsMatchArgs(pr, ar),
+    _ -> false,
+}
+
+def buildParamInlineEnv(ps: List VarDecl, pref: String): List (String, String) = match ps {
+    Nil -> Nil,
+    Cons(p, r) -> Cons((p.vname, pref + p.vname), buildParamInlineEnv(r, pref)),
+}
+
+def wrapInlinedParamLets(
+    ps: List VarDecl,
+    args: List TaggedTerm,
+    pref: String,
+    body: TaggedTerm,
+    sp: Span,
+    resScm: Scheme
+): TaggedTerm = match (ps, args) {
+    (Cons(p, pr), Cons(a, ar)) -> {
+        let inner = wrapInlinedParamLets(pr, ar, pref, body, sp, resScm);
+        let vd = MkVarDecl { vname: pref + p.vname, vscm: ScmMono(schemeBody(a.tscm)) };
+        MkTerm { tspan: sp, tscm: resScm, tnode: TmLet(vd, a, inner) }
+    },
+    _ -> body,
+}
+
+def rewriteTermInlineLeaves(
+    callerName: String,
+    tm: TaggedTerm,
+    leaves: StrMap FunDef,
+    counter: Cell Int
+): TaggedTerm = {
+    let sp = tm.tspan;
+    let sc = tm.tscm;
+    match tm.tnode {
+        TmLit(_) -> tm,
+        TmVar(_) -> tm,
+        TmGlobalVar(_) -> tm,
+        TmTuple(es) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmTuple(rewriteTermListInlineLeaves(callerName, es, leaves, counter)),
+        },
+        TmBlock(es) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmBlock(rewriteTermListInlineLeaves(callerName, es, leaves, counter)),
+        },
+        TmMakeCls(vd, cls, body) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmMakeCls(vd, cls, rewriteTermInlineLeaves(callerName, body, leaves, counter)),
+        },
+        TmApplyCls(c, args) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmApplyCls(
+                rewriteTermInlineLeaves(callerName, c, leaves, counter),
+                rewriteTermListInlineLeaves(callerName, args, leaves, counter)
+            ),
+        },
+        TmApplyDir(vd, args) -> {
+            let args2 = rewriteTermListInlineLeaves(callerName, args, leaves, counter);
+            match strMapGet(leaves, vd.vname) {
+                Some(callee) ->
+                    if (
+                        callerName != callee.fnName
+                        && canInlineIntoCaller(callerName, callee.fnName)
+                        && typesEqual(schemeBody(sc), schemeBody(callee.fnBody.tscm))
+                        && inlineParamsMatchArgs(callee.fnParams, args2)
+                    ) {
+                        let id = cellGet(counter);
+                        cellSet(counter, id + 1);
+                        let pref = "$inl$" + intToStr(id) + "$";
+                        let pEnv = buildParamInlineEnv(callee.fnParams, pref);
+                        let cloned = alphaCloneTerm(callee.fnBody, pref, pEnv, sp);
+                        wrapInlinedParamLets(callee.fnParams, args2, pref, cloned, sp, sc)
+                    } else MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args2) },
+                None -> MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args2) },
+            }
+        },
+        TmBin(op, l, r) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmBin(
+                op,
+                rewriteTermInlineLeaves(callerName, l, leaves, counter),
+                rewriteTermInlineLeaves(callerName, r, leaves, counter)
+            ),
+        },
+        TmUn(op, e1) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmUn(op, rewriteTermInlineLeaves(callerName, e1, leaves, counter)),
+        },
+        TmLet(vd, e1, e2) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmLet(
+                vd,
+                rewriteTermInlineLeaves(callerName, e1, leaves, counter),
+                rewriteTermInlineLeaves(callerName, e2, leaves, counter)
+            ),
+        },
+        TmIf(c, t, e) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmIf(
+                rewriteTermInlineLeaves(callerName, c, leaves, counter),
+                rewriteTermInlineLeaves(callerName, t, leaves, counter),
+                rewriteTermInlineLeaves(callerName, e, leaves, counter)
+            ),
+        },
+        TmWhile(c, b) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmWhile(
+                rewriteTermInlineLeaves(callerName, c, leaves, counter),
+                rewriteTermInlineLeaves(callerName, b, leaves, counter)
+            ),
+        },
+        TmMatch(s, arms) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmMatch(
+                rewriteTermInlineLeaves(callerName, s, leaves, counter),
+                rewriteArmListInlineLeaves(callerName, arms, leaves, counter)
+            ),
+        },
+        TmMakeData(cn, tag, args, fTys, tArgs) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmMakeData(cn, tag, rewriteTermListInlineLeaves(callerName, args, leaves, counter), fTys, tArgs),
+        },
+        TmGetTag(e1) -> MkTerm {
+            tspan: sp,
+            tscm: sc,
+            tnode: TmGetTag(rewriteTermInlineLeaves(callerName, e1, leaves, counter)),
+        },
+    }
+}
+
+def rewriteTermListInlineLeaves(
+    callerName: String,
+    es: List TaggedTerm,
+    leaves: StrMap FunDef,
+    counter: Cell Int
+): List TaggedTerm = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(
+        rewriteTermInlineLeaves(callerName, h, leaves, counter),
+        rewriteTermListInlineLeaves(callerName, t, leaves, counter)
+    ),
+}
+
+def rewriteArmListInlineLeaves(
+    callerName: String,
+    arms: List CoreArm,
+    leaves: StrMap FunDef,
+    counter: Cell Int
+): List CoreArm = match arms {
+    Nil -> Nil,
+    Cons(a, r) -> {
+        let g2 = match a.caGuard {
+            Some(g) -> Some(rewriteTermInlineLeaves(callerName, g, leaves, counter)),
+            None -> None,
+        };
+        let b2 = rewriteTermInlineLeaves(callerName, a.caBody, leaves, counter);
+        Cons(
+            MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: b2 },
+            rewriteArmListInlineLeaves(callerName, r, leaves, counter)
+        )
+    },
+}
+
+def inlineTinyLeafFns(
+    fns: StrMap FunDef,
+    fnNames: List String,
+    globals: List GlobalValDef,
+    externs: StrMap ExternDef
+): List GlobalValDef = {
+    let fnCounters: StrMap (Cell Int) = strMapNew();
+    let pass = cellNew(0);
+    let curGlobals = cellNew(globals);
+    while (cellGet(pass) < 2) {
+        let leaves: StrMap FunDef = strMapNew();
+        let leafCount = cellNew(0);
+        let cf0 = cellNew(fnNames);
+        while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+            match cellGet(cf0) {
+                Cons(fnm, r) -> {
+                    match strMapGet(fns, fnm) {
+                        Some(fd) ->
+                            if (isEligibleTinyLeafFn(fd, fns, externs)) {
+                                strMapInsert(leaves, fnm, fd);
+                                cellSet(leafCount, cellGet(leafCount) + 1)
+                            } else (),
+                        None -> (),
+                    };
+                    cellSet(cf0, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(leafCount) > 0) {
+            let cf1 = cellNew(fnNames);
+            while (match cellGet(cf1) { Nil -> false, _ -> true }) {
+                match cellGet(cf1) {
+                    Cons(fnm, r) -> {
+                        match strMapGet(fns, fnm) {
+                            Some(fd) -> {
+                                let cnt = match strMapGet(fnCounters, fnm) {
+                                    Some(c) -> c,
+                                    None -> {
+                                        let c = cellNew(0);
+                                        strMapInsert(fnCounters, fnm, c);
+                                        c
+                                    },
+                                };
+                                let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, leaves, cnt);
+                                strMapInsert(fns, fnm, MkFunDef {
+                                    fnName: fd.fnName,
+                                    fnSpan: fd.fnSpan,
+                                    fnScm: fd.fnScm,
+                                    fnParams: fd.fnParams,
+                                    fnFvs: fd.fnFvs,
+                                    fnBody: newBody,
+                                })
+                            },
+                            None -> (),
+                        };
+                        cellSet(cf1, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let globCnt = match strMapGet(fnCounters, "$globals") {
+                Some(c) -> c,
+                None -> {
+                    let c = cellNew(0);
+                    strMapInsert(fnCounters, "$globals", c);
+                    c
+                },
+            };
+            let newGlobsRev = cellNew(Nil);
+            let cg = cellNew(cellGet(curGlobals));
+            while (match cellGet(cg) { Nil -> false, _ -> true }) {
+                match cellGet(cg) {
+                    Cons(gv, r) -> {
+                        let newInit = rewriteTermInlineLeaves("", gv.gvInit, leaves, globCnt);
+                        cellSet(newGlobsRev, Cons(MkGlobalValDef {
+                            gvName: gv.gvName,
+                            gvSpan: gv.gvSpan,
+                            gvTy: gv.gvTy,
+                            gvInit: newInit,
+                        }, cellGet(newGlobsRev)));
+                        cellSet(cg, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellSet(curGlobals, listRev(cellGet(newGlobsRev)))
+        } else ();
+        cellSet(pass, cellGet(pass) + 1)
+    };
+    cellGet(curGlobals)
+}
+
+// ============================================================================
 // Top-Level Entry Point (`lowerToCore`)
 // ============================================================================
 
-def lowerToCoreOpts(inf: InferOutput, runEscape: Bool): Result CoreProgram String = {
+pub def lowerToCoreOpt(inf: InferOutput, runEscape: Bool, runInline: Bool): Result CoreProgram String = {
     let ctorMap: StrMap (String, VariantInfo) = strMapNew();
     let ai = cellNew(0);
     while (cellGet(ai) < vecLen(inf.adtNames)) {
@@ -4277,7 +4841,10 @@ def lowerToCoreOpts(inf: InferOutput, runEscape: Bool): Result CoreProgram Strin
     match cellGet(ctx.kErr) {
         Some(emsg) -> Err(emsg),
         None -> {
-            let (concreteFns, concreteNames, concreteGlobals) = runMonomorphizationWorklist(ctx);
+            let (concreteFns, concreteNames, concreteGlobals0) = runMonomorphizationWorklist(ctx);
+            let concreteGlobals =
+                if (runInline) inlineTinyLeafFns(concreteFns, concreteNames, concreteGlobals0, ctx.kExterns)
+                else concreteGlobals0;
             verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
             let escapeInfo =
                 if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames)
@@ -4303,9 +4870,9 @@ def lowerToCoreOpts(inf: InferOutput, runEscape: Bool): Result CoreProgram Strin
 }
 
 pub def lowerToCore(inf: InferOutput): Result CoreProgram String =
-    lowerToCoreOpts(inf, true)
+    lowerToCoreOpt(inf, true, true)
 
 pub def lowerToCoreForCheck(inf: InferOutput): Result Void String = {
-    let _ = lowerToCoreOpts(inf, false)?;
+    let _ = lowerToCoreOpt(inf, false, false)?;
     Ok(())
 }

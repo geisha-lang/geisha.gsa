@@ -10,7 +10,7 @@ use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use diag.diagReset
 use loader.{MkPkgSpec, loadSingleSourceProgramWithPkgsNamed}
 use infer.inferProgram
-use core.lowerToCore
+use core.{lowerToCore, lowerToCoreForCheck}
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
 
 def hexLower(n: Int): Int = if (n < 10) 48 + n else 87 + n
@@ -65,8 +65,7 @@ def checkSourceInMemory(src: String): Result Void String = {
     };
     let rawDefs = loadSingleSourceProgramWithPkgsNamed("<playground>", src, rootSpec, Nil, Nil)?;
     let inf = inferProgram(rawDefs)?;
-    let _ = lowerToCore(inf)?;
-    Ok(())
+    lowerToCoreForCheck(inf)
 }
 
 /// Typecheck a single Geisha source file (with full `std.*` support) and return JSON:

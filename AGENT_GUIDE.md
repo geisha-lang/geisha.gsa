@@ -50,7 +50,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 ## 3. Core Syntax & Semantics
 
 ### Primitives & Built-ins
-- Types: `Int` (32-bit signed int; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
+- Types: `Int` (32-bit signed int `-2147483648..2147483647`, checked at parse time; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
 - Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`.
 - Operators: `+`, `-`, `*`, `/` (works on `Int`, `Float`, `Float32`, and `String` concatenation via `+`), `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, `>>>`, `~`. Custom symbolic operators can be defined with `def (<op>)(a, b) = ...`.
 

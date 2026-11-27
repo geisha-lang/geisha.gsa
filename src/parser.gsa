@@ -104,9 +104,19 @@ def parseStrictIntTok(raw: String, neg: Bool, sp: Span): Result Int String =
         let s = if (neg) "-" + raw else raw;
         match parseInt(s) {
             Ok(n) -> Ok(n),
-            Err(_) -> Err(formatSpanDiag("Parse error", sp, "integer literal '" + s + "' out of 32-bit Int range")),
+            Err(_) -> Err(formatSpanDiagHint(
+                "Parse error",
+                sp,
+                "integer literal '" + s + "' out of 32-bit Int range (-2147483648..2147483647)",
+                "append '.0' for Float, or parse via std.str.parseInt64 for 64-bit integers"
+            )),
         }
     }
+
+def prependRev(xs: List a, accRev: List a): List a = match xs {
+    Nil -> accRev,
+    Cons(h, t) -> prependRev(t, Cons(h, accRev)),
+}
 
 def newParser(toks: Vec Token): Parser =
     MkParser {
@@ -964,12 +974,12 @@ def parseBlockExpr(p: Parser): Result Form String = {
                         let fullSp = unionSpan(letSp, body.pos);
                         let eForm = if (isVar) mkForm(fullSp, ExLet(vd, val, body))
                             else mkForm(fullSp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }]));
-                        cellSet(items, listAppend(cellGet(items), [BsExpr(eForm)]))
+                        cellSet(items, Cons(BsExpr(eForm), cellGet(items)))
                     },
                     _ -> {
                         let fullSp = unionSpan(letSp, val.pos);
                         let bs = if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val);
-                        cellSet(items, listAppend(cellGet(items), [bs]))
+                        cellSet(items, Cons(bs, cellGet(items)))
                     },
                 };
                 match peekTok(p).kind {
@@ -984,7 +994,7 @@ def parseBlockExpr(p: Parser): Result Form String = {
             },
             _ -> {
                 let e = parseExpr(p)?;
-                cellSet(items, listAppend(cellGet(items), [BsExpr(e)]));
+                cellSet(items, Cons(BsExpr(e), cellGet(items)));
                 match peekTok(p).kind {
                     TkRBrace -> cellSet(more, false),
                     _ ->
@@ -998,7 +1008,7 @@ def parseBlockExpr(p: Parser): Result Form String = {
         }
     };
     let closeSp = expectRBrace(p)?;
-    let folded = foldBlockItems(cellGet(items))?;
+    let folded = foldBlockItems(listRev(cellGet(items)))?;
     Ok(MkForm { pos: unionSpan(openSp, closeSp), ty: folded.ty, annot: folded.annot, node: folded.node })
 }
 
@@ -1092,13 +1102,13 @@ def parseAtomExpr(p: Parser): Result Form String = {
                             _ -> expectSym(p, "->"),
                         }?;
                         let armBody = parseExpr(p)?;
-                        cellSet(arms, listAppend(cellGet(arms), [MkMatchArm { pat: pat, guard: guardOpt, body: armBody }]));
+                        cellSet(arms, Cons(MkMatchArm { pat: pat, guard: guardOpt, body: armBody }, cellGet(arms)));
                         if (!eatComma(p)) cellSet(more, false) else ()
                     },
                 }
             };
             let closeSp = expectRBrace(p)?;
-            Ok(mkForm(unionSpan(t.span, closeSp), ExMatch(scrut, cellGet(arms))))
+            Ok(mkForm(unionSpan(t.span, closeSp), ExMatch(scrut, listRev(cellGet(arms)))))
         },
         TkLBrace -> parseBlockExpr(p),
         TkLBracket -> {
@@ -1110,13 +1120,13 @@ def parseAtomExpr(p: Parser): Result Form String = {
                     TkRBracket -> cellSet(more, false),
                     _ -> {
                         let el = parseExpr(p)?;
-                        cellSet(elems, listAppend(cellGet(elems), [el]));
+                        cellSet(elems, Cons(el, cellGet(elems)));
                         if (!eatComma(p)) cellSet(more, false) else ()
                     },
                 }
             };
             let closeSp = expectRBracket(p)?;
-            Ok(mkForm(unionSpan(t.span, closeSp), ExList(cellGet(elems))))
+            Ok(mkForm(unionSpan(t.span, closeSp), ExList(listRev(cellGet(elems)))))
         },
         TkLParen -> match tryParseLambda(p) {
             Some(lamRes) -> lamRes,
@@ -1156,13 +1166,13 @@ def parseAtomExpr(p: Parser): Result Form String = {
                                             TkRParen -> cellSet(more, false),
                                             _ -> {
                                                 let nxt = parseExpr(p)?;
-                                                cellSet(elems, listAppend(cellGet(elems), [nxt]));
+                                                cellSet(elems, Cons(nxt, cellGet(elems)));
                                                 if (!eatComma(p)) cellSet(more, false) else ()
                                             },
                                         }
                                     };
                                     let closeSp = expectRParen(p)?;
-                                    Ok(mkForm(unionSpan(openSp, closeSp), ExTuple(cellGet(elems))))
+                                    Ok(mkForm(unionSpan(openSp, closeSp), ExTuple(listRev(cellGet(elems)))))
                                 } else {
                                     let closeSp = expectRParen(p)?;
                                     Ok(MkForm { pos: unionSpan(openSp, closeSp), ty: first.ty, annot: first.annot, node: first.node })
@@ -1175,18 +1185,8 @@ def parseAtomExpr(p: Parser): Result Form String = {
         },
         TkInt(raw) -> {
             let _ = bumpTok(p);
-            if (isRadixIntRaw(raw)) {
-                let n = parseRadixLitInt(raw, false, t.span)?;
-                Ok(mkForm(t.span, ExLit(LitInt(n))))
-            } else {
-                match parseInt(raw) {
-                    Ok(n) -> Ok(mkForm(t.span, ExLit(LitInt(n)))),
-                    Err(_) -> {
-                        let f = parseFloat(raw)?;
-                        Ok(mkForm(t.span, ExLit(LitFloat(f))))
-                    },
-                }
-            }
+            let n = parseStrictIntTok(raw, false, t.span)?;
+            Ok(mkForm(t.span, ExLit(LitInt(n))))
         },
         TkFloat(raw) -> {
             let _ = bumpTok(p);
@@ -1233,13 +1233,13 @@ def parseAtomExpr(p: Parser): Result Form String = {
                                 let fnm = parseLowerIdent(p)?;
                                 let _ = expectSym(p, ":")?;
                                 let fval = parseExpr(p)?;
-                                cellSet(fields, listAppend(cellGet(fields), [(fnm, fval)]));
+                                cellSet(fields, Cons((fnm, fval), cellGet(fields)));
                                 if (!eatComma(p)) cellSet(more, false) else ()
                             },
                         }
                     };
                     let closeSp = expectRBrace(p)?;
-                    Ok(mkForm(unionSpan(t.span, closeSp), ExStructInit(name, cellGet(fields))))
+                    Ok(mkForm(unionSpan(t.span, closeSp), ExStructInit(name, listRev(cellGet(fields)))))
                 }
             } else Ok(mkForm(t.span, ExVar(name)))
         },
@@ -1265,14 +1265,14 @@ def parsePostfixExpr(p: Parser): Result Form String = {
                             TkRParen -> cellSet(more, false),
                             _ -> {
                                 let a = parseExpr(p)?;
-                                cellSet(args, listAppend(cellGet(args), [a]));
+                                cellSet(args, Cons(a, cellGet(args)));
                                 if (!eatComma(p)) cellSet(more, false) else ()
                             },
                         }
                     };
                     let closeSp = expectRParen(p)?;
                     let prev = cellGet(cur);
-                    cellSet(cur, mkForm(unionSpan(prev.pos, closeSp), ExApply(prev, cellGet(args))))
+                    cellSet(cur, mkForm(unionSpan(prev.pos, closeSp), ExApply(prev, listRev(cellGet(args)))))
                 },
             TkDot -> {
                 let _ = bumpTok(p);
@@ -1323,18 +1323,8 @@ def parseUnaryExpr(p: Parser): Result Form String = {
                         if (!nextT.hadNewline && nextT.span.start == t.span.start + 1) {
                             let _ = bumpTok(p);
                             let fullSp = unionSpan(t.span, nextT.span);
-                            if (isRadixIntRaw(raw)) {
-                                let n = parseRadixLitInt(raw, true, fullSp)?;
-                                Ok(mkForm(fullSp, ExLit(LitInt(n))))
-                            } else {
-                                match parseInt("-" + raw) {
-                                    Ok(n) -> Ok(mkForm(fullSp, ExLit(LitInt(n)))),
-                                    Err(_) -> {
-                                        let f = parseFloat("-" + raw)?;
-                                        Ok(mkForm(fullSp, ExLit(LitFloat(f))))
-                                    },
-                                }
-                            }
+                            let n = parseStrictIntTok(raw, true, fullSp)?;
+                            Ok(mkForm(fullSp, ExLit(LitInt(n))))
                         } else {
                             let operand: Form = parseUnaryExpr(p)?;
                             Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
@@ -2028,17 +2018,16 @@ def parseModuleItem(p: Parser): Result ModuleItem String = {
             match peekTok(p).kind {
                 TkLBrace -> {
                     let _ = bumpTok(p);
-                    let subItems = cellNew(Nil);
+                    let subItemsRev = cellNew(Nil);
                     while ({ skipSemis(p); match peekTok(p).kind { TkRBrace -> false, TkEof -> false, _ -> true } }) {
                         let it = parseModuleItem(p)?;
-                        cellSet(subItems, listAppend(cellGet(subItems), [it]));
                         let pend = cellGet(p.pendingItems);
                         cellSet(p.pendingItems, Nil);
-                        cellSet(subItems, listAppend(cellGet(subItems), pend));
+                        cellSet(subItemsRev, prependRev(pend, Cons(it, cellGet(subItemsRev))));
                         skipSemis(p)
                     };
                     let closeSp = expectRBrace(p)?;
-                    Ok(ModSub(vis, mname, cellGet(subItems), unionSpan(startSp, closeSp)))
+                    Ok(ModSub(vis, mname, listRev(cellGet(subItemsRev)), unionSpan(startSp, closeSp)))
                 },
                 _ -> Ok(ModDecl(vis, mname)),
             }
@@ -2153,26 +2142,26 @@ pub def parseFileModule(src: String, modPath: List String): Result FileModule St
 pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): Result FileModule String = {
     let toks = tokenizeInFile(src, fileId)?;
     let p = newParser(toks);
-    let items = cellNew(Nil);
-    let scriptStmts: Cell (List BlockStmtItem) = cellNew(Nil);
+    let itemsRev = cellNew(Nil);
+    let scriptStmtsRev: Cell (List BlockStmtItem) = cellNew(Nil);
     let allowTopStmts = match modPath { Nil -> true, _ -> false };
     skipSemis(p);
     while (!isEof(p)) {
         if (allowTopStmts && !isTopLevelModuleItemStart(p)) {
             let st = parseTopLevelScriptStmt(p)?;
-            cellSet(scriptStmts, listAppend(cellGet(scriptStmts), [st]))
+            cellSet(scriptStmtsRev, Cons(st, cellGet(scriptStmtsRev)))
         } else {
             let item = parseModuleItem(p)?;
-            cellSet(items, listAppend(cellGet(items), [item]));
             let pend = cellGet(p.pendingItems);
             cellSet(p.pendingItems, Nil);
-            cellSet(items, listAppend(cellGet(items), pend));
+            cellSet(itemsRev, prependRev(pend, Cons(item, cellGet(itemsRev))));
             skipSemis(p)
         }
     };
-    match cellGet(scriptStmts) {
-        Nil -> Ok(MkFileModule { modPath: modPath, items: cellGet(items) }),
-        stmts -> match findMainDefSpan(cellGet(items)) {
+    let items = listRev(cellGet(itemsRev));
+    match listRev(cellGet(scriptStmtsRev)) {
+        Nil -> Ok(MkFileModule { modPath: modPath, items: items }),
+        stmts -> match findMainDefSpan(items) {
             Some(mainSp) -> Err(formatSpanDiag("Parse error", mainSp, "cannot mix top-level script statements with an explicit `def main`")),
             None -> {
                 let normStmts = normalizeScriptStmts(stmts);
@@ -2187,7 +2176,7 @@ pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): R
                 };
                 Ok(MkFileModule {
                     modPath: modPath,
-                    items: listAppend(cellGet(items), [ModDef(VisPrivate, mainDef)]),
+                    items: listRev(Cons(ModDef(VisPrivate, mainDef), cellGet(itemsRev))),
                 })
             },
         },
