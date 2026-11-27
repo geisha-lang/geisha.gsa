@@ -6961,6 +6961,52 @@ EOF
         exit 1
     fi
 
+    # Read-only `.geisha-doc-manifest` (`chmod 444`) after module rename must roll back new pages and preserve old pages
+    mv "$T44_CASE_PROJ/src/writer.gsa" "$T44_CASE_PROJ/src/writer2.gsa"
+    chmod 444 "$T44_CASE_SITE/.geisha-doc-manifest"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_MF_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/.geisha-doc-manifest"
+    if [ "$T44_MF_RO_RC" -eq 0 ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.writer.html" ] || [ -f "$T44_CASE_SITE/modules/caseproj.writer2.html" ] || grep -q 'caseproj.writer2.html' "$T44_CASE_SITE/index.html"; then
+        echo "FAIL [doc_ro_manifest_rollback]: read-only manifest must roll back new pages and keep old pages intact" >&2
+        exit 1
+    fi
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if [ -f "$T44_CASE_SITE/modules/caseproj.writer.html" ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.writer2.html" ]; then
+        echo "FAIL [doc_ro_manifest_recovery]: expected clean publish after restoring manifest permissions" >&2
+        exit 1
+    fi
+
+    # Short write (`RLIMIT_FSIZE`) must fail without truncating existing live files
+    T44_ORIG_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
+    cat > "$T44_CASE_PROJ/src/writer2.gsa" << 'EOF'
+/// Big doc update that exceeds RLIMIT_FSIZE to verify short-write rollback safety.
+pub def bigFn1(): Int = 1
+pub def bigFn2(): Int = 2
+pub def bigFn3(): Int = 3
+pub def bigFn4(): Int = 4
+pub def bigFn5(): Int = 5
+pub def bigFn6(): Int = 6
+pub def bigFn7(): Int = 7
+pub def bigFn8(): Int = 8
+EOF
+    T44_SW_LIMIT=$((T44_ORIG_SZ + 200))
+    set +e
+    python3 -c 'import resource, subprocess, sys
+lim = int(sys.argv[1])
+resource.setrlimit(resource.RLIMIT_FSIZE, (lim, lim))
+r = subprocess.run([sys.argv[2], "doc", "--out", sys.argv[3], "--no-stdlib"], cwd=sys.argv[4], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.exit(r.returncode)' "$T44_SW_LIMIT" "$T44_GEISHA_BIN" "$T44_CASE_SITE" "$T44_CASE_PROJ"
+    T44_SW_RC=$?
+    set -e
+    T44_AFTER_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
+    if [ "$T44_SW_RC" -eq 0 ] || [ "$T44_AFTER_SZ" != "$T44_ORIG_SZ" ] || ! grep -q 'v3Api' "$T44_CASE_SITE/modules/caseproj.writer2.html"; then
+        echo "FAIL [doc_short_write_rollback]: RLIMIT_FSIZE short write must fail without truncating live file (orig=$T44_ORIG_SZ after=$T44_AFTER_SZ rc=$T44_SW_RC)" >&2
+        exit 1
+    fi
+
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
     printf 'not a dir\n' > "$TMP_DIR/notes"
     T44_BS_OUT="$TMP_DIR/notes\\site"

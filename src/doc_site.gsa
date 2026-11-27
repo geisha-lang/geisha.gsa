@@ -1329,11 +1329,48 @@ def ensureRealDir(dir: String): Result Void String = {
     }
 }
 
+// Write `content` to `path` safely:
+//   1. Refuse symlink/junction (`3`/`4`) or directory (`2`) targets.
+//   2. Pre-write to a same-volume temporary file and verify full byte length before touching
+//      `path` so short writes (e.g. RLIMIT_FSIZE / ENOSPC) never truncate the live target file.
+//   3. Write `path`, verify full byte length, and clean up the temporary file.
 def writeDocFileSafe(path: String, content: String): Result Void String = {
     let k = c_site_lstat_kind(path);
     if (k == 3 || k == 4) Err("refusing to overwrite symlinked doc output file: " + path)
     else if (k == 2) Err("refusing to overwrite directory as doc output file: " + path)
-    else writeFile(path, content)
+    else {
+        let wantLen = strLen(content);
+        let tmpPath = path + ".geisha-doc-tmp";
+        let tk = c_site_lstat_kind(tmpPath);
+        if (tk == 3 || tk == 4 || tk == 2) {
+            Err("refusing to use unsafe temp doc output path: " + tmpPath)
+        } else {
+            match writeFile(tmpPath, content) {
+                Err(e) -> {
+                    let _ = removeFile(tmpPath);
+                    Err(e)
+                },
+                Ok(()) -> match readFile(tmpPath) {
+                    Err(e) -> {
+                        let _ = removeFile(tmpPath);
+                        Err("failed to verify temp doc output file: " + e)
+                    },
+                    Ok(chk) ->
+                        if (strLen(chk) != wantLen) {
+                            let _ = removeFile(tmpPath);
+                            Err("short write detected for doc output file: " + path)
+                        } else {
+                            let _ = removeFile(tmpPath);
+                            writeFile(path, content)?;
+                            match readFile(path) {
+                                Ok(chk2) if (strLen(chk2) == wantLen) -> Ok(()),
+                                _ -> Err("short write detected while committing doc output file: " + path),
+                            }
+                        },
+                },
+            }
+        }
+    }
 }
 
 def buildDirEntrySet(dir: String): Result (StrMap Bool) String = {
@@ -1435,9 +1472,36 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
     } else ();
     stageFile("index.html", renderIndexPage(site));
 
-    // 2. Transactional publish with full rollback on any write/permission/symlink failure:
-    //    if writing any file fails (e.g. read-only `src/<mod>.html` or `app.js`), every
-    //    previously overwritten/created file is restored so the previous site stays 100% consistent.
+    // Include a union `.geisha-doc-manifest` (new + previously tracked entries) in the
+    // transactional write phase BEFORE any stale file is deleted: if `.geisha-doc-manifest`
+    // is read-only or fails to write, every newly written file is rolled back and zero old
+    // pages are deleted.
+    let unionPrevRev: Cell (List String) = cellNew(Nil);
+    let cu = cellNew(prevFiles);
+    while (match cellGet(cu) { Nil -> false, _ -> true }) {
+        match cellGet(cu) {
+            Cons(rawRel, ru) -> {
+                let rel = strTrim(rawRel);
+                if (isSafeRelManifestPath(rel)) {
+                    match strMapGet(generatedSet, rel) {
+                        None -> cellSet(unionPrevRev, Cons(rel, cellGet(unionPrevRev))),
+                        Some(_) -> (),
+                    }
+                } else ();
+                cellSet(cu, ru)
+            },
+            Nil -> (),
+        }
+    };
+    let generatedLines = listRev(cellGet(generatedRev));
+    let unionManifestContent = match listRev(cellGet(unionPrevRev)) {
+        Nil -> strJoin(generatedLines, "\n") + "\n",
+        up -> strJoin(generatedLines, "\n") + "\n" + strJoin(up, "\n") + "\n",
+    };
+    cellSet(stagedRev, Cons((".geisha-doc-manifest", unionManifestContent), cellGet(stagedRev)));
+
+    // 2. Transactional publish with pre-write backup recording and full rollback on any
+    //    write/short-write/permission/symlink failure.
     let staged = listRev(cellGet(stagedRev));
     let backupsRev: Cell (List (String, Option String)) = cellNew(Nil);
     let writeErrOpt: Cell (Option String) = cellNew(None);
@@ -1465,9 +1529,13 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                         };
                     match prevOptRes {
                         Err(e) -> cellSet(writeErrOpt, Some(e)),
-                        Ok(prevOpt) -> match writeDocFileSafe(full, content) {
-                            Err(e) -> cellSet(writeErrOpt, Some(e)),
-                            Ok(()) -> cellSet(backupsRev, Cons((rel, prevOpt), cellGet(backupsRev))),
+                        Ok(prevOpt) -> {
+                            // Record backup BEFORE writing so even a partial/short write is rolled back.
+                            cellSet(backupsRev, Cons((rel, prevOpt), cellGet(backupsRev)));
+                            match writeDocFileSafe(full, content) {
+                                Err(e) -> cellSet(writeErrOpt, Some(e)),
+                                Ok(()) -> (),
+                            }
                         },
                     }
                 };
