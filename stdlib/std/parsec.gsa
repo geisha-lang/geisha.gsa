@@ -1,0 +1,2009 @@
+/// High-performance, Geisha-idiomatic parser combinators (`std.parsec`).
+///
+/// Design highlights:
+/// - **Geisha HKT flavor**: `Parser` implements `Functor`, `Applicative`, and `Monad` from
+///   `std.control` (enabling `(<$>)`, `(<*>)`, `(>>=)`, `(>>)`), alongside `(<|>)`, `(<*)`,
+///   `(*>)`, `(<?>)`, and `(<$)`.
+/// - **Zero-allocation hot path**: parsing runs over a compact 4-word `ParseState` cursor
+///   allocated once per parse. Hot loops use self-tail-recursive register loops (zero `Cell`
+///   allocations), unit/constant parsers reuse pre-boxed `Option` singletons, wrapper
+///   combinators (`lexeme`, `between`, `<*`, `<|>`, `label`, `cut`, `peek`) forward `Option`
+///   results without re-boxing, and failure records `(offset, expected)` in-place with zero
+///   allocations. Line/column numbers and compact 1D diagnostics (`formatParseError`) are
+///   computed lazily only when the top-level parse fails.
+/// - **Byte-loop leaf scanners & O(1) dispatch**: `skipSpaces`, `takeWhile`, `tag`, `ident`,
+///   `decInt`, `decInt64`, `quotedString`, `oneOf`, and `byteTable` run tight register loops or
+///   precomputed ASCII lookup tables with zero per-byte closures or intermediate lists.
+/// - **Tail-recursive repetition & streaming folds**: `manyVec`, `sepByVec`, `skipMany`,
+///   `foldMany`, and `chainl1` run in constant stack space via self-TCO and respect `cut`.
+///
+/// Operator precedence note (Geisha infix rules):
+/// `(<$>)`, `(<*>)`, `(<*)`, `(<|>)`, `(<?>)`, `(<$)`, `(>>=)` all share precedence 5
+/// (left-associative), while `(*>)` has precedence 12 (starts with `*`). Parenthesize when
+/// mixing `(*>)` with `<$>`/`<*>` or when writing `<|>` before `<$>`.
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{intToStr, parseFloat}
+use std.char.{isDigitByte, isIdentStartByte, isIdentContByte}
+use std.control.{Functor, Applicative, Monad}
+
+// ============================================================================
+// Core Types: Span, ParseError, ParseState, Parser
+// ============================================================================
+
+/// Half-open byte span `[start, end)` within the input string.
+pub data Span {
+    Span { start: Int, end: Int },
+}
+
+pub instance Eq Span {
+    def (==)(a, b) = a.start == b.start && a.end == b.end
+    def (!=)(a, b) = !(a == b)
+}
+
+/// A parsed value paired with its half-open byte `Span`.
+pub data Spanned a {
+    Spanned { span: Span, value: a },
+}
+
+/// Rich parse error constructed lazily only when top-level parsing fails.
+pub data ParseError {
+    ParseError {
+        source: String,
+        offset: Int,
+        line: Int,
+        col: Int,
+        expected: String,
+        found: String,
+        lineText: String,
+    },
+}
+
+pub instance Eq ParseError {
+    def (==)(a, b) =
+        a.source == b.source
+        && a.offset == b.offset
+        && a.line == b.line
+        && a.col == b.col
+        && a.expected == b.expected
+        && a.found == b.found
+        && a.lineText == b.lineText
+    def (!=)(a, b) = !(a == b)
+}
+
+data ErrSlot {
+    ErrSlot {
+        errPos: Cell Int,
+        errExpected: Cell String,
+        furthestPos: Cell Int,
+        furthestExpected: Cell String,
+    },
+}
+
+/// Single-allocation mutable parsing cursor shared across a parse run.
+///
+/// Exposed so performance-critical leaf parsers can use `mkParser` + `state*`
+/// primitives directly while composing seamlessly with algebraic combinators.
+pub data ParseState {
+    ParseState {
+        src: String,
+        len: Int,
+        pos: Cell Int,
+        committed: Cell Bool,
+        err: Cell ErrSlot,
+    },
+}
+
+/// A parser producing a value of type `a` over a UTF-8 / byte `String` cursor.
+pub data Parser a {
+    MkParser(ParseState -> Option a),
+}
+
+// Pre-allocated singleton for zero-allocation `Parser Void` successes.
+def okUnit: Option Void = Some(())
+
+// ============================================================================
+// Low-Level ParseState Accessors (for custom zero-overhead leaf parsers)
+// ============================================================================
+
+/// Construct a `Parser a` from a raw `ParseState -> Option a` function.
+pub def mkParser(f: ParseState -> Option a): Parser a = MkParser(f)
+
+/// Underlying input string of the cursor.
+pub def stateSrc(st: ParseState): String = st.src
+
+/// Total byte length of the input string.
+pub def stateLen(st: ParseState): Int = st.len
+
+/// Current byte offset of the cursor.
+pub def statePos(st: ParseState): Int = cellGet(st.pos)
+
+/// Set the cursor byte offset directly.
+pub def stateSetPos(st: ParseState, nextPos: Int): Void = cellSet(st.pos, nextPos)
+
+/// Peek the next byte (`0..255`), or `-1` at end-of-input.
+pub def statePeek(st: ParseState): Int = {
+    let i = cellGet(st.pos);
+    if (i >= st.len) -1 else strByteAt(st.src, i)
+}
+
+/// Consume and return the next byte (`0..255`), or `-1` at end-of-input.
+pub def stateBump(st: ParseState): Int = {
+    let i = cellGet(st.pos);
+    if (i >= st.len) -1
+    else {
+        cellSet(st.pos, i + 1);
+        strByteAt(st.src, i)
+    }
+}
+
+/// Record a zero-allocation failure at the current cursor offset and return `None`.
+pub def stateFail(st: ParseState, expected: String): Option a = {
+    let p = cellGet(st.pos);
+    let e = cellGet(st.err);
+    cellSet(e.errPos, p);
+    cellSet(e.errExpected, expected);
+    if (p >= cellGet(e.furthestPos)) {
+        cellSet(e.furthestPos, p);
+        cellSet(e.furthestExpected, expected)
+    } else ();
+    None
+}
+
+/// Record a zero-allocation failure at an explicit byte offset and return `None`.
+pub def stateFailAt(st: ParseState, offset: Int, expected: String): Option a = {
+    let e = cellGet(st.err);
+    cellSet(e.errPos, offset);
+    cellSet(e.errExpected, expected);
+    if (offset >= cellGet(e.furthestPos)) {
+        cellSet(e.furthestPos, offset);
+        cellSet(e.furthestExpected, expected)
+    } else ();
+    None
+}
+
+/// Mark the current branch as committed (`cut`), preventing outer `<|>` / `choice`
+/// / `many` / `optional` from backtracking past this point.
+pub def stateCut(st: ParseState): Void = cellSet(st.committed, true)
+
+// ============================================================================
+// Running Parsers & Compact 1D Diagnostics
+// ============================================================================
+
+def newState(src: String): ParseState = ParseState {
+    src: src,
+    len: strLen(src),
+    pos: cellNew(0),
+    committed: cellNew(false),
+    err: cellNew(ErrSlot {
+        errPos: cellNew(0),
+        errExpected: cellNew("valid input"),
+        furthestPos: cellNew(-1),
+        furthestExpected: cellNew("valid input"),
+    }),
+}
+
+def describeFound(src: String, len: Int, offset: Int): String =
+    if (offset >= len) {
+        "end of input"
+    } else {
+        let b = strByteAt(src, offset);
+        if (b == 10) "'\\n'"
+        else if (b == 13) "'\\r'"
+        else if (b == 9) "'\\t'"
+        else if (b == 39) "\"'\""
+        else if (b >= 32 && b <= 126) "'" + ptrSliceFromStr(src, offset, 1) + "'"
+        else "byte " + intToStr(b)
+    }
+
+def findLineStartLoop(src: String, offset: Int, i: Int, line: Int, lineStart: Int): (Int, Int) =
+    if (i >= offset) (line, lineStart)
+    else if (strByteAt(src, i) == 10) findLineStartLoop(src, offset, i + 1, line + 1, i + 1)
+    else findLineStartLoop(src, offset, i + 1, line, lineStart)
+
+def findLineEndLoop(src: String, len: Int, i: Int): Int =
+    if (i >= len) len
+    else {
+        let c = strByteAt(src, i);
+        if (c == 10 || c == 13) i
+        else findLineEndLoop(src, len, i + 1)
+    }
+
+def buildParseError(source: String, src: String, len: Int, rawOffset: Int, expected: String): ParseError = {
+    let offset = if (rawOffset < 0) 0 else if (rawOffset > len) len else rawOffset;
+    let (line, ls) = findLineStartLoop(src, offset, 0, 1, 0);
+    let le = findLineEndLoop(src, len, ls);
+    let col = (offset - ls) + 1;
+    let lineText = ptrSliceFromStr(src, ls, le - ls);
+    let found = describeFound(src, len, offset);
+    ParseError {
+        source: source,
+        offset: offset,
+        line: line,
+        col: col,
+        expected: expected,
+        found: found,
+        lineText: lineText,
+    }
+}
+
+def finishError(source: String, st: ParseState): ParseError = {
+    let e = cellGet(st.err);
+    let fPos = cellGet(e.furthestPos);
+    if (cellGet(st.committed) || fPos < 0) {
+        buildParseError(source, st.src, st.len, cellGet(e.errPos), cellGet(e.errExpected))
+    } else {
+        buildParseError(source, st.src, st.len, fPos, cellGet(e.furthestExpected))
+    }
+}
+
+/// Format a `ParseError` in Geisha's compact 1D diagnostic style.
+///
+/// Example:
+/// ```text
+/// config.dsl:2:14: error[parse]: expected ']', found '}'
+///   line 2: [1, 2, 3}
+/// ```
+pub def formatParseError(err: ParseError): String = {
+    let buf = bufNew();
+    bufPushStr(buf, err.source);
+    bufPushByte(buf, 58);
+    bufPushStr(buf, intToStr(err.line));
+    bufPushByte(buf, 58);
+    bufPushStr(buf, intToStr(err.col));
+    bufPushStr(buf, ": error[parse]: expected ");
+    bufPushStr(buf, err.expected);
+    bufPushStr(buf, ", found ");
+    bufPushStr(buf, err.found);
+    if (strLen(err.lineText) > 0) {
+        bufPushStr(buf, "\n  line ");
+        bufPushStr(buf, intToStr(err.line));
+        bufPushStr(buf, ": ");
+        bufPushStr(buf, err.lineText)
+    } else ();
+    bufToString(buf)
+}
+
+/// Run `p` on `src` with an explicit source name (for diagnostics), requiring full consumption.
+pub def parseNamed(p: Parser a, source: String, src: String): Result a ParseError = match p {
+    MkParser(fp) -> {
+        let st = newState(src);
+        match fp(st) {
+            Some(v) -> {
+                if (cellGet(st.pos) == st.len) {
+                    Ok(v)
+                } else {
+                    let _ = stateFail(st, "end of input");
+                    Err(finishError(source, st))
+                }
+            },
+            None -> Err(finishError(source, st)),
+        }
+    },
+}
+
+/// Run `p` on `src`, requiring full consumption of the input.
+pub def parse(p: Parser a, src: String): Result a ParseError =
+    parseNamed(p, "<input>", src)
+
+/// Run `p` on a prefix of `src`, returning `(value, nextOffset)` without requiring EOF.
+pub def parsePartial(p: Parser a, src: String): Result (a, Int) ParseError = match p {
+    MkParser(fp) -> {
+        let st = newState(src);
+        match fp(st) {
+            Some(v) -> Ok((v, cellGet(st.pos))),
+            None -> Err(finishError("<input>", st)),
+        }
+    },
+}
+
+// ============================================================================
+// Functor, Applicative, Monad (`std.control`) & Core Combinators
+// ============================================================================
+
+/// Parser that succeeds without consuming input and yields `x`.
+pub def pureP(x: a): Parser a = {
+    let wrapped = Some(x);
+    MkParser((_: ParseState) -> wrapped)
+}
+
+/// Parser that always fails at the current position with `expected`.
+pub def failP(expected: String): Parser a = MkParser((st: ParseState) -> stateFail(st, expected))
+
+/// Transform the output of `p` with `g` (`fmap`).
+pub def mapP(p: Parser a, g: a -> b): Parser b = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> match fp(st) {
+        Some(x) -> Some(g(x)),
+        None -> None,
+    }),
+}
+
+/// Replace the output of `p` with constant `val` when `p` succeeds (zero allocation at parse time).
+pub def valueP(val: b, p: Parser a): Parser b = {
+    let wrapped = Some(val);
+    match p {
+        MkParser(fp) -> MkParser((st: ParseState) -> match fp(st) {
+            Some(_) -> wrapped,
+            None -> None,
+        }),
+    }
+}
+
+/// Applicative application (`<*>`).
+pub def apP(pf: Parser (a -> b), pa: Parser a): Parser b = match (pf, pa) {
+    (MkParser(ff), MkParser(fa)) -> MkParser((st: ParseState) -> match ff(st) {
+        Some(f) -> match fa(st) {
+            Some(a) -> Some(f(a)),
+            None -> None,
+        },
+        None -> None,
+    }),
+}
+
+/// Monadic bind (`>>=`).
+pub def bindP(pa: Parser a, k: a -> Parser b): Parser b = match pa {
+    MkParser(fa) -> MkParser((st: ParseState) -> match fa(st) {
+        Some(a) -> match k(a) {
+            MkParser(fb) -> fb(st),
+        },
+        None -> None,
+    }),
+}
+
+/// Sequence `p1` then `p2`, discarding `p1`'s result (`*>`).
+pub def seqRight(p1: Parser a, p2: Parser b): Parser b = match (p1, p2) {
+    (MkParser(f1), MkParser(f2)) -> MkParser((st: ParseState) -> match f1(st) {
+        Some(_) -> f2(st),
+        None -> None,
+    }),
+}
+
+/// Sequence `p1` then `p2`, keeping `p1`'s result (`<*`; zero re-boxing).
+pub def seqLeft(p1: Parser a, p2: Parser b): Parser a = match (p1, p2) {
+    (MkParser(f1), MkParser(f2)) -> MkParser((st: ParseState) -> {
+        let res = f1(st);
+        match res {
+            Some(_) -> match f2(st) {
+                Some(_) -> res,
+                None -> None,
+            },
+            None -> None,
+        }
+    }),
+}
+
+/// Sequence `p1` and `p2` into a tuple `(a, b)`.
+pub def pair(p1: Parser a, p2: Parser b): Parser (a, b) = match (p1, p2) {
+    (MkParser(f1), MkParser(f2)) -> MkParser((st: ParseState) -> match f1(st) {
+        Some(a) -> match f2(st) {
+            Some(b) -> Some((a, b)),
+            None -> None,
+        },
+        None -> None,
+    }),
+}
+
+/// Combine 2 parsers with a 2-argument function (avoids curried closure allocation of `<$>`/`<*>`).
+pub def map2(p1: Parser a, p2: Parser b, g: (a, b) -> c): Parser c = match (p1, p2) {
+    (MkParser(f1), MkParser(f2)) -> MkParser((st: ParseState) -> match f1(st) {
+        Some(a) -> match f2(st) {
+            Some(b) -> Some(g(a, b)),
+            None -> None,
+        },
+        None -> None,
+    }),
+}
+
+/// Combine 3 parsers with a 3-argument function.
+pub def map3(p1: Parser a, p2: Parser b, p3: Parser c, g: (a, b, c) -> d): Parser d =
+    match (p1, p2, p3) {
+        (MkParser(f1), MkParser(f2), MkParser(f3)) -> MkParser((st: ParseState) -> match f1(st) {
+            Some(a) -> match f2(st) {
+                Some(b) -> match f3(st) {
+                    Some(c) -> Some(g(a, b, c)),
+                    None -> None,
+                },
+                None -> None,
+            },
+            None -> None,
+        }),
+    }
+
+/// Combine 4 parsers with a 4-argument function.
+pub def map4(p1: Parser a, p2: Parser b, p3: Parser c, p4: Parser d, g: (a, b, c, d) -> e): Parser e =
+    match (p1, p2, p3, p4) {
+        (MkParser(f1), MkParser(f2), MkParser(f3), MkParser(f4)) -> MkParser((st: ParseState) -> match f1(st) {
+            Some(a) -> match f2(st) {
+                Some(b) -> match f3(st) {
+                    Some(c) -> match f4(st) {
+                        Some(d) -> Some(g(a, b, c, d)),
+                        None -> None,
+                    },
+                    None -> None,
+                },
+                None -> None,
+            },
+            None -> None,
+        }),
+    }
+
+/// Parse `openP`, then `p`, then `closeP`, returning `p`'s value (zero re-boxing).
+pub def between(openP: Parser o, closeP: Parser c, p: Parser a): Parser a =
+    match (openP, closeP, p) {
+        (MkParser(fo), MkParser(fc), MkParser(fp)) -> MkParser((st: ParseState) -> match fo(st) {
+            Some(_) -> {
+                let res = fp(st);
+                match res {
+                    Some(_) -> match fc(st) {
+                        Some(_) -> res,
+                        None -> None,
+                    },
+                    None -> None,
+                }
+            },
+            None -> None,
+        }),
+    }
+
+/// Ordered choice: try `p1`; if it fails without `cut`, backtrack and try `p2`.
+pub def alt(p1: Parser a, p2: Parser a): Parser a = match (p1, p2) {
+    (MkParser(f1), MkParser(f2)) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let savedCommitted = cellGet(st.committed);
+        cellSet(st.committed, false);
+        let res = f1(st);
+        match res {
+            Some(_) -> {
+                if (savedCommitted) cellSet(st.committed, true) else ();
+                res
+            },
+            None -> {
+                if (cellGet(st.committed)) {
+                    None
+                } else {
+                    cellSet(st.pos, savedPos);
+                    cellSet(st.committed, savedCommitted);
+                    f2(st)
+                }
+            },
+        }
+    }),
+}
+
+def choiceLoop(
+    st: ParseState,
+    fns: Vec (ParseState -> Option a),
+    n: Int,
+    fallback: ParseState -> Option a,
+    savedPos: Int,
+    savedCommitted: Bool,
+    idx: Int
+): Option a =
+    if (idx >= n) {
+        cellSet(st.pos, savedPos);
+        cellSet(st.committed, savedCommitted);
+        None
+    } else {
+        let fp = vecGetOr(fns, idx, fallback);
+        cellSet(st.pos, savedPos);
+        cellSet(st.committed, false);
+        let res = fp(st);
+        match res {
+            Some(_) -> {
+                if (savedCommitted) cellSet(st.committed, true) else ();
+                res
+            },
+            None -> {
+                if (cellGet(st.committed)) None
+                else choiceLoop(st, fns, n, fallback, savedPos, savedCommitted, idx + 1)
+            },
+        }
+    }
+
+def collectChoiceFns(ps: List (Parser a), out: Vec (ParseState -> Option a)): Void = match ps {
+    Nil -> (),
+    Cons(p, rest) -> {
+        match p {
+            MkParser(fp) -> vecPush(out, fp),
+        };
+        collectChoiceFns(rest, out)
+    },
+}
+
+/// Ordered choice over a list of parsers (flattened into a contiguous `Vec` once at build time).
+pub def choice(ps: List (Parser a)): Parser a = {
+    let fns: Vec (ParseState -> Option a) = vecNew();
+    collectChoiceFns(ps, fns);
+    let n = vecLen(fns);
+    if (n == 0) {
+        failP("one of alternatives")
+    } else {
+        let fallback = vecGetOr(fns, 0, (st: ParseState) -> stateFail(st, "alternative"));
+        MkParser((st: ParseState) -> {
+            let savedPos = cellGet(st.pos);
+            let savedCommitted = cellGet(st.committed);
+            choiceLoop(st, fns, n, fallback, savedPos, savedCommitted, 0)
+        })
+    }
+}
+
+// ============================================================================
+// Standard Control Instances & Combinator Operators
+// ============================================================================
+
+pub instance Functor Parser {
+    def fmap(g, pa) = mapP(pa, g)
+}
+
+pub instance Applicative Parser {
+    def pure(x) = pureP(x)
+    def ap(pf, pa) = apP(pf, pa)
+}
+
+pub instance Monad Parser {
+    def (>>=)(pa, k) = bindP(pa, k)
+}
+
+/// Ordered choice operator (`alt`).
+pub def (<|>)(p1: Parser a, p2: Parser a): Parser a = alt(p1, p2)
+
+/// Sequence and keep left (`seqLeft`).
+pub def (<*)(p1: Parser a, p2: Parser b): Parser a = seqLeft(p1, p2)
+
+/// Sequence and keep right (`seqRight`). Note: prec 12 in Geisha.
+pub def (*>)(p1: Parser a, p2: Parser b): Parser b = seqRight(p1, p2)
+
+/// Replace parsed result with a constant value (`valueP`).
+pub def (<$)(val: b, p: Parser a): Parser b = valueP(val, p)
+
+/// Attach a human-readable expected label when `p` fails without consuming input.
+pub def label(p: Parser a, expected: String): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let res = fp(st);
+        match res {
+            Some(_) -> res,
+            None -> {
+                let e = cellGet(st.err);
+                if (cellGet(e.errPos) == savedPos) {
+                    cellSet(e.errExpected, expected);
+                    if (savedPos >= cellGet(e.furthestPos)) {
+                        cellSet(e.furthestPos, savedPos);
+                        cellSet(e.furthestExpected, expected)
+                    } else ()
+                } else ();
+                None
+            },
+        }
+    }),
+}
+
+/// Infix expected-label operator (`label`).
+pub def (<?>)(p: Parser a, expected: String): Parser a = label(p, expected)
+
+// ============================================================================
+// Backtracking Control, Lookahead, Filtering, Spans & Recursion
+// ============================================================================
+
+/// Commit the current branch: if `p` fails, outer `<|>` / `choice` / `many` / `optional`
+/// will NOT backtrack and will surface the exact failure.
+pub def cut(p: Parser a): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        cellSet(st.committed, true);
+        fp(st)
+    }),
+}
+
+/// Allow backtracking even if `p` internally called `cut`.
+pub def tryP(p: Parser a): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let savedCommitted = cellGet(st.committed);
+        cellSet(st.committed, false);
+        let res = fp(st);
+        match res {
+            Some(_) -> {
+                if (savedCommitted) cellSet(st.committed, true) else ();
+                res
+            },
+            None -> {
+                cellSet(st.pos, savedPos);
+                cellSet(st.committed, savedCommitted);
+                None
+            },
+        }
+    }),
+}
+
+/// Parse `p` optionally: returns `Some(v)` on match, `None` on uncommitted failure.
+/// Propagates failure if `p` fails after `cut`.
+pub def optional(p: Parser a): Parser (Option a) = {
+    let someNone: Option (Option a) = Some(None);
+    match p {
+        MkParser(fp) -> MkParser((st: ParseState) -> {
+            let savedPos = cellGet(st.pos);
+            let savedCommitted = cellGet(st.committed);
+            cellSet(st.committed, false);
+            match fp(st) {
+                Some(v) -> {
+                    if (savedCommitted) cellSet(st.committed, true) else ();
+                    Some(Some(v))
+                },
+                None -> {
+                    if (cellGet(st.committed)) {
+                        None
+                    } else {
+                        cellSet(st.pos, savedPos);
+                        cellSet(st.committed, savedCommitted);
+                        someNone
+                    }
+                },
+            }
+        }),
+    }
+}
+
+/// Parse `p` optionally, returning `fallback` on uncommitted failure.
+pub def optOr(p: Parser a, fallback: a): Parser a = {
+    let someFallback = Some(fallback);
+    match p {
+        MkParser(fp) -> MkParser((st: ParseState) -> {
+            let savedPos = cellGet(st.pos);
+            let savedCommitted = cellGet(st.committed);
+            cellSet(st.committed, false);
+            let res = fp(st);
+            match res {
+                Some(_) -> {
+                    if (savedCommitted) cellSet(st.committed, true) else ();
+                    res
+                },
+                None -> {
+                    if (cellGet(st.committed)) {
+                        None
+                    } else {
+                        cellSet(st.pos, savedPos);
+                        cellSet(st.committed, savedCommitted);
+                        someFallback
+                    }
+                },
+            }
+        }),
+    }
+}
+
+/// Positive lookahead: run `p` without advancing the cursor.
+pub def peek(p: Parser a): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let savedCommitted = cellGet(st.committed);
+        let res = fp(st);
+        cellSet(st.pos, savedPos);
+        cellSet(st.committed, savedCommitted);
+        res
+    }),
+}
+
+/// Negative lookahead: succeed with `()` iff `p` fails, without advancing the cursor.
+pub def notFollowedBy(p: Parser a, expected: String): Parser Void = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let savedCommitted = cellGet(st.committed);
+        let e = cellGet(st.err);
+        let savedErrPos = cellGet(e.errPos);
+        let savedFurthestPos = cellGet(e.furthestPos);
+        let savedErrExp = cellGet(e.errExpected);
+        let savedFurthestExp = cellGet(e.furthestExpected);
+        let res = fp(st);
+        cellSet(st.pos, savedPos);
+        cellSet(st.committed, savedCommitted);
+        cellSet(e.errPos, savedErrPos);
+        cellSet(e.furthestPos, savedFurthestPos);
+        cellSet(e.errExpected, savedErrExp);
+        cellSet(e.furthestExpected, savedFurthestExp);
+        match res {
+            Some(_) -> stateFail(st, expected),
+            None -> okUnit,
+        }
+    }),
+}
+
+/// Validate the result of `p` with `pred`; fails at the start of `p` if `pred` returns `false`.
+pub def verify(p: Parser a, pred: a -> Bool, expected: String): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        let res = fp(st);
+        match res {
+            Some(v) -> if (pred(v)) res else {
+                cellSet(st.pos, savedPos);
+                stateFail(st, expected)
+            },
+            None -> None,
+        }
+    }),
+}
+
+/// Transform and filter the result of `p` using a function returning `Option b`.
+pub def mapOpt(p: Parser a, g: a -> Option b, expected: String): Parser b = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedPos = cellGet(st.pos);
+        match fp(st) {
+            Some(v) -> {
+                let res = g(v);
+                match res {
+                    Some(_) -> res,
+                    None -> {
+                        cellSet(st.pos, savedPos);
+                        stateFail(st, expected)
+                    },
+                }
+            },
+            None -> None,
+        }
+    }),
+}
+
+/// Run `p` and return the exact zero-copy input slice it consumed (discarding `p`'s value).
+pub def recognize(p: Parser a): Parser String = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        match fp(st) {
+            Some(_) -> Some(ptrSliceFromStr(st.src, start, cellGet(st.pos) - start)),
+            None -> None,
+        }
+    }),
+}
+
+/// Run `p` and return its half-open byte `Span` alongside its parsed value.
+pub def spanOf(p: Parser a): Parser (Span, a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        match fp(st) {
+            Some(v) -> Some((Span { start: start, end: cellGet(st.pos) }, v)),
+            None -> None,
+        }
+    }),
+}
+
+/// Run `p` and wrap its result in `Spanned { span, value }`.
+pub def spanned(p: Parser a): Parser (Spanned a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        match fp(st) {
+            Some(v) -> Some(Spanned {
+                span: Span { start: start, end: cellGet(st.pos) },
+                value: v,
+            }),
+            None -> None,
+        }
+    }),
+}
+
+/// Memoized lazy parser for recursive grammars. `thunk` is evaluated at most once.
+pub def lazy(thunk: () -> Parser a): Parser a = {
+    let cached: Cell (Option (ParseState -> Option a)) = cellNew(None);
+    MkParser((st: ParseState) -> match cellGet(cached) {
+        Some(fp) -> fp(st),
+        None -> match thunk() {
+            MkParser(fp) -> {
+                cellSet(cached, Some(fp));
+                fp(st)
+            },
+        },
+    })
+}
+
+/// Direct fixed-point combinator for recursive grammars (zero `Option` unwrap on recursion).
+pub def fix(build: Parser a -> Parser a): Parser a = {
+    let slot: Cell (ParseState -> Option a) = cellNew((st: ParseState) -> stateFail(st, "uninitialized recursive parser"));
+    let selfP: Parser a = MkParser((st: ParseState) -> {
+        let f = cellGet(slot);
+        f(st)
+    });
+    match build(selfP) {
+        MkParser(fp) -> {
+            cellSet(slot, fp);
+            MkParser(fp)
+        },
+    }
+}
+
+// ============================================================================
+// Tail-Recursive Repetition, Separation & Streaming Folds (Zero `Cell` Alloc)
+// ============================================================================
+
+def manyVecLoop(st: ParseState, fp: ParseState -> Option a, out: Vec a, savedCommitted: Bool): Option (Vec a) = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fp(st) {
+        Some(v) -> {
+            vecPush(out, v);
+            if (cellGet(st.pos) == before) {
+                cellSet(st.committed, savedCommitted);
+                Some(out)
+            } else {
+                manyVecLoop(st, fp, out, savedCommitted)
+            }
+        },
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(out)
+            }
+        },
+    }
+}
+
+/// Parse zero or more occurrences of `p` into a growable `Vec a` (self-TCO, zero list-rev).
+pub def manyVec(p: Parser a): Parser (Vec a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let out: Vec a = vecNew();
+        let savedCommitted = cellGet(st.committed);
+        manyVecLoop(st, fp, out, savedCommitted)
+    }),
+}
+
+/// Parse one or more occurrences of `p` into a `Vec a`.
+pub def many1Vec(p: Parser a): Parser (Vec a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> match fp(st) {
+        None -> None,
+        Some(first) -> {
+            let out: Vec a = vecNew();
+            vecPush(out, first);
+            let savedCommitted = cellGet(st.committed);
+            manyVecLoop(st, fp, out, savedCommitted)
+        },
+    }),
+}
+
+def manyListLoop(st: ParseState, fp: ParseState -> Option a, acc: List a, savedCommitted: Bool): Option (List a) = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fp(st) {
+        Some(v) -> {
+            let nextAcc = Cons(v, acc);
+            if (cellGet(st.pos) == before) {
+                cellSet(st.committed, savedCommitted);
+                Some(listRev(nextAcc))
+            } else {
+                manyListLoop(st, fp, nextAcc, savedCommitted)
+            }
+        },
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(listRev(acc))
+            }
+        },
+    }
+}
+
+/// Parse zero or more occurrences of `p` into a `List a` (self-TCO).
+pub def many(p: Parser a): Parser (List a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedCommitted = cellGet(st.committed);
+        manyListLoop(st, fp, Nil, savedCommitted)
+    }),
+}
+
+/// Parse one or more occurrences of `p` into a `List a` (self-TCO).
+pub def many1(p: Parser a): Parser (List a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> match fp(st) {
+        None -> None,
+        Some(first) -> {
+            let savedCommitted = cellGet(st.committed);
+            manyListLoop(st, fp, Cons(first, Nil), savedCommitted)
+        },
+    }),
+}
+
+def skipManyLoop(st: ParseState, fp: ParseState -> Option a, savedCommitted: Bool): Option Void = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fp(st) {
+        Some(_) -> {
+            if (cellGet(st.pos) == before) {
+                cellSet(st.committed, savedCommitted);
+                okUnit
+            } else {
+                skipManyLoop(st, fp, savedCommitted)
+            }
+        },
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                okUnit
+            }
+        },
+    }
+}
+
+/// Parse and discard zero or more occurrences of `p` (zero allocation).
+pub def skipMany(p: Parser a): Parser Void = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedCommitted = cellGet(st.committed);
+        skipManyLoop(st, fp, savedCommitted)
+    }),
+}
+
+/// Parse and discard one or more occurrences of `p` (zero allocation).
+pub def skipMany1(p: Parser a): Parser Void = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> match fp(st) {
+        None -> None,
+        Some(_) -> {
+            let savedCommitted = cellGet(st.committed);
+            skipManyLoop(st, fp, savedCommitted)
+        },
+    }),
+}
+
+def foldManyLoop(st: ParseState, fp: ParseState -> Option a, step: (b, a) -> b, acc: b, savedCommitted: Bool): Option b = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fp(st) {
+        Some(v) -> {
+            let nextAcc = step(acc, v);
+            if (cellGet(st.pos) == before) {
+                cellSet(st.committed, savedCommitted);
+                Some(nextAcc)
+            } else {
+                foldManyLoop(st, fp, step, nextAcc, savedCommitted)
+            }
+        },
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(acc)
+            }
+        },
+    }
+}
+
+/// Streaming left-fold over zero or more `p` (zero intermediate `List`/`Vec` allocation).
+/// `init` is a thunk so mutable accumulators are fresh on every parse run.
+pub def foldMany(p: Parser a, init: () -> b, step: (b, a) -> b): Parser b = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let savedCommitted = cellGet(st.committed);
+        foldManyLoop(st, fp, step, init(), savedCommitted)
+    }),
+}
+
+def sepByVecLoop(
+    st: ParseState,
+    fp: ParseState -> Option a,
+    fs: ParseState -> Option s,
+    out: Vec a,
+    savedCommitted: Bool
+): Option (Vec a) = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fs(st) {
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(out)
+            }
+        },
+        Some(_) -> match fp(st) {
+            Some(v) -> {
+                vecPush(out, v);
+                sepByVecLoop(st, fp, fs, out, savedCommitted)
+            },
+            None -> {
+                if (cellGet(st.committed)) None
+                else {
+                    cellSet(st.pos, before);
+                    cellSet(st.committed, savedCommitted);
+                    Some(out)
+                }
+            },
+        },
+    }
+}
+
+/// Parse zero or more `p` separated by `sep` into a `Vec a`.
+pub def sepByVec(p: Parser a, sep: Parser s): Parser (Vec a) = match (p, sep) {
+    (MkParser(fp), MkParser(fs)) -> MkParser((st: ParseState) -> {
+        let out: Vec a = vecNew();
+        let savedPos = cellGet(st.pos);
+        let savedCommitted = cellGet(st.committed);
+        cellSet(st.committed, false);
+        match fp(st) {
+            None -> {
+                if (cellGet(st.committed)) None
+                else {
+                    cellSet(st.pos, savedPos);
+                    cellSet(st.committed, savedCommitted);
+                    Some(out)
+                }
+            },
+            Some(first) -> {
+                vecPush(out, first);
+                sepByVecLoop(st, fp, fs, out, savedCommitted)
+            },
+        }
+    }),
+}
+
+/// Parse one or more `p` separated by `sep` into a `Vec a`.
+pub def sepBy1Vec(p: Parser a, sep: Parser s): Parser (Vec a) = match (p, sep) {
+    (MkParser(fp), MkParser(fs)) -> MkParser((st: ParseState) -> match fp(st) {
+        None -> None,
+        Some(first) -> {
+            let out: Vec a = vecNew();
+            vecPush(out, first);
+            let savedCommitted = cellGet(st.committed);
+            sepByVecLoop(st, fp, fs, out, savedCommitted)
+        },
+    }),
+}
+
+def sepByListLoop(
+    st: ParseState,
+    fp: ParseState -> Option a,
+    fs: ParseState -> Option s,
+    acc: List a,
+    savedCommitted: Bool
+): Option (List a) = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fs(st) {
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(listRev(acc))
+            }
+        },
+        Some(_) -> match fp(st) {
+            Some(v) -> sepByListLoop(st, fp, fs, Cons(v, acc), savedCommitted),
+            None -> {
+                if (cellGet(st.committed)) None
+                else {
+                    cellSet(st.pos, before);
+                    cellSet(st.committed, savedCommitted);
+                    Some(listRev(acc))
+                }
+            },
+        },
+    }
+}
+
+/// Parse zero or more `p` separated by `sep` into a `List a`.
+pub def sepBy(p: Parser a, sep: Parser s): Parser (List a) = {
+    let someNil: Option (List a) = Some(Nil);
+    match (p, sep) {
+        (MkParser(fp), MkParser(fs)) -> MkParser((st: ParseState) -> {
+            let savedPos = cellGet(st.pos);
+            let savedCommitted = cellGet(st.committed);
+            cellSet(st.committed, false);
+            match fp(st) {
+                None -> {
+                    if (cellGet(st.committed)) None
+                    else {
+                        cellSet(st.pos, savedPos);
+                        cellSet(st.committed, savedCommitted);
+                        someNil
+                    }
+                },
+                Some(first) -> sepByListLoop(st, fp, fs, Cons(first, Nil), savedCommitted),
+            }
+        }),
+    }
+}
+
+/// Parse one or more `p` separated by `sep` into a `List a`.
+pub def sepBy1(p: Parser a, sep: Parser s): Parser (List a) = match (p, sep) {
+    (MkParser(fp), MkParser(fs)) -> MkParser((st: ParseState) -> match fp(st) {
+        None -> None,
+        Some(first) -> {
+            let savedCommitted = cellGet(st.committed);
+            sepByListLoop(st, fp, fs, Cons(first, Nil), savedCommitted)
+        },
+    }),
+}
+
+/// Parse zero or more `p` separated by (and optionally terminated by) `sep` into a `List a`.
+pub def sepEndBy(p: Parser a, sep: Parser s): Parser (List a) =
+    seqLeft(sepBy(p, sep), optional(sep))
+
+def foldSepByLoop(
+    st: ParseState,
+    fp: ParseState -> Option a,
+    fs: ParseState -> Option s,
+    step: (b, a) -> b,
+    acc: b,
+    savedCommitted: Bool
+): Option b = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fs(st) {
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(acc)
+            }
+        },
+        Some(_) -> match fp(st) {
+            Some(v) -> foldSepByLoop(st, fp, fs, step, step(acc, v), savedCommitted),
+            None -> {
+                if (cellGet(st.committed)) None
+                else {
+                    cellSet(st.pos, before);
+                    cellSet(st.committed, savedCommitted);
+                    Some(acc)
+                }
+            },
+        },
+    }
+}
+
+/// Streaming left-fold over zero or more `p` separated by `sep`.
+pub def foldSepBy(p: Parser a, sep: Parser s, init: () -> b, step: (b, a) -> b): Parser b =
+    match (p, sep) {
+        (MkParser(fp), MkParser(fs)) -> MkParser((st: ParseState) -> {
+            let acc0 = init();
+            let savedPos = cellGet(st.pos);
+            let savedCommitted = cellGet(st.committed);
+            cellSet(st.committed, false);
+            match fp(st) {
+                None -> {
+                    if (cellGet(st.committed)) None
+                    else {
+                        cellSet(st.pos, savedPos);
+                        cellSet(st.committed, savedCommitted);
+                        Some(acc0)
+                    }
+                },
+                Some(first) -> foldSepByLoop(st, fp, fs, step, step(acc0, first), savedCommitted),
+            }
+        }),
+    }
+
+def countVecLoop(st: ParseState, fp: ParseState -> Option a, out: Vec a, rem: Int): Option (Vec a) =
+    if (rem <= 0) Some(out)
+    else match fp(st) {
+        Some(v) -> {
+            vecPush(out, v);
+            countVecLoop(st, fp, out, rem - 1)
+        },
+        None -> None,
+    }
+
+/// Parse exactly `n` occurrences of `p` into a `Vec a`.
+pub def countVec(n: Int, p: Parser a): Parser (Vec a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> countVecLoop(st, fp, vecNew(), n)),
+}
+
+def countListLoop(st: ParseState, fp: ParseState -> Option a, acc: List a, rem: Int): Option (List a) =
+    if (rem <= 0) Some(listRev(acc))
+    else match fp(st) {
+        Some(v) -> countListLoop(st, fp, Cons(v, acc), rem - 1),
+        None -> None,
+    }
+
+/// Parse exactly `n` occurrences of `p` into a `List a`.
+pub def count(n: Int, p: Parser a): Parser (List a) = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> countListLoop(st, fp, Nil, n)),
+}
+
+def chainl1Loop(
+    st: ParseState,
+    ft: ParseState -> Option a,
+    fop: ParseState -> Option ((a, a) -> a),
+    acc: a,
+    savedCommitted: Bool
+): Option a = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fop(st) {
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                Some(acc)
+            }
+        },
+        Some(combine) -> match ft(st) {
+            Some(rhs) -> chainl1Loop(st, ft, fop, combine(acc, rhs), savedCommitted),
+            None -> None,
+        },
+    }
+}
+
+/// Left-associative infix operator chain: `term (op term)*` (self-TCO, zero list allocation).
+pub def chainl1(term: Parser a, op: Parser ((a, a) -> a)): Parser a = match (term, op) {
+    (MkParser(ft), MkParser(fop)) -> MkParser((st: ParseState) -> match ft(st) {
+        None -> None,
+        Some(first) -> {
+            let savedCommitted = cellGet(st.committed);
+            chainl1Loop(st, ft, fop, first, savedCommitted)
+        },
+    }),
+}
+
+def foldRightChain(
+    vals: Vec a,
+    ops: Vec ((a, a) -> a),
+    fallbackVal: a,
+    noop: (a, a) -> a,
+    k: Int,
+    acc: a
+): a =
+    if (k < 0) acc
+    else {
+        let lhs = vecGetOr(vals, k, fallbackVal);
+        let combine = vecGetOr(ops, k, noop);
+        foldRightChain(vals, ops, fallbackVal, noop, k - 1, combine(lhs, acc))
+    }
+
+def chainr1Collect(
+    st: ParseState,
+    ft: ParseState -> Option a,
+    fop: ParseState -> Option ((a, a) -> a),
+    vals: Vec a,
+    ops: Vec ((a, a) -> a),
+    first: a,
+    savedCommitted: Bool
+): Option a = {
+    let before = cellGet(st.pos);
+    cellSet(st.committed, false);
+    match fop(st) {
+        None -> {
+            if (cellGet(st.committed)) None
+            else {
+                cellSet(st.pos, before);
+                cellSet(st.committed, savedCommitted);
+                let nOps = vecLen(ops);
+                let lastVal = vecGetOr(vals, nOps, first);
+                let noop: (a, a) -> a = (x, _) -> x;
+                Some(foldRightChain(vals, ops, first, noop, nOps - 1, lastVal))
+            }
+        },
+        Some(combine) -> match ft(st) {
+            Some(rhs) -> {
+                vecPush(ops, combine);
+                vecPush(vals, rhs);
+                chainr1Collect(st, ft, fop, vals, ops, first, savedCommitted)
+            },
+            None -> None,
+        },
+    }
+}
+
+/// Right-associative infix operator chain: `term (op term)*`.
+pub def chainr1(term: Parser a, op: Parser ((a, a) -> a)): Parser a = match (term, op) {
+    (MkParser(ft), MkParser(fop)) -> MkParser((st: ParseState) -> match ft(st) {
+        None -> None,
+        Some(first) -> {
+            let vals: Vec a = vecNew();
+            let ops: Vec ((a, a) -> a) = vecNew();
+            vecPush(vals, first);
+            let savedCommitted = cellGet(st.committed);
+            chainr1Collect(st, ft, fop, vals, ops, first, savedCommitted)
+        },
+    }),
+}
+
+// ============================================================================
+// O(1) First-Byte Dispatch Combinators
+// ============================================================================
+
+/// Peek the next byte (`0..255`, or `-1` on EOF) and dispatch to a parser without backtracking.
+pub def dispatch(f: Int -> Parser a): Parser a = MkParser((st: ParseState) -> {
+    let b = statePeek(st);
+    match f(b) {
+        MkParser(fp) -> fp(st),
+    }
+})
+
+def fillByteTable(tbl: MutArray (ParseState -> Option a), entries: List (Int, Parser a)): Void =
+    match entries {
+        Nil -> (),
+        Cons(entry, rest) -> {
+            match entry {
+                (b, MkParser(fp)) -> if (b >= 0 && b < 128) arraySet(tbl, b, fp) else (),
+            };
+            fillByteTable(tbl, rest)
+        },
+    }
+
+/// Precomputed O(1) ASCII jump table (128 entries) dispatching on the next byte without consuming it.
+/// Bytes outside `0..127` (including EOF `-1`) or unlisted bytes invoke `defaultP`.
+pub def byteTable(defaultP: Parser a, entries: List (Int, Parser a)): Parser a = match defaultP {
+    MkParser(defaultFn) -> {
+        let tbl = arrayNew(128, defaultFn);
+        fillByteTable(tbl, entries);
+        MkParser((st: ParseState) -> {
+            let i = cellGet(st.pos);
+            if (i < st.len) {
+                let b = strByteAt(st.src, i);
+                if (b >= 0 && b < 128) {
+                    let fp = arrayGet(tbl, b);
+                    fp(st)
+                } else {
+                    defaultFn(st)
+                }
+            } else {
+                defaultFn(st)
+            }
+        })
+    },
+}
+
+// ============================================================================
+// High-Speed Register-Loop Byte & Token Leaf Scanners
+// ============================================================================
+
+/// Succeed iff the cursor is at the end of input.
+pub def eof(): Parser Void = MkParser((st: ParseState) ->
+    if (cellGet(st.pos) >= st.len) okUnit
+    else stateFail(st, "end of input")
+)
+
+/// Return the current byte offset without consuming input.
+pub def position(): Parser Int = MkParser((st: ParseState) -> Some(cellGet(st.pos)))
+
+/// Peek the next byte (`0..255`, or `-1` at EOF) without consuming input.
+pub def peekByte(): Parser Int = MkParser((st: ParseState) -> Some(statePeek(st)))
+
+/// Consume and return any single byte (`0..255`).
+pub def anyByte(): Parser Int = MkParser((st: ParseState) -> {
+    let i = cellGet(st.pos);
+    if (i >= st.len) stateFail(st, "any byte")
+    else {
+        cellSet(st.pos, i + 1);
+        Some(strByteAt(st.src, i))
+    }
+})
+
+/// Consume and return any single ASCII/byte `Char`.
+pub def anyChar(): Parser Char = MkParser((st: ParseState) -> {
+    let i = cellGet(st.pos);
+    if (i >= st.len) stateFail(st, "any character")
+    else {
+        cellSet(st.pos, i + 1);
+        Some(intToChar(strByteAt(st.src, i)))
+    }
+})
+
+def byteLabel(b: Int): String =
+    if (b == 10) "'\\n'"
+    else if (b == 13) "'\\r'"
+    else if (b == 9) "'\\t'"
+    else if (b == 39) "\"'\""
+    else if (b >= 32 && b <= 126) {
+        let buf = bufNew();
+        bufPushByte(buf, 39);
+        bufPushByte(buf, b);
+        bufPushByte(buf, 39);
+        bufToString(buf)
+    } else "byte " + intToStr(b)
+
+/// Match an exact byte `b` (zero allocation at parse time).
+pub def byte(b: Int): Parser Int = {
+    let lbl = byteLabel(b);
+    let wrapped = Some(b);
+    MkParser((st: ParseState) -> {
+        let i = cellGet(st.pos);
+        if (i < st.len && strByteAt(st.src, i) == b) {
+            cellSet(st.pos, i + 1);
+            wrapped
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Match and discard an exact byte `b` (zero allocation at parse time).
+pub def skipByte(b: Int): Parser Void = {
+    let lbl = byteLabel(b);
+    MkParser((st: ParseState) -> {
+        let i = cellGet(st.pos);
+        if (i < st.len && strByteAt(st.src, i) == b) {
+            cellSet(st.pos, i + 1);
+            okUnit
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Match an exact `Char` (zero allocation at parse time).
+pub def char(c: Char): Parser Char = {
+    let b = charToInt(c);
+    let lbl = byteLabel(b);
+    let wrapped = Some(c);
+    MkParser((st: ParseState) -> {
+        let i = cellGet(st.pos);
+        if (i < st.len && strByteAt(st.src, i) == b) {
+            cellSet(st.pos, i + 1);
+            wrapped
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Match and discard an exact `Char` (zero allocation at parse time).
+pub def skipChar(c: Char): Parser Void = skipByte(charToInt(c))
+
+/// Match a single byte satisfying `pred`.
+pub def satisfyByte(pred: Int -> Bool, expected: String): Parser Int = MkParser((st: ParseState) -> {
+    let i = cellGet(st.pos);
+    if (i < st.len) {
+        let b = strByteAt(st.src, i);
+        if (pred(b)) {
+            cellSet(st.pos, i + 1);
+            Some(b)
+        } else {
+            stateFail(st, expected)
+        }
+    } else {
+        stateFail(st, expected)
+    }
+})
+
+/// Match a single `Char` satisfying `pred`.
+pub def satisfy(pred: Char -> Bool, expected: String): Parser Char = MkParser((st: ParseState) -> {
+    let i = cellGet(st.pos);
+    if (i < st.len) {
+        let c = intToChar(strByteAt(st.src, i));
+        if (pred(c)) {
+            cellSet(st.pos, i + 1);
+            Some(c)
+        } else {
+            stateFail(st, expected)
+        }
+    } else {
+        stateFail(st, expected)
+    }
+})
+
+/// Match a single byte in the inclusive range `[lo, hi]`.
+pub def byteRange(lo: Int, hi: Int, expected: String): Parser Int = MkParser((st: ParseState) -> {
+    let i = cellGet(st.pos);
+    if (i < st.len) {
+        let b = strByteAt(st.src, i);
+        if (b >= lo && b <= hi) {
+            cellSet(st.pos, i + 1);
+            Some(b)
+        } else {
+            stateFail(st, expected)
+        }
+    } else {
+        stateFail(st, expected)
+    }
+})
+
+def buildByteSet(chars: String, n: Int, k: Int, tbl: MutArray Bool): Void =
+    if (k >= n) ()
+    else {
+        let b = strByteAt(chars, k);
+        if (b >= 0 && b < 256) arraySet(tbl, b, true) else ();
+        buildByteSet(chars, n, k + 1, tbl)
+    }
+
+/// Match any byte present in `chars` using a precomputed 256-entry O(1) lookup table.
+pub def oneOf(chars: String): Parser Int = {
+    let tbl = arrayNew(256, false);
+    buildByteSet(chars, strLen(chars), 0, tbl);
+    let lbl = "one of \"" + chars + "\"";
+    MkParser((st: ParseState) -> {
+        let i = cellGet(st.pos);
+        if (i < st.len) {
+            let b = strByteAt(st.src, i);
+            if (b >= 0 && b < 256 && arrayGet(tbl, b)) {
+                cellSet(st.pos, i + 1);
+                Some(b)
+            } else {
+                stateFail(st, lbl)
+            }
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Match any byte NOT present in `chars` using a precomputed 256-entry O(1) lookup table.
+pub def noneOf(chars: String): Parser Int = {
+    let tbl = arrayNew(256, false);
+    buildByteSet(chars, strLen(chars), 0, tbl);
+    let lbl = "none of \"" + chars + "\"";
+    MkParser((st: ParseState) -> {
+        let i = cellGet(st.pos);
+        if (i < st.len) {
+            let b = strByteAt(st.src, i);
+            if (!(b >= 0 && b < 256 && arrayGet(tbl, b))) {
+                cellSet(st.pos, i + 1);
+                Some(b)
+            } else {
+                stateFail(st, lbl)
+            }
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+def matchTagLoop(src: String, start: Int, lit: String, m: Int, k: Int): Bool =
+    if (k >= m) true
+    else if (strByteAt(src, start + k) != strByteAt(lit, k)) false
+    else matchTagLoop(src, start, lit, m, k + 1)
+
+/// Match an exact string literal by direct byte comparison (zero allocation at parse time).
+pub def tag(lit: String): Parser String = {
+    let m = strLen(lit);
+    let lbl = "\"" + lit + "\"";
+    let wrapped = Some(lit);
+    MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        if (start + m <= st.len && matchTagLoop(st.src, start, lit, m, 0)) {
+            cellSet(st.pos, start + m);
+            wrapped
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Match and discard an exact string literal by direct byte comparison (zero allocation).
+pub def skipTag(lit: String): Parser Void = {
+    let m = strLen(lit);
+    let lbl = "\"" + lit + "\"";
+    MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        if (start + m <= st.len && matchTagLoop(st.src, start, lit, m, 0)) {
+            cellSet(st.pos, start + m);
+            okUnit
+        } else {
+            stateFail(st, lbl)
+        }
+    })
+}
+
+/// Consume exactly `n` bytes and return them as a zero-copy `String` slice.
+pub def takeN(n: Int): Parser String = {
+    let lbl = intToStr(n) + " bytes";
+    MkParser((st: ParseState) -> {
+        let start = cellGet(st.pos);
+        if (n < 0 || start + n > st.len) {
+            stateFail(st, lbl)
+        } else {
+            cellSet(st.pos, start + n);
+            Some(ptrSliceFromStr(st.src, start, n))
+        }
+    })
+}
+
+def scanWhileLoop(src: String, len: Int, pred: Int -> Bool, i: Int): Int =
+    if (i < len && pred(strByteAt(src, i))) scanWhileLoop(src, len, pred, i + 1)
+    else i
+
+/// Consume zero or more bytes satisfying `pred` and return an O(1) slice.
+pub def takeWhile(pred: Int -> Bool): Parser String = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanWhileLoop(st.src, st.len, pred, start);
+    cellSet(st.pos, end);
+    Some(ptrSliceFromStr(st.src, start, end - start))
+})
+
+/// Consume one or more bytes satisfying `pred` and return an O(1) slice.
+pub def takeWhile1(pred: Int -> Bool, expected: String): Parser String = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanWhileLoop(st.src, st.len, pred, start);
+    if (end == start) {
+        stateFail(st, expected)
+    } else {
+        cellSet(st.pos, end);
+        Some(ptrSliceFromStr(st.src, start, end - start))
+    }
+})
+
+/// Skip zero or more bytes satisfying `pred` (zero allocation).
+pub def skipWhile(pred: Int -> Bool): Parser Void = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanWhileLoop(st.src, st.len, pred, start);
+    if (end != start) cellSet(st.pos, end) else ();
+    okUnit
+})
+
+/// Skip one or more bytes satisfying `pred` (zero allocation).
+pub def skipWhile1(pred: Int -> Bool, expected: String): Parser Void = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanWhileLoop(st.src, st.len, pred, start);
+    if (end == start) {
+        stateFail(st, expected)
+    } else {
+        cellSet(st.pos, end);
+        okUnit
+    }
+})
+
+def scanUntilByteLoop(src: String, len: Int, stop: Int, i: Int): Int =
+    if (i < len && strByteAt(src, i) != stop) scanUntilByteLoop(src, len, stop, i + 1)
+    else i
+
+/// Consume bytes until `stop` byte (not consumed) or EOF, returning a single `strSlice`.
+pub def takeUntilByte(stop: Int): Parser String = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanUntilByteLoop(st.src, st.len, stop, start);
+    cellSet(st.pos, end);
+    Some(ptrSliceFromStr(st.src, start, end - start))
+})
+
+/// Skip bytes until `stop` byte (not consumed) or EOF (zero allocation).
+pub def skipUntilByte(stop: Int): Parser Void = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = scanUntilByteLoop(st.src, st.len, stop, start);
+    if (end != start) cellSet(st.pos, end) else ();
+    okUnit
+})
+
+def skipSpacesLoop(src: String, len: Int, i: Int): Int =
+    if (i >= len) i
+    else {
+        let c = strByteAt(src, i);
+        if (c == 32 || c == 9 || c == 10 || c == 13) skipSpacesLoop(src, len, i + 1)
+        else i
+    }
+
+def skipSpacesRaw(st: ParseState): Void = {
+    let i = cellGet(st.pos);
+    if (i < st.len) {
+        let c = strByteAt(st.src, i);
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            cellSet(st.pos, skipSpacesLoop(st.src, st.len, i + 1))
+        } else ()
+    } else ()
+}
+
+/// Inline tight-loop ASCII whitespace skipper (`' '`, `'\t'`, `'\n'`, `'\r'`; zero allocation).
+pub def skipSpaces(): Parser Void = MkParser((st: ParseState) -> {
+    skipSpacesRaw(st);
+    okUnit
+})
+
+/// Inline tight-loop skipper requiring at least one ASCII whitespace byte.
+pub def skipSpaces1(): Parser Void = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = skipSpacesLoop(st.src, st.len, start);
+    if (end == start) stateFail(st, "whitespace")
+    else {
+        cellSet(st.pos, end);
+        okUnit
+    }
+})
+
+def skipHorizLoop(src: String, len: Int, i: Int): Int =
+    if (i >= len) i
+    else {
+        let c = strByteAt(src, i);
+        if (c == 32 || c == 9) skipHorizLoop(src, len, i + 1)
+        else i
+    }
+
+/// Inline tight-loop horizontal whitespace skipper (`' '` and `'\t'`).
+pub def skipHorizontalSpaces(): Parser Void = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let end = skipHorizLoop(st.src, st.len, start);
+    if (end != start) cellSet(st.pos, end) else ();
+    okUnit
+})
+
+/// Run `p` and consume any trailing ASCII whitespace (zero re-boxing, O(1) fast path when no ws).
+pub def lexeme(p: Parser a): Parser a = match p {
+    MkParser(fp) -> MkParser((st: ParseState) -> {
+        let res = fp(st);
+        match res {
+            Some(_) -> {
+                skipSpacesRaw(st);
+                res
+            },
+            None -> None,
+        }
+    }),
+}
+
+/// Match `lit` followed by trailing ASCII whitespace, returning `lit`.
+pub def symbol(lit: String): Parser String = lexeme(tag(lit))
+
+/// Match and discard `lit` followed by trailing ASCII whitespace.
+pub def skipSymbol(lit: String): Parser Void = lexeme(skipTag(lit))
+
+def scanIdentLoop(src: String, len: Int, i: Int): Int =
+    if (i < len && isIdentContByte(strByteAt(src, i))) scanIdentLoop(src, len, i + 1)
+    else i
+
+/// Fast ASCII identifier parser (`[A-Za-z_][A-Za-z0-9_]*`, register loop + single `strSlice`).
+pub def ident(): Parser String = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len || !isIdentStartByte(strByteAt(st.src, start))) {
+        stateFail(st, "identifier")
+    } else {
+        let end = scanIdentLoop(st.src, st.len, start + 1);
+        cellSet(st.pos, end);
+        Some(ptrSliceFromStr(st.src, start, end - start))
+    }
+})
+
+def scanBoundedIntLoop(src: String, len: Int, limit: Int64, i: Int, acc: Int64): (Int, Int64, Bool) =
+    if (i >= len) (i, acc, false)
+    else {
+        let b = strByteAt(src, i);
+        if (b >= 48 && b <= 57) {
+            let next = acc * intToI64(10) + intToI64(b - 48);
+            if (next > limit) (i, acc, true)
+            else scanBoundedIntLoop(src, len, limit, i + 1, next)
+        } else (i, acc, false)
+    }
+
+/// Fast unsigned decimal `Int` parser (direct arithmetic accumulation, zero string allocation).
+pub def uint(): Parser Int = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len || !isDigitByte(strByteAt(st.src, start))) {
+        stateFail(st, "unsigned integer")
+    } else {
+        let (end, acc, overflow) = scanBoundedIntLoop(st.src, st.len, intToI64(2147483647), start, intToI64(0));
+        if (overflow) {
+            stateFailAt(st, start, "32-bit unsigned integer")
+        } else {
+            cellSet(st.pos, end);
+            Some(i64ToInt(acc))
+        }
+    }
+})
+
+/// Fast signed decimal `Int` parser (direct arithmetic accumulation, zero string allocation).
+pub def decInt(): Parser Int = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len) {
+        stateFail(st, "integer")
+    } else {
+        let neg = strByteAt(st.src, start) == 45;
+        let dStart = if (neg) start + 1 else start;
+        if (dStart >= st.len || !isDigitByte(strByteAt(st.src, dStart))) {
+            stateFail(st, "integer")
+        } else {
+            let limit = if (neg) intToI64(2147483647) + intToI64(1) else intToI64(2147483647);
+            let (end, acc, overflow) = scanBoundedIntLoop(st.src, st.len, limit, dStart, intToI64(0));
+            if (overflow) {
+                stateFailAt(st, start, "32-bit integer")
+            } else {
+                cellSet(st.pos, end);
+                if (neg) Some(i64ToInt(intToI64(0) - acc))
+                else Some(i64ToInt(acc))
+            }
+        }
+    }
+})
+
+def scanInt64Loop(src: String, len: Int, i: Int, acc: Int64): (Int, Int64) =
+    if (i >= len) (i, acc)
+    else {
+        let b = strByteAt(src, i);
+        if (b >= 48 && b <= 57) scanInt64Loop(src, len, i + 1, acc * intToI64(10) + intToI64(b - 48))
+        else (i, acc)
+    }
+
+/// Fast signed decimal `Int64` parser (direct arithmetic accumulation, zero string allocation).
+pub def decInt64(): Parser Int64 = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len) {
+        stateFail(st, "64-bit integer")
+    } else {
+        let neg = strByteAt(st.src, start) == 45;
+        let dStart = if (neg) start + 1 else start;
+        if (dStart >= st.len || !isDigitByte(strByteAt(st.src, dStart))) {
+            stateFail(st, "64-bit integer")
+        } else {
+            let (end, acc) = scanInt64Loop(st.src, st.len, dStart, intToI64(0));
+            cellSet(st.pos, end);
+            if (neg) Some(intToI64(0) - acc) else Some(acc)
+        }
+    }
+})
+
+def hexDigitVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def scanHexLoop(src: String, len: Int, i: Int, acc: Int64): (Int, Int64) =
+    if (i >= len) (i, acc)
+    else {
+        let dv = hexDigitVal(strByteAt(src, i));
+        if (dv >= 0) scanHexLoop(src, len, i + 1, (acc << 4) | intToI64(dv))
+        else (i, acc)
+    }
+
+/// Fast hexadecimal unsigned `Int` parser (one or more `[0-9a-fA-F]`, zero string allocation).
+pub def hexInt(): Parser Int = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len || hexDigitVal(strByteAt(st.src, start)) < 0) {
+        stateFail(st, "hexadecimal integer")
+    } else {
+        let (end, acc) = scanHexLoop(st.src, st.len, start, intToI64(0));
+        cellSet(st.pos, end);
+        Some(i64ToInt(acc))
+    }
+})
+
+def scanDigitsLoop(src: String, len: Int, i: Int): Int =
+    if (i < len && isDigitByte(strByteAt(src, i))) scanDigitsLoop(src, len, i + 1)
+    else i
+
+/// Fast floating-point literal parser (`-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`).
+pub def floatLit(): Parser Float = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    let i0 = if (start < st.len && strByteAt(st.src, start) == 45) start + 1 else start;
+    let i1 = scanDigitsLoop(st.src, st.len, i0);
+    if (i1 == i0) {
+        stateFail(st, "number")
+    } else {
+        let i2 = if (i1 < st.len && strByteAt(st.src, i1) == 46) {
+            let fEnd = scanDigitsLoop(st.src, st.len, i1 + 1);
+            if (fEnd == i1 + 1) -1 else fEnd
+        } else i1;
+        if (i2 < 0) {
+            stateFailAt(st, start, "number")
+        } else {
+            let i3 = if (i2 < st.len && (strByteAt(st.src, i2) == 101 || strByteAt(st.src, i2) == 69)) {
+                let e0 = i2 + 1;
+                let e1 = if (e0 < st.len && (strByteAt(st.src, e0) == 43 || strByteAt(st.src, e0) == 45)) e0 + 1 else e0;
+                let eEnd = scanDigitsLoop(st.src, st.len, e1);
+                if (eEnd == e1) -1 else eEnd
+            } else i2;
+            if (i3 < 0) {
+                stateFailAt(st, start, "number")
+            } else {
+                match parseFloat(ptrSliceFromStr(st.src, start, i3 - start)) {
+                    Ok(f) -> {
+                        cellSet(st.pos, i3);
+                        Some(f)
+                    },
+                    Err(_) -> stateFailAt(st, start, "number"),
+                }
+            }
+        }
+    }
+})
+
+def pushUtf8Codepoint(buf: StringBuf, cp: Int): Void =
+    if (cp < 128) {
+        bufPushByte(buf, cp)
+    } else if (cp < 2048) {
+        bufPushByte(buf, 192 | (cp >>> 6));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else if (cp < 65536) {
+        bufPushByte(buf, 224 | (cp >>> 12));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    } else {
+        bufPushByte(buf, 240 | (cp >>> 18));
+        bufPushByte(buf, 128 | ((cp >>> 12) & 63));
+        bufPushByte(buf, 128 | ((cp >>> 6) & 63));
+        bufPushByte(buf, 128 | (cp & 63))
+    }
+
+def readHex4At(src: String, len: Int, idx: Int): Int =
+    if (idx + 4 > len) -1
+    else {
+        let b0 = hexDigitVal(strByteAt(src, idx));
+        let b1 = hexDigitVal(strByteAt(src, idx + 1));
+        let b2 = hexDigitVal(strByteAt(src, idx + 2));
+        let b3 = hexDigitVal(strByteAt(src, idx + 3));
+        if (b0 < 0 || b1 < 0 || b2 < 0 || b3 < 0) -1
+        else (b0 << 12) | (b1 << 8) | (b2 << 4) | b3
+    }
+
+// Fast-path scanner for unescaped quoted strings:
+//   returns >= 0 : index of closing '"' (zero escapes!)
+//   returns < 0  : -(idx + 1) when '\', EOF, or control char is encountered at `idx`
+def scanQuotedFast(src: String, len: Int, i: Int): Int =
+    if (i >= len) -(i + 1)
+    else {
+        let c = strByteAt(src, i);
+        if (c == 34) i
+        else if (c == 92 || c < 32) -(i + 1)
+        else scanQuotedFast(src, len, i + 1)
+    }
+
+def scanQuotedSlow(st: ParseState, buf: StringBuf, idx: Int): Option String =
+    if (idx >= st.len) {
+        stateFailAt(st, idx, "closing '\"'")
+    } else {
+        let c = strByteAt(st.src, idx);
+        if (c == 34) {
+            cellSet(st.pos, idx + 1);
+            Some(bufToString(buf))
+        } else if (c == 92) {
+            if (idx + 1 >= st.len) {
+                stateFailAt(st, idx, "escape character")
+            } else {
+                let esc = strByteAt(st.src, idx + 1);
+                if (esc == 34) { bufPushByte(buf, 34); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 92) { bufPushByte(buf, 92); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 47) { bufPushByte(buf, 47); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 98) { bufPushByte(buf, 8); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 102) { bufPushByte(buf, 12); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 110) { bufPushByte(buf, 10); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 114) { bufPushByte(buf, 13); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 116) { bufPushByte(buf, 9); scanQuotedSlow(st, buf, idx + 2) }
+                else if (esc == 117) {
+                    let cp = readHex4At(st.src, st.len, idx + 2);
+                    if (cp < 0) {
+                        stateFailAt(st, idx, "4 hex digits after \\u")
+                    } else if (cp >= 55296 && cp <= 56319 && idx + 11 < st.len && strByteAt(st.src, idx + 6) == 92 && strByteAt(st.src, idx + 7) == 117) {
+                        let low = readHex4At(st.src, st.len, idx + 8);
+                        if (low >= 56320 && low <= 57343) {
+                            let full = 65536 + ((cp - 55296) << 10) + (low - 56320);
+                            pushUtf8Codepoint(buf, full);
+                            scanQuotedSlow(st, buf, idx + 12)
+                        } else {
+                            pushUtf8Codepoint(buf, cp);
+                            scanQuotedSlow(st, buf, idx + 6)
+                        }
+                    } else {
+                        pushUtf8Codepoint(buf, cp);
+                        scanQuotedSlow(st, buf, idx + 6)
+                    }
+                } else {
+                    stateFailAt(st, idx, "valid escape sequence")
+                }
+            }
+        } else if (c < 32) {
+            stateFailAt(st, idx, "valid string character")
+        } else {
+            bufPushByte(buf, c);
+            scanQuotedSlow(st, buf, idx + 1)
+        }
+    }
+
+/// Fast double-quoted string parser with RFC 8259 escapes (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, `\uXXXX`).
+///
+/// Uses a zero-allocation register loop + zero-copy `strSlice` fast path when no backslash escapes occur.
+pub def quotedString(): Parser String = MkParser((st: ParseState) -> {
+    let start = cellGet(st.pos);
+    if (start >= st.len || strByteAt(st.src, start) != 34) {
+        stateFail(st, "quoted string")
+    } else {
+        let contentStart = start + 1;
+        let fastRes = scanQuotedFast(st.src, st.len, contentStart);
+        if (fastRes >= 0) {
+            cellSet(st.pos, fastRes + 1);
+            Some(ptrSliceFromStr(st.src, contentStart, fastRes - contentStart))
+        } else {
+            let stopIdx = (-fastRes) - 1;
+            if (stopIdx >= st.len) {
+                stateFailAt(st, stopIdx, "closing '\"'")
+            } else if (strByteAt(st.src, stopIdx) < 32) {
+                stateFailAt(st, stopIdx, "valid string character")
+            } else {
+                let buf = bufNew();
+                if (stopIdx > contentStart) {
+                    bufPushStr(buf, ptrSliceFromStr(st.src, contentStart, stopIdx - contentStart))
+                } else ();
+                scanQuotedSlow(st, buf, stopIdx)
+            }
+        }
+    }
+})

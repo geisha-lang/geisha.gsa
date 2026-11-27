@@ -30,6 +30,7 @@ MODULES = [
     ("std.codec", "std/codec.gsa"),
     ("std.json", "std/json.gsa"),
     ("std.toml", "std/toml.gsa"),
+    ("std.parsec", "std/parsec.gsa"),
     ("std.sha256", "std/sha256.gsa"),
     ("std.bench", "std/bench.gsa"),
     ("sys.io", "sys/io.gsa"),

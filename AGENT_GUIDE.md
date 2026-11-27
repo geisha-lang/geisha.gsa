@@ -159,6 +159,7 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.codec` — binary/text encoding & decoding concepts
 - `std.json` — JSON parser, AST, and serializer
 - `std.toml` — TOML parser, canonical serializer, and comment-preserving `patch`
+- `std.parsec` — high-performance parser combinators (`Parser a` with `Functor`/`Applicative`/`Monad` instances, `<|>`, `<*`, `*>`, `<?>`, `<$`, zero-alloc failure cursor, `cut`, `byteTable` O(1) dispatch, iterative `manyVec`/`sepByVec`/`foldMany`/`chainl1`, fast byte scanners, and compact 1D `formatParseError`)
 - `std.sha256` — SHA-256 hashing
 - `std.bench` — microbenchmarking (polymorphic `blackBox`, `blackBoxBarrier`, `BenchConfig`, `BenchStats`, `measure`, `bench`, `benchWith`, `benchGroup`, `formatStatsText`, `formatStatsJson`, `formatStatsJsonInFile`)
 

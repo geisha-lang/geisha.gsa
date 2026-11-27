@@ -4601,4 +4601,147 @@ EOF
 "$CC" $HOST_CC_TARGET -O2 -Iruntime/include -pthread "$TMP_DIR/t39_blocking_roots.c" "$GEISHA_RUNTIME" $HOST_CC_LIBS -o "$TMP_DIR/t39_blocking_roots"
 assert_eq "blocking_capture_callee_saved_roots_O2" "1" "$("$TMP_DIR/t39_blocking_roots")"
 
+# --- Test 40: `std.parsec` high-performance parser combinators ---
+DOC_PARSEC="$("$GEISHA_BIN" doc std.parsec)"
+for sym in "Parser" "ParseState" "ParseError" "Span" "Functor" "Applicative" "Monad" "formatParseError" "byteTable" "chainl1" "chainr1" "quotedString" "manyVec" "sepByVec" "foldMany"; do
+    if ! printf '%s\n' "$DOC_PARSEC" | grep -q "$sym"; then
+        echo "FAIL [parsec_doc]: missing '$sym' in 'geisha doc std.parsec'" >&2
+        exit 1
+    fi
+done
+echo "PASS [parsec_doc]: std.parsec exports verified"
+PASS=$((PASS + 1))
+
+cat << 'EOF' > "$TMP_DIR/t40_parsec.gsa"
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listLen}
+use std.vec.{Vec, vecLen, vecGetOr}
+use std.str.{intToStr, i64ToStr, strContains}
+use std.char.{isDigitByte}
+use std.control.{pure, fmap, (<$>), (<*>), (>>=), (>>)}
+use std.parsec.{
+    Parser, Span, Spanned, ParseError,
+    parse, parseNamed, parsePartial, formatParseError,
+    pureP, failP, mapP, valueP, pair, map2, map3, between, alt, choice,
+    cut, tryP, label, optional, optOr, peek, notFollowedBy, verify, mapOpt,
+    recognize, spanOf, spanned, lazy, fix,
+    many, many1, manyVec, many1Vec, skipMany, skipMany1,
+    sepBy, sepBy1, sepByVec, sepBy1Vec, sepEndBy, foldMany, foldSepBy,
+    count, countVec, chainl1, chainr1,
+    dispatch, byteTable,
+    eof, position, peekByte, anyByte, anyChar, byte, skipByte, char, skipChar,
+    satisfyByte, byteRange, oneOf, noneOf, tag, skipTag, takeN,
+    takeWhile, takeWhile1, skipWhile, skipWhile1, takeUntilByte, skipUntilByte,
+    skipSpaces, skipSpaces1, skipHorizontalSpaces, lexeme, symbol, skipSymbol,
+    ident, uint, decInt, decInt64, hexInt, floatLit, quotedString,
+    (<|>), (<*), (*>), (<?>), (<$)
+}
+
+def powInt(base: Int, exp: Int): Int =
+    if (exp <= 0) 1 else base * powInt(base, exp - 1)
+
+def main(): Void = {
+    // 1. HKT Functor / Applicative / Monad (<$>, <*>, >>=, >>, pure)
+    let addPair = ((a: Int) -> (b: Int) -> a * 10 + b) <$> (lexeme(decInt()) <* lexeme(skipChar(','))) <*> lexeme(decInt());
+    let r1 = match parse(addPair, "4, 2") { Ok(v) -> intToStr(v), Err(e) -> formatParseError(e) };
+
+    let monadP = lexeme(ident()) >>= (k) -> (skipSymbol("=") *> lexeme(decInt())) >>= (v) -> pure(k + "=" + intToStr(v));
+    let r2 = match parse(monadP, "age = 27") { Ok(s) -> s, Err(e) -> formatParseError(e) };
+
+    // 2. Recursive expression parser with chainl1 (left-assoc) & chainr1 (right-assoc ^)
+    let lp = lexeme(skipByte(40));
+    let rp = lexeme(skipByte(41));
+    let addOp = (((a: Int, b: Int) -> a + b) <$ lexeme(skipByte(43)))
+        <|> (((a: Int, b: Int) -> a - b) <$ lexeme(skipByte(45)));
+    let mulOp = (((a: Int, b: Int) -> a * b) <$ lexeme(skipByte(42)))
+        <|> (((a: Int, b: Int) -> a / b) <$ lexeme(skipByte(47)));
+    let powOp = ((a: Int, b: Int) -> powInt(a, b)) <$ lexeme(skipByte(94));
+    let exprP = fix((selfExpr) -> {
+        let atom = lexeme(decInt()) <|> between(lp, rp, selfExpr);
+        let power = chainr1(atom, powOp);
+        let term = chainl1(power, mulOp);
+        chainl1(term, addOp)
+    });
+    // 10 - 3 - 2 = 5 (left-assoc), 2 ^ 3 ^ 2 = 512 (right-assoc), (1 + 2) * 4 = 12 => 5 + 512 + 12 = 529
+    let r3 = match parse(skipSpaces() *> exprP, "  10 - 3 - 2 + 2 ^ 3 ^ 2 + (1 + 2) * 4") {
+        Ok(v) -> intToStr(v),
+        Err(e) -> formatParseError(e),
+    };
+
+    // 3. cut prevents backtracking & produces sharp 1D diagnostic
+    let stmtP =
+        (skipSymbol("let") *> cut(pair(lexeme(ident()) <* skipSymbol("="), lexeme(decInt()))))
+        <|> (skipSymbol("var") *> pair(lexeme(ident()) <* skipSymbol("="), lexeme(decInt())));
+    let r4 = match parseNamed(stmtP, "test.dsl", "let x = oops") {
+        Ok(_) -> "unexpected-ok",
+        Err(e) -> {
+            let msg = formatParseError(e);
+            if (e.line == 1 && e.col == 9 && strContains(msg, "test.dsl:1:9: error[parse]: expected integer, found 'o'")) "cutOk"
+            else msg
+        },
+    };
+
+    // 4. tryP overrides cut & furthest error tracking across lines
+    let tryBranch = tryP(skipTag("ab") *> cut(skipTag("cd"))) <|> skipTag("abef");
+    let r5 = match parse(tryBranch, "abef") { Ok(_) -> "tryOk", Err(e) -> formatParseError(e) };
+
+    let multiLineP = sepBy1(lexeme(decInt()), lexeme(skipChar(',')));
+    let r6 = match parseNamed(multiLineP, "nums.txt", "1,\n2,\n3!") {
+        Ok(_) -> "unexpected-ok",
+        Err(e) -> if (e.line == 3 && e.col == 2 && e.expected == "end of input") "mlErrOk" else formatParseError(e),
+    };
+
+    // 5. quotedString (fast unescaped + escaped + unicode surrogate pair)
+    let r7 = match parse(quotedString(), "\"hello world\"") { Ok(s) -> s, Err(_) -> "err" };
+    let r8 = match parse(quotedString(), "\"a\\nb\\t\\u0041\"") {
+        Ok(s) -> if (strLen(s) == 5 && strByteAt(s, 1) == 10 && strByteAt(s, 3) == 9 && strByteAt(s, 4) == 65) "escOk" else "escBad",
+        Err(_) -> "escErr",
+    };
+
+    // 6. Numbers, hex, float, spans, recognize, foldSepBy, sepByVec, byteTable, oneOf/noneOf, notFollowedBy
+    let r9 = match parse(map3(lexeme(decInt64()), lexeme(skipTag("0x") *> hexInt()), lexeme(floatLit()), (a, b, c) -> i64ToStr(a) + ":" + intToStr(b) + ":" + (if (c > 3.13 && c < 3.15) "pi" else "bad")), "-5000000000 0xFF 3.14") {
+        Ok(s) -> s,
+        Err(e) -> formatParseError(e),
+    };
+
+    let sumP = foldSepBy(lexeme(uint()), lexeme(skipChar(',')), () -> 0, (acc, x) -> acc + x);
+    let r10 = match parse(sumP, "10, 20, 30, 40") { Ok(v) -> intToStr(v), Err(_) -> "err" };
+
+    let vecP = sepByVec(lexeme(ident()), lexeme(skipChar(';')));
+    let r11 = match parse(vecP, "alpha; beta; gamma") {
+        Ok(v) -> intToStr(vecLen(v)) + ":" + vecGetOr(v, 1, ""),
+        Err(_) -> "err",
+    };
+
+    let spanP = skipSpaces() *> spanned(recognize(ident() *> skipChar(':') *> takeWhile1(isDigitByte, "digits")));
+    let r12 = match parse(spanP, "  k:99") {
+        Ok(Spanned { span, value }) -> intToStr(span.start) + ".." + intToStr(span.end) + "=" + value,
+        Err(_) -> "err",
+    };
+
+    let kwNotIdent = (tag("if") <* notFollowedBy(satisfyByte((b) -> b >= 97 && b <= 122, "letter"), "word boundary")) <|> ident();
+    let r13 = match parse(kwNotIdent, "ifdef") { Ok(s) -> s, Err(_) -> "err" };
+
+    let dispP = byteTable(failP("token"), [
+        (43, "plus" <$ skipByte(43)),
+        (45, "minus" <$ skipByte(45)),
+        (42, "star" <$ skipByte(42)),
+    ]);
+    let r14 = match parse(sepBy(dispP, skipSpaces1()), "+ - *") {
+        Ok(xs) -> intToStr(listLen(xs)),
+        Err(_) -> "err",
+    };
+
+    let partialRes = match parsePartial(count(3, oneOf("abc")), "abczzz") {
+        Ok((xs, nextOff)) -> intToStr(listLen(xs)) + "@" + intToStr(nextOff),
+        Err(_) -> "err",
+    };
+
+    printLn(r1 + "|" + r2 + "|" + r3 + "|" + r4 + "|" + r5 + "|" + r6 + "|" + r7 + "|" + r8 + "|" + r9 + "|" + r10 + "|" + r11 + "|" + r12 + "|" + r13 + "|" + r14 + "|" + partialRes)
+}
+EOF
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t40_parsec" "$TMP_DIR/t40_parsec.gsa"
+assert_eq "std_parsec_combinators_e2e" "42|age=27|529|cutOk|tryOk|mlErrOk|hello world|escOk|-5000000000:255:pi|100|3:beta|2..6=k:99|ifdef|3|3@3" "$("$TMP_DIR/t40_parsec")"
+
 echo "All $PASS end-to-end test suites passed!"
