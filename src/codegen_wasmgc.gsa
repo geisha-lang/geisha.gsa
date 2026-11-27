@@ -1,0 +1,3731 @@
+// Geisha Core IR -> WebAssembly GC (`.wasm` + companion `.mjs` / `.d.ts`) Backend (`codegen_wasmgc`)
+//
+// Directly lowers monomorphized, K-converted `CoreProgram` to a standalone WasmGC binary
+// with ZERO linear memory and ZERO custom GC runtime:
+//   - Records / single-variant ADTs  -> `sub final` WasmGC `struct` (`struct.new` / `struct.get`)
+//   - Multi-variant ADTs             -> tagged `sub` base struct + `sub final` variant structs (`ref.test` / `ref.cast`)
+//   - Pure unit-variant enums        -> unboxed `i31ref` (`ref.i31` / `i31.get_s`), zero heap allocation
+//   - `String`                       -> `array (mut i8)` + passive data segment (`array.new_data` / `array.copy`)
+//   - `MutArray a` / `ImmArray a`    -> `array (mut T)` (`array.new` / `array.new_default` / `array.get` / `array.set` / `array.len`)
+//   - `Cell a` / `AtomicInt`         -> mutable 1-field `struct (field (mut T))` (`struct.new` / `struct.get` / `struct.set`)
+//   - Closures                       -> closure base `struct (field (ref $fn))` + `sub final` env struct + `ref.func` + `call_ref`
+//   - `Ptr`/`ScopedPtr`/`ForeignPtr` -> GC-managed `{ buf: array (mut i8), off: i32 }` struct (zero linear memory!)
+//   - Tail calls                     -> native Wasm `return_call` / `return_call_ref`
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listLen, listAppend}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr, vecSet}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.buf.{StringBuf, MkStringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
+use std.str.{intToStr, strJoin, strStartsWith}
+use ast.{
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, ScmMono, schemeBody,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    Span, emptySpan
+}
+use diag.formatSpanDiag
+use infer.{
+    VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
+}
+use core.{
+    ClosureSpec, TaggedTerm, MkTerm, CoreArm, Term,
+    TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
+    TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
+    FunDef, GlobalValDef, ExternDef, CoreProgram,
+    extractTypeArgs
+}
+
+// ============================================================================
+// Low-Level Wasm Binary Encoding Helpers
+// ============================================================================
+
+def emitUleb(b: StringBuf, n: Int): Void = {
+    let v = cellNew(n);
+    let more = cellNew(true);
+    while (cellGet(more)) {
+        let cur = cellGet(v);
+        let byte = cur & 127;
+        let next = cur >>> 7;
+        if (next != 0) {
+            bufPushByte(b, byte | 128);
+            cellSet(v, next)
+        } else {
+            bufPushByte(b, byte);
+            cellSet(more, false)
+        }
+    }
+}
+
+def emitSleb(b: StringBuf, n: Int): Void = {
+    let v = cellNew(n);
+    let more = cellNew(true);
+    while (cellGet(more)) {
+        let cur = cellGet(v);
+        let byte = cur & 127;
+        let next = cur >> 7;
+        if ((next == 0 && (byte & 64) == 0) || (next == -1 && (byte & 64) != 0)) {
+            bufPushByte(b, byte);
+            cellSet(more, false)
+        } else {
+            bufPushByte(b, byte | 128);
+            cellSet(v, next)
+        }
+    }
+}
+
+def emitSleb64(b: StringBuf, n: Int64): Void = {
+    let v = cellNew(n);
+    let more = cellNew(true);
+    let z64 = intToI64(0);
+    let m1_64 = intToI64(-1);
+    let mask7 = intToI64(127);
+    while (cellGet(more)) {
+        let cur = cellGet(v);
+        let byte = i64ToInt(bitAnd64(cur, mask7));
+        let next = bitShr64(cur, 7);
+        if ((next == z64 && (byte & 64) == 0) || (next == m1_64 && (byte & 64) != 0)) {
+            bufPushByte(b, byte);
+            cellSet(more, false)
+        } else {
+            bufPushByte(b, byte | 128);
+            cellSet(v, next)
+        }
+    }
+}
+
+def emitF32Le(b: StringBuf, f: Float32): Void = {
+    let bits = f32ToBits32(f);
+    bufPushByte(b, bits & 255);
+    bufPushByte(b, (bits >>> 8) & 255);
+    bufPushByte(b, (bits >>> 16) & 255);
+    bufPushByte(b, (bits >>> 24) & 255)
+}
+
+def emitF64Le(b: StringBuf, f: Float): Void = {
+    let bits = floatToBits64(f);
+    let mask = intToI64(255);
+    bufPushByte(b, i64ToInt(bitAnd64(bits, mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 8), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 16), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 24), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 32), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 40), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 48), mask)));
+    bufPushByte(b, i64ToInt(bitAnd64(bitUshr64(bits, 56), mask)))
+}
+
+def emitWasmName(b: StringBuf, s: String): Void = {
+    emitUleb(b, strLen(s));
+    bufPushStr(b, s)
+}
+
+def emitSection(out: StringBuf, secId: Int, body: StringBuf): Void = {
+    bufPushByte(out, secId);
+    emitUleb(out, bufLen(body));
+    bufPushBuf(out, body)
+}
+
+// ============================================================================
+// WasmGC Type Representation
+// ============================================================================
+
+// Pre-allocated core type indices in the single `rec` group:
+//   0 = String: array (mut i8)
+//   1 = Ptr:    struct (field (mut (ref null 0))) (field (mut i32))
+//   2 = CellI32: struct (field (mut i32))
+//   3 = ArrI32:  array (mut i32)
+
+data WgcValType {
+    WTI32,
+    WTI64,
+    WTF32,
+    WTF64,
+    WTI31,
+    WTAny,
+    WTRefNull(Int),
+    WTRef(Int),
+}
+
+data WgcStorageType {
+    WSVal(WgcValType),
+    WSI8,
+}
+
+data WgcFieldType {
+    MkWgcField { wfTy: WgcStorageType, wfMut: Bool },
+}
+
+data WgcTypeDef {
+    WTDPlaceholder,
+    WTDArray(WgcFieldType),
+    WTDStruct(List WgcFieldType),
+    WTDSubStruct(Option Int, Bool, List WgcFieldType),
+    WTDFunc(List WgcValType, List WgcValType),
+}
+
+def valTypeKey(wt: WgcValType): String = match wt {
+    WTI32 -> "i32",
+    WTI64 -> "i64",
+    WTF32 -> "f32",
+    WTF64 -> "f64",
+    WTI31 -> "i31",
+    WTAny -> "any",
+    WTRefNull(idx) -> "rn" + intToStr(idx),
+    WTRef(idx) -> "r" + intToStr(idx),
+}
+
+def valTypeListKey(wts: List WgcValType): String = match wts {
+    Nil -> "",
+    Cons(h, Nil) -> valTypeKey(h),
+    Cons(h, t) -> valTypeKey(h) + "," + valTypeListKey(t),
+}
+
+def emitValType(b: StringBuf, wt: WgcValType): Void = match wt {
+    WTI32 -> bufPushByte(b, 0x7F),
+    WTI64 -> bufPushByte(b, 0x7E),
+    WTF32 -> bufPushByte(b, 0x7D),
+    WTF64 -> bufPushByte(b, 0x7C),
+    WTI31 -> bufPushByte(b, 0x6C),
+    WTAny -> bufPushByte(b, 0x6E),
+    WTRefNull(idx) -> {
+        bufPushByte(b, 0x63);
+        emitSleb(b, idx)
+    },
+    WTRef(idx) -> {
+        bufPushByte(b, 0x64);
+        emitSleb(b, idx)
+    },
+}
+
+def emitFieldType(b: StringBuf, f: WgcFieldType): Void = {
+    match f.wfTy {
+        WSVal(wt) -> emitValType(b, wt),
+        WSI8 -> bufPushByte(b, 0x78),
+    };
+    bufPushByte(b, if (f.wfMut) 1 else 0)
+}
+
+def emitFieldList(b: StringBuf, fs: List WgcFieldType): Void = {
+    emitUleb(b, listLen(fs));
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(f, r) -> { emitFieldType(b, f); cellSet(cur, r) },
+            Nil -> (),
+        }
+    }
+}
+
+def emitValTypeVec(b: StringBuf, wts: List WgcValType): Void = {
+    emitUleb(b, listLen(wts));
+    let cur = cellNew(wts);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(wt, r) -> { emitValType(b, wt); cellSet(cur, r) },
+            Nil -> (),
+        }
+    }
+}
+
+def emitTypeDef(b: StringBuf, td: WgcTypeDef): Void = match td {
+    WTDPlaceholder -> {
+        // Should never be emitted; fallback to empty struct
+        bufPushByte(b, 0x5F);
+        bufPushByte(b, 0x00)
+    },
+    WTDArray(ft) -> {
+        bufPushByte(b, 0x5E);
+        emitFieldType(b, ft)
+    },
+    WTDStruct(fs) -> {
+        bufPushByte(b, 0x5F);
+        emitFieldList(b, fs)
+    },
+    WTDSubStruct(supOpt, isFinal, fs) -> {
+        bufPushByte(b, if (isFinal) 0x4F else 0x50);
+        match supOpt {
+            None -> bufPushByte(b, 0x00),
+            Some(sup) -> {
+                bufPushByte(b, 0x01);
+                emitUleb(b, sup)
+            },
+        };
+        bufPushByte(b, 0x5F);
+        emitFieldList(b, fs)
+    },
+    WTDFunc(ps, rs) -> {
+        bufPushByte(b, 0x60);
+        emitValTypeVec(b, ps);
+        emitValTypeVec(b, rs)
+    },
+}
+
+def emitDefaultVal(b: StringBuf, wt: WgcValType): Void = match wt {
+    WTI32 -> { bufPushByte(b, 0x41); bufPushByte(b, 0x00) },
+    WTI64 -> { bufPushByte(b, 0x42); bufPushByte(b, 0x00) },
+    WTF32 -> { bufPushByte(b, 0x43); emitF32Le(b, floatToF32(0.0)) },
+    WTF64 -> { bufPushByte(b, 0x44); emitF64Le(b, 0.0) },
+    WTI31 -> { bufPushByte(b, 0xD0); bufPushByte(b, 0x6C) },
+    WTAny -> { bufPushByte(b, 0xD0); bufPushByte(b, 0x6E) },
+    WTRefNull(idx) -> { bufPushByte(b, 0xD0); emitSleb(b, idx) },
+    WTRef(idx) -> { bufPushByte(b, 0xD0); emitSleb(b, idx) },
+}
+
+// ============================================================================
+// ADT Layout & Module State
+// ============================================================================
+
+data WgcAdtLayout {
+    WALEnumI31,
+    WALSingleStruct(Int, List WgcValType),
+    WALMultiAdt(Int, List (Int, Int, List WgcValType)),
+}
+
+data WgcImport {
+    MkWgcImport { impMod: String, impName: String, impTypeIdx: Int },
+}
+
+data WgcDefinedFn {
+    MkWgcDefinedFn {
+        dfTypeIdx: Int,
+        dfBody: Cell StringBuf,
+    },
+}
+
+data WgcGlobal {
+    MkWgcGlobal { glValTy: WgcValType, glMut: Bool },
+}
+
+data WgcExport {
+    MkWgcExport { expName: String, expFuncIdx: Int },
+}
+
+data WgcModule {
+    MkWgcModule {
+        wmProg: CoreProgram,
+        wmTypes: Vec WgcTypeDef,
+        wmTypeCache: StrMap Int,
+        wmClsCache: StrMap (Int, Int),
+        wmAdtLayouts: StrMap WgcAdtLayout,
+        wmImports: Vec WgcImport,
+        wmImportMap: StrMap Int,
+        wmNumImports: Cell Int,
+        wmDefinedFns: Vec WgcDefinedFn,
+        wmFnIdxMap: StrMap Int,
+        wmFnRetVoid: StrMap Bool,
+        wmThunkMap: StrMap Int,
+        wmHelperMap: StrMap Int,
+        wmGlobals: Vec WgcGlobal,
+        wmGlobalMap: StrMap Int,
+        wmGlobalWts: StrMap WgcValType,
+        wmExports: Vec WgcExport,
+        wmRefFuncSet: StrMap Bool,
+        wmRefFuncList: Vec Int,
+        wmDataPool: StringBuf,
+        wmStrLitMap: StrMap (Int, Int),
+        wmStartFunc: Cell (Option Int),
+        wmNeedsStrInterop: Cell Bool,
+        wmErr: Cell (Option String),
+    },
+}
+
+def newWgcModule(prog: CoreProgram): WgcModule = {
+    let types: Vec WgcTypeDef = vecNew();
+    // 0: TY_STR = array (mut i8)
+    vecPush(types, WTDArray(MkWgcField { wfTy: WSI8, wfMut: true }));
+    // 1: TY_PTR = struct (field (mut (ref null 0))) (field (mut i32))
+    vecPush(types, WTDStruct([
+        MkWgcField { wfTy: WSVal(WTRefNull(0)), wfMut: true },
+        MkWgcField { wfTy: WSVal(WTI32), wfMut: true },
+    ]));
+    // 2: TY_CELL_I32 = struct (field (mut i32))
+    vecPush(types, WTDStruct([
+        MkWgcField { wfTy: WSVal(WTI32), wfMut: true },
+    ]));
+    // 3: TY_ARR_I32 = array (mut i32)
+    vecPush(types, WTDArray(MkWgcField { wfTy: WSVal(WTI32), wfMut: true }));
+
+    let tcache: StrMap Int = strMapNew();
+    strMapInsert(tcache, "cell:i32", 2);
+    strMapInsert(tcache, "arr:i32", 3);
+
+    MkWgcModule {
+        wmProg: prog,
+        wmTypes: types,
+        wmTypeCache: tcache,
+        wmClsCache: strMapNew(),
+        wmAdtLayouts: strMapNew(),
+        wmImports: vecNew(),
+        wmImportMap: strMapNew(),
+        wmNumImports: cellNew(0),
+        wmDefinedFns: vecNew(),
+        wmFnIdxMap: strMapNew(),
+        wmFnRetVoid: strMapNew(),
+        wmThunkMap: strMapNew(),
+        wmHelperMap: strMapNew(),
+        wmGlobals: vecNew(),
+        wmGlobalMap: strMapNew(),
+        wmGlobalWts: strMapNew(),
+        wmExports: vecNew(),
+        wmRefFuncSet: strMapNew(),
+        wmRefFuncList: vecNew(),
+        wmDataPool: bufNew(),
+        wmStrLitMap: strMapNew(),
+        wmStartFunc: cellNew(None),
+        wmNeedsStrInterop: cellNew(false),
+        wmErr: cellNew(None),
+    }
+}
+
+def setWgcErr(wm: WgcModule, sp: Span, msg: String): Void = match cellGet(wm.wmErr) {
+    Some(_) -> (),
+    None -> cellSet(wm.wmErr, Some(formatSpanDiag("codegen", sp, msg))),
+}
+
+def addRawType(wm: WgcModule, td: WgcTypeDef): Int = {
+    let idx = vecLen(wm.wmTypes);
+    vecPush(wm.wmTypes, td);
+    idx
+}
+
+def internFuncType(wm: WgcModule, params: List WgcValType, results: List WgcValType): Int = {
+    let key = "fn:(" + valTypeListKey(params) + ")->(" + valTypeListKey(results) + ")";
+    match strMapGet(wm.wmTypeCache, key) {
+        Some(idx) -> idx,
+        None -> {
+            let idx = addRawType(wm, WTDFunc(params, results));
+            strMapInsert(wm.wmTypeCache, key, idx);
+            idx
+        },
+    }
+}
+
+def internCellType(wm: WgcModule, elemWt: WgcValType): Int = {
+    let key = "cell:" + valTypeKey(elemWt);
+    match strMapGet(wm.wmTypeCache, key) {
+        Some(idx) -> idx,
+        None -> {
+            let idx = addRawType(wm, WTDStruct([MkWgcField { wfTy: WSVal(elemWt), wfMut: true }]));
+            strMapInsert(wm.wmTypeCache, key, idx);
+            idx
+        },
+    }
+}
+
+def internArrayType(wm: WgcModule, elemWt: WgcValType): Int = {
+    let key = "arr:" + valTypeKey(elemWt);
+    match strMapGet(wm.wmTypeCache, key) {
+        Some(idx) -> idx,
+        None -> {
+            let idx = addRawType(wm, WTDArray(MkWgcField { wfTy: WSVal(elemWt), wfMut: true }));
+            strMapInsert(wm.wmTypeCache, key, idx);
+            idx
+        },
+    }
+}
+
+def mapMutFields(wts: List WgcValType, isMut: Bool): List WgcFieldType = match wts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(MkWgcField { wfTy: WSVal(h), wfMut: isMut }, mapMutFields(t, isMut)),
+}
+
+def internTupleType(wm: WgcModule, elemWts: List WgcValType): Int = {
+    let key = "tup:(" + valTypeListKey(elemWts) + ")";
+    match strMapGet(wm.wmTypeCache, key) {
+        Some(idx) -> idx,
+        None -> {
+            let idx = addRawType(wm, WTDStruct(mapMutFields(elemWts, false)));
+            strMapInsert(wm.wmTypeCache, key, idx);
+            idx
+        },
+    }
+}
+
+def internClsTypes(wm: WgcModule, paramWts: List WgcValType, retWts: List WgcValType): (Int, Int) = {
+    let key = "cls:(" + valTypeListKey(paramWts) + ")->(" + valTypeListKey(retWts) + ")";
+    match strMapGet(wm.wmClsCache, key) {
+        Some(pair) -> pair,
+        None -> {
+            // Reserve both indices so they mutually reference each other in the rec group!
+            let baseIdx = addRawType(wm, WTDPlaceholder);
+            let fnIdx = addRawType(wm, WTDPlaceholder);
+            let pair = (baseIdx, fnIdx);
+            strMapInsert(wm.wmClsCache, key, pair);
+            vecSet(wm.wmTypes, baseIdx, WTDSubStruct(None, false, [
+                MkWgcField { wfTy: WSVal(WTRef(fnIdx)), wfMut: false },
+            ]));
+            vecSet(wm.wmTypes, fnIdx, WTDFunc(Cons(WTRefNull(baseIdx), paramWts), retWts));
+            pair
+        },
+    }
+}
+
+def internClsEnvType(wm: WgcModule, baseIdx: Int, fnIdx: Int, fvWts: List WgcValType): Int = {
+    let key = "clsenv:" + intToStr(baseIdx) + ":" + valTypeListKey(fvWts);
+    match strMapGet(wm.wmTypeCache, key) {
+        Some(idx) -> idx,
+        None -> {
+            let fields = Cons(
+                MkWgcField { wfTy: WSVal(WTRef(fnIdx)), wfMut: false },
+                mapMutFields(fvWts, true)
+            );
+            let idx = addRawType(wm, WTDSubStruct(Some(baseIdx), true, fields));
+            strMapInsert(wm.wmTypeCache, key, idx);
+            idx
+        },
+    }
+}
+
+// ============================================================================
+// Geisha Type -> WasmGC Type Mapping
+// ============================================================================
+
+def isVoidTy(ty: Type): Bool = match ty {
+    TyVoid -> true,
+    TyCon(n) -> n == "Void",
+    _ -> false,
+}
+
+def tyConName(ty: Type): String = match ty {
+    TyCon(n) -> n,
+    TyComp(b, _) -> tyConName(b),
+    _ -> "",
+}
+
+def substTypeList(ts: List Type, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), substTypeList(t, sub)),
+}
+
+def adtMangleKey(adtName: String, targs: List Type): String = match targs {
+    Nil -> adtName,
+    _ -> adtName + "<" + joinTypeKeys(targs) + ">",
+}
+
+def joinTypeKeys(ts: List Type): String = match ts {
+    Nil -> "",
+    Cons(h, Nil) -> ast.typeToString(h),
+    Cons(h, t) -> ast.typeToString(h) + "," + joinTypeKeys(t),
+}
+
+def allVariantsUnit(vs: List VariantInfo): Bool = match vs {
+    Nil -> true,
+    Cons(v, r) -> match v.fieldTypes {
+        Nil -> allVariantsUnit(r),
+        _ -> false,
+    },
+}
+
+def resolveAdtLayout(wm: WgcModule, adtName: String, targs: List Type): WgcAdtLayout = {
+    let key = adtMangleKey(adtName, targs);
+    match strMapGet(wm.wmAdtLayouts, key) {
+        Some(lay) -> lay,
+        None -> match strMapGet(wm.wmProg.coreAdtReg, adtName) {
+            None -> WALEnumI31,
+            Some(ainfo) -> {
+                if (allVariantsUnit(ainfo.variants)) {
+                    strMapInsert(wm.wmAdtLayouts, key, WALEnumI31);
+                    WALEnumI31
+                } else match ainfo.variants {
+                    Cons(onlyVar, Nil) -> {
+                        // Single-variant record/struct ADT: zero tag field overhead!
+                        let styIdx = addRawType(wm, WTDPlaceholder);
+                        // Insert placeholder layout first so recursive fields resolve cleanly
+                        strMapInsert(wm.wmAdtLayouts, key, WALSingleStruct(styIdx, Nil));
+                        let sub = buildPairMap(ainfo.typeParams, targs);
+                        let concreteFts = substTypeList(onlyVar.fieldTypes, sub);
+                        let fieldWts = mapGeishaTypesToWgc(wm, concreteFts);
+                        vecSet(wm.wmTypes, styIdx, WTDSubStruct(None, true, mapMutFields(fieldWts, false)));
+                        let lay = WALSingleStruct(styIdx, fieldWts);
+                        strMapInsert(wm.wmAdtLayouts, key, lay);
+                        lay
+                    },
+                    _ -> {
+                        // Multi-variant ADT with payload: base `sub (struct (field i32))` + `sub final` per variant
+                        let baseIdx = addRawType(wm, WTDSubStruct(None, false, [
+                            MkWgcField { wfTy: WSVal(WTI32), wfMut: false },
+                        ]));
+                        // Register base layout early for recursive ADTs (e.g. List, Expr, Json)
+                        strMapInsert(wm.wmAdtLayouts, key, WALMultiAdt(baseIdx, Nil));
+                        let sub = buildPairMap(ainfo.typeParams, targs);
+                        let varsRev = cellNew(Nil);
+                        let cv = cellNew(ainfo.variants);
+                        while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                            match cellGet(cv) {
+                                Cons(vi, rv) -> {
+                                    let concreteFts = substTypeList(vi.fieldTypes, sub);
+                                    let fieldWts = mapGeishaTypesToWgc(wm, concreteFts);
+                                    let allFields = Cons(
+                                        MkWgcField { wfTy: WSVal(WTI32), wfMut: false },
+                                        mapMutFields(fieldWts, false)
+                                    );
+                                    let varIdx = addRawType(wm, WTDSubStruct(Some(baseIdx), true, allFields));
+                                    cellSet(varsRev, Cons((vi.tag, varIdx, fieldWts), cellGet(varsRev)));
+                                    cellSet(cv, rv)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let lay = WALMultiAdt(baseIdx, listRev(cellGet(varsRev)));
+                        strMapInsert(wm.wmAdtLayouts, key, lay);
+                        lay
+                    },
+                }
+            },
+        },
+    }
+}
+
+def mapGeishaTypesToWgc(wm: WgcModule, ts: List Type): List WgcValType = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(geishaTypeToWgc(wm, h), mapGeishaTypesToWgc(wm, t)),
+}
+
+def geishaTypeToWgc(wm: WgcModule, ty: Type): WgcValType = match ty {
+    TyVoid -> WTI32,
+    TyVar(_) -> WTI32,
+    TyCon(n) ->
+        if (n == "Int" || n == "Bool" || n == "Char" || n == "Void") WTI32
+        else if (n == "Int64") WTI64
+        else if (n == "Float32") WTF32
+        else if (n == "Float") WTF64
+        else if (n == "String") WTRefNull(0)
+        else if (n == "Ptr" || n == "ScopedPtr" || n == "ForeignPtr" || n == "Arena") WTRefNull(1)
+        else if (n == "AtomicInt") WTRefNull(2)
+        else if (strMapContains(wm.wmProg.coreAdtReg, n)) {
+            match resolveAdtLayout(wm, n, Nil) {
+                WALEnumI31 -> WTI31,
+                WALSingleStruct(sty, _) -> WTRefNull(sty),
+                WALMultiAdt(baseIdx, _) -> WTRefNull(baseIdx),
+            }
+        } else WTAny,
+    TyComp(_, _) -> {
+        let base = tyConName(ty);
+        let targs = extractTypeArgs(ty);
+        if (base == "Cell") {
+            let elemWt = match targs { Cons(t, _) -> geishaTypeToWgc(wm, t), Nil -> WTI32 };
+            WTRefNull(internCellType(wm, elemWt))
+        } else if (base == "MutArray" || base == "ImmArray") {
+            let elemWt = match targs { Cons(t, _) -> geishaTypeToWgc(wm, t), Nil -> WTI32 };
+            WTRefNull(internArrayType(wm, elemWt))
+        } else if (strMapContains(wm.wmProg.coreAdtReg, base)) {
+            match resolveAdtLayout(wm, base, targs) {
+                WALEnumI31 -> WTI31,
+                WALSingleStruct(sty, _) -> WTRefNull(sty),
+                WALMultiAdt(baseIdx, _) -> WTRefNull(baseIdx),
+            }
+        } else WTAny
+    },
+    TyTuple(es) -> WTRefNull(internTupleType(wm, mapGeishaTypesToWgc(wm, es))),
+    TyArr(_, ps, r) -> {
+        let pWts = mapGeishaTypesToWgc(wm, ps);
+        let rWts = geishaRetToWgc(wm, r);
+        let (baseIdx, _) = internClsTypes(wm, pWts, rWts);
+        WTRefNull(baseIdx)
+    },
+}
+
+def geishaRetToWgc(wm: WgcModule, ty: Type): List WgcValType =
+    if (isVoidTy(ty)) Nil else [geishaTypeToWgc(wm, ty)]
+
+def emitBlockType(wm: WgcModule, code: StringBuf, optWt: Option WgcValType): Void = match optWt {
+    None -> bufPushByte(code, 0x40),
+    Some(WTI32) -> bufPushByte(code, 0x7F),
+    Some(WTI64) -> bufPushByte(code, 0x7E),
+    Some(WTF32) -> bufPushByte(code, 0x7D),
+    Some(WTF64) -> bufPushByte(code, 0x7C),
+    Some(WTI31) -> bufPushByte(code, 0x6C),
+    Some(WTAny) -> bufPushByte(code, 0x6E),
+    Some(wt) -> {
+        let fty = internFuncType(wm, Nil, [wt]);
+        emitSleb(code, fty)
+    },
+}
+
+// ============================================================================
+// Function Index, String Data Pool & Declarative ref.func Registration
+// ============================================================================
+
+def registerRefFunc(wm: WgcModule, fidx: Int): Void = {
+    let k = intToStr(fidx);
+    if (!strMapContains(wm.wmRefFuncSet, k)) {
+        strMapInsert(wm.wmRefFuncSet, k, true);
+        vecPush(wm.wmRefFuncList, fidx)
+    } else ()
+}
+
+def allocDefinedFn(wm: WgcModule, typeIdx: Int): Int = {
+    let fidx = cellGet(wm.wmNumImports) + vecLen(wm.wmDefinedFns);
+    vecPush(wm.wmDefinedFns, MkWgcDefinedFn { dfTypeIdx: typeIdx, dfBody: cellNew(bufNew()) });
+    fidx
+}
+
+def setDefinedFnBody(wm: WgcModule, fidx: Int, body: StringBuf): Void = {
+    let defIdx = fidx - cellGet(wm.wmNumImports);
+    let df = vecGetOr(wm.wmDefinedFns, defIdx, MkWgcDefinedFn { dfTypeIdx: 0, dfBody: cellNew(bufNew()) });
+    cellSet(df.dfBody, body)
+}
+
+def internStringLit(wm: WgcModule, s: String): (Int, Int) = match strMapGet(wm.wmStrLitMap, s) {
+    Some(pair) -> pair,
+    None -> {
+        let off = bufLen(wm.wmDataPool);
+        let len = strLen(s);
+        bufPushStr(wm.wmDataPool, s);
+        let pair = (off, len);
+        strMapInsert(wm.wmStrLitMap, s, pair);
+        pair
+    },
+}
+
+// ============================================================================
+// Host Import Discovery (Phase 1: Only Import What Is Actually Called)
+// ============================================================================
+
+def addHostImport(wm: WgcModule, impMod: String, impName: String, params: List WgcValType, results: List WgcValType): Int = {
+    let key = impMod + "." + impName;
+    match strMapGet(wm.wmImportMap, key) {
+        Some(idx) -> idx,
+        None -> {
+            let fty = internFuncType(wm, params, results);
+            let idx = vecLen(wm.wmImports);
+            vecPush(wm.wmImports, MkWgcImport { impMod: impMod, impName: impName, impTypeIdx: fty });
+            strMapInsert(wm.wmImportMap, key, idx);
+            cellSet(wm.wmNumImports, idx + 1);
+            idx
+        },
+    }
+}
+
+def scanTermImports(wm: WgcModule, tm: TaggedTerm): Void = match tm.tnode {
+    TmLit(_) -> (),
+    TmVar(_) -> (),
+    TmGlobalVar(_) -> (),
+    TmTuple(es) -> scanTermListImports(wm, es),
+    TmBlock(es) -> scanTermListImports(wm, es),
+    TmMakeCls(_, _, body) -> scanTermImports(wm, body),
+    TmApplyCls(c, args) -> {
+        scanTermImports(wm, c);
+        scanTermListImports(wm, args)
+    },
+    TmBin(_, l, r) -> {
+        scanTermImports(wm, l);
+        scanTermImports(wm, r)
+    },
+    TmUn(_, e) -> scanTermImports(wm, e),
+    TmLet(_, v, b) -> {
+        scanTermImports(wm, v);
+        scanTermImports(wm, b)
+    },
+    TmIf(c, t, e) -> {
+        scanTermImports(wm, c);
+        scanTermImports(wm, t);
+        scanTermImports(wm, e)
+    },
+    TmWhile(c, b) -> {
+        scanTermImports(wm, c);
+        scanTermImports(wm, b)
+    },
+    TmMatch(s, arms) -> {
+        scanTermImports(wm, s);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> scanTermImports(wm, g), None -> () };
+                    scanTermImports(wm, a.caBody);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, fs, _, _) -> scanTermListImports(wm, fs),
+    TmGetTag(e) -> scanTermImports(wm, e),
+    TmApplyDir(vd, args) -> {
+        scanTermListImports(wm, args);
+        let nm = vd.vname;
+        if (nm == "printLn") {
+            cellSet(wm.wmNeedsStrInterop, true);
+            let _ = addHostImport(wm, "geisha", "print_str", [WTAny], Nil);
+            ()
+        } else if (nm == "putChar") {
+            let _ = addHostImport(wm, "geisha", "put_char", [WTI32], Nil);
+            ()
+        } else if (nm == "putNumber") {
+            let _ = addHostImport(wm, "geisha", "put_i32", [WTI32], Nil);
+            ()
+        } else if (nm == "putFloat" || nm == "putF32") {
+            let _ = addHostImport(wm, "geisha", "put_f64", [WTF64], Nil);
+            ()
+        } else if (nm == "mathExp" || nm == "mathExpF32") {
+            let _ = addHostImport(wm, "geisha", "math_exp", [WTF64], [WTF64]);
+            ()
+        } else if (nm == "mathLog" || nm == "mathLogF32") {
+            let _ = addHostImport(wm, "geisha", "math_log", [WTF64], [WTF64]);
+            ()
+        } else if (nm == "mathSin" || nm == "mathSinF32") {
+            let _ = addHostImport(wm, "geisha", "math_sin", [WTF64], [WTF64]);
+            ()
+        } else if (nm == "mathCos" || nm == "mathCosF32") {
+            let _ = addHostImport(wm, "geisha", "math_cos", [WTF64], [WTF64]);
+            ()
+        } else if (nm == "mathTanh" || nm == "mathTanhF32") {
+            let _ = addHostImport(wm, "geisha", "math_tanh", [WTF64], [WTF64]);
+            ()
+        } else if (nm == "mathPow" || nm == "mathPowF32") {
+            let _ = addHostImport(wm, "geisha", "math_pow", [WTF64, WTF64], [WTF64]);
+            ()
+        } else {
+            match strMapGet(wm.wmProg.coreExterns, nm) {
+                Some(ext) -> {
+                    let link = ext.extLink;
+                    if (link == "strtod") {
+                        cellSet(wm.wmNeedsStrInterop, true);
+                        let _ = addHostImport(wm, "geisha", "strtod", [WTAny], [WTF64]);
+                        ()
+                    } else if (link == "gs_fmt_f64") {
+                        cellSet(wm.wmNeedsStrInterop, true);
+                        let _ = addHostImport(wm, "geisha", "fmt_f64", [WTF64], [WTAny]);
+                        ()
+                    } else if (link == "gs_sys_time_now_ms") {
+                        let _ = addHostImport(wm, "geisha", "time_now_ms", Nil, [WTI64]);
+                        ()
+                    } else if (link == "gs_sys_time_mono_ms") {
+                        let _ = addHostImport(wm, "geisha", "time_mono_ms", Nil, [WTI64]);
+                        ()
+                    } else if (link == "gs_sys_time_mono_ns") {
+                        let _ = addHostImport(wm, "geisha", "time_mono_ns", Nil, [WTI64]);
+                        ()
+                    } else if (link == "gs_sys_rand_seed") {
+                        let _ = addHostImport(wm, "geisha", "rand_seed", Nil, [WTI64]);
+                        ()
+                    } else if (link == "gs_sys_fd_write" || link == "write") {
+                        cellSet(wm.wmNeedsStrInterop, true);
+                        let _ = addHostImport(wm, "geisha", "fd_write", [WTI32, WTAny, WTI64], [WTI64]);
+                        ()
+                    } else if (link == "exit") {
+                        let _ = addHostImport(wm, "geisha", "exit", [WTI32], Nil);
+                        ()
+                    } else ()
+                },
+                None -> (),
+            }
+        }
+    },
+}
+
+def scanTermListImports(wm: WgcModule, es: List TaggedTerm): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> { scanTermImports(wm, h); scanTermListImports(wm, t) },
+}
+
+def discoverImports(wm: WgcModule): Void = {
+    let cg = cellNew(wm.wmProg.coreGlobals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(gv, r) -> { scanTermImports(wm, gv.gvInit); cellSet(cg, r) },
+            Nil -> (),
+        }
+    };
+    let cf = cellNew(wm.wmProg.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnm, r) -> {
+                match strMapGet(wm.wmProg.coreFns, fnm) {
+                    Some(fd) -> scanTermImports(wm, fd.fnBody),
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+// ============================================================================
+// Lazy Internal WasmGC Runtime Helpers (Zero Linear Memory!)
+// ============================================================================
+
+def wrapSimpleBody(extraLocals: List (Int, WgcValType), instrs: StringBuf): StringBuf = {
+    let out = bufNew();
+    emitUleb(out, listLen(extraLocals));
+    let cur = cellNew(extraLocals);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((cnt, wt), r) -> {
+                emitUleb(out, cnt);
+                emitValType(out, wt);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushBuf(out, instrs);
+    bufPushByte(out, 0x0B);
+    out
+}
+
+def getOrCreateHelper(wm: WgcModule, name: String): Int = match strMapGet(wm.wmHelperMap, name) {
+    Some(idx) -> idx,
+    None -> {
+        let fidx =
+            if (name == "idiv32") {
+                let fty = internFuncType(wm, [WTI32, WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // if (b == 0) unreachable
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x45);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                // if (a == INT32_MIN && b == -1) return INT32_MIN
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x41); emitSleb(c, -2147483647 - 1); bufPushByte(c, 0x46);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x41); emitSleb(c, -1); bufPushByte(c, 0x46);
+                bufPushByte(c, 0x71);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x41); emitSleb(c, -2147483647 - 1); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x6D); // i32.div_s
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "irem32") {
+                let fty = internFuncType(wm, [WTI32, WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x45);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x41); emitSleb(c, -2147483647 - 1); bufPushByte(c, 0x46);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x41); emitSleb(c, -1); bufPushByte(c, 0x46);
+                bufPushByte(c, 0x71);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x6F); // i32.rem_s
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "idiv64") {
+                let fty = internFuncType(wm, [WTI64, WTI64], [WTI64]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                let min64 = bitShl64(intToI64(1), 63);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x50); // i64.eqz
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x42); emitSleb64(c, min64); bufPushByte(c, 0x51);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, intToI64(-1)); bufPushByte(c, 0x51);
+                bufPushByte(c, 0x71);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x42); emitSleb64(c, min64); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x7F); // i64.div_s
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "irem64") {
+                let fty = internFuncType(wm, [WTI64, WTI64], [WTI64]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                let min64 = bitShl64(intToI64(1), 63);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x50);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x42); emitSleb64(c, min64); bufPushByte(c, 0x51);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, intToI64(-1)); bufPushByte(c, 0x51);
+                bufPushByte(c, 0x71);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x42); bufPushByte(c, 0x00); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x81); // i64.rem_s
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "strConcat") {
+                // (a: (ref null 0), b: (ref null 0)) -> (ref null 0)
+                // locals: 2 = lenA: i32, 3 = lenB: i32, 4 = out: (ref null 0)
+                let fty = internFuncType(wm, [WTRefNull(0), WTRefNull(0)], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x21); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0); // array.new_default 0
+                bufPushByte(c, 0x21); emitUleb(c, 4);
+                // array.copy 0 0 (out, 0, a, 0, lenA)
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                // array.copy 0 0 (out, lenA, b, 0, lenB)
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(2, WTI32), (1, WTRefNull(0))], c));
+                id
+            } else if (name == "strSlice") {
+                // (s: (ref null 0), start: i32, end: i32) -> (ref null 0)
+                // locals: 3 = len: i32, 4 = out: (ref null 0)
+                let fty = internFuncType(wm, [WTRefNull(0), WTI32, WTI32], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6B); // end - start
+                bufPushByte(c, 0x22); emitUleb(c, 3); // local.tee 3
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0); // array.new_default 0
+                bufPushByte(c, 0x22); emitUleb(c, 4); // local.tee 4
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTI32), (1, WTRefNull(0))], c));
+                id
+            } else if (name == "strEq") {
+                // (a: (ref null 0), b: (ref null 0)) -> i32
+                // locals: 2 = len: i32, 3 = i: i32
+                let fty = internFuncType(wm, [WTRefNull(0), WTRefNull(0)], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // if (ref.eq a b) return 1
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xD3);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                // len = array.len a; if (len != array.len b) return 0
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x22); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x47);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                // loop i < len
+                bufPushByte(c, 0x02); bufPushByte(c, 0x40); // block
+                bufPushByte(c, 0x03); bufPushByte(c, 0x40); // loop
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x4E); // i >= len
+                bufPushByte(c, 0x0D); emitUleb(c, 1); // br_if block
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0);
+                bufPushByte(c, 0x47); // ne
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x0C); emitUleb(c, 0); // br loop
+                bufPushByte(c, 0x0B); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x01);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(2, WTI32)], c));
+                id
+            } else if (name == "strCmp") {
+                // (a: (ref null 0), b: (ref null 0)) -> i32 (-1, 0, 1)
+                // locals: 2 = lenA, 3 = lenB, 4 = minLen, 5 = i, 6 = ca, 7 = cb
+                let fty = internFuncType(wm, [WTRefNull(0), WTRefNull(0)], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xD3);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x21); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x21); emitUleb(c, 3);
+                // minLen = lenA < lenB ? lenA : lenB
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x48); // lt_s
+                bufPushByte(c, 0x1B); // select
+                bufPushByte(c, 0x21); emitUleb(c, 4);
+                bufPushByte(c, 0x02); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x03); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x20); emitUleb(c, 5); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x4E);
+                bufPushByte(c, 0x0D); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 5); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 6);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 5); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 7);
+                bufPushByte(c, 0x20); emitUleb(c, 6); bufPushByte(c, 0x20); emitUleb(c, 7); bufPushByte(c, 0x48);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); emitSleb(c, -1); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 6); bufPushByte(c, 0x20); emitUleb(c, 7); bufPushByte(c, 0x4A);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 5); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 5);
+                bufPushByte(c, 0x0C); emitUleb(c, 0);
+                bufPushByte(c, 0x0B); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x48);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); emitSleb(c, -1); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x4A);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x0F); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(6, WTI32)], c));
+                id
+            } else if (name == "strFromBytes") {
+                // (arr: (ref null 3), n: i32) -> (ref null 0)
+                // locals: 2 = out: (ref null 0), 3 = i: i32
+                let fty = internFuncType(wm, [WTRefNull(3), WTI32], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 2);
+                bufPushByte(c, 0x02); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x03); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x4E);
+                bufPushByte(c, 0x0D); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xFB); bufPushByte(c, 0x0B); emitUleb(c, 3);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x0C); emitUleb(c, 0);
+                bufPushByte(c, 0x0B); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else if (name == "ptrAlloc") {
+                let fty = internFuncType(wm, [WTI32], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // if (n < 0) unreachable
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x48); // i32.lt_s
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrAlloc64") {
+                // Checked i64 -> i32 length conversion: trap if n < 0 or n > 2147483647
+                let conv = getOrCreateHelper(wm, "i64ToI32Checked");
+                let p32 = getOrCreateHelper(wm, "ptrAlloc");
+                let fty = internFuncType(wm, [WTI64], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x10); emitUleb(c, conv);
+                bufPushByte(c, 0x10); emitUleb(c, p32);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "i64ToI32Checked") {
+                let fty = internFuncType(wm, [WTI64], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(0));
+                bufPushByte(c, 0x53); // i64.lt_s
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(2147483647));
+                bufPushByte(c, 0x55); // i64.gt_s
+                bufPushByte(c, 0x72); // i32.or
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0xA7); // i32.wrap_i64
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrReadU16Le") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x41); bufPushByte(c, 0x08); bufPushByte(c, 0x74); bufPushByte(c, 0x72);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else if (name == "ptrWriteU16Le") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTI32], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 4);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x41); bufPushByte(c, 0x08); bufPushByte(c, 0x76); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else if (name == "ptrOffset") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xD1); // ref.is_null
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0xD0); emitSleb(c, 1); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrOffset64") {
+                // (p: (ref null 1), d: i64) -> (ref null 1)
+                // Checks signed i32 range for d AND final offset in [0, array.len(p.buf)]
+                let fty = internFuncType(wm, [WTRefNull(1), WTI64], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                let minI32_64 = intToI64(-2147483647 - 1);
+                let maxI32_64 = intToI64(2147483647);
+                // if (ref.is_null p) return null
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xD1);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0xD0); emitSleb(c, 1); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                // if (d < INT32_MIN || d > INT32_MAX) unreachable
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, minI32_64); bufPushByte(c, 0x53);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x42); emitSleb64(c, maxI32_64); bufPushByte(c, 0x55);
+                bufPushByte(c, 0x72);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                // buf = p.buf (local 2)
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x21); emitUleb(c, 2);
+                // next64 = i64.extend_i32_s(p.off) + d (local 3)
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0xAC); // i64.extend_i32_s
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x7C); // i64.add
+                bufPushByte(c, 0x22); emitUleb(c, 3);
+                // if (next64 < 0 || next64 > i64.extend_i32_s(array.len(buf))) unreachable
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(0)); bufPushByte(c, 0x53);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0xAC);
+                bufPushByte(c, 0x55);
+                bufPushByte(c, 0x72);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                // return struct.new 1 (buf, i32.wrap_i64(next64))
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xA7);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI64)], c));
+                id
+            } else if (name == "ptrByteAt") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrSetByte") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTI32], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrCopyBytes") {
+                // (dst, dOff, src, sOff, len) -> ()
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTRefNull(1), WTI32, WTI32], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrCopyFromStr") {
+                // (dst, dOff, s, len) -> ()
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTRefNull(0), WTI32], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrSliceFromStr") {
+                // (s, start, len) -> (ref null 0)
+                let fty = internFuncType(wm, [WTRefNull(0), WTI32, WTI32], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
+                bufPushByte(c, 0x22); emitUleb(c, 3);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0))], c));
+                id
+            } else if (name == "ptrSliceToString") {
+                // (p, len) -> (ref null 0)
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
+                bufPushByte(c, 0x22); emitUleb(c, 2);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0))], c));
+                id
+            } else if (name == "ptrToString") {
+                // (p: (ref null 1)) -> (ref null 0)
+                // locals: 1 = buf, 2 = start, 3 = cap, 4 = end, 5 = out
+                let fty = internFuncType(wm, [WTRefNull(1)], [WTRefNull(0)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xD1);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0); bufPushByte(c, 0x0F);
+                bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0); bufPushByte(c, 0x22); emitUleb(c, 1);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1); bufPushByte(c, 0x22); emitUleb(c, 2); bufPushByte(c, 0x21); emitUleb(c, 4);
+                bufPushByte(c, 0x02); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x03); bufPushByte(c, 0x40);
+                bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x4E); bufPushByte(c, 0x0D); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x45); bufPushByte(c, 0x0D); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 4);
+                bufPushByte(c, 0x0C); emitUleb(c, 0);
+                bufPushByte(c, 0x0B); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x6B);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0); bufPushByte(c, 0x22); emitUleb(c, 5);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x6B);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 5);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (3, WTI32), (1, WTRefNull(0))], c));
+                id
+            } else if (name == "ptrReadI32Le") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // locals: 2 = buf, 3 = base
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 2);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 3);
+                // b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x41); bufPushByte(c, 0x08); bufPushByte(c, 0x74); bufPushByte(c, 0x72);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x02); bufPushByte(c, 0x6A); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x41); bufPushByte(c, 0x10); bufPushByte(c, 0x74); bufPushByte(c, 0x72);
+                bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x41); bufPushByte(c, 0x03); bufPushByte(c, 0x6A); bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); bufPushByte(c, 0x41); bufPushByte(c, 0x18); bufPushByte(c, 0x74); bufPushByte(c, 0x72);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else if (name == "ptrWriteI32Le") {
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTI32], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, 3);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, 4);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x41); bufPushByte(c, 0x08); bufPushByte(c, 0x76); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x41); bufPushByte(c, 0x02); bufPushByte(c, 0x6A); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x41); bufPushByte(c, 0x10); bufPushByte(c, 0x76); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 3); bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x41); bufPushByte(c, 0x03); bufPushByte(c, 0x6A); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x41); bufPushByte(c, 0x18); bufPushByte(c, 0x76); bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, 0);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else if (name == "ptrReadI64Le") {
+                let rd32 = getOrCreateHelper(wm, "ptrReadI32Le");
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32], [WTI64]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // lo = i64.extend_i32_u(rd32(p, off))
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x10); emitUleb(c, rd32); bufPushByte(c, 0xAD);
+                // hi = i64.extend_i32_u(rd32(p, off+4)) << 32
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x41); bufPushByte(c, 0x04); bufPushByte(c, 0x6A); bufPushByte(c, 0x10); emitUleb(c, rd32); bufPushByte(c, 0xAD);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(32)); bufPushByte(c, 0x86); // i64.shl
+                bufPushByte(c, 0x84); // i64.or
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrWriteI64Le") {
+                let wr32 = getOrCreateHelper(wm, "ptrWriteI32Le");
+                let fty = internFuncType(wm, [WTRefNull(1), WTI32, WTI64], Nil);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0xA7); bufPushByte(c, 0x10); emitUleb(c, wr32);
+                bufPushByte(c, 0x20); emitUleb(c, 0); bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0x41); bufPushByte(c, 0x04); bufPushByte(c, 0x6A); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x42); emitSleb64(c, intToI64(32)); bufPushByte(c, 0x88); bufPushByte(c, 0xA7); bufPushByte(c, 0x10); emitUleb(c, wr32);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "fmtF64Wrapper") {
+                // (f: f64, p: (ref null 1), cap: i32) -> i32
+                // calls import geisha.fmt_f64(f) -> anyref (string), copies into p.buf at p.off, returns len
+                let impIdx = match strMapGet(wm.wmImportMap, "geisha.fmt_f64") { Some(i) -> i, None -> 0 };
+                let fty = internFuncType(wm, [WTF64, WTRefNull(1), WTI32], [WTI32]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                // locals: 3 = s: (ref null 0), 4 = n: i32
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x10); emitUleb(c, impIdx);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x17); emitSleb(c, 0); // ref.cast (ref null 0)
+                bufPushByte(c, 0x22); emitUleb(c, 3);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x0F); // array.len
+                bufPushByte(c, 0x21); emitUleb(c, 4);
+                // if (n > cap) n = cap
+                bufPushByte(c, 0x20); emitUleb(c, 4); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x4A);
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x20); emitUleb(c, 2); bufPushByte(c, 0x21); emitUleb(c, 4); bufPushByte(c, 0x0B);
+                // array.copy 0 0 (p.buf, p.off, s, 0, n)
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 1); bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 1); emitUleb(c, 1);
+                bufPushByte(c, 0x20); emitUleb(c, 3);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x11); emitUleb(c, 0); emitUleb(c, 0);
+                bufPushByte(c, 0x20); emitUleb(c, 4);
+                setDefinedFnBody(wm, id, wrapSimpleBody([(1, WTRefNull(0)), (1, WTI32)], c));
+                id
+            } else {
+                0
+            };
+        strMapInsert(wm.wmHelperMap, name, fidx);
+        fidx
+    },
+}
+
+def getOrCreateTopFnThunk(wm: WgcModule, fnName: String, fd: FunDef): (Int, Int) = {
+    let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+        TyArr(_, ps, rt) -> (ps, rt),
+        other -> (Nil, other),
+    };
+    let pWts = mapGeishaTypesToWgc(wm, paramTys);
+    let rWts = geishaRetToWgc(wm, retTy);
+    let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, pWts, rWts);
+    let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
+    let thunkIdx =
+        if (hasFvs) {
+            match strMapGet(wm.wmFnIdxMap, fnName) { Some(fi) -> fi, None -> 0 }
+        } else {
+            match strMapGet(wm.wmThunkMap, fnName) {
+                Some(idx) -> idx,
+                None -> {
+                    let tid = allocDefinedFn(wm, clsFnIdx);
+                    strMapInsert(wm.wmThunkMap, fnName, tid);
+                    let targetFidx = match strMapGet(wm.wmFnIdxMap, fnName) { Some(fi) -> fi, None -> 0 };
+                    let c = bufNew();
+                    let nParams = listLen(pWts);
+                    let i = cellNew(0);
+                    while (cellGet(i) < nParams) {
+                        bufPushByte(c, 0x20);
+                        emitUleb(c, cellGet(i) + 1); // param 0 is $env, forward params 1..n
+                        cellSet(i, cellGet(i) + 1)
+                    };
+                    bufPushByte(c, 0x12); // return_call targetFidx
+                    emitUleb(c, targetFidx);
+                    setDefinedFnBody(wm, tid, wrapSimpleBody(Nil, c));
+                    tid
+                },
+            }
+        };
+    registerRefFunc(wm, thunkIdx);
+    (clsBaseIdx, thunkIdx)
+}
+
+// ============================================================================
+// Function Compilation Context & Local Variable Allocation
+// ============================================================================
+
+data WgcFnCtx {
+    MkWgcFnCtx {
+        fcMod: WgcModule,
+        fcCode: StringBuf,
+        fcNumParams: Int,
+        fcExtraLocals: Vec WgcValType,
+        fcRetVoid: Bool,
+        fcCurFnName: String,
+    },
+}
+
+def fcAllocLocal(fctx: WgcFnCtx, wt: WgcValType): Int = {
+    let idx = fctx.fcNumParams + vecLen(fctx.fcExtraLocals);
+    vecPush(fctx.fcExtraLocals, wt);
+    idx
+}
+
+def lookupLocalWgc(locals: List (String, Int, WgcValType), name: String): Option (Int, WgcValType) = match locals {
+    Nil -> None,
+    Cons((k, idx, wt), r) -> if (k == name) Some((idx, wt)) else lookupLocalWgc(r, name),
+}
+
+def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
+    Cons(h, t) -> if (idx == 0) h else nthArgTerm(t, idx - 1),
+    Nil -> MkTerm { tspan: emptySpan(), tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
+}
+
+def emitTermAsVal(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcValType)): Void = {
+    let ty = schemeBody(tm.tscm);
+    emitWgcExpr(fctx, tm, locals, false);
+    if (isVoidTy(ty)) {
+        bufPushByte(fctx.fcCode, 0x41);
+        bufPushByte(fctx.fcCode, 0x00)
+    } else ()
+}
+
+def emitTermDiscard(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcValType)): Void = {
+    let ty = schemeBody(tm.tscm);
+    emitWgcExpr(fctx, tm, locals, false);
+    if (!isVoidTy(ty)) {
+        bufPushByte(fctx.fcCode, 0x1A) // drop
+    } else ()
+}
+
+def emitArgsAsVals(fctx: WgcFnCtx, args: List TaggedTerm, locals: List (String, Int, WgcValType)): Void = {
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                emitTermAsVal(fctx, a, locals);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def emitWgcLit(fctx: WgcFnCtx, lit: Lit, ty: Type): Void = {
+    let c = fctx.fcCode;
+    match lit {
+        LitInt(n) -> match ty {
+            TyCon("Int64") -> { bufPushByte(c, 0x42); emitSleb64(c, intToI64(n)) },
+            _ -> { bufPushByte(c, 0x41); emitSleb(c, n) },
+        },
+        LitFloat(f) -> match ty {
+            TyCon("Float32") -> { bufPushByte(c, 0x43); emitF32Le(c, floatToF32(f)) },
+            _ -> { bufPushByte(c, 0x44); emitF64Le(c, f) },
+        },
+        LitChar(ch) -> { bufPushByte(c, 0x41); emitSleb(c, ch) },
+        LitBool(b) -> { bufPushByte(c, 0x41); bufPushByte(c, if (b) 1 else 0) },
+        LitUnit -> (),
+        LitStr(s) -> {
+            let (off, len) = internStringLit(fctx.fcMod, s);
+            if (len == 0) {
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0) // array.new_default 0
+            } else {
+                bufPushByte(c, 0x41); emitSleb(c, off);
+                bufPushByte(c, 0x41); emitSleb(c, len);
+                bufPushByte(c, 0xFB); bufPushByte(c, 0x09); emitUleb(c, 0); emitUleb(c, 0) // array.new_data 0 0
+            }
+        },
+    }
+}
+
+// ============================================================================
+// Binary & Unary Operators
+// ============================================================================
+
+def emitWgcBinOp(fctx: WgcFnCtx, op: BinOp, l: TaggedTerm, r: TaggedTerm, locals: List (String, Int, WgcValType)): Void = {
+    let c = fctx.fcCode;
+    let opTy = schemeBody(l.tscm);
+    match op {
+        OpAnd -> {
+            emitTermAsVal(fctx, l, locals);
+            bufPushByte(c, 0x04); bufPushByte(c, 0x7F); // if (result i32)
+            emitTermAsVal(fctx, r, locals);
+            bufPushByte(c, 0x05); // else
+            bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+            bufPushByte(c, 0x0B)
+        },
+        OpOr -> {
+            emitTermAsVal(fctx, l, locals);
+            bufPushByte(c, 0x04); bufPushByte(c, 0x7F); // if (result i32)
+            bufPushByte(c, 0x41); bufPushByte(c, 0x01);
+            bufPushByte(c, 0x05); // else
+            emitTermAsVal(fctx, r, locals);
+            bufPushByte(c, 0x0B)
+        },
+        _ -> {
+            emitTermAsVal(fctx, l, locals);
+            emitTermAsVal(fctx, r, locals);
+            let tyName = match opTy { TyCon(n) -> n, _ -> "Int" };
+            if (tyName == "String") {
+                match op {
+                    OpAdd -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strConcat");
+                        bufPushByte(c, 0x10); emitUleb(c, h)
+                    },
+                    OpEq -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strEq");
+                        bufPushByte(c, 0x10); emitUleb(c, h)
+                    },
+                    OpNe -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strEq");
+                        bufPushByte(c, 0x10); emitUleb(c, h);
+                        bufPushByte(c, 0x45) // i32.eqz
+                    },
+                    OpLt -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strCmp");
+                        bufPushByte(c, 0x10); emitUleb(c, h);
+                        bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x48)
+                    },
+                    OpLe -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strCmp");
+                        bufPushByte(c, 0x10); emitUleb(c, h);
+                        bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x4C)
+                    },
+                    OpGt -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strCmp");
+                        bufPushByte(c, 0x10); emitUleb(c, h);
+                        bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x4A)
+                    },
+                    OpGe -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strCmp");
+                        bufPushByte(c, 0x10); emitUleb(c, h);
+                        bufPushByte(c, 0x41); bufPushByte(c, 0x00); bufPushByte(c, 0x4E)
+                    },
+                    _ -> {
+                        let h = getOrCreateHelper(fctx.fcMod, "strEq");
+                        bufPushByte(c, 0x10); emitUleb(c, h)
+                    },
+                }
+            } else if (tyName == "Float") {
+                match op {
+                    OpAdd -> bufPushByte(c, 0xA0),
+                    OpSub -> bufPushByte(c, 0xA1),
+                    OpMul -> bufPushByte(c, 0xA2),
+                    OpDiv -> bufPushByte(c, 0xA3),
+                    OpEq -> bufPushByte(c, 0x61),
+                    OpNe -> bufPushByte(c, 0x62),
+                    OpLt -> bufPushByte(c, 0x63),
+                    OpGt -> bufPushByte(c, 0x64),
+                    OpLe -> bufPushByte(c, 0x65),
+                    OpGe -> bufPushByte(c, 0x66),
+                    _ -> bufPushByte(c, 0xA0),
+                }
+            } else if (tyName == "Float32") {
+                match op {
+                    OpAdd -> bufPushByte(c, 0x92),
+                    OpSub -> bufPushByte(c, 0x93),
+                    OpMul -> bufPushByte(c, 0x94),
+                    OpDiv -> bufPushByte(c, 0x95),
+                    OpEq -> bufPushByte(c, 0x5B),
+                    OpNe -> bufPushByte(c, 0x5C),
+                    OpLt -> bufPushByte(c, 0x5D),
+                    OpGt -> bufPushByte(c, 0x5E),
+                    OpLe -> bufPushByte(c, 0x5F),
+                    OpGe -> bufPushByte(c, 0x60),
+                    _ -> bufPushByte(c, 0x92),
+                }
+            } else if (tyName == "Int64") {
+                match op {
+                    OpAdd -> bufPushByte(c, 0x7C),
+                    OpSub -> bufPushByte(c, 0x7D),
+                    OpMul -> bufPushByte(c, 0x7E),
+                    OpDiv -> { let h = getOrCreateHelper(fctx.fcMod, "idiv64"); bufPushByte(c, 0x10); emitUleb(c, h) },
+                    OpRem -> { let h = getOrCreateHelper(fctx.fcMod, "irem64"); bufPushByte(c, 0x10); emitUleb(c, h) },
+                    OpBitAnd -> bufPushByte(c, 0x83),
+                    OpBitOr -> bufPushByte(c, 0x84),
+                    OpBitXor -> bufPushByte(c, 0x85),
+                    OpShl -> {
+                        match schemeBody(r.tscm) { TyCon("Int64") -> (), _ -> bufPushByte(c, 0xAC) };
+                        bufPushByte(c, 0x86)
+                    },
+                    OpShr -> {
+                        match schemeBody(r.tscm) { TyCon("Int64") -> (), _ -> bufPushByte(c, 0xAC) };
+                        bufPushByte(c, 0x87)
+                    },
+                    OpUshr -> {
+                        match schemeBody(r.tscm) { TyCon("Int64") -> (), _ -> bufPushByte(c, 0xAC) };
+                        bufPushByte(c, 0x88)
+                    },
+                    OpEq -> bufPushByte(c, 0x51),
+                    OpNe -> bufPushByte(c, 0x52),
+                    OpLt -> bufPushByte(c, 0x53),
+                    OpGt -> bufPushByte(c, 0x55),
+                    OpLe -> bufPushByte(c, 0x57),
+                    OpGe -> bufPushByte(c, 0x59),
+                    _ -> bufPushByte(c, 0x7C),
+                }
+            } else {
+                // Int, Bool, Char (all i32)
+                match op {
+                    OpAdd -> bufPushByte(c, 0x6A),
+                    OpSub -> bufPushByte(c, 0x6B),
+                    OpMul -> bufPushByte(c, 0x6C),
+                    OpDiv -> { let h = getOrCreateHelper(fctx.fcMod, "idiv32"); bufPushByte(c, 0x10); emitUleb(c, h) },
+                    OpRem -> { let h = getOrCreateHelper(fctx.fcMod, "irem32"); bufPushByte(c, 0x10); emitUleb(c, h) },
+                    OpBitAnd -> bufPushByte(c, 0x71),
+                    OpBitOr -> bufPushByte(c, 0x72),
+                    OpBitXor -> bufPushByte(c, 0x73),
+                    OpShl -> bufPushByte(c, 0x74),
+                    OpShr -> bufPushByte(c, 0x75),
+                    OpUshr -> bufPushByte(c, 0x76),
+                    OpEq -> bufPushByte(c, 0x46),
+                    OpNe -> bufPushByte(c, 0x47),
+                    OpLt -> bufPushByte(c, 0x48),
+                    OpGt -> bufPushByte(c, 0x4A),
+                    OpLe -> bufPushByte(c, 0x4C),
+                    OpGe -> bufPushByte(c, 0x4E),
+                    _ -> bufPushByte(c, 0x6A),
+                }
+            }
+        },
+    }
+}
+
+def emitWgcUnOp(fctx: WgcFnCtx, op: UnOp, e: TaggedTerm, locals: List (String, Int, WgcValType)): Void = {
+    let c = fctx.fcCode;
+    let opTy = schemeBody(e.tscm);
+    match op {
+        UnNot -> {
+            emitTermAsVal(fctx, e, locals);
+            bufPushByte(c, 0x45) // i32.eqz
+        },
+        UnNeg -> match opTy {
+            TyCon("Int64") -> {
+                bufPushByte(c, 0x42); bufPushByte(c, 0x00);
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x7D) // i64.sub
+            },
+            TyCon("Float") -> {
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x9A) // f64.neg
+            },
+            TyCon("Float32") -> {
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x8C) // f32.neg
+            },
+            _ -> {
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x6B) // i32.sub
+            },
+        },
+        UnBitNot -> match opTy {
+            TyCon("Int64") -> {
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(-1));
+                bufPushByte(c, 0x85) // i64.xor
+            },
+            _ -> {
+                emitTermAsVal(fctx, e, locals);
+                bufPushByte(c, 0x41); emitSleb(c, -1);
+                bufPushByte(c, 0x73) // i32.xor
+            },
+        },
+    }
+}
+
+// ============================================================================
+// ADT Lookup Helpers & Pattern Matching Compilation
+// ============================================================================
+
+def findAdtByCtorNameWgc(ctorName: String): String =
+    if (ctorName == "Cons" || ctorName == "Nil") "List"
+    else if (ctorName == "Some" || ctorName == "None") "std.option.Option"
+    else if (ctorName == "Ok" || ctorName == "Err") "std.result.Result"
+    else ""
+
+def extractAdtNameAndArgsWgc(adtReg: StrMap AdtInfo, ty: Type, ctorHint: String): (String, List Type) = match ty {
+    TyCon(n) ->
+        if (strMapContains(adtReg, n)) (n, Nil)
+        else (findAdtByCtorNameWgc(ctorHint), Nil),
+    TyComp(_, _) -> {
+        let base = tyConName(ty);
+        if (strMapContains(adtReg, base)) (base, extractTypeArgs(ty))
+        else (findAdtByCtorNameWgc(ctorHint), extractTypeArgs(ty))
+    },
+    _ -> (findAdtByCtorNameWgc(ctorHint), Nil),
+}
+
+def findVariantTypeIdx(vars: List (Int, Int, List WgcValType), tag: Int): (Int, List WgcValType) = match vars {
+    Nil -> (0, Nil),
+    Cons((t, idx, fwts), r) -> if (t == tag) (idx, fwts) else findVariantTypeIdx(r, tag),
+}
+
+def emitPatternCheckAndBind(
+    fctx: WgcFnCtx,
+    scrutLocal: Int,
+    scrutTy: Type,
+    pat: Pattern,
+    localsCell: Cell (List (String, Int, WgcValType))
+): Void = {
+    let c = fctx.fcCode;
+    let wm = fctx.fcMod;
+    match pat {
+        PatWild -> (),
+        PatVar(vname) -> {
+            let wt = geishaTypeToWgc(wm, scrutTy);
+            cellSet(localsCell, Cons((vname, scrutLocal, wt), cellGet(localsCell)))
+        },
+        PatLit(lit) -> {
+            bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+            emitWgcLit(fctx, lit, scrutTy);
+            match lit {
+                LitStr(_) -> {
+                    let h = getOrCreateHelper(wm, "strEq");
+                    bufPushByte(c, 0x10); emitUleb(c, h);
+                    bufPushByte(c, 0x45); // i32.eqz
+                    bufPushByte(c, 0x0D); emitUleb(c, 0) // br_if $next_arm
+                },
+                LitInt(_) -> match scrutTy {
+                    TyCon("Int64") -> { bufPushByte(c, 0x52); bufPushByte(c, 0x0D); emitUleb(c, 0) }, // i64.ne
+                    _ -> { bufPushByte(c, 0x47); bufPushByte(c, 0x0D); emitUleb(c, 0) }, // i32.ne
+                },
+                LitFloat(_) -> match scrutTy {
+                    TyCon("Float32") -> { bufPushByte(c, 0x5C); bufPushByte(c, 0x0D); emitUleb(c, 0) }, // f32.ne
+                    _ -> { bufPushByte(c, 0x62); bufPushByte(c, 0x0D); emitUleb(c, 0) }, // f64.ne
+                },
+                LitUnit -> {
+                    bufPushByte(c, 0x1A) // drop scrut
+                },
+                _ -> {
+                    bufPushByte(c, 0x47); // i32.ne
+                    bufPushByte(c, 0x0D); emitUleb(c, 0)
+                },
+            }
+        },
+        PatTuple(subPats) -> {
+            let elemTys = match scrutTy { TyTuple(es) -> es, _ -> Nil };
+            let tupWts = mapGeishaTypesToWgc(wm, elemTys);
+            let tupIdx = internTupleType(wm, tupWts);
+            let idx = cellNew(0);
+            let cp = cellNew(subPats);
+            let ct = cellNew(elemTys);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(sp, rp) -> {
+                        let i = cellGet(idx);
+                        let et = match cellGet(ct) { Cons(t, rt) -> { cellSet(ct, rt); t }, Nil -> TyVoid };
+                        match sp {
+                            PatWild -> (),
+                            _ -> {
+                                let fwt = geishaTypeToWgc(wm, et);
+                                let fl = fcAllocLocal(fctx, fwt);
+                                bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+                                bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, tupIdx); emitUleb(c, i);
+                                bufPushByte(c, 0x21); emitUleb(c, fl);
+                                emitPatternCheckAndBind(fctx, fl, et, sp, localsCell)
+                            },
+                        };
+                        cellSet(idx, i + 1);
+                        cellSet(cp, rp)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        PatCtor(ctorName, subPats) -> {
+            let (adtName, typeArgs) = extractAdtNameAndArgsWgc(wm.wmProg.coreAdtReg, scrutTy, ctorName);
+            match strMapGet(wm.wmProg.coreAdtReg, adtName) {
+                None -> (),
+                Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+                    None -> (),
+                    Some(vinfo) -> {
+                        let lay = resolveAdtLayout(wm, adtName, typeArgs);
+                        let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                        let concreteFts = substTypeList(vinfo.fieldTypes, sub);
+                        match lay {
+                            WALEnumI31 -> {
+                                // Pure enum: i31.get_s != tag -> br_if 0
+                                bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+                                bufPushByte(c, 0xFB); bufPushByte(c, 0x1D); // i31.get_s
+                                bufPushByte(c, 0x41); emitSleb(c, vinfo.tag);
+                                bufPushByte(c, 0x47); // i32.ne
+                                bufPushByte(c, 0x0D); emitUleb(c, 0)
+                            },
+                            WALSingleStruct(styIdx, _) -> {
+                                // Single-variant record: always matches, fields at 0..k-1
+                                let idx = cellNew(0);
+                                let cp = cellNew(subPats);
+                                let cft = cellNew(concreteFts);
+                                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                    match cellGet(cp) {
+                                        Cons(sp, rp) -> {
+                                            let i = cellGet(idx);
+                                            let ft = match cellGet(cft) { Cons(t, rt) -> { cellSet(cft, rt); t }, Nil -> TyVoid };
+                                            match sp {
+                                                PatWild -> (),
+                                                _ -> {
+                                                    let fwt = geishaTypeToWgc(wm, ft);
+                                                    let fl = fcAllocLocal(fctx, fwt);
+                                                    bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+                                                    bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, styIdx); emitUleb(c, i);
+                                                    bufPushByte(c, 0x21); emitUleb(c, fl);
+                                                    emitPatternCheckAndBind(fctx, fl, ft, sp, localsCell)
+                                                },
+                                            };
+                                            cellSet(idx, i + 1);
+                                            cellSet(cp, rp)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            WALMultiAdt(_, varList) -> {
+                                let (varTyIdx, _) = findVariantTypeIdx(varList, vinfo.tag);
+                                // Check subtype via `ref.test (ref varTyIdx)`!
+                                bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+                                bufPushByte(c, 0xFB); bufPushByte(c, 0x14); emitSleb(c, varTyIdx); // ref.test (ref varTyIdx)
+                                bufPushByte(c, 0x45); // i32.eqz
+                                bufPushByte(c, 0x0D); emitUleb(c, 0); // br_if $next_arm
+                                // If there are sub-patterns, downcast once with `ref.cast (ref varTyIdx)`
+                                match subPats {
+                                    Nil -> (),
+                                    _ -> {
+                                        let castLoc = fcAllocLocal(fctx, WTRefNull(varTyIdx));
+                                        bufPushByte(c, 0x20); emitUleb(c, scrutLocal);
+                                        bufPushByte(c, 0xFB); bufPushByte(c, 0x16); emitSleb(c, varTyIdx); // ref.cast (ref varTyIdx)
+                                        bufPushByte(c, 0x21); emitUleb(c, castLoc);
+                                        let idx = cellNew(0);
+                                        let cp = cellNew(subPats);
+                                        let cft = cellNew(concreteFts);
+                                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                            match cellGet(cp) {
+                                                Cons(sp, rp) -> {
+                                                    let i = cellGet(idx);
+                                                    let ft = match cellGet(cft) { Cons(t, rt) -> { cellSet(cft, rt); t }, Nil -> TyVoid };
+                                                    match sp {
+                                                        PatWild -> (),
+                                                        _ -> {
+                                                            let fwt = geishaTypeToWgc(wm, ft);
+                                                            let fl = fcAllocLocal(fctx, fwt);
+                                                            bufPushByte(c, 0x20); emitUleb(c, castLoc);
+                                                            bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, varTyIdx); emitUleb(c, i + 1);
+                                                            bufPushByte(c, 0x21); emitUleb(c, fl);
+                                                            emitPatternCheckAndBind(fctx, fl, ft, sp, localsCell)
+                                                        },
+                                                    };
+                                                    cellSet(idx, i + 1);
+                                                    cellSet(cp, rp)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                },
+            }
+        },
+        PatStruct(_, _) -> (),
+    }
+}
+
+// ============================================================================
+// Builtin Intrinsics Lowering (Zero Linear Memory!)
+// ============================================================================
+
+def emitHostImportCall(fctx: WgcFnCtx, impKey: String): Void =
+    match strMapGet(fctx.fcMod.wmImportMap, impKey) {
+        Some(idx) -> { bufPushByte(fctx.fcCode, 0x10); emitUleb(fctx.fcCode, idx) },
+        None -> bufPushByte(fctx.fcCode, 0x00), // unreachable
+    }
+
+def tryEmitBuiltinWgc(
+    fctx: WgcFnCtx,
+    name: String,
+    args: List TaggedTerm,
+    retTy: Type,
+    locals: List (String, Int, WgcValType)
+): Bool = {
+    let c = fctx.fcCode;
+    let wm = fctx.fcMod;
+    if (name == "cellNew") {
+        let a0 = nthArgTerm(args, 0);
+        let elemWt = geishaTypeToWgc(wm, schemeBody(a0.tscm));
+        let cellTy = internCellType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, cellTy);
+        true
+    } else if (name == "cellGet") {
+        let a0 = nthArgTerm(args, 0);
+        let elemWt = geishaTypeToWgc(wm, retTy);
+        let cellTy = internCellType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, cellTy); emitUleb(c, 0);
+        if (isVoidTy(retTy)) bufPushByte(c, 0x1A) else ();
+        true
+    } else if (name == "cellSet") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let elemWt = geishaTypeToWgc(wm, schemeBody(a1.tscm));
+        let cellTy = internCellType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        emitTermAsVal(fctx, a1, locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x05); emitUleb(c, cellTy); emitUleb(c, 0);
+        true
+    } else if (name == "arrayNew") {
+        // Geisha: arrayNew(len, initVal); Wasm array.new: [initVal, len] -> [ref]
+        let aLen = nthArgTerm(args, 0);
+        let aVal = nthArgTerm(args, 1);
+        let elemWt = geishaTypeToWgc(wm, schemeBody(aVal.tscm));
+        let arrTy = internArrayType(wm, elemWt);
+        let lenLoc = fcAllocLocal(fctx, WTI32);
+        emitTermAsVal(fctx, aLen, locals);
+        bufPushByte(c, 0x21); emitUleb(c, lenLoc);
+        emitTermAsVal(fctx, aVal, locals);
+        bufPushByte(c, 0x20); emitUleb(c, lenLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x06); emitUleb(c, arrTy);
+        true
+    } else if (name == "arrayNewZeroed") {
+        let elemTy = match retTy { TyComp(_, et) -> et, _ -> TyVoid };
+        let arrTy = internArrayType(wm, geishaTypeToWgc(wm, elemTy));
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, arrTy);
+        true
+    } else if (name == "arrayLen" || name == "immArrayLen") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0F);
+        true
+    } else if (name == "arrayFreeze") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        true
+    } else if (name == "arrayGet" || name == "immArrayGet") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let elemWt = geishaTypeToWgc(wm, retTy);
+        let arrTy = internArrayType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        emitTermAsVal(fctx, a1, locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0B); emitUleb(c, arrTy);
+        if (isVoidTy(retTy)) bufPushByte(c, 0x1A) else ();
+        true
+    } else if (name == "arraySet") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let a2 = nthArgTerm(args, 2);
+        let elemWt = geishaTypeToWgc(wm, schemeBody(a2.tscm));
+        let arrTy = internArrayType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        emitTermAsVal(fctx, a1, locals);
+        emitTermAsVal(fctx, a2, locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, arrTy);
+        true
+    } else if (name == "arrayClearSlot") {
+        let a0 = nthArgTerm(args, 0);
+        let a1 = nthArgTerm(args, 1);
+        let elemTy = match schemeBody(a0.tscm) { TyComp(_, et) -> et, _ -> TyVoid };
+        let elemWt = geishaTypeToWgc(wm, elemTy);
+        let arrTy = internArrayType(wm, elemWt);
+        emitTermAsVal(fctx, a0, locals);
+        emitTermAsVal(fctx, a1, locals);
+        emitDefaultVal(c, elemWt);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, arrTy);
+        true
+    } else if (name == "parTabulate") {
+        // parTabulate(n: Int, f: Int -> a): ImmArray a
+        let aN = nthArgTerm(args, 0);
+        let aF = nthArgTerm(args, 1);
+        let elemTy = match retTy { TyComp(_, et) -> et, _ -> TyVoid };
+        let elemWt = geishaTypeToWgc(wm, elemTy);
+        let elemVoid = isVoidTy(elemTy);
+        let arrTy = internArrayType(wm, elemWt);
+        let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, [WTI32], if (elemVoid) Nil else [elemWt]);
+        let nLoc = fcAllocLocal(fctx, WTI32);
+        let fLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+        let arrLoc = fcAllocLocal(fctx, WTRefNull(arrTy));
+        let iLoc = fcAllocLocal(fctx, WTI32);
+        emitTermAsVal(fctx, aN, locals);
+        bufPushByte(c, 0x21); emitUleb(c, nLoc);
+        emitTermAsVal(fctx, aF, locals);
+        bufPushByte(c, 0x21); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, nLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, arrTy);
+        bufPushByte(c, 0x21); emitUleb(c, arrLoc);
+        bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+        bufPushByte(c, 0x21); emitUleb(c, iLoc);
+        bufPushByte(c, 0x02); bufPushByte(c, 0x40);
+        bufPushByte(c, 0x03); bufPushByte(c, 0x40);
+        bufPushByte(c, 0x20); emitUleb(c, iLoc); bufPushByte(c, 0x20); emitUleb(c, nLoc); bufPushByte(c, 0x4E);
+        bufPushByte(c, 0x0D); emitUleb(c, 1);
+        bufPushByte(c, 0x20); emitUleb(c, arrLoc);
+        bufPushByte(c, 0x20); emitUleb(c, iLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, iLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, clsBaseIdx); emitUleb(c, 0);
+        bufPushByte(c, 0x14); emitUleb(c, clsFnIdx);
+        if (elemVoid) { bufPushByte(c, 0x41); bufPushByte(c, 0x00) } else ();
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0E); emitUleb(c, arrTy);
+        bufPushByte(c, 0x20); emitUleb(c, iLoc); bufPushByte(c, 0x41); bufPushByte(c, 0x01); bufPushByte(c, 0x6A); bufPushByte(c, 0x21); emitUleb(c, iLoc);
+        bufPushByte(c, 0x0C); emitUleb(c, 0);
+        bufPushByte(c, 0x0B); bufPushByte(c, 0x0B);
+        bufPushByte(c, 0x20); emitUleb(c, arrLoc);
+        true
+    } else if (name == "strLen") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0F);
+        true
+    } else if (name == "strByteAt") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x0D); emitUleb(c, 0); // array.get_u 0
+        true
+    } else if (name == "strSlice") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "strSlice");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "strConcat") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "strConcat");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "strFromBytes") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "strFromBytes");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "printLn") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, "geisha.print_str");
+        true
+    } else if (name == "putChar") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, "geisha.put_char");
+        true
+    } else if (name == "putNumber") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, "geisha.put_i32");
+        true
+    } else if (name == "putFloat") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, "geisha.put_f64");
+        true
+    } else if (name == "putF32") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xBB); // f64.promote_f32
+        emitHostImportCall(fctx, "geisha.put_f64");
+        true
+    } else if (name == "bitAnd") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x71); true
+    } else if (name == "bitAnd64") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x83); true
+    } else if (name == "bitOr") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x72); true
+    } else if (name == "bitOr64") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x84); true
+    } else if (name == "bitXor") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x73); true
+    } else if (name == "bitXor64") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x85); true
+    } else if (name == "bitNot") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0x41); emitSleb(c, -1); bufPushByte(c, 0x73);
+        true
+    } else if (name == "bitNot64") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0x42); emitSleb64(c, intToI64(-1)); bufPushByte(c, 0x85);
+        true
+    } else if (name == "bitShl") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x74); true
+    } else if (name == "bitShr") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x75); true
+    } else if (name == "bitUshr") { emitArgsAsVals(fctx, args, locals); bufPushByte(c, 0x76); true
+    } else if (name == "bitShl64") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xAC); // i64.extend_i32_s
+        bufPushByte(c, 0x86); // i64.shl
+        true
+    } else if (name == "bitShr64") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xAC);
+        bufPushByte(c, 0x87); // i64.shr_s
+        true
+    } else if (name == "bitUshr64") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xAC);
+        bufPushByte(c, 0x88); // i64.shr_u
+        true
+    } else if (name == "bitPopCount") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x69); true
+    } else if (name == "bitPopCount64") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x7B); bufPushByte(c, 0xA7); true
+    } else if (name == "bitCtz") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x68); true
+    } else if (name == "charToInt" || name == "intToChar") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0x41); emitSleb(c, 255); bufPushByte(c, 0x71);
+        true
+    } else if (name == "intToI64") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xAC); true
+    } else if (name == "i64ToInt") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xA7); true
+    } else if (name == "floatToBits64") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBD); true
+    } else if (name == "bits64ToFloat") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBF); true
+    } else if (name == "floatToBits32" || name == "f32ToBits32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBC); true
+    } else if (name == "bits32ToFloat" || name == "bits32ToF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBE); true
+    } else if (name == "intToFloat") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xB7); true
+    } else if (name == "floatToInt") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xFC); bufPushByte(c, 0x02); true
+    } else if (name == "f32ToInt") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xFC); bufPushByte(c, 0x00); true
+    } else if (name == "floatToF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xB6); true
+    } else if (name == "intToF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xB2); true
+    } else if (name == "f32ToFloat") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBB); true
+    } else if (name == "mathSqrt") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x9F); true
+    } else if (name == "mathSqrtF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x91); true
+    } else if (name == "mathAbs") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x99); true
+    } else if (name == "mathAbsF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x8B); true
+    } else if (name == "mathFloor") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x9C); true
+    } else if (name == "mathFloorF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x8E); true
+    } else if (name == "mathCeil") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x9B); true
+    } else if (name == "mathCeilF32") { emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x8D); true
+    } else if (name == "mathFma") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xA2);
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        bufPushByte(c, 0xA0);
+        true
+    } else if (name == "mathFmaF32") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0x94);
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        bufPushByte(c, 0x92);
+        true
+    } else if (name == "mathExp" || name == "mathLog" || name == "mathSin" || name == "mathCos" || name == "mathTanh") {
+        let imp =
+            if (name == "mathExp") "geisha.math_exp"
+            else if (name == "mathLog") "geisha.math_log"
+            else if (name == "mathSin") "geisha.math_sin"
+            else if (name == "mathCos") "geisha.math_cos"
+            else "geisha.math_tanh";
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, imp);
+        true
+    } else if (name == "mathExpF32" || name == "mathLogF32" || name == "mathSinF32" || name == "mathCosF32" || name == "mathTanhF32") {
+        let imp =
+            if (name == "mathExpF32") "geisha.math_exp"
+            else if (name == "mathLogF32") "geisha.math_log"
+            else if (name == "mathSinF32") "geisha.math_sin"
+            else if (name == "mathCosF32") "geisha.math_cos"
+            else "geisha.math_tanh";
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xBB);
+        emitHostImportCall(fctx, imp);
+        bufPushByte(c, 0xB6);
+        true
+    } else if (name == "mathPow") {
+        emitArgsAsVals(fctx, args, locals);
+        emitHostImportCall(fctx, "geisha.math_pow");
+        true
+    } else if (name == "mathPowF32") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0xBB);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals); bufPushByte(c, 0xBB);
+        emitHostImportCall(fctx, "geisha.math_pow");
+        bufPushByte(c, 0xB6);
+        true
+    } else if (name == "ptrNull") {
+        bufPushByte(c, 0xD0); emitSleb(c, 1);
+        true
+    } else if (name == "ptrIsNull") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xD1);
+        true
+    } else if (name == "ptrAllocBytes" || name == "ptrAllocBytes64" || name == "foreignPtrAlloc") {
+        let aLen = nthArgTerm(args, 0);
+        emitTermAsVal(fctx, aLen, locals);
+        let h = match schemeBody(aLen.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrOffset" || name == "scopedPtrOffset") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrOffset");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrOffset64" || name == "scopedPtrOffset64") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        let h = match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrOffset64"),
+            _ -> getOrCreateHelper(wm, "ptrOffset"),
+        };
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrByteAt" || name == "scopedPtrByteAt") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrByteAt");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrSetByte" || name == "scopedPtrSetByte") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrSetByte");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrReadI8") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrByteAt");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        bufPushByte(c, 0xC0); // i32.extend8_s
+        true
+    } else if (name == "ptrReadU16Le") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrReadU16Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrWriteU16Le") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrWriteU16Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrReadU32Le" || name == "scopedPtrReadI32Le") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrReadI32Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrWriteU32Le" || name == "scopedPtrWriteI32Le") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrWriteI32Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrReadI64Le" || name == "ptrReadI64Le64" || name == "scopedPtrReadI64Le") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        let h = getOrCreateHelper(wm, "ptrReadI64Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrWriteI64Le" || name == "ptrWriteI64Le64" || name == "scopedPtrWriteI64Le") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        let h = getOrCreateHelper(wm, "ptrWriteI64Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrReadF32Le" || name == "ptrReadF32Le64" || name == "scopedPtrReadF32Le" || name == "scopedPtrReadF32Le64") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        let h = getOrCreateHelper(wm, "ptrReadI32Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        bufPushByte(c, 0xBE); // f32.reinterpret_i32
+        true
+    } else if (name == "ptrWriteF32Le" || name == "ptrWriteF32Le64" || name == "scopedPtrWriteF32Le" || name == "scopedPtrWriteF32Le64") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        bufPushByte(c, 0xBC); // i32.reinterpret_f32
+        let h = getOrCreateHelper(wm, "ptrWriteI32Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrReadF64Le" || name == "ptrReadF64Le64" || name == "scopedPtrReadF64Le" || name == "scopedPtrReadF64Le64") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        let h = getOrCreateHelper(wm, "ptrReadI64Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        bufPushByte(c, 0xBF); // f64.reinterpret_i64
+        true
+    } else if (name == "ptrWriteF64Le" || name == "ptrWriteF64Le64" || name == "scopedPtrWriteF64Le" || name == "scopedPtrWriteF64Le64") {
+        let aOff = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aOff, locals);
+        match schemeBody(aOff.tscm) {
+            TyCon("Int64") -> { let conv = getOrCreateHelper(wm, "i64ToI32Checked"); bufPushByte(c, 0x10); emitUleb(c, conv) },
+            _ -> (),
+        };
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        bufPushByte(c, 0xBD); // i64.reinterpret_f64
+        let h = getOrCreateHelper(wm, "ptrWriteI64Le");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrCopyBytes" || name == "ptrCopyBytes64" || name == "scopedPtrCopyBytes") {
+        let conv = getOrCreateHelper(wm, "i64ToI32Checked");
+        let aDOff = nthArgTerm(args, 1);
+        let aSOff = nthArgTerm(args, 3);
+        let aLen = nthArgTerm(args, 4);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, aDOff, locals);
+        match schemeBody(aDOff.tscm) { TyCon("Int64") -> { bufPushByte(c, 0x10); emitUleb(c, conv) }, _ -> () };
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals);
+        emitTermAsVal(fctx, aSOff, locals);
+        match schemeBody(aSOff.tscm) { TyCon("Int64") -> { bufPushByte(c, 0x10); emitUleb(c, conv) }, _ -> () };
+        emitTermAsVal(fctx, aLen, locals);
+        match schemeBody(aLen.tscm) { TyCon("Int64") -> { bufPushByte(c, 0x10); emitUleb(c, conv) }, _ -> () };
+        let h = getOrCreateHelper(wm, "ptrCopyBytes");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrCopyFromStr") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrCopyFromStr");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrSliceFromStr") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrSliceFromStr");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrSliceToString") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrSliceToString");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "ptrToString") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(wm, "ptrToString");
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "withForeignPtr") {
+        // withForeignPtr(fp, fn) -> fn(fp)
+        let aFp = nthArgTerm(args, 0);
+        let aFn = nthArgTerm(args, 1);
+        let retWts = geishaRetToWgc(wm, retTy);
+        let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, [WTRefNull(1)], retWts);
+        let fLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+        let fpLoc = fcAllocLocal(fctx, WTRefNull(1));
+        emitTermAsVal(fctx, aFp, locals); bufPushByte(c, 0x21); emitUleb(c, fpLoc);
+        emitTermAsVal(fctx, aFn, locals); bufPushByte(c, 0x21); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fpLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, clsBaseIdx); emitUleb(c, 0);
+        bufPushByte(c, 0x14); emitUleb(c, clsFnIdx);
+        true
+    } else if (name == "withArena") {
+        let aFn = nthArgTerm(args, 0);
+        let retWts = geishaRetToWgc(wm, retTy);
+        let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, [WTRefNull(1)], retWts);
+        let fLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+        emitTermAsVal(fctx, aFn, locals); bufPushByte(c, 0x21); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0xD0); emitSleb(c, 1);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, clsBaseIdx); emitUleb(c, 0);
+        bufPushByte(c, 0x14); emitUleb(c, clsFnIdx);
+        true
+    } else if (name == "withAlloca") {
+        let aSz = nthArgTerm(args, 0);
+        let aFn = nthArgTerm(args, 1);
+        let retWts = geishaRetToWgc(wm, retTy);
+        let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, [WTRefNull(1)], retWts);
+        let hAlloc = match schemeBody(aSz.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
+        let pLoc = fcAllocLocal(fctx, WTRefNull(1));
+        let fLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+        emitTermAsVal(fctx, aSz, locals); bufPushByte(c, 0x10); emitUleb(c, hAlloc); bufPushByte(c, 0x21); emitUleb(c, pLoc);
+        emitTermAsVal(fctx, aFn, locals); bufPushByte(c, 0x21); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0x20); emitUleb(c, pLoc);
+        bufPushByte(c, 0x20); emitUleb(c, fLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, clsBaseIdx); emitUleb(c, 0);
+        bufPushByte(c, 0x14); emitUleb(c, clsFnIdx);
+        true
+    } else if (name == "arenaAlloc") {
+        emitTermDiscard(fctx, nthArgTerm(args, 0), locals);
+        let aLen = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, aLen, locals);
+        let h = match schemeBody(aLen.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
+        bufPushByte(c, 0x10); emitUleb(c, h);
+        true
+    } else if (name == "foreignPtrNew" || name == "cFnPtr" || name == "__blackBox") {
+        emitWgcExpr(fctx, nthArgTerm(args, 0), locals, false);
+        true
+    } else if (name == "gcTrim" || name == "gcSetThresholds") {
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) { Cons(a, r) -> { emitTermDiscard(fctx, a, locals); cellSet(cur, r) }, Nil -> () }
+        };
+        true
+    } else if (name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes") {
+        bufPushByte(c, 0x42); bufPushByte(c, 0x00);
+        true
+    } else if (name == "__concNumCpu") {
+        bufPushByte(c, 0x41); bufPushByte(c, 0x01);
+        true
+    } else if (name == "__concAtomicNew") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 2); // struct.new TY_CELL_I32
+        true
+    } else if (name == "__concAtomicLoad") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 2); emitUleb(c, 0);
+        true
+    } else if (name == "__concAtomicStore") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x05); emitUleb(c, 2); emitUleb(c, 0);
+        true
+    } else if (name == "__concAtomicAdd") {
+        let aLoc = fcAllocLocal(fctx, WTRefNull(2));
+        let pLoc = fcAllocLocal(fctx, WTI32);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x22); emitUleb(c, aLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 2); emitUleb(c, 0); bufPushByte(c, 0x21); emitUleb(c, pLoc);
+        bufPushByte(c, 0x20); emitUleb(c, aLoc);
+        bufPushByte(c, 0x20); emitUleb(c, pLoc);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
+        bufPushByte(c, 0x6A);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x05); emitUleb(c, 2); emitUleb(c, 0);
+        bufPushByte(c, 0x20); emitUleb(c, pLoc);
+        true
+    } else if (name == "__concAtomicCas") {
+        let aLoc = fcAllocLocal(fctx, WTRefNull(2));
+        let expLoc = fcAllocLocal(fctx, WTI32);
+        let desLoc = fcAllocLocal(fctx, WTI32);
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals); bufPushByte(c, 0x21); emitUleb(c, aLoc);
+        emitTermAsVal(fctx, nthArgTerm(args, 1), locals); bufPushByte(c, 0x21); emitUleb(c, expLoc);
+        emitTermAsVal(fctx, nthArgTerm(args, 2), locals); bufPushByte(c, 0x21); emitUleb(c, desLoc);
+        bufPushByte(c, 0x20); emitUleb(c, aLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, 2); emitUleb(c, 0);
+        bufPushByte(c, 0x20); emitUleb(c, expLoc);
+        bufPushByte(c, 0x46); // i32.eq
+        bufPushByte(c, 0x04); bufPushByte(c, 0x7F); // if (result i32)
+        bufPushByte(c, 0x20); emitUleb(c, aLoc);
+        bufPushByte(c, 0x20); emitUleb(c, desLoc);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x05); emitUleb(c, 2); emitUleb(c, 0);
+        bufPushByte(c, 0x41); bufPushByte(c, 0x01);
+        bufPushByte(c, 0x05); // else
+        bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+        bufPushByte(c, 0x0B);
+        true
+    } else if (name == "sysArgc") {
+        bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+        true
+    } else if (name == "sysArgv") {
+        emitTermDiscard(fctx, nthArgTerm(args, 0), locals);
+        bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+        bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
+        true
+    } else {
+        false
+    }
+}
+
+def emitExternCallWgc(fctx: WgcFnCtx, ext: ExternDef, args: List TaggedTerm, retTy: Type, sp: Span, locals: List (String, Int, WgcValType)): Void = {
+    let c = fctx.fcCode;
+    let link = ext.extLink;
+    if (ext.extIsFnPtr) {
+        setWgcErr(fctx.fcMod, sp, "WasmGC target does not support indirect C function pointer extern '" + ext.extName + "'");
+        bufPushByte(c, 0x00)
+    } else if (link == "strtod") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        if (listLen(args) > 1) emitTermDiscard(fctx, nthArgTerm(args, 1), locals) else ();
+        emitHostImportCall(fctx, "geisha.strtod")
+    } else if (link == "gs_fmt_f64") {
+        emitArgsAsVals(fctx, args, locals);
+        let h = getOrCreateHelper(fctx.fcMod, "fmtF64Wrapper");
+        bufPushByte(c, 0x10); emitUleb(c, h)
+    } else if (link == "gs_sys_time_now_ms") {
+        emitHostImportCall(fctx, "geisha.time_now_ms")
+    } else if (link == "gs_sys_time_mono_ms") {
+        emitHostImportCall(fctx, "geisha.time_mono_ms")
+    } else if (link == "gs_sys_time_mono_ns") {
+        emitHostImportCall(fctx, "geisha.time_mono_ns")
+    } else if (link == "gs_sys_rand_seed") {
+        emitHostImportCall(fctx, "geisha.rand_seed")
+    } else if (link == "gs_sys_fd_write" || link == "write") {
+        emitArgsAsVals(fctx, args, locals);
+        emitHostImportCall(fctx, "geisha.fd_write")
+    } else if (link == "exit") {
+        emitArgsAsVals(fctx, args, locals);
+        emitHostImportCall(fctx, "geisha.exit")
+    } else {
+        let _ = retTy;
+        setWgcErr(fctx.fcMod, sp, "WasmGC target does not support extern '" + link + "' (declared as '" + ext.extName + "')");
+        bufPushByte(c, 0x00)
+    }
+}
+
+// ============================================================================
+// Core IR Expression -> WasmGC Bytecode Emitter
+// ============================================================================
+
+def emitFnRefAsClosure(fctx: WgcFnCtx, fnName: String, resTy: Type): Void = {
+    let wm = fctx.fcMod;
+    let c = fctx.fcCode;
+    match strMapGet(wm.wmProg.coreFns, fnName) {
+        Some(fd) -> {
+            let (clsBaseIdx, thunkIdx) = getOrCreateTopFnThunk(wm, fnName, fd);
+            bufPushByte(c, 0xD2); emitUleb(c, thunkIdx); // ref.func thunkIdx
+            bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, clsBaseIdx) // struct.new clsBaseIdx
+        },
+        None ->
+            if (!isVoidTy(resTy)) emitDefaultVal(c, geishaTypeToWgc(wm, resTy)) else (),
+    }
+}
+
+def emitWgcExpr(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcValType), inTailPos: Bool): Void = {
+    let c = fctx.fcCode;
+    let wm = fctx.fcMod;
+    let resTy = schemeBody(tm.tscm);
+    match tm.tnode {
+        TmLit(lit) -> emitWgcLit(fctx, lit, resTy),
+        TmVar(vname) -> match lookupLocalWgc(locals, vname) {
+            Some((lidx, _)) ->
+                if (!isVoidTy(resTy)) { bufPushByte(c, 0x20); emitUleb(c, lidx) } else (),
+            None -> match strMapGet(wm.wmGlobalMap, vname) {
+                Some(gidx) ->
+                    if (!isVoidTy(resTy)) { bufPushByte(c, 0x23); emitUleb(c, gidx) } else (),
+                None -> emitFnRefAsClosure(fctx, vname, resTy),
+            },
+        },
+        TmGlobalVar(gname) -> match strMapGet(wm.wmGlobalMap, gname) {
+            Some(gidx) ->
+                if (!isVoidTy(resTy)) { bufPushByte(c, 0x23); emitUleb(c, gidx) } else (),
+            None -> emitFnRefAsClosure(fctx, gname, resTy),
+        },
+        TmTuple(es) -> {
+            let elemTys = match resTy { TyTuple(ts) -> ts, _ -> Nil };
+            let tupIdx = internTupleType(wm, mapGeishaTypesToWgc(wm, elemTys));
+            emitArgsAsVals(fctx, es, locals);
+            bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, tupIdx)
+        },
+        TmBlock(es) -> emitWgcBlock(fctx, es, locals, inTailPos),
+        TmUn(op, e) -> emitWgcUnOp(fctx, op, e, locals),
+        TmBin(op, l, r) -> emitWgcBinOp(fctx, op, l, r, locals),
+        TmGetTag(node) -> {
+            let nty = schemeBody(node.tscm);
+            let (adtName, targs) = extractAdtNameAndArgsWgc(wm.wmProg.coreAdtReg, nty, "");
+            let lay = resolveAdtLayout(wm, adtName, targs);
+            match lay {
+                WALEnumI31 -> {
+                    emitTermAsVal(fctx, node, locals);
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x1D) // i31.get_s
+                },
+                WALSingleStruct(_, _) -> {
+                    emitTermDiscard(fctx, node, locals);
+                    bufPushByte(c, 0x41); bufPushByte(c, 0x00)
+                },
+                WALMultiAdt(baseIdx, _) -> {
+                    emitTermAsVal(fctx, node, locals);
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, baseIdx); emitUleb(c, 0)
+                },
+            }
+        },
+        TmMakeData(adtName, tag, fields, _, targs) -> {
+            let lay = resolveAdtLayout(wm, adtName, targs);
+            match lay {
+                WALEnumI31 -> {
+                    bufPushByte(c, 0x41); emitSleb(c, tag);
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x1C) // ref.i31
+                },
+                WALSingleStruct(styIdx, _) -> {
+                    emitArgsAsVals(fctx, fields, locals);
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, styIdx)
+                },
+                WALMultiAdt(_, varList) -> {
+                    let (varTyIdx, _) = findVariantTypeIdx(varList, tag);
+                    bufPushByte(c, 0x41); emitSleb(c, tag);
+                    emitArgsAsVals(fctx, fields, locals);
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, varTyIdx)
+                },
+            }
+        },
+        TmLet(vd, valTm, bodyTm) -> {
+            let vty = schemeBody(valTm.tscm);
+            let vwt = geishaTypeToWgc(wm, vty);
+            let lidx = fcAllocLocal(fctx, vwt);
+            emitTermAsVal(fctx, valTm, locals);
+            bufPushByte(c, 0x21); emitUleb(c, lidx);
+            let nextLocals = Cons((vd.vname, lidx, vwt), locals);
+            emitWgcExpr(fctx, bodyTm, nextLocals, inTailPos)
+        },
+        TmMakeCls(vd, cls, bodyTm) -> {
+            let clsTy = schemeBody(vd.vscm);
+            let (paramTys, retTy) = match clsTy {
+                TyArr(_, ps, rt) -> (ps, rt),
+                other -> (Nil, other),
+            };
+            let pWts = mapGeishaTypesToWgc(wm, paramTys);
+            let rWts = geishaRetToWgc(wm, retTy);
+            let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, pWts, rWts);
+            match cls.clsFvs {
+                Nil -> {
+                    let clsLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+                    match strMapGet(wm.wmProg.coreFns, cls.clsEntry) {
+                        Some(fd) -> {
+                            let hasFvsDef = match fd.fnFvs { Nil -> false, _ -> true };
+                            let fidx =
+                                if (hasFvsDef) {
+                                    let fi = match strMapGet(wm.wmFnIdxMap, cls.clsEntry) { Some(i) -> i, None -> 0 };
+                                    registerRefFunc(wm, fi);
+                                    fi
+                                } else {
+                                    let (_, tid) = getOrCreateTopFnThunk(wm, cls.clsEntry, fd);
+                                    tid
+                                };
+                            bufPushByte(c, 0xD2); emitUleb(c, fidx);
+                            bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, clsBaseIdx);
+                            bufPushByte(c, 0x21); emitUleb(c, clsLoc)
+                        },
+                        None -> {
+                            emitDefaultVal(c, WTRefNull(clsBaseIdx));
+                            bufPushByte(c, 0x21); emitUleb(c, clsLoc)
+                        },
+                    };
+                    emitWgcExpr(fctx, bodyTm, Cons((vd.vname, clsLoc, WTRefNull(clsBaseIdx)), locals), inTailPos)
+                },
+                fvs -> {
+                    let entryFidx = match strMapGet(wm.wmFnIdxMap, cls.clsEntry) { Some(i) -> i, None -> 0 };
+                    registerRefFunc(wm, entryFidx);
+                    // Determine free variable Wasm types from the lifted FunDef's `fnFvs`
+                    let fvWts = match strMapGet(wm.wmProg.coreFns, cls.clsEntry) {
+                        Some(fd) -> mapVarDeclWgcTypes(wm, fd.fnFvs),
+                        None -> Nil,
+                    };
+                    let clsEnvIdx = internClsEnvType(wm, clsBaseIdx, clsFnIdx, fvWts);
+                    let envLoc = fcAllocLocal(fctx, WTRefNull(clsEnvIdx));
+                    bufPushByte(c, 0xD2); emitUleb(c, entryFidx); // field 0: (ref clsFnIdx)
+                    let selfSlotsRev: Cell (List Int) = cellNew(Nil);
+                    let idx = cellNew(0);
+                    let cf = cellNew(fvs);
+                    let cfw = cellNew(fvWts);
+                    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                        match cellGet(cf) {
+                            Cons(fvName, rf) -> {
+                                let fwt = match cellGet(cfw) { Cons(w, rw) -> { cellSet(cfw, rw); w }, Nil -> WTI32 };
+                                if (fvName == vd.vname) {
+                                    emitDefaultVal(c, fwt);
+                                    cellSet(selfSlotsRev, Cons(cellGet(idx) + 1, cellGet(selfSlotsRev)))
+                                } else {
+                                    match lookupLocalWgc(locals, fvName) {
+                                        Some((li, _)) -> { bufPushByte(c, 0x20); emitUleb(c, li) },
+                                        None -> match strMapGet(wm.wmGlobalMap, fvName) {
+                                            Some(gi) -> { bufPushByte(c, 0x23); emitUleb(c, gi) },
+                                            None ->
+                                                if (strMapContains(wm.wmProg.coreFns, fvName)) emitFnRefAsClosure(fctx, fvName, TyVoid)
+                                                else emitDefaultVal(c, fwt),
+                                        },
+                                    }
+                                };
+                                cellSet(idx, cellGet(idx) + 1);
+                                cellSet(cf, rf)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, clsEnvIdx); // struct.new clsEnvIdx
+                    bufPushByte(c, 0x21); emitUleb(c, envLoc);
+                    // Patch self-recursive closure slots via struct.set
+                    let cs = cellNew(listRev(cellGet(selfSlotsRev)));
+                    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                        match cellGet(cs) {
+                            Cons(slotFieldIdx, rs) -> {
+                                bufPushByte(c, 0x20); emitUleb(c, envLoc);
+                                bufPushByte(c, 0x20); emitUleb(c, envLoc);
+                                bufPushByte(c, 0xFB); bufPushByte(c, 0x05); emitUleb(c, clsEnvIdx); emitUleb(c, slotFieldIdx);
+                                cellSet(cs, rs)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    emitWgcExpr(fctx, bodyTm, Cons((vd.vname, envLoc, WTRefNull(clsBaseIdx)), locals), inTailPos)
+                },
+            }
+        },
+        TmApplyCls(clsTm, args) -> {
+            let clsTy = schemeBody(clsTm.tscm);
+            let (paramTys, retTy) = match clsTy {
+                TyArr(_, ps, rt) -> (ps, rt),
+                other -> (Nil, other),
+            };
+            let pWts = mapGeishaTypesToWgc(wm, paramTys);
+            let rWts = geishaRetToWgc(wm, retTy);
+            let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, pWts, rWts);
+            let clsLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
+            emitTermAsVal(fctx, clsTm, locals);
+            bufPushByte(c, 0x21); emitUleb(c, clsLoc);
+            bufPushByte(c, 0x20); emitUleb(c, clsLoc); // arg 0 = $env
+            emitArgsAsVals(fctx, args, locals);
+            bufPushByte(c, 0x20); emitUleb(c, clsLoc);
+            bufPushByte(c, 0xFB); bufPushByte(c, 0x02); emitUleb(c, clsBaseIdx); emitUleb(c, 0); // (ref clsFnIdx)
+            let canTail = inTailPos && (isVoidTy(retTy) == fctx.fcRetVoid);
+            bufPushByte(c, if (canTail) 0x15 else 0x14); // return_call_ref or call_ref
+            emitUleb(c, clsFnIdx)
+        },
+        TmApplyDir(vd, args) -> {
+            if (tryEmitBuiltinWgc(fctx, vd.vname, args, resTy, locals)) {
+                ()
+            } else {
+                match strMapGet(wm.wmProg.coreExterns, vd.vname) {
+                    Some(ext) -> emitExternCallWgc(fctx, ext, args, resTy, tm.tspan, locals),
+                    None -> match strMapGet(wm.wmFnIdxMap, vd.vname) {
+                        Some(fidx) -> {
+                            emitArgsAsVals(fctx, args, locals);
+                            let calleeVoid = match strMapGet(wm.wmFnRetVoid, vd.vname) { Some(b) -> b, None -> false };
+                            let canTail = inTailPos && (calleeVoid == fctx.fcRetVoid) && (isVoidTy(resTy) == calleeVoid);
+                            bufPushByte(c, if (canTail) 0x12 else 0x10); // return_call or call
+                            emitUleb(c, fidx)
+                        },
+                        None -> {
+                            let cur = cellNew(args);
+                            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                                match cellGet(cur) { Cons(a, r) -> { emitTermDiscard(fctx, a, locals); cellSet(cur, r) }, Nil -> () }
+                            };
+                            if (!isVoidTy(resTy)) emitDefaultVal(c, geishaTypeToWgc(wm, resTy)) else ()
+                        },
+                    },
+                }
+            }
+        },
+        TmIf(cond, thenTm, elseTm) -> {
+            let optRes = if (isVoidTy(resTy)) None else Some(geishaTypeToWgc(wm, resTy));
+            emitTermAsVal(fctx, cond, locals);
+            bufPushByte(c, 0x04);
+            emitBlockType(wm, c, optRes);
+            emitWgcExpr(fctx, thenTm, locals, inTailPos);
+            bufPushByte(c, 0x05);
+            emitWgcExpr(fctx, elseTm, locals, inTailPos);
+            bufPushByte(c, 0x0B)
+        },
+        TmWhile(cond, bodyTm) -> {
+            bufPushByte(c, 0x02); bufPushByte(c, 0x40); // block $break
+            bufPushByte(c, 0x03); bufPushByte(c, 0x40); // loop $cont
+            emitTermAsVal(fctx, cond, locals);
+            bufPushByte(c, 0x45); // i32.eqz
+            bufPushByte(c, 0x0D); emitUleb(c, 1); // br_if $break
+            emitTermDiscard(fctx, bodyTm, locals);
+            bufPushByte(c, 0x0C); emitUleb(c, 0); // br $cont
+            bufPushByte(c, 0x0B);
+            bufPushByte(c, 0x0B)
+        },
+        TmMatch(scrut, arms) -> {
+            let scrutTy = schemeBody(scrut.tscm);
+            let scrutWt = geishaTypeToWgc(wm, scrutTy);
+            let scrutLoc = fcAllocLocal(fctx, scrutWt);
+            emitTermAsVal(fctx, scrut, locals);
+            bufPushByte(c, 0x21); emitUleb(c, scrutLoc);
+            let optRes = if (isVoidTy(resTy)) None else Some(geishaTypeToWgc(wm, resTy));
+            bufPushByte(c, 0x02); // block $done
+            emitBlockType(wm, c, optRes);
+            let ca = cellNew(arms);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(arm, rest) -> {
+                        bufPushByte(c, 0x02); bufPushByte(c, 0x40); // block $next_arm
+                        let armLocals = cellNew(locals);
+                        emitPatternCheckAndBind(fctx, scrutLoc, scrutTy, arm.caPat, armLocals);
+                        match arm.caGuard {
+                            Some(gTm) -> {
+                                emitTermAsVal(fctx, gTm, cellGet(armLocals));
+                                bufPushByte(c, 0x45); // i32.eqz
+                                bufPushByte(c, 0x0D); emitUleb(c, 0) // br_if $next_arm
+                            },
+                            None -> (),
+                        };
+                        emitWgcExpr(fctx, arm.caBody, cellGet(armLocals), inTailPos);
+                        bufPushByte(c, 0x0C); emitUleb(c, 1); // br $done
+                        bufPushByte(c, 0x0B); // end $next_arm
+                        cellSet(ca, rest)
+                    },
+                    Nil -> (),
+                }
+            };
+            bufPushByte(c, 0x00); // unreachable (non-exhaustive match trap)
+            bufPushByte(c, 0x0B)  // end $done
+        },
+    }
+}
+
+def emitWgcBlock(fctx: WgcFnCtx, es: List TaggedTerm, locals: List (String, Int, WgcValType), inTailPos: Bool): Void = match es {
+    Nil -> (),
+    Cons(last, Nil) -> emitWgcExpr(fctx, last, locals, inTailPos),
+    Cons(h, t) -> {
+        emitTermDiscard(fctx, h, locals);
+        emitWgcBlock(fctx, t, locals, inTailPos)
+    },
+}
+
+def mapVarDeclWgcTypes(wm: WgcModule, vds: List VarDecl): List WgcValType = match vds {
+    Nil -> Nil,
+    Cons(vd, r) -> Cons(geishaTypeToWgc(wm, schemeBody(vd.vscm)), mapVarDeclWgcTypes(wm, r)),
+}
+
+// ============================================================================
+// Function Compilation, Globals, Exports & Binary Module Assembly
+// ============================================================================
+
+def emitFnBodyWithLocals(extraLocals: Vec WgcValType, code: StringBuf): StringBuf = {
+    let out = bufNew();
+    let n = vecLen(extraLocals);
+    emitUleb(out, n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let wt = vecGetOr(extraLocals, cellGet(i), WTI32);
+        emitUleb(out, 1);
+        emitValType(out, wt);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushBuf(out, code);
+    bufPushByte(out, 0x0B); // end
+    out
+}
+
+def registerUserFunctionSig(wm: WgcModule, fd: FunDef): Void = {
+    let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+        TyArr(_, ps, rt) -> (ps, rt),
+        other -> (Nil, other),
+    };
+    let pWts = mapGeishaTypesToWgc(wm, paramTys);
+    let rWts = geishaRetToWgc(wm, retTy);
+    let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
+    let ftyIdx =
+        if (hasFvs) {
+            let (_, clsFnIdx) = internClsTypes(wm, pWts, rWts);
+            clsFnIdx
+        } else {
+            internFuncType(wm, pWts, rWts)
+        };
+    let fidx = allocDefinedFn(wm, ftyIdx);
+    strMapInsert(wm.wmFnIdxMap, fd.fnName, fidx);
+    strMapInsert(wm.wmFnRetVoid, fd.fnName, isVoidTy(retTy))
+}
+
+def compileUserFunctionBody(wm: WgcModule, fd: FunDef): Void = {
+    let fidx = match strMapGet(wm.wmFnIdxMap, fd.fnName) { Some(i) -> i, None -> 0 };
+    let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+        TyArr(_, ps, rt) -> (ps, rt),
+        other -> (Nil, other),
+    };
+    let pWts = mapGeishaTypesToWgc(wm, paramTys);
+    let rWts = geishaRetToWgc(wm, retTy);
+    let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
+    let numParams = listLen(fd.fnParams) + (if (hasFvs) 1 else 0);
+    let fctx = MkWgcFnCtx {
+        fcMod: wm,
+        fcCode: bufNew(),
+        fcNumParams: numParams,
+        fcExtraLocals: vecNew(),
+        fcRetVoid: isVoidTy(retTy),
+        fcCurFnName: fd.fnName,
+    };
+    let localsCell: Cell (List (String, Int, WgcValType)) = cellNew(Nil);
+    let pIdx = cellNew(if (hasFvs) 1 else 0);
+    let cp = cellNew(fd.fnParams);
+    let cpt = cellNew(pWts);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(pvd, rp) -> {
+                let pwt = match cellGet(cpt) {
+                    Cons(w, rw) -> { cellSet(cpt, rw); w },
+                    Nil -> geishaTypeToWgc(wm, schemeBody(pvd.vscm)),
+                };
+                cellSet(localsCell, Cons((pvd.vname, cellGet(pIdx), pwt), cellGet(localsCell)));
+                cellSet(pIdx, cellGet(pIdx) + 1);
+                cellSet(cp, rp)
+            },
+            Nil -> (),
+        }
+    };
+    if (hasFvs) {
+        let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, pWts, rWts);
+        let fvWts = mapVarDeclWgcTypes(wm, fd.fnFvs);
+        let clsEnvIdx = internClsEnvType(wm, clsBaseIdx, clsFnIdx, fvWts);
+        let castEnvLoc = fcAllocLocal(fctx, WTRefNull(clsEnvIdx));
+        bufPushByte(fctx.fcCode, 0x20); emitUleb(fctx.fcCode, 0); // local.get $env
+        bufPushByte(fctx.fcCode, 0xFB); bufPushByte(fctx.fcCode, 0x16); emitSleb(fctx.fcCode, clsEnvIdx); // ref.cast (ref clsEnvIdx)
+        bufPushByte(fctx.fcCode, 0x21); emitUleb(fctx.fcCode, castEnvLoc);
+        let fi = cellNew(0);
+        let cf = cellNew(fd.fnFvs);
+        let cfw = cellNew(fvWts);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fv, rf) -> {
+                    let fwt = match cellGet(cfw) { Cons(w, rw) -> { cellSet(cfw, rw); w }, Nil -> WTI32 };
+                    let fl = fcAllocLocal(fctx, fwt);
+                    bufPushByte(fctx.fcCode, 0x20); emitUleb(fctx.fcCode, castEnvLoc);
+                    bufPushByte(fctx.fcCode, 0xFB); bufPushByte(fctx.fcCode, 0x02); emitUleb(fctx.fcCode, clsEnvIdx); emitUleb(fctx.fcCode, cellGet(fi) + 1);
+                    bufPushByte(fctx.fcCode, 0x21); emitUleb(fctx.fcCode, fl);
+                    cellSet(localsCell, Cons((fv.vname, fl, fwt), cellGet(localsCell)));
+                    cellSet(fi, cellGet(fi) + 1);
+                    cellSet(cf, rf)
+                },
+                Nil -> (),
+            }
+        }
+    } else ();
+    emitWgcExpr(fctx, fd.fnBody, cellGet(localsCell), true);
+    setDefinedFnBody(wm, fidx, emitFnBodyWithLocals(fctx.fcExtraLocals, fctx.fcCode))
+}
+
+def emitGlobalInitFunction(wm: WgcModule): Option Int = {
+    let hasGlobals = match wm.wmProg.coreGlobals { Nil -> false, _ -> true };
+    let hasCtors = match wm.wmProg.coreCtors { Nil -> false, _ -> true };
+    if (hasGlobals || hasCtors) {
+        let initedGidx = vecLen(wm.wmGlobals);
+        vecPush(wm.wmGlobals, MkWgcGlobal { glValTy: WTI32, glMut: true });
+        let fty = internFuncType(wm, Nil, Nil);
+        let initIdx = allocDefinedFn(wm, fty);
+        let fctx = MkWgcFnCtx {
+            fcMod: wm,
+            fcCode: bufNew(),
+            fcNumParams: 0,
+            fcExtraLocals: vecNew(),
+            fcRetVoid: true,
+            fcCurFnName: "__geisha_init",
+        };
+        // Idempotent guard: if (init_done != 0) return; init_done = 1;
+        bufPushByte(fctx.fcCode, 0x23); emitUleb(fctx.fcCode, initedGidx);
+        bufPushByte(fctx.fcCode, 0x04); bufPushByte(fctx.fcCode, 0x40);
+        bufPushByte(fctx.fcCode, 0x0F); // return
+        bufPushByte(fctx.fcCode, 0x0B);
+        bufPushByte(fctx.fcCode, 0x41); bufPushByte(fctx.fcCode, 0x01);
+        bufPushByte(fctx.fcCode, 0x24); emitUleb(fctx.fcCode, initedGidx);
+        let cg = cellNew(wm.wmProg.coreGlobals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(gv, r) -> {
+                    match strMapGet(wm.wmGlobalMap, gv.gvName) {
+                        Some(gidx) -> {
+                            emitTermAsVal(fctx, gv.gvInit, Nil);
+                            bufPushByte(fctx.fcCode, 0x24); emitUleb(fctx.fcCode, gidx) // global.set
+                        },
+                        None -> (),
+                    };
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
+        };
+        let cc = cellNew(wm.wmProg.coreCtors);
+        while (match cellGet(cc) { Nil -> false, _ -> true }) {
+            match cellGet(cc) {
+                Cons((fnName, _), r) -> {
+                    match strMapGet(wm.wmFnIdxMap, fnName) {
+                        Some(fi) -> { bufPushByte(fctx.fcCode, 0x10); emitUleb(fctx.fcCode, fi) },
+                        None -> (),
+                    };
+                    cellSet(cc, r)
+                },
+                Nil -> (),
+            }
+        };
+        setDefinedFnBody(wm, initIdx, emitFnBodyWithLocals(fctx.fcExtraLocals, fctx.fcCode));
+        vecPush(wm.wmExports, MkWgcExport { expName: "__geisha_init", expFuncIdx: initIdx });
+        // Only emit Wasm Start section when module has zero host imports, so JS host glue
+        // binds `_gs_exp = instance.exports` before `__geisha_init()` runs host-calling ctors!
+        if (vecLen(wm.wmImports) == 0) {
+            cellSet(wm.wmStartFunc, Some(initIdx))
+        } else ();
+        Some(initIdx)
+    } else None
+}
+
+def wrapExportWithInit(wm: WgcModule, fnName: String, fi: Int, initIdxOpt: Option Int): Int =
+    match initIdxOpt {
+        None -> fi,
+        Some(initIdx) ->
+            if (vecLen(wm.wmImports) == 0) {
+                // Start section already runs `__geisha_init` on instantiation
+                fi
+            } else {
+                match strMapGet(wm.wmProg.coreFns, fnName) {
+                    None -> fi,
+                    Some(fd) -> {
+                        let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+                            TyArr(_, ps, rt) -> (ps, rt),
+                            other -> (Nil, other),
+                        };
+                        let pWts = mapGeishaTypesToWgc(wm, paramTys);
+                        let rWts = geishaRetToWgc(wm, retTy);
+                        let fty = internFuncType(wm, pWts, rWts);
+                        let wid = allocDefinedFn(wm, fty);
+                        let c = bufNew();
+                        bufPushByte(c, 0x10); emitUleb(c, initIdx); // call $__geisha_init
+                        let nParams = listLen(pWts);
+                        let i = cellNew(0);
+                        while (cellGet(i) < nParams) {
+                            bufPushByte(c, 0x20); emitUleb(c, cellGet(i));
+                            cellSet(i, cellGet(i) + 1)
+                        };
+                        bufPushByte(c, 0x12); emitUleb(c, fi); // return_call $fi
+                        setDefinedFnBody(wm, wid, wrapSimpleBody(Nil, c));
+                        wid
+                    },
+                }
+            },
+    }
+
+def emitStrInteropExports(wm: WgcModule): Void = {
+    // __geisha_str_len(s: anyref) -> i32
+    let tyLen = internFuncType(wm, [WTAny], [WTI32]);
+    let fnLen = allocDefinedFn(wm, tyLen);
+    let cLen = bufNew();
+    bufPushByte(cLen, 0x20); emitUleb(cLen, 0);
+    bufPushByte(cLen, 0xFB); bufPushByte(cLen, 0x16); emitSleb(cLen, 0);
+    bufPushByte(cLen, 0xFB); bufPushByte(cLen, 0x0F);
+    setDefinedFnBody(wm, fnLen, wrapSimpleBody(Nil, cLen));
+    vecPush(wm.wmExports, MkWgcExport { expName: "__geisha_str_len", expFuncIdx: fnLen });
+
+    // __geisha_str_get(s: anyref, i: i32) -> i32
+    let tyGet = internFuncType(wm, [WTAny, WTI32], [WTI32]);
+    let fnGet = allocDefinedFn(wm, tyGet);
+    let cGet = bufNew();
+    bufPushByte(cGet, 0x20); emitUleb(cGet, 0);
+    bufPushByte(cGet, 0xFB); bufPushByte(cGet, 0x16); emitSleb(cGet, 0);
+    bufPushByte(cGet, 0x20); emitUleb(cGet, 1);
+    bufPushByte(cGet, 0xFB); bufPushByte(cGet, 0x0D); emitUleb(cGet, 0);
+    setDefinedFnBody(wm, fnGet, wrapSimpleBody(Nil, cGet));
+    vecPush(wm.wmExports, MkWgcExport { expName: "__geisha_str_get", expFuncIdx: fnGet });
+
+    // __geisha_str_new(len: i32) -> (ref null 0)
+    let tyNew = internFuncType(wm, [WTI32], [WTRefNull(0)]);
+    let fnNew = allocDefinedFn(wm, tyNew);
+    let cNew = bufNew();
+    bufPushByte(cNew, 0x20); emitUleb(cNew, 0);
+    bufPushByte(cNew, 0xFB); bufPushByte(cNew, 0x07); emitUleb(cNew, 0);
+    setDefinedFnBody(wm, fnNew, wrapSimpleBody(Nil, cNew));
+    vecPush(wm.wmExports, MkWgcExport { expName: "__geisha_str_new", expFuncIdx: fnNew });
+
+    // __geisha_str_set(s: anyref, i: i32, b: i32) -> ()
+    let tySet = internFuncType(wm, [WTAny, WTI32, WTI32], Nil);
+    let fnSet = allocDefinedFn(wm, tySet);
+    let cSet = bufNew();
+    bufPushByte(cSet, 0x20); emitUleb(cSet, 0);
+    bufPushByte(cSet, 0xFB); bufPushByte(cSet, 0x16); emitSleb(cSet, 0);
+    bufPushByte(cSet, 0x20); emitUleb(cSet, 1);
+    bufPushByte(cSet, 0x20); emitUleb(cSet, 2);
+    bufPushByte(cSet, 0xFB); bufPushByte(cSet, 0x0E); emitUleb(cSet, 0);
+    setDefinedFnBody(wm, fnSet, wrapSimpleBody(Nil, cSet));
+    vecPush(wm.wmExports, MkWgcExport { expName: "__geisha_str_set", expFuncIdx: fnSet })
+}
+
+def collectWgcExportPairs(prog: CoreProgram, cliExports: List String): List (String, String) = {
+    let seen: StrMap Bool = strMapNew();
+    let accRev: Cell (List (String, String)) = cellNew(Nil);
+    let ce = cellNew(prog.coreCExports);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnName, expName), r) -> {
+                if (strMapContains(prog.coreFns, fnName) && !strMapContains(seen, expName)) {
+                    strMapInsert(seen, expName, true);
+                    cellSet(accRev, Cons((fnName, expName), cellGet(accRev)))
+                } else ();
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+    let cx = cellNew(cliExports);
+    while (match cellGet(cx) { Nil -> false, _ -> true }) {
+        match cellGet(cx) {
+            Cons(nm, r) -> {
+                if (strMapContains(prog.coreFns, nm) && !strMapContains(seen, nm)) {
+                    strMapInsert(seen, nm, true);
+                    cellSet(accRev, Cons((nm, nm), cellGet(accRev)))
+                } else ();
+                cellSet(cx, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(accRev))
+}
+
+def typeUsesString(ty: Type): Bool = match ty {
+    TyCon("String") -> true,
+    TyArr(_, ps, r) -> typeUsesStringList(ps) || typeUsesString(r),
+    TyTuple(es) -> typeUsesStringList(es),
+    TyComp(b, a) -> typeUsesString(b) || typeUsesString(a),
+    _ -> false,
+}
+
+def typeUsesStringList(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> typeUsesString(h) || typeUsesStringList(t),
+}
+
+def assembleWasmGcBinary(wm: WgcModule): StringBuf = {
+    let out = bufNew();
+    // Magic + Version 1
+    bufPushByte(out, 0x00); bufPushByte(out, 0x61); bufPushByte(out, 0x73); bufPushByte(out, 0x6D);
+    bufPushByte(out, 0x01); bufPushByte(out, 0x00); bufPushByte(out, 0x00); bufPushByte(out, 0x00);
+
+    // Section 1: Type section (all types in 1 `rec` group for unrestricted mutual recursion)
+    let nTypes = vecLen(wm.wmTypes);
+    if (nTypes > 0) {
+        let secType = bufNew();
+        emitUleb(secType, 1); // 1 rec group
+        bufPushByte(secType, 0x4E); // rec
+        emitUleb(secType, nTypes);
+        let ti = cellNew(0);
+        while (cellGet(ti) < nTypes) {
+            emitTypeDef(secType, vecGetOr(wm.wmTypes, cellGet(ti), WTDPlaceholder));
+            cellSet(ti, cellGet(ti) + 1)
+        };
+        emitSection(out, 1, secType)
+    } else ();
+
+    // Section 2: Import section (only if used)
+    let nImps = vecLen(wm.wmImports);
+    if (nImps > 0) {
+        let secImp = bufNew();
+        emitUleb(secImp, nImps);
+        let ii = cellNew(0);
+        while (cellGet(ii) < nImps) {
+            let imp = vecGetOr(wm.wmImports, cellGet(ii), MkWgcImport { impMod: "", impName: "", impTypeIdx: 0 });
+            emitWasmName(secImp, imp.impMod);
+            emitWasmName(secImp, imp.impName);
+            bufPushByte(secImp, 0x00); // func import
+            emitUleb(secImp, imp.impTypeIdx);
+            cellSet(ii, cellGet(ii) + 1)
+        };
+        emitSection(out, 2, secImp)
+    } else ();
+
+    // Section 3: Function section
+    let nDefs = vecLen(wm.wmDefinedFns);
+    if (nDefs > 0) {
+        let secFn = bufNew();
+        emitUleb(secFn, nDefs);
+        let fi = cellNew(0);
+        while (cellGet(fi) < nDefs) {
+            let df = vecGetOr(wm.wmDefinedFns, cellGet(fi), MkWgcDefinedFn { dfTypeIdx: 0, dfBody: cellNew(bufNew()) });
+            emitUleb(secFn, df.dfTypeIdx);
+            cellSet(fi, cellGet(fi) + 1)
+        };
+        emitSection(out, 3, secFn)
+    } else ();
+
+    // Section 5: Memory section — OMITTED (ZERO linear memory!)
+
+    // Section 6: Global section
+    let nGlobs = vecLen(wm.wmGlobals);
+    if (nGlobs > 0) {
+        let secGl = bufNew();
+        emitUleb(secGl, nGlobs);
+        let gi = cellNew(0);
+        while (cellGet(gi) < nGlobs) {
+            let gl = vecGetOr(wm.wmGlobals, cellGet(gi), MkWgcGlobal { glValTy: WTI32, glMut: true });
+            emitValType(secGl, gl.glValTy);
+            bufPushByte(secGl, if (gl.glMut) 1 else 0);
+            emitDefaultVal(secGl, gl.glValTy);
+            bufPushByte(secGl, 0x0B);
+            cellSet(gi, cellGet(gi) + 1)
+        };
+        emitSection(out, 6, secGl)
+    } else ();
+
+    // Section 7: Export section
+    let nExps = vecLen(wm.wmExports);
+    if (nExps > 0) {
+        let secExp = bufNew();
+        emitUleb(secExp, nExps);
+        let ei = cellNew(0);
+        while (cellGet(ei) < nExps) {
+            let ex = vecGetOr(wm.wmExports, cellGet(ei), MkWgcExport { expName: "", expFuncIdx: 0 });
+            emitWasmName(secExp, ex.expName);
+            bufPushByte(secExp, 0x00); // func export
+            emitUleb(secExp, ex.expFuncIdx);
+            cellSet(ei, cellGet(ei) + 1)
+        };
+        emitSection(out, 7, secExp)
+    } else ();
+
+    // Section 8: Start section (runs __geisha_init automatically on instantiation)
+    match cellGet(wm.wmStartFunc) {
+        Some(startIdx) -> {
+            let secStart = bufNew();
+            emitUleb(secStart, startIdx);
+            emitSection(out, 8, secStart)
+        },
+        None -> (),
+    };
+
+    // Section 9: Declarative Element section for all `ref.func` targets
+    let nRefs = vecLen(wm.wmRefFuncList);
+    if (nRefs > 0) {
+        let secElem = bufNew();
+        emitUleb(secElem, 1); // 1 declarative segment
+        bufPushByte(secElem, 0x03); // declarative
+        bufPushByte(secElem, 0x00); // elemkind = funcref
+        emitUleb(secElem, nRefs);
+        let ri = cellNew(0);
+        while (cellGet(ri) < nRefs) {
+            emitUleb(secElem, vecGetOr(wm.wmRefFuncList, cellGet(ri), 0));
+            cellSet(ri, cellGet(ri) + 1)
+        };
+        emitSection(out, 9, secElem)
+    } else ();
+
+    // Section 12: DataCount section (MUST precede Code section when `array.new_data` is used!)
+    let hasData = bufLen(wm.wmDataPool) > 0;
+    if (hasData) {
+        let secDc = bufNew();
+        emitUleb(secDc, 1);
+        emitSection(out, 12, secDc)
+    } else ();
+
+    // Section 10: Code section
+    if (nDefs > 0) {
+        let secCode = bufNew();
+        emitUleb(secCode, nDefs);
+        let ci = cellNew(0);
+        while (cellGet(ci) < nDefs) {
+            let df = vecGetOr(wm.wmDefinedFns, cellGet(ci), MkWgcDefinedFn { dfTypeIdx: 0, dfBody: cellNew(bufNew()) });
+            let b = cellGet(df.dfBody);
+            emitUleb(secCode, bufLen(b));
+            bufPushBuf(secCode, b);
+            cellSet(ci, cellGet(ci) + 1)
+        };
+        emitSection(out, 10, secCode)
+    } else ();
+
+    // Section 11: Passive Data section (packed string literal pool, zero linear memory!)
+    if (hasData) {
+        let secData = bufNew();
+        emitUleb(secData, 1); // 1 passive segment
+        bufPushByte(secData, 0x01); // passive mode
+        emitUleb(secData, bufLen(wm.wmDataPool));
+        bufPushBuf(secData, wm.wmDataPool);
+        emitSection(out, 11, secData)
+    } else ();
+
+    out
+}
+
+extern "gs_sys_fopen" def c_wgc_fopen(path: String, mode: String): Ptr
+extern "fwrite" def c_wgc_fwrite(buf: Ptr, size: Int64, nitems: Int64, fp: Ptr): Int64
+extern "fclose" def c_wgc_fclose(fp: Ptr): Int
+
+pub def writeWasmGcBinary(path: String, buf: StringBuf): Result Void String = match buf {
+    MkStringBuf(dataCell, lenCell, _) -> {
+        let fp = c_wgc_fopen(path, "wb");
+        if (ptrIsNull(fp)) {
+            Err("failed to open file for writing: " + path)
+        } else {
+            let total = cellGet(lenCell);
+            let written = i64ToInt(c_wgc_fwrite(cellGet(dataCell), intToI64(1), intToI64(total), fp));
+            let rc = c_wgc_fclose(fp);
+            if (written == total && rc == 0) Ok(())
+            else Err("failed to write WasmGC binary: " + path)
+        }
+    },
+}
+
+def isReservedWgcExportName(nm: String): Bool =
+    nm == "__geisha_init"
+    || nm == "__geisha_str_len"
+    || nm == "__geisha_str_get"
+    || nm == "__geisha_str_new"
+    || nm == "__geisha_str_set"
+    || nm == "instantiate"
+    || nm == "wasmExports"
+
+def hexDigitUpper(nib: Int): Int =
+    if (nib < 10) 48 + nib else 55 + nib
+
+def isUrlPathSegmentUnreserved(b: Int): Bool =
+    (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || (b >= 48 && b <= 57)
+    || b == 45 || b == 95 || b == 46 || b == 126
+    || b == 33 || b == 39 || b == 40 || b == 41 || b == 42
+
+def urlEncodePathSegment(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i)) & 255;
+        if (isUrlPathSegmentUnreserved(ch)) {
+            bufPushByte(b, ch)
+        } else {
+            bufPushByte(b, 37); // '%'
+            bufPushByte(b, hexDigitUpper((ch >>> 4) & 15));
+            bufPushByte(b, hexDigitUpper(ch & 15))
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool): Result StringBuf String = {
+    let wm = newWgcModule(prog);
+
+    // Phase 1: Discover needed host imports
+    discoverImports(wm);
+
+    // Phase 2: Register all global variables
+    let cg = cellNew(prog.coreGlobals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(gv, r) -> {
+                let gwt = geishaTypeToWgc(wm, gv.gvTy);
+                let gidx = vecLen(wm.wmGlobals);
+                vecPush(wm.wmGlobals, MkWgcGlobal { glValTy: gwt, glMut: true });
+                strMapInsert(wm.wmGlobalMap, gv.gvName, gidx);
+                strMapInsert(wm.wmGlobalWts, gv.gvName, gwt);
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Phase 3: Pre-register all user function signatures & indices
+    let cf0 = cellNew(prog.coreFnNames);
+    while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+        match cellGet(cf0) {
+            Cons(fnm, r) -> {
+                match strMapGet(prog.coreFns, fnm) {
+                    Some(fd) -> registerUserFunctionSig(wm, fd),
+                    None -> (),
+                };
+                cellSet(cf0, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Phase 4: Compile all user function bodies
+    let cf1 = cellNew(prog.coreFnNames);
+    while (match cellGet(cf1) { Nil -> false, _ -> true }) {
+        match cellGet(cf1) {
+            Cons(fnm, r) -> {
+                match strMapGet(prog.coreFns, fnm) {
+                    Some(fd) -> compileUserFunctionBody(wm, fd),
+                    None -> (),
+                };
+                cellSet(cf1, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Phase 5: Global initializer & Start section
+    let initIdxOpt = emitGlobalInitFunction(wm);
+
+    // Phase 6: Exports (wrapped with lazy `__geisha_init` call when host imports defer Start)
+    let expPairs = collectWgcExportPairs(prog, exports);
+    let expSeen: StrMap Bool = strMapNew();
+    let ce = cellNew(expPairs);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnName, expName), r) -> {
+                if (isReservedWgcExportName(expName)) {
+                    let sp = match strMapGet(prog.coreFns, fnName) { Some(fd) -> fd.fnSpan, None -> emptySpan() };
+                    setWgcErr(wm, sp, "WasmGC target cannot export '" + expName + "' because it conflicts with a reserved WasmGC runtime/glue export")
+                } else match strMapGet(wm.wmFnIdxMap, fnName) {
+                    Some(fi) -> {
+                        if (!strMapContains(expSeen, expName)) {
+                            strMapInsert(expSeen, expName, true);
+                            let expFi = wrapExportWithInit(wm, fnName, fi, initIdxOpt);
+                            vecPush(wm.wmExports, MkWgcExport { expName: expName, expFuncIdx: expFi });
+                            match strMapGet(prog.coreFns, fnName) {
+                                Some(fd) -> if (typeUsesString(schemeBody(fd.fnScm))) cellSet(wm.wmNeedsStrInterop, true) else (),
+                                None -> (),
+                            }
+                        } else ()
+                    },
+                    None -> (),
+                };
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    if (strMapContains(wm.wmFnIdxMap, "main") && !strMapContains(expSeen, "main")) {
+        match strMapGet(wm.wmFnIdxMap, "main") {
+            Some(fi) -> {
+                let expFi = wrapExportWithInit(wm, "main", fi, initIdxOpt);
+                vecPush(wm.wmExports, MkWgcExport { expName: "main", expFuncIdx: expFi })
+            },
+            None -> (),
+        }
+    } else ();
+
+    if (cellGet(wm.wmNeedsStrInterop)) {
+        emitStrInteropExports(wm)
+    } else ();
+
+    let _ = noMain;
+    match cellGet(wm.wmErr) {
+        Some(errMsg) -> Err(errMsg),
+        None -> Ok(assembleWasmGcBinary(wm)),
+    }
+}
+
+// ============================================================================
+// Companion ES Module Glue (`.mjs`) & TypeScript Declarations (`.d.ts`)
+// ============================================================================
+
+def isValidJsIdentName(s: String): Bool = {
+    let n = strLen(s);
+    if (n == 0) false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let b = strByteAt(s, cellGet(i)) & 255;
+            let isStart = (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 || b == 36;
+            let isCont = isStart || (b >= 48 && b <= 57);
+            if (cellGet(i) == 0) {
+                if (!isStart) cellSet(ok, false) else ()
+            } else {
+                if (!isCont) cellSet(ok, false) else ()
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+def jsEscapeStringLit(s: String): String = {
+    let b = bufNew();
+    bufPushByte(b, 34); // '"'
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i)) & 255;
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else if (ch < 32 || ch == 127) {
+            bufPushStr(b, "\\x");
+            bufPushByte(b, hexDigitUpper((ch >>> 4) & 15));
+            bufPushByte(b, hexDigitUpper(ch & 15))
+        } else {
+            bufPushByte(b, ch)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 34);
+    bufToString(b)
+}
+
+def formatEsmExportName(s: String): String =
+    if (isValidJsIdentName(s)) s else jsEscapeStringLit(s)
+
+def wgcArgFromJs(ty: Type, expr: String): String = match ty {
+    TyCon("String") -> "_gs_toWasmStr(" + expr + ")",
+    TyCon("Bool") -> "(" + expr + " ? 1 : 0)",
+    TyCon("Int") -> "(" + expr + " | 0)",
+    TyCon("Char") -> "(" + expr + " & 255)",
+    TyCon("Int64") -> "BigInt.asIntN(64, " + expr + ")",
+    TyCon("Float32") -> "Math.fround(" + expr + ")",
+    TyVoid -> "0",
+    _ -> expr,
+}
+
+def wgcRetToJs(ty: Type, expr: String): String = match ty {
+    TyCon("String") -> "_gs_fromWasmStr(" + expr + ")",
+    TyCon("Bool") -> "(" + expr + " !== 0)",
+    TyVoid -> expr,
+    _ -> expr,
+}
+
+pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: List String, noMain: Bool): String = {
+    let out = bufNew();
+    bufPushStr(out, "// Generated by Geisha (`--target wasm-gc`) — Zero-dependency WasmGC ES Module Host Glue\n");
+    bufPushStr(out, "const _gs_enc = new TextEncoder();\n");
+    bufPushStr(out, "const _gs_dec = new TextDecoder(\"utf-8\");\n");
+    bufPushStr(out, "let _gs_exp = null;\n\n");
+    bufPushStr(out, "function _gs_fromWasmBytes(ref) {\n");
+    bufPushStr(out, "  if (ref == null || !_gs_exp || !_gs_exp.__geisha_str_len) return new Uint8Array(0);\n");
+    bufPushStr(out, "  const n = _gs_exp.__geisha_str_len(ref);\n");
+    bufPushStr(out, "  const u = new Uint8Array(n);\n");
+    bufPushStr(out, "  for (let i = 0; i < n; i++) u[i] = _gs_exp.__geisha_str_get(ref, i);\n");
+    bufPushStr(out, "  return u;\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_fromWasmStr(ref) {\n");
+    bufPushStr(out, "  return _gs_dec.decode(_gs_fromWasmBytes(ref));\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_toWasmStr(s) {\n");
+    bufPushStr(out, "  if (!_gs_exp.__geisha_str_new) return null;\n");
+    bufPushStr(out, "  const u = _gs_enc.encode(String(s));\n");
+    bufPushStr(out, "  const ref = _gs_exp.__geisha_str_new(u.length);\n");
+    bufPushStr(out, "  for (let i = 0; i < u.length; i++) _gs_exp.__geisha_str_set(ref, i, u[i]);\n");
+    bufPushStr(out, "  return ref;\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "let _gs_seed = 0x243f6a8885a308d3n;\n");
+    bufPushStr(out, "function _gs_putStr(t) {\n");
+    bufPushStr(out, "  if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(t);\n");
+    bufPushStr(out, "  else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t);\n");
+    bufPushStr(out, "  else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(t);\n");
+    bufPushStr(out, "  else console.log(t);\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_makeImports(extra) {\n");
+    bufPushStr(out, "  return {\n");
+    bufPushStr(out, "    geisha: {\n");
+    bufPushStr(out, "      print_str(r) { const t = _gs_fromWasmStr(r); if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t); else console.log(t); },\n");
+    bufPushStr(out, "      put_char(c) { _gs_putStr(String.fromCharCode(c & 255)); },\n");
+    bufPushStr(out, "      put_i32(n) { _gs_putStr(String(n | 0)); },\n");
+    bufPushStr(out, "      put_f64(f) { _gs_putStr(String(f)); },\n");
+    bufPushStr(out, "      math_exp(x) { return Math.exp(x); },\n");
+    bufPushStr(out, "      math_log(x) { return Math.log(x); },\n");
+    bufPushStr(out, "      math_sin(x) { return Math.sin(x); },\n");
+    bufPushStr(out, "      math_cos(x) { return Math.cos(x); },\n");
+    bufPushStr(out, "      math_tanh(x) { return Math.tanh(x); },\n");
+    bufPushStr(out, "      math_pow(a, b) { return Math.pow(a, b); },\n");
+    bufPushStr(out, "      strtod(r) { const v = Number.parseFloat(_gs_fromWasmStr(r)); return Number.isNaN(v) ? 0.0 : v; },\n");
+    bufPushStr(out, "      fmt_f64(f) { let s; if (Number.isNaN(f)) s = \"NaN\"; else if (f === Infinity) s = \"inf\"; else if (f === -Infinity) s = \"-inf\"; else if (Object.is(f, -0)) s = \"-0.0\"; else { s = f.toString(); if (!s.includes(\".\") && !s.includes(\"e\") && !s.includes(\"E\")) s += \".0\"; } return _gs_toWasmStr(s); },\n");
+    bufPushStr(out, "      time_now_ms() { return BigInt(Date.now()); },\n");
+    bufPushStr(out, "      time_mono_ms() { return BigInt(Math.trunc(performance.now())); },\n");
+    bufPushStr(out, "      time_mono_ns() { return BigInt(Math.trunc(performance.now() * 1e6)); },\n");
+    bufPushStr(out, "      rand_seed() { _gs_seed = BigInt.asIntN(64, _gs_seed + 0x9e3779b97f4a7c15n); return _gs_seed; },\n");
+    bufPushStr(out, "      fd_write(fd, r, n) { const u = _gs_fromWasmBytes(r); const len = Math.max(0, Math.min(u.length, Number(n))); const slice = u.subarray(0, len); if (fd === 2) { if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(slice); else console.error(_gs_dec.decode(slice)); } else { if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(_gs_dec.decode(slice)); else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(slice); else console.log(_gs_dec.decode(slice)); } return BigInt(len); },\n");
+    bufPushStr(out, "      exit(c) { if (typeof process !== \"undefined\" && typeof process.exit === \"function\") process.exit(c | 0); throw new Error(\"Geisha exit(\" + (c | 0) + \")\"); },\n");
+    bufPushStr(out, "    },\n");
+    bufPushStr(out, "    ...(extra || {}),\n");
+    bufPushStr(out, "  };\n");
+    bufPushStr(out, "}\n\n");
+    bufPushStr(out, "async function _gs_loadBytes() {\n");
+    bufPushStr(out, "  const url = new URL(\"./" + urlEncodePathSegment(wasmBasename) + "\", import.meta.url);\n");
+    bufPushStr(out, "  if (typeof process !== \"undefined\" && process.versions && process.versions.node) {\n");
+    bufPushStr(out, "    const { readFile } = await import(\"node:fs/promises\");\n");
+    bufPushStr(out, "    return await readFile(url);\n");
+    bufPushStr(out, "  }\n");
+    bufPushStr(out, "  const resp = await fetch(url);\n");
+    bufPushStr(out, "  return new Uint8Array(await resp.arrayBuffer());\n");
+    bufPushStr(out, "}\n\n");
+    bufPushStr(out, "export async function instantiate(bytesOrBuf, extraImports) {\n");
+    bufPushStr(out, "  const bytes = bytesOrBuf || await _gs_loadBytes();\n");
+    bufPushStr(out, "  const { instance } = await WebAssembly.instantiate(bytes, _gs_makeImports(extraImports));\n");
+    bufPushStr(out, "  _gs_exp = instance.exports;\n");
+    bufPushStr(out, "  if (typeof _gs_exp.__geisha_init === \"function\") _gs_exp.__geisha_init();\n");
+    bufPushStr(out, "  return instance;\n");
+    bufPushStr(out, "}\n\n");
+    bufPushStr(out, "const _gs_inst = await instantiate();\n");
+    bufPushStr(out, "export const wasmExports = _gs_inst.exports;\n");
+
+    let expPairs = collectWgcExportPairs(prog, exports);
+    let ce = cellNew(expPairs);
+    let expIdx = cellNew(0);
+    let hasMainExp = cellNew(false);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnName, expName), r) -> {
+                if (expName == "main") cellSet(hasMainExp, true) else ();
+                match strMapGet(prog.coreFns, fnName) {
+                    Some(fd) -> {
+                        let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+                            TyArr(_, ps, rt) -> (ps, rt),
+                            other -> (Nil, other),
+                        };
+                        let pNamesRev = cellNew(Nil);
+                        let pCallsRev = cellNew(Nil);
+                        let idx = cellNew(0);
+                        let cp = cellNew(fd.fnParams);
+                        let cpt = cellNew(paramTys);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(pvd, rp) -> {
+                                    let pty = match cellGet(cpt) { Cons(t, rt) -> { cellSet(cpt, rt); t }, Nil -> schemeBody(pvd.vscm) };
+                                    let pn = "a" + intToStr(cellGet(idx));
+                                    cellSet(pNamesRev, Cons(pn, cellGet(pNamesRev)));
+                                    cellSet(pCallsRev, Cons(wgcArgFromJs(pty, pn), cellGet(pCallsRev)));
+                                    cellSet(idx, cellGet(idx) + 1);
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
+                        cellSet(expIdx, cellGet(expIdx) + 1);
+                        let callExpr = "wasmExports[" + jsEscapeStringLit(expName) + "](" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
+                        if (isVoidTy(retTy)) {
+                            bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { " + callExpr + "; }\n")
+                        } else {
+                            bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { return " + wgcRetToJs(retTy, callExpr) + "; }\n")
+                        };
+                        bufPushStr(out, "export { " + localFn + " as " + formatEsmExportName(expName) + " };\n")
+                    },
+                    None -> (),
+                };
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    if (strMapContains(prog.coreFns, "main")) {
+        if (!cellGet(hasMainExp)) {
+            bufPushStr(out, "function _gs_export_main() { wasmExports.main(); }\nexport { _gs_export_main as main };\n")
+        } else ();
+        if (!noMain) {
+            bufPushStr(out, "wasmExports.main();\n")
+        } else ()
+    } else ();
+
+    bufToString(out)
+}
+
+def wgcTypeToTs(ty: Type): String = match ty {
+    TyVoid -> "void",
+    TyCon(n) ->
+        if (n == "Int" || n == "Float" || n == "Float32" || n == "Char") "number"
+        else if (n == "Int64") "bigint"
+        else if (n == "Bool") "boolean"
+        else if (n == "String") "string"
+        else if (n == "Void") "void"
+        else "unknown",
+    _ -> "unknown",
+}
+
+pub def emitProgramWasmGcDts(prog: CoreProgram, exports: List String, noMain: Bool): String = {
+    let out = bufNew();
+    bufPushStr(out, "// Generated by Geisha (`--target wasm-gc`)\n\n");
+    bufPushStr(out, "export declare const wasmExports: WebAssembly.Exports;\n");
+    bufPushStr(out, "export declare function instantiate(bytesOrBuf?: BufferSource, extraImports?: WebAssembly.Imports): Promise<WebAssembly.Instance>;\n\n");
+    let expPairs = collectWgcExportPairs(prog, exports);
+    let hasMainExp = cellNew(false);
+    let expIdx = cellNew(0);
+    let ce = cellNew(expPairs);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnName, expName), r) -> {
+                if (expName == "main") cellSet(hasMainExp, true) else ();
+                match strMapGet(prog.coreFns, fnName) {
+                    Some(fd) -> {
+                        let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+                            TyArr(_, ps, rt) -> (ps, rt),
+                            other -> (Nil, other),
+                        };
+                        let pRev = cellNew(Nil);
+                        let idx = cellNew(0);
+                        let cp = cellNew(fd.fnParams);
+                        let cpt = cellNew(paramTys);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(pvd, rp) -> {
+                                    let pty = match cellGet(cpt) { Cons(t, rt) -> { cellSet(cpt, rt); t }, Nil -> schemeBody(pvd.vscm) };
+                                    cellSet(pRev, Cons("arg" + intToStr(cellGet(idx)) + ": " + wgcTypeToTs(pty), cellGet(pRev)));
+                                    cellSet(idx, cellGet(idx) + 1);
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
+                        cellSet(expIdx, cellGet(expIdx) + 1);
+                        bufPushStr(out, "declare function " + localFn + "(" + strJoin(listRev(cellGet(pRev)), ", ") + "): " + wgcTypeToTs(retTy) + ";\n");
+                        bufPushStr(out, "export { " + localFn + " as " + formatEsmExportName(expName) + " };\n")
+                    },
+                    None -> (),
+                };
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+    if (strMapContains(prog.coreFns, "main") && !cellGet(hasMainExp)) {
+        bufPushStr(out, "declare function _gs_export_main(): void;\nexport { _gs_export_main as main };\n")
+    } else ();
+    let _ = noMain;
+    bufToString(out)
+}

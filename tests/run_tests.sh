@@ -4909,4 +4909,362 @@ if command -v node >/dev/null 2>&1; then
     assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
 fi
 
+# 44. `--target wasm-gc`: Direct Geisha Core IR -> WasmGC binary (zero linear memory, structs/enums/closures/strings/arrays/JSON/GC stress + size comparison)
+if command -v node >/dev/null 2>&1; then
+cat > "$TMP_DIR/t44_wasmgc.gsa" << 'EOF'
+use std.str.{intToStr, i64ToStr}
+use std.buf.{bufNew, bufPushStr, bufToString}
+use std.result.{Ok, Err}
+use std.json.{parse, stringify}
+
+pub data Point { x: Int, y: Int }
+
+pub data Color { Red, Green, Blue }
+
+pub data Expr {
+    ELit(Int),
+    EAdd(Expr, Expr),
+    EMul(Expr, Expr),
+}
+
+def gBootFlag: Cell Int = cellNew(0)
+extern init def initWgcFlag(): Void = cellSet(gBootFlag, 77)
+
+def colorVal(c: Color): Int = match c {
+    Red -> 1,
+    Green -> 2,
+    Blue -> 3,
+}
+
+def evalExpr(e: Expr): Int = match e {
+    ELit(n) if (n < 0) -> 0 - n,
+    ELit(n) -> n,
+    EAdd(a, b) -> evalExpr(a) + evalExpr(b),
+    EMul(a, b) -> evalExpr(a) * evalExpr(b),
+}
+
+def sumTail(n: Int, acc: Int64): Int64 =
+    if (n <= 0) acc
+    else sumTail(n - 1, acc + intToI64(n))
+
+def makeAdder(base: Int): Int -> Int =
+    (x: Int) -> base + x
+
+def applyTwice(f: Int -> Int, x: Int): Int = f(f(x))
+
+def makeCounter(): () -> Int = {
+    let c = cellNew(0);
+    () -> {
+        let next = cellGet(c) + 1;
+        cellSet(c, next);
+        next
+    }
+}
+
+pub def gcStress(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let p = Point { x: cellGet(i), y: 1 };
+        let xs = Cons(p.x, Cons(p.y, Nil));
+        let v = match xs {
+            Cons(h, Cons(t, Nil)) -> h + t,
+            _ -> 0,
+        };
+        cellSet(acc, (cellGet(acc) + v) & 65535);
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+pub def greet(name: String): String = "Hello, " + name + "!"
+
+pub def add(a: Int, b: Int): Int = a + b
+
+def main(): Void = {
+    let p = Point { x: 10, y: 20 };
+    let cv = colorVal(Red) + colorVal(Green) + colorVal(Blue);
+    let ev = evalExpr(EAdd(EMul(ELit(-6), ELit(7)), ELit(p.x + p.y)));
+    let tail = sumTail(100000, intToI64(0));
+    let add5 = makeAdder(5);
+    let clsRes = applyTwice(add5, 32);
+    let ctr = makeCounter();
+    let csum = ctr() + ctr() + ctr();
+    let arr = parTabulate(5, (i: Int) -> i * i);
+    let arrSum = immArrayGet(arr, 4) + immArrayGet(arr, 3);
+    let b = bufNew();
+    bufPushStr(b, "wa");
+    bufPushStr(b, "smgc");
+    let s = bufToString(b);
+    let j = match parse("{\"a\":[1,true,\"ok\"]}") {
+        Ok(v) -> stringify(v),
+        Err(e) -> "ERR:" + e,
+    };
+    let gc = gcStress(50000);
+    printLn(
+        intToStr(cv) + "|"
+        + intToStr(ev) + "|"
+        + i64ToStr(tail) + "|"
+        + intToStr(clsRes) + "|"
+        + intToStr(csum) + "|"
+        + intToStr(arrSum) + "|"
+        + s + ":" + intToStr(strLen(s)) + "|"
+        + j + "|"
+        + intToStr(gc) + "|"
+        + intToStr(cellGet(gBootFlag))
+    )
+}
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_wasmgc.wasm" "$TMP_DIR/t44_wasmgc.gsa"
+if [ ! -f "$TMP_DIR/t44_wasmgc.wasm" ] || [ ! -f "$TMP_DIR/t44_wasmgc.mjs" ] || [ ! -f "$TMP_DIR/t44_wasmgc.d.ts" ]; then
+    echo "FAIL [wasmgc_outputs]: expected .wasm, .mjs, and .d.ts outputs" >&2
+    exit 1
+fi
+WGC_OUT="$(node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const { add, greet, gcStress } = await import(pathToFileURL(process.argv[1]).href);
+const bytes = fs.readFileSync(process.argv[2]);
+const mod = new WebAssembly.Module(bytes);
+const memExports = WebAssembly.Module.exports(mod).filter(e => e.kind === "memory");
+const memImports = WebAssembly.Module.imports(mod).filter(i => i.kind === "memory");
+if (memExports.length !== 0 || memImports.length !== 0) {
+    throw new Error("Expected zero linear memory in WasmGC module");
+}
+console.log(add(19, 23) + "|" + greet("WasmGC") + "|" + gcStress(10000));
+' "$TMP_DIR/t44_wasmgc.mjs" "$TMP_DIR/t44_wasmgc.wasm")"
+WGC_MAIN_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '1p')"
+WGC_HOST_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '2p')"
+assert_eq "wasmgc_full_e2e_main" '6|72|5000050000|42|6|25|wasmgc:6|{"a":[1,true,"ok"]}|56872|77' "$WGC_MAIN_LINE"
+assert_eq "wasmgc_full_e2e_host" '42|Hello, WasmGC!|1032' "$WGC_HOST_LINE"
+
+# Verify --no-dts skips .d.ts and .d.mts
+"$GEISHA_BIN" --target wasm-gc --no-dts -o "$TMP_DIR/t44_nodts.wasm" "$TMP_DIR/t44_wasmgc.gsa"
+if [ -f "$TMP_DIR/t44_nodts.d.ts" ] || [ -f "$TMP_DIR/t44_nodts.d.mts" ]; then
+    echo "FAIL [wasmgc_no_dts]: expected --no-dts to omit .d.ts and .d.mts" >&2
+    exit 1
+fi
+
+# Verify project-mode `geisha build --target wasm-gc` + zero-import raw WebAssembly.Instance + binary size comparison vs wasm32
+WGC_PROJ="$TMP_DIR/t44_wgc_proj"
+mkdir -p "$WGC_PROJ/src"
+cat > "$WGC_PROJ/geisha.toml" << 'EOF'
+name = "wgc_bench"
+version = "0.1.0"
+
+[target.wasm-gc]
+exports = ["runBench"]
+owns_main = true
+EOF
+cat > "$WGC_PROJ/src/main.gsa" << 'EOF'
+pub data Point { x: Int, y: Int }
+pub data Color { Red, Green, Blue }
+pub data Tree { Leaf(Int), Node(Tree, Tree) }
+
+def makeTree(depth: Int, v: Int): Tree =
+    if (depth <= 0) Leaf(v)
+    else Node(makeTree(depth - 1, v + 1), makeTree(depth - 1, v + 2))
+
+def sumTree(t: Tree): Int = match t {
+    Leaf(n) -> n,
+    Node(l, r) -> sumTree(l) + sumTree(r),
+}
+
+pub def runBench(n: Int): Int = {
+    let p = Point { x: n, y: 3 };
+    let c = match Red { Red -> 1, Green -> 2, Blue -> 3 };
+    let f = (k: Int) -> k + p.x + c;
+    sumTree(makeTree(6, f(p.y)))
+}
+
+def main(): Void = { let _ = runBench(5); () }
+EOF
+ABS_GEISHA_44="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+(cd "$WGC_PROJ" && "$ABS_GEISHA_44" build --target wasm-gc)
+WGC_RAW_RES="$(node -e "
+const fs = require('fs');
+const bytes = fs.readFileSync('$WGC_PROJ/build/wgc_bench.wasm');
+const mod = new WebAssembly.Module(bytes);
+const inst = new WebAssembly.Instance(mod);
+console.log(inst.exports.runBench(5) + '|' + bytes.length);
+")"
+WGC_RAW_VAL="$(printf '%s' "$WGC_RAW_RES" | cut -d'|' -f1)"
+WGC_RAW_SZ="$(printf '%s' "$WGC_RAW_RES" | cut -d'|' -f2)"
+assert_eq "wasmgc_proj_raw_instance" "1152" "$WGC_RAW_VAL"
+if [ -f "./build/wasm_rt.o" ]; then
+    "$GEISHA_BIN" --target wasm32 --opt z --strip --runtime ./build/wasm_rt.o --export runBench -o "$TMP_DIR/t44_w32.wasm" "$WGC_PROJ/src/main.gsa"
+    W32_SZ="$(wc -c < "$TMP_DIR/t44_w32.wasm" | tr -d ' ')"
+    if [ "$WGC_RAW_SZ" -ge "$W32_SZ" ]; then
+        echo "FAIL [wasmgc_size_smaller]: expected wasm-gc ($WGC_RAW_SZ bytes) < wasm32 ($W32_SZ bytes)" >&2
+        exit 1
+    fi
+    echo "PASS [wasmgc_size_comparison]: wasm-gc=${WGC_RAW_SZ}B vs wasm32(-Oz --strip)=${W32_SZ}B (zero linear memory)"
+    PASS=$((PASS + 1))
+fi
+
+# 44b. WasmGC regression tests: i64 foreignPtrAlloc/arenaAlloc, extern init printLn ordering, and unsupported extern compile error
+cat > "$TMP_DIR/t44_reg.gsa" << 'EOF'
+use std.str.intToStr
+
+extern init def bootPrint(): Void = printLn("boot text")
+
+pub def testForeignAndArena(): Int = {
+    let fp = foreignPtrAlloc(intToI64(8));
+    let v1 = withForeignPtr(fp, (p: ScopedPtr) -> {
+        scopedPtrWriteI32Le(p, 0, 111);
+        scopedPtrWriteI32Le(p, 4, 222);
+        scopedPtrReadI32Le(p, 0) + scopedPtrReadI32Le(p, 4)
+    });
+    let v2 = withArena((a: Arena) -> {
+        let sp = arenaAlloc(a, intToI64(8));
+        scopedPtrWriteI32Le(sp, 0, 1000);
+        scopedPtrWriteI32Le(sp, 4, 234);
+        scopedPtrReadI32Le(sp, 0) + scopedPtrReadI32Le(sp, 4)
+    });
+    v1 + v2
+}
+
+pub def testNegAlloc64(): Int = {
+    let _ = foreignPtrAlloc(intToI64(-1));
+    0
+}
+
+pub def testExtraBuiltins(): Int = {
+    let p = ptrAllocBytes(16);
+    ptrWriteU16Le(p, 0, 51321);
+    let u16v = ptrReadU16Le(p, 0);
+    ptrWriteF64Le64(p, intToI64(8), 12.5);
+    let f64v = floatToInt(ptrReadF64Le64(p, intToI64(8)));
+    let a = __concAtomicNew(10);
+    let ok1 = if (__concAtomicCas(a, 10, 42)) 1 else 0;
+    let ok2 = if (__concAtomicCas(a, 10, 99)) 1 else 0;
+    u16v + f64v + __concAtomicLoad(a) + ok1 * 10 + ok2
+}
+
+def main(): Void = {
+    printLn("main text");
+    printLn(intToStr(testForeignAndArena()) + "|" + intToStr(testExtraBuiltins()))
+}
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_reg.wasm" "$TMP_DIR/t44_reg.gsa"
+WGC_REG_OUT="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { testNegAlloc64 } = await import(pathToFileURL(process.argv[1]).href);
+let trapped = false;
+try { testNegAlloc64(); } catch (e) { trapped = true; }
+console.log("trap:" + trapped);
+' "$TMP_DIR/t44_reg.mjs")"
+WGC_REG_L1="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '1p')"
+WGC_REG_L2="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '2p')"
+WGC_REG_L3="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '3p')"
+WGC_REG_L4="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '4p')"
+assert_eq "wasmgc_extern_init_print_order_1" "boot text" "$WGC_REG_L1"
+assert_eq "wasmgc_extern_init_print_order_2" "main text" "$WGC_REG_L2"
+assert_eq "wasmgc_foreign_arena_and_builtins" "1567|51385" "$WGC_REG_L3"
+assert_eq "wasmgc_neg_i64_alloc_traps" "trap:true" "$WGC_REG_L4"
+
+cat > "$TMP_DIR/t44_bad_extern.gsa" << 'EOF'
+extern "abs" def hostAbs(x: Int): Int
+def main(): Void = { let _ = hostAbs(-42); () }
+EOF
+WGC_BAD_EXT_ERR="$("$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_extern.wasm" "$TMP_DIR/t44_bad_extern.gsa" 2>&1 || true)"
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_extern.wasm" "$TMP_DIR/t44_bad_extern.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_unsupported_extern]: expected unsupported extern 'abs' to fail compilation" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$WGC_BAD_EXT_ERR" | grep -q "WasmGC target does not support extern 'abs'"; then
+    echo "FAIL [wasmgc_reject_unsupported_extern_diag]: unexpected error output: $WGC_BAD_EXT_ERR" >&2
+    exit 1
+fi
+echo "PASS [wasmgc_reject_unsupported_extern]: rejected unsupported extern 'abs' with codegen diagnostic"
+PASS=$((PASS + 1))
+
+# 44c. WasmGC edge regressions: ptrOffset64/scopedPtrOffset64 overflow trap, raw fd_write UTF-8 byte preservation, reserved export collision diag, and #/% output filenames
+cat > "$TMP_DIR/t44_edge.gsa" << 'EOF'
+extern "gs_sys_fd_write" def raw_write(fd: Int, buf: String, n: Int64): Int64
+
+pub def testOffset64Valid(): Int = {
+    let p = ptrAllocBytes(16);
+    let p1 = ptrOffset64(p, intToI64(8));
+    ptrWriteU32Le(p1, 0, 777);
+    let p0 = ptrOffset64(p1, intToI64(-8));
+    ptrReadU32Le(p0, 8)
+}
+
+pub def testPtrOffset64Overflow(): Int = {
+    let p = ptrAllocBytes(16);
+    let _ = ptrOffset64(p, bitShl64(intToI64(1), 32));
+    0
+}
+
+pub def testScopedOffset64Overflow(): Int = {
+    let fp = foreignPtrAlloc(intToI64(16));
+    withForeignPtr(fp, (sp: ScopedPtr) -> {
+        let _ = scopedPtrOffset64(sp, bitShl64(intToI64(1), 31));
+        0
+    })
+}
+
+pub def writeHalfUtf8(): Int64 = raw_write(1, "é", intToI64(1))
+
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/test#output%20.wasm" "$TMP_DIR/t44_edge.gsa"
+WGC_EDGE_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { testOffset64Valid, testPtrOffset64Overflow, testScopedOffset64Overflow } = await import(pathToFileURL(process.argv[1]).href);
+let t1 = false, t2 = false;
+try { testPtrOffset64Overflow(); } catch (e) { t1 = true; }
+try { testScopedOffset64Overflow(); } catch (e) { t2 = true; }
+console.log(testOffset64Valid() + "|" + t1 + "|" + t2);
+' "$TMP_DIR/test#output%20.mjs")"
+assert_eq "wasmgc_offset64_and_special_filename" "777|true|true" "$WGC_EDGE_RES"
+
+WGC_RAW_BYTE_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const { writeHalfUtf8 } = await import(pathToFileURL(process.argv[1]).href);
+const rc = writeHalfUtf8();
+if (rc !== 1n) { process.stderr.write("BAD_RC=" + rc); process.exit(1); }
+' "$TMP_DIR/test#output%20.mjs" | od -An -tx1 | tr -d ' \n')"
+assert_eq "wasmgc_fd_write_raw_utf8_byte" "c3" "$WGC_RAW_BYTE_RES"
+
+cat > "$TMP_DIR/t44_bad_exp1.gsa" << 'EOF'
+pub def __geisha_init(): Int = 1
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_exp1.wasm" "$TMP_DIR/t44_bad_exp1.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_reserved_export_init]: expected reserved export '__geisha_init' to fail" >&2
+    exit 1
+fi
+cat > "$TMP_DIR/t44_bad_exp2.gsa" << 'EOF'
+pub def instantiate(): Int = 1
+def main(): Void = ()
+EOF
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_exp2.wasm" "$TMP_DIR/t44_bad_exp2.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_reserved_export_inst]: expected reserved export 'instantiate' to fail" >&2
+    exit 1
+fi
+echo "PASS [wasmgc_reject_reserved_exports]: rejected reserved exports '__geisha_init' and 'instantiate'"
+PASS=$((PASS + 1))
+
+cat > "$TMP_DIR/t44_alias_exp.gsa" << 'EOF'
+pub def default(): Int = 101
+pub def _gs_exp(): Int = 202
+pub def URL(s: String): String = "url:" + s
+pub extern "feature-v2" def feature(): Int = 9
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_alias_exp.wasm" "$TMP_DIR/t44_alias_exp.gsa"
+if [ ! -f "$TMP_DIR/t44_alias_exp.d.mts" ] || [ ! -f "$TMP_DIR/t44_alias_exp.d.ts" ]; then
+    echo "FAIL [wasmgc_dmts_missing]: expected both .d.mts and .d.ts outputs" >&2
+    exit 1
+fi
+WGC_ALIAS_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(process.argv[1]).href);
+console.log(m.default() + "|" + m._gs_exp() + "|" + m.URL("ok") + "|" + m["feature-v2"]());
+' "$TMP_DIR/t44_alias_exp.mjs")"
+assert_eq "wasmgc_esm_alias_exports" "101|202|url:ok|9" "$WGC_ALIAS_RES"
+fi
+
 echo "All $PASS end-to-end test suites passed!"
