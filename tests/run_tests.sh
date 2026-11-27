@@ -4909,4 +4909,77 @@ if command -v node >/dev/null 2>&1; then
     assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
 fi
 
+echo "[Test 44] Project templates (geisha new --list-templates & --template cli|lib|wasm|web-js)..."
+ABS_GEISHA_44="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_44="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+TMPL_LIST="$("$ABS_GEISHA_44" new --list-templates)"
+for tname in cli lib wasm web-js; do
+    if ! printf "%s\n" "$TMPL_LIST" | grep -q "$tname"; then
+        echo "FAIL [geisha_new_list_templates]: missing '$tname' in: $TMPL_LIST" >&2
+        exit 1
+    fi
+done
+echo "PASS [geisha_new_list_templates]: listed cli, lib, wasm, web-js"
+PASS=$((PASS + 1))
+
+# Reject unknown template and missing dir
+if "$ABS_GEISHA_44" new --template bogus "$TMP_DIR/t44_bogus" >/dev/null 2>&1; then
+    echo "FAIL [geisha_new_bad_template]: expected unknown template to fail" >&2
+    exit 1
+fi
+if "$ABS_GEISHA_44" new >/dev/null 2>&1; then
+    echo "FAIL [geisha_new_missing_dir]: expected missing directory to fail" >&2
+    exit 1
+fi
+
+# cli template: create, test, run
+"$ABS_GEISHA_44" new --template cli "$TMP_DIR/t44_cli" >/dev/null
+(cd "$TMP_DIR/t44_cli" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
+T44_CLI_OUT="$(cd "$TMP_DIR/t44_cli" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" run -- World)"
+assert_eq "geisha_new_cli_template" "Hello, World!" "$T44_CLI_OUT"
+
+# Reject re-creating in existing project dir
+if "$ABS_GEISHA_44" new --template cli "$TMP_DIR/t44_cli" >/dev/null 2>&1; then
+    echo "FAIL [geisha_new_existing_manifest]: expected existing geisha.toml to be rejected" >&2
+    exit 1
+fi
+
+# lib template: create, check, test
+"$ABS_GEISHA_44" new --template lib "$TMP_DIR/t44_lib" >/dev/null
+(cd "$TMP_DIR/t44_lib" && "$ABS_GEISHA_44" check >/dev/null && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
+echo "PASS [geisha_new_lib_template]: check + test passed"
+PASS=$((PASS + 1))
+
+# wasm template: create, test, and build --target wasm32
+"$ABS_GEISHA_44" new --template=wasm "$TMP_DIR/t44_wasm" >/dev/null
+(cd "$TMP_DIR/t44_wasm" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
+if [ -f "./build/wasm_rt.o" ] && command -v node >/dev/null 2>&1; then
+    ABS_WRT_44="$(pwd)/build/wasm_rt.o"
+    (cd "$TMP_DIR/t44_wasm" && "$ABS_GEISHA_44" build --target wasm32 --runtime "$ABS_WRT_44" >/dev/null)
+    T44_WASM_OUT="$(node -e '
+        const fs = require("fs");
+        (async () => {
+            const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]), { env: {} });
+            console.log(String(instance.exports.wasm_add(19, 23)));
+        })();
+    ' "$TMP_DIR/t44_wasm/build/t44_wasm.wasm")"
+    assert_eq "geisha_new_wasm_template" "42" "$T44_WASM_OUT"
+fi
+
+# web-js template: create, test, and build --target js (+ .d.ts + web_assets)
+"$ABS_GEISHA_44" new -t web-js "$TMP_DIR/t44_webjs" >/dev/null
+(cd "$TMP_DIR/t44_webjs" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
+(cd "$TMP_DIR/t44_webjs" && "$ABS_GEISHA_44" build --target js >/dev/null)
+if [ ! -f "$TMP_DIR/t44_webjs/build/t44_webjs.mjs" ] || [ ! -f "$TMP_DIR/t44_webjs/build/t44_webjs.d.ts" ] || [ ! -f "$TMP_DIR/t44_webjs/build/index.html" ]; then
+    echo "FAIL [geisha_new_webjs_artifacts]: expected .mjs, .d.ts, and index.html in build/" >&2
+    exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+    T44_WEBJS_OUT="$(node --input-type=module -e '
+        import { greet, add } from "'"$TMP_DIR"'/t44_webjs/build/t44_webjs.mjs";
+        console.log(greet("Geisha") + "|" + String(add(20, 22)));
+    ')"
+    assert_eq "geisha_new_webjs_template" "Hello from t44_webjs, Geisha!|42" "$T44_WEBJS_OUT"
+fi
+
 echo "All $PASS end-to-end test suites passed!"

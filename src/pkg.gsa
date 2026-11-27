@@ -2252,6 +2252,268 @@ pub def cmdInit(args: List String): Result Void String = {
     }
 }
 
+def isSupportedTemplate(tmpl: String): Bool =
+    tmpl == "cli" || tmpl == "lib" || tmpl == "wasm" || tmpl == "web-js"
+
+def printTemplateList(): Void = {
+    printLn("Available project templates for `geisha new --template <name> <dir>`:");
+    printLn("  cli     Command-line application with src/main.gsa, helper module, and tests/");
+    printLn("  lib     Reusable Geisha library package with src/<name>.gsa and tests/");
+    printLn("  wasm    WebAssembly (--target wasm32) module with [target.wasm32] exports and tests/");
+    printLn("  web-js  Web / ES Module (--target js) app with .d.ts declarations, web/index.html, and tests/")
+}
+
+def scaffoldTemplate(projDir: String, pkgName: String, tmpl: String): Result Void String = {
+    let srcDir = pathJoin(projDir, "src");
+    let testsDir = pathJoin(projDir, "tests");
+    mkdirAll(srcDir)?;
+    mkdirAll(testsDir)?;
+    let mfPath = pathJoin(projDir, "geisha.toml");
+    writeFileIfMissing(pathJoin(projDir, ".gitignore"), "build/\ngeisha.local.toml\n")?;
+
+    if (tmpl == "cli") {
+        let mfContent =
+            "name = \"" + pkgName + "\"\n"
+            + "version = \"0.1.0\"\n"
+            + "entry = \"src/main.gsa\"\n\n"
+            + "[deps]\n";
+        writeFile(mfPath, mfContent)?;
+        let corePath = pathJoin(srcDir, "core.gsa");
+        writeFileIfMissing(
+            corePath,
+            "// Core application logic for " + pkgName + "\n\n"
+            + "/// Format a greeting message for `name`.\n"
+            + "pub def greet(name: String): String =\n"
+            + "    \"Hello, \" + name + \"!\"\n"
+        )?;
+        let mainPath = pathJoin(srcDir, "main.gsa");
+        writeFileIfMissing(
+            mainPath,
+            "use sys.env.{argCount, argAt}\n"
+            + "use core.greet\n\n"
+            + "def main(): Void = {\n"
+            + "    let target = if (argCount() > 1) argAt(1) else \"" + pkgName + "\";\n"
+            + "    printLn(greet(target))\n"
+            + "}\n"
+        )?;
+        let specPath = pathJoin(testsDir, "spec.gsa");
+        writeFileIfMissing(
+            specPath,
+            "use core.greet\n"
+            + "use sys.io.eprintLn\n"
+            + "use sys.proc.exit\n\n"
+            + "def main(): Void = {\n"
+            + "    if (greet(\"Geisha\") == \"Hello, Geisha!\") {\n"
+            + "        printLn(\"ok\")\n"
+            + "    } else {\n"
+            + "        eprintLn(\"greet test failed\");\n"
+            + "        exit(1)\n"
+            + "    }\n"
+            + "}\n"
+        )
+    } else if (tmpl == "lib") {
+        let mfContent =
+            "name = \"" + pkgName + "\"\n"
+            + "version = \"0.1.0\"\n\n"
+            + "[deps]\n";
+        writeFile(mfPath, mfContent)?;
+        let libPath = pathJoin(srcDir, pkgName + ".gsa");
+        writeFileIfMissing(
+            libPath,
+            "// " + pkgName + " library root module\n\n"
+            + "/// Return a friendly greeting for `name`.\n"
+            + "pub def hello(name: String): String =\n"
+            + "    \"Hello, \" + name + \"!\"\n\n"
+            + "/// Add two integers.\n"
+            + "pub def add(a: Int, b: Int): Int = a + b\n"
+        )?;
+        let specPath = pathJoin(testsDir, "spec.gsa");
+        writeFileIfMissing(
+            specPath,
+            "use " + pkgName + ".{hello, add}\n"
+            + "use sys.io.eprintLn\n"
+            + "use sys.proc.exit\n\n"
+            + "def main(): Void = {\n"
+            + "    if (hello(\"Geisha\") == \"Hello, Geisha!\" && add(20, 22) == 42) {\n"
+            + "        printLn(\"ok\")\n"
+            + "    } else {\n"
+            + "        eprintLn(\"library test failed\");\n"
+            + "        exit(1)\n"
+            + "    }\n"
+            + "}\n"
+        )
+    } else if (tmpl == "wasm") {
+        let mfContent =
+            "name = \"" + pkgName + "\"\n"
+            + "version = \"0.1.0\"\n"
+            + "entry = \"src/main.gsa\"\n\n"
+            + "[deps]\n\n"
+            + "[target.wasm32]\n"
+            + "exports = [\"wasm_add\"]\n"
+            + "opt = \"z\"\n"
+            + "strip = true\n";
+        writeFile(mfPath, mfContent)?;
+        let corePath = pathJoin(srcDir, "core.gsa");
+        writeFileIfMissing(
+            corePath,
+            "// Portable core logic for " + pkgName + " (shared by wasm32 and native tests)\n\n"
+            + "/// Add two 32-bit integers.\n"
+            + "pub def computeAdd(a: Int, b: Int): Int = a + b\n"
+        )?;
+        let mainPath = pathJoin(srcDir, "main.gsa");
+        writeFileIfMissing(
+            mainPath,
+            "use core.computeAdd\n\n"
+            + "pub extern \"wasm_add\" def wasmAdd(a: Int, b: Int): Int = computeAdd(a, b)\n\n"
+            + "def main(): Void = ()\n"
+        )?;
+        let specPath = pathJoin(testsDir, "spec.gsa");
+        writeFileIfMissing(
+            specPath,
+            "use core.computeAdd\n"
+            + "use sys.io.eprintLn\n"
+            + "use sys.proc.exit\n\n"
+            + "def main(): Void = {\n"
+            + "    if (computeAdd(19, 23) == 42) {\n"
+            + "        printLn(\"ok\")\n"
+            + "    } else {\n"
+            + "        eprintLn(\"wasm core test failed\");\n"
+            + "        exit(1)\n"
+            + "    }\n"
+            + "}\n"
+        )
+    } else {
+        // web-js
+        let webDir = pathJoin(projDir, "web");
+        mkdirAll(webDir)?;
+        let mfContent =
+            "name = \"" + pkgName + "\"\n"
+            + "version = \"0.1.0\"\n"
+            + "entry = \"src/main.gsa\"\n\n"
+            + "[deps]\n\n"
+            + "[target.js]\n"
+            + "exports = [\"greet\", \"add\"]\n"
+            + "web_assets = [\"web/index.html\"]\n"
+            + "dts = true\n"
+            + "owns_main = true\n";
+        writeFile(mfPath, mfContent)?;
+        let corePath = pathJoin(srcDir, "core.gsa");
+        writeFileIfMissing(
+            corePath,
+            "// Shared logic for " + pkgName + " (compiled to ES Module JS + .d.ts)\n\n"
+            + "/// Format a greeting message.\n"
+            + "pub def formatGreeting(name: String): String =\n"
+            + "    \"Hello from " + pkgName + ", \" + name + \"!\"\n\n"
+            + "/// Add two integers.\n"
+            + "pub def sumTwo(a: Int, b: Int): Int = a + b\n"
+        )?;
+        let mainPath = pathJoin(srcDir, "main.gsa");
+        writeFileIfMissing(
+            mainPath,
+            "use core.{formatGreeting, sumTwo}\n\n"
+            + "pub def greet(name: String): String = formatGreeting(name)\n\n"
+            + "pub def add(a: Int, b: Int): Int = sumTwo(a, b)\n\n"
+            + "def main(): Void = printLn(greet(\"Web\"))\n"
+        )?;
+        let htmlPath = pathJoin(webDir, "index.html");
+        writeFileIfMissing(
+            htmlPath,
+            "<!doctype html>\n"
+            + "<html lang=\"en\">\n"
+            + "<head>\n"
+            + "  <meta charset=\"utf-8\" />\n"
+            + "  <title>" + pkgName + "</title>\n"
+            + "</head>\n"
+            + "<body>\n"
+            + "  <pre id=\"out\">Loading...</pre>\n"
+            + "  <script type=\"module\">\n"
+            + "    import { greet, add } from \"./" + pkgName + ".mjs\";\n"
+            + "    document.getElementById(\"out\").textContent = greet(\"Geisha\") + \" (20 + 22 = \" + add(20, 22) + \")\";\n"
+            + "  </script>\n"
+            + "</body>\n"
+            + "</html>\n"
+        )?;
+        let specPath = pathJoin(testsDir, "spec.gsa");
+        writeFileIfMissing(
+            specPath,
+            "use core.{formatGreeting, sumTwo}\n"
+            + "use sys.io.eprintLn\n"
+            + "use sys.proc.exit\n\n"
+            + "def main(): Void = {\n"
+            + "    if (formatGreeting(\"Web\") == \"Hello from " + pkgName + ", Web!\" && sumTwo(20, 22) == 42) {\n"
+            + "        printLn(\"ok\")\n"
+            + "    } else {\n"
+            + "        eprintLn(\"web-js test failed\");\n"
+            + "        exit(1)\n"
+            + "    }\n"
+            + "}\n"
+        )
+    }
+}
+
+pub def cmdNew(args: List String): Result Void String = {
+    let listOnly = cellNew(false);
+    let tmplCell = cellNew("cli");
+    let targetArg: Cell (Option String) = cellNew(None);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--list-templates") {
+                    cellSet(listOnly, true);
+                    cellSet(cur, r)
+                } else if (a == "--template" || a == "-t") {
+                    match r {
+                        Cons(t, r2) -> { cellSet(tmplCell, t); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing template name after '" + a + "'")),
+                    }
+                } else if (strStartsWith(a, "--template=")) {
+                    cellSet(tmplCell, strSlice(a, 11, strLen(a)));
+                    cellSet(cur, r)
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha new': " + a))
+                } else {
+                    match cellGet(targetArg) {
+                        None -> { cellSet(targetArg, Some(a)); cellSet(cur, r) },
+                        Some(_) -> cellSet(errOpt, Some("unexpected extra argument for 'geisha new': " + a)),
+                    }
+                }
+            },
+            Nil -> (),
+        }
+    };
+
+    checkOptErr(cellGet(errOpt))?;
+
+    if (cellGet(listOnly)) {
+        printTemplateList();
+        Ok(())
+    } else {
+        let tmpl = cellGet(tmplCell);
+        if (!isSupportedTemplate(tmpl)) {
+            Err("unknown template '" + tmpl + "' (supported: cli, lib, wasm, web-js; run 'geisha new --list-templates')")
+        } else {
+            match cellGet(targetArg) {
+                None -> Err("missing project directory (usage: geisha new [--template <cli|lib|wasm|web-js>] <dir>)"),
+                Some(rawDir) -> {
+                    mkdirIfMissing(rawDir)?;
+                    let pkgName = sanitizeIdentAlias(pathBasename(absPath(rawDir)));
+                    let mfPath = pathJoin(rawDir, "geisha.toml");
+                    if (fileExists(mfPath)) {
+                        Err("geisha.toml already exists in '" + rawDir + "'")
+                    } else {
+                        scaffoldTemplate(rawDir, pkgName, tmpl)?;
+                        printLn("Created Geisha '" + tmpl + "' project '" + pkgName + "' in " + rawDir);
+                        Ok(())
+                    }
+                },
+            }
+        }
+    }
+}
+
 pub def cmdAdd(args: List String): Result Void String = {
     let projDir = match findProjectRoot(".") {
         Some(d) -> d,

@@ -21,7 +21,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha fmt [--check] [--write] [--stdout] [paths...]` — format `.gsa` files in-place (defaults to project/cwd; `--check` exits non-zero if any file needs formatting; `--stdout` prints formatted output)
    - `geisha build [--target native|wasm32|js|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3|-Os|-Oz|--opt[=]<lvl>|--dev|--release] [--strip] [--slim-runtime] [--no-dts] [--single-cgu] [--no-cache] [-o out]` (splits multi-module programs into per-module LLVM CGUs compiled in parallel with content-addressed `.o` caching in `build/cache/cgu/` and `build/cache/native/`; override concurrency via `GEISHA_JOBS`)
    - **Source-level debugging (`lldb` / `gdb` / VS Code CodeLLDB)**: compile with `-g` / `--debug` (defaults to `-O0`, disables tail-call optimization, emits DWARF v4 line info + `@llvm.dbg.declare` local variables, and runs `dsymutil` on macOS). Load `~/.geisha/lib/geisha_lldb.py` in LLDB for formatted `String`, `Vec`, `Array`, `List`, `Option`, and boxed ADT inspection (see `docs/DEBUGGING.md`).
-   - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
+   - `geisha init [--lib] [dir]` / `geisha new [--template <cli|lib|wasm|web-js>] <dir>` (`--list-templates`) / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
 5. **Editor / IDE integration (LSP)**:
    - `geisha lsp` — start the built-in JSON-RPC 2.0 Language Server over stdio (diagnostics, hover with inferred types & `///` docs, go-to-definition, document symbols, completion)
 

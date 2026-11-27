@@ -36,7 +36,7 @@ use pkg.{
     NativeUnit, MkNativeUnit, TargetCfg, MkTargetCfg, AppleBundleCfg, MkAppleBundleCfg,
     CompileCallbacks, MkCompileCallbacks,
     shellQuote, geishaHomeDir, findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, resolveDefaultEntryFile,
-    cmdInit, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
+    cmdInit, cmdNew, cmdAdd, cmdRemove, cmdFetch, cmdBuildProject, cmdRun, cmdTest
 }
 
 extern "gs_sys_host_os" def c_host_os(): Ptr
@@ -108,6 +108,7 @@ data CliOpts {
 
 def isSubcommandWord(w: String): Bool =
     w == "init"
+    || w == "new"
     || w == "add"
     || w == "remove"
     || w == "fetch"
@@ -223,7 +224,7 @@ def parseCliArgs(): Result CliOpts String = {
                     cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
                     cellSet(i, cellGet(i) + 1)
                 }
-            } else if (sub == "init" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "fmt" || sub == "guide" || sub == "lsp") {
+            } else if (sub == "init" || sub == "new" || sub == "add" || sub == "remove" || sub == "fetch" || sub == "update" || sub == "doc" || sub == "fmt" || sub == "guide" || sub == "lsp") {
                 if (a == "-h" || a == "--help") {
                     cellSet(showHelp, true)
                 } else {
@@ -3061,6 +3062,7 @@ def printUsage(): Void = {
     printLn("");
     printLn("Package & Project Commands (reads geisha.toml):");
     printLn("  geisha init [--lib] [dir]      Initialize a new Geisha package or library");
+    printLn("  geisha new [--template <t>] <dir>  Create a project from a built-in template (cli|lib|wasm|web-js; --list-templates)");
     printLn("  geisha add <pkg|git-url>       Add dependency (MVS tag/rev + geisha.lock)");
     printLn("         [--version <v>] [--rev <r>] [--path <dir>] [--subdir <s>] [--as <name>]");
     printLn("  geisha remove <alias>          Remove dependency from geisha.toml");
@@ -3120,6 +3122,7 @@ def runDriver(): Result Int String = {
         let cbs = makeCompileCallbacks(opts.optDebug, effOptLevel, opts.optSingleCgu, opts.optNoCache);
         match opts.optSubcmd {
             Some("init") -> { cmdInit(opts.optSubArgs)?; Ok(0) },
+            Some("new") -> { cmdNew(opts.optSubArgs)?; Ok(0) },
             Some("add") -> { cmdAdd(opts.optSubArgs)?; Ok(0) },
             Some("remove") -> { cmdRemove(opts.optSubArgs)?; Ok(0) },
             Some("fetch") -> { cmdFetch(false, opts.optSubArgs)?; Ok(0) },
