@@ -52,7 +52,7 @@ else
   STAGE0_DEP :=
 endif
 
-.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle check-docs stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test verify-core clean
+.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle check-docs stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test test-sanitizers verify-core clean
 
 all: stage2
 
@@ -150,6 +150,9 @@ install: $(BUILD_DIR)/geisha3 $(RUNTIME_LIB) $(WASM_RT_OBJ)
 
 test: check-docs $(BUILD_DIR)/geisha2
 	CC="$(CC)" GEISHA_BIN=$(BUILD_DIR)/geisha2 GEISHA_RUNTIME=$(RUNTIME_LIB) sh tests/run_tests.sh
+
+test-sanitizers: $(BUILD_DIR)/geisha2
+	CC="$(CC)" GEISHA_BIN=$(BUILD_DIR)/geisha2 sh tests/run_sanitizers.sh
 
 verify-core: $(BUILD_DIR)/geisha2
 	cd formal && lake build geisha-check

@@ -1630,8 +1630,15 @@ def tryEmitIntrinsic(
             None -> false,
         };
         let cellPtr =
-            if (useStack) emitEntryAlloca(fctx, elemLlvm)
-            else {
+            if (useStack) {
+                if (!mctx.mcIsWasm && !isNoscanElemType(elemTy)) {
+                    let boxSlot = emitEntryAlloca(fctx, "{ i64, " + elemLlvm + " }");
+                    emitStore(fctx, "i64", "0", boxSlot);
+                    emitGep(fctx, "i8", boxSlot, "8")
+                } else {
+                    emitEntryAlloca(fctx, elemLlvm)
+                }
+            } else {
                 let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
                 let byteSz = if (rawSz < 8) 8 else rawSz;
                 emitGcAllocForType(mctx, fctx, byteSz, elemTy)

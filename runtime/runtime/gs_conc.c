@@ -415,8 +415,7 @@ static void execute_task(gs_task_t *t)
 static void *pool_worker_main(void *arg)
 {
     (void)arg;
-    volatile uintptr_t stack_anchor = 0;
-    gc_thread_attach((void *)&stack_anchor);
+    gc_thread_attach(__builtin_frame_address(0));
 
     pthread_mutex_lock(&_pool_mu);
     for (;;) {
@@ -616,8 +615,7 @@ typedef struct {
 static void *actor_thread_main(void *arg)
 {
     gs_actor_t *a = (gs_actor_t *)arg;
-    volatile uintptr_t stack_anchor = 0;
-    gc_thread_attach((void *)&stack_anchor);
+    gc_thread_attach(__builtin_frame_address(0));
 
     /* Initialize state `s` IN-PLACE on the actor's dedicated OS thread! */
     void *st_box = a->init_runner(a->init_cls);
@@ -877,9 +875,8 @@ typedef struct {
 
 static void *tabulate_worker_entry(void *arg_void)
 {
-    volatile uintptr_t stack_anchor = 0;
     gs_tabulate_arg_t *arg = (gs_tabulate_arg_t *)arg_void;
-    gc_thread_attach((void *)&stack_anchor);
+    gc_thread_attach(__builtin_frame_address(0));
     arg->chunk_fn(arg->arr_ptr, arg->lo, arg->hi, arg->cls_ptr);
     gc_thread_detach();
     return NULL;

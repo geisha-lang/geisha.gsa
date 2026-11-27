@@ -135,3 +135,23 @@ jobs:
           print("Verified zero sorry / admit / custom axiom across all Lean files.")
           '
           make verify-core
+
+  sanitizers:
+    name: Sanitizers (ASan+UBSan & TSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang & LLVM sanitizer runtimes
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
+          sudo apt-get update
+          sudo apt-get install -y clang lld xz-utils
+
+      - name: Build Stage-2 Geisha compiler
+        run: make runtime stage1 stage2
+
+      - name: Run ASan + UBSan & TSan runtime + generated-IR stress suites
+        run: make test-sanitizers
+

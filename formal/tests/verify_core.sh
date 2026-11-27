@@ -226,3 +226,75 @@ if "$TMP_DIR/div_zero" 2>"$TMP_DIR/div_zero.err"; then
     exit 1
 fi
 echo "PASS [div_by_zero_trap]: $(cat "$TMP_DIR/div_zero.err")"
+
+# 9. Full-spectrum Core translation validation: Int64, Float, Float32, Char, MutArray,
+#    Arena/ForeignPtr/ScopedPtr FFI, pattern guards, global Cell, while+`?`, and shadowed param Cell
+cat > "$TMP_DIR/full_ext.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+
+def gCounter: Cell Int = cellNew(10)
+
+def bumpGlobalAndShadow(x: Cell Int, n: Int): Int = {
+    cellSet(gCounter, cellGet(gCounter) + n);
+    let x = cellNew(n * 2);
+    let i = cellNew(0);
+    while (cellGet(i) < 3) {
+        let loopCell = cellNew(cellGet(i) + 1);
+        cellSet(x, cellGet(x) + cellGet(loopCell));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(x)
+}
+
+def scanWhileTry(xs: List Int): Result Int String = {
+    let acc = cellNew(0);
+    let cur = cellNew(xs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(v, rest) if (v >= 0) -> {
+                cellSet(acc, cellGet(acc) + v);
+                cellSet(cur, rest)
+            },
+            Cons(_, _) -> {
+                let _ = Err("neg")?;
+                ()
+            },
+            Nil -> (),
+        }
+    };
+    Ok(cellGet(acc))
+}
+
+def main(): Void = {
+    let i64v = (intToI64(7) << 4) + intToI64(3);
+    let fv = 3.5 * 2.0 - 1.0;
+    let f32v = floatToF32(fv) + floatToF32(1.5);
+    let ch = 'G';
+    let arr = arrayNew(4, i64ToInt(i64v));
+    arraySet(arr, 1, floatToInt(fv) + f32ToInt(f32v));
+    let arenaByte = withArena((a) -> {
+        let p = arenaAlloc(a, intToI64(16));
+        scopedPtrSetByte(p, 0, charToInt(ch));
+        scopedPtrByteAt(p, 0)
+    });
+    let pBox = cellNew(1);
+    let s1 = bumpGlobalAndShadow(pBox, arenaByte - 70);
+    let s2 = match scanWhileTry([1, 2, 3]) {
+        Ok(v) -> v,
+        Err(_) -> 0,
+    };
+    let _ = arrayGet(arr, 1) + s1 + s2 + cellGet(gCounter);
+    ()
+}
+EOF
+"$GEISHA_BIN" --dump-core "$TMP_DIR/full_ext.gscore" -o "$TMP_DIR/full_ext" "$TMP_DIR/full_ext.gsa"
+"$TMP_DIR/full_ext"
+"$CHECKER_BIN" "$TMP_DIR/full_ext.gscore"
+
+# 10. Full Self-Hosting Compiler Translation Validation:
+#     Dump and mechanically verify the entire ~20,000-line self-hosted Geisha compiler (`src/geisha.gsa`)!
+"$GEISHA_BIN" --src-root . --dump-core "$TMP_DIR/compiler.gscore" -e -o "$TMP_DIR/compiler.ll" src/geisha.gsa
+"$CHECKER_BIN" "$TMP_DIR/compiler.gscore"
+echo "PASS [self_hosted_compiler_verified]: entire src/geisha.gsa compiler verified by Lean 4 geisha-check"
+

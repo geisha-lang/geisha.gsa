@@ -165,12 +165,23 @@ mutual
 theorem TySub.refl : (t : Ty) → TySub t t
   | .void => .void
   | .int => .int
+  | .int64 => .int64
+  | .float => .float
+  | .float32 => .float32
   | .bool => .bool
+  | .char => .char
   | .str => .str
+  | .ptr => .ptr
+  | .scopedPtr => .scopedPtr
+  | .arena => .arena
+  | .foreignPtr => .foreignPtr
+  | .atomicInt => .atomicInt
   | .tuple ts => .tuple (TyListSub.refl ts)
   | .fn m ps r => .fn (.refl m) (TyListSub.refl ps) (TySub.refl r)
   | .adt n => .adt n
   | .cell t => .cell t
+  | .mutArray t => .mutArray t
+  | .immArray t => .immArray (TySub.refl t)
   | .task t => .task (TySub.refl t)
   | .mvar t => .mvar t
   | .chan t => .chan t
@@ -187,8 +198,17 @@ theorem TySub.trans {t1 t2 t3 : Ty} (h12 : TySub t1 t2) (h23 : TySub t2 t3) :
   cases t2 with
   | void => cases h12; cases h23; exact .void
   | int => cases h12; cases h23; exact .int
+  | int64 => cases h12; cases h23; exact .int64
+  | float => cases h12; cases h23; exact .float
+  | float32 => cases h12; cases h23; exact .float32
   | bool => cases h12; cases h23; exact .bool
+  | char => cases h12; cases h23; exact .char
   | str => cases h12; cases h23; exact .str
+  | ptr => cases h12; cases h23; exact .ptr
+  | scopedPtr => cases h12; cases h23; exact .scopedPtr
+  | arena => cases h12; cases h23; exact .arena
+  | foreignPtr => cases h12; cases h23; exact .foreignPtr
+  | atomicInt => cases h12; cases h23; exact .atomicInt
   | tuple ts2 =>
     cases h12 with
     | tuple hs12 =>
@@ -202,6 +222,12 @@ theorem TySub.trans {t1 t2 t3 : Ty} (h12 : TySub t1 t2) (h23 : TySub t2 t3) :
         exact .fn (ModeSub.trans hm12 hm23) (TyListSub.trans hps23 hps12) (TySub.trans hr12 hr23)
   | adt n => cases h12; cases h23; exact .adt n
   | cell t => cases h12; cases h23; exact .cell t
+  | mutArray t => cases h12; cases h23; exact .mutArray t
+  | immArray u2 =>
+    cases h12 with
+    | immArray hs12 =>
+      cases h23 with
+      | immArray hs23 => exact .immArray (TySub.trans hs12 hs23)
   | task u2 =>
     cases h12 with
     | task hs12 =>
@@ -340,8 +366,17 @@ theorem tySendIn_of_tySub {S : Ident → Prop} {τ0 τ : Ty}
   cases hsub with
   | void => exact .void
   | int => exact .int
+  | int64 => exact .int64
+  | float => exact .float
+  | float32 => exact .float32
   | bool => exact .bool
+  | char => exact .char
   | str => exact .str
+  | ptr => cases hsend
+  | scopedPtr => cases hsend
+  | arena => cases hsend
+  | foreignPtr => cases hsend
+  | atomicInt => exact .atomicInt
   | tuple hts =>
     cases hsend with
     | tuple hls => exact .tuple (tyListSendIn_of_tyListSub hts hls)
@@ -352,6 +387,10 @@ theorem tySendIn_of_tySub {S : Ident → Prop} {τ0 τ : Ty}
       | refl => exact .fnShared _ _
   | adt _ => exact hsend
   | cell _ => cases hsend
+  | mutArray _ => cases hsend
+  | immArray ht =>
+    cases hsend with
+    | immArray hs => exact .immArray (tySendIn_of_tySub ht hs)
   | task ht =>
     cases hsend with
     | task hs => exact .task (tySendIn_of_tySub ht hs)
@@ -1586,6 +1625,54 @@ theorem canonical_str {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {
   | tuple _ => cases ht
   | makeData _ _ _ => cases ht
 
+theorem canonical_int64 {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .int64) (hv : IsValue v) :
+    ∃ n : Int64, v = .lit (.int64 n) := by
+  cases hv with
+  | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_float {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .float) (hv : IsValue v) :
+    ∃ bits : UInt64, v = .lit (.floatBits bits) := by
+  cases hv with
+  | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_float32 {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .float32) (hv : IsValue v) :
+    ∃ bits : UInt32, v = .lit (.float32Bits bits) := by
+  cases hv with
+  | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
+theorem canonical_char {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
+    (ht : HasType Δ Φ Ψ Θ emptyCtx v .char) (hv : IsValue v) :
+    ∃ c : UInt32, v = .lit (.char c) := by
+  cases hv with
+  | lit l => cases ht with | lit hl => cases hl; exact ⟨_, rfl⟩
+  | loc _ => cases ht
+  | taskRef _ => cases ht
+  | syncRef _ _ => cases ht with | syncRef hsr => cases hsr
+  | lam _ _ _ _ => cases ht
+  | tuple _ => cases ht
+  | makeData _ _ _ => cases ht
+
 theorem canonical_fn {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy} {v : Expr}
     {m : Mode} {paramTys : List Ty} {ret : Ty}
     (ht : HasType Δ Φ Ψ Θ emptyCtx v (.fn m paramTys ret)) (hv : IsValue v) :
@@ -1708,6 +1795,99 @@ theorem evalBinOp_sound {op : BinOp} {l1 l2 l' : Lit} {τ1 τ2 τr : Ty}
     | (subst he; constructor)
     | (split at he <;> simp at he; subst he; constructor)
 
+theorem unOp_eval_progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {pool : ConcPool} {σ : Store} {op : UnOp} {v1 : Expr} {τ1 τr : Ty}
+    (hop : UnOpHasType op τ1 τr)
+    (ht1 : HasType Δ Φ Ψ Θ emptyCtx v1 τ1) (hv1 : IsValue v1) :
+    ∃ e' σ' eff, Step Δ Φ pool (.un op v1) σ e' σ' eff := by
+  cases hop with
+  | not =>
+    rcases canonical_bool ht1 hv1 with ⟨b, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .bool (!b)) rfl⟩
+  | neg =>
+    rcases canonical_int ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int (-n)) rfl⟩
+  | bitNot =>
+    rcases canonical_int ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int (~~~n)) rfl⟩
+  | neg64 =>
+    rcases canonical_int64 ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int64 (-n)) rfl⟩
+  | bitNot64 =>
+    rcases canonical_int64 ht1 hv1 with ⟨n, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .int64 (~~~n)) rfl⟩
+  | negFloat =>
+    rcases canonical_float ht1 hv1 with ⟨bits, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .floatBits (-(Float.ofBits bits)).toBits) rfl⟩
+  | negFloat32 =>
+    rcases canonical_float32 ht1 hv1 with ⟨bits, rfl⟩
+    exact ⟨_, σ, .none, .unVal (l' := .float32Bits (-(Float32.ofBits bits)).toBits) rfl⟩
+
+theorem binOp_eval_progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
+    {pool : ConcPool} {σ : Store} {op : BinOp} {v1 v2 : Expr} {τ1 τ2 τr : Ty}
+    (hand : op ≠ .and) (hor : op ≠ .or)
+    (hop : BinOpHasType op τ1 τ2 τr)
+    (ht1 : HasType Δ Φ Ψ Θ emptyCtx v1 τ1) (hv1 : IsValue v1)
+    (ht2 : HasType Δ Φ Ψ Θ emptyCtx v2 τ2) (hv2 : IsValue v2) :
+    ∃ e' σ' eff, Step Δ Φ pool (.bin op v1 v2) σ e' σ' eff := by
+  cases hop with
+  | and => exact False.elim (hand rfl)
+  | or => exact False.elim (hor rfl)
+  | div =>
+    rcases canonical_int ht1 hv1 with ⟨a, rfl⟩
+    rcases canonical_int ht2 hv2 with ⟨b, rfl⟩
+    by_cases hb : (b == 0) = true
+    · exact ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩
+    · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+      exact ⟨_, σ, .none, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩
+  | rem =>
+    rcases canonical_int ht1 hv1 with ⟨a, rfl⟩
+    rcases canonical_int ht2 hv2 with ⟨b, rfl⟩
+    by_cases hb : (b == 0) = true
+    · exact ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩
+    · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+      exact ⟨_, σ, .none, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩
+  | div64 =>
+    rcases canonical_int64 ht1 hv1 with ⟨a, rfl⟩
+    rcases canonical_int64 ht2 hv2 with ⟨b, rfl⟩
+    by_cases hb : (b == 0) = true
+    · exact ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩
+    · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+      exact ⟨_, σ, .none, .binVal (l' := .int64 (a / b)) (by simp [evalBinOp, hb'])⟩
+  | rem64 =>
+    rcases canonical_int64 ht1 hv1 with ⟨a, rfl⟩
+    rcases canonical_int64 ht2 hv2 with ⟨b, rfl⟩
+    by_cases hb : (b == 0) = true
+    · exact ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩
+    · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
+      exact ⟨_, σ, .none, .binVal (l' := .int64 (a % b)) (by simp [evalBinOp, hb'])⟩
+  | _ =>
+    first
+    | (rcases canonical_int ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_int ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_int64 ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_int64 ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_int64 ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_int ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_float ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_float ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_float32 ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_float32 ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_bool ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_bool ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_char ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_char ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+    | (rcases canonical_str ht1 hv1 with ⟨a, rfl⟩
+       rcases canonical_str ht2 hv2 with ⟨b, rfl⟩
+       exact ⟨_, σ, .none, .binVal (l' := _) rfl⟩)
+
 /-! ## Progress Theorem -/
 
 mutual
@@ -1761,71 +1941,33 @@ theorem progress {Δ : AdtEnv} {Φ : FunEnv} {Ψ : StoreTy} {Θ : TaskTy}
     · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .applyDirTrap htrap⟩)
     · exact Or.inr (Or.inl (.applyDirArgs hblk))
     · exact Or.inr (Or.inr ⟨_, σ', eff, .applyDirArgs hsargs⟩)
-  | bin hop h1 h2 =>
+  | @bin _ op e1 e2 _ _ _ hop h1 h2 =>
     rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk1 | ⟨e1', σ', eff, hs1⟩
-    · cases hop with
-      | and =>
+    · by_cases hand : op = .and
+      · subst hand
+        cases hop
         rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
         cases b
         · exact Or.inr (Or.inr ⟨_, σ, .none, .binAndFalse⟩)
         · exact Or.inr (Or.inr ⟨_, σ, .none, .binAndTrue⟩)
-      | or =>
-        rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
-        cases b
-        · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrFalse⟩)
-        · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrTrue⟩)
-      | div =>
-        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
-        · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-          rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-          by_cases hb : (b == 0) = true
-          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩)
-          · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-            exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := .int (a / b)) (by simp [evalBinOp, hb'])⟩)
-        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
-        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
-      | rem =>
-        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
-        · rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-          rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-          by_cases hb : (b == 0) = true
-          · exact Or.inr (Or.inr ⟨.trap .divByZero, σ, .none, .binTrap (by simp [evalBinOp, hb])⟩)
-          · have hb' : (b == 0) = false := Bool.eq_false_iff.mpr hb
-            exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := .int (a % b)) (by simp [evalBinOp, hb'])⟩)
-        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
-        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
-      | _ =>
-        rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
-        · first
-          | (rcases canonical_int h1 hv1 with ⟨a, rfl⟩
-             rcases canonical_int h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
-          | (rcases canonical_bool h1 hv1 with ⟨a, rfl⟩
-             rcases canonical_bool h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
-          | (rcases canonical_str h1 hv1 with ⟨a, rfl⟩
-             rcases canonical_str h2 hv2 with ⟨b, rfl⟩
-             exact Or.inr (Or.inr ⟨_, σ, .none, .binVal (l' := _) rfl⟩))
-        · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap (by decide) (by decide) hv1⟩)
-        · exact Or.inr (Or.inl (.binRight (by decide) (by decide) hv1 hblk2))
-        · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight (by decide) (by decide) hv1 hs2⟩)
+      · by_cases hor : op = .or
+        · subst hor
+          cases hop
+          rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
+          cases b
+          · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrFalse⟩)
+          · exact Or.inr (Or.inr ⟨_, σ, .none, .binOrTrue⟩)
+        · rcases progress hΦ h2 hσ hpool with (hv2 | ⟨t, rfl⟩) | hblk2 | ⟨e2', σ', eff, hs2⟩
+          · exact Or.inr (Or.inr (binOp_eval_progress hand hor hop h1 hv1 h2 hv2))
+          · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binRightTrap hand hor hv1⟩)
+          · exact Or.inr (Or.inl (.binRight hand hor hv1 hblk2))
+          · exact Or.inr (Or.inr ⟨_, σ', eff, .binRight hand hor hv1 hs2⟩)
     · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .binLeftTrap⟩)
     · exact Or.inr (Or.inl (.binLeft hblk1))
     · exact Or.inr (Or.inr ⟨_, σ', eff, .binLeft hs1⟩)
   | un hop h1 =>
     rcases progress hΦ h1 hσ hpool with (hv1 | ⟨t, rfl⟩) | hblk | ⟨e1', σ', eff, hs1⟩
-    · cases hop with
-      | not =>
-        rcases canonical_bool h1 hv1 with ⟨b, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .bool (!b)) rfl⟩)
-      | neg =>
-        rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .int (-n)) rfl⟩)
-      | bitNot =>
-        rcases canonical_int h1 hv1 with ⟨n, rfl⟩
-        exact Or.inr (Or.inr ⟨_, σ, .none, .unVal (l' := .int (~~~n)) rfl⟩)
+    · exact Or.inr (Or.inr (unOp_eval_progress hop h1 hv1))
     · exact Or.inr (Or.inr ⟨.trap t, σ, .none, .unTrap⟩)
     · exact Or.inr (Or.inl (.un hblk))
     · exact Or.inr (Or.inr ⟨_, σ', eff, .unStep hs1⟩)

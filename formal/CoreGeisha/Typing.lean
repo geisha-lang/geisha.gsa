@@ -76,8 +76,17 @@ mutual
 inductive TySub : Ty → Ty → Prop where
   | void : TySub .void .void
   | int : TySub .int .int
+  | int64 : TySub .int64 .int64
+  | float : TySub .float .float
+  | float32 : TySub .float32 .float32
   | bool : TySub .bool .bool
+  | char : TySub .char .char
   | str : TySub .str .str
+  | ptr : TySub .ptr .ptr
+  | scopedPtr : TySub .scopedPtr .scopedPtr
+  | arena : TySub .arena .arena
+  | foreignPtr : TySub .foreignPtr .foreignPtr
+  | atomicInt : TySub .atomicInt .atomicInt
   | tuple {ts1 ts2 : List Ty} : TyListSub ts1 ts2 → TySub (.tuple ts1) (.tuple ts2)
   | fn {m1 m2 : Mode} {ps1 ps2 : List Ty} {r1 r2 : Ty} :
       ModeSub m1 m2 →
@@ -86,6 +95,8 @@ inductive TySub : Ty → Ty → Prop where
       TySub (.fn m1 ps1 r1) (.fn m2 ps2 r2)
   | adt (n : Ident) : TySub (.adt n) (.adt n)
   | cell (t : Ty) : TySub (.cell t) (.cell t)
+  | mutArray (t : Ty) : TySub (.mutArray t) (.mutArray t)
+  | immArray {t1 t2 : Ty} : TySub t1 t2 → TySub (.immArray t1) (.immArray t2)
   | task {t1 t2 : Ty} : TySub t1 t2 → TySub (.task t1) (.task t2)
   | mvar (t : Ty) : TySub (.mvar t) (.mvar t)
   | chan (t : Ty) : TySub (.chan t) (.chan t)
@@ -102,19 +113,26 @@ end
 /-! ## Coinductive `IsSend` Predicate (Supporting Recursive ADTs & `!Send`-State Actors) -/
 
 /- One-step `Send` membership relative to a candidate set `S` of `Send` ADTs.
-   - `Ty.cell _` and `Ty.fn .local _ _` have NO constructors (`!Send`).
-   - `Ty.mvar t` and `Ty.chan t` require `TySendIn S t`.
+   - `Ty.cell _`, `Ty.mutArray _`, `Ty.ptr`, `Ty.scopedPtr`, `Ty.arena`, `Ty.foreignPtr`,
+     and `Ty.fn .local _ _` have NO constructors (`!Send`, matching `src/infer.gsa`).
+   - `Ty.mvar t`, `Ty.chan t`, `Ty.task t`, and `Ty.immArray t` require `TySendIn S t`.
    - `Ty.actor s` is unconditionally `Send` even when `s` is `!Send` (e.g. `Cell`!),
      because `s` never leaves the actor's dedicated sequential thread. -/
 mutual
 inductive TySendIn (S : Ident → Prop) : Ty → Prop where
   | void : TySendIn S .void
   | int : TySendIn S .int
+  | int64 : TySendIn S .int64
+  | float : TySendIn S .float
+  | float32 : TySendIn S .float32
   | bool : TySendIn S .bool
+  | char : TySendIn S .char
   | str : TySendIn S .str
+  | atomicInt : TySendIn S .atomicInt
   | tuple {ts : List Ty} : TyListSendIn S ts → TySendIn S (.tuple ts)
   | fnShared (ps : List Ty) (ret : Ty) : TySendIn S (.fn .shared ps ret)
   | adt {name : Ident} : S name → TySendIn S (.adt name)
+  | immArray {t : Ty} : TySendIn S t → TySendIn S (.immArray t)
   | task {t : Ty} : TySendIn S t → TySendIn S (.task t)
   | mvar {t : Ty} : TySendIn S t → TySendIn S (.mvar t)
   | chan {t : Ty} : TySendIn S t → TySendIn S (.chan t)
@@ -144,7 +162,11 @@ def IsSend (Δ : AdtEnv) (τ : Ty) : Prop :=
 /-- Literal typing judgment. -/
 inductive LitHasType : Lit → Ty → Prop where
   | int (n : Int32) : LitHasType (.int n) .int
+  | int64 (n : Int64) : LitHasType (.int64 n) .int64
+  | floatBits (bits : UInt64) : LitHasType (.floatBits bits) .float
+  | float32Bits (bits : UInt32) : LitHasType (.float32Bits bits) .float32
   | bool (b : Bool) : LitHasType (.bool b) .bool
+  | char (c : UInt32) : LitHasType (.char c) .char
   | str (s : String) : LitHasType (.str s) .str
   | unit : LitHasType .unit .void
 
@@ -153,6 +175,10 @@ inductive UnOpHasType : UnOp → Ty → Ty → Prop where
   | not : UnOpHasType .not .bool .bool
   | neg : UnOpHasType .neg .int .int
   | bitNot : UnOpHasType .bitNot .int .int
+  | neg64 : UnOpHasType .neg64 .int64 .int64
+  | bitNot64 : UnOpHasType .bitNot64 .int64 .int64
+  | negFloat : UnOpHasType .negFloat .float .float
+  | negFloat32 : UnOpHasType .negFloat32 .float32 .float32
 
 /-- Binary operator typing judgment. -/
 inductive BinOpHasType : BinOp → Ty → Ty → Ty → Prop where
@@ -164,14 +190,69 @@ inductive BinOpHasType : BinOp → Ty → Ty → Ty → Prop where
   | bitAnd : BinOpHasType .bitAnd .int .int .int
   | bitOr : BinOpHasType .bitOr .int .int .int
   | bitXor : BinOpHasType .bitXor .int .int .int
+  | shlInt : BinOpHasType .shlInt .int .int .int
+  | shrInt : BinOpHasType .shrInt .int .int .int
+  | ushrInt : BinOpHasType .ushrInt .int .int .int
   | eqInt : BinOpHasType .eqInt .int .int .bool
   | neInt : BinOpHasType .neInt .int .int .bool
   | ltInt : BinOpHasType .ltInt .int .int .bool
   | leInt : BinOpHasType .leInt .int .int .bool
   | gtInt : BinOpHasType .gtInt .int .int .bool
   | geInt : BinOpHasType .geInt .int .int .bool
+  | add64 : BinOpHasType .add64 .int64 .int64 .int64
+  | sub64 : BinOpHasType .sub64 .int64 .int64 .int64
+  | mul64 : BinOpHasType .mul64 .int64 .int64 .int64
+  | div64 : BinOpHasType .div64 .int64 .int64 .int64
+  | rem64 : BinOpHasType .rem64 .int64 .int64 .int64
+  | bitAnd64 : BinOpHasType .bitAnd64 .int64 .int64 .int64
+  | bitOr64 : BinOpHasType .bitOr64 .int64 .int64 .int64
+  | bitXor64 : BinOpHasType .bitXor64 .int64 .int64 .int64
+  | shl64 : BinOpHasType .shl64 .int64 .int .int64
+  | shr64 : BinOpHasType .shr64 .int64 .int .int64
+  | ushr64 : BinOpHasType .ushr64 .int64 .int .int64
+  | eq64 : BinOpHasType .eq64 .int64 .int64 .bool
+  | ne64 : BinOpHasType .ne64 .int64 .int64 .bool
+  | lt64 : BinOpHasType .lt64 .int64 .int64 .bool
+  | le64 : BinOpHasType .le64 .int64 .int64 .bool
+  | gt64 : BinOpHasType .gt64 .int64 .int64 .bool
+  | ge64 : BinOpHasType .ge64 .int64 .int64 .bool
+  | addFloat : BinOpHasType .addFloat .float .float .float
+  | subFloat : BinOpHasType .subFloat .float .float .float
+  | mulFloat : BinOpHasType .mulFloat .float .float .float
+  | divFloat : BinOpHasType .divFloat .float .float .float
+  | eqFloat : BinOpHasType .eqFloat .float .float .bool
+  | neFloat : BinOpHasType .neFloat .float .float .bool
+  | ltFloat : BinOpHasType .ltFloat .float .float .bool
+  | leFloat : BinOpHasType .leFloat .float .float .bool
+  | gtFloat : BinOpHasType .gtFloat .float .float .bool
+  | geFloat : BinOpHasType .geFloat .float .float .bool
+  | addF32 : BinOpHasType .addF32 .float32 .float32 .float32
+  | subF32 : BinOpHasType .subF32 .float32 .float32 .float32
+  | mulF32 : BinOpHasType .mulF32 .float32 .float32 .float32
+  | divF32 : BinOpHasType .divF32 .float32 .float32 .float32
+  | eqF32 : BinOpHasType .eqF32 .float32 .float32 .bool
+  | neF32 : BinOpHasType .neF32 .float32 .float32 .bool
+  | ltF32 : BinOpHasType .ltF32 .float32 .float32 .bool
+  | leF32 : BinOpHasType .leF32 .float32 .float32 .bool
+  | gtF32 : BinOpHasType .gtF32 .float32 .float32 .bool
+  | geF32 : BinOpHasType .geF32 .float32 .float32 .bool
   | eqBool : BinOpHasType .eqBool .bool .bool .bool
+  | neBool : BinOpHasType .neBool .bool .bool .bool
+  | bitAndBool : BinOpHasType .bitAndBool .bool .bool .bool
+  | bitOrBool : BinOpHasType .bitOrBool .bool .bool .bool
+  | bitXorBool : BinOpHasType .bitXorBool .bool .bool .bool
+  | eqChar : BinOpHasType .eqChar .char .char .bool
+  | neChar : BinOpHasType .neChar .char .char .bool
+  | ltChar : BinOpHasType .ltChar .char .char .bool
+  | leChar : BinOpHasType .leChar .char .char .bool
+  | gtChar : BinOpHasType .gtChar .char .char .bool
+  | geChar : BinOpHasType .geChar .char .char .bool
   | eqStr : BinOpHasType .eqStr .str .str .bool
+  | neStr : BinOpHasType .neStr .str .str .bool
+  | ltStr : BinOpHasType .ltStr .str .str .bool
+  | leStr : BinOpHasType .leStr .str .str .bool
+  | gtStr : BinOpHasType .gtStr .str .str .bool
+  | geStr : BinOpHasType .geStr .str .str .bool
   | strConcat : BinOpHasType .strConcat .str .str .str
   | and : BinOpHasType .and .bool .bool .bool
   | or : BinOpHasType .or .bool .bool .bool
