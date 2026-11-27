@@ -1,9 +1,10 @@
 #!/bin/sh
-# End-to-end Verified Translation Validation across all 4 Formal Pillars:
+# End-to-end Verified Translation Validation across all Formal Pillars & Guardrails:
 # 1. Maranget Pattern Match Exhaustiveness (eliminating Trap.matchFailure)
 # 2. Full Concurrency (Task + MVar + Chan + !Send-state Actor) & Data-Race Freedom
-# 3. Escape Analysis & Stack-Frame Region Memory Safety ((stack-allocs ...))
-# 4. Exact 40-bit GC Pointer Masks & Arithmetic/Trap Conformance
+# 3. Unfiltered Escape Analysis & Stack-Frame Region Memory Safety ((stack-allocs ...))
+# 4. Live Codegen 40-bit GC Pointer Masks ((gc-masks ...)) & Differential Small-Step Evaluation (--eval)
+# 5. Full E2E Language-Surface Suite + ~20,000-line Self-Hosted Compiler Translation Validation
 set -eu
 
 GEISHA_BIN="${GEISHA_BIN:-./build/geisha2}"
@@ -13,6 +14,17 @@ export GEISHA_RUNTIME
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/geisha_formal_verify.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
+
+# 0. Static anti-bypass guardrail: core_dump.gsa MUST NOT silently pre-filter escFnStackVars
+if grep -qE 'checkStackVarInCoreDump|onlyDirectCellOpsDump' src/core_dump.gsa; then
+    echo "FAIL [no_silent_escape_filter]: src/core_dump.gsa must emit raw escFnStackVars without pre-filtering!" >&2
+    exit 1
+fi
+if ! grep -q 'isKnownCoreIntrinsic' src/core_dump.gsa; then
+    echo "FAIL [fail_closed_intrinsic_allowlist]: src/core_dump.gsa must enforce isKnownCoreIntrinsic allowlist!" >&2
+    exit 1
+fi
+echo "PASS [anti_bypass_guardrails]: raw unfiltered stack-allocs & fail-closed intrinsic allowlist enforced"
 
 # 1. Rich Core Geisha program (recursive ADT, generic Option, Concept, closure, stack-promoted while+Cell, exhaustive match)
 cat > "$TMP_DIR/demo.gsa" << 'EOF'
@@ -74,6 +86,10 @@ if ! grep -q '(fn-stack "sumTo" "acc" "i")' "$TMP_DIR/demo.gscore"; then
     echo "FAIL: expected sumTo stack-promoted cells (acc, i) in demo.gscore!" >&2
     exit 1
 fi
+if ! grep -q '(gc-masks' "$TMP_DIR/demo.gscore"; then
+    echo "FAIL: expected live (gc-masks ...) section in demo.gscore!" >&2
+    exit 1
+fi
 "$CHECKER_BIN" "$TMP_DIR/demo.gscore"
 
 # 2. Negative type check: tampered literal type in Core IR must be rejected
@@ -97,6 +113,27 @@ if "$CHECKER_BIN" "$TMP_DIR/demo_nonexh.gscore" 2>/dev/null; then
     exit 1
 fi
 echo "PASS [non_exhaustive_match_rejected]: Lean 4 Maranget verifier rejected non-exhaustive Core IR match"
+
+# 3b. Negative Pillar 4 check: tampering live codegen GC pointer mask bits in (gc-masks ...) MUST be rejected!
+python3 -c '
+import sys
+s = open(sys.argv[1]).read()
+target = "(adt-masks \"Expr\" (vmask 0 (mask 0)) (vmask 1 (mask 6)) (vmask 2 (mask 6)))"
+assert target in s, f"expected Expr gc-masks entry in demo.gscore"
+# Drop pointer bit 2 (word 2 of Add(Expr, Expr)) so GC would miss the second child pointer
+open(sys.argv[2], "w").write(s.replace(target, "(adt-masks \"Expr\" (vmask 0 (mask 0)) (vmask 1 (mask 2)) (vmask 2 (mask 6)))", 1))
+# Forge bit 0 (tag word) as a pointer on Lit(Int)
+open(sys.argv[3], "w").write(s.replace(target, "(adt-masks \"Expr\" (vmask 0 (mask 1)) (vmask 1 (mask 6)) (vmask 2 (mask 6)))", 1))
+' "$TMP_DIR/demo.gscore" "$TMP_DIR/demo_bad_gcmask1.gscore" "$TMP_DIR/demo_bad_gcmask2.gscore"
+if "$CHECKER_BIN" "$TMP_DIR/demo_bad_gcmask1.gscore" 2>/dev/null; then
+    echo "FAIL: tampered GC pointer mask dropping pointer field bit was accepted!" >&2
+    exit 1
+fi
+if "$CHECKER_BIN" "$TMP_DIR/demo_bad_gcmask2.gscore" 2>/dev/null; then
+    echo "FAIL: tampered GC pointer mask setting tag-word bit 0 was accepted!" >&2
+    exit 1
+fi
+echo "PASS [tampered_gc_masks_rejected]: Lean 4 LP64 GC layout oracle rejected wrong pointer masks"
 
 # 4. Full Concurrent Core Geisha program (`Task` + `par` + `MVar` + `Chan` + `!Send`-state `Actor` + recursive `Tree` ADT)
 cat > "$TMP_DIR/conc_demo.gsa" << 'EOF'
@@ -227,6 +264,86 @@ if "$TMP_DIR/div_zero" 2>"$TMP_DIR/div_zero.err"; then
 fi
 echo "PASS [div_by_zero_trap]: $(cat "$TMP_DIR/div_zero.err")"
 
+# 8b. Operational Semantics Differential Testing (`geisha-check --eval` vs Native LLVM Binary):
+#     Evaluates pure Core IR via Lean's proven `runSteps` small-step reducer and asserts
+#     bit-for-bit agreement with the compiled native binary!
+cat > "$TMP_DIR/diff_sem.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+
+data Pack {
+    MkPack(Int, Int, String),
+}
+
+data SeqTree {
+    SLeaf(Int),
+    SBranch(SeqTree, SeqTree),
+}
+
+def foldSeqTree(t: SeqTree): Int = match t {
+    SLeaf(v) -> v,
+    SBranch(l, r) -> foldSeqTree(l) * 3 + foldSeqTree(r),
+}
+
+def classifyGuard(p: Pack): Int = match p {
+    MkPack(a, b, tag) if (a > b && tag == "hi") -> a - b,
+    MkPack(a, b, _) -> a + b,
+}
+
+def computeConformance(): String = {
+    let min32 = -2147483647 - 1;
+    let max32 = 2147483647;
+    let wrapAdd = max32 + 1;
+    let wrapDiv = min32 / (-1);
+    let wrapRem = min32 % (-1);
+    let sh1 = (-16) >> 2;
+    let sh2 = (-16) >>> 28;
+    let shMask = 1 << 35;
+    let bitMix = ((0x5A ^ 0x0F) & (~0x03)) | 0x100;
+    let sc1 = if (false && (1 / 0 == 0)) 99 else 11;
+    let sc2 = if (true || (1 / 0 == 0)) 22 else 88;
+    let cCmp = if ('A' < 'Z' && 'z' > 'a' && 'x' == 'x') 7 else 0;
+    let sCmp = if ("ab" + "cd" == "abcd" && "abc" < "abd" && "z" > "a") 9 else 0;
+    let acc = cellNew(0);
+    let k = cellNew(1);
+    while (cellGet(k) <= 6) {
+        let cur = cellGet(k);
+        let f = (x: Int) -> x * cur + 1;
+        cellSet(acc, cellGet(acc) + f(2));
+        cellSet(k, cur + 1)
+    };
+    let treeVal = foldSeqTree(SBranch(SLeaf(4), SBranch(SLeaf(5), SLeaf(2))));
+    let g1 = classifyGuard(MkPack(10, 3, "hi"));
+    let g2 = classifyGuard(MkPack(10, 3, "lo"));
+    let ok =
+        wrapAdd == min32
+        && wrapDiv == min32
+        && wrapRem == 0
+        && sh1 == -4
+        && sh2 == 15
+        && shMask == 8
+        && bitMix == 340
+        && sc1 + sc2 == 33
+        && cCmp == 7
+        && sCmp == 9
+        && cellGet(acc) == 48
+        && treeVal == 29
+        && g1 == 7
+        && g2 == 13;
+    if (ok) "CONFORMANCE_OK:29:48:340" else "CONFORMANCE_MISMATCH"
+}
+
+def main(): Void = printLn(computeConformance())
+EOF
+"$GEISHA_BIN" --dump-core "$TMP_DIR/diff_sem.gscore" -o "$TMP_DIR/diff_sem" "$TMP_DIR/diff_sem.gsa"
+"$CHECKER_BIN" "$TMP_DIR/diff_sem.gscore"
+NATIVE_DIFF_OUT="$("$TMP_DIR/diff_sem")"
+LEAN_DIFF_OUT="$("$CHECKER_BIN" --eval computeConformance "$TMP_DIR/diff_sem.gscore")"
+if [ "$NATIVE_DIFF_OUT" != "$LEAN_DIFF_OUT" ] || [ "$NATIVE_DIFF_OUT" != "CONFORMANCE_OK:29:48:340" ]; then
+    echo "FAIL [differential_semantics]: native='$NATIVE_DIFF_OUT' vs lean='$LEAN_DIFF_OUT'" >&2
+    exit 1
+fi
+echo "PASS [differential_semantics]: native binary == Lean small-step --eval ($LEAN_DIFF_OUT)"
+
 # 9. Full-spectrum Core translation validation: Int64, Float, Float32, Char, MutArray,
 #    Arena/ForeignPtr/ScopedPtr FFI, pattern guards, global Cell, while+`?`, and shadowed param Cell
 cat > "$TMP_DIR/full_ext.gsa" << 'EOF'
@@ -292,9 +409,66 @@ EOF
 "$TMP_DIR/full_ext"
 "$CHECKER_BIN" "$TMP_DIR/full_ext.gscore"
 
-# 10. Full Self-Hosting Compiler Translation Validation:
+# 10. Full Language-Surface E2E Suite Translation Validation:
+#     Extract every positive standalone `.gsa` test program from `tests/run_tests.sh`
+#     (covering HKT, FunDeps, MTL, generic derive, Float32, Ptr/ScopedPtr/Arena/ForeignPtr,
+#     ImmArray/parTabulate, @repr(C) structs, cFnPtr, radix/_ literals, sys.fs, sys.proc,
+#     std.toml.patch, codec.json, Task/MVar/Chan/Actor, etc.) and verify each with Lean 4!
+mkdir -p "$TMP_DIR/e2e_suite"
+python3 - tests/run_tests.sh "$TMP_DIR/e2e_suite" << 'PY'
+import os, re, sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+out_dir = sys.argv[2]
+pat = re.compile(r'cat > "\$TMP_DIR/([A-Za-z0-9_]+\.gsa)" << \'EOF\'\n(.*?)\nEOF\n((?:[^\n]*\n){1,4})', re.S)
+
+extracted = []
+for m in pat.finditer(src):
+    name, body, tail = m.group(1), m.group(2), m.group(3)
+    tail_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    is_pos = False
+    is_nomain = False
+    for ln in tail_lines:
+        if ln.startswith('if "$GEISHA_BIN"') or ln.startswith('assert_compile_fails'):
+            break
+        if ln.startswith('"$GEISHA_BIN"'):
+            if not ln.startswith('"$GEISHA_BIN" check ') and "--pkg" not in tail and "--src-root" not in tail and " -L " not in tail:
+                is_pos = True
+                if "--no-main" in tail:
+                    is_nomain = True
+            break
+    if is_pos:
+        out_path = os.path.join(out_dir, name)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(body + "\n")
+        extracted.append((name, is_nomain))
+
+if len(extracted) < 20:
+    print(f"FAIL: expected >= 20 positive E2E .gsa programs, found {len(extracted)}", file=sys.stderr)
+    sys.exit(1)
+
+with open(os.path.join(out_dir, "manifest.txt"), "w", encoding="utf-8") as mf:
+    for name, is_nomain in extracted:
+        mf.write(f"{name} {'1' if is_nomain else '0'}\n")
+PY
+
+E2E_COUNT=0
+while read -r gsa_name is_nomain; do
+    gsa_path="$TMP_DIR/e2e_suite/$gsa_name"
+    gscore_path="$TMP_DIR/e2e_suite/${gsa_name}.gscore"
+    ll_path="$TMP_DIR/e2e_suite/${gsa_name}.ll"
+    if [ "$is_nomain" = "1" ]; then
+        "$GEISHA_BIN" --no-main --dump-core "$gscore_path" -e -o "$ll_path" "$gsa_path"
+    else
+        "$GEISHA_BIN" --dump-core "$gscore_path" -e -o "$ll_path" "$gsa_path"
+    fi
+    "$CHECKER_BIN" "$gscore_path" >/dev/null
+    E2E_COUNT=$((E2E_COUNT + 1))
+done < "$TMP_DIR/e2e_suite/manifest.txt"
+echo "PASS [e2e_suite_translation_validation]: all $E2E_COUNT positive E2E language-surface programs verified by Lean 4 geisha-check"
+
+# 11. Full Self-Hosting Compiler Translation Validation:
 #     Dump and mechanically verify the entire ~20,000-line self-hosted Geisha compiler (`src/geisha.gsa`)!
 "$GEISHA_BIN" --src-root . --dump-core "$TMP_DIR/compiler.gscore" -e -o "$TMP_DIR/compiler.ll" src/geisha.gsa
 "$CHECKER_BIN" "$TMP_DIR/compiler.gscore"
 echo "PASS [self_hosted_compiler_verified]: entire src/geisha.gsa compiler verified by Lean 4 geisha-check"
-

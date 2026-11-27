@@ -14,9 +14,10 @@ This directory contains the complete machine-checked formal semantics and safety
 | `CoreGeisha/Exhaustive.lean` | Executable **Maranget Pattern-Matrix Exhaustiveness Checker** (`checkPatsExhaustive`, `checkProgramExhaustive`) and zero-`sorry` proofs of matrix specialization soundness (`checkArmsExhaustive_sound`), dynamic match-coverage preservation (`step_preserves_exhSafe`), and **Complete Elimination of `Trap.matchFailure`** (`exhaustive_no_match_failure`, `conc_exhaustive_no_match_failure`). |
 | `CoreGeisha/Escape.lean` | Executable **Escape Analysis Verifier** (`checkProgramEscape`), explicit **Stack-Frame Region Operational Semantics** (`RExpr`, `RStore`, `popRegion`, `IsDanglingAccess`), non-vacuity counterexample (`dangling_access_nonvacuous`), **Zero Use-After-Return / No Dangling Stack Pointers** (`escape_no_dangling_pointers`), and **Stack-vs-Heap Observational Simulation** (`stack_alloc_simulates_heap`). |
 | `CoreGeisha/Scoped.lean` | Zero-`sorry` proofs of the **3-Point Capture-Mode Lattice** (`shared <: local <: scoped`, `modeJoin_lub`), **Thread-Safe Non-Escape** (`isSend_implies_noScoped`), **Scoped Region Memory Safety** (`noScoped_value_has_no_regions`, `scoped_preservation`, `scoped_no_dangling_access` / `¬DanglingScopedAccess`, `dangling_scoped_nonvacuous`), and **`ImmArray` / `parTabulate` Disjoint-Chunk Data-Race Freedom** (`parTabulate_chunks_disjoint`, `parTabulate_chunks_cover`, `parTabulate_data_race_free`). |
-| `CoreGeisha/GC.lean` | Formalization of **40-Bit Exact Object Pointer Masks** (`computePtrMask_sound`, `adtVariantPtrMask_sound` with scalar false-pointer immunity) and **Sticky-Mark Generational GC & Write Barrier** (`GenHeapInv`, `gcAllocImmutable_preserves_inv`, `gcWriteBarrierStore_preserves_inv`, UAF counterexample `missing_write_barrier_unsound`, `minorGc_sound`, `majorGc_sound`, and `majorGc_complete`). |
-| `CoreGeisha/Checker.lean` | Unified verified executable checker (`checkProgram`) combining type/mode/concurrency checking, Maranget exhaustiveness, stack-escape checking, and GC layout checking, linked directly to end-to-end safety theorems. |
-| `CoreGeisha/Parser.lean` | `.gscore` S-expression parser for `--dump-core` translation validation (`adts`, `externs`, `funs`, `stack-allocs`), supporting full self-verification of `src/geisha.gsa`. |
+| `CoreGeisha/GC.lean` | Formalization of **40-Bit Exact Object Pointer Masks** (`computePtrMask_sound`, `adtVariantPtrMask_sound` with scalar false-pointer immunity, plus `checkEmittedGcMasks` LP64 byte-offset & unboxed-ADT cross-checking against `src/codegen.gsa`) and **Sticky-Mark Generational GC & Write Barrier** (`GenHeapInv`, `gcAllocImmutable_preserves_inv`, `gcWriteBarrierStore_preserves_inv`, UAF counterexample `missing_write_barrier_unsound`, `minorGc_sound`, `majorGc_sound`, and `majorGc_complete`). |
+| `CoreGeisha/Eval.lean` | Fuel-bounded deterministic small-step evaluator (`stepOnce`, `runSteps`) with zero-`sorry` soundness proof (`runSteps_sound`) for `geisha-check --eval` differential conformance testing against native LLVM binaries. |
+| `CoreGeisha/Checker.lean` | Unified verified executable checker (`checkProgram`) combining type/mode/concurrency checking, Maranget exhaustiveness, stack-escape checking, and live codegen GC mask verification, linked directly to end-to-end safety theorems. |
+| `CoreGeisha/Parser.lean` | `.gscore` S-expression parser for `--dump-core` translation validation (`adts`, `externs`, `funs`, `stack-allocs`, `gc-masks`), supporting full self-verification of `src/geisha.gsa`. |
 
 ## 2. Key Machine-Checked Guarantees
 
@@ -38,4 +39,4 @@ cd formal && lake build
 make verify-core
 ```
 
-All 10 modules compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`**, **zero custom axioms**, and **zero external library dependencies**.
+All 11 modules compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`**, **zero custom axioms**, and **zero external library dependencies**.

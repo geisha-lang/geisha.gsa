@@ -3576,6 +3576,325 @@ def analyzeAllocEscapes(
     _ -> (),
 }
 
+def escPatBindsName(pat: Pattern, target: String): Bool = match pat {
+    PatWild -> false,
+    PatLit(_) -> false,
+    PatVar(x) -> x == target,
+    PatTuple(ps) -> escPatListBindsName(ps, target),
+    PatCtor(_, ps) -> escPatListBindsName(ps, target),
+    PatStruct(_, _) -> false,
+}
+
+def escPatListBindsName(ps: List Pattern, target: String): Bool = match ps {
+    Nil -> false,
+    Cons(p, r) -> if (escPatBindsName(p, target)) true else escPatListBindsName(r, target),
+}
+
+def escTermMentionsVar(fns: StrMap FunDef, tm: TaggedTerm, x: String, visitedCls: StrMap Bool): Bool = match tm.tnode {
+    TmLit(_) -> false,
+    TmVar(y) -> y == x,
+    TmGlobalVar(_) -> false,
+    TmTuple(es) -> escTermListMentionsVar(fns, es, x, visitedCls),
+    TmBlock(es) -> escTermListMentionsVar(fns, es, x, visitedCls),
+    TmMakeCls(vd, cls, body) -> {
+        let inCls =
+            if (strMapContains(visitedCls, cls.clsEntry)) false
+            else {
+                strMapInsert(visitedCls, cls.clsEntry, true);
+                match strMapGet(fns, cls.clsEntry) {
+                    Some(cfd) -> escTermMentionsVar(fns, cfd.fnBody, x, visitedCls),
+                    None -> false,
+                }
+            };
+        vd.vname == x
+        || strListHas(cls.clsFvs, x)
+        || inCls
+        || escTermMentionsVar(fns, body, x, visitedCls)
+    },
+    TmApplyCls(fnTm, args) ->
+        escTermMentionsVar(fns, fnTm, x, visitedCls) || escTermListMentionsVar(fns, args, x, visitedCls),
+    TmApplyDir(_, args) -> escTermListMentionsVar(fns, args, x, visitedCls),
+    TmBin(_, e1, e2) ->
+        escTermMentionsVar(fns, e1, x, visitedCls) || escTermMentionsVar(fns, e2, x, visitedCls),
+    TmUn(_, e1) -> escTermMentionsVar(fns, e1, x, visitedCls),
+    TmLet(vd, e1, e2) ->
+        vd.vname == x
+        || escTermMentionsVar(fns, e1, x, visitedCls)
+        || escTermMentionsVar(fns, e2, x, visitedCls),
+    TmIf(c, t, e) ->
+        escTermMentionsVar(fns, c, x, visitedCls)
+        || escTermMentionsVar(fns, t, x, visitedCls)
+        || escTermMentionsVar(fns, e, x, visitedCls),
+    TmWhile(c, b) ->
+        escTermMentionsVar(fns, c, x, visitedCls) || escTermMentionsVar(fns, b, x, visitedCls),
+    TmMatch(s, arms) ->
+        if (escTermMentionsVar(fns, s, x, visitedCls)) true
+        else {
+            let hit = cellNew(false);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> !cellGet(hit) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let gHit = match a.caGuard {
+                            Some(g) -> escTermMentionsVar(fns, g, x, visitedCls),
+                            None -> false,
+                        };
+                        if (escPatBindsName(a.caPat, x) || gHit || escTermMentionsVar(fns, a.caBody, x, visitedCls)) {
+                            cellSet(hit, true)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        },
+    TmMakeData(_, _, args, _, _) -> escTermListMentionsVar(fns, args, x, visitedCls),
+    TmGetTag(e1) -> escTermMentionsVar(fns, e1, x, visitedCls),
+}
+
+def escTermListMentionsVar(fns: StrMap FunDef, es: List TaggedTerm, x: String, visitedCls: StrMap Bool): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> if (escTermMentionsVar(fns, h, x, visitedCls)) true else escTermListMentionsVar(fns, t, x, visitedCls),
+}
+
+def escClsFreeOfVar(fns: StrMap FunDef, vd: VarDecl, cls: ClosureSpec, x: String): Bool =
+    vd.vname != x
+    && !strListHas(cls.clsFvs, x)
+    && (match strMapGet(fns, cls.clsEntry) {
+        Some(cfd) -> {
+            let pbound = cellNew(false);
+            let cp = cellNew(cfd.fnParams);
+            while (match cellGet(cp) { Nil -> false, _ -> !cellGet(pbound) }) {
+                match cellGet(cp) {
+                    Cons(pvd, pr) -> {
+                        if (pvd.vname == x) cellSet(pbound, true) else ();
+                        cellSet(cp, pr)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(pbound) || !escTermMentionsVar(fns, cfd.fnBody, x, strMapNew())
+        },
+        None -> false,
+    })
+
+def escOnlyDirectCellOps(fns: StrMap FunDef, tm: TaggedTerm, x: String): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(y) -> y != x,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> escOnlyDirectCellOpsList(fns, es, x),
+    TmBlock(es) -> escOnlyDirectCellOpsList(fns, es, x),
+    TmMakeCls(vd, cls, body) ->
+        escClsFreeOfVar(fns, vd, cls, x) && escOnlyDirectCellOps(fns, body, x),
+    TmApplyCls(fnTm, args) ->
+        escOnlyDirectCellOps(fns, fnTm, x) && escOnlyDirectCellOpsList(fns, args, x),
+    TmApplyDir(vd, args) ->
+        if (vd.vname == "cellGet") {
+            match args {
+                Cons(a0, Nil) -> match a0.tnode {
+                    TmVar(y) -> if (y == x) true else escOnlyDirectCellOps(fns, a0, x),
+                    _ -> escOnlyDirectCellOps(fns, a0, x),
+                },
+                _ -> false,
+            }
+        } else if (vd.vname == "cellSet") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> match a0.tnode {
+                    TmVar(y) ->
+                        if (y == x) escOnlyDirectCellOps(fns, a1, x)
+                        else escOnlyDirectCellOps(fns, a0, x) && escOnlyDirectCellOps(fns, a1, x),
+                    _ -> escOnlyDirectCellOps(fns, a0, x) && escOnlyDirectCellOps(fns, a1, x),
+                },
+                _ -> false,
+            }
+        } else escOnlyDirectCellOpsList(fns, args, x),
+    TmBin(_, e1, e2) ->
+        escOnlyDirectCellOps(fns, e1, x) && escOnlyDirectCellOps(fns, e2, x),
+    TmUn(_, e1) -> escOnlyDirectCellOps(fns, e1, x),
+    TmLet(vd, e1, e2) ->
+        vd.vname != x && escOnlyDirectCellOps(fns, e1, x) && escOnlyDirectCellOps(fns, e2, x),
+    TmIf(c, t, e) ->
+        escOnlyDirectCellOps(fns, c, x) && escOnlyDirectCellOps(fns, t, x) && escOnlyDirectCellOps(fns, e, x),
+    TmWhile(c, b) ->
+        escOnlyDirectCellOps(fns, c, x) && escOnlyDirectCellOps(fns, b, x),
+    TmMatch(s, arms) ->
+        if (!escOnlyDirectCellOps(fns, s, x)) false
+        else {
+            let ok = cellNew(true);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let gOk = match a.caGuard {
+                            Some(g) -> escOnlyDirectCellOps(fns, g, x),
+                            None -> true,
+                        };
+                        if (escPatBindsName(a.caPat, x) || !gOk || !escOnlyDirectCellOps(fns, a.caBody, x)) {
+                            cellSet(ok, false)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(ok)
+        },
+    TmMakeData(_, _, args, _, _) -> escOnlyDirectCellOpsList(fns, args, x),
+    TmGetTag(e1) -> escOnlyDirectCellOps(fns, e1, x),
+}
+
+def escOnlyDirectCellOpsList(fns: StrMap FunDef, es: List TaggedTerm, x: String): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> if (escOnlyDirectCellOps(fns, h, x)) escOnlyDirectCellOpsList(fns, t, x) else false,
+}
+
+def escCheckStackVarInTerm(fns: StrMap FunDef, tm: TaggedTerm, x: String): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(y) -> y != x,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> escCheckStackVarInList(fns, es, x),
+    TmBlock(es) -> escCheckStackVarInList(fns, es, x),
+    TmMakeCls(vd, cls, body) ->
+        escClsFreeOfVar(fns, vd, cls, x) && escCheckStackVarInTerm(fns, body, x),
+    TmApplyCls(fnTm, args) ->
+        escCheckStackVarInTerm(fns, fnTm, x) && escCheckStackVarInList(fns, args, x),
+    TmApplyDir(_, args) -> escCheckStackVarInList(fns, args, x),
+    TmBin(_, e1, e2) ->
+        escCheckStackVarInTerm(fns, e1, x) && escCheckStackVarInTerm(fns, e2, x),
+    TmUn(_, e1) -> escCheckStackVarInTerm(fns, e1, x),
+    TmLet(vd, e1, e2) ->
+        if (vd.vname == x) {
+            match e1.tnode {
+                TmApplyDir(fvd, Cons(init, Nil)) ->
+                    fvd.vname == "cellNew"
+                    && escCheckStackVarInTerm(fns, init, x)
+                    && escOnlyDirectCellOps(fns, e2, x),
+                _ -> false,
+            }
+        } else {
+            escCheckStackVarInTerm(fns, e1, x) && escCheckStackVarInTerm(fns, e2, x)
+        },
+    TmIf(c, t, e) ->
+        escCheckStackVarInTerm(fns, c, x)
+        && escCheckStackVarInTerm(fns, t, x)
+        && escCheckStackVarInTerm(fns, e, x),
+    TmWhile(c, b) ->
+        escCheckStackVarInTerm(fns, c, x) && escCheckStackVarInTerm(fns, b, x),
+    TmMatch(s, arms) ->
+        if (!escCheckStackVarInTerm(fns, s, x)) false
+        else {
+            let ok = cellNew(true);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let gOk = match a.caGuard {
+                            Some(g) -> escCheckStackVarInTerm(fns, g, x),
+                            None -> true,
+                        };
+                        if (escPatBindsName(a.caPat, x) || !gOk || !escCheckStackVarInTerm(fns, a.caBody, x)) {
+                            cellSet(ok, false)
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(ok)
+        },
+    TmMakeData(_, _, args, _, _) -> escCheckStackVarInList(fns, args, x),
+    TmGetTag(e1) -> escCheckStackVarInTerm(fns, e1, x),
+}
+
+def escCheckStackVarInList(fns: StrMap FunDef, es: List TaggedTerm, x: String): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> if (escCheckStackVarInTerm(fns, h, x)) escCheckStackVarInList(fns, t, x) else false,
+}
+
+def escCollectCellAllocs(tm: TaggedTerm, out: StrMap Bool): Void = match tm.tnode {
+    TmLet(vd, val, body) -> {
+        match val.tnode {
+            TmApplyDir(fvd, _) if (fvd.vname == "cellNew") -> strMapInsert(out, vd.vname, true),
+            _ -> (),
+        };
+        escCollectCellAllocs(val, out);
+        escCollectCellAllocs(body, out)
+    },
+    TmMakeCls(_, _, body) -> escCollectCellAllocs(body, out),
+    TmTuple(es) -> escCollectCellAllocsList(es, out),
+    TmBlock(es) -> escCollectCellAllocsList(es, out),
+    TmApplyCls(c, args) -> {
+        escCollectCellAllocs(c, out);
+        escCollectCellAllocsList(args, out)
+    },
+    TmApplyDir(_, args) -> escCollectCellAllocsList(args, out),
+    TmBin(_, e1, e2) -> {
+        escCollectCellAllocs(e1, out);
+        escCollectCellAllocs(e2, out)
+    },
+    TmUn(_, e1) -> escCollectCellAllocs(e1, out),
+    TmIf(c, t, e) -> {
+        escCollectCellAllocs(c, out);
+        escCollectCellAllocs(t, out);
+        escCollectCellAllocs(e, out)
+    },
+    TmWhile(c, b) -> {
+        escCollectCellAllocs(c, out);
+        escCollectCellAllocs(b, out)
+    },
+    TmMatch(s, arms) -> {
+        escCollectCellAllocs(s, out);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> escCollectCellAllocs(g, out), None -> () };
+                    escCollectCellAllocs(a.caBody, out);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, args, _, _) -> escCollectCellAllocsList(args, out),
+    TmGetTag(e1) -> escCollectCellAllocs(e1, out),
+    _ -> (),
+}
+
+def escCollectCellAllocsList(es: List TaggedTerm, out: StrMap Bool): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> {
+        escCollectCellAllocs(h, out);
+        escCollectCellAllocsList(t, out)
+    },
+}
+
+def isVerifiedStackCellInFn(fd: FunDef, fns: StrMap FunDef, x: String): Bool = {
+    let badParam = cellNew(false);
+    let cp = cellNew(fd.fnParams);
+    while (match cellGet(cp) { Nil -> false, _ -> !cellGet(badParam) }) {
+        match cellGet(cp) {
+            Cons(pvd, pr) -> {
+                if (pvd.vname == x) cellSet(badParam, true) else ();
+                cellSet(cp, pr)
+            },
+            Nil -> (),
+        }
+    };
+    let cf = cellNew(fd.fnFvs);
+    while (match cellGet(cf) { Nil -> false, _ -> !cellGet(badParam) }) {
+        match cellGet(cf) {
+            Cons(fvd, fr) -> {
+                if (fvd.vname == x) cellSet(badParam, true) else ();
+                cellSet(cf, fr)
+            },
+            Nil -> (),
+        }
+    };
+    !cellGet(badParam) && escCheckStackVarInTerm(fns, fd.fnBody, x)
+}
+
 def runEscapeAnalysis(
     fns: StrMap FunDef,
     fnNames: List String,
@@ -3672,6 +3991,8 @@ def runEscapeAnalysis(
                         let allocKeys = cellNew(Nil);
                         collectLocalAllocs(fd.fnBody, recAdts, allocMap, allocKeys);
                         let origKeys = cellGet(allocKeys);
+                        let cellAllocs: StrMap Bool = strMapNew();
+                        escCollectCellAllocs(fd.fnBody, cellAllocs);
 
                         let escaping: StrMap Bool = strMapNew();
                         let escList = cellNew(Nil);
@@ -3680,6 +4001,9 @@ def runEscapeAnalysis(
                             match cellGet(ck0) {
                                 Cons(aid, rk) -> {
                                     if (strMapContains(nonAlloc, aid)) {
+                                        markEscaping(aid, allocMap, escaping, escList)
+                                    } else ();
+                                    if (strMapContains(cellAllocs, aid) && !isVerifiedStackCellInFn(fd, fns, aid)) {
                                         markEscaping(aid, allocMap, escaping, escList)
                                     } else ();
                                     match strMapGet(allocMap, aid) {

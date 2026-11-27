@@ -400,27 +400,75 @@ private def parseStackSpec : SExpr → Except String FnStackSpec
     }
   | other => .error s!"invalid fn-stack entry: {repr other}"
 
+private def parseVariantGcMaskSpec : SExpr → Except String VariantGcMaskSpec
+  | .atom "static" => .ok .staticNullary
+  | .atom "unboxed" => .ok .unboxedValue
+  | .atom "conservative" => .ok .conservative
+  | .list [.atom "mask", n] => do pure (.exactMask (← expectNat n))
+  | other => .error s!"invalid vmask spec: {repr other}"
+
+private def parseVmaskEntry : SExpr → Except String (Nat × VariantGcMaskSpec)
+  | .list [.atom "vmask", tag, spec] => do
+    pure (← expectNat tag, ← parseVariantGcMaskSpec spec)
+  | other => .error s!"invalid vmask entry: {repr other}"
+
+private def parseAdtGcMaskSpec : SExpr → Except String AdtGcMaskSpec
+  | .list (.atom "adt-masks" :: .atom "cstruct" :: name :: vs) => do
+    pure {
+      adtName := ← expectStr name
+      isCStruct := true
+      variants := ← vs.mapM parseVmaskEntry
+    }
+  | .list (.atom "adt-masks" :: name :: vs) => do
+    pure {
+      adtName := ← expectStr name
+      isCStruct := false
+      variants := ← vs.mapM parseVmaskEntry
+    }
+  | other => .error s!"invalid adt-masks entry: {repr other}"
+
+private def parseProgramSections (sects : List SExpr) : Except String Program := do
+  let mut adts : Option (List AdtDef) := none
+  let mut funs : Option (List FunDef) := none
+  let mut externs : List ExternDecl := []
+  let mut stackAllocs : List FnStackSpec := []
+  let mut gcMasks : List AdtGcMaskSpec := []
+  let mut hasGcMasks : Bool := false
+  for s in sects do
+    match s with
+    | .list (.atom "adts" :: xs) =>
+      adts := some (← xs.mapM parseAdt)
+    | .list (.atom "externs" :: xs) =>
+      externs := ← xs.mapM parseExtern
+    | .list (.atom "funs" :: xs) =>
+      funs := some (← xs.mapM parseFun)
+    | .list (.atom "stack-allocs" :: xs) =>
+      stackAllocs := ← xs.mapM parseStackSpec
+    | .list (.atom "gc-masks" :: xs) =>
+      gcMasks := ← xs.mapM parseAdtGcMaskSpec
+      hasGcMasks := true
+    | other =>
+      throw s!"unknown program section: {repr other}"
+  match adts, funs with
+  | some a, some f =>
+    pure {
+      adts := a
+      funs := f
+      externs := externs
+      stackAllocs := stackAllocs
+      gcMasks := gcMasks
+      hasGcMasks := hasGcMasks
+    }
+  | _, _ =>
+    throw "program requires both (adts ...) and (funs ...) sections"
+
 def parseProgram (src : String) : Except String Program := do
   let (sexpr, rest) ← parseSExpr src.toList
   match skipWs rest with
   | [] =>
     match sexpr with
-    | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs)] => do
-      let adts' ← adts.mapM parseAdt
-      let funs' ← funs.mapM parseFun
-      pure { adts := adts', funs := funs', externs := [], stackAllocs := [] }
-    | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "funs" :: funs), .list (.atom "stack-allocs" :: specs)] => do
-      let adts' ← adts.mapM parseAdt
-      let funs' ← funs.mapM parseFun
-      let specs' ← specs.mapM parseStackSpec
-      pure { adts := adts', funs := funs', externs := [], stackAllocs := specs' }
-    | .list [.atom "program", .list (.atom "adts" :: adts), .list (.atom "externs" :: exts), .list (.atom "funs" :: funs), .list (.atom "stack-allocs" :: specs)] => do
-      let adts' ← adts.mapM parseAdt
-      let exts' ← exts.mapM parseExtern
-      let funs' ← funs.mapM parseFun
-      let specs' ← specs.mapM parseStackSpec
-      pure { adts := adts', funs := funs', externs := exts', stackAllocs := specs' }
-    | other => .error s!"expected (program (adts ...) [(externs ...)] (funs ...) [(stack-allocs ...)]), got {repr other}"
+    | .list (.atom "program" :: sects) => parseProgramSections sects
+    | other => .error s!"expected (program ...), got {repr other}"
   | _ => .error "trailing tokens after top-level program"
 
 end CoreGeisha.Parser
