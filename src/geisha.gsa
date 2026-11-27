@@ -26,6 +26,7 @@ use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch}
 use doc.cmdDoc
+use bench.cmdBench
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
@@ -92,6 +93,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "run"
     || w == "eval"
     || w == "test"
+    || w == "bench"
     || w == "doc"
     || w == "guide"
 
@@ -1432,6 +1434,7 @@ def printUsage(): Void = {
     printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
     printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
+    printLn("  geisha bench [file|filter]     Run microbenchmarks (--iters N --warmup N --rounds N --json)");
     printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
     printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
     printLn("");
@@ -1525,6 +1528,7 @@ def runDriver(): Result Int String = {
             },
             Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
+            Some("bench") -> cmdBench(opts.optSubArgs, opts.optJson, opts.optRuntime, cbs),
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
             Some("guide") -> { printLn(embeddedAgentGuide()); Ok(0) },
             Some(other) -> Err("unknown subcommand: " + other),

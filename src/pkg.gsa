@@ -95,6 +95,7 @@ pub data Manifest {
         mfEntry: Option String,
         mfSrcDir: String,
         mfTests: List String,
+        mfBenches: List String,
         mfDeps: List DepDecl,
         mfOverrides: List DepDecl,
         mfNative: TargetCfg,
@@ -182,6 +183,7 @@ def emptyManifest(fallbackName: String): Manifest = MkManifest {
     mfEntry: None,
     mfSrcDir: "src",
     mfTests: Nil,
+    mfBenches: Nil,
     mfDeps: Nil,
     mfOverrides: Nil,
     mfNative: emptyTargetCfg(),
@@ -745,6 +747,8 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
             };
             let tests1 = asStrList(lookupVal(fs, "tests"))?;
             let tests2 = asStrList(lookupVal(fs, "test"))?;
+            let benches1 = asStrList(lookupVal(fs, "benches"))?;
+            let benches2 = asStrList(lookupVal(fs, "bench"))?;
             let deps = parseDepTable(lookupVal(fs, "deps"))?;
             let overrides = parseDepTable(lookupVal(fs, "overrides"))?;
             let (nativeCfg, wasmCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
@@ -766,6 +770,7 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
                 mfEntry: entryOpt,
                 mfSrcDir: srcDir,
                 mfTests: listAppend(tests1, tests2),
+                mfBenches: listAppend(benches1, benches2),
                 mfDeps: deps,
                 mfOverrides: overrides,
                 mfNative: nativeCfg,
@@ -881,7 +886,7 @@ def sanitizeSlug(s: String): String = {
     bufToString(b)
 }
 
-def sanitizeIdentAlias(raw: String): String = {
+pub def sanitizeIdentAlias(raw: String): String = {
     let base = pathBasename(stripGitSuffix(raw));
     let b = bufNew();
     let n = strLen(base);
@@ -1351,6 +1356,7 @@ def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List 
                 mfEntry: mf0.mfEntry,
                 mfSrcDir: mf0.mfSrcDir,
                 mfTests: mf0.mfTests,
+                mfBenches: mf0.mfBenches,
                 mfDeps: mf0.mfDeps,
                 mfOverrides: mf0.mfOverrides,
                 mfNative: mergeLocalTargetCfg(mf0.mfNative, lmf.mfNative),
@@ -1855,7 +1861,7 @@ pub def findProjectRoot(startDir: String): Option String = {
     cellGet(found)
 }
 
-def resolveRelList(baseDir: String, rels: List String): List String = {
+pub def resolveRelList(baseDir: String, rels: List String): List String = {
     let out = cellNew(Nil);
     let cur = cellNew(rels);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -2001,7 +2007,7 @@ def mergeTargetConfigsFor(
     }
 }
 
-def mergeTargetConfigs(
+pub def mergeTargetConfigs(
     projectDir: String,
     rootMf: Manifest,
     resolvedPkgs: List ResolvedPkg,

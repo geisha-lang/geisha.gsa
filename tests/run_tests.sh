@@ -2817,4 +2817,187 @@ fi
 echo "PASS [syslib_literals_toml_patch]: 0x/0o/0b/_ literals, sys.fs atomic writes, sys.proc poll/timeout/signals, std.toml.patch, & geisha.local.toml verified"
 PASS=$((PASS + 1))
 
+# --- Test 37: `geisha bench` microbenchmarking framework & `std.bench` ---
+ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_37="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+
+# 37a: `geisha doc std.bench` exposes BlackBox, measure, bench, BenchStats
+DOC_BENCH="$("$GEISHA_BIN" doc std.bench)"
+for sym in "concept BlackBox" "def measure" "def bench(" "data BenchStats"; do
+    if ! printf '%s\n' "$DOC_BENCH" | grep -q "$sym"; then
+        echo "FAIL [bench_doc]: missing '$sym' in 'geisha doc std.bench'" >&2
+        exit 1
+    fi
+done
+
+# 37b: Verify blackBox emits opaque runtime barriers in LLVM IR & preserves values
+cat > "$TMP_DIR/t37_blackbox.gsa" << 'EOF'
+use std.bench.{blackBox, blackBoxBarrier}
+use std.option.{Option, Some, None}
+use std.str.{intToStr, i64ToStr, boolToStr}
+
+def pureWork(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+def main(): Void = {
+    let a = blackBox(pureWork(100));
+    let b = blackBox(intToI64(42));
+    let c = blackBox(3.5);
+    let d = blackBox(true);
+    let s = blackBox("ok");
+    let o = match blackBox(Some(7)) { Some(v) -> v, None -> 0 };
+    blackBoxBarrier();
+    printLn(intToStr(a) + "|" + i64ToStr(b) + "|" + intToStr(floatToInt(c * 2.0)) + "|" + boolToStr(d) + "|" + s + "|" + intToStr(o))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t37_blackbox.ll" "$TMP_DIR/t37_blackbox.gsa"
+if ! grep -q "@gs_bench_black_box_i32" "$TMP_DIR/t37_blackbox.ll" || ! grep -q "@gs_bench_black_box_f64" "$TMP_DIR/t37_blackbox.ll"; then
+    echo "FAIL [bench_blackbox_ir]: expected @gs_bench_black_box_* calls in LLVM IR" >&2
+    exit 1
+fi
+"$GEISHA_BIN" -o "$TMP_DIR/t37_blackbox" "$TMP_DIR/t37_blackbox.gsa"
+T37_BB_OUT="$("$TMP_DIR/t37_blackbox")"
+assert_eq "bench_blackbox_values" "5050|42|7|true|ok|7" "$T37_BB_OUT"
+
+# 37c: Standalone single-file mode with `bench_*` functions (no `main`)
+cat > "$TMP_DIR/t37_standalone_fns.gsa" << 'EOF'
+use std.bench.blackBox
+
+def sumTo(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+def fib(n: Int): Int = if (n <= 1) n else fib(n - 1) + fib(n - 2)
+
+def bench_sum_1000(): Void = {
+    let _ = blackBox(sumTo(blackBox(1000)));
+    ()
+}
+
+def bench_fib_14(): Int = blackBox(fib(blackBox(14)))
+EOF
+T37_TEXT="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" --iters 30 --warmup 2 --rounds 5 --runtime "$GEISHA_RUNTIME")"
+for tok in "bench_sum_1000" "bench_fib_14" "mean:" "median:" "min:" "max:" "ops/s" "30 iters x 5 rounds"; do
+    if ! printf '%s\n' "$T37_TEXT" | grep -q "$tok"; then
+        echo "FAIL [bench_standalone_text]: missing '$tok' in output:" >&2
+        echo "$T37_TEXT" >&2
+        exit 1
+    fi
+done
+
+T37_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" --iters 30 --warmup 2 --rounds 5 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True, data
+bs = data["benchmarks"]
+assert len(bs) == 2, bs
+assert [b["name"] for b in bs] == ["bench_sum_1000", "bench_fib_14"], bs
+for b in bs:
+    assert b["iters"] == 30, b
+    assert b["rounds"] == 5, b
+    assert b["total_ns"] > 0, b
+    assert b["min_ns"] <= b["median_ns"] <= b["max_ns"], b
+    assert b["mean_ns"] > 0, b
+    assert b["ops_per_sec"] > 0, b
+    assert b["file"].endswith("t37_standalone_fns.gsa"), b
+PY
+
+T37_FILT_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_fns.gsa" fib --iters 15 --warmup 1 --rounds 3 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_FILT_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True
+bs = data["benchmarks"]
+assert len(bs) == 1 and bs[0]["name"] == "bench_fib_14", bs
+assert bs[0]["iters"] == 15 and bs[0]["rounds"] == 3, bs
+PY
+
+# 37d: Standalone script with explicit `main()` calling `std.bench.{bench, benchGroup}`
+cat > "$TMP_DIR/t37_standalone_main.gsa" << 'EOF'
+use std.bench.{bench, benchGroup, blackBox}
+
+def work(n: Int): Int = {
+    let s = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        cellSet(s, cellGet(s) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(s)
+}
+
+def main(): Void = {
+    let _ = bench("custom_loop", () -> { let _ = blackBox(work(blackBox(500))); () });
+    let _ = benchGroup("grp", [
+        ("a", () -> { let _ = blackBox(work(blackBox(200))); () }),
+        ("b", () -> { let _ = blackBox(work(blackBox(400))); () }),
+    ]);
+    ()
+}
+EOF
+T37_MAIN_JSON="$("$GEISHA_BIN" bench "$TMP_DIR/t37_standalone_main.gsa" --filter grp/ --iters 20 --warmup 1 --rounds 3 --json --runtime "$GEISHA_RUNTIME")"
+python3 - "$T37_MAIN_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True
+bs = data["benchmarks"]
+assert [b["name"] for b in bs] == ["grp/a", "grp/b"], bs
+assert all(b["iters"] == 20 and b["rounds"] == 3 for b in bs), bs
+PY
+
+# 37e: Project mode (`geisha.toml` + `src/` + `benches/*.gsa`, auto-calibrated iters)
+BENCH_PROJ="$TMP_DIR/t37_bench_proj"
+mkdir -p "$BENCH_PROJ/src" "$BENCH_PROJ/benches"
+cat > "$BENCH_PROJ/geisha.toml" << 'EOF'
+name = "t37_bench_proj"
+version = "0.1.0"
+EOF
+cat > "$BENCH_PROJ/src/t37_bench_proj.gsa" << 'EOF'
+pub def triSum(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(1);
+    while (cellGet(i) <= n) {
+        cellSet(acc, cellGet(acc) + cellGet(i));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+EOF
+cat > "$BENCH_PROJ/benches/core_bench.gsa" << 'EOF'
+use t37_bench_proj.triSum
+use std.bench.blackBox
+
+def bench_tri_sum_500(): Void = {
+    let _ = blackBox(triSum(blackBox(500)));
+    ()
+}
+EOF
+T37_PROJ_JSON="$(cd "$BENCH_PROJ" && "$ABS_GEISHA_37" bench --warmup 2 --rounds 5 --json --runtime "$ABS_RT_37")"
+python3 - "$T37_PROJ_JSON" << 'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+assert data["ok"] is True, data
+bs = data["benchmarks"]
+assert len(bs) == 1 and bs[0]["name"] == "bench_tri_sum_500", bs
+assert bs[0]["iters"] >= 1 and bs[0]["rounds"] == 5, bs
+assert bs[0]["mean_ns"] > 0 and bs[0]["ops_per_sec"] > 0, bs
+PY
+
+echo "PASS [geisha_bench]: std.bench blackBox barriers, standalone bench_*/main, project benches/*.gsa, filter & --json verified"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

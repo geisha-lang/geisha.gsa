@@ -322,6 +322,44 @@ int64_t gs_sys_time_mono_ns(void)
     return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
 }
 
+/* ---- Benchmark black-box barriers (`std.bench`) ---- */
+
+int32_t gs_bench_black_box_i32(int32_t v)
+{
+    volatile int32_t sink = v;
+    return sink;
+}
+
+int64_t gs_bench_black_box_i64(int64_t v)
+{
+    volatile int64_t sink = v;
+    return sink;
+}
+
+double gs_bench_black_box_f64(double v)
+{
+    volatile double sink = v;
+    return sink;
+}
+
+float gs_bench_black_box_f32(float v)
+{
+    volatile float sink = v;
+    return sink;
+}
+
+void *gs_bench_black_box_ptr(void *v)
+{
+    void *volatile sink = v;
+    return sink;
+}
+
+void gs_bench_black_box_void(void)
+{
+    volatile int32_t sink = 0;
+    (void)sink;
+}
+
 /* ---- OS entropy seed (`std.rand`) ---- */
 
 int64_t gs_sys_rand_seed(void)

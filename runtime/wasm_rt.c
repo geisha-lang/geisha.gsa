@@ -860,3 +860,39 @@ void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_f
     if (n <= 0 || chunk_fn == NULL) return;
     chunk_fn(arr_ptr, 0, n, cls_ptr);
 }
+
+int32_t gs_bench_black_box_i32(int32_t v)
+{
+    volatile int32_t sink = v;
+    return sink;
+}
+
+int64_t gs_bench_black_box_i64(int64_t v)
+{
+    volatile int64_t sink = v;
+    return sink;
+}
+
+double gs_bench_black_box_f64(double v)
+{
+    volatile double sink = v;
+    return sink;
+}
+
+float gs_bench_black_box_f32(float v)
+{
+    volatile float sink = v;
+    return sink;
+}
+
+void *gs_bench_black_box_ptr(void *v)
+{
+    void *volatile sink = v;
+    return sink;
+}
+
+void gs_bench_black_box_void(void)
+{
+    volatile int32_t sink = 0;
+    (void)sink;
+}
