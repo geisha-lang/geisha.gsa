@@ -13,9 +13,10 @@ use std.str.{strStartsWith, strEndsWith, strIndexOfByte, strSplitChar, strJoin, 
 use std.sha256.sha256Hex
 use std.path.{pathStem, pathJoin, pathDirname, pathBasename}
 use sys.env.{argCount, argAt, getEnv}
-use sys.fs.{readFile, writeFile, removeFile, removeDirAll, fileExists, mkdirAll}
+use sys.fs.{readFile, writeFile, removeFile, removeDirAll, fileExists, mkdirAll, isDir, readDir}
 use sys.io.eprintLn
 use sys.proc.{ExitStatus, Exited, Signaled, exit, shell, command, cmdEnv, spawn as procSpawn, childWait}
+use std.task.sleepMs
 use ast.{addUniqueStr, sortUniqueStrings}
 use loader.{
     PkgSpec, MkPkgSpec,
@@ -102,6 +103,7 @@ data CliOpts {
         optJson: Bool,
         optSingleCgu: Bool,
         optNoCache: Bool,
+        optWatch: Bool,
         optHelp: Bool,
     },
 }
@@ -161,6 +163,7 @@ def parseCliArgs(): Result CliOpts String = {
         let debugInfo = cellNew(false);
         let singleCgu = cellNew(false);
         let noCache = cellNew(false);
+        let watchFlag = cellNew(false);
         let optLevel: Cell (Option String) = cellNew(None);
         let dumpCore: Cell (Option String) = cellNew(None);
         let compOnly = cellNew(false);
@@ -339,6 +342,9 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--no-cache") {
                 cellSet(noCache, true);
                 cellSet(i, cellGet(i) + 1)
+            } else if ((a == "--watch" || a == "-w") && (sub == "test" || sub == "run")) {
+                cellSet(watchFlag, true);
+                cellSet(i, cellGet(i) + 1)
             } else if ((sub == "run" || sub == "check") && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
                 cellSet(inPath, Some(a));
                 cellSet(i, cellGet(i) + 1)
@@ -377,6 +383,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optJson: cellGet(jsonOut),
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
+                optWatch: cellGet(watchFlag),
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -546,6 +553,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optJson: false,
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
+                optWatch: false,
                 optHelp: cellGet(showHelp),
             }),
         }
@@ -3068,9 +3076,9 @@ def printUsage(): Void = {
     printLn("  geisha update [alias]          Re-resolve remote tags/revs and update geisha.lock");
     printLn("  geisha build [options]         Compile current geisha.toml project");
     printLn("  geisha check [file.gsa]        Fast frontend type/exhaustiveness/Send check (--json)");
-    printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
+    printLn("  geisha run [--watch] [file.gsa] [args..] Build & run project or cached standalone script");
     printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
-    printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
+    printLn("  geisha test [--watch]          Build & run project test suite (tests/*.gsa)");
     printLn("  geisha bench [file|filter]     Run microbenchmarks (--iters N --warmup N --rounds N --filter <pat> --json)");
     printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
     printLn("  geisha fmt [options] [paths..] Format .gsa files in-place (--check, --write, --stdout)");
@@ -3103,6 +3111,132 @@ def printUsage(): Void = {
     printLn("  --single-cgu                   Emit a single monolithic LLVM IR unit instead of per-module CGUs");
     printLn("  --no-cache                     Bypass incremental CGU/native/project object caches");
     printLn("  -h, --help                     Show this help message")
+}
+
+def isWatchIgnoredDir(name: String): Bool =
+    name == ".git" || name == "build" || name == "dist" || name == "target"
+    || name == "node_modules" || strStartsWith(name, ".")
+
+def collectWatchFilesDir(dir: String, outRev: Cell (List String)): Void =
+    match readDir(dir) {
+        Err(_) -> (),
+        Ok(entries) -> {
+            let cur = cellNew(entries);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(nm, r) -> {
+                        if (!isWatchIgnoredDir(nm)) {
+                            let full = pathJoin(dir, nm);
+                            if (isDir(full)) {
+                                collectWatchFilesDir(full, outRev)
+                            } else if (strEndsWith(nm, ".gsa") || nm == "geisha.toml" || nm == "geisha.lock") {
+                                cellSet(outRev, Cons(full, cellGet(outRev)))
+                            } else ()
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+
+def computeWatchSnapshot(watchDirs: List String, extraFiles: List String): String = {
+    let filesRev: Cell (List String) = cellNew(extraFiles);
+    let cd = cellNew(watchDirs);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) {
+            Cons(d, r) -> {
+                if (strLen(d) > 0 && isDir(d)) {
+                    collectWatchFilesDir(d, filesRev)
+                } else ();
+                cellSet(cd, r)
+            },
+            Nil -> (),
+        }
+    };
+    let sorted = sortUniqueStrings(cellGet(filesRev));
+    let b = bufNew();
+    let cf = cellNew(sorted);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fp, r) -> {
+                if (fileExists(fp)) {
+                    bufPushStr(b, fp);
+                    bufPushByte(b, 9);
+                    bufPushStr(b, i64ToStr(c_file_size(fp)));
+                    bufPushByte(b, 9);
+                    bufPushStr(b, i64ToStr(c_file_mtime_ms(fp)));
+                    bufPushByte(b, 10)
+                } else ();
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufToString(b)
+}
+
+def clearWatchScreen(): Void =
+    match getEnv("GEISHA_WATCH_NO_CLEAR") {
+        Some("1") -> (),
+        _ -> {
+            let b = bufNew();
+            bufPushByte(b, 27);
+            bufPushStr(b, "[2J");
+            bufPushByte(b, 27);
+            bufPushStr(b, "[H");
+            printLn(bufToString(b))
+        },
+    }
+
+def watchPollIntervalMs(): Int =
+    match getEnv("GEISHA_WATCH_POLL_MS") {
+        Some(raw) -> match parseInt(raw) {
+            Ok(ms) if (ms >= 20) -> ms,
+            _ -> 250,
+        },
+        None -> 250,
+    }
+
+def runWatchLoop(
+    label: String,
+    watchDirs: List String,
+    extraFiles: List String,
+    runOnce: () -> Result Int String
+): Result Int String = {
+    let pollMs = watchPollIntervalMs();
+    let lastSnap = cellNew(computeWatchSnapshot(watchDirs, extraFiles));
+    let firstRun = cellNew(true);
+    while (true) {
+        clearWatchScreen();
+        if (cellGet(firstRun)) {
+            eprintLn("[watch] Starting " + label + "...");
+            cellSet(firstRun, false)
+        } else {
+            eprintLn("[watch] Change detected — re-running " + label + "...")
+        };
+        match runOnce() {
+            Ok(rc) ->
+                if (rc != 0) eprintLn("[watch] Exited with status " + intToStr(rc) + ". Watching for changes...")
+                else eprintLn("[watch] Done. Watching for changes..."),
+            Err(msg) -> {
+                if (isFormattedDiag(msg)) eprintLn(msg)
+                else eprintLn("error: " + msg);
+                eprintLn("[watch] Watching for changes...")
+            },
+        };
+        let changed = cellNew(false);
+        while (!cellGet(changed)) {
+            sleepMs(pollMs);
+            let nextSnap = computeWatchSnapshot(watchDirs, extraFiles);
+            if (nextSnap != cellGet(lastSnap)) {
+                cellSet(lastSnap, nextSnap);
+                cellSet(changed, true)
+            } else ()
+        }
+    };
+    Ok(0)
 }
 
 def runDriver(): Result Int String = {
@@ -3150,45 +3284,81 @@ def runDriver(): Result Int String = {
                 Ok(0)
             },
             Some("check") -> runCheckSubcmd(opts),
-            Some("run") -> match opts.optInput {
-                Some(gsaFile) ->
-                    if (opts.optDebug) runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
-                    else runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, effOptLevel, opts.optDebug, opts.optNoCache),
-                None ->
-                    if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {
-                        let projDir = match findProjectRoot(".") {
-                            Some(d) -> d,
-                            None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
-                        };
-                        let bundlePath = cmdBuildProject(
-                            projDir, opts.optTarget, false, false, opts.optOutPath, None,
-                            opts.optRuntime, opts.optExports, opts.optNoMain, opts.optBootSym,
-                            opts.optLevel, opts.optStrip, opts.optSlimRuntime, opts.optNoDts,
-                            None, cbs
-                        )?;
-                        if (opts.optTarget == "macos-app") {
-                            let rc = shell("open " + shellQuote(bundlePath));
-                            Ok(if (rc == 0) 0 else 1)
-                        } else {
-                            let (rootMf, _, _) = resolveProjectGraph(projDir, false, None, false)?;
-                            let bid = match rootMf.mfIosBundle.abBundleId {
-                                Some(id) -> id,
-                                None -> "com.geisha." + rootMf.mfName,
+            Some("run") -> {
+                let runOnce = () -> match opts.optInput {
+                    Some(gsaFile) ->
+                        if (opts.optDebug) runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
+                        else runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, effOptLevel, opts.optDebug, opts.optNoCache),
+                    None ->
+                        if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {
+                            let projDir = match findProjectRoot(".") {
+                                Some(d) -> d,
+                                None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
                             };
-                            let cmd =
-                                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl install booted "
-                                + shellQuote(bundlePath)
-                                + " && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl launch booted "
-                                + shellQuote(bid);
-                            let rc = shell(cmd);
-                            Ok(if (rc == 0) 0 else 1)
-                        }
-                    } else {
-                        cmdRun(opts.optSubArgs, None, opts.optRuntime, cbs)
-                    },
+                            let bundlePath = cmdBuildProject(
+                                projDir, opts.optTarget, false, false, opts.optOutPath, None,
+                                opts.optRuntime, opts.optExports, opts.optNoMain, opts.optBootSym,
+                                opts.optLevel, opts.optStrip, opts.optSlimRuntime, opts.optNoDts,
+                                None, cbs
+                            )?;
+                            if (opts.optTarget == "macos-app") {
+                                let rc = shell("open " + shellQuote(bundlePath));
+                                Ok(if (rc == 0) 0 else 1)
+                            } else {
+                                let (rootMf, _, _) = resolveProjectGraph(projDir, false, None, false)?;
+                                let bid = match rootMf.mfIosBundle.abBundleId {
+                                    Some(id) -> id,
+                                    None -> "com.geisha." + rootMf.mfName,
+                                };
+                                let cmd =
+                                    "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl install booted "
+                                    + shellQuote(bundlePath)
+                                    + " && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun simctl launch booted "
+                                    + shellQuote(bid);
+                                let rc = shell(cmd);
+                                Ok(if (rc == 0) 0 else 1)
+                            }
+                        } else {
+                            cmdRun(opts.optSubArgs, None, opts.optRuntime, cbs)
+                        },
+                };
+                if (opts.optWatch) {
+                    match opts.optInput {
+                        Some(gsaFile) -> {
+                            let dir = pathDirname(gsaFile);
+                            let watchRoot = match findProjectRoot(dir) {
+                                Some(pr) -> pr,
+                                None -> if (strLen(dir) == 0) "." else dir,
+                            };
+                            runWatchLoop("geisha run " + gsaFile, [watchRoot], [gsaFile], runOnce)
+                        },
+                        None -> {
+                            let projDir = match findProjectRoot(".") {
+                                Some(d) -> d,
+                                None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
+                            };
+                            runWatchLoop("geisha run", [projDir], [pathJoin(projDir, "geisha.toml")], runOnce)
+                        },
+                    }
+                } else {
+                    runOnce()
+                }
             },
             Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
-            Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
+            Some("test") ->
+                if (opts.optWatch) {
+                    let projDir = match findProjectRoot(".") {
+                        Some(d) -> d,
+                        None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
+                    };
+                    runWatchLoop("geisha test", [projDir], [pathJoin(projDir, "geisha.toml")], () -> {
+                        cmdTest(opts.optRuntime, cbs)?;
+                        Ok(0)
+                    })
+                } else {
+                    cmdTest(opts.optRuntime, cbs)?;
+                    Ok(0)
+                },
             Some("bench") -> cmdBench(opts.optSubArgs, opts.optJson, opts.optRuntime, cbs),
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
             Some("fmt") -> cmdFmt(opts.optSubArgs),

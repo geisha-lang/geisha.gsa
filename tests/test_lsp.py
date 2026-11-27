@@ -171,6 +171,10 @@ def main() -> int:
         caps = init_resp["result"]["capabilities"]
         assert caps["hoverProvider"] is True
         assert caps["definitionProvider"] is True
+        assert caps["referencesProvider"] is True
+        assert caps["renameProvider"]["prepareProvider"] is True
+        assert caps["inlayHintProvider"] is True
+        assert "quickfix" in caps["codeActionProvider"]["codeActionKinds"]
         assert caps["documentSymbolProvider"] is True
         assert caps["completionProvider"]["triggerCharacters"] == ["."]
         assert init_resp["result"]["serverInfo"]["name"] == "geisha-lsp"
@@ -518,6 +522,251 @@ def main() -> int:
         assert len(dep_link_err) == 1 and dep_link_err[0]["range"]["start"]["line"] == 0, f"expected error on symlink URI {dep_link_uri}: {dep_link_err}"
         assert client.wait_diag_for(app_link_uri) == []
 
+        # 11e. Scope-aware references & rename (shadowing, sibling functions, struct fields, cross-file & unsaved overlay)
+        ref_dir = root / "refactor_proj"
+        ref_dir.mkdir(parents=True)
+        lib_ref_path = ref_dir / "geom.gsa"
+        lib_ref_src = (
+            "pub data Vec2 { x: Int, y: Int }\n"
+            "pub data Other { x: Int }\n"
+            "pub data Color {\n"
+            "    Red,\n"
+            "    Blue(Int),\n"
+            "}\n"
+            "pub def scale(v: Vec2, factor: Int): Int = v.x * factor + v.y\n"
+        )
+        app_ref_path = ref_dir / "app.gsa"
+        app_ref_src = (
+            "use geom.{Vec2, Other, Color, Red, Blue, scale}\n"
+            "\n"
+            "def scopedShadow(): Int = {\n"
+            "    let x = 1;\n"
+            "    let y = x + 2;\n"
+            "    let x = 10;\n"
+            "    x + y\n"
+            "}\n"
+            "\n"
+            "def siblingScope(): Int = {\n"
+            "    let x = 99;\n"
+            "    x\n"
+            "}\n"
+            "\n"
+            "def useGeom(c: Color): Int = {\n"
+            "    let p = Vec2 { x: 3, y: 4 };\n"
+            "    let o = Other { x: 5 };\n"
+            "    let explicit: Int = p.x + o.x;\n"
+            "    let res = scale(p, 2) + explicit;\n"
+            "    match c {\n"
+            "        Red -> res,\n"
+            "        Blue(n) -> res + n,\n"
+            "    }\n"
+            "}\n"
+        )
+        lib_ref_path.write_text(lib_ref_src, encoding="utf-8")
+        app_ref_path.write_text(app_ref_src, encoding="utf-8")
+        lib_ref_uri = path_to_uri(lib_ref_path)
+        app_ref_uri = path_to_uri(app_ref_path)
+
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": lib_ref_uri, "languageId": "geisha", "version": 1, "text": lib_ref_src},
+        })
+        assert client.wait_diag_for(lib_ref_uri) == []
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": app_ref_uri, "languageId": "geisha", "version": 1, "text": app_ref_src},
+        })
+        assert client.wait_diag_for(app_ref_uri) == []
+
+        # References on outer `x` (line 3, col 8: `let x = 1;`): only line 3 & line 4 (NOT line 5/6 or sibling line 10/11)
+        refs_outer_incl = client.request("textDocument/references", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 3, "character": 8},
+            "context": {"includeDeclaration": True},
+        })
+        outer_lines = sorted(r["range"]["start"]["line"] for r in refs_outer_incl["result"])
+        assert outer_lines == [3, 4], f"expected outer x refs on lines [3, 4], got {refs_outer_incl}"
+
+        refs_outer_excl = client.request("textDocument/references", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 3, "character": 8},
+            "context": {"includeDeclaration": False},
+        })
+        outer_excl_lines = sorted(r["range"]["start"]["line"] for r in refs_outer_excl["result"])
+        assert outer_excl_lines == [4], f"expected outer x refs (excl decl) on [4], got {refs_outer_excl}"
+
+        # References on inner shadowed `x` (line 5, col 8): only lines 5 & 6
+        refs_inner = client.request("textDocument/references", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 5, "character": 8},
+            "context": {"includeDeclaration": True},
+        })
+        inner_lines = sorted(r["range"]["start"]["line"] for r in refs_inner["result"])
+        assert inner_lines == [5, 6], f"expected inner x refs on [5, 6], got {refs_inner}"
+
+        # References on Vec2.x field (line 17, col 26: `p.x`): geom.gsa decl + v.x + app.gsa Vec2{x:3} + p.x (NOT Other.x!)
+        refs_field = client.request("textDocument/references", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 17, "character": 26},
+            "context": {"includeDeclaration": True},
+        })
+        field_uris_lines = sorted((r["uri"], r["range"]["start"]["line"]) for r in refs_field["result"])
+        assert (lib_ref_uri, 0) in field_uris_lines and (lib_ref_uri, 6) in field_uris_lines, f"missing geom.gsa Vec2.x refs: {field_uris_lines}"
+        assert (app_ref_uri, 15) in field_uris_lines and (app_ref_uri, 17) in field_uris_lines, f"missing app.gsa Vec2.x refs: {field_uris_lines}"
+        assert (lib_ref_uri, 1) not in field_uris_lines and (app_ref_uri, 16) not in field_uris_lines, f"Other.x leaked into Vec2.x refs: {field_uris_lines}"
+
+        # prepareRename: rejects keyword `let`, accepts `scale`
+        prep_kw = client.request("textDocument/prepareRename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 3, "character": 5},
+        })
+        assert prep_kw["result"] is None, f"expected null prepareRename on keyword 'let', got {prep_kw}"
+
+        prep_scale = client.request("textDocument/prepareRename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 18, "character": 16},
+        })
+        assert prep_scale["result"] is not None and prep_scale["result"]["placeholder"] == "scale", f"unexpected prepareRename: {prep_scale}"
+
+        # rename: rejects keyword and invalid identifier with -32602
+        bad_ren_kw = client.request("textDocument/rename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 18, "character": 16},
+            "newName": "match",
+        })
+        assert "error" in bad_ren_kw and bad_ren_kw["error"]["code"] == -32602, f"expected -32602 for keyword rename: {bad_ren_kw}"
+
+        bad_ren_id = client.request("textDocument/rename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 18, "character": 16},
+            "newName": "123bad",
+        })
+        assert "error" in bad_ren_id and bad_ren_id["error"]["code"] == -32602, f"expected -32602 for invalid ident rename: {bad_ren_id}"
+
+        # Cross-file rename of `scale` -> `scaleVec` across geom.gsa and app.gsa
+        ren_scale = client.request("textDocument/rename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 18, "character": 16},
+            "newName": "scaleVec",
+        })
+        changes_scale = ren_scale["result"]["changes"]
+        assert lib_ref_uri in changes_scale and app_ref_uri in changes_scale, f"expected cross-file rename edits: {changes_scale}"
+        assert len(changes_scale[lib_ref_uri]) == 1 and changes_scale[lib_ref_uri][0]["newText"] == "scaleVec"
+        assert len(changes_scale[app_ref_uri]) == 2, f"expected import + call edits in app.gsa, got: {changes_scale[app_ref_uri]}"
+
+        # Cross-file rename of enum variant `Blue` -> `Cyan`
+        ren_var = client.request("textDocument/rename", {
+            "textDocument": {"uri": app_ref_uri},
+            "position": {"line": 21, "character": 10},
+            "newName": "Cyan",
+        })
+        changes_var = ren_var["result"]["changes"]
+        assert lib_ref_uri in changes_var and app_ref_uri in changes_var, f"expected cross-file variant rename: {changes_var}"
+
+        # Unsaved overlay cross-file rename: add another call to `scale` in unsaved app.gsa buffer
+        app_ref_unsaved = app_ref_src + "\ndef extraCall(v: Vec2): Int = scale(v, 3)\n"
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": app_ref_uri, "version": 2},
+            "contentChanges": [{"text": app_ref_unsaved}],
+        })
+        assert client.wait_diag_for(app_ref_uri) == []
+        ren_overlay = client.request("textDocument/rename", {
+            "textDocument": {"uri": lib_ref_uri},
+            "position": {"line": 6, "character": 9},
+            "newName": "scaleVec",
+        })
+        assert len(ren_overlay["result"]["changes"][app_ref_uri]) == 3, f"expected 3 edits in unsaved overlay app.gsa, got: {ren_overlay}"
+
+        # 11f. Inlay Hints: inferred `let` types (skipping explicit annotations) & function call parameter names
+        hints_resp = client.request("textDocument/inlayHint", {
+            "textDocument": {"uri": app_ref_uri},
+            "range": {"start": {"line": 14, "character": 0}, "end": {"line": 23, "character": 0}},
+        })
+        hints = hints_resp["result"]
+        type_hints = [(h["position"]["line"], h["label"]) for h in hints if h["kind"] == 1]
+        param_hints = [(h["position"]["line"], h["label"]) for h in hints if h["kind"] == 2]
+        assert any(l == 15 and "Vec2" in lbl for l, lbl in type_hints), f"expected Vec2 inlay hint on line 15: {type_hints}"
+        assert any(l == 18 and "Int" in lbl for l, lbl in type_hints), f"expected Int inlay hint on line 18: {type_hints}"
+        assert not any(l == 17 for l, _ in type_hints), f"explicitly annotated `let explicit: Int` on line 17 must not get type hint: {type_hints}"
+        assert (18, "v:") in param_hints and (18, "factor:") in param_hints, f"expected parameter hints v: and factor: on line 18: {param_hints}"
+
+        # 11g. Code Actions (Quick Fixes): unused var prefix `_`, missing match arm skeleton, auto-import
+        qa_dir = root / "quickfix_proj"
+        qa_dir.mkdir(parents=True)
+        (qa_dir / "myutil.gsa").write_text("pub def magicNum(): Int = 77\n", encoding="utf-8")
+
+        # 11g-1: Unused variable -> prefix `_`
+        unused_path = qa_dir / "unused.gsa"
+        unused_src = "def f(): Int = {\n    let temp = 42;\n    1\n}\n"
+        unused_path.write_text(unused_src, encoding="utf-8")
+        unused_uri = path_to_uri(unused_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": unused_uri, "languageId": "geisha", "version": 1, "text": unused_src},
+        })
+        assert client.wait_diag_for(unused_uri) == []
+        ca_unused = client.request("textDocument/codeAction", {
+            "textDocument": {"uri": unused_uri},
+            "range": {"start": {"line": 1, "character": 8}, "end": {"line": 1, "character": 12}},
+            "context": {"diagnostics": []},
+        })
+        unused_actions = ca_unused["result"]
+        assert any("_temp" in a["edit"]["changes"][unused_uri][0]["newText"] for a in unused_actions), f"expected _temp quickfix: {unused_actions}"
+
+        # 11g-2: Missing match branch skeleton
+        match_path = qa_dir / "missing_match.gsa"
+        match_src = (
+            "data Toggle { On, Off }\n"
+            "def f(t: Toggle): Void = match t {\n"
+            "    On -> (),\n"
+            "}\n"
+        )
+        match_path.write_text(match_src, encoding="utf-8")
+        match_uri = path_to_uri(match_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": match_uri, "languageId": "geisha", "version": 1, "text": match_src},
+        })
+        match_diags = client.wait_diag_for(match_uri)
+        assert len(match_diags) == 1 and "Off" in match_diags[0]["message"], f"expected missing Off diag: {match_diags}"
+        ca_match = client.request("textDocument/codeAction", {
+            "textDocument": {"uri": match_uri},
+            "range": match_diags[0]["range"],
+            "context": {"diagnostics": match_diags},
+        })
+        match_actions = ca_match["result"]
+        assert any("Off -> ()" in a["edit"]["changes"][match_uri][0]["newText"] for a in match_actions), f"expected missing match arm quickfix: {match_actions}"
+
+        # 11g-3: Missing symbol auto-import (both builtin std.str and sibling myutil)
+        imp_path = qa_dir / "missing_imp.gsa"
+        imp_src = "def f(): String = intToStr(1)\n"
+        imp_path.write_text(imp_src, encoding="utf-8")
+        imp_uri = path_to_uri(imp_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": imp_uri, "languageId": "geisha", "version": 1, "text": imp_src},
+        })
+        imp_diags = client.wait_diag_for(imp_uri)
+        assert len(imp_diags) == 1 and "intToStr" in imp_diags[0]["message"], f"expected undefined intToStr diag: {imp_diags}"
+        ca_imp = client.request("textDocument/codeAction", {
+            "textDocument": {"uri": imp_uri},
+            "range": imp_diags[0]["range"],
+            "context": {"diagnostics": imp_diags},
+        })
+        imp_actions = ca_imp["result"]
+        assert any("use std.str.intToStr" in a["edit"]["changes"][imp_uri][0]["newText"] for a in imp_actions), f"expected std.str.intToStr auto-import: {imp_actions}"
+
+        imp2_src = "def f(): Int = magicNum()\n"
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": imp_uri, "version": 2},
+            "contentChanges": [{"text": imp2_src}],
+        })
+        imp2_diags = client.wait_diag_for(imp_uri)
+        assert len(imp2_diags) == 1 and "magicNum" in imp2_diags[0]["message"]
+        ca_imp2 = client.request("textDocument/codeAction", {
+            "textDocument": {"uri": imp_uri},
+            "range": imp2_diags[0]["range"],
+            "context": {"diagnostics": imp2_diags},
+        })
+        imp2_actions = ca_imp2["result"]
+        assert any("use myutil.magicNum" in a["edit"]["changes"][imp_uri][0]["newText"] for a in imp2_actions), f"expected myutil.magicNum auto-import: {imp2_actions}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
@@ -530,7 +779,7 @@ def main() -> int:
         rc = client.proc.wait(timeout=10)
         assert rc == 0, f"expected exit code 0, got {rc}"
 
-    print("PASS [geisha_lsp]: JSON-RPC stdio round-trip (diagnostics, hover, definition, documentSymbol, completion, UTF-8/CRLF, didClose, shutdown) verified!")
+    print("PASS [geisha_lsp]: JSON-RPC stdio round-trip (diagnostics, hover, definition, references, prepareRename/rename, inlayHint, codeAction, documentSymbol, completion, UTF-8/CRLF, didClose, shutdown) verified!")
     return 0
 
 
