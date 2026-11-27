@@ -587,6 +587,26 @@ def float_closure_probe(tag: String, w: Float, y0: Float): String = {
     applyClosure(fmt, 10.5)
 }
 
+def scoped_capture_probe(base: Int, scale: Int): Int = {
+    let fromArena = withArena((a) -> {
+        let p = arenaAlloc(a, intToI64(16));
+        scopedPtrWriteF32Le(p, 0, floatToF32(intToFloat(base * scale)));
+        f32ToInt(scopedPtrReadF32Le(p, 0))
+    });
+    let fromAlloca = withAlloca(16, (p) -> {
+        scopedPtrWriteF32Le(p, 0, floatToF32(intToFloat(base + scale)));
+        f32ToInt(scopedPtrReadF32Le(p, 0))
+    });
+    let fp = foreignPtrAlloc(intToI64(16));
+    let fromForeign = withForeignPtr(fp, (p) -> {
+        scopedPtrWriteF32Le(p, 0, floatToF32(intToFloat(scale * 3)));
+        f32ToInt(scopedPtrReadF32Le(p, 0))
+    });
+    let arr = parTabulate(4, (i) -> base + i * scale);
+    let fromTab = immArrayGet(arr, 0) + immArrayGet(arr, 1) + immArrayGet(arr, 2) + immArrayGet(arr, 3);
+    fromArena + fromAlloca + fromForeign + fromTab
+}
+
 def main(): Void = cellSet(counter, 10)
 EOF
 "$GEISHA_BIN" --target wasm32 --runtime ./build/wasm_rt.o -o "$TMP_DIR/t12_wasm.wasm" "$TMP_DIR/t12_wasm.gsa"
@@ -622,6 +642,7 @@ WebAssembly.instantiate(bytes, {
   const res = readStr(resPtr);
   const syncOk = (notified === res ? "sync" : "diff");
   const clsRes = readStr(ex.float_closure_probe(writeStr("card"), 25.0, 4.5));
+  const capRes = ex.scoped_capture_probe(7, 5);
   // Verify frame-boundary mark-sweep GC reclaims transient garbage while preserving global Cell root
   let totalReclaimed = 0;
   for (let i = 0; i < 200; i++) {
@@ -632,10 +653,10 @@ WebAssembly.instantiate(bytes, {
   const liveAfter = ex.gs_wasm_heap_live();
   const c2 = ex.bump(1);
   const gcOk = (totalReclaimed > 20000 && liveAfter < 4096 && c2 === 16) ? "gc-ok" : ("gc-bad:" + totalReclaimed + ":" + liveAfter + ":" + c2);
-  console.log(c + "|" + res + "|" + syncOk + "|" + clsRes + "|" + gcOk);
+  console.log(c + "|" + res + "|" + syncOk + "|" + clsRes + "|" + capRes + "|" + gcOk);
 });
 ' "$TMP_DIR/t12_wasm.wasm")"
-assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|card:65|gc-ok' "$WASM_OUT"
+assert_eq "wasm32_codec_json_and_host_ffi" '15|{"name":"Tingfeng","hp":115}|sync|card:65|120|gc-ok' "$WASM_OUT"
 fi
 
 # 13. Mode-Polymorphic `Send` Closures & Implicit Mode-Lifted ADTs (Positive + 8 Negative Soundness Checks)

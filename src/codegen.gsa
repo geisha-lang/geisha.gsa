@@ -1353,14 +1353,22 @@ def emitNullableBoxToPair(fctx: FnEmitCtx, boxPtr: String, pairRetTy: Type): Str
     emitAssign(fctx, "insertvalue " + pairLlvmTy + " " + agg0 + ", " + elemLlvmTy + " " + valPhi + ", 1")
 }
 
+def emitClosureFnSlot(mctx: ModEmitCtx, fctx: FnEmitCtx, clsPtr: String): String =
+    if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", clsPtr, 0)
+    else emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0)
+
+def emitClosureFvsPtr(mctx: ModEmitCtx, fctx: FnEmitCtx, clsPtr: String): String =
+    if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", clsPtr, 2)
+    else emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1)
+
 def getOrEmitThunkRunner(mctx: ModEmitCtx, retTy: Type): String = {
     let rawSym = "__gs_thunk_runner__" + mangleConcTypeSym(retTy);
     let sym = llvmSym(rawSym);
     if (!strMapContains(mctx.mcSynthSet, rawSym)) {
         strMapInsert(mctx.mcSynthSet, rawSym, true);
         let rf = newFnEmitCtx(rawSym);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let callVal =
@@ -1390,8 +1398,8 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
         let rf = newFnEmitCtx(rawSym);
         let stVal = unboxGeishaValue(rf, "%state_box", stateTy);
         let stLlvm = getValLlvmType(stateTy);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let callVal =
@@ -1418,8 +1426,8 @@ def getOrEmitTabulateRunner(mctx: ModEmitCtx, elemTy: Type): String = {
         let rf = newFnEmitCtx(rawSym);
         let elemLlvm = getValLlvmType(elemTy);
         let retLlvm = getFnRetLlvmType(elemTy);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let elemsBase = emitGep(rf, "i8", "%arr_ptr", "8");
         let idxSlot = emitEntryAlloca(rf, "i32");
@@ -2347,8 +2355,8 @@ def tryEmitIntrinsic(
         let fp = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let rawP = emitAssign(fctx, "call ptr @gc_foreign_ptr_get(ptr " + fp + ")");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -2369,8 +2377,8 @@ def tryEmitIntrinsic(
         let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
         let savedSp = emitAssign(fctx, "call ptr @llvm.stacksave.p0()");
         let bufPtr = emitAssign(fctx, "alloca i8, i64 " + n64 + ", align 16");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -2385,8 +2393,8 @@ def tryEmitIntrinsic(
     } else if (name == "withArena") {
         let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let arenaPtr = emitAssign(fctx, "call ptr @gc_arena_new()");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -3302,12 +3310,8 @@ def genExpr(
                     Nil -> (),
                 }
             };
-            let fvsPtr =
-                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 2)
-                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 1);
-            let fnEntryPtr =
-                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 0)
-                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 0);
+            let fvsPtr = emitClosureFvsPtr(mctx, fctx, calleePtr);
+            let fnEntryPtr = emitClosureFnSlot(mctx, fctx, calleePtr);
             let fnEntry = emitLoad(fctx, "ptr", fnEntryPtr);
 
             let allTys = listRev(Cons("ptr", cellGet(argTysRev)));
