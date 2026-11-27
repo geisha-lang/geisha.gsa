@@ -13,12 +13,13 @@ use std.str.{
     intToStr, strStartsWith, strEndsWith, strTrim, strSplitChar, strJoin,
     strIndexOfByte, parseInt
 }
-use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.buf.{bufNew, bufLen, bufPushByte, bufPushStr, bufToString}
 use std.path.{isAbsPath, pathJoin, pathDirname, pathBasename, pathStem}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.sha256.{sha256New, sha256Update, sha256FinishHex, sha256Hex}
 use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
 use std.toml.{parse as tomlParse, stringify as tomlStringify}
+use std.json.{parse as jsonParse}
 use sys.env.{getEnv}
 use sys.fs.{fileExists, isDir, mkdirAll, readDir, readFile, writeFile, removeFile, renameFile, removeDirAll}
 use sys.io.eprintLn
@@ -2252,208 +2253,286 @@ pub def cmdInit(args: List String): Result Void String = {
     }
 }
 
-def isSupportedTemplate(tmpl: String): Bool =
-    tmpl == "cli" || tmpl == "lib" || tmpl == "wasm" || tmpl == "web-js"
-
-def printTemplateList(): Void = {
-    printLn("Available project templates for `geisha new --template <name> <dir>`:");
-    printLn("  cli     Command-line application with src/main.gsa, helper module, and tests/");
-    printLn("  lib     Reusable Geisha library package with src/<name>.gsa and tests/");
-    printLn("  wasm    WebAssembly (--target wasm32) module with [target.wasm32] exports and tests/");
-    printLn("  web-js  Web / ES Module (--target js) app with .d.ts declarations, web/index.html, and tests/")
+def defaultTemplatesRepo(): String = match getEnv("GEISHA_TEMPLATES_REPO") {
+    Some(u) if (strTrim(u) != "") -> strTrim(u),
+    _ -> "https://github.com/geisha-lang/templates",
 }
 
-def scaffoldTemplate(projDir: String, pkgName: String, tmpl: String): Result Void String = {
-    let srcDir = pathJoin(projDir, "src");
-    let testsDir = pathJoin(projDir, "tests");
-    mkdirAll(srcDir)?;
-    mkdirAll(testsDir)?;
-    let mfPath = pathJoin(projDir, "geisha.toml");
-    writeFileIfMissing(pathJoin(projDir, ".gitignore"), "build/\ngeisha.local.toml\n")?;
+def isDirectTemplateUrl(spec: String): Bool =
+    strStartsWith(spec, "https://")
+    || strStartsWith(spec, "http://")
+    || strStartsWith(spec, "git@")
+    || strStartsWith(spec, "ssh://")
+    || strStartsWith(spec, "file://")
+    || strEndsWith(spec, ".git")
 
-    if (tmpl == "cli") {
-        let mfContent =
-            "name = \"" + pkgName + "\"\n"
-            + "version = \"0.1.0\"\n"
-            + "entry = \"src/main.gsa\"\n\n"
-            + "[deps]\n";
-        writeFile(mfPath, mfContent)?;
-        let corePath = pathJoin(srcDir, "core.gsa");
-        writeFileIfMissing(
-            corePath,
-            "// Core application logic for " + pkgName + "\n\n"
-            + "/// Format a greeting message for `name`.\n"
-            + "pub def greet(name: String): String =\n"
-            + "    \"Hello, \" + name + \"!\"\n"
-        )?;
-        let mainPath = pathJoin(srcDir, "main.gsa");
-        writeFileIfMissing(
-            mainPath,
-            "use sys.env.{argCount, argAt}\n"
-            + "use core.greet\n\n"
-            + "def main(): Void = {\n"
-            + "    let target = if (argCount() > 1) argAt(1) else \"" + pkgName + "\";\n"
-            + "    printLn(greet(target))\n"
-            + "}\n"
-        )?;
-        let specPath = pathJoin(testsDir, "spec.gsa");
-        writeFileIfMissing(
-            specPath,
-            "use core.greet\n"
-            + "use sys.io.eprintLn\n"
-            + "use sys.proc.exit\n\n"
-            + "def main(): Void = {\n"
-            + "    if (greet(\"Geisha\") == \"Hello, Geisha!\") {\n"
-            + "        printLn(\"ok\")\n"
-            + "    } else {\n"
-            + "        eprintLn(\"greet test failed\");\n"
-            + "        exit(1)\n"
-            + "    }\n"
-            + "}\n"
-        )
-    } else if (tmpl == "lib") {
-        let mfContent =
-            "name = \"" + pkgName + "\"\n"
-            + "version = \"0.1.0\"\n\n"
-            + "[deps]\n";
-        writeFile(mfPath, mfContent)?;
-        let libPath = pathJoin(srcDir, pkgName + ".gsa");
-        writeFileIfMissing(
-            libPath,
-            "// " + pkgName + " library root module\n\n"
-            + "/// Return a friendly greeting for `name`.\n"
-            + "pub def hello(name: String): String =\n"
-            + "    \"Hello, \" + name + \"!\"\n\n"
-            + "/// Add two integers.\n"
-            + "pub def add(a: Int, b: Int): Int = a + b\n"
-        )?;
-        let specPath = pathJoin(testsDir, "spec.gsa");
-        writeFileIfMissing(
-            specPath,
-            "use " + pkgName + ".{hello, add}\n"
-            + "use sys.io.eprintLn\n"
-            + "use sys.proc.exit\n\n"
-            + "def main(): Void = {\n"
-            + "    if (hello(\"Geisha\") == \"Hello, Geisha!\" && add(20, 22) == 42) {\n"
-            + "        printLn(\"ok\")\n"
-            + "    } else {\n"
-            + "        eprintLn(\"library test failed\");\n"
-            + "        exit(1)\n"
-            + "    }\n"
-            + "}\n"
-        )
-    } else if (tmpl == "wasm") {
-        let mfContent =
-            "name = \"" + pkgName + "\"\n"
-            + "version = \"0.1.0\"\n"
-            + "entry = \"src/main.gsa\"\n\n"
-            + "[deps]\n\n"
-            + "[target.wasm32]\n"
-            + "exports = [\"wasm_add\"]\n"
-            + "opt = \"z\"\n"
-            + "strip = true\n";
-        writeFile(mfPath, mfContent)?;
-        let corePath = pathJoin(srcDir, "core.gsa");
-        writeFileIfMissing(
-            corePath,
-            "// Portable core logic for " + pkgName + " (shared by wasm32 and native tests)\n\n"
-            + "/// Add two 32-bit integers.\n"
-            + "pub def computeAdd(a: Int, b: Int): Int = a + b\n"
-        )?;
-        let mainPath = pathJoin(srcDir, "main.gsa");
-        writeFileIfMissing(
-            mainPath,
-            "use core.computeAdd\n\n"
-            + "pub extern \"wasm_add\" def wasmAdd(a: Int, b: Int): Int = computeAdd(a, b)\n\n"
-            + "def main(): Void = ()\n"
-        )?;
-        let specPath = pathJoin(testsDir, "spec.gsa");
-        writeFileIfMissing(
-            specPath,
-            "use core.computeAdd\n"
-            + "use sys.io.eprintLn\n"
-            + "use sys.proc.exit\n\n"
-            + "def main(): Void = {\n"
-            + "    if (computeAdd(19, 23) == 42) {\n"
-            + "        printLn(\"ok\")\n"
-            + "    } else {\n"
-            + "        eprintLn(\"wasm core test failed\");\n"
-            + "        exit(1)\n"
-            + "    }\n"
-            + "}\n"
-        )
+def isSafeTemplateName(name: String): Bool =
+    name != ""
+    && name != "."
+    && name != ".."
+    && match strIndexOfByte(name, 47, 0) { Some(_) -> false, None -> true }
+    && match strIndexOfByte(name, 92, 0) { Some(_) -> false, None -> true }
+
+def replaceAllSubstr(s: String, needle: String, repl: String): String = {
+    let slen = strLen(s);
+    let nlen = strLen(needle);
+    if (nlen == 0 || slen < nlen) s
+    else {
+        let out = bufNew();
+        let i = cellNew(0);
+        while (cellGet(i) < slen) {
+            let cur = cellGet(i);
+            let matched = if (cur + nlen <= slen) {
+                let j = cellNew(0);
+                let ok = cellNew(true);
+                while (cellGet(j) < nlen && cellGet(ok)) {
+                    if (strByteAt(s, cur + cellGet(j)) != strByteAt(needle, cellGet(j))) cellSet(ok, false) else ();
+                    cellSet(j, cellGet(j) + 1)
+                };
+                cellGet(ok)
+            } else false;
+            if (matched) {
+                bufPushStr(out, repl);
+                cellSet(i, cur + nlen)
+            } else {
+                bufPushByte(out, strByteAt(s, cur));
+                cellSet(i, cur + 1)
+            }
+        };
+        bufToString(out)
+    }
+}
+
+def renderTemplateText(raw: String, pkgName: String): String =
+    replaceAllSubstr(replaceAllSubstr(raw, "{{pkg_name}}", pkgName), "__PKG_NAME__", pkgName)
+
+def ensureTemplateRepoCheckout(repoSpec: String): Result String String =
+    if (isDir(repoSpec)) {
+        Ok(repoSpec)
     } else {
-        // web-js
-        let webDir = pathJoin(projDir, "web");
-        mkdirAll(webDir)?;
-        let mfContent =
-            "name = \"" + pkgName + "\"\n"
-            + "version = \"0.1.0\"\n"
-            + "entry = \"src/main.gsa\"\n\n"
-            + "[deps]\n\n"
-            + "[target.js]\n"
-            + "exports = [\"greet\", \"add\"]\n"
-            + "web_assets = [\"web/index.html\"]\n"
-            + "dts = true\n"
-            + "owns_main = true\n";
-        writeFile(mfPath, mfContent)?;
-        let corePath = pathJoin(srcDir, "core.gsa");
-        writeFileIfMissing(
-            corePath,
-            "// Shared logic for " + pkgName + " (compiled to ES Module JS + .d.ts)\n\n"
-            + "/// Format a greeting message.\n"
-            + "pub def formatGreeting(name: String): String =\n"
-            + "    \"Hello from " + pkgName + ", \" + name + \"!\"\n\n"
-            + "/// Add two integers.\n"
-            + "pub def sumTwo(a: Int, b: Int): Int = a + b\n"
-        )?;
-        let mainPath = pathJoin(srcDir, "main.gsa");
-        writeFileIfMissing(
-            mainPath,
-            "use core.{formatGreeting, sumTwo}\n\n"
-            + "pub def greet(name: String): String = formatGreeting(name)\n\n"
-            + "pub def add(a: Int, b: Int): Int = sumTwo(a, b)\n\n"
-            + "def main(): Void = printLn(greet(\"Web\"))\n"
-        )?;
-        let htmlPath = pathJoin(webDir, "index.html");
-        writeFileIfMissing(
-            htmlPath,
-            "<!doctype html>\n"
-            + "<html lang=\"en\">\n"
-            + "<head>\n"
-            + "  <meta charset=\"utf-8\" />\n"
-            + "  <title>" + pkgName + "</title>\n"
-            + "</head>\n"
-            + "<body>\n"
-            + "  <pre id=\"out\">Loading...</pre>\n"
-            + "  <script type=\"module\">\n"
-            + "    import { greet, add } from \"./" + pkgName + ".mjs\";\n"
-            + "    document.getElementById(\"out\").textContent = greet(\"Geisha\") + \" (20 + 22 = \" + add(20, 22) + \")\";\n"
-            + "  </script>\n"
-            + "</body>\n"
-            + "</html>\n"
-        )?;
-        let specPath = pathJoin(testsDir, "spec.gsa");
-        writeFileIfMissing(
-            specPath,
-            "use core.{formatGreeting, sumTwo}\n"
-            + "use sys.io.eprintLn\n"
-            + "use sys.proc.exit\n\n"
-            + "def main(): Void = {\n"
-            + "    if (formatGreeting(\"Web\") == \"Hello from " + pkgName + ", Web!\" && sumTwo(20, 22) == 42) {\n"
-            + "        printLn(\"ok\")\n"
-            + "    } else {\n"
-            + "        eprintLn(\"web-js test failed\");\n"
-            + "        exit(1)\n"
-            + "    }\n"
-            + "}\n"
-        )
+        let hash16 = strSlice(sha256Hex(repoSpec), 0, 16);
+        let cacheRoot = pathJoin(geishaHomeDir(), "cache/templates");
+        mkdirAll(cacheRoot)?;
+        let cacheDir = pathJoin(cacheRoot, hash16);
+        if (isDir(pathJoin(cacheDir, ".git"))) {
+            // Refresh shallow clone; fall back to cached checkout if offline
+            match gitCapture(["-C", cacheDir, "fetch", "--depth", "1", "--quiet", "origin"], false) {
+                Ok(_) -> {
+                    let _ = gitCapture(["-C", cacheDir, "reset", "--hard", "--quiet", "FETCH_HEAD"], false);
+                    Ok(cacheDir)
+                },
+                Err(_) -> Ok(cacheDir),
+            }
+        } else {
+            let _ = gitCapture(["clone", "--depth", "1", "--quiet", repoSpec, cacheDir], false)?;
+            Ok(cacheDir)
+        }
+    }
+
+def isGeishaReservedWord(w: String): Bool =
+    w == "def" || w == "let" || w == "if" || w == "else" || w == "while"
+    || w == "match" || w == "data" || w == "type" || w == "concept" || w == "instance"
+    || w == "pub" || w == "use" || w == "mod" || w == "open" || w == "extern"
+    || w == "true" || w == "false" || w == "forall" || w == "import" || w == "as"
+
+def deriveValidPkgName(rawDirName: String): Result String String = {
+    let n = strLen(rawDirName);
+    let out = bufNew();
+    let hasAlphaNum = cellNew(false);
+    let prevUnderscore = cellNew(false);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let b = strByteAt(rawDirName, cellGet(i));
+        if (b >= 97 && b <= 122) {
+            bufPushByte(out, b);
+            cellSet(hasAlphaNum, true);
+            cellSet(prevUnderscore, false)
+        } else if (b >= 65 && b <= 90) {
+            bufPushByte(out, b + 32);
+            cellSet(hasAlphaNum, true);
+            cellSet(prevUnderscore, false)
+        } else if (b >= 48 && b <= 57) {
+            bufPushByte(out, b);
+            cellSet(hasAlphaNum, true);
+            cellSet(prevUnderscore, false)
+        } else if (b == 95 || b == 45 || b == 32 || b == 46) {
+            if (!cellGet(prevUnderscore) && bufLen(out) > 0) {
+                bufPushByte(out, 95);
+                cellSet(prevUnderscore, true)
+            } else ()
+        } else {
+            // Strip quotes, backslashes, punctuation, non-ASCII bytes cleanly by separating with '_'
+            if (!cellGet(prevUnderscore) && bufLen(out) > 0) {
+                bufPushByte(out, 95);
+                cellSet(prevUnderscore, true)
+            } else ()
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    let s0 = bufToString(out);
+    // Trim trailing underscores
+    let endIdx = cellNew(strLen(s0));
+    while (cellGet(endIdx) > 0 && strByteAt(s0, cellGet(endIdx) - 1) == 95) {
+        cellSet(endIdx, cellGet(endIdx) - 1)
+    };
+    let s1 = strSlice(s0, 0, cellGet(endIdx));
+    if (!cellGet(hasAlphaNum) || strLen(s1) == 0) {
+        Err("cannot derive a valid Geisha package identifier from directory name '" + rawDirName + "'")
+    } else {
+        let first = strByteAt(s1, 0);
+        let s2 = if (first >= 48 && first <= 57) "pkg_" + s1 else s1;
+        let s3 = if (isGeishaReservedWord(s2)) "pkg_" + s2 else s2;
+        Ok(s3)
+    }
+}
+
+def collectTemplateConflictsRec(
+    srcDir: String,
+    dstDir: String,
+    pkgName: String,
+    conflictsRev: Cell (List String)
+): Result Void String = {
+    if (fileExists(dstDir) && !isDir(dstDir)) {
+        cellSet(conflictsRev, Cons(dstDir, cellGet(conflictsRev)));
+        Ok(())
+    } else {
+        let entries = readDir(srcDir)?;
+        let cur = cellNew(entries);
+        let errOpt: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(name, rest) -> {
+                    if (name == ".git") {
+                        ()
+                    } else {
+                        let srcPath = pathJoin(srcDir, name);
+                        let dstName = renderTemplateText(name, pkgName);
+                        let dstPath = pathJoin(dstDir, dstName);
+                        if (isDir(srcPath)) {
+                            if (fileExists(dstPath) && !isDir(dstPath)) {
+                                cellSet(conflictsRev, Cons(dstPath, cellGet(conflictsRev)))
+                            } else {
+                                match collectTemplateConflictsRec(srcPath, dstPath, pkgName, conflictsRev) {
+                                    Ok(_) -> (),
+                                    Err(e) -> cellSet(errOpt, Some(e)),
+                                }
+                            }
+                        } else {
+                            if (fileExists(dstPath) || isDir(dstPath)) {
+                                cellSet(conflictsRev, Cons(dstPath, cellGet(conflictsRev)))
+                            } else ()
+                        }
+                    };
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        checkOptErr(cellGet(errOpt))
+    }
+}
+
+def copyTemplateDirRec(srcDir: String, dstDir: String, pkgName: String): Result Void String = {
+    mkdirAll(dstDir)?;
+    let entries = readDir(srcDir)?;
+    let cur = cellNew(entries);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(name, rest) -> {
+                if (name == ".git") {
+                    ()
+                } else {
+                    let srcPath = pathJoin(srcDir, name);
+                    let dstName = renderTemplateText(name, pkgName);
+                    let dstPath = pathJoin(dstDir, dstName);
+                    if (isDir(srcPath)) {
+                        match copyTemplateDirRec(srcPath, dstPath, pkgName) {
+                            Ok(_) -> (),
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                        }
+                    } else {
+                        match readFile(srcPath) {
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                            Ok(raw) -> match writeFile(dstPath, renderTemplateText(raw, pkgName)) {
+                                Ok(_) -> (),
+                                Err(e) -> cellSet(errOpt, Some(e)),
+                            },
+                        }
+                    }
+                };
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    checkOptErr(cellGet(errOpt))
+}
+
+def findObjField(fields: List (String, Value), key: String): Option Value = match fields {
+    Nil -> None,
+    Cons((k, v), rest) -> if (k == key) Some(v) else findObjField(rest, key),
+}
+
+def printTemplatesFromJson(raw: String, repoSpec: String): Bool = match jsonParse(raw) {
+    Ok(VObj(topFields)) -> match findObjField(topFields, "templates") {
+        Some(VArr(items)) -> {
+            printLn("Available project templates from " + repoSpec + ":");
+            let cur = cellNew(items);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(VObj(flds), rest) -> {
+                        let tName = match findObjField(flds, "name") { Some(VStr(s)) -> s, _ -> "" };
+                        let tDesc = match findObjField(flds, "description") { Some(VStr(s)) -> s, _ -> "" };
+                        if (tName != "") {
+                            if (tDesc != "") printLn("  " + tName + "  —  " + tDesc)
+                            else printLn("  " + tName)
+                        } else ();
+                        cellSet(cur, rest)
+                    },
+                    Cons(_, rest) -> cellSet(cur, rest),
+                    Nil -> (),
+                }
+            };
+            true
+        },
+        _ -> false,
+    },
+    _ -> false,
+}
+
+def listTemplatesFromRepo(repoDir: String, repoSpec: String): Result Void String = {
+    let manifestPath = pathJoin(repoDir, "templates.json");
+    let printedJson = if (fileExists(manifestPath)) {
+        match readFile(manifestPath) {
+            Ok(raw) -> printTemplatesFromJson(raw, repoSpec),
+            Err(_) -> false,
+        }
+    } else false;
+    if (printedJson) Ok(())
+    else {
+        let entries = sortUniqueStrings(readDir(repoDir)?);
+        printLn("Available project templates from " + repoSpec + ":");
+        let cur = cellNew(entries);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(name, rest) -> {
+                    if (!strStartsWith(name, ".") && isDir(pathJoin(repoDir, name)) && fileExists(pathJoin(pathJoin(repoDir, name), "geisha.toml"))) {
+                        printLn("  " + name)
+                    } else ();
+                    cellSet(cur, rest)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(())
     }
 }
 
 pub def cmdNew(args: List String): Result Void String = {
     let listOnly = cellNew(false);
     let tmplCell = cellNew("cli");
+    let repoOpt: Cell (Option String) = cellNew(None);
     let targetArg: Cell (Option String) = cellNew(None);
     let errOpt: Cell (Option String) = cellNew(None);
 
@@ -2467,10 +2546,18 @@ pub def cmdNew(args: List String): Result Void String = {
                 } else if (a == "--template" || a == "-t") {
                     match r {
                         Cons(t, r2) -> { cellSet(tmplCell, t); cellSet(cur, r2) },
-                        Nil -> cellSet(errOpt, Some("missing template name after '" + a + "'")),
+                        Nil -> cellSet(errOpt, Some("missing template name or git URL after '" + a + "'")),
                     }
                 } else if (strStartsWith(a, "--template=")) {
                     cellSet(tmplCell, strSlice(a, 11, strLen(a)));
+                    cellSet(cur, r)
+                } else if (a == "--template-repo") {
+                    match r {
+                        Cons(u, r2) -> { cellSet(repoOpt, Some(u)); cellSet(cur, r2) },
+                        Nil -> cellSet(errOpt, Some("missing repository URL or path after '--template-repo'")),
+                    }
+                } else if (strStartsWith(a, "--template-repo=")) {
+                    cellSet(repoOpt, Some(strSlice(a, 16, strLen(a))));
                     cellSet(cur, r)
                 } else if (strStartsWith(a, "-")) {
                     cellSet(errOpt, Some("unknown option for 'geisha new': " + a))
@@ -2487,29 +2574,52 @@ pub def cmdNew(args: List String): Result Void String = {
 
     checkOptErr(cellGet(errOpt))?;
 
+    let repoSpec = match cellGet(repoOpt) {
+        Some(u) -> u,
+        None -> defaultTemplatesRepo(),
+    };
+
     if (cellGet(listOnly)) {
-        printTemplateList();
-        Ok(())
+        let repoDir = ensureTemplateRepoCheckout(repoSpec)?;
+        listTemplatesFromRepo(repoDir, repoSpec)
     } else {
-        let tmpl = cellGet(tmplCell);
-        if (!isSupportedTemplate(tmpl)) {
-            Err("unknown template '" + tmpl + "' (supported: cli, lib, wasm, web-js; run 'geisha new --list-templates')")
-        } else {
-            match cellGet(targetArg) {
-                None -> Err("missing project directory (usage: geisha new [--template <cli|lib|wasm|web-js>] <dir>)"),
-                Some(rawDir) -> {
-                    mkdirIfMissing(rawDir)?;
-                    let pkgName = sanitizeIdentAlias(pathBasename(absPath(rawDir)));
-                    let mfPath = pathJoin(rawDir, "geisha.toml");
-                    if (fileExists(mfPath)) {
-                        Err("geisha.toml already exists in '" + rawDir + "'")
+        match cellGet(targetArg) {
+            None -> Err("missing project directory (usage: geisha new [--template <name|git-url>] [--template-repo <url|dir>] <dir>)"),
+            Some(rawDir) -> {
+                let mfPath = pathJoin(rawDir, "geisha.toml");
+                if (fileExists(mfPath)) {
+                    Err("geisha.toml already exists in '" + rawDir + "'")
+                } else {
+                    let tmpl = cellGet(tmplCell);
+                    let srcTplDir = if (isDirectTemplateUrl(tmpl)) {
+                        ensureTemplateRepoCheckout(tmpl)?
+                    } else if (!isSafeTemplateName(tmpl)) {
+                        returnMatErr("invalid template name '" + tmpl + "'")?
                     } else {
-                        scaffoldTemplate(rawDir, pkgName, tmpl)?;
-                        printLn("Created Geisha '" + tmpl + "' project '" + pkgName + "' in " + rawDir);
-                        Ok(())
+                        let repoDir = ensureTemplateRepoCheckout(repoSpec)?;
+                        let cand = pathJoin(repoDir, tmpl);
+                        if (!isDir(cand)) {
+                            returnMatErr("template '" + tmpl + "' not found in " + repoSpec + " (run 'geisha new --list-templates')")?
+                        } else {
+                            cand
+                        }
+                    };
+                    let rawBase = pathBasename(absPath(rawDir));
+                    let pkgName = deriveValidPkgName(rawBase)?;
+                    let conflictsRev: Cell (List String) = cellNew(Nil);
+                    collectTemplateConflictsRec(srcTplDir, rawDir, pkgName, conflictsRev)?;
+                    match listRev(cellGet(conflictsRev)) {
+                        Cons(firstC, restC) ->
+                            Err("refusing to overwrite existing path(s): " + strJoin(Cons(firstC, restC), ", ")),
+                        Nil -> {
+                            mkdirIfMissing(rawDir)?;
+                            copyTemplateDirRec(srcTplDir, rawDir, pkgName)?;
+                            printLn("Created Geisha project '" + pkgName + "' from template '" + tmpl + "' in " + rawDir);
+                            Ok(())
+                        },
                     }
-                },
-            }
+                }
+            },
         }
     }
 }

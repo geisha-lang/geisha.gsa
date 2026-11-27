@@ -3062,7 +3062,7 @@ def printUsage(): Void = {
     printLn("");
     printLn("Package & Project Commands (reads geisha.toml):");
     printLn("  geisha init [--lib] [dir]      Initialize a new Geisha package or library");
-    printLn("  geisha new [--template <t>] <dir>  Create a project from a built-in template (cli|lib|wasm|web-js; --list-templates)");
+    printLn("  geisha new [--template <t|url>] <dir>  Scaffold project from templates repo (--template-repo <url|dir>, --list-templates)");
     printLn("  geisha add <pkg|git-url>       Add dependency (MVS tag/rev + geisha.lock)");
     printLn("         [--version <v>] [--rev <r>] [--path <dir>] [--subdir <s>] [--as <name>]");
     printLn("  geisha remove <alias>          Remove dependency from geisha.toml");

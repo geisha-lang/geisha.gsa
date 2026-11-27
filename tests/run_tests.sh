@@ -4909,22 +4909,126 @@ if command -v node >/dev/null 2>&1; then
     assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
 fi
 
-echo "[Test 44] Project templates (geisha new --list-templates & --template cli|lib|wasm|web-js)..."
+echo "[Test 44] Project templates (geisha new --list-templates, --template <name|git-url>, --template-repo / GEISHA_TEMPLATES_REPO)..."
 ABS_GEISHA_44="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
 ABS_RT_44="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
-TMPL_LIST="$("$ABS_GEISHA_44" new --list-templates)"
+T44_HOME="$TMP_DIR/t44_ghome"
+T44_REPO="$TMP_DIR/t44_templates_repo"
+mkdir -p "$T44_REPO/cli/src" "$T44_REPO/cli/tests" "$T44_REPO/lib/src" "$T44_REPO/lib/tests" "$T44_REPO/wasm/src" "$T44_REPO/wasm/tests" "$T44_REPO/web-js/src" "$T44_REPO/web-js/tests" "$T44_REPO/web-js/web"
+cat > "$T44_REPO/templates.json" << 'EOF'
+{
+  "templates": [
+    { "name": "cli", "description": "CLI app" },
+    { "name": "lib", "description": "Library package" },
+    { "name": "wasm", "description": "Wasm32 module" },
+    { "name": "web-js", "description": "Web ES Module" }
+  ]
+}
+EOF
+cat > "$T44_REPO/cli/geisha.toml" << 'EOF'
+name = "{{pkg_name}}"
+version = "0.1.0"
+entry = "src/main.gsa"
+EOF
+cat > "$T44_REPO/cli/src/core.gsa" << 'EOF'
+pub def greet(name: String): String = "Hello, " + name + "!"
+EOF
+cat > "$T44_REPO/cli/src/main.gsa" << 'EOF'
+use sys.env.{argCount, argAt}
+use core.greet
+def main(): Void = printLn(greet(if (argCount() > 1) argAt(1) else "{{pkg_name}}"))
+EOF
+cat > "$T44_REPO/cli/tests/spec.gsa" << 'EOF'
+use core.greet
+use sys.proc.exit
+def main(): Void = if (greet("Geisha") == "Hello, Geisha!") printLn("ok") else exit(1)
+EOF
+cat > "$T44_REPO/lib/geisha.toml" << 'EOF'
+name = "{{pkg_name}}"
+version = "0.1.0"
+EOF
+cat > "$T44_REPO/lib/src/__PKG_NAME__.gsa" << 'EOF'
+pub def add(a: Int, b: Int): Int = a + b
+EOF
+cat > "$T44_REPO/lib/tests/spec.gsa" << 'EOF'
+use {{pkg_name}}.add
+use sys.proc.exit
+def main(): Void = if (add(20, 22) == 42) printLn("ok") else exit(1)
+EOF
+cat > "$T44_REPO/wasm/geisha.toml" << 'EOF'
+name = "{{pkg_name}}"
+version = "0.1.0"
+entry = "src/main.gsa"
+[target.wasm32]
+exports = ["wasm_add"]
+opt = "z"
+strip = true
+EOF
+cat > "$T44_REPO/wasm/src/core.gsa" << 'EOF'
+pub def computeAdd(a: Int, b: Int): Int = a + b
+EOF
+cat > "$T44_REPO/wasm/src/main.gsa" << 'EOF'
+use core.computeAdd
+pub extern "wasm_add" def wasmAdd(a: Int, b: Int): Int = computeAdd(a, b)
+def main(): Void = ()
+EOF
+cat > "$T44_REPO/wasm/tests/spec.gsa" << 'EOF'
+use core.computeAdd
+use sys.proc.exit
+def main(): Void = if (computeAdd(19, 23) == 42) printLn("ok") else exit(1)
+EOF
+cat > "$T44_REPO/web-js/geisha.toml" << 'EOF'
+name = "{{pkg_name}}"
+version = "0.1.0"
+entry = "src/main.gsa"
+[target.js]
+exports = ["greet", "add"]
+web_assets = ["web/index.html"]
+dts = true
+owns_main = true
+EOF
+cat > "$T44_REPO/web-js/src/core.gsa" << 'EOF'
+pub def formatGreeting(name: String): String = "Hello from {{pkg_name}}, " + name + "!"
+pub def sumTwo(a: Int, b: Int): Int = a + b
+EOF
+cat > "$T44_REPO/web-js/src/main.gsa" << 'EOF'
+use core.{formatGreeting, sumTwo}
+pub def greet(name: String): String = formatGreeting(name)
+pub def add(a: Int, b: Int): Int = sumTwo(a, b)
+def main(): Void = printLn(greet("Web"))
+EOF
+cat > "$T44_REPO/web-js/web/index.html" << 'EOF'
+<!doctype html><title>{{pkg_name}}</title>
+EOF
+cat > "$T44_REPO/web-js/tests/spec.gsa" << 'EOF'
+use core.{formatGreeting, sumTwo}
+use sys.proc.exit
+def main(): Void = if (formatGreeting("Web") == "Hello from {{pkg_name}}, Web!" && sumTwo(20, 22) == 42) printLn("ok") else exit(1)
+EOF
+git -C "$T44_REPO" init -q
+git -C "$T44_REPO" config user.email "test@geisha.local"
+git -C "$T44_REPO" config user.name "Geisha Test"
+git -C "$T44_REPO" add .
+git -C "$T44_REPO" commit -q -m "init templates"
+
+# 44a. --list-templates via GEISHA_TEMPLATES_REPO (git file:// clone + cache)
+TMPL_LIST="$(GEISHA_HOME="$T44_HOME" GEISHA_TEMPLATES_REPO="file://$T44_REPO" "$ABS_GEISHA_44" new --list-templates)"
 for tname in cli lib wasm web-js; do
     if ! printf "%s\n" "$TMPL_LIST" | grep -q "$tname"; then
         echo "FAIL [geisha_new_list_templates]: missing '$tname' in: $TMPL_LIST" >&2
         exit 1
     fi
 done
-echo "PASS [geisha_new_list_templates]: listed cli, lib, wasm, web-js"
+echo "PASS [geisha_new_list_templates]: listed cli, lib, wasm, web-js from templates repo"
 PASS=$((PASS + 1))
 
-# Reject unknown template and missing dir
-if "$ABS_GEISHA_44" new --template bogus "$TMP_DIR/t44_bogus" >/dev/null 2>&1; then
+# 44b. Reject unknown template, path traversal, and missing dir
+if GEISHA_HOME="$T44_HOME" GEISHA_TEMPLATES_REPO="file://$T44_REPO" "$ABS_GEISHA_44" new --template bogus "$TMP_DIR/t44_bogus" >/dev/null 2>&1; then
     echo "FAIL [geisha_new_bad_template]: expected unknown template to fail" >&2
+    exit 1
+fi
+if GEISHA_HOME="$T44_HOME" GEISHA_TEMPLATES_REPO="file://$T44_REPO" "$ABS_GEISHA_44" new --template "../escape" "$TMP_DIR/t44_esc" >/dev/null 2>&1; then
+    echo "FAIL [geisha_new_path_traversal]: expected path traversal template name to fail" >&2
     exit 1
 fi
 if "$ABS_GEISHA_44" new >/dev/null 2>&1; then
@@ -4932,26 +5036,26 @@ if "$ABS_GEISHA_44" new >/dev/null 2>&1; then
     exit 1
 fi
 
-# cli template: create, test, run
-"$ABS_GEISHA_44" new --template cli "$TMP_DIR/t44_cli" >/dev/null
+# 44c. cli template via GEISHA_TEMPLATES_REPO (file:// git clone)
+GEISHA_HOME="$T44_HOME" GEISHA_TEMPLATES_REPO="file://$T44_REPO" "$ABS_GEISHA_44" new --template cli "$TMP_DIR/t44_cli" >/dev/null
 (cd "$TMP_DIR/t44_cli" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
 T44_CLI_OUT="$(cd "$TMP_DIR/t44_cli" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" run -- World)"
 assert_eq "geisha_new_cli_template" "Hello, World!" "$T44_CLI_OUT"
 
 # Reject re-creating in existing project dir
-if "$ABS_GEISHA_44" new --template cli "$TMP_DIR/t44_cli" >/dev/null 2>&1; then
+if GEISHA_HOME="$T44_HOME" "$ABS_GEISHA_44" new --template-repo "$T44_REPO" --template cli "$TMP_DIR/t44_cli" >/dev/null 2>&1; then
     echo "FAIL [geisha_new_existing_manifest]: expected existing geisha.toml to be rejected" >&2
     exit 1
 fi
 
-# lib template: create, check, test
-"$ABS_GEISHA_44" new --template lib "$TMP_DIR/t44_lib" >/dev/null
+# 44d. lib template via --template-repo <local-dir> (verifies __PKG_NAME__ filename + {{pkg_name}} content substitution)
+"$ABS_GEISHA_44" new --template-repo "$T44_REPO" --template lib "$TMP_DIR/t44_lib" >/dev/null
 (cd "$TMP_DIR/t44_lib" && "$ABS_GEISHA_44" check >/dev/null && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
 echo "PASS [geisha_new_lib_template]: check + test passed"
 PASS=$((PASS + 1))
 
-# wasm template: create, test, and build --target wasm32
-"$ABS_GEISHA_44" new --template=wasm "$TMP_DIR/t44_wasm" >/dev/null
+# 44e. wasm template
+"$ABS_GEISHA_44" new --template-repo="$T44_REPO" --template=wasm "$TMP_DIR/t44_wasm" >/dev/null
 (cd "$TMP_DIR/t44_wasm" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
 if [ -f "./build/wasm_rt.o" ] && command -v node >/dev/null 2>&1; then
     ABS_WRT_44="$(pwd)/build/wasm_rt.o"
@@ -4966,8 +5070,8 @@ if [ -f "./build/wasm_rt.o" ] && command -v node >/dev/null 2>&1; then
     assert_eq "geisha_new_wasm_template" "42" "$T44_WASM_OUT"
 fi
 
-# web-js template: create, test, and build --target js (+ .d.ts + web_assets)
-"$ABS_GEISHA_44" new -t web-js "$TMP_DIR/t44_webjs" >/dev/null
+# 44f. web-js template
+"$ABS_GEISHA_44" new --template-repo "$T44_REPO" -t web-js "$TMP_DIR/t44_webjs" >/dev/null
 (cd "$TMP_DIR/t44_webjs" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
 (cd "$TMP_DIR/t44_webjs" && "$ABS_GEISHA_44" build --target js >/dev/null)
 if [ ! -f "$TMP_DIR/t44_webjs/build/t44_webjs.mjs" ] || [ ! -f "$TMP_DIR/t44_webjs/build/t44_webjs.d.ts" ] || [ ! -f "$TMP_DIR/t44_webjs/build/index.html" ]; then
@@ -4981,5 +5085,50 @@ if command -v node >/dev/null 2>&1; then
     ')"
     assert_eq "geisha_new_webjs_template" "Hello from t44_webjs, Geisha!|42" "$T44_WEBJS_OUT"
 fi
+
+# 44g. Direct git URL as --template <git-url>
+T44_DIRECT="$TMP_DIR/t44_direct_tpl"
+mkdir -p "$T44_DIRECT/src"
+cat > "$T44_DIRECT/geisha.toml" << 'EOF'
+name = "{{pkg_name}}"
+version = "0.1.0"
+EOF
+cat > "$T44_DIRECT/src/main.gsa" << 'EOF'
+def main(): Void = printLn("direct:{{pkg_name}}")
+EOF
+git -C "$T44_DIRECT" init -q
+git -C "$T44_DIRECT" config user.email "test@geisha.local"
+git -C "$T44_DIRECT" config user.name "Geisha Test"
+git -C "$T44_DIRECT" add .
+git -C "$T44_DIRECT" commit -q -m "init direct"
+GEISHA_HOME="$T44_HOME" "$ABS_GEISHA_44" new --template "file://$T44_DIRECT" "$TMP_DIR/t44_from_url" >/dev/null
+T44_URL_OUT="$(cd "$TMP_DIR/t44_from_url" && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" run)"
+assert_eq "geisha_new_direct_git_url" "direct:t44_from_url" "$T44_URL_OUT"
+
+# 44h. Regression: directory names with spaces, leading digits, or quotes normalize to valid Geisha identifiers & TOML
+"$ABS_GEISHA_44" new --template-repo "$T44_REPO" --template lib "$TMP_DIR/123 my app" >/dev/null
+(cd "$TMP_DIR/123 my app" && "$ABS_GEISHA_44" check >/dev/null && GEISHA_RUNTIME="$ABS_RT_44" "$ABS_GEISHA_44" test >/dev/null)
+echo "PASS [geisha_new_sanitize_dir_name]: '123 my app' normalized to valid package identifier and passed check+test"
+PASS=$((PASS + 1))
+
+# Reject purely non-identifier directory name
+if "$ABS_GEISHA_44" new --template-repo "$T44_REPO" --template lib "$TMP_DIR/---" >/dev/null 2>&1; then
+    echo "FAIL [geisha_new_invalid_pkg_name]: expected '---' directory name to be rejected" >&2
+    exit 1
+fi
+
+# 44i. Regression: pre-flight conflict check refuses to overwrite existing files and leaves no partial scaffold
+mkdir -p "$TMP_DIR/t44_conflict/src"
+printf 'KEEP_ME\n' > "$TMP_DIR/t44_conflict/src/main.gsa"
+set +e
+T44_CONF_ERR="$("$ABS_GEISHA_44" new --template-repo "$T44_REPO" --template cli "$TMP_DIR/t44_conflict" 2>&1)"
+T44_CONF_RC=$?
+set -e
+if [ "$T44_CONF_RC" -eq 0 ] || [ "$(cat "$TMP_DIR/t44_conflict/src/main.gsa")" != "KEEP_ME" ] || [ -f "$TMP_DIR/t44_conflict/geisha.toml" ]; then
+    echo "FAIL [geisha_new_conflict_preflight]: expected non-zero exit, preserved src/main.gsa, and no geisha.toml (rc=$T44_CONF_RC, err=$T44_CONF_ERR)" >&2
+    exit 1
+fi
+echo "PASS [geisha_new_conflict_preflight]: refused overwrite and left zero partial files"
+PASS=$((PASS + 1))
 
 echo "All $PASS end-to-end test suites passed!"
