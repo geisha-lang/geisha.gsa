@@ -387,7 +387,7 @@ static void mark_from_hdr(uint32_t root_hdr, int *overflowed)
     }
 }
 
-__attribute__((export_name("gs_wasm_gc_collect")))
+/* Exported on demand by `geisha` via `-Wl,--export=gs_wasm_gc_collect` (omitted under `--slim-runtime`) */
 int32_t gs_wasm_gc_collect(void)
 {
     int overflowed = 0;
@@ -717,27 +717,23 @@ void putF32(const float f, void *fv)
     (void)fv;
 }
 
-/* ---- JS/WASM interop bridge exports ---- */
+/* ---- JS/WASM interop bridge exports (exported by linker unless `--slim-runtime`) ---- */
 
-__attribute__((export_name("gs_wasm_alloc")))
 void *gs_wasm_alloc(int32_t bytes)
 {
     return gc_alloc_atomic((int64_t)bytes);
 }
 
-__attribute__((export_name("gs_wasm_str_len")))
 int32_t gs_wasm_str_len(const char *s)
 {
     return (int32_t)gs_strlen(s);
 }
 
-__attribute__((export_name("gs_wasm_heap_used")))
 int32_t gs_wasm_heap_used(void)
 {
     return (int32_t)gs_total_seg_bytes;
 }
 
-__attribute__((export_name("gs_wasm_heap_live")))
 int32_t gs_wasm_heap_live(void)
 {
     return (int32_t)gs_live_bytes;

@@ -387,6 +387,10 @@ def emptyBenchTargetCfg(): TargetCfg = MkTargetCfg {
     tcWebAssets: Nil,
     tcOwnsMain: false,
     tcBootSymbol: None,
+    tcOptLevel: None,
+    tcStrip: None,
+    tcSlimRuntime: false,
+    tcEmitDts: false,
 }
 
 def buildBenchEnvVars(
@@ -792,6 +796,10 @@ def cmdBenchInner(
                                 tcWebAssets: Nil,
                                 tcOwnsMain: false,
                                 tcBootSymbol: None,
+                                tcOptLevel: None,
+                                tcStrip: None,
+                                tcSlimRuntime: false,
+                                tcEmitDts: false,
                             };
                             let bd = pathJoin(projDir, "build/benches");
                             mkdirAll(bd)?;
@@ -859,6 +867,10 @@ def cmdBenchInner(
                         tcWebAssets: Nil,
                         tcOwnsMain: false,
                         tcBootSymbol: None,
+                        tcOptLevel: None,
+                        tcStrip: None,
+                        tcSlimRuntime: false,
+                        tcEmitDts: false,
                     };
                     let buildDir = pathJoin(projDir, "build/benches");
                     mkdirAll(buildDir)?;

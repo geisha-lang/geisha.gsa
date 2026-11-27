@@ -1,6 +1,6 @@
 # Packages, Targets & FFI Interop
 
-This document covers Geisha's decentralized Git/MVS package manager (`geisha.toml`), local overrides (`geisha.local.toml`), conditional native builds, and cross-compilation to `wasm32`, `ios`, and `ios-sim`.
+This document covers Geisha's decentralized Git/MVS package manager (`geisha.toml`), local overrides (`geisha.local.toml`), conditional native builds, and cross-compilation to `wasm32`, `js` (ES Module + `.d.ts`), `ios`, and `ios-sim`.
 
 ---
 
@@ -97,24 +97,48 @@ Predicates:
 
 ---
 
-## 3. WebAssembly (`[target.wasm32]`)
+## 3. WebAssembly (`[target.wasm32]`) & Size Optimization
 
 ```toml
 [target.wasm32]
-exports    = ["app_init", "app_step"]
-web_assets = ["host/web/index.html", "host/web/runtime.js"]
+exports      = ["app_init", "app_step"]
+web_assets   = ["host/web/index.html", "host/web/runtime.js"]
+opt          = "z"        # "0" | "1" | "2" (default) | "3" | "s" | "z"
+strip        = true       # defaults to true under opt = "s"/"z"; set false to retain name section
+slim_runtime = false      # true omits default gs_wasm_* bridge exports so --gc-sections drops unused GC
 ```
 
 Build with:
 ```sh
 geisha build --target wasm32
+geisha build --target wasm32 --opt z --strip --slim-runtime
 ```
 
-Requires LLVM `clang` with `wasm32` target support and `wasm-ld` (`lld`), plus `wasm_rt.o` (built via `make wasm-runtime`).
+Requires LLVM `clang` with `wasm32` target support and `wasm-ld` (`lld`), plus `wasm_rt.o` (built via `make wasm-runtime`). When `opt` is `"s"` or `"z"`, `geisha` automatically runs `wasm-opt -Oz` if available on `PATH` (set `GEISHA_DISABLE_TOOL=wasm-opt` to skip).
 
 ---
 
-## 4. iOS, macOS `.app` & `.appex` Bundles (`ios`, `ios-sim`, `macos-app`, `ios-app`, `ios-sim-app`)
+## 4. JavaScript / TypeScript (`[target.js]`) & Zero-Server Playground
+
+```toml
+[target.js]
+exports    = ["add", "parseDoc"]   # defaults to root module `pub def`s when omitted
+web_assets = ["host/web/index.html"]
+dts        = true                  # emit companion `.d.ts` TypeScript declarations (default: true)
+owns_main  = false                 # true skips auto-invoking `main()` on module import
+```
+
+Build directly or as a project:
+```sh
+geisha --target js -o app.mjs app.gsa      # emits app.mjs + app.d.ts
+geisha build --target js                   # emits build/<name>.mjs + build/<name>.d.ts
+```
+
+For zero-server browser playgrounds, `make wasm-playground` compiles the self-hosted Geisha frontend, embedded `stdlib_bundle`, and `codegen_js` into `build/geisha-playground.wasm`, paired with `playground/geisha-playground.mjs` (`createGeishaPlayground`).
+
+---
+
+## 5. iOS, macOS `.app` & `.appex` Bundles (`ios`, `ios-sim`, `macos-app`, `ios-app`, `ios-sim-app`)
 
 Build static runtime archives once in `geisha.gsa`:
 ```sh

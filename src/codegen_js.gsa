@@ -1,0 +1,2043 @@
+// Geisha Core IR -> ES Module JavaScript & TypeScript `.d.ts` Backend (`codegen_js`)
+//
+// Directly lowers monomorphized, K-converted `CoreProgram` to readable, zero-dependency
+// ES Module JS (`.mjs`) with:
+//   - Exact 32-bit signed `Int` wrapping (`| 0`, `Math.imul`, div/rem zero & INT_MIN guards)
+//   - Exact 64-bit signed `Int64` via `BigInt` (`BigInt.asIntN(64, ...)`)
+//   - Bit-exact IEEE-754 `Float` / `Float32` literals and bitcast intrinsics
+//   - Exact UTF-8 byte semantics for `String` (`strLen`/`strByteAt`/`strSlice`/`strFromBytes`)
+//     while preserving native JS `string` values at API boundaries
+//   - `Uint8Array`-backed `Ptr`/`ScopedPtr`/`ForeignPtr`/`Arena` so `std.buf`/`std.str`/`std.json`
+//     work out of the box without stdlib forks
+//   - Direct self-tail-call optimization (`while (true)` + `continue`) for stack safety in V8/JSC/SM
+//   - Automatic TypeScript `.d.ts` declaration generation for exported functions and ADTs
+
+use std.option.{Option, Some, None}
+use std.list.{listRev, listLen, listAppend}
+use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
+use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufPushInt, bufToString}
+use std.str.{intToStr, floatToHex16, strJoin, strStartsWith}
+use ast.{
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Scheme, ScmMono, schemeBody,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
+    OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
+    OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
+    UnOp, UnNot, UnNeg, UnBitNot,
+    VarDecl,
+    Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    Def, ItForm, ExAbs, isPublicVis, emptySpan
+}
+use infer.{
+    VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
+}
+use core.{
+    ClosureSpec, TaggedTerm, MkTerm, CoreArm, Term,
+    TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
+    TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
+    FunDef, GlobalValDef, ExternDef, CoreProgram,
+    extractTypeArgs
+}
+
+// ============================================================================
+// JS Identifier Escaping & String Literal Escaping
+// ============================================================================
+
+def isJsReserved(s: String): Bool =
+    s == "break" || s == "case" || s == "catch" || s == "class" || s == "const"
+    || s == "continue" || s == "debugger" || s == "default" || s == "delete" || s == "do"
+    || s == "else" || s == "enum" || s == "export" || s == "extends" || s == "false"
+    || s == "finally" || s == "for" || s == "function" || s == "if" || s == "import"
+    || s == "in" || s == "instanceof" || s == "let" || s == "new" || s == "null"
+    || s == "return" || s == "super" || s == "switch" || s == "this" || s == "throw"
+    || s == "true" || s == "try" || s == "typeof" || s == "var" || s == "void"
+    || s == "while" || s == "with" || s == "yield" || s == "await" || s == "async"
+    || s == "arguments" || s == "eval" || s == "implements" || s == "interface"
+    || s == "package" || s == "private" || s == "protected" || s == "public" || s == "static"
+    || s == "undefined" || s == "NaN" || s == "Infinity"
+
+def isAsciiIdentChar(b: Int, isFirst: Bool): Bool =
+    (b >= 65 && b <= 90)
+    || (b >= 97 && b <= 122)
+    || b == 95
+    || (!isFirst && b >= 48 && b <= 57)
+
+def hexDigitLower(nib: Int): Int =
+    if (nib < 10) 48 + nib else 87 + nib
+
+def pushHex2(b: StringBuf, v: Int): Void = {
+    let u = v & 255;
+    bufPushByte(b, hexDigitLower((u >>> 4) & 15));
+    bufPushByte(b, hexDigitLower(u & 15))
+}
+
+def jsSanitizeIdent(raw: String, prefix: String): String = {
+    let b = bufNew();
+    bufPushStr(b, prefix);
+    let n = strLen(raw);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(raw, idx);
+        if (isAsciiIdentChar(c, idx == 0 && strLen(prefix) == 0)) {
+            bufPushByte(b, c)
+        } else if (c == 46) {
+            bufPushStr(b, "$")
+        } else if (c == 36) {
+            bufPushStr(b, "_$")
+        } else {
+            bufPushStr(b, "_x");
+            pushHex2(b, c);
+            bufPushByte(b, 95)
+        };
+        cellSet(i, idx + 1)
+    };
+    let s = bufToString(b);
+    if (strLen(s) == 0) "_gs_empty"
+    else if (isJsReserved(s)) "_gs_" + s
+    else s
+}
+
+def jsFnIdent(name: String): String = jsSanitizeIdent(name, "$f_")
+def jsGlobalIdent(name: String): String = jsSanitizeIdent(name, "$g_")
+def jsLocalIdent(name: String): String = jsSanitizeIdent(name, "$v_")
+
+def jsStringLit(s: String): String = {
+    let b = bufNew();
+    bufPushByte(b, 34);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c == 34) bufPushStr(b, "\\\"")
+        else if (c == 92) bufPushStr(b, "\\\\")
+        else if (c == 10) bufPushStr(b, "\\n")
+        else if (c == 13) bufPushStr(b, "\\r")
+        else if (c == 9) bufPushStr(b, "\\t")
+        else if (c == 0) bufPushStr(b, "\\0")
+        else if (c < 32 || c == 127) {
+            bufPushStr(b, "\\x");
+            pushHex2(b, c)
+        } else {
+            bufPushByte(b, c)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 34);
+    bufToString(b)
+}
+
+def jsFloatLit(f: Float): String = {
+    let bits = floatToBits64(f);
+    if (bits == intToI64(0)) "0.0"
+    else if (f >= -1000000.0 && f <= 1000000.0) {
+        let whole = floatToInt(f);
+        let back = intToFloat(whole);
+        if (floatToBits64(back) == bits) intToStr(whole) + ".0"
+        else "_gs_bits64ToFloat(" + floatToHex16(f) + "n)"
+    } else {
+        "_gs_bits64ToFloat(" + floatToHex16(f) + "n)"
+    }
+}
+
+// ============================================================================
+// Type Helpers
+// ============================================================================
+
+def isVoidTy(ty: Type): Bool = match ty {
+    TyVoid -> true,
+    TyCon(n) -> n == "Void",
+    _ -> false,
+}
+
+def tyConName(ty: Type): String = match ty {
+    TyCon(n) -> n,
+    TyComp(b, _) -> tyConName(b),
+    _ -> "",
+}
+
+def isInt64Ty(ty: Type): Bool = match ty {
+    TyCon("Int64") -> true,
+    _ -> false,
+}
+
+def isFloat32Ty(ty: Type): Bool = match ty {
+    TyCon("Float32") -> true,
+    _ -> false,
+}
+
+def jsZeroForType(ty: Type): String = match ty {
+    TyVoid -> "undefined",
+    TyCon(n) ->
+        if (n == "Int" || n == "Char") "0"
+        else if (n == "Int64") "0n"
+        else if (n == "Float" || n == "Float32") "0.0"
+        else if (n == "Bool") "false"
+        else if (n == "String") "_gs_emptyStr"
+        else if (n == "Ptr" || n == "ScopedPtr" || n == "ForeignPtr" || n == "Arena") "null"
+        else "undefined",
+    _ -> "undefined",
+}
+
+def findVariantByTag(vs: List VariantInfo, tag: Int): Option VariantInfo = match vs {
+    Nil -> None,
+    Cons(v, r) -> if (v.tag == tag) Some(v) else findVariantByTag(r, tag),
+}
+
+def nthStrOpt(xs: List String, idx: Int): Option String = match xs {
+    Nil -> None,
+    Cons(h, t) -> if (idx == 0) Some(h) else nthStrOpt(t, idx - 1),
+}
+
+def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
+    Cons(h, t) -> if (idx == 0) h else nthArgTerm(t, idx - 1),
+    Nil -> match args { Cons(h, _) -> h, Nil -> panicPlaceholderTerm() },
+}
+
+def panicPlaceholderTerm(): TaggedTerm =
+    MkTerm { tspan: emptySpan(), tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
+
+def variantFieldProp(vinfoOpt: Option VariantInfo, idx: Int): String = match vinfoOpt {
+    Some(vi) -> match vi.fieldNames {
+        Some(fnames) -> match nthStrOpt(fnames, idx) {
+            Some(fnm) -> fnm,
+            None -> "_" + intToStr(idx),
+        },
+        None -> "_" + intToStr(idx),
+    },
+    None -> "_" + intToStr(idx),
+}
+
+def extractAdtNameAndArgs(adtReg: StrMap AdtInfo, ty: Type, ctorHint: String): (String, List Type) = match ty {
+    TyCon(n) ->
+        if (strMapContains(adtReg, n)) (n, Nil)
+        else (findAdtByCtorName(adtReg, ctorHint), Nil),
+    TyComp(_, _) -> {
+        let base = tyConName(ty);
+        if (strMapContains(adtReg, base)) (base, extractTypeArgs(ty))
+        else (findAdtByCtorName(adtReg, ctorHint), extractTypeArgs(ty))
+    },
+    _ -> (findAdtByCtorName(adtReg, ctorHint), Nil),
+}
+
+def findAdtByCtorName(adtReg: StrMap AdtInfo, ctorName: String): String =
+    // Fast fallback when scrutinee type is already known; unused if tyConName hit
+    if (ctorName == "Cons" || ctorName == "Nil") "List"
+    else if (ctorName == "Some" || ctorName == "None") "std.option.Option"
+    else if (ctorName == "Ok" || ctorName == "Err") "std.result.Result"
+    else ""
+
+def substTypeList(ts: List Type, sub: StrMap Type): List Type = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(applyExplicitSubst(h, sub), substTypeList(t, sub)),
+}
+
+def listContainsStr(xs: List String, target: String): Bool = match xs {
+    Nil -> false,
+    Cons(h, t) -> if (h == target) true else listContainsStr(t, target),
+}
+
+// ============================================================================
+// Self-Tail-Call Detection
+// ============================================================================
+
+def hasSelfTailCall(fnName: String, tm: TaggedTerm): Bool = match tm.tnode {
+    TmApplyDir(vd, _) -> vd.vname == fnName,
+    TmLet(_, _, body) -> hasSelfTailCall(fnName, body),
+    TmMakeCls(_, _, body) -> hasSelfTailCall(fnName, body),
+    TmIf(_, t, e) -> hasSelfTailCall(fnName, t) || hasSelfTailCall(fnName, e),
+    TmBlock(es) -> hasSelfTailCallLast(fnName, es),
+    TmMatch(_, arms) -> hasSelfTailCallArms(fnName, arms),
+    _ -> false,
+}
+
+def hasSelfTailCallLast(fnName: String, es: List TaggedTerm): Bool = match es {
+    Nil -> false,
+    Cons(h, Nil) -> hasSelfTailCall(fnName, h),
+    Cons(_, t) -> hasSelfTailCallLast(fnName, t),
+}
+
+def hasSelfTailCallArms(fnName: String, arms: List CoreArm): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> hasSelfTailCall(fnName, a.caBody) || hasSelfTailCallArms(fnName, r),
+}
+
+// ============================================================================
+// JS Function & Module Emission Context
+// ============================================================================
+
+data JsEmitCtx {
+    MkJsEmitCtx {
+        jcProg: CoreProgram,
+        jcBuf: StringBuf,
+        jcTmpCnt: Cell Int,
+        jcIndent: Cell Int,
+        jcCurFnName: String,
+        jcTcoActive: Bool,
+        jcTcoParamJs: List String,
+    },
+}
+
+def jcFreshTmp(ctx: JsEmitCtx): String = {
+    let n = cellGet(ctx.jcTmpCnt) + 1;
+    cellSet(ctx.jcTmpCnt, n);
+    "$t" + intToStr(n)
+}
+
+def jcPushIndent(ctx: JsEmitCtx): Void = {
+    let n = cellGet(ctx.jcIndent);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        bufPushStr(ctx.jcBuf, "  ");
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def jcEmitLine(ctx: JsEmitCtx, line: String): Void = {
+    jcPushIndent(ctx);
+    bufPushStr(ctx.jcBuf, line);
+    bufPushByte(ctx.jcBuf, 10)
+}
+
+def jcIncIndent(ctx: JsEmitCtx): Void = cellSet(ctx.jcIndent, cellGet(ctx.jcIndent) + 1)
+def jcDecIndent(ctx: JsEmitCtx): Void = cellSet(ctx.jcIndent, cellGet(ctx.jcIndent) - 1)
+
+def lookupLocalJs(locals: List (String, String), name: String): Option String = match locals {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == name) Some(v) else lookupLocalJs(r, name),
+}
+
+def bindLocalJs(ctx: JsEmitCtx, locals: List (String, String), origName: String): (String, List (String, String)) = {
+    let base = jsLocalIdent(origName);
+    let jsName = match lookupLocalJs(locals, origName) {
+        None -> base,
+        Some(_) -> {
+            let n = cellGet(ctx.jcTmpCnt) + 1;
+            cellSet(ctx.jcTmpCnt, n);
+            base + "_" + intToStr(n)
+        },
+    };
+    (jsName, Cons((origName, jsName), locals))
+}
+
+data StmtTarget {
+    TgtReturn,
+    TgtAssign(String),
+    TgtDiscard,
+}
+
+def emitTargetResult(ctx: JsEmitCtx, target: StmtTarget, exprStr: String): Void = match target {
+    TgtReturn -> jcEmitLine(ctx, "return " + exprStr + ";"),
+    TgtAssign(v) -> jcEmitLine(ctx, v + " = " + exprStr + ";"),
+    TgtDiscard ->
+        if (exprStr != "undefined") jcEmitLine(ctx, exprStr + ";") else (),
+}
+
+// ============================================================================
+// Pattern Matching Compilation
+// ============================================================================
+
+def emitPatternCondAndBinds(
+    ctx: JsEmitCtx,
+    scrutExpr: String,
+    scrutTy: Type,
+    pat: Pattern,
+    condsRev: Cell (List String),
+    bindsRev: Cell (List (String, String)),
+    localsCell: Cell (List (String, String))
+): Void = match pat {
+    PatWild -> (),
+    PatVar(vname) -> {
+        let (jsNm, nextLocs) = bindLocalJs(ctx, cellGet(localsCell), vname);
+        cellSet(localsCell, nextLocs);
+        cellSet(bindsRev, Cons((jsNm, scrutExpr), cellGet(bindsRev)))
+    },
+    PatLit(lit) -> {
+        let litJs = emitLitJs(lit, scrutTy);
+        match lit {
+            LitStr(_) -> cellSet(condsRev, Cons("_gs_strEq(" + scrutExpr + ", " + litJs + ")", cellGet(condsRev))),
+            _ -> cellSet(condsRev, Cons("(" + scrutExpr + " === " + litJs + ")", cellGet(condsRev))),
+        }
+    },
+    PatTuple(subPats) -> {
+        let elemTys = match scrutTy {
+            TyTuple(es) -> es,
+            _ -> Nil,
+        };
+        let idx = cellNew(0);
+        let cp = cellNew(subPats);
+        let ct = cellNew(elemTys);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(sp, rp) -> {
+                    let i = cellGet(idx);
+                    let et = match cellGet(ct) {
+                        Cons(t, rt) -> { cellSet(ct, rt); t },
+                        Nil -> TyVoid,
+                    };
+                    match sp {
+                        PatWild -> (),
+                        _ -> emitPatternCondAndBinds(
+                            ctx, scrutExpr + "[" + intToStr(i) + "]", et, sp, condsRev, bindsRev, localsCell
+                        ),
+                    };
+                    cellSet(idx, i + 1);
+                    cellSet(cp, rp)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    PatCtor(ctorName, subPats) -> {
+        let (adtName, typeArgs) = extractAdtNameAndArgs(ctx.jcProg.coreAdtReg, scrutTy, ctorName);
+        match strMapGet(ctx.jcProg.coreAdtReg, adtName) {
+            None -> (),
+            Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+                None -> (),
+                Some(vinfo) -> {
+                    cellSet(condsRev, Cons("(" + scrutExpr + ".$ === " + intToStr(vinfo.tag) + ")", cellGet(condsRev)));
+                    let sub = buildPairMap(ainfo.typeParams, typeArgs);
+                    let concreteFieldTys = substTypeList(vinfo.fieldTypes, sub);
+                    let idx = cellNew(0);
+                    let cp = cellNew(subPats);
+                    let cft = cellNew(concreteFieldTys);
+                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                        match cellGet(cp) {
+                            Cons(sp, rp) -> {
+                                let i = cellGet(idx);
+                                let ft = match cellGet(cft) {
+                                    Cons(t, rt) -> { cellSet(cft, rt); t },
+                                    Nil -> TyVoid,
+                                };
+                                match sp {
+                                    PatWild -> (),
+                                    _ -> {
+                                        let prop = variantFieldProp(Some(vinfo), i);
+                                        emitPatternCondAndBinds(
+                                            ctx, scrutExpr + "." + prop, ft, sp, condsRev, bindsRev, localsCell
+                                        )
+                                    },
+                                };
+                                cellSet(idx, i + 1);
+                                cellSet(cp, rp)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+            },
+        }
+    },
+    PatStruct(_, _) -> (),
+}
+
+// ============================================================================
+// Literal & Operator Emission
+// ============================================================================
+
+def emitLitJs(lit: Lit, ty: Type): String = match lit {
+    LitInt(n) -> if (isInt64Ty(ty)) intToStr(n) + "n" else intToStr(n),
+    LitFloat(f) ->
+        if (isFloat32Ty(ty)) "Math.fround(" + jsFloatLit(f) + ")"
+        else jsFloatLit(f),
+    LitChar(c) -> intToStr(c),
+    LitStr(s) -> "_gs_s(" + jsStringLit(s) + ")",
+    LitBool(b) -> if (b) "true" else "false",
+    LitUnit -> "undefined",
+}
+
+def emitBinOpJs(op: BinOp, lhs: String, rhs: String, opTy: Type): String = {
+    let tyName = match opTy {
+        TyCon(n) -> n,
+        _ -> "Int",
+    };
+    if (tyName == "String") {
+        match op {
+            OpAdd -> "_gs_strConcat(" + lhs + ", " + rhs + ")",
+            OpEq -> "_gs_strEq(" + lhs + ", " + rhs + ")",
+            OpNe -> "(!_gs_strEq(" + lhs + ", " + rhs + "))",
+            OpLt -> "(_gs_strCmp(" + lhs + ", " + rhs + ") < 0)",
+            OpLe -> "(_gs_strCmp(" + lhs + ", " + rhs + ") <= 0)",
+            OpGt -> "(_gs_strCmp(" + lhs + ", " + rhs + ") > 0)",
+            OpGe -> "(_gs_strCmp(" + lhs + ", " + rhs + ") >= 0)",
+            _ -> "_gs_strEq(" + lhs + ", " + rhs + ")",
+        }
+    } else if (tyName == "Float") {
+        match op {
+            OpAdd -> "(" + lhs + " + " + rhs + ")",
+            OpSub -> "(" + lhs + " - " + rhs + ")",
+            OpMul -> "(" + lhs + " * " + rhs + ")",
+            OpDiv -> "(" + lhs + " / " + rhs + ")",
+            OpEq -> "(" + lhs + " === " + rhs + ")",
+            OpNe -> "(" + lhs + " !== " + rhs + ")",
+            OpLt -> "(" + lhs + " < " + rhs + ")",
+            OpLe -> "(" + lhs + " <= " + rhs + ")",
+            OpGt -> "(" + lhs + " > " + rhs + ")",
+            OpGe -> "(" + lhs + " >= " + rhs + ")",
+            _ -> "(" + lhs + " + " + rhs + ")",
+        }
+    } else if (tyName == "Float32") {
+        match op {
+            OpAdd -> "Math.fround(" + lhs + " + " + rhs + ")",
+            OpSub -> "Math.fround(" + lhs + " - " + rhs + ")",
+            OpMul -> "Math.fround(" + lhs + " * " + rhs + ")",
+            OpDiv -> "Math.fround(" + lhs + " / " + rhs + ")",
+            OpEq -> "(" + lhs + " === " + rhs + ")",
+            OpNe -> "(" + lhs + " !== " + rhs + ")",
+            OpLt -> "(" + lhs + " < " + rhs + ")",
+            OpLe -> "(" + lhs + " <= " + rhs + ")",
+            OpGt -> "(" + lhs + " > " + rhs + ")",
+            OpGe -> "(" + lhs + " >= " + rhs + ")",
+            _ -> "Math.fround(" + lhs + " + " + rhs + ")",
+        }
+    } else if (tyName == "Bool" || tyName == "Char") {
+        match op {
+            OpEq -> "(" + lhs + " === " + rhs + ")",
+            OpNe -> "(" + lhs + " !== " + rhs + ")",
+            OpLt -> "(" + lhs + " < " + rhs + ")",
+            OpLe -> "(" + lhs + " <= " + rhs + ")",
+            OpGt -> "(" + lhs + " > " + rhs + ")",
+            OpGe -> "(" + lhs + " >= " + rhs + ")",
+            OpAnd -> "(" + lhs + " && " + rhs + ")",
+            OpOr -> "(" + lhs + " || " + rhs + ")",
+            OpBitAnd -> "(" + lhs + " & " + rhs + ")",
+            OpBitOr -> "(" + lhs + " | " + rhs + ")",
+            OpBitXor -> "(" + lhs + " ^ " + rhs + ")",
+            _ -> "(" + lhs + " === " + rhs + ")",
+        }
+    } else if (tyName == "Int64") {
+        match op {
+            OpAdd -> "BigInt.asIntN(64, " + lhs + " + " + rhs + ")",
+            OpSub -> "BigInt.asIntN(64, " + lhs + " - " + rhs + ")",
+            OpMul -> "BigInt.asIntN(64, " + lhs + " * " + rhs + ")",
+            OpDiv -> "_gs_idiv64(" + lhs + ", " + rhs + ")",
+            OpRem -> "_gs_irem64(" + lhs + ", " + rhs + ")",
+            OpBitAnd -> "BigInt.asIntN(64, " + lhs + " & " + rhs + ")",
+            OpBitOr -> "BigInt.asIntN(64, " + lhs + " | " + rhs + ")",
+            OpBitXor -> "BigInt.asIntN(64, " + lhs + " ^ " + rhs + ")",
+            OpShl -> "BigInt.asIntN(64, " + lhs + " << BigInt(" + rhs + " & 63))",
+            OpShr -> "BigInt.asIntN(64, " + lhs + " >> BigInt(" + rhs + " & 63))",
+            OpUshr -> "BigInt.asIntN(64, BigInt.asUintN(64, " + lhs + ") >> BigInt(" + rhs + " & 63))",
+            OpEq -> "(" + lhs + " === " + rhs + ")",
+            OpNe -> "(" + lhs + " !== " + rhs + ")",
+            OpLt -> "(" + lhs + " < " + rhs + ")",
+            OpLe -> "(" + lhs + " <= " + rhs + ")",
+            OpGt -> "(" + lhs + " > " + rhs + ")",
+            OpGe -> "(" + lhs + " >= " + rhs + ")",
+            _ -> "BigInt.asIntN(64, " + lhs + " + " + rhs + ")",
+        }
+    } else {
+        // `Int` (32-bit signed)
+        match op {
+            OpAdd -> "((" + lhs + " + " + rhs + ") | 0)",
+            OpSub -> "((" + lhs + " - " + rhs + ") | 0)",
+            OpMul -> "Math.imul(" + lhs + ", " + rhs + ")",
+            OpDiv -> "_gs_idiv32(" + lhs + ", " + rhs + ")",
+            OpRem -> "_gs_irem32(" + lhs + ", " + rhs + ")",
+            OpBitAnd -> "(" + lhs + " & " + rhs + ")",
+            OpBitOr -> "(" + lhs + " | " + rhs + ")",
+            OpBitXor -> "(" + lhs + " ^ " + rhs + ")",
+            OpShl -> "(" + lhs + " << (" + rhs + " & 31))",
+            OpShr -> "(" + lhs + " >> (" + rhs + " & 31))",
+            OpUshr -> "((" + lhs + " >>> (" + rhs + " & 31)) | 0)",
+            OpEq -> "(" + lhs + " === " + rhs + ")",
+            OpNe -> "(" + lhs + " !== " + rhs + ")",
+            OpLt -> "(" + lhs + " < " + rhs + ")",
+            OpLe -> "(" + lhs + " <= " + rhs + ")",
+            OpGt -> "(" + lhs + " > " + rhs + ")",
+            OpGe -> "(" + lhs + " >= " + rhs + ")",
+            _ -> "((" + lhs + " + " + rhs + ") | 0)",
+        }
+    }
+}
+
+def emitUnOpJs(op: UnOp, operand: String, opTy: Type): String = match op {
+    UnNot -> "(!" + operand + ")",
+    UnNeg -> match opTy {
+        TyCon("Int64") -> "BigInt.asIntN(64, -" + operand + ")",
+        TyCon("Float") -> "(-" + operand + ")",
+        TyCon("Float32") -> "Math.fround(-" + operand + ")",
+        _ -> "((-" + operand + ") | 0)",
+    },
+    UnBitNot -> match opTy {
+        TyCon("Int64") -> "BigInt.asIntN(64, ~" + operand + ")",
+        _ -> "(~" + operand + ")",
+    },
+}
+
+// ============================================================================
+// Builtin Intrinsics Lowering
+// ============================================================================
+
+def isPureImmutableJsExpr(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(_) -> true,
+    TmGlobalVar(_) -> true,
+    _ -> false,
+}
+
+def anyNonPureJsExpr(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> if (!isPureImmutableJsExpr(h)) true else anyNonPureJsExpr(t),
+}
+
+def evalArgsJs(ctx: JsEmitCtx, args: List TaggedTerm, locals: List (String, String)): List String = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                let exprStr = emitJsExpr(ctx, a, locals);
+                let finalExpr =
+                    if (!isPureImmutableJsExpr(a) && anyNonPureJsExpr(r)) {
+                        let t = jcFreshTmp(ctx);
+                        jcEmitLine(ctx, "const " + t + " = " + exprStr + ";");
+                        t
+                    } else exprStr;
+                cellSet(rev, Cons(finalExpr, cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def nthStr(xs: List String, idx: Int): String = match xs {
+    Cons(h, t) -> if (idx == 0) h else nthStr(t, idx - 1),
+    Nil -> "undefined",
+}
+
+def tryEmitBuiltinJs(
+    ctx: JsEmitCtx,
+    name: String,
+    args: List TaggedTerm,
+    retTy: Type,
+    locals: List (String, String)
+): Option String =
+    if (name == "cellNew") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("{ v: " + nthStr(vs, 0) + " }")
+    } else if (name == "cellGet") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some(nthStr(vs, 0) + ".v")
+    } else if (name == "cellSet") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, nthStr(vs, 0) + ".v = " + nthStr(vs, 1) + ";");
+        Some("undefined")
+    } else if (name == "arrayNew") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_arrayNew(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "arrayNewZeroed") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let elemTy = match retTy {
+            TyComp(_, et) -> et,
+            _ -> TyVoid,
+        };
+        Some("_gs_arrayNew(" + nthStr(vs, 0) + ", " + jsZeroForType(elemTy) + ")")
+    } else if (name == "arrayLen" || name == "immArrayLen") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + ".length | 0)")
+    } else if (name == "arrayFreeze") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some(nthStr(vs, 0))
+    } else if (name == "arrayGet" || name == "immArrayGet") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_arrayGet(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "arraySet") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_arraySet(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "arrayClearSlot") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_arraySet(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", undefined);");
+        Some("undefined")
+    } else if (name == "parTabulate") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_parTabulate(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "printLn") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_printLn(" + nthStr(vs, 0) + ");");
+        Some("undefined")
+    } else if (name == "putChar") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_putStr(String.fromCharCode(" + nthStr(vs, 0) + " & 255));");
+        Some("undefined")
+    } else if (name == "putNumber") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_putStr(String(" + nthStr(vs, 0) + "));");
+        Some("undefined")
+    } else if (name == "putFloat" || name == "putF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_putStr(String(" + nthStr(vs, 0) + "));");
+        Some("undefined")
+    } else if (name == "strLen") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + ".length | 0)")
+    } else if (name == "strByteAt") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_strByteAt(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "strSlice") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_strSlice(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")")
+    } else if (name == "strConcat") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_strConcat(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "strFromBytes") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_strFromBytes(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "bitAnd") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " & " + nthStr(vs, 1) + ")")
+    } else if (name == "bitAnd64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, " + nthStr(vs, 0) + " & " + nthStr(vs, 1) + ")")
+    } else if (name == "bitOr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " | " + nthStr(vs, 1) + ")")
+    } else if (name == "bitOr64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, " + nthStr(vs, 0) + " | " + nthStr(vs, 1) + ")")
+    } else if (name == "bitXor") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " ^ " + nthStr(vs, 1) + ")")
+    } else if (name == "bitXor64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, " + nthStr(vs, 0) + " ^ " + nthStr(vs, 1) + ")")
+    } else if (name == "bitNot") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(~" + nthStr(vs, 0) + ")")
+    } else if (name == "bitNot64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, ~" + nthStr(vs, 0) + ")")
+    } else if (name == "bitShl") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " << (" + nthStr(vs, 1) + " & 31))")
+    } else if (name == "bitShr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " >> (" + nthStr(vs, 1) + " & 31))")
+    } else if (name == "bitUshr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("((" + nthStr(vs, 0) + " >>> (" + nthStr(vs, 1) + " & 31)) | 0)")
+    } else if (name == "bitShl64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, " + nthStr(vs, 0) + " << BigInt(" + nthStr(vs, 1) + " & 63))")
+    } else if (name == "bitShr64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, " + nthStr(vs, 0) + " >> BigInt(" + nthStr(vs, 1) + " & 63))")
+    } else if (name == "bitUshr64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt.asIntN(64, BigInt.asUintN(64, " + nthStr(vs, 0) + ") >> BigInt(" + nthStr(vs, 1) + " & 63))")
+    } else if (name == "bitPopCount") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_popcnt32(" + nthStr(vs, 0) + ")")
+    } else if (name == "bitPopCount64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_popcnt64(" + nthStr(vs, 0) + ")")
+    } else if (name == "bitCtz") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ctz32(" + nthStr(vs, 0) + ")")
+    } else if (name == "charToInt") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " & 255)")
+    } else if (name == "intToChar") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " & 255)")
+    } else if (name == "intToI64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("BigInt(" + nthStr(vs, 0) + " | 0)")
+    } else if (name == "i64ToInt") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(Number(BigInt.asIntN(32, " + nthStr(vs, 0) + ")) | 0)")
+    } else if (name == "floatToBits64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_floatToBits64(" + nthStr(vs, 0) + ")")
+    } else if (name == "bits64ToFloat") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_bits64ToFloat(" + nthStr(vs, 0) + ")")
+    } else if (name == "floatToBits32" || name == "f32ToBits32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_f32ToBits32(" + nthStr(vs, 0) + ")")
+    } else if (name == "bits32ToFloat" || name == "bits32ToF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_bits32ToF32(" + nthStr(vs, 0) + ")")
+    } else if (name == "intToFloat") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("Number(" + nthStr(vs, 0) + ")")
+    } else if (name == "floatToInt" || name == "f32ToInt") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(Math.trunc(" + nthStr(vs, 0) + ") | 0)")
+    } else if (name == "floatToF32" || name == "intToF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("Math.fround(" + nthStr(vs, 0) + ")")
+    } else if (name == "f32ToFloat") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("Number(" + nthStr(vs, 0) + ")")
+    } else if (name == "mathExp" || name == "mathExpF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.exp(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathExpF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathLog" || name == "mathLogF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.log(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathLogF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathSqrt" || name == "mathSqrtF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.sqrt(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathSqrtF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathSin" || name == "mathSinF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.sin(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathSinF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathCos" || name == "mathCosF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.cos(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathCosF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathTanh" || name == "mathTanhF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.tanh(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathTanhF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathPow" || name == "mathPowF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.pow(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")";
+        Some(if (name == "mathPowF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathAbs" || name == "mathAbsF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.abs(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathAbsF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathFloor" || name == "mathFloorF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.floor(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathFloorF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathCeil" || name == "mathCeilF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "Math.ceil(" + nthStr(vs, 0) + ")";
+        Some(if (name == "mathCeilF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "mathFma" || name == "mathFmaF32") {
+        let vs = evalArgsJs(ctx, args, locals);
+        let e = "(" + nthStr(vs, 0) + " * " + nthStr(vs, 1) + " + " + nthStr(vs, 2) + ")";
+        Some(if (name == "mathFmaF32") "Math.fround(" + e + ")" else e)
+    } else if (name == "ptrNull") {
+        Some("null")
+    } else if (name == "ptrIsNull") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + " === null)")
+    } else if (name == "ptrAllocBytes" || name == "ptrAllocBytes64" || name == "foreignPtrAlloc") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrAlloc(Number(" + nthStr(vs, 0) + "))")
+    } else if (name == "ptrOffset" || name == "ptrOffset64" || name == "scopedPtrOffset" || name == "scopedPtrOffset64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrOffset(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrByteAt" || name == "scopedPtrByteAt") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrByteAt(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrSetByte" || name == "scopedPtrSetByte") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrSetByte(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrReadI8") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadI8(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrReadU16Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadU16Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrReadU32Le" || name == "scopedPtrReadI32Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadI32Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrReadI64Le" || name == "ptrReadI64Le64" || name == "scopedPtrReadI64Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadI64Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrReadF32Le" || name == "ptrReadF32Le64" || name == "scopedPtrReadF32Le" || name == "scopedPtrReadF32Le64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadF32Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrReadF64Le" || name == "ptrReadF64Le64" || name == "scopedPtrReadF64Le" || name == "scopedPtrReadF64Le64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrReadF64Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrWriteU16Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrWriteU16Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrWriteU32Le" || name == "scopedPtrWriteI32Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrWriteI32Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrWriteI64Le" || name == "ptrWriteI64Le64" || name == "scopedPtrWriteI64Le") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrWriteI64Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrWriteF32Le" || name == "ptrWriteF32Le64" || name == "scopedPtrWriteF32Le" || name == "scopedPtrWriteF32Le64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrWriteF32Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrWriteF64Le" || name == "ptrWriteF64Le64" || name == "scopedPtrWriteF64Le" || name == "scopedPtrWriteF64Le64") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrWriteF64Le(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ");");
+        Some("undefined")
+    } else if (name == "ptrCopyBytes" || name == "ptrCopyBytes64" || name == "scopedPtrCopyBytes") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrCopyBytes(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ", Number(" + nthStr(vs, 3) + "), Number(" + nthStr(vs, 4) + "));");
+        Some("undefined")
+    } else if (name == "ptrCopyFromStr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_ptrCopyFromStr(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), " + nthStr(vs, 2) + ", Number(" + nthStr(vs, 3) + "));");
+        Some("undefined")
+    } else if (name == "ptrSliceFromStr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrSliceFromStr(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "), Number(" + nthStr(vs, 2) + "))")
+    } else if (name == "ptrSliceToString") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrSliceToString(" + nthStr(vs, 0) + ", Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "ptrToString") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrToString(" + nthStr(vs, 0) + ")")
+    } else if (name == "withForeignPtr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 1) + ")(" + nthStr(vs, 0) + ")")
+    } else if (name == "withArena") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + ")({})")
+    } else if (name == "withAlloca") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 1) + ")(_gs_ptrAlloc(Number(" + nthStr(vs, 0) + ")))")
+    } else if (name == "arenaAlloc") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_ptrAlloc(Number(" + nthStr(vs, 1) + "))")
+    } else if (name == "foreignPtrNew") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some(nthStr(vs, 0))
+    } else if (name == "cFnPtr") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some(nthStr(vs, 0))
+    } else if (name == "gcHandleNew") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_handleNew(" + nthStr(vs, 0) + ")")
+    } else if (name == "gcHandleGet") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_handleGet(" + nthStr(vs, 0) + ")")
+    } else if (name == "gcHandleFree") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, "_gs_handleFree(" + nthStr(vs, 0) + ");");
+        Some("undefined")
+    } else if (name == "gcTrim" || name == "gcSetThresholds") {
+        let _ = evalArgsJs(ctx, args, locals);
+        Some("undefined")
+    } else if (name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes") {
+        Some("0n")
+    } else if (name == "__blackBox") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some(nthStr(vs, 0))
+    } else if (name == "sysArgc") {
+        Some("_gs_sysArgc()")
+    } else if (name == "sysArgv") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_sysArgv(" + nthStr(vs, 0) + ")")
+    } else if (name == "__concNumCpu") {
+        Some("1")
+    } else if (name == "__concAtomicNew") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("{ v: (" + nthStr(vs, 0) + " | 0) }")
+    } else if (name == "__concAtomicLoad") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(" + nthStr(vs, 0) + ".v | 0)")
+    } else if (name == "__concAtomicStore") {
+        let vs = evalArgsJs(ctx, args, locals);
+        jcEmitLine(ctx, nthStr(vs, 0) + ".v = (" + nthStr(vs, 1) + " | 0);");
+        Some("undefined")
+    } else if (name == "__concAtomicAdd") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_atomicAdd(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ")")
+    } else if (name == "__concAtomicCas") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("_gs_atomicCas(" + nthStr(vs, 0) + ", " + nthStr(vs, 1) + ", " + nthStr(vs, 2) + ")")
+    } else if (strStartsWith(name, "__conc")) {
+        Some("(() => { throw new Error(" + jsStringLit("Geisha JS target does not support blocking multicore primitive '" + name + "'") + "); })()")
+    } else {
+        None
+    }
+
+def emitExternCallJs(ext: ExternDef, argExprs: List String): String =
+    if (ext.extIsFnPtr) {
+        match argExprs {
+            Cons(fp, rest) -> "(" + fp + ")(" + strJoin(rest, ", ") + ")",
+            Nil -> "(() => { throw new Error(\"Geisha extern ptr call missing function pointer\"); })()",
+        }
+    } else {
+        let link = ext.extLink;
+        let joined = strJoin(argExprs, ", ");
+        if (link == "strtod") "_gs_strtod(" + nthStr(argExprs, 0) + ")"
+        else if (link == "gs_sys_rand_seed") "_gs_rand_seed()"
+        else if (link == "gs_sys_time_now_ms") "BigInt(Date.now())"
+        else if (link == "gs_sys_time_mono_ms") "BigInt(Math.trunc(performance.now()))"
+        else if (link == "gs_sys_time_mono_ns") "BigInt(Math.trunc(performance.now() * 1e6))"
+        else if (link == "write") "_gs_sys_write(" + joined + ")"
+        else if (link == "exit") "_gs_sys_exit(" + nthStr(argExprs, 0) + ")"
+        else if (strStartsWith(link, "js:")) {
+            let jsPath = strSlice(link, 3, strLen(link));
+            "_gs_hostCall(" + jsStringLit(jsPath) + ", [" + joined + "])"
+        } else {
+            "_gs_hostCall(" + jsStringLit(link) + ", [" + joined + "])"
+        }
+    }
+
+// ============================================================================
+// Expression & Statement Code Generation
+// ============================================================================
+
+def emitJsExpr(ctx: JsEmitCtx, tm: TaggedTerm, locals: List (String, String)): String = {
+    let resTy = schemeBody(tm.tscm);
+    match tm.tnode {
+        TmLit(lit) -> emitLitJs(lit, resTy),
+        TmVar(vname) -> match lookupLocalJs(locals, vname) {
+            Some(jsNm) -> jsNm,
+            None ->
+                if (strMapContains(ctx.jcProg.coreFns, vname)) jsFnIdent(vname)
+                else jsGlobalIdent(vname),
+        },
+        TmGlobalVar(gname) ->
+            if (strMapContains(ctx.jcProg.coreFns, gname)) jsFnIdent(gname)
+            else jsGlobalIdent(gname),
+        TmTuple(es) -> {
+            let vals = evalArgsJs(ctx, es, locals);
+            "[" + strJoin(vals, ", ") + "]"
+        },
+        TmUn(op, e) -> {
+            let ev = emitJsExpr(ctx, e, locals);
+            emitUnOpJs(op, ev, schemeBody(e.tscm))
+        },
+        TmBin(op, l, r) -> match op {
+            OpAnd -> {
+                let tmp = jcFreshTmp(ctx);
+                let lv = emitJsExpr(ctx, l, locals);
+                jcEmitLine(ctx, "let " + tmp + " = false;");
+                jcEmitLine(ctx, "if (" + lv + ") {");
+                jcIncIndent(ctx);
+                emitJsStmt(ctx, r, locals, TgtAssign(tmp));
+                jcDecIndent(ctx);
+                jcEmitLine(ctx, "}");
+                tmp
+            },
+            OpOr -> {
+                let tmp = jcFreshTmp(ctx);
+                let lv = emitJsExpr(ctx, l, locals);
+                jcEmitLine(ctx, "let " + tmp + " = true;");
+                jcEmitLine(ctx, "if (!(" + lv + ")) {");
+                jcIncIndent(ctx);
+                emitJsStmt(ctx, r, locals, TgtAssign(tmp));
+                jcDecIndent(ctx);
+                jcEmitLine(ctx, "}");
+                tmp
+            },
+            _ -> {
+                let lv0 = emitJsExpr(ctx, l, locals);
+                let lv =
+                    if (!isPureImmutableJsExpr(l) && !isPureImmutableJsExpr(r)) {
+                        let t = jcFreshTmp(ctx);
+                        jcEmitLine(ctx, "const " + t + " = " + lv0 + ";");
+                        t
+                    } else lv0;
+                let rv = emitJsExpr(ctx, r, locals);
+                emitBinOpJs(op, lv, rv, schemeBody(l.tscm))
+            },
+        },
+        TmGetTag(node) -> {
+            let nv = emitJsExpr(ctx, node, locals);
+            "(" + nv + ".$)"
+        },
+        TmMakeData(adtName, tag, fields, _, _) -> {
+            let vinfoOpt = match strMapGet(ctx.jcProg.coreAdtReg, adtName) {
+                Some(ainfo) -> findVariantByTag(ainfo.variants, tag),
+                None -> None,
+            };
+            match fields {
+                Nil -> "{ $: " + intToStr(tag) + " }",
+                _ -> {
+                    let fvals = evalArgsJs(ctx, fields, locals);
+                    let partsRev = cellNew(["$: " + intToStr(tag)]);
+                    let idx = cellNew(0);
+                    let cur = cellNew(fvals);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(fv, r) -> {
+                                let prop = variantFieldProp(vinfoOpt, cellGet(idx));
+                                cellSet(partsRev, Cons(prop + ": " + fv, cellGet(partsRev)));
+                                cellSet(idx, cellGet(idx) + 1);
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    "{ " + strJoin(listRev(cellGet(partsRev)), ", ") + " }"
+                },
+            }
+        },
+        TmApplyCls(clsTm, args) -> {
+            let cv = emitJsExpr(ctx, clsTm, locals);
+            let avs = evalArgsJs(ctx, args, locals);
+            "(" + cv + ")(" + strJoin(avs, ", ") + ")"
+        },
+        TmApplyDir(vd, args) -> match tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals) {
+            Some(expr) -> expr,
+            None -> {
+                let avs = evalArgsJs(ctx, args, locals);
+                match strMapGet(ctx.jcProg.coreExterns, vd.vname) {
+                    Some(ext) -> emitExternCallJs(ext, avs),
+                    None -> jsFnIdent(vd.vname) + "(" + strJoin(avs, ", ") + ")",
+                }
+            },
+        },
+        TmBlock(_) -> {
+            let tmp = jcFreshTmp(ctx);
+            jcEmitLine(ctx, "let " + tmp + ";");
+            emitJsStmt(ctx, tm, locals, TgtAssign(tmp));
+            tmp
+        },
+        TmLet(_, _, _) -> {
+            let tmp = jcFreshTmp(ctx);
+            jcEmitLine(ctx, "let " + tmp + ";");
+            emitJsStmt(ctx, tm, locals, TgtAssign(tmp));
+            tmp
+        },
+        TmMakeCls(_, _, _) -> {
+            let tmp = jcFreshTmp(ctx);
+            jcEmitLine(ctx, "let " + tmp + ";");
+            emitJsStmt(ctx, tm, locals, TgtAssign(tmp));
+            tmp
+        },
+        TmIf(_, _, _) -> {
+            let tmp = jcFreshTmp(ctx);
+            jcEmitLine(ctx, "let " + tmp + ";");
+            emitJsStmt(ctx, tm, locals, TgtAssign(tmp));
+            tmp
+        },
+        TmWhile(_, _) -> {
+            emitJsStmt(ctx, tm, locals, TgtDiscard);
+            "undefined"
+        },
+        TmMatch(_, _) -> {
+            let tmp = jcFreshTmp(ctx);
+            jcEmitLine(ctx, "let " + tmp + ";");
+            emitJsStmt(ctx, tm, locals, TgtAssign(tmp));
+            tmp
+        },
+    }
+}
+
+def emitJsStmt(ctx: JsEmitCtx, tm: TaggedTerm, locals: List (String, String), target: StmtTarget): Void = match tm.tnode {
+    TmBlock(es) -> emitJsBlockItems(ctx, es, locals, target),
+    TmLet(vd, valTm, bodyTm) -> {
+        let vexpr = emitJsExpr(ctx, valTm, locals);
+        let (jsNm, nextLocs) = bindLocalJs(ctx, locals, vd.vname);
+        jcEmitLine(ctx, "const " + jsNm + " = " + vexpr + ";");
+        emitJsStmt(ctx, bodyTm, nextLocs, target)
+    },
+    TmMakeCls(vd, cls, bodyTm) -> {
+        let (jsNm, nextLocs) = bindLocalJs(ctx, locals, vd.vname);
+        let entryJs = jsFnIdent(cls.clsEntry);
+        match cls.clsFvs {
+            Nil -> jcEmitLine(ctx, "const " + jsNm + " = " + entryJs + ";"),
+            fvs -> {
+                let envTmp = jcFreshTmp(ctx);
+                let elemsRev = cellNew(Nil);
+                let selfIdxRev = cellNew(Nil);
+                let idx = cellNew(0);
+                let cur = cellNew(fvs);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(fv, r) -> {
+                            if (fv == vd.vname) {
+                                cellSet(elemsRev, Cons("null", cellGet(elemsRev)));
+                                cellSet(selfIdxRev, Cons(cellGet(idx), cellGet(selfIdxRev)))
+                            } else {
+                                let fvExpr = match lookupLocalJs(locals, fv) {
+                                    Some(locJs) -> locJs,
+                                    None ->
+                                        if (strMapContains(ctx.jcProg.coreFns, fv)) jsFnIdent(fv)
+                                        else jsGlobalIdent(fv),
+                                };
+                                cellSet(elemsRev, Cons(fvExpr, cellGet(elemsRev)))
+                            };
+                            cellSet(idx, cellGet(idx) + 1);
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                jcEmitLine(ctx, "const " + envTmp + " = [" + strJoin(listRev(cellGet(elemsRev)), ", ") + "];");
+                jcEmitLine(ctx, "const " + jsNm + " = (...$a) => " + entryJs + "(...$a, " + envTmp + ");");
+                let cs = cellNew(listRev(cellGet(selfIdxRev)));
+                while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                    match cellGet(cs) {
+                        Cons(si, r) -> {
+                            jcEmitLine(ctx, envTmp + "[" + intToStr(si) + "] = " + jsNm + ";");
+                            cellSet(cs, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            },
+        };
+        emitJsStmt(ctx, bodyTm, nextLocs, target)
+    },
+    TmIf(c, t, e) -> {
+        let cv = emitJsExpr(ctx, c, locals);
+        jcEmitLine(ctx, "if (" + cv + ") {");
+        jcIncIndent(ctx);
+        emitJsStmt(ctx, t, locals, target);
+        jcDecIndent(ctx);
+        jcEmitLine(ctx, "} else {");
+        jcIncIndent(ctx);
+        emitJsStmt(ctx, e, locals, target);
+        jcDecIndent(ctx);
+        jcEmitLine(ctx, "}")
+    },
+    TmWhile(c, b) -> {
+        jcEmitLine(ctx, "while (true) {");
+        jcIncIndent(ctx);
+        let cv = emitJsExpr(ctx, c, locals);
+        jcEmitLine(ctx, "if (!(" + cv + ")) break;");
+        emitJsStmt(ctx, b, locals, TgtDiscard);
+        jcDecIndent(ctx);
+        jcEmitLine(ctx, "}");
+        emitTargetResult(ctx, target, "undefined")
+    },
+    TmMatch(scrut, arms) -> {
+        let sv = emitJsExpr(ctx, scrut, locals);
+        let scrutTmp = jcFreshTmp(ctx);
+        jcEmitLine(ctx, "const " + scrutTmp + " = " + sv + ";");
+        let scrutTy = schemeBody(scrut.tscm);
+        emitJsMatchArms(ctx, scrutTmp, scrutTy, arms, locals, target)
+    },
+    TmApplyDir(vd, args) -> match target {
+        TgtReturn if (ctx.jcTcoActive && vd.vname == ctx.jcCurFnName) -> {
+            // Direct self-tail-call optimization -> update parameters + continue
+            let argExprs = evalArgsJs(ctx, args, locals);
+            let tmpsRev = cellNew(Nil);
+            let ca = cellNew(argExprs);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(ae, r) -> {
+                        let t = jcFreshTmp(ctx);
+                        jcEmitLine(ctx, "const " + t + " = " + ae + ";");
+                        cellSet(tmpsRev, Cons(t, cellGet(tmpsRev)));
+                        cellSet(ca, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            let cp = cellNew(ctx.jcTcoParamJs);
+            let ct = cellNew(listRev(cellGet(tmpsRev)));
+            while (match (cellGet(cp), cellGet(ct)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                match (cellGet(cp), cellGet(ct)) {
+                    (Cons(pjs, rp), Cons(tjs, rt)) -> {
+                        jcEmitLine(ctx, pjs + " = " + tjs + ";");
+                        cellSet(cp, rp);
+                        cellSet(ct, rt)
+                    },
+                    _ -> (),
+                }
+            };
+            jcEmitLine(ctx, "continue;")
+        },
+        _ -> {
+            let e = emitJsExpr(ctx, tm, locals);
+            emitTargetResult(ctx, target, e)
+        },
+    },
+    _ -> {
+        let e = emitJsExpr(ctx, tm, locals);
+        emitTargetResult(ctx, target, e)
+    },
+}
+
+def emitJsBlockItems(ctx: JsEmitCtx, es: List TaggedTerm, locals: List (String, String), target: StmtTarget): Void = match es {
+    Nil -> emitTargetResult(ctx, target, "undefined"),
+    Cons(last, Nil) -> emitJsStmt(ctx, last, locals, target),
+    Cons(h, t) -> {
+        emitJsStmt(ctx, h, locals, TgtDiscard);
+        emitJsBlockItems(ctx, t, locals, target)
+    },
+}
+
+def emitJsMatchArms(
+    ctx: JsEmitCtx,
+    scrutTmp: String,
+    scrutTy: Type,
+    arms: List CoreArm,
+    locals: List (String, String),
+    target: StmtTarget
+): Void = {
+    let matchedVar = jcFreshTmp(ctx);
+    jcEmitLine(ctx, "let " + matchedVar + " = false;");
+    let cur = cellNew(arms);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(arm, rest) -> {
+                let condsRev: Cell (List String) = cellNew(Nil);
+                let bindsRev: Cell (List (String, String)) = cellNew(Nil);
+                let armLocals = cellNew(locals);
+                emitPatternCondAndBinds(ctx, scrutTmp, scrutTy, arm.caPat, condsRev, bindsRev, armLocals);
+                let condList = listRev(cellGet(condsRev));
+                let condStr = match condList {
+                    Nil -> "!" + matchedVar,
+                    _ -> "!" + matchedVar + " && " + strJoin(condList, " && "),
+                };
+                jcEmitLine(ctx, "if (" + condStr + ") {");
+                jcIncIndent(ctx);
+                let cb = cellNew(listRev(cellGet(bindsRev)));
+                while (match cellGet(cb) { Nil -> false, _ -> true }) {
+                    match cellGet(cb) {
+                        Cons((bname, bexpr), rb) -> {
+                            jcEmitLine(ctx, "const " + bname + " = " + bexpr + ";");
+                            cellSet(cb, rb)
+                        },
+                        Nil -> (),
+                    }
+                };
+                match arm.caGuard {
+                    Some(gTerm) -> {
+                        let gv = emitJsExpr(ctx, gTerm, cellGet(armLocals));
+                        jcEmitLine(ctx, "if (" + gv + ") {");
+                        jcIncIndent(ctx);
+                        jcEmitLine(ctx, matchedVar + " = true;");
+                        emitJsStmt(ctx, arm.caBody, cellGet(armLocals), target);
+                        jcDecIndent(ctx);
+                        jcEmitLine(ctx, "}")
+                    },
+                    None -> {
+                        jcEmitLine(ctx, matchedVar + " = true;");
+                        emitJsStmt(ctx, arm.caBody, cellGet(armLocals), target)
+                    },
+                };
+                jcDecIndent(ctx);
+                jcEmitLine(ctx, "}");
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    jcEmitLine(ctx, "if (!" + matchedVar + ") throw new Error(\"Geisha non-exhaustive match failure\");")
+}
+
+// ============================================================================
+// Inline Zero-Dependency JS Runtime Prelude
+// ============================================================================
+
+def emitJsRuntimePrelude(out: StringBuf): Void = {
+    bufPushStr(out, "// Generated by Geisha (`--target js`) — Zero-dependency ES Module\n");
+    bufPushStr(out, "const _gs_enc = new TextEncoder();\n");
+    bufPushStr(out, "const _gs_dec = new TextDecoder(\"utf-8\");\n");
+    bufPushStr(out, "const _gs_fbuf = new ArrayBuffer(8);\n");
+    bufPushStr(out, "const _gs_fdv = new DataView(_gs_fbuf);\n");
+    bufPushStr(out, "function _gs_idiv32(a, b) {\n");
+    bufPushStr(out, "  a |= 0; b |= 0;\n");
+    bufPushStr(out, "  if (b === 0) throw new Error(\"Geisha division by zero\");\n");
+    bufPushStr(out, "  if (a === -2147483648 && b === -1) return -2147483648;\n");
+    bufPushStr(out, "  return Math.trunc(a / b) | 0;\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_irem32(a, b) {\n");
+    bufPushStr(out, "  a |= 0; b |= 0;\n");
+    bufPushStr(out, "  if (b === 0) throw new Error(\"Geisha division by zero\");\n");
+    bufPushStr(out, "  if (a === -2147483648 && b === -1) return 0;\n");
+    bufPushStr(out, "  return (a % b) | 0;\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_idiv64(a, b) {\n");
+    bufPushStr(out, "  if (b === 0n) throw new Error(\"Geisha division by zero\");\n");
+    bufPushStr(out, "  if (a === -9223372036854775808n && b === -1n) return -9223372036854775808n;\n");
+    bufPushStr(out, "  return BigInt.asIntN(64, a / b);\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_irem64(a, b) {\n");
+    bufPushStr(out, "  if (b === 0n) throw new Error(\"Geisha division by zero\");\n");
+    bufPushStr(out, "  if (a === -9223372036854775808n && b === -1n) return 0n;\n");
+    bufPushStr(out, "  return BigInt.asIntN(64, a % b);\n");
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "function _gs_popcnt32(x) { x = x - ((x >>> 1) & 0x55555555); x = (x & 0x33333333) + ((x >>> 2) & 0x33333333); return (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) | 0; }\n");
+    bufPushStr(out, "function _gs_popcnt64(x) { let u = BigInt.asUintN(64, x), c = 0; while (u !== 0n) { u &= u - 1n; c++; } return c | 0; }\n");
+    bufPushStr(out, "function _gs_ctz32(x) { x |= 0; return x === 0 ? 32 : (31 - Math.clz32(x & -x)) | 0; }\n");
+    bufPushStr(out, "function _gs_floatToBits64(f) { _gs_fdv.setFloat64(0, f, true); return _gs_fdv.getBigInt64(0, true); }\n");
+    bufPushStr(out, "function _gs_bits64ToFloat(b) { _gs_fdv.setBigInt64(0, b, true); return _gs_fdv.getFloat64(0, true); }\n");
+    bufPushStr(out, "function _gs_f32ToBits32(f) { _gs_fdv.setFloat32(0, f, true); return _gs_fdv.getInt32(0, true); }\n");
+    bufPushStr(out, "function _gs_bits32ToF32(b) { _gs_fdv.setInt32(0, b | 0, true); return _gs_fdv.getFloat32(0, true); }\n");
+    bufPushStr(out, "function _gs_arrayNew(n, v) { if (n < 0) throw new RangeError(\"Geisha negative array length\"); return new Array(n).fill(v); }\n");
+    bufPushStr(out, "function _gs_arrayGet(a, i) { if (i < 0 || i >= a.length) throw new RangeError(\"Geisha array bounds\"); return a[i]; }\n");
+    bufPushStr(out, "function _gs_arraySet(a, i, v) { if (i < 0 || i >= a.length) throw new RangeError(\"Geisha array bounds\"); a[i] = v; }\n");
+    bufPushStr(out, "function _gs_parTabulate(n, f) { const a = new Array(Math.max(0, n | 0)); for (let i = 0; i < a.length; i++) a[i] = f(i); return a; }\n");
+    bufPushStr(out, "const _gs_emptyStr = new Uint8Array(0);\n");
+    bufPushStr(out, "function _gs_s(s) { return _gs_enc.encode(s); }\n");
+    bufPushStr(out, "function _gs_toJsStr(b) { return b instanceof Uint8Array ? _gs_dec.decode(b) : String(b); }\n");
+    bufPushStr(out, "function _gs_fromJsStr(s) { return s instanceof Uint8Array ? s : _gs_enc.encode(String(s)); }\n");
+    bufPushStr(out, "function _gs_isPtr(v) { return v !== null && typeof v === \"object\" && v.buf instanceof Uint8Array && typeof v.off === \"number\"; }\n");
+    bufPushStr(out, "function _gs_toJs(v) { if (v instanceof Uint8Array) return _gs_dec.decode(v); if (v === null || typeof v !== \"object\" || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_toJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_toJs(v[k]); return o; }\n");
+    bufPushStr(out, "function _gs_fromJs(v) { if (typeof v === \"string\") return _gs_enc.encode(v); if (v === null || typeof v !== \"object\" || v instanceof Uint8Array || _gs_isPtr(v)) return v; if (Array.isArray(v)) return v.map(_gs_fromJs); const o = {}; for (const k of Object.keys(v)) o[k] = _gs_fromJs(v[k]); return o; }\n");
+    bufPushStr(out, "function _gs_mutArrProxy(arr, fromElem, toElem) { return new Proxy(arr, { get(t, p, r) { const v = Reflect.get(t, p, r); return (typeof p === \"string\" && /^\\d+$/.test(p)) ? fromElem(v) : v; }, set(t, p, v, r) { return (typeof p === \"string\" && /^\\d+$/.test(p)) ? Reflect.set(t, p, toElem(v), r) : Reflect.set(t, p, v, r); } }); }\n");
+    bufPushStr(out, "function _gs_cellProxy(c, fromElem, toElem) { return { get v() { return fromElem(c.v); }, set v(x) { c.v = toElem(x); } }; }\n");
+    bufPushStr(out, "function _gs_strConcat(a, b) { const r = new Uint8Array(a.length + b.length); r.set(a, 0); r.set(b, a.length); return r; }\n");
+    bufPushStr(out, "function _gs_strEq(a, b) { if (a === b) return true; if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false; return true; }\n");
+    bufPushStr(out, "function _gs_strByteAt(b, i) { if (i < 0 || i >= b.length) throw new RangeError(\"Geisha string bounds\"); return b[i] | 0; }\n");
+    bufPushStr(out, "function _gs_strSlice(b, a, e) { if (a < 0 || e < a || e > b.length) throw new RangeError(\"Geisha string slice bounds\"); return b.slice(a, e); }\n");
+    bufPushStr(out, "function _gs_strFromBytes(arr, n) { if (n < 0 || n > arr.length) throw new RangeError(\"Geisha strFromBytes bounds\"); const u = new Uint8Array(n); for (let i = 0; i < n; i++) u[i] = arr[i] & 255; return u; }\n");
+    bufPushStr(out, "function _gs_strCmp(a, b) { if (a === b) return 0; const m = Math.min(a.length, b.length); for (let i = 0; i < m; i++) { if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1; } return a.length < b.length ? -1 : (a.length > b.length ? 1 : 0); }\n");
+    bufPushStr(out, "function _gs_ptrAlloc(n) { const sz = Math.max(0, n | 0); return { buf: new Uint8Array(sz), off: 0 }; }\n");
+    bufPushStr(out, "function _gs_ptrOffset(p, d) { return p === null ? null : { buf: p.buf, off: p.off + d }; }\n");
+    bufPushStr(out, "function _gs_ptrDv(p) { return new DataView(p.buf.buffer, p.buf.byteOffset, p.buf.byteLength); }\n");
+    bufPushStr(out, "function _gs_ptrByteAt(p, i) { return p.buf[p.off + i] | 0; }\n");
+    bufPushStr(out, "function _gs_ptrSetByte(p, i, v) { p.buf[p.off + i] = v & 255; }\n");
+    bufPushStr(out, "function _gs_ptrReadI8(p, i) { return _gs_ptrDv(p).getInt8(p.off + i) | 0; }\n");
+    bufPushStr(out, "function _gs_ptrReadU16Le(p, i) { return _gs_ptrDv(p).getUint16(p.off + i, true) | 0; }\n");
+    bufPushStr(out, "function _gs_ptrReadI32Le(p, i) { return _gs_ptrDv(p).getInt32(p.off + i, true) | 0; }\n");
+    bufPushStr(out, "function _gs_ptrReadI64Le(p, i) { return _gs_ptrDv(p).getBigInt64(p.off + i, true); }\n");
+    bufPushStr(out, "function _gs_ptrReadF32Le(p, i) { return _gs_ptrDv(p).getFloat32(p.off + i, true); }\n");
+    bufPushStr(out, "function _gs_ptrReadF64Le(p, i) { return _gs_ptrDv(p).getFloat64(p.off + i, true); }\n");
+    bufPushStr(out, "function _gs_ptrWriteU16Le(p, i, v) { _gs_ptrDv(p).setUint16(p.off + i, v & 0xffff, true); }\n");
+    bufPushStr(out, "function _gs_ptrWriteI32Le(p, i, v) { _gs_ptrDv(p).setInt32(p.off + i, v | 0, true); }\n");
+    bufPushStr(out, "function _gs_ptrWriteI64Le(p, i, v) { _gs_ptrDv(p).setBigInt64(p.off + i, v, true); }\n");
+    bufPushStr(out, "function _gs_ptrWriteF32Le(p, i, v) { _gs_ptrDv(p).setFloat32(p.off + i, v, true); }\n");
+    bufPushStr(out, "function _gs_ptrWriteF64Le(p, i, v) { _gs_ptrDv(p).setFloat64(p.off + i, v, true); }\n");
+    bufPushStr(out, "function _gs_ptrCopyBytes(dst, dOff, src, sOff, len) { if (len <= 0) return; dst.buf.set(src.buf.subarray(src.off + sOff, src.off + sOff + len), dst.off + dOff); }\n");
+    bufPushStr(out, "function _gs_ptrCopyFromStr(dst, dOff, s, len) { if (len <= 0) return; dst.buf.set(s.subarray(0, len), dst.off + dOff); }\n");
+    bufPushStr(out, "function _gs_ptrSliceFromStr(s, start, len) { return s.slice(start, start + len); }\n");
+    bufPushStr(out, "function _gs_ptrSliceToString(p, len) { return p.buf.slice(p.off, p.off + Math.max(0, len | 0)); }\n");
+    bufPushStr(out, "function _gs_ptrToString(p) { if (p === null) return _gs_emptyStr; let e = p.off; while (e < p.buf.length && p.buf[e] !== 0) e++; return p.buf.slice(p.off, e); }\n");
+    bufPushStr(out, "const _gs_handles = new Map(); let _gs_nextHandle = 1n;\n");
+    bufPushStr(out, "function _gs_handleNew(v) { if (v === null || v === undefined) return 0n; const h = _gs_nextHandle++; _gs_handles.set(h, v); return h; }\n");
+    bufPushStr(out, "function _gs_handleGet(h) { return _gs_handles.has(h) ? _gs_handles.get(h) : null; }\n");
+    bufPushStr(out, "function _gs_handleFree(h) { _gs_handles.delete(h); }\n");
+    bufPushStr(out, "function _gs_strtod(s) { const v = Number.parseFloat(_gs_toJsStr(s)); return Number.isNaN(v) ? 0.0 : v; }\n");
+    bufPushStr(out, "let _gs_seed = 0x243f6a8885a308d3n;\n");
+    bufPushStr(out, "function _gs_rand_seed() { _gs_seed = BigInt.asIntN(64, _gs_seed + 0x9e3779b97f4a7c15n); return _gs_seed; }\n");
+    bufPushStr(out, "function _gs_printLn(s) { const t = _gs_toJsStr(s); if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t); else console.log(t); }\n");
+    bufPushStr(out, "function _gs_putStr(s) { const t = _gs_toJsStr(s); if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(t); else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(t); else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(t); else console.log(t); }\n");
+    bufPushStr(out, "function _gs_sys_write(fd, s, n) { const t = _gs_dec.decode(s.subarray(0, Number(n))); if (fd === 2 && typeof process !== \"undefined\" && process.stderr) process.stderr.write(t); else _gs_putStr(t); return BigInt(n); }\n");
+    bufPushStr(out, "function _gs_sys_exit(c) { if (typeof process !== \"undefined\" && typeof process.exit === \"function\") process.exit(c | 0); throw new Error(\"Geisha exit(\" + (c | 0) + \")\"); }\n");
+    bufPushStr(out, "function _gs_sysArgc() { return (typeof process !== \"undefined\" && Array.isArray(process.argv)) ? Math.max(0, process.argv.length - 1) | 0 : 0; }\n");
+    bufPushStr(out, "function _gs_sysArgv(i) { return (typeof process !== \"undefined\" && Array.isArray(process.argv) && i >= 0 && i + 1 < process.argv.length) ? _gs_enc.encode(process.argv[i + 1]) : _gs_emptyStr; }\n");
+    bufPushStr(out, "function _gs_atomicAdd(a, d) { const prev = a.v | 0; a.v = (prev + (d | 0)) | 0; return prev; }\n");
+    bufPushStr(out, "function _gs_atomicCas(a, exp, des) { if ((a.v | 0) === (exp | 0)) { a.v = des | 0; return true; } return false; }\n");
+    bufPushStr(out, "function _gs_hostCall(path, args) { const parts = path.split(\".\"); let obj = globalThis; let parent = globalThis; for (const k of parts) { parent = obj; obj = obj == null ? undefined : obj[k]; } if (typeof obj !== \"function\") throw new Error(\"Geisha JS extern not found: \" + path); return _gs_fromJs(obj.apply(parent, args.map(_gs_toJs))); }\n\n")
+}
+
+// ============================================================================
+// Top-Level Program -> ES Module JS Emitter
+// ============================================================================
+
+def emitJsFunction(prog: CoreProgram, out: StringBuf, fd: FunDef): Void = {
+    let paramsRev: Cell (List String) = cellNew(Nil);
+    let initLocals: Cell (List (String, String)) = cellNew(Nil);
+    let tmpCnt = cellNew(0);
+    let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
+    let tco = !hasFvs && hasSelfTailCall(fd.fnName, fd.fnBody);
+    let tmpCtx = MkJsEmitCtx {
+        jcProg: prog,
+        jcBuf: out,
+        jcTmpCnt: tmpCnt,
+        jcIndent: cellNew(1),
+        jcCurFnName: fd.fnName,
+        jcTcoActive: tco,
+        jcTcoParamJs: Nil,
+    };
+    let cp = cellNew(fd.fnParams);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(pvd, r) -> {
+                let (pjs, nextLocs) = bindLocalJs(tmpCtx, cellGet(initLocals), pvd.vname);
+                cellSet(paramsRev, Cons(pjs, cellGet(paramsRev)));
+                cellSet(initLocals, nextLocs);
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+    let paramJsList = listRev(cellGet(paramsRev));
+    let sigParams = if (hasFvs) listAppend(paramJsList, ["$env"]) else paramJsList;
+
+    bufPushStr(out, "function " + jsFnIdent(fd.fnName) + "(" + strJoin(sigParams, ", ") + ") {\n");
+
+    let ctx = MkJsEmitCtx {
+        jcProg: prog,
+        jcBuf: out,
+        jcTmpCnt: tmpCnt,
+        jcIndent: cellNew(1),
+        jcCurFnName: fd.fnName,
+        jcTcoActive: tco,
+        jcTcoParamJs: paramJsList,
+    };
+
+    if (hasFvs) {
+        let idx = cellNew(0);
+        let cf = cellNew(fd.fnFvs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fv, r) -> {
+                    let (fjs, nextL) = bindLocalJs(ctx, cellGet(initLocals), fv.vname);
+                    cellSet(initLocals, nextL);
+                    jcEmitLine(ctx, "const " + fjs + " = $env[" + intToStr(cellGet(idx)) + "];");
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        }
+    } else ();
+
+    if (tco) {
+        jcEmitLine(ctx, "while (true) {");
+        jcIncIndent(ctx);
+        emitJsStmt(ctx, fd.fnBody, cellGet(initLocals), TgtReturn);
+        jcDecIndent(ctx);
+        jcEmitLine(ctx, "}")
+    } else {
+        emitJsStmt(ctx, fd.fnBody, cellGet(initLocals), TgtReturn)
+    };
+
+    bufPushStr(out, "}\n\n")
+}
+
+def hasDotByte(s: String): Bool = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        if (strByteAt(s, cellGet(i)) == 46) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+pub def collectRootPubFnNames(rawDefs: List Def, prog: CoreProgram): List String = {
+    let seen: StrMap Bool = strMapNew();
+    let accRev: Cell (List String) = cellNew(Nil);
+    let cur = cellNew(rawDefs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(d, r) -> {
+                if (isPublicVis(d.vis) && !hasDotByte(d.ident) && d.ident != "main" && !strMapContains(seen, d.ident)) {
+                    match d.item {
+                        ItForm(f) -> match f.node {
+                            ExAbs(_, _, _) ->
+                                if (strMapContains(prog.coreFns, d.ident)) {
+                                    strMapInsert(seen, d.ident, true);
+                                    cellSet(accRev, Cons(d.ident, cellGet(accRev)))
+                                } else (),
+                            _ -> (),
+                        },
+                        _ -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(accRev))
+}
+
+def emitGlobalCtorsJs(prog: CoreProgram, out: StringBuf): Void = {
+    let cur = cellNew(prog.coreCtors);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((fnName, _), r) -> {
+                if (strMapContains(prog.coreFns, fnName)) {
+                    bufPushStr(out, "  " + jsFnIdent(fnName) + "();\n")
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def collectExportPairs(prog: CoreProgram, cliExports: List String): List (String, String) = {
+    let seen: StrMap Bool = strMapNew();
+    let accRev: Cell (List (String, String)) = cellNew(Nil);
+    // 1. `pub extern ["sym"] def ...` pairs from CoreProgram
+    let ce = cellNew(prog.coreCExports);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnName, expName), r) -> {
+                if (strMapContains(prog.coreFns, fnName) && !strMapContains(seen, expName)) {
+                    strMapInsert(seen, expName, true);
+                    cellSet(accRev, Cons((fnName, expName), cellGet(accRev)))
+                } else ();
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+    // 2. CLI `--export` / `[target.js] exports`
+    let cx = cellNew(cliExports);
+    while (match cellGet(cx) { Nil -> false, _ -> true }) {
+        match cellGet(cx) {
+            Cons(nm, r) -> {
+                if (strMapContains(prog.coreFns, nm) && !strMapContains(seen, nm)) {
+                    strMapInsert(seen, nm, true);
+                    cellSet(accRev, Cons((nm, nm), cellGet(accRev)))
+                } else ();
+                cellSet(cx, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(accRev))
+}
+
+def isJsScalarNoMarshal(ty: Type): Bool = match ty {
+    TyVoid -> true,
+    TyCon(n) -> n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Bool" || n == "Char" || n == "Void" || n == "Ptr" || n == "ScopedPtr" || n == "ForeignPtr" || n == "AtomicInt",
+    _ -> false,
+}
+
+def wrapArgFromJs(ty: Type, expr: String, depth: Int): String = match ty {
+    TyCon("String") -> "_gs_fromJsStr(" + expr + ")",
+    TyArr(_, ps, r) -> {
+        let pNamesRev = cellNew(Nil);
+        let pCallsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(pt, rp) -> {
+                    let pn = "$c" + intToStr(depth) + "_" + intToStr(cellGet(idx));
+                    cellSet(pNamesRev, Cons(pn, cellGet(pNamesRev)));
+                    cellSet(pCallsRev, Cons(wrapRetToJs(pt, pn, depth + 1), cellGet(pCallsRev)));
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, rp)
+                },
+                Nil -> (),
+            }
+        };
+        let fnVar = "$fn" + intToStr(depth);
+        let callJs = "(" + fnVar + ")(" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
+        "(((" + fnVar + ") => ((" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") => " + wrapArgFromJs(r, callJs, depth + 1) + "))(" + expr + "))"
+    },
+    TyComp(_, elemTy) -> {
+        let base = tyConName(ty);
+        if (base == "MutArray") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "_gs_mutArrProxy(" + expr + ", (" + x + ") => " + wrapArgFromJs(elemTy, x, depth + 1) + ", (" + x + ") => " + wrapRetToJs(elemTy, x, depth + 1) + ")"
+            }
+        } else if (base == "Cell") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "_gs_cellProxy(" + expr + ", (" + x + ") => " + wrapArgFromJs(elemTy, x, depth + 1) + ", (" + x + ") => " + wrapRetToJs(elemTy, x, depth + 1) + ")"
+            }
+        } else if (base == "ImmArray") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "(" + expr + ").map((" + x + ") => " + wrapArgFromJs(elemTy, x, depth + 1) + ")"
+            }
+        } else "_gs_fromJs(" + expr + ")"
+    },
+    _ -> if (isJsScalarNoMarshal(ty)) expr else "_gs_fromJs(" + expr + ")",
+}
+
+def wrapRetToJs(ty: Type, expr: String, depth: Int): String = match ty {
+    TyCon("String") -> "_gs_toJsStr(" + expr + ")",
+    TyArr(_, ps, r) -> {
+        let pNamesRev = cellNew(Nil);
+        let pCallsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(pt, rp) -> {
+                    let pn = "$r" + intToStr(depth) + "_" + intToStr(cellGet(idx));
+                    cellSet(pNamesRev, Cons(pn, cellGet(pNamesRev)));
+                    cellSet(pCallsRev, Cons(wrapArgFromJs(pt, pn, depth + 1), cellGet(pCallsRev)));
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, rp)
+                },
+                Nil -> (),
+            }
+        };
+        let fnVar = "$rfn" + intToStr(depth);
+        let callGs = "(" + fnVar + ")(" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
+        "(((" + fnVar + ") => ((" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") => " + wrapRetToJs(r, callGs, depth + 1) + "))(" + expr + "))"
+    },
+    TyComp(_, elemTy) -> {
+        let base = tyConName(ty);
+        if (base == "MutArray") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "_gs_mutArrProxy(" + expr + ", (" + x + ") => " + wrapRetToJs(elemTy, x, depth + 1) + ", (" + x + ") => " + wrapArgFromJs(elemTy, x, depth + 1) + ")"
+            }
+        } else if (base == "Cell") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "_gs_cellProxy(" + expr + ", (" + x + ") => " + wrapRetToJs(elemTy, x, depth + 1) + ", (" + x + ") => " + wrapArgFromJs(elemTy, x, depth + 1) + ")"
+            }
+        } else if (base == "ImmArray") {
+            if (isJsScalarNoMarshal(elemTy)) expr
+            else {
+                let x = "$e" + intToStr(depth);
+                "(" + expr + ").map((" + x + ") => " + wrapRetToJs(elemTy, x, depth + 1) + ")"
+            }
+        } else "_gs_toJs(" + expr + ")"
+    },
+    _ -> if (isJsScalarNoMarshal(ty)) expr else "_gs_toJs(" + expr + ")",
+}
+
+def emitJsExportWrapper(prog: CoreProgram, out: StringBuf, fnName: String, expName: String): Void =
+    match strMapGet(prog.coreFns, fnName) {
+        None -> bufPushStr(out, "export const " + expName + " = " + jsFnIdent(fnName) + ";\n"),
+        Some(fd) -> {
+            let (paramTys, retTy) = match schemeBody(fd.fnScm) {
+                TyArr(_, ps, rt) -> (ps, rt),
+                other -> (Nil, other),
+            };
+            let pNamesRev = cellNew(Nil);
+            let pCallsRev = cellNew(Nil);
+            let idx = cellNew(0);
+            let cp = cellNew(fd.fnParams);
+            let cpt = cellNew(paramTys);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(pvd, rp) -> {
+                        let pty = match cellGet(cpt) {
+                            Cons(t, rt) -> { cellSet(cpt, rt); t },
+                            Nil -> schemeBody(pvd.vscm),
+                        };
+                        let pn = "a" + intToStr(cellGet(idx));
+                        cellSet(pNamesRev, Cons(pn, cellGet(pNamesRev)));
+                        cellSet(pCallsRev, Cons(wrapArgFromJs(pty, pn, 0), cellGet(pCallsRev)));
+                        cellSet(idx, cellGet(idx) + 1);
+                        cellSet(cp, rp)
+                    },
+                    Nil -> (),
+                }
+            };
+            let callExpr = jsFnIdent(fnName) + "(" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
+            let retExpr = wrapRetToJs(retTy, "$res", 0);
+            bufPushStr(out, "export function " + expName + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { const $res = " + callExpr + "; return " + retExpr + "; }\n")
+        },
+    }
+
+pub def emitProgramJs(prog: CoreProgram, exports: List String, noMain: Bool): String = {
+    let out = bufNew();
+    emitJsRuntimePrelude(out);
+
+    // 1. Global value declarations
+    let cg0 = cellNew(prog.coreGlobals);
+    while (match cellGet(cg0) { Nil -> false, _ -> true }) {
+        match cellGet(cg0) {
+            Cons(gv, r) -> {
+                bufPushStr(out, "let " + jsGlobalIdent(gv.gvName) + ";\n");
+                cellSet(cg0, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(out, 10);
+
+    // 2. Function definitions
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnm, r) -> {
+                match strMapGet(prog.coreFns, fnm) {
+                    Some(fd) -> emitJsFunction(prog, out, fd),
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // 3. Global initialization function
+    bufPushStr(out, "let _gs_inited = false;\n");
+    bufPushStr(out, "export function __geisha_init() {\n");
+    bufPushStr(out, "  if (_gs_inited) return;\n");
+    bufPushStr(out, "  _gs_inited = true;\n");
+    let initCtx = MkJsEmitCtx {
+        jcProg: prog,
+        jcBuf: out,
+        jcTmpCnt: cellNew(0),
+        jcIndent: cellNew(1),
+        jcCurFnName: "__geisha_init",
+        jcTcoActive: false,
+        jcTcoParamJs: Nil,
+    };
+    let cg1 = cellNew(prog.coreGlobals);
+    while (match cellGet(cg1) { Nil -> false, _ -> true }) {
+        match cellGet(cg1) {
+            Cons(gv, r) -> {
+                emitJsStmt(initCtx, gv.gvInit, Nil, TgtAssign(jsGlobalIdent(gv.gvName)));
+                cellSet(cg1, r)
+            },
+            Nil -> (),
+        }
+    };
+    emitGlobalCtorsJs(prog, out);
+    bufPushStr(out, "}\n");
+    bufPushStr(out, "__geisha_init();\n\n");
+
+    // 4. Named ES Module exports (with UTF-8 string <-> Uint8Array boundary marshalling)
+    let expPairs = collectExportPairs(prog, exports);
+    let ep = cellNew(expPairs);
+    while (match cellGet(ep) { Nil -> false, _ -> true }) {
+        match cellGet(ep) {
+            Cons((fnName, expName), r) -> {
+                emitJsExportWrapper(prog, out, fnName, expName);
+                cellSet(ep, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // 5. Optional `main` export and auto-invocation
+    let hasMain = strMapContains(prog.coreFns, "main");
+    if (hasMain) {
+        if (!listContainsStr(exports, "main")) {
+            bufPushStr(out, "export const main = " + jsFnIdent("main") + ";\n")
+        } else ();
+        if (!noMain) {
+            bufPushStr(out, jsFnIdent("main") + "();\n")
+        } else ()
+    } else ();
+
+    bufToString(out)
+}
+
+// ============================================================================
+// TypeScript `.d.ts` Declaration Emitter
+// ============================================================================
+
+def tsTypeIdent(raw: String): String = jsSanitizeIdent(raw, "")
+
+def collectAdtsInType(adtReg: StrMap AdtInfo, ty: Type, seen: StrMap Bool, order: Vec String): Void = match ty {
+    TyVoid -> (),
+    TyVar(_) -> (),
+    TyCon(n) ->
+        if (strMapContains(adtReg, n) && !strMapContains(seen, n)) {
+            strMapInsert(seen, n, true);
+            vecPush(order, n);
+            match strMapGet(adtReg, n) {
+                Some(ainfo) -> collectAdtsInVariants(adtReg, ainfo.variants, seen, order),
+                None -> (),
+            }
+        } else (),
+    TyComp(b, a) -> {
+        collectAdtsInType(adtReg, b, seen, order);
+        collectAdtsInType(adtReg, a, seen, order)
+    },
+    TyTuple(es) -> collectAdtsInTypeList(adtReg, es, seen, order),
+    TyArr(_, ps, r) -> {
+        collectAdtsInTypeList(adtReg, ps, seen, order);
+        collectAdtsInType(adtReg, r, seen, order)
+    },
+}
+
+def collectAdtsInTypeList(adtReg: StrMap AdtInfo, ts: List Type, seen: StrMap Bool, order: Vec String): Void = match ts {
+    Nil -> (),
+    Cons(h, t) -> {
+        collectAdtsInType(adtReg, h, seen, order);
+        collectAdtsInTypeList(adtReg, t, seen, order)
+    },
+}
+
+def collectAdtsInVariants(adtReg: StrMap AdtInfo, vs: List VariantInfo, seen: StrMap Bool, order: Vec String): Void = match vs {
+    Nil -> (),
+    Cons(vi, r) -> {
+        collectAdtsInTypeList(adtReg, vi.fieldTypes, seen, order);
+        collectAdtsInVariants(adtReg, r, seen, order)
+    },
+}
+
+def typeToTs(adtReg: StrMap AdtInfo, ty: Type): String = match ty {
+    TyVoid -> "void",
+    TyVar(v) -> tsTypeIdent(v),
+    TyCon(n) ->
+        if (n == "Int" || n == "Float" || n == "Float32" || n == "Char") "number"
+        else if (n == "Int64") "bigint"
+        else if (n == "Bool") "boolean"
+        else if (n == "String") "string"
+        else if (n == "Void") "void"
+        else if (n == "Ptr" || n == "ScopedPtr" || n == "ForeignPtr") "GeishaPtr | null"
+        else if (n == "Arena") "Record<string, unknown>"
+        else if (n == "AtomicInt") "{ v: number }"
+        else if (strMapContains(adtReg, n)) tsTypeIdent(n)
+        else "unknown",
+    TyComp(_, _) -> {
+        let base = tyConName(ty);
+        let targs = extractTypeArgs(ty);
+        if (base == "Cell") {
+            let inner = match targs { Cons(t, _) -> typeToTs(adtReg, t), Nil -> "unknown" };
+            "{ v: " + inner + " }"
+        } else if (base == "MutArray") {
+            let inner = match targs { Cons(t, _) -> typeToTs(adtReg, t), Nil -> "unknown" };
+            "Array<" + inner + ">"
+        } else if (base == "ImmArray") {
+            let inner = match targs { Cons(t, _) -> typeToTs(adtReg, t), Nil -> "unknown" };
+            "readonly (" + inner + ")[]"
+        } else if (strMapContains(adtReg, base)) {
+            let argsTs = mapTypesToTs(adtReg, targs);
+            tsTypeIdent(base) + "<" + strJoin(argsTs, ", ") + ">"
+        } else "unknown"
+    },
+    TyTuple(es) -> "[" + strJoin(mapTypesToTs(adtReg, es), ", ") + "]",
+    TyArr(_, ps, r) -> {
+        let pPartsRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(pt, rp) -> {
+                    cellSet(pPartsRev, Cons("arg" + intToStr(cellGet(idx)) + ": " + typeToTs(adtReg, pt), cellGet(pPartsRev)));
+                    cellSet(idx, cellGet(idx) + 1);
+                    cellSet(cur, rp)
+                },
+                Nil -> (),
+            }
+        };
+        "(" + strJoin(listRev(cellGet(pPartsRev)), ", ") + ") => " + typeToTs(adtReg, r)
+    },
+}
+
+def mapTypesToTs(adtReg: StrMap AdtInfo, ts: List Type): List String = match ts {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(typeToTs(adtReg, h), mapTypesToTs(adtReg, t)),
+}
+
+def emitAdtDts(adtReg: StrMap AdtInfo, out: StringBuf, ainfo: AdtInfo): Void = {
+    let tparamsStr = match ainfo.typeParams {
+        Nil -> "",
+        ps -> {
+            let mappedRev = cellNew(Nil);
+            let cur = cellNew(ps);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(p, r) -> { cellSet(mappedRev, Cons(tsTypeIdent(p), cellGet(mappedRev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            "<" + strJoin(listRev(cellGet(mappedRev)), ", ") + ">"
+        },
+    };
+    let variantsRev = cellNew(Nil);
+    let cv = cellNew(ainfo.variants);
+    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+        match cellGet(cv) {
+            Cons(vi, rv) -> {
+                let fieldsRev = cellNew(["readonly $: " + intToStr(vi.tag)]);
+                let idx = cellNew(0);
+                let cf = cellNew(vi.fieldTypes);
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(ft, rf) -> {
+                            let prop = variantFieldProp(Some(vi), cellGet(idx));
+                            cellSet(fieldsRev, Cons("readonly " + prop + ": " + typeToTs(adtReg, ft), cellGet(fieldsRev)));
+                            cellSet(idx, cellGet(idx) + 1);
+                            cellSet(cf, rf)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(variantsRev, Cons("{ " + strJoin(listRev(cellGet(fieldsRev)), "; ") + " }", cellGet(variantsRev)));
+                cellSet(cv, rv)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushStr(out, "export type " + tsTypeIdent(ainfo.adtName) + tparamsStr + " =\n  | " + strJoin(listRev(cellGet(variantsRev)), "\n  | ") + ";\n\n")
+}
+
+pub def emitProgramDts(prog: CoreProgram, exports: List String, noMain: Bool): String = {
+    let out = bufNew();
+    bufPushStr(out, "// Generated by Geisha (`--target js`)\n\n");
+    bufPushStr(out, "export interface GeishaPtr {\n  readonly buf: Uint8Array;\n  readonly off: number;\n}\n\n");
+    bufPushStr(out, "export declare function __geisha_init(): void;\n\n");
+
+    let expPairs = collectExportPairs(prog, exports);
+    let seenAdts: StrMap Bool = strMapNew();
+    let adtOrder: Vec String = vecNew();
+
+    // Collect referenced ADTs from exported signatures
+    let ce0 = cellNew(expPairs);
+    while (match cellGet(ce0) { Nil -> false, _ -> true }) {
+        match cellGet(ce0) {
+            Cons((fnName, _), r) -> {
+                match strMapGet(prog.coreFns, fnName) {
+                    Some(fd) -> collectAdtsInType(prog.coreAdtReg, schemeBody(fd.fnScm), seenAdts, adtOrder),
+                    None -> (),
+                };
+                cellSet(ce0, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let ai = cellNew(0);
+    while (cellGet(ai) < vecLen(adtOrder)) {
+        let anm = vecGetOr(adtOrder, cellGet(ai), "");
+        match strMapGet(prog.coreAdtReg, anm) {
+            Some(ainfo) -> emitAdtDts(prog.coreAdtReg, out, ainfo),
+            None -> (),
+        };
+        cellSet(ai, cellGet(ai) + 1)
+    };
+
+    // Exported function declarations
+    let ce1 = cellNew(expPairs);
+    while (match cellGet(ce1) { Nil -> false, _ -> true }) {
+        match cellGet(ce1) {
+            Cons((fnName, expName), r) -> {
+                match strMapGet(prog.coreFns, fnName) {
+                    Some(fd) -> {
+                        let fnTy = schemeBody(fd.fnScm);
+                        let (paramTys, retTy) = match fnTy {
+                            TyArr(_, ps, rt) -> (ps, rt),
+                            other -> (Nil, other),
+                        };
+                        let paramsRev = cellNew(Nil);
+                        let seenParams: StrMap Bool = strMapNew();
+                        let cp = cellNew(fd.fnParams);
+                        let cpt = cellNew(paramTys);
+                        let idx = cellNew(0);
+                        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                            match cellGet(cp) {
+                                Cons(pvd, rp) -> {
+                                    let pty = match cellGet(cpt) {
+                                        Cons(t, rt) -> { cellSet(cpt, rt); t },
+                                        Nil -> schemeBody(pvd.vscm),
+                                    };
+                                    let basePnm = jsSanitizeIdent(pvd.vname, "");
+                                    let pnm =
+                                        if (!strMapContains(seenParams, basePnm)) basePnm
+                                        else basePnm + "_" + intToStr(cellGet(idx));
+                                    strMapInsert(seenParams, pnm, true);
+                                    cellSet(paramsRev, Cons(pnm + ": " + typeToTs(prog.coreAdtReg, pty), cellGet(paramsRev)));
+                                    cellSet(idx, cellGet(idx) + 1);
+                                    cellSet(cp, rp)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        bufPushStr(
+                            out,
+                            "export declare function " + expName + "(" + strJoin(listRev(cellGet(paramsRev)), ", ") + "): "
+                            + typeToTs(prog.coreAdtReg, retTy) + ";\n"
+                        )
+                    },
+                    None -> (),
+                };
+                cellSet(ce1, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let hasMain = strMapContains(prog.coreFns, "main");
+    if (hasMain && !listContainsStr(exports, "main")) {
+        bufPushStr(out, "export declare function main(): void;\n")
+    } else ();
+
+    let _ = noMain;
+    bufToString(out)
+}

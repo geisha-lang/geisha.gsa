@@ -1,0 +1,90 @@
+// Geisha Client-Side Playground Compiler Engine (`geisha-playground.wasm`)
+//
+// Compiles to a standalone, zero-server `wasm32` binary that performs full
+// Geisha lexing, parsing, stdlib module loading (from embedded `stdlib_bundle`),
+// Hindley-Milner type inference, exhaustiveness & `Send` checking, Core IR lowering,
+// and ES Module JS + TypeScript `.d.ts` emission entirely inside the browser or Node.js.
+
+use std.result.{Result, Ok, Err}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use diag.diagReset
+use loader.{MkPkgSpec, loadSingleSourceProgramWithPkgsNamed}
+use infer.inferProgram
+use core.lowerToCore
+use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
+
+def hexLower(n: Int): Int = if (n < 10) 48 + n else 87 + n
+
+def jsonQuote(s: String): String = {
+    let b = bufNew();
+    bufPushByte(b, 34);
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i));
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else if (ch < 32) {
+            bufPushStr(b, "\\u00");
+            bufPushByte(b, hexLower((ch >>> 4) & 15));
+            bufPushByte(b, hexLower(ch & 15))
+        } else bufPushByte(b, ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufPushByte(b, 34);
+    bufToString(b)
+}
+
+def compileSourceInMemory(src: String): Result (String, String) String = {
+    diagReset();
+    let rootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: "",
+        srcRoots: Nil,
+        deps: Nil,
+    };
+    let rawDefs = loadSingleSourceProgramWithPkgsNamed("<playground>", src, rootSpec, Nil, Nil)?;
+    let inf = inferProgram(rawDefs)?;
+    let cp = lowerToCore(inf)?;
+    let pubExports = collectRootPubFnNames(rawDefs, cp);
+    let jsCode = emitProgramJs(cp, pubExports, false);
+    let dtsCode = emitProgramDts(cp, pubExports, false);
+    Ok((jsCode, dtsCode))
+}
+
+def checkSourceInMemory(src: String): Result Void String = {
+    diagReset();
+    let rootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: "",
+        srcRoots: Nil,
+        deps: Nil,
+    };
+    let rawDefs = loadSingleSourceProgramWithPkgsNamed("<playground>", src, rootSpec, Nil, Nil)?;
+    let inf = inferProgram(rawDefs)?;
+    let _ = lowerToCore(inf)?;
+    Ok(())
+}
+
+/// Typecheck a single Geisha source file (with full `std.*` support) and return JSON:
+/// `{"ok":true}` or `{"ok":false,"error":"..."}`.
+pub extern "geisha_check" def playgroundCheck(src: String): String =
+    match checkSourceInMemory(src) {
+        Ok(()) -> "{\"ok\":true}",
+        Err(e) -> "{\"ok\":false,\"error\":" + jsonQuote(e) + "}",
+    }
+
+/// Compile a single Geisha source file (with full `std.*` support) to ES Module JS + `.d.ts`
+/// and return JSON: `{"ok":true,"js":"...","dts":"..."}` or `{"ok":false,"error":"..."}`.
+pub extern "geisha_compile_js" def playgroundCompileJs(src: String): String =
+    match compileSourceInMemory(src) {
+        Ok((jsCode, dtsCode)) ->
+            "{\"ok\":true,\"js\":" + jsonQuote(jsCode) + ",\"dts\":" + jsonQuote(dtsCode) + "}",
+        Err(e) ->
+            "{\"ok\":false,\"error\":" + jsonQuote(e) + "}",
+    }
+
+def main(): Void = ()

@@ -3703,4 +3703,347 @@ PASS=$((PASS + 1))
 python3 tests/test_lsp.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
+# 40. Wasm32 Size Optimization Mode, --target js (ES Module + .d.ts + [target.js]), & geisha-playground.wasm
+if command -v node >/dev/null 2>&1; then
+    # 37a. Wasm32 size optimization (--opt z --strip --slim-runtime) & backward-compat default exports
+    if [ -f "./build/wasm_rt.o" ]; then
+        cat > "$TMP_DIR/t37_add.gsa" << 'EOF'
+pub extern "add" def add(a: Int, b: Int): Int = a + b
+def main(): Void = ()
+EOF
+        "$GEISHA_BIN" --target wasm32 --runtime ./build/wasm_rt.o -o "$TMP_DIR/t37_add_default.wasm" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --target wasm32 --opt z --strip --slim-runtime --runtime ./build/wasm_rt.o -o "$TMP_DIR/t37_add_slim.wasm" "$TMP_DIR/t37_add.gsa"
+        SLIM_BYTES="$(wc -c < "$TMP_DIR/t37_add_slim.wasm" | tr -d ' ')"
+        if [ "$SLIM_BYTES" -ge 512 ]; then
+            echo "FAIL [wasm32_slim_size]: expected < 512 bytes, got $SLIM_BYTES" >&2
+            exit 1
+        fi
+        T37_WASM_OUT="$(node -e '
+            const fs = require("fs");
+            (async () => {
+                const d = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]), { env: {} });
+                const s = await WebAssembly.instantiate(fs.readFileSync(process.argv[2]), { env: {} });
+                const hasDefaultGc = typeof d.instance.exports.gs_wasm_gc_collect === "function" && typeof d.instance.exports.gs_wasm_alloc === "function";
+                const noSlimGc = s.instance.exports.gs_wasm_gc_collect === undefined;
+                console.log([d.instance.exports.add(19, 23), s.instance.exports.add(19, 23), hasDefaultGc, noSlimGc].join("|"));
+            })();
+        ' "$TMP_DIR/t37_add_default.wasm" "$TMP_DIR/t37_add_slim.wasm")"
+        assert_eq "wasm32_size_mode_and_compat" "42|42|true|true" "$T37_WASM_OUT"
+        echo "PASS [wasm32_slim_bytes]: t37_add_slim.wasm = ${SLIM_BYTES} B (< 512 B)"
+        PASS=$((PASS + 1))
+    fi
+
+    # 38b. --target js ES Module + .d.ts end-to-end semantics (Int32 wrap, Int64 BigInt, self-TCO, ADT/guards, closures, UTF-8, std.json, eval order, 1e20 float, duplicate `_` params, withAlloca, gcHandle, extern init, 100KB MRU strByteAt)
+    cat > "$TMP_DIR/t37_js.gsa" << 'EOF'
+use std.str.{intToStr, i64ToStr}
+use std.buf.{bufNew, bufPushStr, bufToString}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use std.result.{Result, Ok, Err}
+use std.option.{Option, Some, None}
+
+pub data Point {
+    MkPoint { x: Int, y: Int },
+}
+
+pub data Shape {
+    Circle(Int),
+    Rect { w: Int, h: Int },
+    Empty,
+}
+
+def gInitFlag: Cell Int = cellNew(0)
+
+extern init def setupJsCtor(): Void = cellSet(gInitFlag, 77)
+
+def sumTail(n: Int, acc: Int64): Int64 =
+    if (n <= 0) acc
+    else sumTail(n - 1, acc + intToI64(n))
+
+def makeAdder(base: Int): Int -> Int =
+    (x: Int) -> base + x
+
+pub def constFirst(x: Int, _: Int, _: Int): Int = x
+
+pub def applyStrCallback(f: String -> String): String = f("é")
+
+pub def setFirstInt(arr: MutArray Int, v: Int): Void = arraySet(arr, 0, v)
+
+pub def setFirstStr(arr: MutArray String, s: String): Void = arraySet(arr, 0, s)
+
+pub def makeCounter(): () -> Int = {
+    let n = cellNew(0);
+    () -> {
+        let next = cellGet(n) + 1;
+        cellSet(n, next);
+        next
+    }
+}
+
+pub extern "area" def area(s: Shape): Int = match s {
+    Circle(r) if (r > 0) -> r * r * 3,
+    Rect { w: w, h: h } -> w * h,
+    _ -> 0,
+}
+
+pub extern "makePoint" def makePoint(x: Int, y: Int): Point =
+    MkPoint { x: x, y: y }
+
+pub extern "jsonRoundtrip" def jsonRoundtrip(raw: String): String = match jsonParse(raw) {
+    Ok(v) -> jsonStringify(v),
+    Err(e) -> "ERR:" + e,
+}
+
+def testEvalOrder(): Int = {
+    let c = cellNew(1);
+    let r1 = cellGet(c) + { cellSet(c, 99); 10 };
+    let c2 = cellNew(5);
+    let xs = Cons(cellGet(c2), { cellSet(c2, 50); Nil });
+    let r2 = match xs { Cons(h, _) -> h, Nil -> 0 };
+    r1 * 100 + r2
+}
+
+def testBigFloat(): Bool = {
+    let big = 1.0e20;
+    big > 1.0e19 && big < 1.0e21
+}
+
+def testAllocaAndHandles(): Int = {
+    let v = withAlloca(16, (p) -> {
+        scopedPtrWriteI32Le(p, 0, 1234);
+        scopedPtrReadI32Le(p, 0)
+    });
+    let h = gcHandleNew("pin");
+    let got: String = gcHandleGet(h);
+    gcHandleFree(h);
+    if (got == "pin") v else -1
+}
+
+def testLargeStrLinear(): Int = {
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < 10000) {
+        bufPushStr(b, "0123456789");
+        cellSet(i, cellGet(i) + 1)
+    };
+    let big = bufToString(b);
+    let n = strLen(big);
+    let sum = cellNew(0);
+    let k = cellNew(0);
+    while (cellGet(k) < n) {
+        cellSet(sum, cellGet(sum) + (strByteAt(big, cellGet(k)) - 48));
+        cellSet(k, cellGet(k) + 1)
+    };
+    cellGet(sum)
+}
+
+def testUtf8RawByteSliceAndFromBytes(): String = {
+    let e = "é";
+    let b0 = strSlice(e, 0, 1);
+    let b1 = strSlice(e, 1, 2);
+    let rejoined = b0 + b1;
+    let rawArr = arrayNew(3, 0);
+    arraySet(rawArr, 0, 255);
+    arraySet(rawArr, 1, 0);
+    arraySet(rawArr, 2, 65);
+    let rawStr = strFromBytes(rawArr, 3);
+    intToStr(strLen(b0)) + ":"
+    + (if (rejoined == e) "eq" else "neq") + ":"
+    + intToStr(strLen(rawStr)) + ":"
+    + intToStr(strByteAt(rawStr, 0)) + ":"
+    + intToStr(strByteAt(rawStr, 1)) + ":"
+    + intToStr(strByteAt(rawStr, 2))
+}
+
+def main(): Void = {
+    let wrap = 2147483647 + 1;
+    let minDiv = (-2147483647 - 1) / -1;
+    let tco = sumTail(100000, intToI64(0));
+    let add10 = makeAdder(10);
+    let cjkBytes = strLen("你好");
+    let arr = parTabulate(4, (i: Int) -> i * i);
+    let p = makePoint(3, 4);
+    let a = area(Rect { w: p.x, h: p.y });
+    let j = jsonRoundtrip("{\"k\":[1,true,\"ok\"]}");
+    let ev = testEvalOrder();
+    let bf = if (testBigFloat()) "fOk" else "fBad";
+    let ah = testAllocaAndHandles();
+    let cf = constFirst(9, 1, 2);
+    let ls = testLargeStrLinear();
+    let utf8Raw = testUtf8RawByteSliceAndFromBytes();
+    printLn(
+        intToStr(wrap) + "|"
+        + intToStr(minDiv) + "|"
+        + i64ToStr(tco) + "|"
+        + intToStr(add10(32)) + "|"
+        + intToStr(cjkBytes) + "|"
+        + intToStr(immArrayGet(arr, 3)) + "|"
+        + intToStr(a) + "|"
+        + j + "|"
+        + intToStr(ev) + "|"
+        + bf + "|"
+        + intToStr(ah) + "|"
+        + intToStr(cf) + "|"
+        + intToStr(cellGet(gInitFlag)) + "|"
+        + intToStr(ls) + "|"
+        + utf8Raw
+    )
+}
+EOF
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t37_js.mjs" "$TMP_DIR/t37_js.gsa"
+    if [ ! -f "$TMP_DIR/t37_js.d.ts" ]; then
+        echo "FAIL [js_dts_missing]: expected $TMP_DIR/t37_js.d.ts" >&2
+        exit 1
+    fi
+    if ! grep -q "export declare function area(" "$TMP_DIR/t37_js.d.ts" || ! grep -q "export declare function constFirst(x: number, _: number, __2: number)" "$TMP_DIR/t37_js.d.ts" || ! grep -q "export type Shape" "$TMP_DIR/t37_js.d.ts" || ! grep -q "readonly w: number" "$TMP_DIR/t37_js.d.ts"; then
+        echo "FAIL [js_dts_content]: unexpected .d.ts content:" >&2
+        cat "$TMP_DIR/t37_js.d.ts" >&2
+        exit 1
+    fi
+    T37_JS_MAIN="$(node "$TMP_DIR/t37_js.mjs")"
+    assert_eq "js_target_main_semantics" '-2147483648|-2147483648|5000050000|42|6|9|12|{"k":[1,true,"ok"]}|1105|fOk|1234|9|77|450000|1:eq:3:255:0:65' "$T37_JS_MAIN"
+
+    T37_JS_EXPORTS="$(node --input-type=module -e '
+        import * as mod from "'"$TMP_DIR"'/t37_js.mjs";
+        const pt = mod.makePoint(5, 6);
+        const a1 = mod.area({ $: 0, _0: 4 });
+        const a2 = mod.area({ $: 1, w: pt.x, h: pt.y });
+        const jr = mod.jsonRoundtrip("{\"msg\":\"é你好\"}");
+        const cb = mod.applyStrCallback((s) => (typeof s) + ":" + s + ":" + s.length);
+        const ma = [1, 2];
+        mod.setFirstInt(ma, 42);
+        const msa = ["old"];
+        mod.setFirstStr(msa, "é");
+        const cnt = mod.makeCounter();
+        console.log([pt.x, pt.y, a1, a2, mod.constFirst(88, 1, 2), jr, cb, ma[0], msa[0], cnt(), cnt()].join("|"));
+    ')"
+    # Note: importing module auto-runs main() first line, so check last line
+    T37_JS_EXP_LAST="$(printf "%s\n" "$T37_JS_EXPORTS" | tail -n 1)"
+    assert_eq "js_target_esm_exports" '5|6|48|30|88|{"msg":"é你好"}|string:é:1|42|é|1|2' "$T37_JS_EXP_LAST"
+
+    # 38c. Verify downstream dep `[target.wasm32]` slim_runtime does NOT pollute root app, and invalid opt is rejected
+    if [ -f "./build/wasm_rt.o" ]; then
+        POLLUTE_DEP="$TMP_DIR/t38_dep"
+        POLLUTE_ROOT="$TMP_DIR/t38_root"
+        mkdir -p "$POLLUTE_DEP/src" "$POLLUTE_ROOT/src"
+        cat > "$POLLUTE_DEP/geisha.toml" << 'EOF'
+name = "t38_dep"
+version = "0.1.0"
+
+[target.wasm32]
+slim_runtime = true
+strip = true
+opt = "z"
+EOF
+        cat > "$POLLUTE_DEP/src/t38_dep.gsa" << 'EOF'
+pub def depVal(): Int = 7
+EOF
+        cat > "$POLLUTE_ROOT/geisha.toml" << EOF
+name = "t38_root"
+version = "0.1.0"
+
+[deps]
+t38_dep = { path = "$POLLUTE_DEP" }
+
+[target.wasm32]
+opt = "z"
+strip = false
+EOF
+        cat > "$POLLUTE_ROOT/src/main.gsa" << 'EOF'
+use t38_dep.depVal
+pub extern "get_v" def getV(): Int = depVal()
+def main(): Void = ()
+EOF
+        ABS_GEISHA_38="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+        ABS_WRT_38="$(pwd)/build/wasm_rt.o"
+        (cd "$POLLUTE_ROOT" && "$ABS_GEISHA_38" build --target wasm32 --runtime "$ABS_WRT_38" >/dev/null)
+        T38_ISOL_OUT="$(node -e '
+            const fs = require("fs");
+            (async () => {
+                const { instance } = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]), { env: {} });
+                console.log([instance.exports.get_v(), typeof instance.exports.gs_wasm_gc_collect === "function"].join("|"));
+            })();
+        ' "$POLLUTE_ROOT/build/t38_root.wasm")"
+        assert_eq "wasm32_dep_flag_isolation" "7|true" "$T38_ISOL_OUT"
+
+        # Invalid opt in geisha.toml must be rejected
+        BAD_OPT_PROJ="$TMP_DIR/t38_bad_opt"
+        mkdir -p "$BAD_OPT_PROJ/src"
+        cat > "$BAD_OPT_PROJ/geisha.toml" << 'EOF'
+name = "t38_bad_opt"
+version = "0.1.0"
+
+[target.wasm32]
+opt = "bogus"
+EOF
+        cat > "$BAD_OPT_PROJ/src/main.gsa" << 'EOF'
+def main(): Void = ()
+EOF
+        if (cd "$BAD_OPT_PROJ" && "$ABS_GEISHA_38" build --target wasm32 --runtime "$ABS_WRT_38" >/dev/null 2>&1); then
+            echo "FAIL [wasm32_invalid_opt]: expected invalid opt='bogus' to be rejected" >&2
+            exit 1
+        fi
+    fi
+
+    # 38d. geisha.toml `[target.js]` via `geisha build --target js`
+    JS_PROJ="$TMP_DIR/t37_js_proj"
+    mkdir -p "$JS_PROJ/src"
+    cat > "$JS_PROJ/geisha.toml" << 'EOF'
+name = "t37_js_proj"
+version = "0.1.0"
+
+[target.js]
+exports = ["doubleIt"]
+dts = true
+owns_main = true
+EOF
+    cat > "$JS_PROJ/src/main.gsa" << 'EOF'
+pub def doubleIt(x: Int): Int = x * 2
+def main(): Void = printLn("SHOULD_NOT_AUTO_RUN")
+EOF
+    ABS_GEISHA_37="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+    (cd "$JS_PROJ" && "$ABS_GEISHA_37" build --target js >/dev/null)
+    if [ ! -f "$JS_PROJ/build/t37_js_proj.mjs" ] || [ ! -f "$JS_PROJ/build/t37_js_proj.d.ts" ]; then
+        echo "FAIL [js_pkg_build]: expected build/t37_js_proj.mjs and .d.ts" >&2
+        exit 1
+    fi
+    T37_PROJ_JS_OUT="$(node --input-type=module -e '
+        import { doubleIt } from "'"$JS_PROJ"'/build/t37_js_proj.mjs";
+        console.log(String(doubleIt(21)));
+    ')"
+    assert_eq "js_pkg_build_target_js" "42" "$T37_PROJ_JS_OUT"
+
+    # 37d. geisha-playground.wasm end-to-end client-side compile + run in Node
+    if [ -f "./build/wasm_rt.o" ] && [ -f "./src/playground.gsa" ]; then
+        PG_WASM="$TMP_DIR/geisha-playground.wasm"
+        "$GEISHA_BIN" --src-root src --target wasm32 --opt z --strip --runtime ./build/wasm_rt.o -o "$PG_WASM" src/playground.gsa
+        T37_PG_OUT="$(node --input-type=module -e '
+            import fs from "node:fs";
+            import { createGeishaPlayground } from "./playground/geisha-playground.mjs";
+            const pg = await createGeishaPlayground(fs.readFileSync(process.argv[1]));
+            const okChk = pg.check("def f(x: Int): Int = x + 1\ndef main(): Void = ()");
+            const badChk = pg.check("def bad(x: Int): String = x + 1");
+            const runRes = await pg.runJs("use std.str.intToStr\nuse std.list.listLen\npub def inc(x: Int): Int = x + 1\ndef main(): Void = printLn(\"pg:\" + intToStr(inc(listLen([10, 20, 30]))))");
+            console.log([okChk.ok, badChk.ok, badChk.error.includes("expected `String`"), runRes.ok, runRes.dts.includes("export declare function inc("), runRes.stdout.join(",")].join("|"));
+        ' "$PG_WASM")"
+        assert_eq "geisha_playground_wasm_e2e" "true|false|true|true|true|pg:4" "$T37_PG_OUT"
+    fi
+
+    # 39f. Cross-PR CLI contract: `--target js` + `-e` must error, and `-Oz` / `--opt=z` / `--dev` / `--release` accepted
+    if "$GEISHA_BIN" --target js -e "$TMP_DIR/t37_js.gsa" >/dev/null 2>&1; then
+        echo "FAIL [js_emit_llvm_mutex]: expected '--target js -e' to be rejected" >&2
+        exit 1
+    fi
+    if [ -f "./build/wasm_rt.o" ]; then
+        "$GEISHA_BIN" --target wasm32 -Oz --slim-runtime --runtime ./build/wasm_rt.o -o "$TMP_DIR/t39_oz.wasm" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --target wasm32 --opt=z --slim-runtime --runtime ./build/wasm_rt.o -o "$TMP_DIR/t39_optz.wasm" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --target wasm32 --dev --runtime ./build/wasm_rt.o -o "$TMP_DIR/t39_dev.wasm" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --target wasm32 --release --runtime ./build/wasm_rt.o -o "$TMP_DIR/t39_rel.wasm" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --dev -o "$TMP_DIR/t39_native_dev" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" -O3 -o "$TMP_DIR/t39_native_o3" "$TMP_DIR/t37_add.gsa"
+        "$GEISHA_BIN" --no-main --dev -o "$TMP_DIR/t39_dev_lib.a" "$TMP_DIR/t37_add.gsa"
+        echo "PASS [cli_opt_contract_and_js_emit_mutex]: -Oz/--opt=z/--dev/--release/-O3 (native+staticlib+wasm32) and --target js -e exclusion verified"
+        PASS=$((PASS + 1))
+    fi
+fi
+
 echo "All $PASS end-to-end test suites passed!"
