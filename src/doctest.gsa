@@ -1,0 +1,946 @@
+// Doctest Runner (`geisha test --doc [file|module...] [--filter <pat>] [--timeout <ms>]`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.str.{
+    intToStr, parseInt, strStartsWith, strEndsWith, strTrim, strContains,
+    strJoin, strSplitChar, strIndexOfByte
+}
+use std.path.{pathJoin, pathDirname, pathStem}
+use sys.env.hostOs
+use sys.fs.{fileExists, isDir, readFile, readDir, mkdirAll, removeFile}
+use sys.io.eprintLn
+use sys.proc.{ExitStatus, Exited, Signaled, command, cmdCwd, runTimeout}
+use ast.{ModuleItem, ModDef, sortUniqueStrings}
+use diag.{diagReset, diagRegisterFile, formatDiagAt}
+use parser.parseFileModuleInFile
+use stdlib_bundle.builtinModuleSource
+use loader.{PkgSpec, MkPkgSpec}
+use pkg.{
+    TargetCfg, MkTargetCfg, CompileCallbacks,
+    findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs,
+    sanitizeIdentAlias, mergeTargetConfigs
+}
+
+extern "gs_sys_getpid" def c_doctest_getpid(): Int
+extern "gs_sys_lstat_kind" def c_doctest_lstat_kind(path: String): Int
+
+data DocCodeLine {
+    MkDocCodeLine {
+        dclText: String,
+        dclOrigLine: Int,
+        dclStartByte: Int,
+        dclEndByte: Int,
+    },
+}
+
+data DocTestCase {
+    MkDocTestCase {
+        dtFile: String,
+        dtOrigSrc: String,
+        dtOpenLine: Int,
+        dtStartByte: Int,
+        dtEndByte: Int,
+        dtNoRun: Bool,
+        dtCompileFail: Bool,
+        dtIgnore: Bool,
+        dtShouldPanic: Bool,
+        dtLines: List DocCodeLine,
+        dtExpectedStdout: Option String,
+    },
+}
+
+data DocScanEvent {
+    EvDocLine(String, Int, Int, Int),
+    EvBreak,
+}
+
+def doctestExeExt(): String =
+    if (hostOs() == "windows") ".exe" else ""
+
+def emptyDocTargetCfg(): TargetCfg = MkTargetCfg {
+    tcCSources: Nil,
+    tcCFlags: Nil,
+    tcLinkFlags: Nil,
+    tcExtraUnits: Nil,
+    tcExports: Nil,
+    tcWebAssets: Nil,
+    tcOwnsMain: false,
+    tcBootSymbol: None,
+    tcOptLevel: None,
+    tcStrip: None,
+    tcSlimRuntime: false,
+    tcEmitDts: false,
+}
+
+def splitFenceTokens(info: String): List String = {
+    let n = strLen(info);
+    let i = cellNew(0);
+    let rev: Cell (List String) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        while (cellGet(i) < n && (strByteAt(info, cellGet(i)) == 32 || strByteAt(info, cellGet(i)) == 9 || strByteAt(info, cellGet(i)) == 44)) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        let start = cellGet(i);
+        while (cellGet(i) < n && strByteAt(info, cellGet(i)) != 32 && strByteAt(info, cellGet(i)) != 9 && strByteAt(info, cellGet(i)) != 44) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        if (cellGet(i) > start) {
+            cellSet(rev, Cons(strSlice(info, start, cellGet(i)), cellGet(rev)))
+        } else ()
+    };
+    listRev(cellGet(rev))
+}
+
+def parseFenceHeader(info: String): (Bool, Bool, Bool, Bool, Bool) = {
+    let toks = splitFenceTokens(info);
+    let hasLang = cellNew(false);
+    let isGeishaLang = cellNew(false);
+    let noRun = cellNew(false);
+    let compileFail = cellNew(false);
+    let ignore = cellNew(false);
+    let shouldPanic = cellNew(false);
+
+    let cur = cellNew(toks);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(t, r) -> {
+                if (t == "geisha" || t == "gsa") {
+                    cellSet(hasLang, true);
+                    cellSet(isGeishaLang, true)
+                } else if (t == "no_run") {
+                    cellSet(noRun, true)
+                } else if (t == "compile_fail") {
+                    cellSet(compileFail, true)
+                } else if (t == "ignore") {
+                    cellSet(ignore, true)
+                } else if (t == "should_panic") {
+                    cellSet(shouldPanic, true)
+                } else {
+                    cellSet(hasLang, true)
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let okLang = if (cellGet(hasLang)) cellGet(isGeishaLang) else true;
+    (okLang, cellGet(noRun), cellGet(compileFail), cellGet(ignore), cellGet(shouldPanic))
+}
+
+def extractExpectedStdout(lines: List DocCodeLine): Option String = {
+    let expRev: Cell (List String) = cellNew(Nil);
+    let cur = cellNew(lines);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(l, r) -> {
+                let t = strTrim(l.dclText);
+                if (strStartsWith(t, "// expect:")) {
+                    cellSet(expRev, Cons(strTrim(strSlice(t, 10, strLen(t))), cellGet(expRev)))
+                } else if (strStartsWith(t, "// output:")) {
+                    cellSet(expRev, Cons(strTrim(strSlice(t, 10, strLen(t))), cellGet(expRev)))
+                } else if (strStartsWith(t, "// => ")) {
+                    cellSet(expRev, Cons(strTrim(strSlice(t, 6, strLen(t))), cellGet(expRev)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match listRev(cellGet(expRev)) {
+        Nil -> None,
+        xs -> Some(strJoin(xs, "\n")),
+    }
+}
+
+// Lexer-aware scanner that extracts only real line-leading `///` doc comments,
+// accurately ignoring `/* ... */` block comments, `"..."` string literals, and `'...'` char literals.
+def scanRealDocLines(src: String): List DocScanEvent = {
+    let n = strLen(src);
+    let i = cellNew(0);
+    let lineNo = cellNew(1);
+    let atLineStart = cellNew(true);
+    let eventsRev: Cell (List DocScanEvent) = cellNew(Nil);
+
+    // Skip optional Unix shebang on line 1
+    if (n >= 2 && strByteAt(src, 0) == 35 && strByteAt(src, 1) == 33) {
+        cellSet(i, 2);
+        while (cellGet(i) < n && strByteAt(src, cellGet(i)) != 10) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        if (cellGet(i) < n) {
+            cellSet(i, cellGet(i) + 1);
+            cellSet(lineNo, 2)
+        } else ()
+    } else ();
+
+    while (cellGet(i) < n) {
+        let p = cellGet(i);
+        let b = strByteAt(src, p);
+        if (b == 32 || b == 9 || b == 13) {
+            cellSet(i, p + 1)
+        } else if (b == 10) {
+            // Blank line breaks a contiguous doc comment block
+            if (cellGet(atLineStart)) {
+                cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)))
+            } else ();
+            cellSet(lineNo, cellGet(lineNo) + 1);
+            cellSet(atLineStart, true);
+            cellSet(i, p + 1)
+        } else if (b == 47 && p + 1 < n && strByteAt(src, p + 1) == 47) {
+            // Line comment `//...`
+            let e = cellNew(p + 2);
+            while (cellGet(e) < n && strByteAt(src, cellGet(e)) != 10) {
+                cellSet(e, cellGet(e) + 1)
+            };
+            let endRaw = cellGet(e);
+            let endTrim = if (endRaw > p && strByteAt(src, endRaw - 1) == 13) endRaw - 1 else endRaw;
+            if (cellGet(atLineStart) && p + 2 < endTrim && (strByteAt(src, p + 2) == 47 || strByteAt(src, p + 2) == 33)) {
+                let rawDoc = strSlice(src, p, endTrim);
+                let docContent =
+                    if (strStartsWith(rawDoc, "/// ") || strStartsWith(rawDoc, "//! ")) strSlice(rawDoc, 4, strLen(rawDoc))
+                    else strSlice(rawDoc, 3, strLen(rawDoc));
+                cellSet(eventsRev, Cons(EvDocLine(docContent, cellGet(lineNo), p, endTrim), cellGet(eventsRev)))
+            } else {
+                cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)))
+            };
+            if (endRaw < n) {
+                cellSet(lineNo, cellGet(lineNo) + 1);
+                cellSet(atLineStart, true);
+                cellSet(i, endRaw + 1)
+            } else {
+                cellSet(i, n)
+            }
+        } else if (b == 47 && p + 1 < n && strByteAt(src, p + 1) == 42) {
+            // Block comment `/* ... */` (matches src/lexer.gsa)
+            cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)));
+            cellSet(atLineStart, false);
+            cellSet(i, p + 2);
+            let closed = cellNew(false);
+            while (cellGet(i) < n && !cellGet(closed)) {
+                let k = cellGet(i);
+                let ch = strByteAt(src, k);
+                if (ch == 10) {
+                    cellSet(lineNo, cellGet(lineNo) + 1);
+                    cellSet(i, k + 1)
+                } else if (ch == 42 && k + 1 < n && strByteAt(src, k + 1) == 47) {
+                    cellSet(i, k + 2);
+                    cellSet(closed, true)
+                } else {
+                    cellSet(i, k + 1)
+                }
+            }
+        } else if (b == 34) {
+            // String literal `"..."`
+            cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)));
+            cellSet(atLineStart, false);
+            cellSet(i, p + 1);
+            let closed = cellNew(false);
+            while (cellGet(i) < n && !cellGet(closed)) {
+                let k = cellGet(i);
+                let ch = strByteAt(src, k);
+                if (ch == 92 && k + 1 < n) {
+                    if (strByteAt(src, k + 1) == 10) cellSet(lineNo, cellGet(lineNo) + 1) else ();
+                    cellSet(i, k + 2)
+                } else if (ch == 34) {
+                    cellSet(i, k + 1);
+                    cellSet(closed, true)
+                } else {
+                    if (ch == 10) cellSet(lineNo, cellGet(lineNo) + 1) else ();
+                    cellSet(i, k + 1)
+                }
+            }
+        } else if (b == 39) {
+            // Char literal `'...'`
+            cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)));
+            cellSet(atLineStart, false);
+            cellSet(i, p + 1);
+            let closed = cellNew(false);
+            while (cellGet(i) < n && !cellGet(closed)) {
+                let k = cellGet(i);
+                let ch = strByteAt(src, k);
+                if (ch == 92 && k + 1 < n) {
+                    if (strByteAt(src, k + 1) == 10) cellSet(lineNo, cellGet(lineNo) + 1) else ();
+                    cellSet(i, k + 2)
+                } else if (ch == 39) {
+                    cellSet(i, k + 1);
+                    cellSet(closed, true)
+                } else if (ch == 10) {
+                    cellSet(lineNo, cellGet(lineNo) + 1);
+                    cellSet(atLineStart, true);
+                    cellSet(i, k + 1);
+                    cellSet(closed, true)
+                } else {
+                    cellSet(i, k + 1)
+                }
+            }
+        } else {
+            cellSet(eventsRev, Cons(EvBreak, cellGet(eventsRev)));
+            cellSet(atLineStart, false);
+            cellSet(i, p + 1)
+        }
+    };
+
+    listRev(cellGet(eventsRev))
+}
+
+def extractDocTests(filePath: String, src: String): List DocTestCase = {
+    let events = scanRealDocLines(src);
+
+    let inFence = cellNew(false);
+    let fenceIsGeisha = cellNew(false);
+    let fenceNoRun = cellNew(false);
+    let fenceCompileFail = cellNew(false);
+    let fenceIgnore = cellNew(false);
+    let fenceShouldPanic = cellNew(false);
+    let fenceOpenLine = cellNew(1);
+    let fenceStartByte = cellNew(0);
+    let fenceEndByte = cellNew(0);
+    let fenceLinesRev: Cell (List DocCodeLine) = cellNew(Nil);
+
+    let outRev: Cell (List DocTestCase) = cellNew(Nil);
+
+    let cur = cellNew(events);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(EvDocLine(docContent, lineNo, sByte, eByte), rest) -> {
+                let docTrim = strTrim(docContent);
+                if (cellGet(inFence)) {
+                    if (strStartsWith(docTrim, "```")) {
+                        if (cellGet(fenceIsGeisha)) {
+                            let codeLines = listRev(cellGet(fenceLinesRev));
+                            let expOut = extractExpectedStdout(codeLines);
+                            let tc = MkDocTestCase {
+                                dtFile: filePath,
+                                dtOrigSrc: src,
+                                dtOpenLine: cellGet(fenceOpenLine),
+                                dtStartByte: cellGet(fenceStartByte),
+                                dtEndByte: cellGet(fenceEndByte),
+                                dtNoRun: cellGet(fenceNoRun),
+                                dtCompileFail: cellGet(fenceCompileFail),
+                                dtIgnore: cellGet(fenceIgnore),
+                                dtShouldPanic: cellGet(fenceShouldPanic),
+                                dtLines: codeLines,
+                                dtExpectedStdout: expOut,
+                            };
+                            cellSet(outRev, Cons(tc, cellGet(outRev)))
+                        } else ();
+                        cellSet(inFence, false);
+                        cellSet(fenceLinesRev, Nil)
+                    } else {
+                        let cl = MkDocCodeLine {
+                            dclText: docContent,
+                            dclOrigLine: lineNo,
+                            dclStartByte: sByte,
+                            dclEndByte: eByte,
+                        };
+                        cellSet(fenceLinesRev, Cons(cl, cellGet(fenceLinesRev)))
+                    }
+                } else if (strStartsWith(docTrim, "```")) {
+                    let info = strTrim(strSlice(docTrim, 3, strLen(docTrim)));
+                    let (isGsa, nr, cf, ig, sp) = parseFenceHeader(info);
+                    cellSet(inFence, true);
+                    cellSet(fenceIsGeisha, isGsa);
+                    cellSet(fenceNoRun, nr);
+                    cellSet(fenceCompileFail, cf);
+                    cellSet(fenceIgnore, ig);
+                    cellSet(fenceShouldPanic, sp);
+                    cellSet(fenceOpenLine, lineNo);
+                    cellSet(fenceStartByte, sByte);
+                    cellSet(fenceEndByte, eByte);
+                    cellSet(fenceLinesRev, Nil)
+                } else ();
+                cellSet(cur, rest)
+            },
+            Cons(EvBreak, rest) -> {
+                if (cellGet(inFence)) {
+                    cellSet(inFence, false);
+                    cellSet(fenceLinesRev, Nil)
+                } else ();
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+
+    listRev(cellGet(outRev))
+}
+
+def joinDocCodeLines(lines: List DocCodeLine): String = {
+    let b = bufNew();
+    let cur = cellNew(lines);
+    let first = cellNew(true);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(l, r) -> {
+                if (!cellGet(first)) bufPushByte(b, 10) else ();
+                cellSet(first, false);
+                bufPushStr(b, l.dclText);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    bufPushByte(b, 10);
+    bufToString(b)
+}
+
+def hasMainDef(items: List ModuleItem): Bool = {
+    let found = cellNew(false);
+    let cur = cellNew(items);
+    while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(_, d), r) -> {
+                if (d.ident == "main") cellSet(found, true) else ();
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def prepareDocTestSource(rawCode: String): String = {
+    diagReset();
+    let fid = diagRegisterFile("<doctest>", rawCode);
+    match parseFileModuleInFile(rawCode, Nil, fid) {
+        Err(_) -> rawCode,
+        Ok(fm) ->
+            if (hasMainDef(fm.items)) rawCode
+            else rawCode + "\ndef main(): Void = ()\n",
+    }
+}
+
+def firstLineOf(s: String): String =
+    match strIndexOfByte(s, 10, 0) {
+        Some(idx) -> strSlice(s, 0, idx),
+        None -> s,
+    }
+
+// Parse `<doctest>:<line>:<col>:` from a compiler diagnostic to map back to the exact doc line.
+def extractErrorLineNum(errMsg: String): Option Int = {
+    let pfx = "<doctest>:";
+    if (!strStartsWith(errMsg, pfx)) None
+    else {
+        let start = strLen(pfx);
+        match strIndexOfByte(errMsg, 58, start) {
+            Some(colonIdx) if (colonIdx > start) ->
+                match parseInt(strSlice(errMsg, start, colonIdx)) {
+                    Ok(n) if (n >= 1) -> Some(n),
+                    _ -> None,
+                },
+            _ -> None,
+        }
+    }
+}
+
+def lookupDocCodeLine(lines: List DocCodeLine, oneBasedIdx: Int): Option DocCodeLine = {
+    let cur = cellNew(lines);
+    let idx = cellNew(1);
+    let found: Cell (Option DocCodeLine) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(l, r) -> {
+                if (cellGet(idx) == oneBasedIdx) cellSet(found, Some(l)) else ();
+                cellSet(idx, cellGet(idx) + 1);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def formatDocTestFailDiag(dt: DocTestCase, errLineOpt: Option Int, msg: String): String = {
+    let (sByte, eByte) = match errLineOpt {
+        Some(ln) -> match lookupDocCodeLine(dt.dtLines, ln) {
+            Some(cl) -> (cl.dclStartByte, cl.dclEndByte),
+            None -> (dt.dtStartByte, dt.dtEndByte),
+        },
+        None -> (dt.dtStartByte, dt.dtEndByte),
+    };
+    diagReset();
+    let fid = diagRegisterFile(dt.dtFile, dt.dtOrigSrc);
+    formatDiagAt("doctest", fid, sByte, eByte, msg)
+}
+
+// Non-following directory walk (`lstat`): never follows symbolic links out of the project tree.
+def collectGsaFilesRec(dir: String, outRev: Cell (List String)): Void =
+    match readDir(dir) {
+        Err(_) -> (),
+        Ok(entries) -> {
+            let cur = cellNew(entries);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(name, r) -> {
+                        if (name != "." && name != ".." && !strStartsWith(name, ".")) {
+                            let full = pathJoin(dir, name);
+                            let kind = c_doctest_lstat_kind(full);
+                            if (kind == 2) collectGsaFilesRec(full, outRev)
+                            else if (kind == 1 && strEndsWith(name, ".gsa")) cellSet(outRev, Cons(full, cellGet(outRev)))
+                            else ()
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+
+// Fold only line-ending `\r+\n` (handling both `\r\n` and Windows text-mode `\r\r\n`) to `\n`,
+// preserving standalone `\r` bytes (e.g. `"A\rB"`).
+def normalizeCrLf(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 13) {
+            let j = cellNew(idx);
+            while (cellGet(j) < n && strByteAt(s, cellGet(j)) == 13) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            if (cellGet(j) < n && strByteAt(s, cellGet(j)) == 10) {
+                bufPushByte(b, 10);
+                cellSet(i, cellGet(j) + 1)
+            } else {
+                let k = cellNew(idx);
+                while (cellGet(k) < cellGet(j)) {
+                    bufPushByte(b, 13);
+                    cellSet(k, cellGet(k) + 1)
+                };
+                cellSet(i, cellGet(j))
+            }
+        } else {
+            bufPushByte(b, c);
+            cellSet(i, idx + 1)
+        }
+    };
+    bufToString(b)
+}
+
+def resolveModPathInRoots(roots: List String, segs: List String): Option String = {
+    let cur = cellNew(roots);
+    let found: Cell (Option String) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(root, r) -> {
+                if (c_doctest_lstat_kind(root) == 2) {
+                    let p = cellNew(root);
+                    let safe = cellNew(true);
+                    let cs = cellNew(segs);
+                    while (cellGet(safe) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                        match cellGet(cs) {
+                            Cons(s, Nil) -> {
+                                let base = pathJoin(cellGet(p), s);
+                                let cand1 = base + ".gsa";
+                                let cand2 = pathJoin(base, "mod.gsa");
+                                if (c_doctest_lstat_kind(cand1) == 1) cellSet(found, Some(cand1))
+                                else if (c_doctest_lstat_kind(base) == 2 && c_doctest_lstat_kind(cand2) == 1) cellSet(found, Some(cand2))
+                                else ();
+                                cellSet(cs, Nil)
+                            },
+                            Cons(s, rs) -> {
+                                let nextDir = pathJoin(cellGet(p), s);
+                                if (c_doctest_lstat_kind(nextDir) == 2) {
+                                    cellSet(p, nextDir);
+                                    cellSet(cs, rs)
+                                } else {
+                                    cellSet(safe, false)
+                                }
+                            },
+                            Nil -> (),
+                        }
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def resolveProjectModuleTarget(target: String, pkgName: String, projSrcRoots: List String): Option String = {
+    let segs = strSplitChar(target, '.');
+    match segs {
+        Nil -> None,
+        Cons(first, rest) -> {
+            let localSegs =
+                if (pkgName != "" && first == pkgName && match rest { Nil -> false, _ -> true }) rest
+                else segs;
+            resolveModPathInRoots(projSrcRoots, localSegs)
+        },
+    }
+}
+
+def collectTargetSources(targets: List String, pkgName: String, projSrcRoots: List String): Result (List (String, String)) String = {
+    let outRev: Cell (List (String, String)) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    match targets {
+        Nil -> {
+            let filesRev: Cell (List String) = cellNew(Nil);
+            let cr = cellNew(projSrcRoots);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons(sr, rr) -> {
+                        if (c_doctest_lstat_kind(sr) == 2) {
+                            collectGsaFilesRec(sr, filesRev)
+                        } else ();
+                        cellSet(cr, rr)
+                    },
+                    Nil -> (),
+                }
+            };
+            let sortedFiles = sortUniqueStrings(cellGet(filesRev));
+            let cf = cellNew(sortedFiles);
+            while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons(fp, rf) -> {
+                        match readFile(fp) {
+                            Ok(src) -> cellSet(outRev, Cons((fp, src), cellGet(outRev))),
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                        };
+                        cellSet(cf, rf)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ts -> {
+            let ct = cellNew(ts);
+            while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(ct) { Nil -> false, _ -> true }) {
+                match cellGet(ct) {
+                    Cons(t, rt) -> {
+                        match builtinModuleSource(t) {
+                            Some(src) -> cellSet(outRev, Cons((t + " (builtin)", src), cellGet(outRev))),
+                            None ->
+                                if (isDir(t)) {
+                                    let dirFilesRev: Cell (List String) = cellNew(Nil);
+                                    collectGsaFilesRec(t, dirFilesRev);
+                                    let sortedDirFiles = sortUniqueStrings(cellGet(dirFilesRev));
+                                    let cf = cellNew(sortedDirFiles);
+                                    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cf) { Nil -> false, _ -> true }) {
+                                        match cellGet(cf) {
+                                            Cons(fp, rf) -> {
+                                                match readFile(fp) {
+                                                    Ok(src) -> cellSet(outRev, Cons((fp, src), cellGet(outRev))),
+                                                    Err(e) -> cellSet(errOpt, Some(e)),
+                                                };
+                                                cellSet(cf, rf)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                } else if (fileExists(t)) {
+                                    match readFile(t) {
+                                        Ok(src) -> cellSet(outRev, Cons((t, src), cellGet(outRev))),
+                                        Err(e) -> cellSet(errOpt, Some(e)),
+                                    }
+                                } else {
+                                    match resolveProjectModuleTarget(t, pkgName, projSrcRoots) {
+                                        Some(fpath) -> match readFile(fpath) {
+                                            Ok(src) -> cellSet(outRev, Cons((fpath, src), cellGet(outRev))),
+                                            Err(e) -> cellSet(errOpt, Some(e)),
+                                        },
+                                        None -> cellSet(errOpt, Some("doctest target not found: '" + t + "'")),
+                                    }
+                                },
+                        };
+                        cellSet(ct, rt)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(listRev(cellGet(outRev))),
+    }
+}
+
+pub def cmdDocTest(
+    subArgs: List String,
+    rtOverrideOpt: Option String,
+    cbs: CompileCallbacks
+): Result Void String = {
+    let filterOpt: Cell (Option String) = cellNew(None);
+    let timeoutMs = cellNew(30000);
+    let targetsRev: Cell (List String) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    let ca = cellNew(subArgs);
+    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(ca) { Nil -> false, _ -> true }) {
+        match cellGet(ca) {
+            Cons(a, r) -> {
+                if (a == "--filter") {
+                    match r {
+                        Cons(pat, r2) -> {
+                            cellSet(filterOpt, Some(pat));
+                            cellSet(ca, r2)
+                        },
+                        Nil -> cellSet(errOpt, Some("missing pattern after '--filter'")),
+                    }
+                } else if (a == "--timeout") {
+                    match r {
+                        Cons(raw, r2) -> {
+                            match parseInt(raw) {
+                                Ok(ms) if (ms >= 1) -> cellSet(timeoutMs, ms),
+                                _ -> cellSet(errOpt, Some("invalid integer for '--timeout': '" + raw + "' (expected milliseconds >= 1)")),
+                            };
+                            cellSet(ca, r2)
+                        },
+                        Nil -> cellSet(errOpt, Some("missing milliseconds after '--timeout'")),
+                    }
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha test --doc': " + a))
+                } else {
+                    cellSet(targetsRev, Cons(a, cellGet(targetsRev)));
+                    cellSet(ca, r)
+                }
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> {
+            let targets = listRev(cellGet(targetsRev));
+            let projOpt = findProjectRoot(".");
+            let (workDir, buildDir, rootSpec, extSpecs, testTc, projPkgName, projSrcRoots) = match projOpt {
+                Some(projDir) -> {
+                    let (rootMf, rootSpec0, resolvedPkgs) = resolveProjectGraph(projDir, false, None, true)?;
+                    let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
+                    let selfPkgId = "__self_" + sanitizeIdentAlias(rootMf.mfName);
+                    let selfPkgSpec = MkPkgSpec {
+                        pkgId: selfPkgId,
+                        pkgName: rootMf.mfName,
+                        srcRoots: rootSpec0.srcRoots,
+                        deps: rootSpec0.deps,
+                    };
+                    let docRootDeps =
+                        if (rootMf.mfName != "") listAppend(rootSpec0.deps, [(rootMf.mfName, selfPkgId)])
+                        else rootSpec0.deps;
+                    let docRootSpec = MkPkgSpec {
+                        pkgId: "",
+                        pkgName: "",
+                        srcRoots: rootSpec0.srcRoots,
+                        deps: docRootDeps,
+                    };
+                    let mergedNative = mergeTargetConfigs(projDir, rootMf, resolvedPkgs, false, Nil, false, None);
+                    let tc = MkTargetCfg {
+                        tcCSources: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcCSources,
+                        tcCFlags: mergedNative.tcCFlags,
+                        tcLinkFlags: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcLinkFlags,
+                        tcExtraUnits: if (mergedNative.tcOwnsMain) Nil else mergedNative.tcExtraUnits,
+                        tcExports: Nil,
+                        tcWebAssets: Nil,
+                        tcOwnsMain: false,
+                        tcBootSymbol: None,
+                        tcOptLevel: None,
+                        tcStrip: None,
+                        tcSlimRuntime: false,
+                        tcEmitDts: false,
+                    };
+                    (projDir, pathJoin(projDir, "build/doctests"), docRootSpec, Cons(selfPkgSpec, extSpecs0), tc, rootMf.mfName, rootSpec0.srcRoots)
+                },
+                None -> match targets {
+                    Nil -> {
+                        let _ = Err("no geisha.toml found (pass a .gsa file or module name to 'geisha test --doc <target>')")?;
+                        (".", "build/doctests", MkPkgSpec { pkgId: "", pkgName: "", srcRoots: Nil, deps: Nil }, Nil, emptyDocTargetCfg(), "", Nil)
+                    },
+                    _ -> {
+                        let docRootSpec = MkPkgSpec { pkgId: "", pkgName: "", srcRoots: ["."], deps: Nil };
+                        (".", "build/doctests", docRootSpec, Nil, emptyDocTargetCfg(), "", Nil)
+                    },
+                },
+            };
+
+            let sources = collectTargetSources(targets, projPkgName, projSrcRoots)?;
+            let allCasesRev: Cell (List DocTestCase) = cellNew(Nil);
+            let cs = cellNew(sources);
+            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                match cellGet(cs) {
+                    Cons((fpath, src), rs) -> {
+                        let cases = extractDocTests(fpath, src);
+                        let cc = cellNew(cases);
+                        while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                            match cellGet(cc) {
+                                Cons(dt, rdt) -> {
+                                    let keep = match cellGet(filterOpt) {
+                                        None -> true,
+                                        Some(pat) -> strContains(dt.dtFile, pat) || strContains(joinDocCodeLines(dt.dtLines), pat),
+                                    };
+                                    if (keep) cellSet(allCasesRev, Cons(dt, cellGet(allCasesRev))) else ();
+                                    cellSet(cc, rdt)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellSet(cs, rs)
+                    },
+                    Nil -> (),
+                }
+            };
+            let allCases = listRev(cellGet(allCasesRev));
+            mkdirAll(buildDir)?;
+
+            let pidStr = intToStr(c_doctest_getpid());
+            let passed = cellNew(0);
+            let failed = cellNew(0);
+            let ignored = cellNew(0);
+            let idx = cellNew(0);
+            let runTimeoutLimit = cellGet(timeoutMs);
+
+            let cur = cellNew(allCases);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(dt, rest) -> {
+                        let label = dt.dtFile + ":" + intToStr(dt.dtOpenLine);
+                        if (dt.dtIgnore) {
+                            printLn("  [IGNORE] " + label);
+                            cellSet(ignored, cellGet(ignored) + 1)
+                        } else {
+                            let rawCode = joinDocCodeLines(dt.dtLines);
+                            let fullCode = prepareDocTestSource(rawCode);
+                            let outBin = pathJoin(buildDir, "doctest_" + pidStr + "_" + intToStr(cellGet(idx)) + doctestExeExt());
+
+                            let effRootSpec =
+                                if (fileExists(dt.dtFile)) {
+                                    let fdir = pathDirname(dt.dtFile);
+                                    MkPkgSpec {
+                                        pkgId: rootSpec.pkgId,
+                                        pkgName: rootSpec.pkgName,
+                                        srcRoots: Cons(fdir, rootSpec.srcRoots),
+                                        deps: rootSpec.deps,
+                                    }
+                                } else rootSpec;
+
+                            if (dt.dtCompileFail) {
+                                // `compile_fail` checks strictly the compiler front-end (lex/parse/load/type/exhaustiveness/Send/Core)
+                                // so external toolchain/CC/linker failures can never be misclassified as passing `compile_fail`.
+                                match cbs.cbCheckSource("<doctest>", fullCode, effRootSpec, extSpecs) {
+                                    Err(_) -> {
+                                        printLn("  [PASS] " + label + " (compile_fail)");
+                                        cellSet(passed, cellGet(passed) + 1)
+                                    },
+                                    Ok(()) -> {
+                                        let dmsg = formatDocTestFailDiag(dt, None, "doctest marked `compile_fail` unexpectedly passed type/semantic check");
+                                        printLn("  [FAIL] " + label + " (compile_fail)");
+                                        eprintLn(dmsg);
+                                        cellSet(failed, cellGet(failed) + 1)
+                                    },
+                                }
+                            } else {
+                                let compRes = cbs.cbCompileNativeExeSource("<doctest>", fullCode, effRootSpec, extSpecs, testTc, Some(outBin), rtOverrideOpt);
+                                match compRes {
+                                    Err(ce) -> {
+                                        let lnOpt = extractErrorLineNum(ce);
+                                        let dmsg = formatDocTestFailDiag(dt, lnOpt, "doctest failed to compile: " + firstLineOf(ce));
+                                        printLn("  [FAIL] " + label);
+                                        eprintLn(dmsg);
+                                        cellSet(failed, cellGet(failed) + 1)
+                                    },
+                                    Ok(()) ->
+                                        if (dt.dtNoRun) {
+                                            let _ = removeFile(outBin);
+                                            printLn("  [PASS] " + label + " (no_run)");
+                                            cellSet(passed, cellGet(passed) + 1)
+                                        } else {
+                                            let runRes = runTimeout(cmdCwd(command(outBin, Nil), workDir), runTimeoutLimit);
+                                            let _ = removeFile(outBin);
+                                            match runRes {
+                                                Err(re) -> {
+                                                    let dmsg = formatDocTestFailDiag(dt, None, "doctest failed to launch: " + re);
+                                                    printLn("  [FAIL] " + label);
+                                                    eprintLn(dmsg);
+                                                    cellSet(failed, cellGet(failed) + 1)
+                                                },
+                                                Ok(None) -> {
+                                                    let dmsg = formatDocTestFailDiag(dt, None, "doctest timed out after " + intToStr(runTimeoutLimit) + "ms");
+                                                    printLn("  [FAIL] " + label);
+                                                    eprintLn(dmsg);
+                                                    cellSet(failed, cellGet(failed) + 1)
+                                                },
+                                                Ok(Some(out)) -> {
+                                                    let exitCode = match out.status {
+                                                        Exited(c) -> c,
+                                                        Signaled(s) -> 128 + s,
+                                                    };
+                                                    if (dt.dtShouldPanic) {
+                                                        if (exitCode != 0) {
+                                                            printLn("  [PASS] " + label + " (should_panic)");
+                                                            cellSet(passed, cellGet(passed) + 1)
+                                                        } else {
+                                                            let dmsg = formatDocTestFailDiag(dt, None, "doctest marked `should_panic` exited with status 0");
+                                                            printLn("  [FAIL] " + label + " (should_panic)");
+                                                            eprintLn(dmsg);
+                                                            cellSet(failed, cellGet(failed) + 1)
+                                                        }
+                                                    } else if (exitCode != 0) {
+                                                        let detail =
+                                                            if (strLen(strTrim(out.stderr)) > 0) " (stderr: " + firstLineOf(strTrim(out.stderr)) + ")"
+                                                            else if (strLen(strTrim(out.stdout)) > 0) " (stdout: " + firstLineOf(strTrim(out.stdout)) + ")"
+                                                            else "";
+                                                        let dmsg = formatDocTestFailDiag(dt, None, "doctest exited with non-zero status " + intToStr(exitCode) + detail);
+                                                        printLn("  [FAIL] " + label);
+                                                        eprintLn(dmsg);
+                                                        cellSet(failed, cellGet(failed) + 1)
+                                                    } else {
+                                                        match dt.dtExpectedStdout {
+                                                            None -> {
+                                                                printLn("  [PASS] " + label);
+                                                                cellSet(passed, cellGet(passed) + 1)
+                                                            },
+                                                            Some(exp) -> {
+                                                                let actual = strTrim(normalizeCrLf(out.stdout));
+                                                                let want = strTrim(normalizeCrLf(exp));
+                                                                if (actual == want) {
+                                                                    printLn("  [PASS] " + label);
+                                                                    cellSet(passed, cellGet(passed) + 1)
+                                                                } else {
+                                                                    let dmsg = formatDocTestFailDiag(dt, None, "doctest stdout mismatch: expected `" + exp + "`, got `" + actual + "`");
+                                                                    printLn("  [FAIL] " + label);
+                                                                    eprintLn(dmsg);
+                                                                    cellSet(failed, cellGet(failed) + 1)
+                                                                }
+                                                            },
+                                                        }
+                                                    }
+                                                },
+                                            }
+                                        },
+                                }
+                            }
+                        };
+                        cellSet(idx, cellGet(idx) + 1);
+                        cellSet(cur, rest)
+                    },
+                    Nil -> (),
+                }
+            };
+
+            let total = cellGet(passed) + cellGet(failed) + cellGet(ignored);
+            printLn(
+                "Doctest summary: "
+                + intToStr(cellGet(passed)) + " passed, "
+                + intToStr(cellGet(failed)) + " failed, "
+                + intToStr(cellGet(ignored)) + " ignored ("
+                + intToStr(total) + " total)."
+            );
+            if (cellGet(failed) > 0) {
+                Err(intToStr(cellGet(failed)) + " doctest(s) failed")
+            } else {
+                Ok(())
+            }
+        },
+    }
+}

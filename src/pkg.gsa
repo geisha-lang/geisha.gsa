@@ -149,6 +149,7 @@ pub data CompileCallbacks {
     MkCompileCallbacks {
         cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String, Option String) -> Result Void String,
         cbCompileNativeExeSource: (String, String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
+        cbCheckSource: (String, String, PkgSpec, List PkgSpec) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String, Option String) -> Result Void String,
         cbCompileWasmGc: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
