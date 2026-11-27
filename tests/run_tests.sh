@@ -2819,6 +2819,8 @@ PASS=$((PASS + 1))
 
 # 37. DWARF Debug Info (`-g` / `--debug`, `-O0`, LLVM 20 verifier, macOS dSYM / Linux ELF, LLDB + geisha_lldb.py)
 cat > "$TMP_DIR/t37_dwarf.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
 use std.str.intToStr
 use std.vec.{Vec, vecNew, vecPush, vecLen}
 
@@ -2844,12 +2846,33 @@ def fact(n: Int): Int = {
     }
 }
 
-def inspectAll(p: Pair, s: String, sh: Shape, v: Vec Int): Int = {
+def shapeArea(sh: Shape): Int = match sh {
+    Circle(r) -> r * r,
+    Rect(w, h) -> {
+        let area = w * h;
+        area
+    },
+}
+
+def inspectAll(
+    p: Pair,
+    s: String,
+    sh: Shape,
+    v: Vec Int,
+    vp: Vec (Int, Int),
+    optSome: Option Int,
+    optNone: Option Int,
+    xs: List Int,
+    resOpt: Result Int (Option String)
+): Int = {
     let f = makeAdder(10);
     let y = f(5);
-    let n = vecLen(v);
+    let n = vecLen(v) + vecLen(vp);
     let f4 = fact(4);
-    p.px + p.py + y + n + f4
+    let (da, db) = (11, 22);
+    let a = shapeArea(Rect(3, 4));
+    let _ = (optSome, optNone, xs, resOpt);
+    p.px + p.py + y + n + f4 + da + db + a
 }
 
 def main(): Void = {
@@ -2860,7 +2883,11 @@ def main(): Void = {
     vecPush(v, 100);
     vecPush(v, 200);
     vecPush(v, 300);
-    let ans = inspectAll(p, msg, sh, v);
+    let vp: Vec (Int, Int) = vecNew();
+    vecPush(vp, (1, 2));
+    vecPush(vp, (3, 4));
+    let resOpt: Result Int (Option String) = Ok(42);
+    let ans = inspectAll(p, msg, sh, v, vp, Some(42), None, [1, 2, 3], resOpt);
     printLn(msg + ":" + intToStr(ans))
 }
 EOF
@@ -2887,20 +2914,22 @@ if [ -n "$OPT_BIN" ]; then
     "$OPT_BIN" -passes=verify -disable-output "$TMP_DIR/t37_dbg.ll"
 fi
 "$GEISHA_BIN" -g --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t37_dwarf" "$TMP_DIR/t37_dwarf.gsa"
-assert_eq "dwarf_debug_run" "hello geisha:73" "$("$TMP_DIR/t37_dwarf")"
+assert_eq "dwarf_debug_run" "hello geisha:120" "$("$TMP_DIR/t37_dwarf")"
 if [ "$UNAME_S" = "Darwin" ] && [ ! -d "$TMP_DIR/t37_dwarf.dSYM" ]; then
     echo "FAIL [dwarf_macos_dsym]: expected $TMP_DIR/t37_dwarf.dSYM to be generated" >&2
     exit 1
 fi
 "$GEISHA_BIN" -g -O2 --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t37_dwarf_o2" "$TMP_DIR/t37_dwarf.gsa"
-assert_eq "dwarf_debug_o2_run" "hello geisha:73" "$("$TMP_DIR/t37_dwarf_o2")"
+assert_eq "dwarf_debug_o2_run" "hello geisha:120" "$("$TMP_DIR/t37_dwarf_o2")"
+assert_eq "dwarf_geisha_run_g" "hello geisha:120" "$("$GEISHA_BIN" run -g --runtime "$GEISHA_RUNTIME" "$TMP_DIR/t37_dwarf.gsa")"
 if command -v lldb >/dev/null 2>&1; then
     LLDB_SCRIPT_PATH="$(pwd)/tools/geisha_lldb.py"
     LLDB_OUT="$(lldb -b \
         -o "command script import $LLDB_SCRIPT_PATH" \
-        -o "b t37_dwarf.gsa:15" \
-        -o "b t37_dwarf.gsa:22" \
-        -o "b t37_dwarf.gsa:31" \
+        -o "b t37_dwarf.gsa:17" \
+        -o "b t37_dwarf.gsa:24" \
+        -o "b t37_dwarf.gsa:32" \
+        -o "b t37_dwarf.gsa:54" \
         -o "run" \
         -o "frame variable" \
         -o "c" \
@@ -2912,15 +2941,42 @@ if command -v lldb >/dev/null 2>&1; then
         -o "c" \
         -o "c" \
         -o "frame variable" \
+        -o "c" \
+        -o "frame variable" \
         "$TMP_DIR/t37_dwarf" 2>&1 || true)"
-    for needle in "t37_dwarf.gsa:22" "t37_dwarf.gsa:31" "px = 10, py = 20" "\"hello geisha\"" "Vec(len=3) [100, 200, 300]" "Shape(tag=0, payload=7)" "(int) offset = 11" "(int) x = 5"; do
+    for needle in \
+        "t37_dwarf.gsa:24" \
+        "t37_dwarf.gsa:32" \
+        "t37_dwarf.gsa:54" \
+        "(int) offset = 11" \
+        "(int) x = 5" \
+        "(int) w = 3" \
+        "(int) h = 4" \
+        "(int) da = 11" \
+        "(int) db = 22" \
+        "px = 10, py = 20" \
+        "\"hello geisha\"" \
+        "Vec(len=3) [100, 200, 300]" \
+        "Vec(len=2) [(1, 2), (3, 4)]" \
+        "Shape(tag=0, payload=7)" \
+        "optSome = 0x" \
+        "Some(42)" \
+        "optNone = 0x" \
+        "None" \
+        "[1, 2, 3]" \
+        "tag=0, payload=42"; do
         if ! printf "%s" "$LLDB_OUT" | grep -Fq "$needle"; then
             echo "FAIL [dwarf_lldb_e2e]: missing '$needle' in LLDB output:" >&2
             printf "%s\n" "$LLDB_OUT" >&2
             exit 1
         fi
     done
-    echo "PASS [dwarf_lldb_e2e]: LLDB breakpoints, recursive bt, closure captures, Pair/String/Vec/Shape formatters verified"
+    if printf "%s" "$LLDB_OUT" | grep -Fq "resOpt = 0x" && printf "%s" "$LLDB_OUT" | grep "resOpt = " | grep -Fq "None"; then
+        echo "FAIL [dwarf_lldb_e2e]: Result Int (Option String) misidentified as None!" >&2
+        printf "%s\n" "$LLDB_OUT" >&2
+        exit 1
+    fi
+    echo "PASS [dwarf_lldb_e2e]: LLDB breakpoints, recursive bt, closure captures, match PatVar bindings, Vec(Int,Int), Option/List/Result/Shape formatters verified"
     PASS=$((PASS + 1))
 else
     echo "PASS [dwarf_ir_and_build]: DWARF IR metadata and debug build verified (lldb not installed)"

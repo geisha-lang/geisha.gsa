@@ -6,7 +6,6 @@ use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
 use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strStartsWith}
-use sys.env.getEnv
 use diag.{diagGetFile, diagSpanLineCol}
 use ast.{
     Span, emptySpan, typeToString,
@@ -503,10 +502,10 @@ def emitGcAllocForFields(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, fieldTy
         emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")")
     }
 
-// Compute `{ i32 tag, [N x word] }` LLVM struct type AND its byte size
-def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type, ptrSize: Int): (String, Int) =
+// Compute `{ i32 tag, [N x word] }` LLVM struct type, its byte size, and max payload alignment
+def getAdtStorageLayout(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type, ptrSize: Int): (String, Int, Int) =
     match strMapGet(adtReg, adtName) {
-        None -> ("{ i32 }", 4),
+        None -> ("{ i32 }", 4, 1),
         Some(ainfo) -> {
             let sub = buildPairMap(ainfo.typeParams, typeArgs);
             let maxBytes = cellNew(0);
@@ -532,16 +531,21 @@ def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: 
             let mb = cellGet(maxBytes);
             let ma = cellGet(maxAlign);
             if (mb == 0) {
-                ("{ i32 }", 4)
+                ("{ i32 }", 4, 1)
             } else if (ma >= 8) {
                 let words = (mb + 7) / 8;
-                ("{ i32, [" + intToStr(words) + " x i64] }", 8 + words * 8)
+                ("{ i32, [" + intToStr(words) + " x i64] }", 8 + words * 8, ma)
             } else {
                 let words = (mb + 3) / 4;
-                ("{ i32, [" + intToStr(words) + " x i32] }", 4 + words * 4)
+                ("{ i32, [" + intToStr(words) + " x i32] }", 4 + words * 4, ma)
             }
         },
     }
+
+def getAdtStorageTypeAndSize(adtReg: StrMap AdtInfo, adtName: String, typeArgs: List Type, ptrSize: Int): (String, Int) = {
+    let (st, sz, _) = getAdtStorageLayout(adtReg, adtName, typeArgs, ptrSize);
+    (st, sz)
+}
 
 def substTypeList(ts: List Type, sub: StrMap Type): List Type = {
     let rev = cellNew(Nil);
@@ -586,6 +590,7 @@ data FnEmitCtx {
         fcDiFileId: Int,
         fcDefLine: Int,
         fcCurLocId: Cell Int,
+        fcCurSpan: Cell Span,
     },
 }
 
@@ -1058,8 +1063,21 @@ def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
     else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
     else llvmSym(fnName)
 
+extern "realpath" def c_dbg_realpath(path: String, resolved: Ptr): Ptr
+extern "free" def c_dbg_free(p: Ptr): Void
+
+def resolveDbgCwd(): String = {
+    let p = c_dbg_realpath(".", ptrNull());
+    if (ptrIsNull(p)) "."
+    else {
+        let s = ptrToString(p);
+        c_dbg_free(p);
+        s
+    }
+}
+
 // ============================================================================
-// DWARF Debug Info Metadata Emitter (LLVM 20 `#dbg_declare` + `!DILocation`)
+// DWARF Debug Info Metadata Emitter (LLVM 18-21 `@llvm.dbg.declare` + `!DILocation`)
 // ============================================================================
 
 def escapeDbgStr(s: String): String = {
@@ -1332,7 +1350,7 @@ def dbgTypeForGeishaType(mctx: ModEmitCtx, ty: Type): Int = {
                         let ptrId = dbgAllocId(mctx);
                         strMapInsert(mctx.mcDbgTypeCache, key, ptrId);
                         let structId = dbgAllocId(mctx);
-                        dbgEmitStructType(mctx, structId, "gs_array<" + typeToString(elemTy) + ">", ["len"], [TyCon("Int64")]);
+                        dbgEmitStructType(mctx, structId, "gs_array<" + typeToString(elemTy) + ">", ["len", "elem0"], [TyCon("Int64"), elemTy]);
                         dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
                         ptrId
                     } else {
@@ -1373,14 +1391,8 @@ def dbgTypeForAdtOrOpaque(mctx: ModEmitCtx, ty: Type, key: String, ptrBits: Int)
                 let structId = dbgAllocId(mctx);
                 let adtBase = getCompBaseName(ty);
                 let targs = extractTypeArgs(ty);
-                let (storageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtBase, targs, mctx.mcPtrSize);
-                let payTy =
-                    if (strStartsWith(storageTy, "{ i32, [") && !strStartsWith(storageTy, "{ i32, [0")) {
-                        // `{ i32, [N x i64] }` has 8-byte aligned payload; `{ i32, [N x i32] }` has 4-byte aligned payload
-                        let slen = strLen(storageTy);
-                        if (slen >= 6 && strByteAt(storageTy, slen - 5) == 54 && strByteAt(storageTy, slen - 4) == 52) TyCon("Int64")
-                        else TyCon("Int")
-                    } else TyCon("Int");
+                let (_, _, maxAlign) = getAdtStorageLayout(mctx.mcAdtReg, adtBase, targs, mctx.mcPtrSize);
+                let payTy = if (maxAlign >= 8) TyCon("Int64") else TyCon("Int");
                 dbgEmitStructType(mctx, structId, "gs_adt<" + key + ">", ["tag", "payload"], [TyCon("Int"), payTy]);
                 dbgEmitNode(mctx, ptrId, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + intToStr(structId) + ", size: " + intToStr(ptrBits) + ")");
                 ptrId
@@ -1448,6 +1460,7 @@ def newFnEmitCtx(fnName: String): FnEmitCtx = {
         fcDiFileId: -1,
         fcDefLine: 1,
         fcCurLocId: cellNew(-1),
+        fcCurSpan: cellNew(emptySpan()),
     }
 }
 
@@ -1486,6 +1499,7 @@ def newFnEmitCtxDebug(mctx: ModEmitCtx, fnName: String, displayName: String, lin
             fcDiFileId: diFileId,
             fcDefLine: defLine,
             fcCurLocId: cellNew(-1),
+            fcCurSpan: cellNew(sp),
         };
         let prologueLoc = dbgGetOrCreatePrologueLoc(mctx, spId);
         cellSet(fctx.fcCurLocId, prologueLoc);
@@ -3260,6 +3274,7 @@ def emitPatternCheck(
     PatVar(vname) -> {
         let llvmTy = getValLlvmType(valTy);
         let slotPtr = emitEntryAlloca(fctx, llvmTy);
+        dbgEmitLocalVar(mctx, fctx, vname, valTy, slotPtr, cellGet(fctx.fcCurSpan), 0);
         emitStore(fctx, llvmTy, val, slotPtr);
         let slot = MkVarSlot { vsPtr: slotPtr, vsLlvmTy: llvmTy, vsGeishaTy: valTy };
         cellSet(localsCell, Cons((vname, slot), cellGet(localsCell)))
@@ -3638,8 +3653,10 @@ def genExpr(
     cellSet(fctx.fcPendingLet, None);
 
     let prevLoc = cellGet(fctx.fcCurLocId);
+    let prevSpan = cellGet(fctx.fcCurSpan);
     if (fctx.fcDebug && tm.tspan.fileId != 0) {
-        cellSet(fctx.fcCurLocId, dbgGetOrCreateLoc(mctx, fctx, tm.tspan))
+        cellSet(fctx.fcCurLocId, dbgGetOrCreateLoc(mctx, fctx, tm.tspan));
+        cellSet(fctx.fcCurSpan, tm.tspan)
     } else ();
 
     let exprRes = match tm.tnode {
@@ -4276,6 +4293,7 @@ def genExpr(
         },
     };
     cellSet(fctx.fcCurLocId, prevLoc);
+    cellSet(fctx.fcCurSpan, prevSpan);
     exprRes
 }
 
@@ -5225,10 +5243,7 @@ pub def emitProgramLlvmIrForArchDebug(
         }
     };
 
-    let dbgCwd = match getEnv("PWD") {
-        Some(p) -> p,
-        None -> ".",
-    };
+    let dbgCwd = if (debugInfo) resolveDbgCwd() else ".";
 
     let mctx = MkModEmitCtx {
         mcStrCnt: cellNew(0),

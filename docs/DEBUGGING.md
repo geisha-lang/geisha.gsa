@@ -74,7 +74,7 @@ Install the **CodeLLDB** extension (`vadimcn.vscode-lldb`) in VS Code — no cus
     {
       "label": "geisha: build debug",
       "type": "shell",
-      "command": "geisha build -g",
+      "command": "geisha build -g -o build/debug",
       "group": {
         "kind": "build",
         "isDefault": true
@@ -96,7 +96,7 @@ Install the **CodeLLDB** extension (`vadimcn.vscode-lldb`) in VS Code — no cus
       "type": "lldb",
       "request": "launch",
       "preLaunchTask": "geisha: build debug",
-      "program": "${workspaceFolder}/build/${workspaceFolderBasename}",
+      "program": "${workspaceFolder}/build/debug",
       "args": [],
       "cwd": "${workspaceFolder}",
       "initCommands": [

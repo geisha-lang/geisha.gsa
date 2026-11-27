@@ -64,6 +64,49 @@ def _elem_stride(elem_type, ptr_size):
     return ptr_size
 
 
+def _format_sbvalue(val, depth=0):
+    if not val or not val.IsValid():
+        return "?"
+    summ = val.GetSummary()
+    if summ:
+        return summ
+    v = val.GetValue()
+    if v is not None:
+        return v
+    n = val.GetNumChildren()
+    if n > 0 and depth < 3:
+        parts = []
+        is_tuple = True
+        for i in range(min(n, 8)):
+            c = val.GetChildAtIndex(i)
+            cname = c.GetName() or f"_{i}"
+            if cname != f"_{i}":
+                is_tuple = False
+            parts.append((cname, _format_sbvalue(c, depth + 1)))
+        if is_tuple:
+            return "(" + ", ".join(pv for _, pv in parts) + ")"
+        return "(" + ", ".join(f"{cn}={pv}" for cn, pv in parts) + ")"
+    return f"<{val.GetTypeName()}>"
+
+
+def _format_array_elems(target, process, arr_ptr, count, elem_sbtype, fallback_elem_type):
+    ptr_size = process.GetAddressByteSize()
+    max_show = min(max(count, 0), 8)
+    elems = []
+    if elem_sbtype and elem_sbtype.IsValid() and elem_sbtype.GetByteSize() > 0:
+        stride = elem_sbtype.GetByteSize()
+        for i in range(max_show):
+            elem_addr = lldb.SBAddress(arr_ptr + 8 + i * stride, target)
+            ev = target.CreateValueFromAddress(f"[{i}]", elem_addr, elem_sbtype)
+            elems.append(_format_sbvalue(ev))
+    else:
+        stride = _elem_stride(fallback_elem_type, ptr_size)
+        for i in range(max_show):
+            elems.append(_format_elem(process, fallback_elem_type, arr_ptr + 8 + i * stride, ptr_size))
+    suffix = ", ..." if count > max_show else ""
+    return f"[{', '.join(elems)}{suffix}]"
+
+
 def geisha_string_summary(valobj, internal_dict):
     process = valobj.GetProcess()
     addr = valobj.GetValueAsUnsigned(0)
@@ -79,9 +122,21 @@ def _extract_vec_elem_type(type_name):
     return "ptr"
 
 
+def _get_elem0_type_from_array_ptr(arr_ptr_val):
+    if not arr_ptr_val or not arr_ptr_val.IsValid():
+        return None
+    arr_struct = arr_ptr_val.Dereference()
+    if not arr_struct or not arr_struct.IsValid():
+        return None
+    elem0 = arr_struct.GetChildMemberWithName("elem0")
+    if elem0 and elem0.IsValid():
+        return elem0.GetType()
+    return None
+
+
 def geisha_vec_summary(valobj, internal_dict):
+    target = valobj.GetTarget()
     process = valobj.GetProcess()
-    ptr_size = process.GetAddressByteSize()
     err = lldb.SBError()
 
     arr_cell_child = valobj.GetChildMemberWithName("_0")
@@ -103,19 +158,15 @@ def geisha_vec_summary(valobj, internal_dict):
     if err.Fail() or arr_ptr == 0:
         return f"Vec(len={vlen})"
 
+    elem_sbtype = _get_elem0_type_from_array_ptr(arr_cell_child.Dereference())
     elem_ty = _extract_vec_elem_type(valobj.GetTypeName())
-    stride = _elem_stride(elem_ty, ptr_size)
-    max_show = min(vlen, 8)
-    elems = []
-    for i in range(max_show):
-        elems.append(_format_elem(process, elem_ty, arr_ptr + 8 + i * stride, ptr_size))
-    suffix = ", ..." if vlen > max_show else ""
-    return f"Vec(len={vlen}) [{', '.join(elems)}{suffix}]"
+    rendered = _format_array_elems(target, process, arr_ptr, vlen, elem_sbtype, elem_ty)
+    return f"Vec(len={vlen}) {rendered}"
 
 
 def geisha_array_summary(valobj, internal_dict):
+    target = valobj.GetTarget()
     process = valobj.GetProcess()
-    ptr_size = process.GetAddressByteSize()
     err = lldb.SBError()
 
     arr_ptr = valobj.GetValueAsUnsigned(0)
@@ -131,13 +182,9 @@ def geisha_array_summary(valobj, internal_dict):
     lt = tname.find("<")
     gt = tname.rfind(">")
     elem_ty = tname[lt + 1 : gt].strip() if lt != -1 and gt > lt else "ptr"
-    stride = _elem_stride(elem_ty, ptr_size)
-    max_show = min(max(alen, 0), 8)
-    elems = []
-    for i in range(max_show):
-        elems.append(_format_elem(process, elem_ty, arr_ptr + 8 + i * stride, ptr_size))
-    suffix = ", ..." if alen > max_show else ""
-    return f"Array(len={alen}) [{', '.join(elems)}{suffix}]"
+    elem_sbtype = _get_elem0_type_from_array_ptr(valobj)
+    rendered = _format_array_elems(target, process, arr_ptr, alen, elem_sbtype, elem_ty)
+    return f"Array(len={alen}) {rendered}"
 
 
 def geisha_adt_summary(valobj, internal_dict):
@@ -183,7 +230,7 @@ def geisha_adt_summary(valobj, internal_dict):
         return f"[{', '.join(items)}{suffix}]"
 
     # Special pretty-printing for `std.option.Option (T)` / `Option (T)`: tag 0 = None, tag 1 = Some(x)
-    if "Option (" in inner and inner.endswith(")"):
+    if (inner.startswith("Option (") or inner.startswith("std.option.Option (")) and inner.endswith(")"):
         if tag == 0:
             return "None"
         lp = inner.find("(")

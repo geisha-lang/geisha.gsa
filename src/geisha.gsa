@@ -1035,15 +1035,16 @@ def strEndsWithA(s: String): Bool = {
     n >= 2 && strByteAt(s, n - 2) == 46 && strByteAt(s, n - 1) == 97
 }
 
-def emitStaticLibFromIr(
+def emitStaticLibFromIrOpt(
     llText: String,
     outArchive: String,
     target: String,
-    rtOverrideOpt: Option String
+    rtOverrideOpt: Option String,
+    optFlag: String
 ): Result Void String = {
     let rtArchive = resolveRuntimeArchiveForTarget(target, rtOverrideOpt)?;
     let tmpObj = outArchive + ".gsa.tmp.o";
-    emitTargetObjFromIr(llText, tmpObj, target)?;
+    emitTargetObjFromIrOpt(llText, tmpObj, target, optFlag)?;
     let cmd =
         if (currentHostOs() == "macos") {
             "libtool -static -o " + shellQuote(outArchive) + " " + shellQuote(tmpObj) + " " + shellQuote(rtArchive)
@@ -1058,6 +1059,14 @@ def emitStaticLibFromIr(
     if (rc == 0) Ok(())
     else Err("archiver failed while creating static library '" + outArchive + "'")
 }
+
+def emitStaticLibFromIr(
+    llText: String,
+    outArchive: String,
+    target: String,
+    rtOverrideOpt: Option String
+): Result Void String =
+    emitStaticLibFromIrOpt(llText, outArchive, target, rtOverrideOpt, " -O2")
 
 def emitWasmFromIr(
     llText: String,
@@ -1176,7 +1185,7 @@ def copyPathsIntoDir(paths: List String, dstDir: String): Result Void String = m
     },
 }
 
-def emitAppleBundleFromIr(
+def emitAppleBundleFromIrDebug(
     target: String,
     llText: String,
     tc: TargetCfg,
@@ -1184,7 +1193,9 @@ def emitAppleBundleFromIr(
     pkgName: String,
     pkgVersion: String,
     outDirOrBundleOpt: Option String,
-    rtOverrideOpt: Option String
+    rtOverrideOpt: Option String,
+    debugInfo: Bool,
+    optFlag: String
 ): Result String String = {
     if (currentHostOs() != "macos") {
         Err("Apple bundle target '" + target + "' requires macOS with Xcode Command Line Tools")
@@ -1230,9 +1241,10 @@ def emitAppleBundleFromIr(
             };
         let extFlags = if (isExt) " -fapplication-extension" else "";
         let extLinkFlags = if (isExt) " -fapplication-extension -e _NSExtensionMain" else "";
+        let cDbgFlag = if (debugInfo) " -g" else "";
 
         let cmdObj =
-            compilePrefix + extFlags + " -O2 -Wno-override-module -x ir -c "
+            compilePrefix + extFlags + optFlag + " -Wno-override-module -x ir -c "
             + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
         let rc1 = shell(cmdObj);
         let _ = removeFile(tmpLl);
@@ -1241,7 +1253,7 @@ def emitAppleBundleFromIr(
             Err("LLVM backend failed compiling object for Apple bundle '" + bundlePath + "'")
         } else {
             let cmdLink =
-                compilePrefix + extLinkFlags + " -O2 -pthread"
+                compilePrefix + extLinkFlags + optFlag + cDbgFlag + " -pthread"
                 + shellQuoteArgs(tc.tcCFlags)
                 + shellQuoteArgs(tc.tcCSources)
                 + " " + shellQuote(tmpObj)
@@ -1249,9 +1261,15 @@ def emitAppleBundleFromIr(
                 + shellQuoteArgs(tc.tcLinkFlags)
                 + " -o " + shellQuote(binPath);
             let rc2 = shell(cmdLink);
+            let rcDsym =
+                if (rc2 == 0 && debugInfo) {
+                    shell("dsymutil " + shellQuote(binPath))
+                } else 0;
             let _ = removeFile(tmpObj);
             if (rc2 != 0) {
                 Err("Linker failed while building Apple bundle '" + bundlePath + "'")
+            } else if (rcDsym != 0) {
+                Err("dsymutil failed while generating dSYM bundle for '" + binPath + "'")
             } else {
                 // Copy icon & resources
                 let iconFileOpt = match ab.abIcon {
@@ -1353,7 +1371,7 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             false, arch, tc.tcExports, noMainFlag, tc.tcBootSymbol, debugInfo
         )?;
-        emitAppleBundleFromIr(target, llText, tc, ab, pkgName, pkgVersion, outOpt, rtOpt)
+        emitAppleBundleFromIrDebug(target, llText, tc, ab, pkgName, pkgVersion, outOpt, rtOpt, debugInfo, optFlag)
     },
     cbCompileTargetArchive: (target, entryFile, rootSpec, extSpecs, tc, outArc, dumpCoreOpt, rtOpt) -> {
         let arch = if (target == "ios" || target == "ios-sim") "arm64" else currentHostArch();
@@ -1361,7 +1379,7 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             false, arch, tc.tcExports, true, tc.tcBootSymbol, debugInfo
         )?;
-        emitStaticLibFromIr(llText, outArc, target, rtOpt)
+        emitStaticLibFromIrOpt(llText, outArc, target, rtOpt, optFlag)
     },
     cbEmitIr: (entryFile, rootSpec, extSpecs, tc, isWasm, outOpt, dumpCoreOpt) -> {
         let llText = compileWithPkgSpecsToIrDebug(
@@ -1450,6 +1468,36 @@ def emptyPlainTargetCfg(): TargetCfg = MkTargetCfg {
     tcWebAssets: Nil,
     tcOwnsMain: false,
     tcBootSymbol: None,
+}
+
+def runUncachedScriptFile(
+    gsaFile: String,
+    appArgs: List String,
+    rtOverrideOpt: Option String,
+    debugInfo: Bool,
+    optFlag: String
+): Result Int String = {
+    diagReset();
+    let rootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: "",
+        srcRoots: [pathDirname(gsaFile)],
+        deps: Nil,
+    };
+    let llText = compileWithPkgSpecsToIrDebug(
+        gsaFile, true, rootSpec, Nil, Nil, None, false, Nil, false, None, debugInfo
+    )?;
+    let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
+    mkdirAll(cacheDir)?;
+    let tmpBin = pathJoin(cacheDir, "run_" + intToStr(c_getpid()));
+    emitNativeExecutableFromIrDebug(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt, debugInfo, optFlag)?;
+    let rc = execCachedScriptBin(tmpBin, appArgs);
+    let _ = removeFile(tmpBin);
+    if (debugInfo && currentHostOs() == "macos") {
+        let _ = shell("rm -rf " + shellQuote(tmpBin + ".dSYM"));
+        ()
+    } else ();
+    Ok(rc)
 }
 
 def runCachedScriptFile(
@@ -1613,7 +1661,11 @@ def runDriver(): Result Int String = {
             },
             Some("check") -> runCheckSubcmd(opts),
             Some("run") -> match opts.optInput {
-                Some(gsaFile) -> runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime),
+                Some(gsaFile) -> {
+                    let customBuild = opts.optDebug || match opts.optOptLevel { Some(_) -> true, None -> false };
+                    if (customBuild) runUncachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime, opts.optDebug, optFlag)
+                    else runCachedScriptFile(gsaFile, opts.optSubArgs, opts.optRuntime)
+                },
                 None ->
                     if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {
                         let projDir = match findProjectRoot(".") {
@@ -1710,7 +1762,7 @@ def runDriver(): Result Int String = {
                         Some(p) -> p,
                         None -> "lib" + pathStem(inputFile) + ".a",
                     };
-                    emitStaticLibFromIr(llText, outArc, opts.optTarget, opts.optRuntime)?;
+                    emitStaticLibFromIrOpt(llText, outArc, opts.optTarget, opts.optRuntime, optFlag)?;
                     Ok(0)
                 } else {
                     let outBin = match opts.optOutPath {
