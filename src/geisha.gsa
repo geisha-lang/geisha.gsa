@@ -637,12 +637,12 @@ def nativePthreadArgs(): List String =
 
 def nativeSysLibs(): String =
     if (currentHostOs() == "macos") ""
-    else if (currentHostOs() == "windows") " -lws2_32 -lbcrypt"
+    else if (currentHostOs() == "windows") " -lws2_32 -lbcrypt -Wl,/STACK:16777216"
     else " -lm"
 
 def nativeSysLibArgs(): List String =
     if (currentHostOs() == "macos") Nil
-    else if (currentHostOs() == "windows") ["-lws2_32", "-lbcrypt"]
+    else if (currentHostOs() == "windows") ["-lws2_32", "-lbcrypt", "-Wl,/STACK:16777216"]
     else ["-lm"]
 
 def hostExeExt(): String =

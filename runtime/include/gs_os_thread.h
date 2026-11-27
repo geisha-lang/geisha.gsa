@@ -86,13 +86,24 @@ static unsigned __stdcall gs_win_thr_entry(void *p)
     return 0;
 }
 
+#ifndef STACK_SIZE_PARAM_IS_A_RESERVATION
+#define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
+#endif
+
 static inline int gs_thread_create(gs_thread_t *out, void *(*fn)(void *), void *arg, bool detached)
 {
     gs_win_thr_pack_t *pack = (gs_win_thr_pack_t *)malloc(sizeof(gs_win_thr_pack_t));
     if (pack == NULL) return -1;
     pack->fn = fn;
     pack->arg = arg;
-    uintptr_t h = _beginthreadex(NULL, 0, gs_win_thr_entry, pack, 0, NULL);
+    uintptr_t h = _beginthreadex(
+        NULL,
+        8u * 1024u * 1024u,
+        gs_win_thr_entry,
+        pack,
+        STACK_SIZE_PARAM_IS_A_RESERVATION,
+        NULL
+    );
     if (h == 0) {
         free(pack);
         return -1;

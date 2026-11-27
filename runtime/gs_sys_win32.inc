@@ -1292,8 +1292,24 @@ void *gs_dlopen(const char *path)
 void *gs_dlsym(void *handle, const char *symbol)
 {
     if (symbol == NULL || symbol[0] == '\0') return NULL;
-    HMODULE h = (handle != NULL) ? (HMODULE)handle : GetModuleHandleW(NULL);
-    return (void *)(uintptr_t)GetProcAddress(h, symbol);
+    HMODULE self = GetModuleHandleW(NULL);
+    HMODULE h = (handle != NULL) ? (HMODULE)handle : self;
+    FARPROC p = GetProcAddress(h, symbol);
+    if (p != NULL) return (void *)(uintptr_t)p;
+    if (h == self) {
+        static const wchar_t *const kMods[] = {
+            L"ucrtbase.dll", L"api-ms-win-crt-string-l1-1-0.dll",
+            L"msvcrt.dll", L"kernel32.dll"
+        };
+        for (size_t i = 0; i < sizeof(kMods) / sizeof(kMods[0]); i++) {
+            HMODULE m = GetModuleHandleW(kMods[i]);
+            if (m != NULL) {
+                p = GetProcAddress(m, symbol);
+                if (p != NULL) return (void *)(uintptr_t)p;
+            }
+        }
+    }
+    return NULL;
 }
 
 int32_t gs_dlclose(void *handle)

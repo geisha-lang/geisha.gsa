@@ -42,6 +42,7 @@ pub data DepDecl {
         depRev: Option String,
         depPath: Option String,
         depSubdir: Option String,
+        depPctEncoded: Bool,
     },
 }
 
@@ -117,10 +118,13 @@ pub data LockEntry {
     MkLockEntry {
         leName: String,
         leUrl: String,
+        leRawUrl: String,
+        leRawFrom: List String,
         leSubdir: String,
         leVersion: String,
         leRev: String,
         leSha256: String,
+        lePctEncoded: Bool,
     },
 }
 
@@ -303,7 +307,7 @@ def runCmdStatus(program: String, args: List String, cwdOpt: Option String): Int
 def gitCapture(args: List String, noPrompt: Bool): Result String String =
     runCmdCapture(
         "git",
-        args,
+        if (pkgHostOs() == "windows") Cons("-c", Cons("core.longpaths=true", args)) else args,
         if (noPrompt) [("GIT_TERMINAL_PROMPT", "0")] else Nil,
         None
     )
@@ -741,6 +745,7 @@ def parseDepTable(vOpt: Option Value): Result (List DepDecl) String = match vOpt
                         depRev: None,
                         depPath: None,
                         depSubdir: None,
+                        depPctEncoded: false,
                     }, cellGet(acc)));
                     cellSet(cur, r)
                 },
@@ -767,6 +772,10 @@ def parseDepTable(vOpt: Option Value): Result (List DepDecl) String = match vOpt
                     };
                     let pathOpt = asStrOpt(lookupVal(dfs, "path"));
                     let subOpt = match explicitSub { Some(_) -> explicitSub, None -> hashSub };
+                    let pctEnc = match asStrOpt(lookupVal(dfs, "url_encoding")) {
+                        Some(enc) -> enc == "pct",
+                        None -> false,
+                    };
                     cellSet(acc, Cons(MkDepDecl {
                         depAlias: key,
                         depGit: gitClean,
@@ -774,6 +783,7 @@ def parseDepTable(vOpt: Option Value): Result (List DepDecl) String = match vOpt
                         depRev: revOpt,
                         depPath: pathOpt,
                         depSubdir: subOpt,
+                        depPctEncoded: pctEnc,
                     }, cellGet(acc)));
                     cellSet(cur, r)
                 },
@@ -867,10 +877,50 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
 
 def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
 
+def parseOptStrArr(vOpt: Option Value): List String = match vOpt {
+    Some(VArr(items)) -> {
+        let acc = cellNew(Nil);
+        let cur = cellNew(items);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(VStr(s), r) -> {
+                    cellSet(acc, addUniqueStr(cellGet(acc), s));
+                    cellSet(cur, r)
+                },
+                Cons(_, r) -> cellSet(cur, r),
+                Nil -> (),
+            }
+        };
+        cellGet(acc)
+    },
+    _ -> Nil,
+}
+
+def strListToVArr(xs: List String): Value = {
+    let acc = cellNew(Nil);
+    let cur = cellNew(xs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(s, r) -> {
+                cellSet(acc, listAppend(cellGet(acc), [VStr(s)]));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    VArr(cellGet(acc))
+}
+
 pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
     let rootVal = tomlParse(raw)?;
     match rootVal {
-        VObj(fs) -> match lookupVal(fs, "pkg") {
+        VObj(fs) -> {
+            let lockVer = match lookupVal(fs, "version") {
+                Some(VInt(v)) -> i64ToInt(v),
+                _ -> 1,
+            };
+            let isPctEncoded = lockVer >= 2;
+            match lookupVal(fs, "pkg") {
             None -> Ok(Nil),
             Some(VArr(items)) -> {
                 let acc = cellNew(Nil);
@@ -881,6 +931,8 @@ pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
                         Cons(VObj(pfs), r) -> {
                             let nm = match asStrOpt(lookupVal(pfs, "name")) { Some(s) -> s, None -> "" };
                             let url = match asStrOpt(lookupVal(pfs, "url")) { Some(s) -> s, None -> "" };
+                            let rawUrl = match asStrOpt(lookupVal(pfs, "raw_url")) { Some(s) -> s, None -> "" };
+                            let rawFrom = parseOptStrArr(lookupVal(pfs, "raw_from"));
                             let sub = match asStrOpt(lookupVal(pfs, "subdir")) { Some(s) -> s, None -> "" };
                             let ver = match asStrOpt(lookupVal(pfs, "version")) { Some(s) -> s, None -> "0.0.0" };
                             let rev = match asStrOpt(lookupVal(pfs, "rev")) { Some(s) -> s, None -> "" };
@@ -891,10 +943,13 @@ pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
                                 cellSet(acc, Cons(MkLockEntry {
                                     leName: nm,
                                     leUrl: url,
+                                    leRawUrl: rawUrl,
+                                    leRawFrom: rawFrom,
                                     leSubdir: sub,
                                     leVersion: ver,
                                     leRev: rev,
                                     leSha256: sha,
+                                    lePctEncoded: isPctEncoded,
                                 }, cellGet(acc)))
                             };
                             cellSet(cur, r)
@@ -908,6 +963,7 @@ pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
                 }
             },
             Some(_) -> Err("expected 'pkg' in geisha.lock to be [[pkg]] array of tables"),
+            }
         },
         _ -> Err("invalid geisha.lock"),
     }
@@ -923,6 +979,13 @@ pub def formatLockfileToml(entries: List LockEntry): String = {
                     ("name", VStr(e.leName)),
                     ("url", VStr(e.leUrl))
                 ]);
+                if (strLen(e.leRawUrl) > 0) {
+                    cellSet(fs, listAppend(cellGet(fs), [("raw_url", VStr(e.leRawUrl))]));
+                    match e.leRawFrom {
+                        Nil -> (),
+                        scopes -> cellSet(fs, listAppend(cellGet(fs), [("raw_from", strListToVArr(sortUniqueStrings(scopes)))])),
+                    }
+                } else ();
                 if (strLen(e.leSubdir) > 0) {
                     cellSet(fs, listAppend(cellGet(fs), [("subdir", VStr(e.leSubdir))]))
                 } else ();
@@ -939,7 +1002,7 @@ pub def formatLockfileToml(entries: List LockEntry): String = {
     };
     let header = "# Auto-generated by geisha — DO NOT EDIT MANUALLY.\n";
     let body = tomlStringify(VObj([
-        ("version", VInt(intToI64(1))),
+        ("version", VInt(intToI64(2))),
         ("pkg", VArr(cellGet(items)))
     ]));
     header + body
@@ -980,16 +1043,116 @@ pub def sanitizeIdentAlias(raw: String): String = {
     bufToString(b)
 }
 
+def winSlashNorm(s: String): String =
+    if (pkgHostOs() != "windows") s
+    else {
+        let n = strLen(s);
+        let b = bufNew();
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let c = strByteAt(s, cellGet(i));
+            bufPushByte(b, if (c == 92) 47 else c);
+            cellSet(i, cellGet(i) + 1)
+        };
+        bufToString(b)
+    }
+
+def hexNibbleVal(c: Int): Int =
+    if (c >= 48 && c <= 57) c - 48
+    else if (c >= 65 && c <= 70) c - 55
+    else if (c >= 97 && c <= 102) c - 87
+    else -1
+
+def pctDecodeUri(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 37 && idx + 2 < n) {
+            let hi = hexNibbleVal(strByteAt(s, idx + 1));
+            let lo = hexNibbleVal(strByteAt(s, idx + 2));
+            if (hi >= 0 && lo >= 0) {
+                bufPushByte(b, hi * 16 + lo);
+                cellSet(i, idx + 3)
+            } else {
+                bufPushByte(b, c);
+                cellSet(i, idx + 1)
+            }
+        } else {
+            bufPushByte(b, c);
+            cellSet(i, idx + 1)
+        }
+    };
+    bufToString(b)
+}
+
+def hexUpperDigit(n: Int): Int =
+    if (n < 10) 48 + n else 55 + n
+
+def pctEncodeFileUriPath(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        if (c == 37 || c == 32 || c == 35 || c == 63 || c < 32) {
+            bufPushByte(b, 37);
+            bufPushByte(b, hexUpperDigit(c / 16));
+            bufPushByte(b, hexUpperDigit(c % 16))
+        } else {
+            bufPushByte(b, c)
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def slashNormAll(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let c = strByteAt(s, cellGet(i));
+        bufPushByte(b, if (c == 92) 47 else c);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
 // Returns `(canonicalUrlKey, gitCloneUrl)`
 pub def normalizeGitSpec(rawSpec: String): Result (String, String) String = {
     let s = strTrim(rawSpec);
     if (strStartsWith(s, "file://")) {
-        let localP = strSlice(s, 7, strLen(s));
-        let ap = absPath(localP);
-        Ok(("file://" + ap, ap))
+        let afterScheme = strSlice(s, 7, strLen(s));
+        let isLocalhost = strStartsWith(afterScheme, "localhost/");
+        let isRooted = strStartsWith(afterScheme, "/") || isLocalhost;
+        if (isRooted) {
+            let rootedRaw = if (isLocalhost) strSlice(afterScheme, 9, strLen(afterScheme)) else afterScheme;
+            let decoded = pctDecodeUri(rootedRaw);
+            let localP =
+                if (pkgHostOs() == "windows" && strLen(decoded) >= 3 && strByteAt(decoded, 0) == 47 && strByteAt(decoded, 2) == 58) {
+                    strSlice(decoded, 1, strLen(decoded))
+                } else decoded;
+            let ap = winSlashNorm(absPath(localP));
+            let urlPfx = if (strLen(ap) >= 2 && strByteAt(ap, 1) == 58) "file:///" else "file://";
+            Ok((urlPfx + pctEncodeFileUriPath(ap), ap))
+        } else {
+            let decoded = pctDecodeUri(afterScheme);
+            if (pkgHostOs() == "windows" && strLen(decoded) >= 2 && strByteAt(decoded, 1) == 58) {
+                let ap = winSlashNorm(absPath(decoded));
+                Ok(("file:///" + pctEncodeFileUriPath(ap), ap))
+            } else {
+                // UNC / remote-authority file URI: `file://server/share/repo` -> preserve authority
+                let uncNorm = slashNormAll(decoded);
+                Ok(("file://" + pctEncodeFileUriPath(uncNorm), "//" + uncNorm))
+            }
+        }
     } else if (isAbsPath(s) || strStartsWith(s, "./") || strStartsWith(s, "../")) {
-        let ap = absPath(s);
-        Ok(("file://" + ap, ap))
+        let ap = winSlashNorm(absPath(s));
+        let urlPfx = if (strLen(ap) >= 2 && strByteAt(ap, 1) == 58) "file:///" else "file://";
+        Ok((urlPfx + pctEncodeFileUriPath(ap), ap))
     } else if (strStartsWith(s, "git@")) {
         // e.g. `git@github.com:geisha-lang/crema.git`
         let afterAt = strSlice(s, 4, strLen(s));
@@ -1098,18 +1261,85 @@ def resolveBareNameFromIndex(pkgName: String): Result (String, String) String = 
 // Bare Git Object DB (`~/.geisha/git/db/`) & Content-Addressed Extraction
 // ============================================================================
 
-def ensureBareRepo(canonUrl: String, cloneUrl: String): Result String String = {
-    let slug = sanitizeSlug(canonUrl);
+def legacyUnencodedFileUrl(canonUrl: String, cloneUrl: String): Option String =
+    if (!strStartsWith(canonUrl, "file://")) None
+    else {
+        let normClone = winSlashNorm(cloneUrl);
+        let rawUrl =
+            if (strStartsWith(normClone, "//")) "file:" + normClone
+            else if (strLen(normClone) >= 2 && strByteAt(normClone, 1) == 58) "file:///" + normClone
+            else "file://" + normClone;
+        if (rawUrl != canonUrl) Some(rawUrl) else None
+    }
+
+def bareDirOriginMatches(dir: String, cloneUrl: String): Bool =
+    match gitCapture(["-C", dir, "remote", "get-url", "origin"], false) {
+        Ok(orig) -> winSlashNorm(strTrim(orig)) == winSlashNorm(cloneUrl),
+        Err(_) -> false,
+    }
+
+def disambigBareRepoDir(canonUrl: String, cloneUrl: String): String = {
+    let rawSlug = sanitizeSlug(canonUrl);
+    let slug = if (strLen(rawSlug) > 32) strSlice(rawSlug, strLen(rawSlug) - 32, strLen(rawSlug)) else rawSlug;
+    let dh12 = strSlice(sha256Hex(canonUrl + "\n" + winSlashNorm(cloneUrl)), 0, 12);
+    pathJoin(pathJoin(geishaHomeDir(), "git/db"), slug + "-d" + dh12 + ".git")
+}
+
+def findExistingBareRepoFor(canonUrl: String, cloneUrl: String): Option String = {
+    let rawSlug = sanitizeSlug(canonUrl);
+    let slug = if (strLen(rawSlug) > 32) strSlice(rawSlug, strLen(rawSlug) - 32, strLen(rawSlug)) else rawSlug;
     let h12 = strSlice(sha256Hex(canonUrl), 0, 12);
-    let dbDir = pathJoin(pathJoin(geishaHomeDir(), "git/db"), slug + "-" + h12 + ".git");
-    if (!isDir(dbDir)) {
-        mkdirAll(dbDir)?;
-        let _ = gitCapture(["init", "--bare", "--quiet", dbDir], false)?;
-        let _ = gitCapture(["-C", dbDir, "remote", "add", "origin", cloneUrl], false)?;
-        Ok(dbDir)
-    } else {
-        let _ = gitCapture(["-C", dbDir, "remote", "set-url", "origin", cloneUrl], false);
-        Ok(dbDir)
+    let dbRoot = pathJoin(geishaHomeDir(), "git/db");
+    let dbDir = pathJoin(dbRoot, slug + "-" + h12 + ".git");
+    let disambigDir = disambigBareRepoDir(canonUrl, cloneUrl);
+    let legacyDbDir = pathJoin(dbRoot, rawSlug + "-" + h12 + ".git");
+    let isFileUrl = strStartsWith(canonUrl, "file://");
+    let dbOk = isDir(dbDir) && (!isFileUrl || bareDirOriginMatches(dbDir, cloneUrl));
+    if (dbOk) Some(dbDir)
+    else if (isFileUrl && isDir(disambigDir) && bareDirOriginMatches(disambigDir, cloneUrl)) Some(disambigDir)
+    else {
+        let legacyDbOk =
+            rawSlug != slug && isDir(legacyDbDir)
+            && (!isFileUrl || bareDirOriginMatches(legacyDbDir, cloneUrl));
+        if (legacyDbOk) Some(legacyDbDir)
+        else match legacyUnencodedFileUrl(canonUrl, cloneUrl) {
+            Some(rawUrl) -> {
+                let uSlug = sanitizeSlug(rawUrl);
+                let uH12 = strSlice(sha256Hex(rawUrl), 0, 12);
+                let uDir = pathJoin(dbRoot, uSlug + "-" + uH12 + ".git");
+                if (isDir(uDir) && bareDirOriginMatches(uDir, cloneUrl)) Some(uDir) else None
+            },
+            None -> None,
+        }
+    }
+}
+
+def ensureBareRepo(canonUrl: String, cloneUrl: String): Result String String = {
+    match findExistingBareRepoFor(canonUrl, cloneUrl) {
+        Some(existingDir) -> {
+            let _ = gitCapture(["-C", existingDir, "remote", "set-url", "origin", cloneUrl], false);
+            Ok(existingDir)
+        },
+        None -> {
+            let rawSlug = sanitizeSlug(canonUrl);
+            let slug = if (strLen(rawSlug) > 32) strSlice(rawSlug, strLen(rawSlug) - 32, strLen(rawSlug)) else rawSlug;
+            let h12 = strSlice(sha256Hex(canonUrl), 0, 12);
+            let dbDir = pathJoin(pathJoin(geishaHomeDir(), "git/db"), slug + "-" + h12 + ".git");
+            let targetDir =
+                if (!isDir(dbDir)) dbDir
+                else disambigBareRepoDir(canonUrl, cloneUrl);
+            if (!isDir(targetDir)) {
+                mkdirAll(targetDir)?;
+                let _ = gitCapture(["init", "--bare", "--quiet", targetDir], false)?;
+                let _ = gitCapture(["-C", targetDir, "remote", "add", "origin", cloneUrl], false)?;
+                Ok(targetDir)
+            } else if (!strStartsWith(canonUrl, "file://") || bareDirOriginMatches(targetDir, cloneUrl)) {
+                let _ = gitCapture(["-C", targetDir, "remote", "set-url", "origin", cloneUrl], false);
+                Ok(targetDir)
+            } else {
+                Err("bare git cache directory occupied by another repository: " + targetDir)
+            }
+        },
     }
 }
 
@@ -1131,9 +1361,9 @@ def resolveTagRev(dbDir: String, ver: String): Result String String = {
     let rawTag = stripLeadingV(ver);
     match tryFetchSingleTag(dbDir, vTag) {
         Ok(sha) -> Ok(sha),
-        Err(_) -> match tryFetchSingleTag(dbDir, rawTag) {
+        Err(e1) -> match tryFetchSingleTag(dbDir, rawTag) {
             Ok(sha2) -> Ok(sha2),
-            Err(e) -> Err("could not fetch version tag '" + vTag + "' (or '" + rawTag + "'): " + e),
+            Err(e2) -> Err("could not fetch version tag '" + vTag + "' (" + e1 + ") or '" + rawTag + "' (" + e2 + ")"),
         },
     }
 }
@@ -1210,16 +1440,26 @@ def readManifestFromBare(dbDir: String, rev: String, subdir: String, fallbackNam
     }
 }
 
+def legacyRawFileUrlFor(canonUrl: String, cloneUrl: String): String =
+    match legacyUnencodedFileUrl(canonUrl, cloneUrl) {
+        Some(u) -> u,
+        None -> canonUrl,
+    }
+
 def findLockEntry(
     locks: List LockEntry,
-    url: String,
+    canonUrl: String,
+    cloneUrl: String,
     subdir: String,
     minVerOpt: Option String,
     exactRevOpt: Option String
 ): Option LockEntry = match locks {
     Nil -> None,
-    Cons(le, rest) ->
-        if (le.leUrl == url && le.leSubdir == subdir) {
+    Cons(le, rest) -> {
+        let expectedUrl =
+            if (le.lePctEncoded || !strStartsWith(canonUrl, "file://")) canonUrl
+            else legacyRawFileUrlFor(canonUrl, cloneUrl);
+        if (le.leUrl == expectedUrl && le.leSubdir == subdir) {
             let okMatch = match exactRevOpt {
                 Some(rv) -> le.leRev == rv || strStartsWith(le.leRev, rv),
                 None -> match minVerOpt {
@@ -1229,8 +1469,9 @@ def findLockEntry(
                     None -> true,
                 },
             };
-            if (okMatch) Some(le) else findLockEntry(rest, url, subdir, minVerOpt, exactRevOpt)
-        } else findLockEntry(rest, url, subdir, minVerOpt, exactRevOpt),
+            if (okMatch) Some(le) else findLockEntry(rest, canonUrl, cloneUrl, subdir, minVerOpt, exactRevOpt)
+        } else findLockEntry(rest, canonUrl, cloneUrl, subdir, minVerOpt, exactRevOpt)
+    },
 }
 
 def cacheDirNameFor(name: String, ver: String, rev: String, sha256Str: String): String = {
@@ -1362,6 +1603,8 @@ data MvsNode {
         mnKey: String,
         mnName: String,
         mnCanonUrl: String,
+        mnRawUrl: String,
+        mnRawFrom: List String,
         mnCloneUrl: String,
         mnSubdir: String,
         mnVersion: String,
@@ -1482,12 +1725,61 @@ def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List 
     Ok((mf, allOverrides, locks))
 }
 
+def normalizeLegacyRawFileSpec(rawSpec: String): Option (String, String) = {
+    let s = strTrim(rawSpec);
+    if (!strStartsWith(s, "file://")) None
+    else {
+        let afterScheme = strSlice(s, 7, strLen(s));
+        let isLocalhost = strStartsWith(afterScheme, "localhost/");
+        let isRooted = strStartsWith(afterScheme, "/") || isLocalhost;
+        let rawBody = if (isLocalhost) strSlice(afterScheme, 9, strLen(afterScheme)) else afterScheme;
+        if (pctDecodeUri(rawBody) == rawBody) None
+        else if (isRooted) {
+            let localP =
+                if (pkgHostOs() == "windows" && strLen(rawBody) >= 3 && strByteAt(rawBody, 0) == 47 && strByteAt(rawBody, 2) == 58) {
+                    strSlice(rawBody, 1, strLen(rawBody))
+                } else rawBody;
+            let ap = winSlashNorm(absPath(localP));
+            let urlPfx = if (strLen(ap) >= 2 && strByteAt(ap, 1) == 58) "file:///" else "file://";
+            Some((urlPfx + pctEncodeFileUriPath(ap), ap))
+        } else if (pkgHostOs() == "windows" && strLen(rawBody) >= 2 && strByteAt(rawBody, 1) == 58) {
+            let ap = winSlashNorm(absPath(rawBody));
+            Some(("file:///" + pctEncodeFileUriPath(ap), ap))
+        } else {
+            let uncNorm = slashNormAll(rawBody);
+            Some(("file://" + pctEncodeFileUriPath(uncNorm), "//" + uncNorm))
+        }
+    }
+}
+
+def hasLegacyV1LockForUrl(locks: List LockEntry, url: String, subdir: String): Bool = match locks {
+    Nil -> false,
+    Cons(le, rest) ->
+        if (!le.lePctEncoded && le.leUrl == url && le.leSubdir == subdir) true
+        else hasLegacyV1LockForUrl(rest, url, subdir),
+}
+
+def hasV2LockForRawUrl(locks: List LockEntry, rawUrl: String, subdir: String, scopeKey: String): Bool = match locks {
+    Nil -> false,
+    Cons(le, rest) ->
+        if (le.lePctEncoded && le.leRawUrl == rawUrl && le.leSubdir == subdir && listContainsStr(le.leRawFrom, scopeKey)) true
+        else hasV2LockForRawUrl(rest, rawUrl, subdir, scopeKey),
+}
+
 def resolveDepCoordinate(
     ownerDir: String,
+    ownerKey: String,
     dep: DepDecl,
-    overrides: List DepDecl
-): Result (String, String, String, String, Option String, Option String, Option String) String = {
-    // Returns `(nodeBucketKey, canonUrl, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)`
+    overrides: List DepDecl,
+    existingLocks: List LockEntry,
+    skipLegacyAliasOpt: Option String
+): Result (String, String, String, String, String, String, Option String, Option String, Option String) String = {
+    // Returns `(nodeBucketKey, canonUrl, rawUrlAlias, rawScope, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)`
+    let scopeKey = (if (ownerKey == "") "@root" else ownerKey) + "::" + dep.depAlias;
+    let skipLegacyForThis = ownerKey == "" && match skipLegacyAliasOpt {
+        Some(al) -> al == dep.depAlias,
+        None -> false,
+    };
     let prelimCanon = match dep.depGit {
         Some(g) -> match normalizeGitSpec(g) {
             Ok((cu, _)) -> cu,
@@ -1503,6 +1795,7 @@ def resolveDepCoordinate(
             depRev: match ov.depRev { Some(_) -> ov.depRev, None -> dep.depRev },
             depPath: match ov.depPath { Some(_) -> ov.depPath, None -> dep.depPath },
             depSubdir: match ov.depSubdir { Some(_) -> ov.depSubdir, None -> dep.depSubdir },
+            depPctEncoded: match ov.depGit { Some(_) -> ov.depPctEncoded, None -> dep.depPctEncoded },
         },
         None -> dep,
     };
@@ -1514,7 +1807,7 @@ def resolveDepCoordinate(
                 Err("local path dependency '" + dep.depAlias + "' not found at '" + fullP + "'")
             } else {
                 let key = "local:" + fullP;
-                Ok((key, key, "", "", effDep.depVersion, None, Some(fullP)))
+                Ok((key, key, "", "", "", "", effDep.depVersion, None, Some(fullP)))
             }
         },
         None -> {
@@ -1522,14 +1815,37 @@ def resolveDepCoordinate(
                 Some(g) -> g,
                 None -> dep.depAlias,
             };
-            let (canonUrl, cloneUrl) = normalizeGitSpec(rawSpec)?;
             let sub = match effDep.depSubdir { Some(s) -> s, None -> "" };
+            let (decCanon, decClone) = normalizeGitSpec(rawSpec)?;
+            let chosenRes: Result (String, String, String, String) String =
+                if (skipLegacyForThis || effDep.depPctEncoded) Ok((decCanon, "", "", decClone))
+                else match normalizeLegacyRawFileSpec(rawSpec) {
+                    Some((litCanon, litClone)) -> {
+                        let litLegacyUrl = legacyRawFileUrlFor(litCanon, litClone);
+                        let decLegacyUrl = legacyRawFileUrlFor(decCanon, decClone);
+                        if (hasV2LockForRawUrl(existingLocks, litLegacyUrl, sub, scopeKey)) {
+                            Ok((litCanon, litLegacyUrl, scopeKey, litClone))
+                        } else {
+                            let litLockHit = hasLegacyV1LockForUrl(existingLocks, litLegacyUrl, sub);
+                            let decLockHit = hasLegacyV1LockForUrl(existingLocks, decLegacyUrl, sub);
+                            if (litLockHit && decLockHit) {
+                                Err("ambiguous legacy file:// dependency '" + dep.depAlias + "' ('" + rawSpec + "'): matches both '" + litClone + "' and '" + decClone + "'; encode literal '%' as '%25' in geisha.toml")
+                            } else if (litLockHit) {
+                                Ok((litCanon, litLegacyUrl, scopeKey, litClone))
+                            } else {
+                                Ok((decCanon, "", "", decClone))
+                            }
+                        }
+                    },
+                    None -> Ok((decCanon, "", "", decClone)),
+                };
+            let (canonUrl, rawUrlAlias, rawScope, cloneUrl) = chosenRes?;
             let bucket = match effDep.depVersion {
                 Some(v) -> majorCompatLine(v),
                 None -> "rev",
             };
             let nodeKey = canonUrl + (if (sub != "") "#" + sub else "") + "@" + bucket;
-            Ok((nodeKey, canonUrl, cloneUrl, sub, effDep.depVersion, effDep.depRev, None))
+            Ok((nodeKey, canonUrl, rawUrlAlias, rawScope, cloneUrl, sub, effDep.depVersion, effDep.depRev, None))
         },
     }
 }
@@ -1627,6 +1943,15 @@ pub def resolveProjectGraph(
     refreshRemote: Bool,
     onlyUpdateAlias: Option String,
     writeLockFile: Bool
+): Result (Manifest, PkgSpec, List ResolvedPkg) String =
+    resolveProjectGraphWithExcl(projectDir, refreshRemote, onlyUpdateAlias, writeLockFile, None)
+
+def resolveProjectGraphWithExcl(
+    projectDir: String,
+    refreshRemote: Bool,
+    onlyUpdateAlias: Option String,
+    writeLockFile: Bool,
+    skipLegacyRootAlias: Option String
 ): Result (Manifest, PkgSpec, List ResolvedPkg) String = {
     let (rootMf, overrides, existingLocks) = loadProjectManifestAndOverrides(projectDir)?;
 
@@ -1654,9 +1979,9 @@ pub def resolveProjectGraph(
         match cellGet(queue) {
             Cons((ownerDir, ownerKey, dep), restQ) -> {
                 cellSet(queue, restQ);
-                match resolveDepCoordinate(ownerDir, dep, overrides) {
+                match resolveDepCoordinate(ownerDir, ownerKey, dep, overrides, existingLocks, skipLegacyRootAlias) {
                     Err(e) -> cellSet(errOpt, Some(e)),
-                    Ok((nodeKey, canonUrl, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)) -> {
+                    Ok((nodeKey, canonUrl, rawUrlAlias, rawScope, cloneUrl, subdir, minVerOpt, revOpt, localDirOpt)) -> {
                         // Record `ownerKey : dep.depAlias -> nodeKey`
                         let prevEdges = match strMapGet(edgeBindings, ownerKey) { Some(es) -> es, None -> Nil };
                         let filteredEdges = {
@@ -1705,6 +2030,8 @@ pub def resolveProjectGraph(
                                                 mnKey: nodeKey,
                                                 mnName: if (lmf.mfName != "") lmf.mfName else dep.depAlias,
                                                 mnCanonUrl: canonUrl,
+                                                mnRawUrl: "",
+                                                mnRawFrom: Nil,
                                                 mnCloneUrl: "",
                                                 mnSubdir: "",
                                                 mnVersion: lmf.mfVersion,
@@ -1734,7 +2061,7 @@ pub def resolveProjectGraph(
                                         };
                                     let lockMatch =
                                         if (skipLock) None
-                                        else findLockEntry(existingLocks, canonUrl, subdir, minVerOpt, revOpt);
+                                        else findLockEntry(existingLocks, canonUrl, cloneUrl, subdir, minVerOpt, revOpt);
 
                                     let resolvedRevVerSha = resolveRemoteMvsCandidate(
                                         lockMatch, canonUrl, cloneUrl, subdir, minVerOpt, revOpt
@@ -1746,11 +2073,26 @@ pub def resolveProjectGraph(
                                             if (!strMapContains(nodesMap, nodeKey)) {
                                                 cellSet(nodeOrder, listAppend(cellGet(nodeOrder), [nodeKey]))
                                             } else ();
+                                            let prevScopes = match strMapGet(nodesMap, nodeKey) {
+                                                Some(ex) -> ex.mnRawFrom,
+                                                None -> Nil,
+                                            };
+                                            let mergedScopes =
+                                                if (strLen(rawScope) > 0) addUniqueStr(prevScopes, rawScope)
+                                                else prevScopes;
+                                            let mergedRawUrl =
+                                                if (strLen(rawUrlAlias) > 0) rawUrlAlias
+                                                else match strMapGet(nodesMap, nodeKey) {
+                                                    Some(ex) -> ex.mnRawUrl,
+                                                    None -> "",
+                                                };
                                             let pkgNm = if (dmf.mfName != "") dmf.mfName else sanitizeIdentAlias(canonUrl);
                                             strMapInsert(nodesMap, nodeKey, MkMvsNode {
                                                 mnKey: nodeKey,
                                                 mnName: pkgNm,
                                                 mnCanonUrl: canonUrl,
+                                                mnRawUrl: mergedRawUrl,
+                                                mnRawFrom: mergedScopes,
                                                 mnCloneUrl: cloneUrl,
                                                 mnSubdir: subdir,
                                                 mnVersion: rVer,
@@ -1772,6 +2114,24 @@ pub def resolveProjectGraph(
                                         },
                                     }
                                 },
+                            }
+                        } else if (strLen(rawScope) > 0) {
+                            match strMapGet(nodesMap, nodeKey) {
+                                Some(ex) -> strMapInsert(nodesMap, nodeKey, MkMvsNode {
+                                    mnKey: ex.mnKey,
+                                    mnName: ex.mnName,
+                                    mnCanonUrl: ex.mnCanonUrl,
+                                    mnRawUrl: if (strLen(ex.mnRawUrl) > 0) ex.mnRawUrl else rawUrlAlias,
+                                    mnRawFrom: addUniqueStr(ex.mnRawFrom, rawScope),
+                                    mnCloneUrl: ex.mnCloneUrl,
+                                    mnSubdir: ex.mnSubdir,
+                                    mnVersion: ex.mnVersion,
+                                    mnRev: ex.mnRev,
+                                    mnExpectedSha: ex.mnExpectedSha,
+                                    mnLocalDir: ex.mnLocalDir,
+                                    mnManifest: ex.mnManifest,
+                                }),
+                                None -> (),
                             }
                         } else ()
                     },
@@ -1895,10 +2255,13 @@ pub def resolveProjectGraph(
                                         cellSet(newLocksRev, Cons(MkLockEntry {
                                             leName: mn.mnName,
                                             leUrl: mn.mnCanonUrl,
+                                            leRawUrl: mn.mnRawUrl,
+                                            leRawFrom: mn.mnRawFrom,
                                             leSubdir: mn.mnSubdir,
                                             leVersion: mn.mnVersion,
                                             leRev: mn.mnRev,
                                             leSha256: actualSha,
+                                            lePctEncoded: true,
                                         }, cellGet(newLocksRev)))
                                     },
                                 }
@@ -2342,7 +2705,7 @@ pub def cmdAdd(args: List String): Result Void String = {
     };
     writeFile(mfPath, outText)?;
 
-    let (_, _, resolved) = resolveProjectGraph(projDir, false, None, true)?;
+    let (_, _, resolved) = resolveProjectGraphWithExcl(projDir, false, None, true, Some(depKey))?;
     printLn("Added '" + depKey + "' to geisha.toml (" + intToStr(listLen(resolved)) + " package(s) resolved)");
     Ok(())
 }
@@ -2394,6 +2757,9 @@ def buildAddedDepPair(
         };
 
         let fields = cellNew([("git", VStr(canonUrl))]);
+        if (strStartsWith(canonUrl, "file://") && pctDecodeUri(canonUrl) != canonUrl) {
+            cellSet(fields, listAppend(cellGet(fields), [("url_encoding", VStr("pct"))]))
+        } else ();
         match finalSub {
             Some(sd) -> cellSet(fields, listAppend(cellGet(fields), [("subdir", VStr(sd))])),
             None -> (),
