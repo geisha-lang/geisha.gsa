@@ -66,30 +66,33 @@ wasm-runtime: $(WASM_RT_OBJ)
 $(WASM_RT_OBJ): runtime/wasm_rt.c | $(BUILD_DIR)
 	$(WASM_CC) $(WASM_FLAGS) -Wall -Wextra -nostdlib -ffreestanding -c runtime/wasm_rt.c -o $(WASM_RT_OBJ)
 
-$(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+$(RUNTIME_LIB): runtime/base.c runtime/gs_sys.c runtime/gs_objc.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/base.o
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/gs_sys.o
+	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/gs_objc.c -o $(BUILD_DIR)/gs_objc.o
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/gc_bitmap.o
 	$(HOST_ENV) $(CC) $(CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/gs_conc.o
-	ar rcs $(RUNTIME_LIB) $(BUILD_DIR)/base.o $(BUILD_DIR)/gs_sys.o $(BUILD_DIR)/gc_bitmap.o $(BUILD_DIR)/gs_conc.o
+	ar rcs $(RUNTIME_LIB) $(BUILD_DIR)/base.o $(BUILD_DIR)/gs_sys.o $(BUILD_DIR)/gs_objc.o $(BUILD_DIR)/gc_bitmap.o $(BUILD_DIR)/gs_conc.o
 
 runtime-ios: $(RUNTIME_IOS_LIB)
 
-$(RUNTIME_IOS_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+$(RUNTIME_IOS_LIB): runtime/base.c runtime/gs_sys.c runtime/gs_objc.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/ios_base.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/ios_gs_sys.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/gs_objc.c -o $(BUILD_DIR)/ios_gs_objc.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/ios_gc_bitmap.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 $(IOS_CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/ios_gs_conc.o
-	ar rcs $(RUNTIME_IOS_LIB) $(BUILD_DIR)/ios_base.o $(BUILD_DIR)/ios_gs_sys.o $(BUILD_DIR)/ios_gc_bitmap.o $(BUILD_DIR)/ios_gs_conc.o
+	ar rcs $(RUNTIME_IOS_LIB) $(BUILD_DIR)/ios_base.o $(BUILD_DIR)/ios_gs_sys.o $(BUILD_DIR)/ios_gs_objc.o $(BUILD_DIR)/ios_gc_bitmap.o $(BUILD_DIR)/ios_gs_conc.o
 
 runtime-ios-sim: $(RUNTIME_IOS_SIM_LIB)
 
-$(RUNTIME_IOS_SIM_LIB): runtime/base.c runtime/gs_sys.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
+$(RUNTIME_IOS_SIM_LIB): runtime/base.c runtime/gs_sys.c runtime/gs_objc.c runtime/runtime/gc_bitmap.c runtime/runtime/gs_conc.c runtime/include/*.h | $(BUILD_DIR)
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/base.c -o $(BUILD_DIR)/iossim_base.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/gs_sys.c -o $(BUILD_DIR)/iossim_gs_sys.o
+	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/gs_objc.c -o $(BUILD_DIR)/iossim_gs_objc.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/runtime/gc_bitmap.c -o $(BUILD_DIR)/iossim_gc_bitmap.o
 	DEVELOPER_DIR=$(XCODE_DEV) IPHONEOS_DEPLOYMENT_TARGET=16.0 xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator $(IOS_CFLAGS) -c runtime/runtime/gs_conc.c -o $(BUILD_DIR)/iossim_gs_conc.o
-	ar rcs $(RUNTIME_IOS_SIM_LIB) $(BUILD_DIR)/iossim_base.o $(BUILD_DIR)/iossim_gs_sys.o $(BUILD_DIR)/iossim_gc_bitmap.o $(BUILD_DIR)/iossim_gs_conc.o
+	ar rcs $(RUNTIME_IOS_SIM_LIB) $(BUILD_DIR)/iossim_base.o $(BUILD_DIR)/iossim_gs_sys.o $(BUILD_DIR)/iossim_gs_objc.o $(BUILD_DIR)/iossim_gc_bitmap.o $(BUILD_DIR)/iossim_gs_conc.o
 
 stdlib-bundle:
 	python3 scripts/gen_stdlib.py

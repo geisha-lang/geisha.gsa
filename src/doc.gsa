@@ -210,8 +210,13 @@ def formatDefSig(d: Def): String = {
             let taStr = match targs { Nil -> "", ts -> " " + formatTypeList(ts, " ") };
             visPfx + "instance " + csStr + cname + taStr
         },
-        ItExtern(sym, scm, _) ->
-            visPfx + "extern \"" + sym + "\" def " + d.ident + ": " + formatScheme(scm),
+        ItExtern(sym, scm, noAlloc, isFnPtr) -> {
+            let modStr =
+                (if (isFnPtr) "ptr " else "")
+                + (if (noAlloc) "noalloc " else "")
+                + (if (isFnPtr) "" else "\"" + sym + "\" ");
+            visPfx + "extern " + modStr + "def " + d.ident + ": " + formatScheme(scm)
+        },
         ItForm(f) -> match f.node {
             ExAbs(ps, retOpt, _) -> {
                 let pStr = formatParamsFromAbs(ps);

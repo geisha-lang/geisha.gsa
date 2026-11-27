@@ -1297,7 +1297,7 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
     };
     let newItem = match d.item {
         ItForm(f) -> ItForm(rewriteFormInMod(ctx, f, Nil)),
-        ItExtern(sym, scm, noAlloc) -> ItExtern(sym, rewriteSchemeInMod(ctx, scm), noAlloc),
+        ItExtern(sym, scm, noAlloc, isFnPtr) -> ItExtern(sym, rewriteSchemeInMod(ctx, scm), noAlloc, isFnPtr),
         ItAlias(ps, scm) -> ItAlias(ps, rewriteSchemeInMod(ctx, scm)),
         ItAlg(ps, vs) -> {
             let newVs = cellNew(Nil);
@@ -1368,7 +1368,7 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
             ItInstance(qcn, rewriteTypeListInMod(ctx, targs), rewriteConstraintsInMod(ctx, cs), cellGet(newImpls))
         },
     };
-    MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, item: newItem }
+    MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: newItem }
 }
 
 def collectTyConsExpanded(

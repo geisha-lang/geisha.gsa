@@ -66,6 +66,27 @@ pub data TargetCfg {
     },
 }
 
+pub data AppleBundleCfg {
+    MkAppleBundleCfg {
+        abBundleId: Option String,
+        abBundleName: Option String,
+        abVersion: Option String,
+        abMinOs: Option String,
+        abFrameworks: List String,
+        abWeakFrameworks: List String,
+        abLsuiElement: Bool,
+        abIsExtension: Bool,
+        abPrincipalClass: Option String,
+        abInfoPlist: Option String,
+        abEntitlements: Option String,
+        abIcon: Option String,
+        abResources: List String,
+        abProvisioningProfile: Option String,
+        abEmbedExtensions: List String,
+        abCodesign: Option String,
+    },
+}
+
 pub data Manifest {
     MkManifest {
         mfName: String,
@@ -77,6 +98,10 @@ pub data Manifest {
         mfOverrides: List DepDecl,
         mfNative: TargetCfg,
         mfWasm: TargetCfg,
+        mfMacos: TargetCfg,
+        mfIos: TargetCfg,
+        mfMacosBundle: AppleBundleCfg,
+        mfIosBundle: AppleBundleCfg,
     },
 }
 
@@ -113,8 +138,29 @@ pub data CompileCallbacks {
         cbCompileNativeExe: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String, Option String) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String) -> Result Void String,
+        cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String) -> Result String String,
+        cbCompileTargetArchive: (String, String, PkgSpec, List PkgSpec, TargetCfg, String, Option String, Option String) -> Result Void String,
         cbEmitIr: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String) -> Result Void String,
     },
+}
+
+pub def emptyAppleBundleCfg(): AppleBundleCfg = MkAppleBundleCfg {
+    abBundleId: None,
+    abBundleName: None,
+    abVersion: None,
+    abMinOs: None,
+    abFrameworks: Nil,
+    abWeakFrameworks: Nil,
+    abLsuiElement: false,
+    abIsExtension: false,
+    abPrincipalClass: None,
+    abInfoPlist: None,
+    abEntitlements: None,
+    abIcon: None,
+    abResources: Nil,
+    abProvisioningProfile: None,
+    abEmbedExtensions: Nil,
+    abCodesign: None,
 }
 
 def emptyTargetCfg(): TargetCfg = MkTargetCfg {
@@ -138,6 +184,10 @@ def emptyManifest(fallbackName: String): Manifest = MkManifest {
     mfOverrides: Nil,
     mfNative: emptyTargetCfg(),
     mfWasm: emptyTargetCfg(),
+    mfMacos: emptyTargetCfg(),
+    mfIos: emptyTargetCfg(),
+    mfMacosBundle: emptyAppleBundleCfg(),
+    mfIosBundle: emptyAppleBundleCfg(),
 }
 
 // ============================================================================
@@ -460,12 +510,49 @@ def definesToFlags(defs: List String): List String = match defs {
     Cons(d, r) -> Cons("-D" + d, definesToFlags(r)),
 }
 
+def frameworksToFlags(flag: String, fws: List String): List String = match fws {
+    Nil -> Nil,
+    Cons(fw, r) -> Cons(flag, Cons(fw, frameworksToFlags(flag, r))),
+}
+
+def parseAppleBundleCfgValue(vOpt: Option Value): Result AppleBundleCfg String = match vOpt {
+    None -> Ok(emptyAppleBundleCfg()),
+    Some(VObj(fs)) -> {
+        let fws = asStrList(lookupVal(fs, "frameworks"))?;
+        let wfws = asStrList(optFieldAlt(fs, "weak_frameworks", "weak-frameworks"))?;
+        let res = asStrList(lookupVal(fs, "resources"))?;
+        let exts = asStrList(optFieldAlt(fs, "embed_extensions", "embed-extensions"))?;
+        Ok(MkAppleBundleCfg {
+            abBundleId: asStrOpt(optFieldAlt(fs, "bundle_id", "bundle-id")),
+            abBundleName: asStrOpt(optFieldAlt(fs, "bundle_name", "bundle-name")),
+            abVersion: asStrOpt(lookupVal(fs, "version")),
+            abMinOs: asStrOpt(optFieldAlt(fs, "min_os", "min-os")),
+            abFrameworks: fws,
+            abWeakFrameworks: wfws,
+            abLsuiElement: asBoolOr(optFieldAlt(fs, "lsui_element", "lsui-element"), false),
+            abIsExtension: asBoolOr(optFieldAlt(fs, "is_extension", "is-extension"), false),
+            abPrincipalClass: asStrOpt(optFieldAlt(fs, "principal_class", "principal-class")),
+            abInfoPlist: asStrOpt(optFieldAlt(fs, "info_plist", "info-plist")),
+            abEntitlements: asStrOpt(lookupVal(fs, "entitlements")),
+            abIcon: asStrOpt(lookupVal(fs, "icon")),
+            abResources: res,
+            abProvisioningProfile: asStrOpt(optFieldAlt(fs, "provisioning_profile", "provisioning-profile")),
+            abEmbedExtensions: exts,
+            abCodesign: asStrOpt(lookupVal(fs, "codesign")),
+        })
+    },
+    Some(_) -> Err("expected '[target.<name>]' to be a TOML table"),
+}
+
 def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOpt {
     None -> Ok(emptyTargetCfg()),
     Some(VObj(fs)) -> {
         let cSrcs = cellNew(asStrList(optFieldAlt(fs, "c_sources", "c-sources"))?);
         let cFlgs = cellNew(asStrList(optFieldAlt(fs, "c_flags", "c-flags"))?);
-        let lFlgs = cellNew(asStrList(optFieldAlt(fs, "link_flags", "link-flags"))?);
+        let baseLFlgs = asStrList(optFieldAlt(fs, "link_flags", "link-flags"))?;
+        let fwFlgs = frameworksToFlags("-framework", asStrList(lookupVal(fs, "frameworks"))?);
+        let wfwFlgs = frameworksToFlags("-weak_framework", asStrList(optFieldAlt(fs, "weak_frameworks", "weak-frameworks"))?);
+        let lFlgs = cellNew(listAppend(baseLFlgs, listAppend(fwFlgs, wfwFlgs)));
         let extraUnits: Cell (List NativeUnit) = cellNew(Nil);
         let exps = asStrList(lookupVal(fs, "exports"))?;
         let webAs = asStrList(optFieldAlt(fs, "web_assets", "web-assets"))?;
@@ -657,13 +744,17 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
             let tests2 = asStrList(lookupVal(fs, "test"))?;
             let deps = parseDepTable(lookupVal(fs, "deps"))?;
             let overrides = parseDepTable(lookupVal(fs, "overrides"))?;
-            let (nativeCfg, wasmCfg) = match lookupVal(fs, "target") {
+            let (nativeCfg, wasmCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
                 Some(VObj(tfs)) -> {
                     let nc = parseTargetCfgValue(lookupVal(tfs, "native"))?;
                     let wc = parseTargetCfgValue(lookupVal(tfs, "wasm32"))?;
-                    (nc, wc)
+                    let mc = parseTargetCfgValue(lookupVal(tfs, "macos"))?;
+                    let ic = parseTargetCfgValue(lookupVal(tfs, "ios"))?;
+                    let mb = parseAppleBundleCfgValue(lookupVal(tfs, "macos"))?;
+                    let ib = parseAppleBundleCfgValue(lookupVal(tfs, "ios"))?;
+                    (nc, wc, mc, ic, mb, ib)
                 },
-                None -> (emptyTargetCfg(), emptyTargetCfg()),
+                None -> (emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyAppleBundleCfg(), emptyAppleBundleCfg()),
                 Some(_) -> returnManifestErr("expected '[target]' to be a TOML table")?,
             };
             Ok(MkManifest {
@@ -676,13 +767,17 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
                 mfOverrides: overrides,
                 mfNative: nativeCfg,
                 mfWasm: wasmCfg,
+                mfMacos: macosCfg,
+                mfIos: iosCfg,
+                mfMacosBundle: macosBundle,
+                mfIosBundle: iosBundle,
             })
         },
         _ -> Err("expected TOML root object"),
     }
 }
 
-def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg) String = Err(msg)
+def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
 
 pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
     let rootVal = tomlParse(raw)?;
@@ -1737,15 +1832,42 @@ def appendUniqueList(base: List String, extra: List String): List String = {
     cellGet(acc)
 }
 
-def mergeTargetConfigs(
+def resolveOptRel(baseDir: String, relOpt: Option String): Option String = match relOpt {
+    None -> None,
+    Some(r) -> Some(if (isAbsPath(r)) r else pathJoin(baseDir, r)),
+}
+
+def resolveAppleBundlePaths(baseDir: String, ab: AppleBundleCfg): AppleBundleCfg = MkAppleBundleCfg {
+    abBundleId: ab.abBundleId,
+    abBundleName: ab.abBundleName,
+    abVersion: ab.abVersion,
+    abMinOs: ab.abMinOs,
+    abFrameworks: ab.abFrameworks,
+    abWeakFrameworks: ab.abWeakFrameworks,
+    abLsuiElement: ab.abLsuiElement,
+    abIsExtension: ab.abIsExtension,
+    abPrincipalClass: ab.abPrincipalClass,
+    abInfoPlist: resolveOptRel(baseDir, ab.abInfoPlist),
+    abEntitlements: resolveOptRel(baseDir, ab.abEntitlements),
+    abIcon: resolveOptRel(baseDir, ab.abIcon),
+    abResources: resolveRelList(baseDir, ab.abResources),
+    abProvisioningProfile: resolveOptRel(baseDir, ab.abProvisioningProfile),
+    abEmbedExtensions: resolveRelList(baseDir, ab.abEmbedExtensions),
+    abCodesign: ab.abCodesign,
+}
+
+def mergeTargetConfigsFor(
     projectDir: String,
     rootMf: Manifest,
     resolvedPkgs: List ResolvedPkg,
-    isWasm: Bool,
+    target: String,
     cliExports: List String,
     cliNoMain: Bool,
     cliBootSym: Option String
 ): TargetCfg = {
+    let isWasm = target == "wasm32";
+    let isMacApp = target == "macos-app";
+    let isIos = target == "ios" || target == "ios-sim" || target == "ios-app" || target == "ios-sim-app";
     let cSrcs = cellNew(Nil);
     let cFlgs = cellNew(Nil);
     let lFlgs = cellNew(Nil);
@@ -1788,16 +1910,28 @@ def mergeTargetConfigs(
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(rp, r) -> {
-                let tc = if (isWasm) rp.rpManifest.mfWasm else rp.rpManifest.mfNative;
-                applyOne(rp.rpRootDir, tc);
+                if (isWasm) {
+                    applyOne(rp.rpRootDir, rp.rpManifest.mfWasm)
+                } else if (isIos) {
+                    applyOne(rp.rpRootDir, rp.rpManifest.mfIos)
+                } else {
+                    applyOne(rp.rpRootDir, rp.rpManifest.mfNative);
+                    if (isMacApp) applyOne(rp.rpRootDir, rp.rpManifest.mfMacos) else ()
+                };
                 cellSet(cur, r)
             },
             Nil -> (),
         }
     };
 
-    let rootTc = if (isWasm) rootMf.mfWasm else rootMf.mfNative;
-    applyOne(projectDir, rootTc);
+    if (isWasm) {
+        applyOne(projectDir, rootMf.mfWasm)
+    } else if (isIos) {
+        applyOne(projectDir, rootMf.mfIos)
+    } else {
+        applyOne(projectDir, rootMf.mfNative);
+        if (isMacApp) applyOne(projectDir, rootMf.mfMacos) else ()
+    };
     cellSet(exps, appendUniqueList(cellGet(exps), cliExports));
 
     MkTargetCfg {
@@ -1811,6 +1945,17 @@ def mergeTargetConfigs(
         tcBootSymbol: cellGet(bootS),
     }
 }
+
+def mergeTargetConfigs(
+    projectDir: String,
+    rootMf: Manifest,
+    resolvedPkgs: List ResolvedPkg,
+    isWasm: Bool,
+    cliExports: List String,
+    cliNoMain: Bool,
+    cliBootSym: Option String
+): TargetCfg =
+    mergeTargetConfigsFor(projectDir, rootMf, resolvedPkgs, if (isWasm) "wasm32" else "native", cliExports, cliNoMain, cliBootSym)
 
 pub def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
     let out = cellNew(Nil);
@@ -2202,7 +2347,9 @@ pub def cmdBuildProject(
     let (rootMf, rootSpec, resolvedPkgs) = resolveProjectGraph(projectDir, false, None, true)?;
     let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
     let isWasm = target == "wasm32";
-    let mergedTc = mergeTargetConfigs(projectDir, rootMf, resolvedPkgs, isWasm, cliExports, cliNoMain, cliBootSym);
+    let isAppleBundle = target == "macos-app" || target == "ios-app" || target == "ios-sim-app";
+    let isIosLib = target == "ios" || target == "ios-sim";
+    let mergedTc = mergeTargetConfigsFor(projectDir, rootMf, resolvedPkgs, target, cliExports, cliNoMain, cliBootSym);
     let entryFile = match entryOverrideOpt {
         Some(ef) -> ef,
         None -> resolveDefaultEntryFile(projectDir, rootMf)?,
@@ -2222,6 +2369,23 @@ pub def cmdBuildProject(
         cbs.cbCompileWasm(entryFile, rootSpec, extSpecs, mergedTc, compileOnly, Some(outWasm), dumpCoreOpt, rtOverrideOpt)?;
         let _ = if (!compileOnly) copyWebAssetsRec(mergedTc.tcWebAssets, pathDirname(outWasm))? else ();
         Ok(outWasm)
+    } else if (isAppleBundle) {
+        let rawAb = if (target == "macos-app") rootMf.mfMacosBundle else rootMf.mfIosBundle;
+        let ab = resolveAppleBundlePaths(projectDir, rawAb);
+        let defaultOut = match outPathOpt {
+            Some(p) -> Some(p),
+            None -> Some(buildDir),
+        };
+        cbs.cbCompileAppleBundle(
+            target, entryFile, rootSpec, extSpecs, mergedTc, ab,
+            rootMf.mfName, rootMf.mfVersion, defaultOut, dumpCoreOpt, rtOverrideOpt
+        )
+    } else if (isIosLib) {
+        let defaultArc = pathJoin(buildDir, "lib" + rootMf.mfName + (if (target == "ios") "_ios.a" else "_iossim.a"));
+        let outArc = match outPathOpt { Some(p) -> p, None -> defaultArc };
+        ensureParentDirExists(outArc)?;
+        cbs.cbCompileTargetArchive(target, entryFile, rootSpec, extSpecs, mergedTc, outArc, dumpCoreOpt, rtOverrideOpt)?;
+        Ok(outArc)
     } else if (compileOnly) {
         let defaultObj = pathJoin(buildDir, rootMf.mfName + ".o");
         let outObj = match outPathOpt { Some(p) -> p, None -> defaultObj };

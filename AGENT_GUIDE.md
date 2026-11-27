@@ -17,7 +17,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha eval '<code>' [args...]` — evaluate an inline Geisha snippet (cached)
    - **Script mode**: standalone entry files support Unix shebang (`#!/usr/bin/env -S geisha run`) and top-level statements (`let` / expressions) without needing an explicit `def main()`
    - `geisha test`
-   - `geisha build [--target native|wasm32|ios|ios-sim] [-o out]`
+   - `geisha build [--target native|wasm32|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-o out]`
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
 
 ---
@@ -119,7 +119,12 @@ pub def printShow(x: a): Void = ... // or with explicit scheme:
 
 ### Concurrency & FFI
 - `Send` concept is checked statically by the compiler for closures/values crossing thread boundaries (`std.task`, `std.actor`, `std.sync`).
-- `extern "c_symbol" def c_fn(x: Int): Ptr` binds C ABI functions; `ForeignPtr` auto-borrows as `ScopedPtr` at `extern` boundaries with compiler keep-alive.
+- `extern "c_symbol" def c_fn(x: Int): Ptr` binds C ABI functions (multiple typed declarations may alias the same symbol such as `"objc_msgSend"`); `extern ptr def call_fp(fp: Ptr, ...): Ret` invokes a typed C function pointer indirectly; `ForeignPtr` auto-borrows as `ScopedPtr` at `extern` boundaries with compiler keep-alive.
+- **Pure C ABI Exports, Callbacks, Structs & Static Constructors**:
+  - `@export` / `@export("c_sym")` on a monomorphic top-level `def` emits a pure C ABI symbol (no trailing `%fvs` closure param, wrapped in `gc_host_enter`/`gc_host_leave`).
+  - `cFnPtr(fn)` returns a C function pointer (`Ptr`) for a top-level Geisha function (synthesizing a thread-safe C callback trampoline) or an `extern` function (e.g. `cFnPtr(c_free)`).
+  - `@cstruct` on a single-constructor non-recursive `data` type enforces C ABI value-struct layout & calling convention (ARM64 HFA / SysV AMD64 / `sret` / `byval`, e.g. `CGPoint`, `CGRect`).
+  - `@ctor` / `@ctor(priority)` on a `() -> Void` top-level `def` registers a static constructor (`@llvm.global_ctors`), e.g. for registering Objective-C subclasses before `main`/`NSExtensionMain`.
 
 ---
 
@@ -157,6 +162,8 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `sys.proc` — process exit and shell execution (`exit`, `shell`)
 - `sys.time` — monotonic/wall clock and sleep
 - `sys.net` — TCP/UDP networking sockets
+- `sys.ffi` — dynamic library loading (`dlOpen`, `dlOpenSelf`, `dlSym`, `dlClose`, `ptrToStrOpt`)
+- `sys.objc` — native Objective-C Runtime & Apple Blocks ABI (`Id a`, `objcClass`, `objcSel`, `withAutoreleasePool`, `nsString`, `fromNSString`, `objcAllocateClass`, `objcAddMethod`, `objcRegisterClass`, `objcSetAssocHandle`, `objcBlock0`/`objcBlock1Ptr`/`objcBlock2Ptr`/`objcBlock1Bool`/`objcBlockCustom`, typed `msgSend*`)
 
 ---
 
@@ -189,5 +196,23 @@ defines   = ["USE_CUDA=1"]
 [target.wasm32]
 exports    = ["app_init", "app_step"]
 web_assets = ["host/web/runtime.js"]
+
+# Native Apple `.app` / `.appex` bundle targets (`macos-app`, `ios-app`, `ios-sim-app`)
+[target.macos]
+bundle_id    = "com.example.myapp"
+bundle_name  = "MyApp"
+min_os       = "14.0"
+frameworks   = ["Cocoa", "QuartzCore"]
+lsui_element = false
+codesign     = "-"
+
+[target.ios]
+bundle_id       = "com.example.myapp"
+bundle_name     = "MyApp"
+min_os          = "16.0"
+frameworks      = ["UIKit", "Foundation", "QuartzCore"]
+is_extension    = false          # true => builds `.appex` with `-fapplication-extension -e _NSExtensionMain`
+principal_class = "MyViewCtrl"   # used when `is_extension = true`
+codesign        = "-"
 ```
 - Local overrides without touching `geisha.toml` or `geisha.lock`: put `[overrides]` in an untracked `geisha.local.toml`.

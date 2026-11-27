@@ -30,6 +30,7 @@ use ast.{
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct,
     Def, MkDef
 }
 use parser.parseTypeSchemeFromStr
@@ -50,6 +51,7 @@ pub data AdtInfo {
         adtName: String,
         typeParams: List String,
         variants: List VariantInfo,
+        isCStruct: Bool,
     },
 }
 
@@ -990,6 +992,7 @@ def initInferCtx(): InferCtx = {
             MkVariantInfo { vname: "Nil", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: nilScm },
             MkVariantInfo { vname: "Cons", tag: 1, fieldNames: None, fieldTypes: [tvA, listTy], ctorScm: consScm },
         ],
+        isCStruct: false,
     });
     vecPush(ctx.adtNames, "List");
     strMapInsert(ctx.ctorToAdt, "Nil", "List");
@@ -1005,6 +1008,7 @@ def initInferCtx(): InferCtx = {
         variants: [
             MkVariantInfo { vname: "Unit", tag: 0, fieldNames: None, fieldTypes: Nil, ctorScm: mkUnitScm },
         ],
+        isCStruct: false,
     });
     vecPush(ctx.adtNames, "Unit");
     strMapInsert(ctx.ctorToAdt, "Unit", "Unit");
@@ -1017,6 +1021,7 @@ def initInferCtx(): InferCtx = {
         variants: [
             MkVariantInfo { vname: "Named", tag: 0, fieldNames: None, fieldTypes: [TyCon("String"), tvA], ctorScm: mkNamedScm },
         ],
+        isCStruct: false,
     });
     vecPush(ctx.adtNames, "Named");
     strMapInsert(ctx.ctorToAdt, "Named", "Named");
@@ -1029,6 +1034,7 @@ def initInferCtx(): InferCtx = {
         variants: [
             MkVariantInfo { vname: "Prod", tag: 0, fieldNames: None, fieldTypes: [tvA, tvB], ctorScm: mkProdScm },
         ],
+        isCStruct: false,
     });
     vecPush(ctx.adtNames, "Prod");
     strMapInsert(ctx.ctorToAdt, "Prod", "Prod");
@@ -1043,6 +1049,7 @@ def initInferCtx(): InferCtx = {
             MkVariantInfo { vname: "InL", tag: 0, fieldNames: None, fieldTypes: [tvA], ctorScm: inLScm },
             MkVariantInfo { vname: "InR", tag: 1, fieldNames: None, fieldTypes: [tvB], ctorScm: inRScm },
         ],
+        isCStruct: false,
     });
     vecPush(ctx.adtNames, "Sum");
     strMapInsert(ctx.ctorToAdt, "InL", "Sum");
@@ -1223,6 +1230,7 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("ptrToString", "Ptr -> String"),
         ("foreignPtrAlloc", "Int64 -> ForeignPtr"),
         ("foreignPtrNew", "(Ptr, Ptr, Int64) -> ForeignPtr"),
+        ("cFnPtr", "forall a. a -> Ptr"),
         ("withForeignPtr", "forall r. (ForeignPtr, ScopedPtr -> r) -> r"),
         ("withAlloca", "forall r. (Int, ScopedPtr -> r) -> r"),
         ("withArena", "forall r. (Arena -> r) -> r"),
@@ -2243,6 +2251,21 @@ def inferPatternInner(
 
 def returnPatErr(sp: Span, msg: String): Result Void String = Err(typeErr(sp, msg))
 
+def checkCFnPtrCall(ctx: InferCtx, sp: Span, iargs: List Form): Result Void String =
+    match iargs {
+        Cons(argF, Nil) -> match argF.node {
+            ExVar(_) -> {
+                let zArg = zonkType(ctx.subst, schemeBody(argF.ty));
+                match zArg {
+                    TyArr(_, _, _) -> Ok(()),
+                    _ -> Err(typeErr(argF.pos, "cFnPtr expects a top-level or extern function, got '" + typeToString(zArg) + "'")),
+                }
+            },
+            _ -> Err(typeErr(argF.pos, "cFnPtr requires a direct top-level or extern function reference (closures are not allowed)")),
+        },
+        _ -> Err(typeErr(sp, "cFnPtr expects exactly 1 function argument")),
+    }
+
 pub def findVariantByName(vs: List VariantInfo, cname: String): Option VariantInfo = match vs {
     Nil -> None,
     Cons(v, r) -> if (v.vname == cname) Some(v) else findVariantByName(r, cname),
@@ -2738,6 +2761,10 @@ def inferForm(ctx: InferCtx, env: TypeEnv, f: Form): Result Form String = {
                 _ -> unifyTypes(ctx.subst, schemeBody(ic.ty), TyArr(callMode, unifyArgTys, retVar), sp)?,
             };
             let resZ = zonkType(ctx.subst, retVar);
+            let _ = match ic.node {
+                ExVar(fnNm) if (fnNm == "cFnPtr") -> checkCFnPtrCall(ctx, sp, cellGet(iargs)),
+                _ -> Ok(()),
+            }?;
             match ic.node {
                 ExVar(fnNm) -> {
                     if (fnNm == "withForeignPtr" || fnNm == "withAlloca" || fnNm == "withArena") {
@@ -4070,11 +4097,26 @@ def inferPass2Adts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Re
                             },
                             None -> (),
                         };
+                        let isCS = hasAttrCStruct(d.attrs);
+                        if (isCS) {
+                            match userTparams {
+                                Cons(_, _) -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' cannot have type parameters")?,
+                                Nil -> (),
+                            };
+                            match cellGet(vinfos) {
+                                Cons(vi0, Nil) -> match vi0.fieldTypes {
+                                    Nil -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' must have at least one field")?,
+                                    _ -> (),
+                                },
+                                _ -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' must have exactly one constructor")?,
+                            }
+                        } else ();
                         if (!strMapContains(ctx.adtReg, d.ident)) vecPush(ctx.adtNames, d.ident) else ();
                         strMapInsert(ctx.adtReg, d.ident, MkAdtInfo {
                             adtName: d.ident,
                             typeParams: tparams,
                             variants: cellGet(vinfos),
+                            isCStruct: isCS,
                         })
                     },
                     _ -> (),
@@ -4084,6 +4126,7 @@ def inferPass2Adts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Re
             Nil -> (),
         }
     };
+    validateAllCStructs(ctx, rawDefs)?;
 
     // Seed built-in concept methods into `baseMap`
     let builtinConcepts = [
@@ -4615,6 +4658,7 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
                                                     ident: mangledFn,
                                                     dpos: d.dpos,
                                                     vis: VisPublic,
+                                                    attrs: Nil,
                                                     item: ItForm(bform),
                                                 }]))
                                             },
@@ -5020,11 +5064,90 @@ def eraseFormModes(modeAdtSet: StrMap Bool, f: Form): Form = {
     MkForm { pos: f.pos, ty: nty, annot: nann, node: nnode }
 }
 
+def hasAttrCStruct(attrs: List DefAttr): Bool = match attrs {
+    Nil -> false,
+    Cons(AttrCStruct, _) -> true,
+    Cons(_, r) -> hasAttrCStruct(r),
+}
+
+def hasAttrExport(attrs: List DefAttr): Bool = match attrs {
+    Nil -> false,
+    Cons(AttrExport(_), _) -> true,
+    Cons(_, r) -> hasAttrExport(r),
+}
+
+def hasAttrCtor(attrs: List DefAttr): Bool = match attrs {
+    Nil -> false,
+    Cons(AttrCtor(_), _) -> true,
+    Cons(_, r) -> hasAttrCtor(r),
+}
+
+def checkCStructFieldType(ctx: InferCtx, ty: Type, visiting: List String, sp: Span, ownerName: String): Result Void String =
+    match ty {
+        TyCon(n) ->
+            if (n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Char" || n == "Bool" || n == "Ptr" || n == "ScopedPtr") Ok(())
+            else if (listContainsStr(visiting, n)) {
+                Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' cannot be recursive through '" + n + "'"))
+            } else match strMapGet(ctx.adtReg, n) {
+                Some(ai) if (ai.isCStruct) -> match ai.variants {
+                    Cons(vi, Nil) -> checkCStructFieldList(ctx, vi.fieldTypes, Cons(n, visiting), sp, ownerName),
+                    _ -> Ok(()),
+                },
+                _ -> Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' field type '" + n + "' is not a C ABI scalar, Ptr, or @cstruct")),
+            },
+        _ -> Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' field type '" + typeToString(ty) + "' is not a valid C ABI type")),
+    }
+
+def checkCStructFieldList(ctx: InferCtx, ts: List Type, visiting: List String, sp: Span, ownerName: String): Result Void String =
+    match ts {
+        Nil -> Ok(()),
+        Cons(h, t) -> {
+            checkCStructFieldType(ctx, h, visiting, sp, ownerName)?;
+            checkCStructFieldList(ctx, t, visiting, sp, ownerName)
+        },
+    }
+
+def validateAllCStructs(ctx: InferCtx, defs: List Def): Result Void String = {
+    let cur = cellNew(defs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItAlg(_, _) ->
+                        if (hasAttrCStruct(d.attrs)) {
+                            match strMapGet(ctx.adtReg, d.ident) {
+                                Some(ai) -> match ai.variants {
+                                    Cons(vi, Nil) -> checkCStructFieldList(ctx, vi.fieldTypes, [d.ident], d.dpos, d.ident)?,
+                                    _ -> (),
+                                },
+                                None -> (),
+                            }
+                        } else (),
+                    _ ->
+                        if (hasAttrCStruct(d.attrs)) {
+                            returnPatErr(d.dpos, "@cstruct attribute is only valid on 'data' declarations")?
+                        } else (),
+                };
+                match d.item {
+                    ItForm(_) -> (),
+                    _ -> {
+                        if (hasAttrExport(d.attrs)) returnPatErr(d.dpos, "@export attribute is only valid on top-level 'def' functions")? else ();
+                        if (hasAttrCtor(d.attrs)) returnPatErr(d.dpos, "@ctor attribute is only valid on top-level 'def' functions")? else ()
+                    },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    Ok(())
+}
+
 def eraseInferOutput(ctx: InferCtx, rawOutDefs: List Def): InferOutput = {
     let mset = ctx.modeAdtSet;
     let edefs = fmap((d: Def) -> match d.item {
-        ItForm(f) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItForm(eraseFormModes(mset, f)) },
-        ItExtern(lnk, scm, noAlloc) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, item: ItExtern(lnk, eraseSchemeModes(mset, scm), noAlloc) },
+        ItForm(f) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: ItForm(eraseFormModes(mset, f)) },
+        ItExtern(lnk, scm, noAlloc, isFnPtr) -> MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: ItExtern(lnk, eraseSchemeModes(mset, scm), noAlloc, isFnPtr) },
         _ -> d,
     }, rawOutDefs);
 
@@ -5045,6 +5168,7 @@ def eraseInferOutput(ctx: InferCtx, rawOutDefs: List Def): InferOutput = {
                     adtName: ai.adtName,
                     typeParams: filterNonModeStrings(ai.typeParams),
                     variants: evs,
+                    isCStruct: ai.isCStruct,
                 })
             },
             None -> (),
@@ -5207,9 +5331,15 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                             },
                         }
                     },
-                    ItExtern(_, scm, _) -> {
+                    ItExtern(_, scm, _, isFnPtr) -> {
                         let expScm = expandPolyScheme(ctx, scm, d.dpos)?;
                         checkSchemeKinds(ctx, expScm, d.dpos)?;
+                        if (isFnPtr) {
+                            match schemeBody(expScm) {
+                                TyArr(_, Cons(TyCon("Ptr"), _), _) -> (),
+                                _ -> returnPatErr(d.dpos, "'extern ptr' declaration '" + d.ident + "' must take 'Ptr' as its first parameter")?,
+                            }
+                        } else ();
                         strMapInsert(ctx.externSet, d.ident, true);
                         strMapInsert(baseMap, d.ident, expScm)
                     },
@@ -5370,6 +5500,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                             ident: d.ident,
                             dpos: d.dpos,
                             vis: d.vis,
+                            attrs: d.attrs,
                             item: ItForm(finalForm),
                         }, cellGet(inferredRev)))
                     },
@@ -5394,10 +5525,30 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                     ItForm(f) -> {
                         let zf = zonkForm(ctx.subst, f);
                         checkExhaustivenessInForm(ctx, zf)?;
+                        if (hasAttrExport(d.attrs) || hasAttrCtor(d.attrs)) {
+                            let bodyTy = schemeBody(zf.ty);
+                            let nonModeTps = filterNonModeStrings(schemeTypeParams(zf.ty));
+                            match nonModeTps {
+                                Cons(_, _) -> returnPatErr(d.dpos, "@export/@ctor function '" + d.ident + "' must be monomorphic (no type parameters)")?,
+                                Nil -> (),
+                            };
+                            match bodyTy {
+                                TyArr(_, ps, rt) ->
+                                    if (hasAttrCtor(d.attrs)) {
+                                        let retIsVoid = match rt { TyVoid -> true, TyCon("Void") -> true, _ -> false };
+                                        match ps {
+                                            Nil if (retIsVoid) -> (),
+                                            _ -> returnPatErr(d.dpos, "@ctor function '" + d.ident + "' must have signature () -> Void")?,
+                                        }
+                                    } else (),
+                                _ -> returnPatErr(d.dpos, "@export/@ctor attribute on '" + d.ident + "' requires a function definition")?,
+                            }
+                        } else ();
                         cellSet(finalRev, Cons(MkDef {
                             ident: d.ident,
                             dpos: d.dpos,
                             vis: d.vis,
+                            attrs: d.attrs,
                             item: ItForm(zf),
                         }, cellGet(finalRev)))
                     },

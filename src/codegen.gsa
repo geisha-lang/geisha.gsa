@@ -204,7 +204,7 @@ def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (Li
                                             else {
                                                 let nextVis = Cons(key, visiting);
                                                 let (sz, _) = structSizeAndAlignRec(concreteFields, cellGet(gActivePtrSize), nextVis, depth + 1);
-                                                if (sz > 0 && sz <= 64) Some(concreteFields) else None
+                                                if (ainfo.isCStruct || (sz > 0 && sz <= 64)) Some(concreteFields) else None
                                             }
                                         },
                                     },
@@ -559,14 +559,409 @@ data ModEmitCtx {
         mcSynthFns: StringBuf,
         mcSynthSet: StrMap Bool,
         mcGlobalSlots: StrMap VarSlot,
+        mcFns: StrMap FunDef,
         mcExterns: StrMap ExternDef,
+        mcMultiExternLinks: StrMap Bool,
         mcAdtReg: StrMap AdtInfo,
         mcEscape: EscapeInfo,
         mcIsWasm: Bool,
+        mcTargetArch: String,
         mcPtrSize: Int,
         mcWasmExports: StrMap Bool,
         mcHasExplicitExports: Bool,
     },
+}
+
+// ============================================================================
+// C ABI Lowering for `@cstruct`, Pure `@export`, `@ctor`, & `cFnPtr`
+// ============================================================================
+
+data CAbiParamMode {
+    CAbiDirect(String),
+    CAbiPair(String, String),
+    CAbiIndirectPtr(String, Int, Bool),
+}
+
+data CAbiRetMode {
+    CAbiRetVoid,
+    CAbiRetDirect(String),
+    CAbiRetSret(String, Int),
+}
+
+def isCStructType(ty: Type): Bool = match ty {
+    TyCon(n) -> match strMapGet(cellGet(gActiveAdtReg), n) {
+        Some(ai) -> ai.isCStruct,
+        None -> false,
+    },
+    _ -> false,
+}
+
+def flattenCStructLeavesRec(ty: Type, baseOff: Int, ptrSize: Int, acc: Cell (List (Int, Int, String))): Void =
+    match ty {
+        TyCon(n) ->
+            if (n == "Float") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, 8, "f64")))
+            } else if (n == "Float32") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, 4, "f32")))
+            } else if (n == "Int") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, 4, "int")))
+            } else if (n == "Int64") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, 8, "int")))
+            } else if (n == "Char" || n == "Bool") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, 1, "int")))
+            } else if (n == "Ptr" || n == "ScopedPtr") {
+                cellSet(acc, consLeaf(cellGet(acc), (baseOff, ptrSize, "int")))
+            } else match unboxedAdtFields(ty) {
+                Some(fs) -> {
+                    let off = cellNew(baseOff);
+                    let cur = cellNew(fs);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(ft, r) -> {
+                                let (fsz, fal) = typeSizeAndAlignFor(ft, ptrSize);
+                                let aligned = alignUp(cellGet(off), fal);
+                                flattenCStructLeavesRec(ft, aligned, ptrSize, acc);
+                                cellSet(off, aligned + fsz);
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    }
+                },
+                None -> cellSet(acc, consLeaf(cellGet(acc), (baseOff, ptrSize, "int"))),
+            },
+        _ -> cellSet(acc, consLeaf(cellGet(acc), (baseOff, ptrSize, "int"))),
+    }
+
+def consLeaf(xs: List (Int, Int, String), item: (Int, Int, String)): List (Int, Int, String) =
+    Cons(item, xs)
+
+def classifyHfaKind(leaves: List (Int, Int, String)): Option (String, Int) = {
+    let n = listLen(leaves);
+    if (n < 1 || n > 4) None
+    else {
+        let allF64 = cellNew(true);
+        let allF32 = cellNew(true);
+        let cur = cellNew(leaves);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, _, k), r) -> {
+                    if (k != "f64") cellSet(allF64, false) else ();
+                    if (k != "f32") cellSet(allF32, false) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(allF64)) Some(("double", n))
+        else if (cellGet(allF32)) Some(("float", n))
+        else None
+    }
+}
+
+def classifyX64Eightbyte(leaves: List (Int, Int, String), ebStart: Int, totalSz: Int): String = {
+    let ebEnd = ebStart + 8;
+    let hasInt = cellNew(false);
+    let hasF64 = cellNew(false);
+    let f32Cnt = cellNew(0);
+    let cur = cellNew(leaves);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((off, fsz, k), r) -> {
+                if (off < ebEnd && off + fsz > ebStart) {
+                    if (k == "int") cellSet(hasInt, true)
+                    else if (k == "f64") cellSet(hasF64, true)
+                    else cellSet(f32Cnt, cellGet(f32Cnt) + 1)
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let ebBytes = if (totalSz - ebStart < 8) totalSz - ebStart else 8;
+    if (cellGet(hasInt)) {
+        if (ebBytes <= 1) "i8"
+        else if (ebBytes <= 2) "i16"
+        else if (ebBytes <= 4) "i32"
+        else "i64"
+    } else if (cellGet(hasF64)) {
+        "double"
+    } else if (cellGet(f32Cnt) >= 2 || ebBytes > 4) {
+        "<2 x float>"
+    } else {
+        "float"
+    }
+}
+
+def classifyCAbiParam(arch: String, ptrSize: Int, ty: Type): CAbiParamMode =
+    if (!isCStructType(ty)) CAbiDirect(getValLlvmType(ty))
+    else {
+        let sLlvm = getValLlvmType(ty);
+        let (sz, aln) = typeSizeAndAlignFor(ty, ptrSize);
+        let leavesRev = cellNew(Nil);
+        flattenCStructLeavesRec(ty, 0, ptrSize, leavesRev);
+        let leaves = listRev(cellGet(leavesRev));
+        if (arch == "arm64") {
+            match classifyHfaKind(leaves) {
+                Some((elemTy, n)) -> CAbiDirect("[" + intToStr(n) + " x " + elemTy + "]"),
+                None ->
+                    if (sz <= 1) CAbiDirect("i8")
+                    else if (sz <= 2) CAbiDirect("i16")
+                    else if (sz <= 4) CAbiDirect("i32")
+                    else if (sz <= 8) CAbiDirect("i64")
+                    else if (sz <= 16) CAbiDirect("[2 x i64]")
+                    else CAbiIndirectPtr(sLlvm, aln, false),
+            }
+        } else if (arch == "x86_64") {
+            if (sz > 16) CAbiIndirectPtr(sLlvm, aln, true)
+            else if (sz <= 8) CAbiDirect(classifyX64Eightbyte(leaves, 0, sz))
+            else {
+                let eb0 = classifyX64Eightbyte(leaves, 0, sz);
+                let eb1 = classifyX64Eightbyte(leaves, 8, sz);
+                CAbiPair(eb0, eb1)
+            }
+        } else {
+            CAbiIndirectPtr(sLlvm, aln, false)
+        }
+    }
+
+def classifyCAbiRet(arch: String, ptrSize: Int, ty: Type): CAbiRetMode =
+    if (isVoidGeishaType(ty)) CAbiRetVoid
+    else if (!isCStructType(ty)) CAbiRetDirect(getValLlvmType(ty))
+    else {
+        let sLlvm = getValLlvmType(ty);
+        let (sz, aln) = typeSizeAndAlignFor(ty, ptrSize);
+        let leavesRev = cellNew(Nil);
+        flattenCStructLeavesRec(ty, 0, ptrSize, leavesRev);
+        let leaves = listRev(cellGet(leavesRev));
+        if (arch == "arm64") {
+            match classifyHfaKind(leaves) {
+                Some((elemTy, n)) -> CAbiRetDirect("[" + intToStr(n) + " x " + elemTy + "]"),
+                None ->
+                    if (sz <= 1) CAbiRetDirect("i8")
+                    else if (sz <= 2) CAbiRetDirect("i16")
+                    else if (sz <= 4) CAbiRetDirect("i32")
+                    else if (sz <= 8) CAbiRetDirect("i64")
+                    else if (sz <= 16) CAbiRetDirect("[2 x i64]")
+                    else CAbiRetSret(sLlvm, aln),
+            }
+        } else if (arch == "x86_64") {
+            if (sz > 16) CAbiRetSret(sLlvm, aln)
+            else if (sz <= 8) CAbiRetDirect(classifyX64Eightbyte(leaves, 0, sz))
+            else {
+                let eb0 = classifyX64Eightbyte(leaves, 0, sz);
+                let eb1 = classifyX64Eightbyte(leaves, 8, sz);
+                CAbiRetDirect("{ " + eb0 + ", " + eb1 + " }")
+            }
+        } else {
+            CAbiRetSret(sLlvm, aln)
+        }
+    }
+
+def cAbiDeclParamStrings(arch: String, ptrSize: Int, paramTys: List Type, retTy: Type): (String, List String) = {
+    let partsRev = cellNew(Nil);
+    let retMode = classifyCAbiRet(arch, ptrSize, retTy);
+    let retStr = match retMode {
+        CAbiRetVoid -> "void",
+        CAbiRetDirect(rt) -> rt,
+        CAbiRetSret(sTy, aln) -> {
+            cellSet(partsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln), cellGet(partsRev)));
+            "void"
+        },
+    };
+    let cur = cellNew(paramTys);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(pt, r) -> {
+                match classifyCAbiParam(arch, ptrSize, pt) {
+                    CAbiDirect(lt) -> cellSet(partsRev, Cons(lt, cellGet(partsRev))),
+                    CAbiPair(t0, t1) -> {
+                        cellSet(partsRev, Cons(t0, cellGet(partsRev)));
+                        cellSet(partsRev, Cons(t1, cellGet(partsRev)))
+                    },
+                    CAbiIndirectPtr(sTy, aln, useByval) ->
+                        if (useByval) cellSet(partsRev, Cons("ptr byval(" + sTy + ") align " + intToStr(aln), cellGet(partsRev)))
+                        else cellSet(partsRev, Cons("ptr", cellGet(partsRev))),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (retStr, listRev(cellGet(partsRev)))
+}
+
+def emitMarshalStructToDirect(fctx: FnEmitCtx, geishaTy: Type, rawVal: String, cTy: String): String = {
+    let sTy = getValLlvmType(geishaTy);
+    if (sTy == cTy) rawVal
+    else {
+        let buf = emitEntryAlloca(fctx, "[4 x i64]");
+        emitLine(fctx, "store [4 x i64] zeroinitializer, ptr " + buf + ", align 8");
+        emitLine(fctx, "store " + sTy + " " + rawVal + ", ptr " + buf + ", align 8");
+        emitAssign(fctx, "load " + cTy + ", ptr " + buf + ", align 8")
+    }
+}
+
+def emitUnmarshalDirectToStruct(fctx: FnEmitCtx, geishaTy: Type, cVal: String, cTy: String): String = {
+    let sTy = getValLlvmType(geishaTy);
+    if (sTy == cTy) cVal
+    else {
+        let buf = emitEntryAlloca(fctx, "[4 x i64]");
+        emitLine(fctx, "store [4 x i64] zeroinitializer, ptr " + buf + ", align 8");
+        emitLine(fctx, "store " + cTy + " " + cVal + ", ptr " + buf + ", align 8");
+        emitAssign(fctx, "load " + sTy + ", ptr " + buf + ", align 8")
+    }
+}
+
+def emitMarshalStructToPair(fctx: FnEmitCtx, geishaTy: Type, rawVal: String, t0: String, t1: String): (String, String) = {
+    let sTy = getValLlvmType(geishaTy);
+    let buf = emitEntryAlloca(fctx, "[2 x i64]");
+    emitLine(fctx, "store [2 x i64] zeroinitializer, ptr " + buf + ", align 8");
+    emitLine(fctx, "store " + sTy + " " + rawVal + ", ptr " + buf + ", align 8");
+    let v0 = emitAssign(fctx, "load " + t0 + ", ptr " + buf + ", align 8");
+    let p1 = emitAssign(fctx, "getelementptr inbounds i8, ptr " + buf + ", i64 8");
+    let v1 = emitAssign(fctx, "load " + t1 + ", ptr " + p1 + ", align 8");
+    (v0, v1)
+}
+
+def emitUnmarshalPairToStruct(fctx: FnEmitCtx, geishaTy: Type, v0: String, t0: String, v1: String, t1: String): String = {
+    let sTy = getValLlvmType(geishaTy);
+    let buf = emitEntryAlloca(fctx, "[2 x i64]");
+    emitLine(fctx, "store [2 x i64] zeroinitializer, ptr " + buf + ", align 8");
+    emitLine(fctx, "store " + t0 + " " + v0 + ", ptr " + buf + ", align 8");
+    let p1 = emitAssign(fctx, "getelementptr inbounds i8, ptr " + buf + ", i64 8");
+    emitLine(fctx, "store " + t1 + " " + v1 + ", ptr " + p1 + ", align 8");
+    emitAssign(fctx, "load " + sTy + ", ptr " + buf + ", align 8")
+}
+
+def emitCAbiTrampoline(
+    out: StringBuf,
+    mctx: ModEmitCtx,
+    fd: FunDef,
+    cSymName: String,
+    isExternal: Bool
+): Void = {
+    let fctx = newFnEmitCtx(cSymName);
+    let funTy = schemeBody(fd.fnScm);
+    let retGeishaTy = match funTy {
+        TyArr(_, _, r) -> r,
+        _ -> TyVoid,
+    };
+    let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcPtrSize, retGeishaTy);
+    let sigPartsRev = cellNew(Nil);
+    let sretRegOpt = match retMode {
+        CAbiRetSret(sTy, aln) -> {
+            cellSet(sigPartsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln) + " %__sret", cellGet(sigPartsRev)));
+            Some("%__sret")
+        },
+        _ -> None,
+    };
+    let retLlvm = match retMode {
+        CAbiRetVoid -> "void",
+        CAbiRetDirect(rt) -> rt,
+        CAbiRetSret(_, _) -> "void",
+    };
+
+    if (!mctx.mcIsWasm) {
+        let anchor = emitEntryAlloca(fctx, "i64");
+        emitLine(fctx, "store i64 0, ptr " + anchor + ", align 8");
+        let _ = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
+        ()
+    } else ();
+    let tokReg = if (!mctx.mcIsWasm) "%r" + intToStr(cellGet(fctx.fcRegCnt)) else "0";
+
+    let gsArgTysRev = cellNew(Nil);
+    let gsArgValsRev = cellNew(Nil);
+    let pIdx = cellNew(0);
+    let cp = cellNew(fd.fnParams);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(vd, r) -> {
+                let i = cellGet(pIdx);
+                let pTy = schemeBody(vd.vscm);
+                let gsTy = getValLlvmType(pTy);
+                let gsVal = match classifyCAbiParam(mctx.mcTargetArch, mctx.mcPtrSize, pTy) {
+                    CAbiDirect(cTy) -> {
+                        let reg = "%carg" + intToStr(i);
+                        cellSet(sigPartsRev, Cons(cTy + " " + reg, cellGet(sigPartsRev)));
+                        if (isCStructType(pTy)) emitUnmarshalDirectToStruct(fctx, pTy, reg, cTy)
+                        else reg
+                    },
+                    CAbiPair(t0, t1) -> {
+                        let r0 = "%carg" + intToStr(i) + "_0";
+                        let r1 = "%carg" + intToStr(i) + "_1";
+                        cellSet(sigPartsRev, Cons(t0 + " " + r0, cellGet(sigPartsRev)));
+                        cellSet(sigPartsRev, Cons(t1 + " " + r1, cellGet(sigPartsRev)));
+                        emitUnmarshalPairToStruct(fctx, pTy, r0, t0, r1, t1)
+                    },
+                    CAbiIndirectPtr(sTy, aln, useByval) -> {
+                        let reg = "%carg" + intToStr(i);
+                        let pDecl = if (useByval) "ptr byval(" + sTy + ") align " + intToStr(aln) + " " + reg else "ptr " + reg;
+                        cellSet(sigPartsRev, Cons(pDecl, cellGet(sigPartsRev)));
+                        emitAssign(fctx, "load " + sTy + ", ptr " + reg + ", align " + intToStr(aln))
+                    },
+                };
+                cellSet(gsArgTysRev, Cons(gsTy, cellGet(gsArgTysRev)));
+                cellSet(gsArgValsRev, Cons(gsVal, cellGet(gsArgValsRev)));
+                cellSet(pIdx, i + 1);
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let allGsTys = listRev(Cons("ptr", cellGet(gsArgTysRev)));
+    let allGsVals = listRev(Cons("null", cellGet(gsArgValsRev)));
+    let gsCallArgs = formatTypedArgs(allGsTys, allGsVals);
+    let gsRetLlvm = getFnRetLlvmType(retGeishaTy);
+    let targetSym =
+        if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fd.fnName)) llvmSym("__gs_exp_" + fd.fnName)
+        else llvmSym(fd.fnName);
+
+    let gsRes =
+        if (gsRetLlvm == "void") {
+            emitLine(fctx, "call void " + targetSym + "(" + gsCallArgs + ")");
+            "0"
+        } else {
+            emitAssign(fctx, "call " + gsRetLlvm + " " + targetSym + "(" + gsCallArgs + ")")
+        };
+
+    match retMode {
+        CAbiRetVoid -> {
+            if (!mctx.mcIsWasm) emitLine(fctx, "call void @gc_host_leave(i64 " + tokReg + ")") else ();
+            emitTermLine(fctx, "ret void")
+        },
+        CAbiRetDirect(cRetTy) -> {
+            let finalRes =
+                if (isCStructType(retGeishaTy)) emitMarshalStructToDirect(fctx, retGeishaTy, gsRes, cRetTy)
+                else gsRes;
+            if (!mctx.mcIsWasm) emitLine(fctx, "call void @gc_host_leave(i64 " + tokReg + ")") else ();
+            emitTermLine(fctx, "ret " + cRetTy + " " + finalRes)
+        },
+        CAbiRetSret(sTy, aln) -> {
+            let sretP = match sretRegOpt { Some(r) -> r, None -> "null" };
+            emitLine(fctx, "store " + sTy + " " + gsRes + ", ptr " + sretP + ", align " + intToStr(aln));
+            if (!mctx.mcIsWasm) emitLine(fctx, "call void @gc_host_leave(i64 " + tokReg + ")") else ();
+            emitTermLine(fctx, "ret void")
+        },
+    };
+
+    let linkage = if (isExternal) "" else "internal ";
+    let wasmAttr = if (mctx.mcIsWasm && isExternal) " \"wasm-export-name\"=\"" + cSymName + "\"" else "";
+    let header = "define " + linkage + retLlvm + " " + llvmSym(cSymName) + "(" + strJoin(listRev(cellGet(sigPartsRev)), ", ") + ") nounwind" + wasmAttr;
+    flushFunctionToBuf(out, header, fctx)
+}
+
+def ensureCCallbackTrampoline(mctx: ModEmitCtx, fnName: String): String = {
+    let cbName = "__gs_cb_" + fnName;
+    if (!strMapContains(mctx.mcSynthSet, cbName)) {
+        strMapInsert(mctx.mcSynthSet, cbName, true);
+        match strMapGet(mctx.mcFns, fnName) {
+            Some(fd) -> emitCAbiTrampoline(mctx.mcSynthFns, mctx, fd, cbName, false),
+            None -> (),
+        }
+    } else ();
+    llvmSym(cbName)
 }
 
 def strlenSym(mctx: ModEmitCtx): String =
@@ -1871,6 +2266,14 @@ def tryEmitIntrinsic(
         let fnP = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let extB = genExpr(mctx, fctx, nthArgTerm(args, 2), locals, false);
         Some(emitAssign(fctx, "call ptr @gc_foreign_ptr_new(ptr " + rawP + ", ptr " + fnP + ", i64 " + extB + ")"))
+    } else if (name == "cFnPtr") {
+        match nthArgTerm(args, 0).tnode {
+            TmLit(LitStr(targetName)) -> match strMapGet(mctx.mcExterns, targetName) {
+                Some(ed) -> Some(llvmSym(ed.extLink)),
+                None -> Some(ensureCCallbackTrampoline(mctx, targetName)),
+            },
+            _ -> Some("null"),
+        }
     } else if (name == "gcExternalLiveBytes") {
         Some(emitAssign(fctx, "call i64 @gc_external_live_bytes()"))
     } else if (name == "withForeignPtr") {
@@ -2865,14 +3268,42 @@ def genExpr(
                 Some(intrinVal) -> intrinVal,
                 None -> match strMapGet(mctx.mcExterns, calleeName) {
                     Some(extDef) -> {
-                        let extParamTys = match extDef.extTy {
+                        let extParamTys0 = match extDef.extTy {
                             TyArr(_, ps, _) -> ps,
                             _ -> Nil,
                         };
-                        let argValsRev = cellNew(Nil);
-                        let argTysRev = cellNew(Nil);
+                        let (calleeVal, callArgs, extParamTys) =
+                            if (extDef.extIsFnPtr) {
+                                match (args, extParamTys0) {
+                                    (Cons(fpArg, restArgs), Cons(_, restPtys)) -> {
+                                        let fpReg = genExpr(mctx, fctx, fpArg, locals, false);
+                                        (fpReg, restArgs, restPtys)
+                                    },
+                                    _ -> ("null", Nil, Nil),
+                                }
+                            } else {
+                                (llvmSym(extDef.extLink), args, extParamTys0)
+                            };
+
+                        let extRetTy = match extDef.extTy {
+                            TyArr(_, _, r) -> r,
+                            _ -> retGeishaTy,
+                        };
+                        let retMode = classifyCAbiRet(mctx.mcTargetArch, mctx.mcPtrSize, extRetTy);
+                        let callArgPartsRev = cellNew(Nil);
+                        let fnSigPartsRev = cellNew(Nil);
                         let keepAliveFpsRev = cellNew(Nil);
-                        let cur = cellNew(args);
+                        let sretBufOpt = match retMode {
+                            CAbiRetSret(sTy, aln) -> {
+                                let sb = emitEntryAlloca(fctx, sTy);
+                                cellSet(callArgPartsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln) + " " + sb, cellGet(callArgPartsRev)));
+                                cellSet(fnSigPartsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln), cellGet(fnSigPartsRev)));
+                                Some((sb, sTy, aln))
+                            },
+                            _ -> None,
+                        };
+
+                        let cur = cellNew(callArgs);
                         let curP = cellNew(extParamTys);
                         while (match cellGet(cur) { Nil -> false, _ -> true }) {
                             match cellGet(cur) {
@@ -2890,14 +3321,41 @@ def genExpr(
                                         },
                                         _ -> rawVal,
                                     };
-                                    cellSet(argValsRev, Cons(passVal, cellGet(argValsRev)));
-                                    cellSet(argTysRev, Cons(getValLlvmType(expectedTy), cellGet(argTysRev)));
+                                    match classifyCAbiParam(mctx.mcTargetArch, mctx.mcPtrSize, expectedTy) {
+                                        CAbiDirect(cTy) -> {
+                                            let cVal =
+                                                if (isCStructType(expectedTy)) emitMarshalStructToDirect(fctx, expectedTy, passVal, cTy)
+                                                else passVal;
+                                            cellSet(callArgPartsRev, Cons(cTy + " " + cVal, cellGet(callArgPartsRev)));
+                                            cellSet(fnSigPartsRev, Cons(cTy, cellGet(fnSigPartsRev)))
+                                        },
+                                        CAbiPair(t0, t1) -> {
+                                            let (v0, v1) = emitMarshalStructToPair(fctx, expectedTy, passVal, t0, t1);
+                                            cellSet(callArgPartsRev, Cons(t0 + " " + v0, cellGet(callArgPartsRev)));
+                                            cellSet(callArgPartsRev, Cons(t1 + " " + v1, cellGet(callArgPartsRev)));
+                                            cellSet(fnSigPartsRev, Cons(t0, cellGet(fnSigPartsRev)));
+                                            cellSet(fnSigPartsRev, Cons(t1, cellGet(fnSigPartsRev)))
+                                        },
+                                        CAbiIndirectPtr(sTy, aln, useByval) -> {
+                                            let tmp = emitEntryAlloca(fctx, sTy);
+                                            emitLine(fctx, "store " + sTy + " " + passVal + ", ptr " + tmp + ", align " + intToStr(aln));
+                                            if (useByval) {
+                                                let declP = "ptr byval(" + sTy + ") align " + intToStr(aln);
+                                                cellSet(callArgPartsRev, Cons(declP + " " + tmp, cellGet(callArgPartsRev)));
+                                                cellSet(fnSigPartsRev, Cons(declP, cellGet(fnSigPartsRev)))
+                                            } else {
+                                                cellSet(callArgPartsRev, Cons("ptr " + tmp, cellGet(callArgPartsRev)));
+                                                cellSet(fnSigPartsRev, Cons("ptr", cellGet(fnSigPartsRev)))
+                                            }
+                                        },
+                                    };
                                     cellSet(cur, r)
                                 },
                                 Nil -> (),
                             }
                         };
-                        let typedArgsStr = formatTypedArgs(listRev(cellGet(argTysRev)), listRev(cellGet(argValsRev)));
+                        let typedArgsStr = strJoin(listRev(cellGet(callArgPartsRev)), ", ");
+                        let sigParamsStr = strJoin(listRev(cellGet(fnSigPartsRev)), ", ");
                         let useBlocking = !mctx.mcIsWasm && !extDef.extNoAlloc;
                         if (useBlocking) {
                             let jbPtr = emitEntryAlloca(fctx, "[64 x i64]");
@@ -2905,18 +3363,21 @@ def genExpr(
                             emitLine(fctx, "call void @gc_enter_blocking(ptr " + jbPtr + ")")
                         } else ();
 
-                        let extRetTy = match extDef.extTy {
-                            TyArr(_, _, r) -> r,
-                            _ -> retGeishaTy,
+                        let callRetLlvm = match retMode {
+                            CAbiRetVoid -> "void",
+                            CAbiRetDirect(rt) -> rt,
+                            CAbiRetSret(_, _) -> "void",
                         };
-                        let retLlvm = getFnRetLlvmType(extRetTy);
-                        let cSym = llvmSym(extDef.extLink);
-                        let cRes =
-                            if (retLlvm == "void") {
-                                emitLine(fctx, "call void " + cSym + "(" + typedArgsStr + ")");
+                        let needExplicitSig = extDef.extIsFnPtr || strMapContains(mctx.mcMultiExternLinks, extDef.extLink);
+                        let callHead =
+                            if (needExplicitSig) "call " + callRetLlvm + " (" + sigParamsStr + ") " + calleeVal + "(" + typedArgsStr + ")"
+                            else "call " + callRetLlvm + " " + calleeVal + "(" + typedArgsStr + ")";
+                        let rawCRes =
+                            if (callRetLlvm == "void") {
+                                emitLine(fctx, callHead);
                                 "0"
                             } else {
-                                emitAssign(fctx, "call " + retLlvm + " " + cSym + "(" + typedArgsStr + ")")
+                                emitAssign(fctx, callHead)
                             };
                         if (useBlocking) emitLine(fctx, "call void @gc_leave_blocking()") else ();
                         if (!mctx.mcIsWasm) {
@@ -2931,7 +3392,16 @@ def genExpr(
                                 }
                             }
                         } else ();
-                        cRes
+                        match retMode {
+                            CAbiRetVoid -> "0",
+                            CAbiRetDirect(cRetTy) ->
+                                if (isCStructType(extRetTy)) emitUnmarshalDirectToStruct(fctx, extRetTy, rawCRes, cRetTy)
+                                else rawCRes,
+                            CAbiRetSret(_, _) -> match sretBufOpt {
+                                Some((sb, sTy, aln)) -> emitAssign(fctx, "load " + sTy + ", ptr " + sb + ", align " + intToStr(aln)),
+                                None -> "0",
+                            },
+                        }
                     },
                     None -> {
                         let argValsRev = cellNew(Nil);
@@ -3315,7 +3785,7 @@ def isPureBuiltinIntrinsic(name: String): Bool =
     || name == "mathTanh" || name == "mathPow" || name == "mathAbs" || name == "mathFloor" || name == "mathCeil" || name == "mathFma"
     || name == "mathExpF32" || name == "mathLogF32" || name == "mathSqrtF32" || name == "mathSinF32" || name == "mathCosF32"
     || name == "mathTanhF32" || name == "mathPowF32" || name == "mathAbsF32" || name == "mathFloorF32" || name == "mathCeilF32" || name == "mathFmaF32"
-    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "ptrAllocBytes" || name == "ptrAllocBytes64"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "cFnPtr" || name == "ptrAllocBytes" || name == "ptrAllocBytes64" || name == "cFnPtr"
     || name == "ptrByteAt" || name == "ptrSetByte"
     || name == "ptrReadI8" || name == "ptrReadU16Le" || name == "ptrReadU32Le"
     || name == "ptrReadI64Le" || name == "ptrReadF32Le" || name == "ptrReadF64Le"
@@ -3355,7 +3825,7 @@ def isNonAllocLeafIntrinsic(name: String): Bool =
     || name == "mathTanh" || name == "mathPow" || name == "mathAbs" || name == "mathFloor" || name == "mathCeil" || name == "mathFma"
     || name == "mathExpF32" || name == "mathLogF32" || name == "mathSqrtF32" || name == "mathSinF32" || name == "mathCosF32"
     || name == "mathTanhF32" || name == "mathPowF32" || name == "mathAbsF32" || name == "mathFloorF32" || name == "mathCeilF32" || name == "mathFmaF32"
-    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64"
+    || name == "ptrNull" || name == "ptrIsNull" || name == "ptrOffset" || name == "ptrOffset64" || name == "cFnPtr"
     || name == "ptrByteAt" || name == "ptrSetByte"
     || name == "ptrReadI8" || name == "ptrReadU16Le" || name == "ptrReadU32Le"
     || name == "ptrReadI64Le" || name == "ptrReadF32Le" || name == "ptrReadF64Le"
@@ -3607,24 +4077,28 @@ def emitWasmInitFunction(out: StringBuf, mctx: ModEmitCtx, mainOpt: Option FunDe
     flushFunctionToBuf(out, "define void @__geisha_init() nounwind \"wasm-export-name\"=\"__geisha_init\"", fctx)
 }
 
-def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef): Void = {
+def emitMainFunctions(out: StringBuf, mctx: ModEmitCtx, mainFd: FunDef, globals: List GlobalValDef, useGlobalsOnce: Bool): Void = {
     let fctx = newFnEmitCtx("main");
-    let cg = cellNew(globals);
-    while (match cellGet(cg) { Nil -> false, _ -> true }) {
-        match cellGet(cg) {
-            Cons(g, r) -> {
-                match strMapGet(mctx.mcGlobalSlots, g.gvName) {
-                    Some(slot) -> {
-                        emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
-                        cellSet(fctx.fcPendingLet, None);
-                        let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
-                        emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
-                    },
-                    None -> (),
-                };
-                cellSet(cg, r)
-            },
-            Nil -> (),
+    if (useGlobalsOnce) {
+        emitLine(fctx, "call void @__gs_init_globals_once()")
+    } else {
+        let cg = cellNew(globals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, r) -> {
+                    match strMapGet(mctx.mcGlobalSlots, g.gvName) {
+                        Some(slot) -> {
+                            emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
+                            cellSet(fctx.fcPendingLet, None);
+                            let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
+                            emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                        },
+                        None -> (),
+                    };
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
         }
     };
 
@@ -3816,38 +4290,65 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
     bufPushByte(out, 10)
 }
 
+def computeMultiExternLinks(externs: StrMap ExternDef, externNames: List String): StrMap Bool = {
+    let seen: StrMap Bool = strMapNew();
+    let multi: StrMap Bool = strMapNew();
+    let cur = cellNew(externNames);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ename, r) -> {
+                match strMapGet(externs, ename) {
+                    Some(ed) if (!ed.extIsFnPtr) ->
+                        if (strMapContains(seen, ed.extLink)) strMapInsert(multi, ed.extLink, true)
+                        else strMapInsert(seen, ed.extLink, true),
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    multi
+}
+
 def emitUserExternDeclares(
     out: StringBuf,
     declaredSyms: StrMap Bool,
     definedFns: StrMap FunDef,
     externs: StrMap ExternDef,
-    externNames: List String
+    externNames: List String,
+    multiLinks: StrMap Bool,
+    targetArch: String,
+    ptrSize: Int
 ): Void = {
     let cur = cellNew(externNames);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(ename, r) -> {
                 match strMapGet(externs, ename) {
-                    Some(ed) -> {
+                    Some(ed) if (!ed.extIsFnPtr) -> {
                         if (!strMapContains(declaredSyms, ed.extLink) && !strMapContains(definedFns, ed.extLink)) {
                             strMapInsert(declaredSyms, ed.extLink, true);
-                            match ed.extTy {
-                                TyArr(_, ps, ret) -> {
-                                    let pTys = mapValLlvmTypes(ps);
-                                    let rTy = getFnRetLlvmType(ret);
-                                    bufPushStr(out, "declare ");
-                                    bufPushStr(out, rTy);
-                                    bufPushByte(out, 32);
-                                    bufPushStr(out, llvmSym(ed.extLink));
-                                    bufPushByte(out, 40);
-                                    bufPushStr(out, strJoin(pTys, ", "));
-                                    bufPushStr(out, if (ed.extNoAlloc) ") nounwind\n" else ")\n")
-                                },
-                                _ -> (),
+                            if (strMapContains(multiLinks, ed.extLink)) {
+                                bufPushStr(out, "declare ptr " + llvmSym(ed.extLink) + "()\n")
+                            } else {
+                                match ed.extTy {
+                                    TyArr(_, ps, ret) -> {
+                                        let (rTy, pTys) = cAbiDeclParamStrings(targetArch, ptrSize, ps, ret);
+                                        bufPushStr(out, "declare ");
+                                        bufPushStr(out, rTy);
+                                        bufPushByte(out, 32);
+                                        bufPushStr(out, llvmSym(ed.extLink));
+                                        bufPushByte(out, 40);
+                                        bufPushStr(out, strJoin(pTys, ", "));
+                                        bufPushStr(out, if (ed.extNoAlloc) ") nounwind\n" else ")\n")
+                                    },
+                                    _ -> (),
+                                }
                             }
                         } else ()
                     },
-                    None -> (),
+                    _ -> (),
                 };
                 cellSet(cur, r)
             },
@@ -3857,17 +4358,18 @@ def emitUserExternDeclares(
     bufPushByte(out, 10)
 }
 
-def emitNativeCustomBootFunctions(
+def emitGlobalsInitOnceHelper(
     out: StringBuf,
     mctx: ModEmitCtx,
-    mainOpt: Option FunDef,
-    globals: List GlobalValDef,
-    bootSymOpt: Option String
+    globals: List GlobalValDef
 ): Void = {
-    let fctx = newFnEmitCtx("__geisha_init");
-    let anchor = emitEntryAlloca(fctx, "i64");
-    emitLine(fctx, "store i64 0, ptr " + anchor + ", align 8");
-    let tokReg = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
+    let fctx = newFnEmitCtx("__gs_init_globals_once");
+    let already = emitAssign(fctx, "load i1, ptr @__gs_globals_inited, align 1");
+    let doBlk = appendBlock(fctx, "ginit_do");
+    let doneBlk = appendBlock(fctx, "ginit_done");
+    emitTermLine(fctx, "br i1 " + already + ", label %" + blockLabel(fctx, doneBlk) + ", label %" + blockLabel(fctx, doBlk));
+    setInsertBlock(fctx, doBlk);
+    emitLine(fctx, "store i1 true, ptr @__gs_globals_inited, align 1");
     let cg = cellNew(globals);
     while (match cellGet(cg) { Nil -> false, _ -> true }) {
         match cellGet(cg) {
@@ -3884,6 +4386,92 @@ def emitNativeCustomBootFunctions(
                 cellSet(cg, r)
             },
             Nil -> (),
+        }
+    };
+    emitTermLine(fctx, "br label %" + blockLabel(fctx, doneBlk));
+    setInsertBlock(fctx, doneBlk);
+    emitTermLine(fctx, "ret void");
+    flushFunctionToBuf(out, "define internal void @__gs_init_globals_once() nounwind", fctx)
+}
+
+def emitGlobalCtors(
+    out: StringBuf,
+    mctx: ModEmitCtx,
+    ctors: List (String, Int),
+    hasGlobalsOnce: Bool
+): Void = match ctors {
+    Nil -> (),
+    _ -> {
+        let entriesRev = cellNew(Nil);
+        let idx = cellNew(0);
+        let cur = cellNew(ctors);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((fnName, prio), r) -> {
+                    let i = cellGet(idx);
+                    let ctorSym = "@__gs_ctor_" + intToStr(i);
+                    bufPushStr(out, "define internal void " + ctorSym + "() nounwind {\nentry:\n");
+                    if (!mctx.mcIsWasm) {
+                        bufPushStr(out, "  %anchor = alloca i64, align 8\n");
+                        bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
+                        bufPushStr(out, "  %tok = call i64 @gc_host_enter(ptr %anchor)\n")
+                    } else ();
+                    if (hasGlobalsOnce) {
+                        bufPushStr(out, "  call void @__gs_init_globals_once()\n")
+                    } else ();
+                    let targetSym =
+                        if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
+                        else llvmSym(fnName);
+                    bufPushStr(out, "  call void " + targetSym + "(ptr null)\n");
+                    if (!mctx.mcIsWasm) {
+                        bufPushStr(out, "  call void @gc_host_leave(i64 %tok)\n")
+                    } else ();
+                    bufPushStr(out, "  ret void\n}\n\n");
+                    cellSet(entriesRev, Cons("{ i32, ptr, ptr } { i32 " + intToStr(prio) + ", ptr " + ctorSym + ", ptr null }", cellGet(entriesRev)));
+                    cellSet(idx, i + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let n = cellGet(idx);
+        let entries = listRev(cellGet(entriesRev));
+        bufPushStr(out, "@llvm.global_ctors = appending global [" + intToStr(n) + " x { i32, ptr, ptr }] [\n  " + strJoin(entries, ",\n  ") + "\n]\n\n")
+    },
+}
+
+def emitNativeCustomBootFunctions(
+    out: StringBuf,
+    mctx: ModEmitCtx,
+    mainOpt: Option FunDef,
+    globals: List GlobalValDef,
+    bootSymOpt: Option String,
+    useGlobalsOnce: Bool
+): Void = {
+    let fctx = newFnEmitCtx("__geisha_init");
+    let anchor = emitEntryAlloca(fctx, "i64");
+    emitLine(fctx, "store i64 0, ptr " + anchor + ", align 8");
+    let tokReg = emitAssign(fctx, "call i64 @gc_host_enter(ptr " + anchor + ")");
+    if (useGlobalsOnce) {
+        emitLine(fctx, "call void @__gs_init_globals_once()")
+    } else {
+        let cg = cellNew(globals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, r) -> {
+                    match strMapGet(mctx.mcGlobalSlots, g.gvName) {
+                        Some(slot) -> {
+                            emitRegisterGlobalRoots(fctx, g.gvTy, slot.vsPtr);
+                            cellSet(fctx.fcPendingLet, None);
+                            let initVal = genExpr(mctx, fctx, g.gvInit, Nil, false);
+                            emitStore(fctx, slot.vsLlvmTy, initVal, slot.vsPtr)
+                        },
+                        None -> (),
+                    };
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
         }
     };
     match mainOpt {
@@ -3910,9 +4498,10 @@ def emitNativeCustomBootFunctions(
     }
 }
 
-pub def emitProgramLlvmIrOpts(
+pub def emitProgramLlvmIrForArch(
     prog: CoreProgram,
     isWasm: Bool,
+    targetArch: String,
     exports: List String,
     noMain: Bool,
     bootSymOpt: Option String
@@ -3934,6 +4523,11 @@ pub def emitProgramLlvmIrOpts(
     };
     bufPushStr(globalsBuf, "@__gs_argc = internal global i32 0\n");
     bufPushStr(globalsBuf, "@__gs_argv = internal global ptr null\n");
+    let hasCtors = match prog.coreCtors { Nil -> false, _ -> true };
+    let useGlobalsOnce = !isWasm && hasCtors;
+    if (useGlobalsOnce) {
+        bufPushStr(globalsBuf, "@__gs_globals_inited = internal global i1 false\n")
+    } else ();
     if (!isWasm) {
         bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
         bufPushStr(globalsBuf, "@__gs_tls_thread = external thread_local global ptr\n");
@@ -4057,6 +4651,7 @@ pub def emitProgramLlvmIrOpts(
     };
     bufPushByte(globalsBuf, 10);
 
+    let multiLinks = computeMultiExternLinks(prog.coreExterns, prog.coreExternNames);
     let mctx = MkModEmitCtx {
         mcStrCnt: cellNew(0),
         mcStrDecls: bufNew(),
@@ -4066,23 +4661,29 @@ pub def emitProgramLlvmIrOpts(
         mcSynthFns: bufNew(),
         mcSynthSet: strMapNew(),
         mcGlobalSlots: globalSlots,
+        mcFns: prog.coreFns,
         mcExterns: prog.coreExterns,
+        mcMultiExternLinks: multiLinks,
         mcAdtReg: prog.coreAdtReg,
         mcEscape: prog.coreEscape,
         mcIsWasm: isWasm,
+        mcTargetArch: targetArch,
         mcPtrSize: if (isWasm) 4 else 8,
         mcWasmExports: exportMap,
         mcHasExplicitExports: hasExplicit,
     };
 
     let fnsBuf = bufNew();
+    if (useGlobalsOnce) {
+        emitGlobalsInitOnceHelper(fnsBuf, mctx, prog.coreGlobals)
+    } else ();
     if (isWasm) {
         emitWasmInitFunction(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals)
     } else if (noMain) {
-        emitNativeCustomBootFunctions(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals, bootSymOpt)
+        emitNativeCustomBootFunctions(fnsBuf, mctx, strMapGet(prog.coreFns, "main"), prog.coreGlobals, bootSymOpt, useGlobalsOnce)
     } else {
         match strMapGet(prog.coreFns, "main") {
-            Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals),
+            Some(mainFd) -> emitMainFunctions(fnsBuf, mctx, mainFd, prog.coreGlobals, useGlobalsOnce),
             None -> (),
         }
     };
@@ -4103,11 +4704,29 @@ pub def emitProgramLlvmIrOpts(
         }
     };
 
+    // Emit pure C ABI export trampolines (`@export` / `@export("sym")`, no trailing `%fvs`)
+    let cce = cellNew(prog.coreCExports);
+    while (match cellGet(cce) { Nil -> false, _ -> true }) {
+        match cellGet(cce) {
+            Cons((fnm, cSym), r) -> {
+                match strMapGet(prog.coreFns, fnm) {
+                    Some(fd) -> emitCAbiTrampoline(fnsBuf, mctx, fd, cSym, true),
+                    None -> (),
+                };
+                cellSet(cce, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Emit `@ctor` static constructors (`@llvm.global_ctors`)
+    emitGlobalCtors(fnsBuf, mctx, prog.coreCtors, useGlobalsOnce);
+
     let out = bufNew();
     bufPushBuf(out, globalsBuf);
     let declaredSyms: StrMap Bool = strMapNew();
     emitRuntimeDeclares(out, declaredSyms, prog.coreFns, isWasm);
-    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames);
+    emitUserExternDeclares(out, declaredSyms, prog.coreFns, prog.coreExterns, prog.coreExternNames, multiLinks, targetArch, if (isWasm) 4 else 8);
 
     if (bufLen(mctx.mcStrDecls) > 0) {
         bufPushBuf(out, mctx.mcStrDecls);
@@ -4121,6 +4740,15 @@ pub def emitProgramLlvmIrOpts(
     bufPushBuf(out, fnsBuf);
     bufToString(out)
 }
+
+pub def emitProgramLlvmIrOpts(
+    prog: CoreProgram,
+    isWasm: Bool,
+    exports: List String,
+    noMain: Bool,
+    bootSymOpt: Option String
+): String =
+    emitProgramLlvmIrForArch(prog, isWasm, if (isWasm) "wasm32" else "arm64", exports, noMain, bootSymOpt)
 
 pub def emitProgramLlvmIrTarget(prog: CoreProgram, isWasm: Bool, wasmExports: List String): String =
     emitProgramLlvmIrOpts(prog, isWasm, wasmExports, false, None)

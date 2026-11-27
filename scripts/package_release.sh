@@ -69,9 +69,10 @@ if [ "${PACKAGE_DARWIN_X86_64:-0}" = "1" ] && [ "$OS_NAME" = "darwin" ] && [ "$A
 
     MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wall -Wextra -Iruntime/include -c runtime/base.c -o "$X64_DIR/base.o"
     MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wall -Wextra -Iruntime/include -c runtime/gs_sys.c -o "$X64_DIR/gs_sys.o"
+    MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wall -Wextra -Iruntime/include -c runtime/gs_objc.c -o "$X64_DIR/gs_objc.o"
     MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wall -Wextra -Iruntime/include -c runtime/runtime/gc_bitmap.c -o "$X64_DIR/gc_bitmap.o"
     MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wall -Wextra -Iruntime/include -c runtime/runtime/gs_conc.c -o "$X64_DIR/gs_conc.o"
-    ar rcs "$X64_DIR/libgeisha_runtime.a" "$X64_DIR/base.o" "$X64_DIR/gs_sys.o" "$X64_DIR/gc_bitmap.o" "$X64_DIR/gs_conc.o"
+    ar rcs "$X64_DIR/libgeisha_runtime.a" "$X64_DIR/base.o" "$X64_DIR/gs_sys.o" "$X64_DIR/gs_objc.o" "$X64_DIR/gc_bitmap.o" "$X64_DIR/gs_conc.o"
 
     MACOSX_DEPLOYMENT_TARGET=14.0 "$CC" -target x86_64-apple-macosx14.0 -O2 -Wno-override-module -pthread -x ir "$BUILD_DIR/stage3.ll" -x none "$X64_DIR/libgeisha_runtime.a" -o "$X64_DIR/geisha"
     package_one "darwin" "x86_64" "$X64_DIR/geisha" "$X64_DIR/libgeisha_runtime.a"

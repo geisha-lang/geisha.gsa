@@ -14,7 +14,7 @@ use ast.{
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     ConstraintSpec, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
     listContainsStr, sortUniqueStrings, typeToString, typesEqual,
-    Lit, LitInt,
+    Lit, LitInt, LitStr,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
     OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
@@ -26,6 +26,7 @@ use ast.{
     ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
     Item, ItForm, ItExtern,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct,
     Def
 }
 use infer.{
@@ -83,7 +84,7 @@ pub data GlobalValDef {
 }
 
 pub data ExternDef {
-    MkExternDef { extName: String, extLink: String, extTy: Type, extNoAlloc: Bool },
+    MkExternDef { extName: String, extLink: String, extTy: Type, extNoAlloc: Bool, extIsFnPtr: Bool },
 }
 
 pub data EscapeInfo {
@@ -101,6 +102,8 @@ pub data CoreProgram {
         coreGlobals: List GlobalValDef,
         coreExterns: StrMap ExternDef,
         coreExternNames: List String,
+        coreCExports: List (String, String),
+        coreCtors: List (String, Int),
         coreAdtReg: StrMap AdtInfo,
         coreEscape: EscapeInfo,
     },
@@ -321,6 +324,7 @@ data KCtx {
         kConceptReg: StrMap ConceptInfo,
         kInstanceReg: List InstanceInfo,
         kConceptMethods: StrMap (String, Int),
+        kErr: Cell (Option String),
     },
 }
 
@@ -1292,7 +1296,49 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                             // 3. Direct function / concept method / intrinsic call?
                             match resolveDirectCallee(ctx, callee.node) {
                                 Some(directName) ->
-                                    if (!strMapContains(ctx.kGlobalValSet, directName)) {
+                                    if (directName == "cFnPtr") {
+                                        match args {
+                                            Cons(argF, Nil) -> match argF.node {
+                                                ExVar(fnNm) -> {
+                                                    let isLocal = match assocLookupScheme(cellGet(ctx.kLocalEnv), fnNm) {
+                                                        Some(_) -> true,
+                                                        None -> false,
+                                                    };
+                                                    let isTop = strMapContains(ctx.kTopDirect, fnNm);
+                                                    let isExtFnPtr = match strMapGet(ctx.kExterns, fnNm) {
+                                                        Some(ed) -> ed.extIsFnPtr,
+                                                        None -> false,
+                                                    };
+                                                    if (isLocal || !isTop) {
+                                                        match cellGet(ctx.kErr) {
+                                                            None -> cellSet(ctx.kErr, Some("cFnPtr requires a top-level or extern function (got local/non-top-level '" + fnNm + "')")),
+                                                            Some(_) -> (),
+                                                        }
+                                                    } else if (isExtFnPtr) {
+                                                        match cellGet(ctx.kErr) {
+                                                            None -> cellSet(ctx.kErr, Some("cFnPtr cannot take an 'extern ptr' declaration ('" + fnNm + "')")),
+                                                            Some(_) -> (),
+                                                        }
+                                                    } else ();
+                                                    MkTerm {
+                                                        tscm: tform,
+                                                        tnode: TmApplyDir(
+                                                            MkVarDecl { vname: "cFnPtr", vscm: callee.ty },
+                                                            [MkTerm { tscm: argF.ty, tnode: TmLit(LitStr(fnNm)) }]
+                                                        ),
+                                                    }
+                                                },
+                                                _ -> {
+                                                    let argTerms = transformFormList(ctx, args);
+                                                    MkTerm { tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
+                                                },
+                                            },
+                                            _ -> {
+                                                let argTerms = transformFormList(ctx, args);
+                                                MkTerm { tscm: tform, tnode: TmApplyDir(MkVarDecl { vname: "cFnPtr", vscm: callee.ty }, argTerms) }
+                                            },
+                                        }
+                                    } else if (!strMapContains(ctx.kGlobalValSet, directName)) {
                                         let target = match lookupDirectTarget(ctx, directName) {
                                             Some(t) -> t,
                                             None -> directName,
@@ -3793,7 +3839,11 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
         kConceptReg: inf.conceptReg,
         kInstanceReg: inf.instanceReg,
         kConceptMethods: inf.conceptMethods,
+        kErr: cellNew(None),
     };
+
+    let cExportsRev: Cell (List (String, String)) = cellNew(Nil);
+    let ctorsRev: Cell (List (String, Int)) = cellNew(Nil);
 
     // Pre-register direct top-level functions & externs
     let cd1 = cellNew(inf.defs);
@@ -3803,15 +3853,32 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
                 match d.item {
                     ItForm(_) ->
                         if (!strMapContains(globalValSet, d.ident)) {
-                            strMapInsert(ctx.kTopDirect, d.ident, d.ident)
+                            strMapInsert(ctx.kTopDirect, d.ident, d.ident);
+                            let ca = cellNew(d.attrs);
+                            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                                match cellGet(ca) {
+                                    Cons(AttrExport(symOpt), ra) -> {
+                                        let cSym = match symOpt { Some(s) -> s, None -> d.ident };
+                                        cellSet(cExportsRev, Cons((d.ident, cSym), cellGet(cExportsRev)));
+                                        cellSet(ca, ra)
+                                    },
+                                    Cons(AttrCtor(prio), ra) -> {
+                                        cellSet(ctorsRev, Cons((d.ident, prio), cellGet(ctorsRev)));
+                                        cellSet(ca, ra)
+                                    },
+                                    Cons(_, ra) -> cellSet(ca, ra),
+                                    Nil -> (),
+                                }
+                            }
                         } else (),
-                    ItExtern(linkName, scm, noAlloc) -> {
+                    ItExtern(linkName, scm, noAlloc, isFnPtr) -> {
                         strMapInsert(ctx.kTopDirect, d.ident, d.ident);
                         strMapInsert(ctx.kExterns, d.ident, MkExternDef {
                             extName: d.ident,
                             extLink: linkName,
                             extTy: schemeBody(scm),
                             extNoAlloc: noAlloc,
+                            extIsFnPtr: isFnPtr,
                         });
                         cellSet(ctx.kExternNamesRev, Cons(d.ident, cellGet(ctx.kExternNamesRev)))
                     },
@@ -3855,17 +3922,24 @@ pub def lowerToCore(inf: InferOutput): Result CoreProgram String = {
         }
     };
 
-    let (concreteFns, concreteNames, concreteGlobals) = runMonomorphizationWorklist(ctx);
-    verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
-    let escapeInfo = runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames);
+    match cellGet(ctx.kErr) {
+        Some(emsg) -> Err(emsg),
+        None -> {
+            let (concreteFns, concreteNames, concreteGlobals) = runMonomorphizationWorklist(ctx);
+            verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
+            let escapeInfo = runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames);
 
-    Ok(MkCoreProgram {
-        coreFns: concreteFns,
-        coreFnNames: concreteNames,
-        coreGlobals: concreteGlobals,
-        coreExterns: ctx.kExterns,
-        coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
-        coreAdtReg: inf.adtReg,
-        coreEscape: escapeInfo,
-    })
+            Ok(MkCoreProgram {
+                coreFns: concreteFns,
+                coreFnNames: concreteNames,
+                coreGlobals: concreteGlobals,
+                coreExterns: ctx.kExterns,
+                coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
+                coreCExports: listRev(cellGet(cExportsRev)),
+                coreCtors: listRev(cellGet(ctorsRev)),
+                coreAdtReg: inf.adtReg,
+                coreEscape: escapeInfo,
+            })
+        },
+    }
 }

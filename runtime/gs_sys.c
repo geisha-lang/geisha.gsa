@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -345,4 +346,26 @@ int32_t gs_net_tcp_close(int32_t fd)
 {
     if (fd < 0) return 0;
     return (int32_t)close(fd);
+}
+
+/* ---- Dynamic Library Loading (`sys.ffi`) ---- */
+
+void *gs_dlopen(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return dlopen(NULL, RTLD_LAZY | RTLD_GLOBAL);
+    }
+    return dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+}
+
+void *gs_dlsym(void *handle, const char *symbol)
+{
+    if (symbol == NULL || symbol[0] == '\0') return NULL;
+    return dlsym(handle != NULL ? handle : RTLD_DEFAULT, symbol);
+}
+
+int32_t gs_dlclose(void *handle)
+{
+    if (handle == NULL) return 0;
+    return (int32_t)dlclose(handle);
 }
