@@ -1316,7 +1316,7 @@ def compileWithPkgSpecsToWasmGc(
         Nil -> collectRootPubFnNames(rawDefs, coreProg),
         es -> es,
     };
-    let wasmBuf = emitProgramWasmGc(coreProg, effExports, tc.tcOwnsMain);
+    let wasmBuf = emitProgramWasmGc(coreProg, effExports, tc.tcOwnsMain)?;
     writeWasmGcBinary(outWasmPath, wasmBuf)?;
     let glueJs = emitProgramWasmGcGlue(coreProg, pathBasename(outWasmPath), effExports, tc.tcOwnsMain);
     writeFile(gluePathForWasmOut(outWasmPath, ".mjs"), glueJs)?;

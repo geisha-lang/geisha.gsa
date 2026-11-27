@@ -29,8 +29,9 @@ use ast.{
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl,
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
-    emptySpan
+    Span, emptySpan
 }
+use diag.formatSpanDiag
 use infer.{
     VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
 }
@@ -332,6 +333,7 @@ data WgcModule {
         wmStrLitMap: StrMap (Int, Int),
         wmStartFunc: Cell (Option Int),
         wmNeedsStrInterop: Cell Bool,
+        wmErr: Cell (Option String),
     },
 }
 
@@ -379,7 +381,13 @@ def newWgcModule(prog: CoreProgram): WgcModule = {
         wmStrLitMap: strMapNew(),
         wmStartFunc: cellNew(None),
         wmNeedsStrInterop: cellNew(false),
+        wmErr: cellNew(None),
     }
+}
+
+def setWgcErr(wm: WgcModule, sp: Span, msg: String): Void = match cellGet(wm.wmErr) {
+    Some(_) -> (),
+    None -> cellSet(wm.wmErr, Some(formatSpanDiag("codegen", sp, msg))),
 }
 
 def addRawType(wm: WgcModule, td: WgcTypeDef): Int = {
@@ -1076,10 +1084,34 @@ def getOrCreateHelper(wm: WgcModule, name: String): Int = match strMapGet(wm.wmH
                 let fty = internFuncType(wm, [WTI32], [WTRefNull(1)]);
                 let id = allocDefinedFn(wm, fty);
                 let c = bufNew();
+                // if (n < 0) unreachable
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x41); bufPushByte(c, 0x00);
+                bufPushByte(c, 0x48); // i32.lt_s
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
                 bufPushByte(c, 0x20); emitUleb(c, 0);
                 bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
                 bufPushByte(c, 0x41); bufPushByte(c, 0x00);
                 bufPushByte(c, 0xFB); bufPushByte(c, 0x00); emitUleb(c, 1);
+                setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
+                id
+            } else if (name == "ptrAlloc64") {
+                // Checked i64 -> i32 length conversion: trap if n < 0 or n > 2147483647
+                let p32 = getOrCreateHelper(wm, "ptrAlloc");
+                let fty = internFuncType(wm, [WTI64], [WTRefNull(1)]);
+                let id = allocDefinedFn(wm, fty);
+                let c = bufNew();
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(0));
+                bufPushByte(c, 0x53); // i64.lt_s
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0x42); emitSleb64(c, intToI64(2147483647));
+                bufPushByte(c, 0x55); // i64.gt_s
+                bufPushByte(c, 0x72); // i32.or
+                bufPushByte(c, 0x04); bufPushByte(c, 0x40); bufPushByte(c, 0x00); bufPushByte(c, 0x0B);
+                bufPushByte(c, 0x20); emitUleb(c, 0);
+                bufPushByte(c, 0xA7); // i32.wrap_i64
+                bufPushByte(c, 0x10); emitUleb(c, p32);
                 setDefinedFnBody(wm, id, wrapSimpleBody(Nil, c));
                 id
             } else if (name == "ptrOffset") {
@@ -2107,15 +2139,13 @@ def tryEmitBuiltinWgc(
         emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
         bufPushByte(c, 0xD1);
         true
-    } else if (name == "ptrAllocBytes" || name == "foreignPtrAlloc") {
-        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
-        let h = getOrCreateHelper(wm, "ptrAlloc");
-        bufPushByte(c, 0x10); emitUleb(c, h);
-        true
-    } else if (name == "ptrAllocBytes64") {
-        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
-        bufPushByte(c, 0xA7);
-        let h = getOrCreateHelper(wm, "ptrAlloc");
+    } else if (name == "ptrAllocBytes" || name == "ptrAllocBytes64" || name == "foreignPtrAlloc") {
+        let aLen = nthArgTerm(args, 0);
+        emitTermAsVal(fctx, aLen, locals);
+        let h = match schemeBody(aLen.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
         bufPushByte(c, 0x10); emitUleb(c, h);
         true
     } else if (name == "ptrOffset" || name == "scopedPtrOffset") {
@@ -2252,7 +2282,10 @@ def tryEmitBuiltinWgc(
         let aFn = nthArgTerm(args, 1);
         let retWts = geishaRetToWgc(wm, retTy);
         let (clsBaseIdx, clsFnIdx) = internClsTypes(wm, [WTRefNull(1)], retWts);
-        let hAlloc = getOrCreateHelper(wm, "ptrAlloc");
+        let hAlloc = match schemeBody(aSz.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
         let pLoc = fcAllocLocal(fctx, WTRefNull(1));
         let fLoc = fcAllocLocal(fctx, WTRefNull(clsBaseIdx));
         emitTermAsVal(fctx, aSz, locals); bufPushByte(c, 0x10); emitUleb(c, hAlloc); bufPushByte(c, 0x21); emitUleb(c, pLoc);
@@ -2265,8 +2298,12 @@ def tryEmitBuiltinWgc(
         true
     } else if (name == "arenaAlloc") {
         emitTermDiscard(fctx, nthArgTerm(args, 0), locals);
-        emitTermAsVal(fctx, nthArgTerm(args, 1), locals);
-        let h = getOrCreateHelper(wm, "ptrAlloc");
+        let aLen = nthArgTerm(args, 1);
+        emitTermAsVal(fctx, aLen, locals);
+        let h = match schemeBody(aLen.tscm) {
+            TyCon("Int64") -> getOrCreateHelper(wm, "ptrAlloc64"),
+            _ -> getOrCreateHelper(wm, "ptrAlloc"),
+        };
         bufPushByte(c, 0x10); emitUleb(c, h);
         true
     } else if (name == "foreignPtrNew" || name == "cFnPtr" || name == "__blackBox") {
@@ -2322,10 +2359,13 @@ def tryEmitBuiltinWgc(
     }
 }
 
-def emitExternCallWgc(fctx: WgcFnCtx, ext: ExternDef, args: List TaggedTerm, retTy: Type, locals: List (String, Int, WgcValType)): Void = {
+def emitExternCallWgc(fctx: WgcFnCtx, ext: ExternDef, args: List TaggedTerm, retTy: Type, sp: Span, locals: List (String, Int, WgcValType)): Void = {
     let c = fctx.fcCode;
     let link = ext.extLink;
-    if (link == "strtod") {
+    if (ext.extIsFnPtr) {
+        setWgcErr(fctx.fcMod, sp, "WasmGC target does not support indirect C function pointer extern '" + ext.extName + "'");
+        bufPushByte(c, 0x00)
+    } else if (link == "strtod") {
         emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
         emitHostImportCall(fctx, "geisha.strtod")
     } else if (link == "gs_fmt_f64") {
@@ -2347,11 +2387,9 @@ def emitExternCallWgc(fctx: WgcFnCtx, ext: ExternDef, args: List TaggedTerm, ret
         emitArgsAsVals(fctx, args, locals);
         emitHostImportCall(fctx, "geisha.exit")
     } else {
-        let cur = cellNew(args);
-        while (match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(a, r) -> { emitTermDiscard(fctx, a, locals); cellSet(cur, r) }, Nil -> () }
-        };
-        if (!isVoidTy(retTy)) emitDefaultVal(c, geishaTypeToWgc(fctx.fcMod, retTy)) else ()
+        let _ = retTy;
+        setWgcErr(fctx.fcMod, sp, "WasmGC target does not support extern '" + link + "' (declared as '" + ext.extName + "')");
+        bufPushByte(c, 0x00)
     }
 }
 
@@ -2566,7 +2604,7 @@ def emitWgcExpr(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcVa
                 ()
             } else {
                 match strMapGet(wm.wmProg.coreExterns, vd.vname) {
-                    Some(ext) -> emitExternCallWgc(fctx, ext, args, resTy, locals),
+                    Some(ext) -> emitExternCallWgc(fctx, ext, args, resTy, tm.tspan, locals),
                     None -> match strMapGet(wm.wmFnIdxMap, vd.vname) {
                         Some(fidx) -> {
                             emitArgsAsVals(fctx, args, locals);
@@ -2770,6 +2808,8 @@ def emitGlobalInitFunction(wm: WgcModule): Void = {
     let hasGlobals = match wm.wmProg.coreGlobals { Nil -> false, _ -> true };
     let hasCtors = match wm.wmProg.coreCtors { Nil -> false, _ -> true };
     if (hasGlobals || hasCtors) {
+        let initedGidx = vecLen(wm.wmGlobals);
+        vecPush(wm.wmGlobals, MkWgcGlobal { glValTy: WTI32, glMut: true });
         let fty = internFuncType(wm, Nil, Nil);
         let initIdx = allocDefinedFn(wm, fty);
         let fctx = MkWgcFnCtx {
@@ -2778,8 +2818,15 @@ def emitGlobalInitFunction(wm: WgcModule): Void = {
             fcNumParams: 0,
             fcExtraLocals: vecNew(),
             fcRetVoid: true,
-            fcCurFnName: "__geisha_init",
+            fcCurFnName: "__gs_init",
         };
+        // Idempotent guard: if (__gs_inited != 0) return; __gs_inited = 1;
+        bufPushByte(fctx.fcCode, 0x23); emitUleb(fctx.fcCode, initedGidx);
+        bufPushByte(fctx.fcCode, 0x04); bufPushByte(fctx.fcCode, 0x40);
+        bufPushByte(fctx.fcCode, 0x0F); // return
+        bufPushByte(fctx.fcCode, 0x0B);
+        bufPushByte(fctx.fcCode, 0x41); bufPushByte(fctx.fcCode, 0x01);
+        bufPushByte(fctx.fcCode, 0x24); emitUleb(fctx.fcCode, initedGidx);
         let cg = cellNew(wm.wmProg.coreGlobals);
         while (match cellGet(cg) { Nil -> false, _ -> true }) {
             match cellGet(cg) {
@@ -2810,7 +2857,12 @@ def emitGlobalInitFunction(wm: WgcModule): Void = {
             }
         };
         setDefinedFnBody(wm, initIdx, emitFnBodyWithLocals(fctx.fcExtraLocals, fctx.fcCode));
-        cellSet(wm.wmStartFunc, Some(initIdx))
+        vecPush(wm.wmExports, MkWgcExport { expName: "__gs_init", expFuncIdx: initIdx });
+        // Only emit Wasm Start section when module has zero host imports, so JS host glue
+        // binds `_gs_exp = instance.exports` before `__gs_init()` runs host-calling ctors!
+        if (vecLen(wm.wmImports) == 0) {
+            cellSet(wm.wmStartFunc, Some(initIdx))
+        } else ()
     } else ()
 }
 
@@ -3071,7 +3123,7 @@ pub def writeWasmGcBinary(path: String, buf: StringBuf): Result Void String = ma
     },
 }
 
-pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool): StringBuf = {
+pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool): Result StringBuf String = {
     let wm = newWgcModule(prog);
 
     // Phase 1: Discover needed host imports
@@ -3164,7 +3216,10 @@ pub def emitProgramWasmGc(prog: CoreProgram, exports: List String, noMain: Bool)
     } else ();
 
     let _ = noMain;
-    assembleWasmGcBinary(wm)
+    match cellGet(wm.wmErr) {
+        Some(errMsg) -> Err(errMsg),
+        None -> Ok(assembleWasmGcBinary(wm)),
+    }
 }
 
 // ============================================================================
@@ -3254,6 +3309,7 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
     bufPushStr(out, "  const bytes = bytesOrBuf || await _gs_loadBytes();\n");
     bufPushStr(out, "  const { instance } = await WebAssembly.instantiate(bytes, _gs_makeImports(extraImports));\n");
     bufPushStr(out, "  _gs_exp = instance.exports;\n");
+    bufPushStr(out, "  if (typeof _gs_exp.__gs_init === \"function\") _gs_exp.__gs_init();\n");
     bufPushStr(out, "  return instance;\n");
     bufPushStr(out, "}\n\n");
     bufPushStr(out, "const _gs_inst = await instantiate();\n");

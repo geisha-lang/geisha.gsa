@@ -5100,6 +5100,70 @@ if [ -f "./build/wasm_rt.o" ]; then
     echo "PASS [wasmgc_size_comparison]: wasm-gc=${WGC_RAW_SZ}B vs wasm32(-Oz --strip)=${W32_SZ}B (zero linear memory)"
     PASS=$((PASS + 1))
 fi
+
+# 44b. WasmGC regression tests: i64 foreignPtrAlloc/arenaAlloc, extern init printLn ordering, and unsupported extern compile error
+cat > "$TMP_DIR/t44_reg.gsa" << 'EOF'
+use std.str.intToStr
+
+extern init def bootPrint(): Void = printLn("boot text")
+
+pub def testForeignAndArena(): Int = {
+    let fp = foreignPtrAlloc(intToI64(8));
+    let v1 = withForeignPtr(fp, (p: ScopedPtr) -> {
+        scopedPtrWriteI32Le(p, 0, 111);
+        scopedPtrWriteI32Le(p, 4, 222);
+        scopedPtrReadI32Le(p, 0) + scopedPtrReadI32Le(p, 4)
+    });
+    let v2 = withArena((a: Arena) -> {
+        let sp = arenaAlloc(a, intToI64(8));
+        scopedPtrWriteI32Le(sp, 0, 1000);
+        scopedPtrWriteI32Le(sp, 4, 234);
+        scopedPtrReadI32Le(sp, 0) + scopedPtrReadI32Le(sp, 4)
+    });
+    v1 + v2
+}
+
+pub def testNegAlloc64(): Int = {
+    let _ = foreignPtrAlloc(intToI64(-1));
+    0
+}
+
+def main(): Void = {
+    printLn("main text");
+    printLn(intToStr(testForeignAndArena()))
+}
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_reg.wasm" "$TMP_DIR/t44_reg.gsa"
+WGC_REG_OUT="$(node --input-type=module -e "
+import { testNegAlloc64 } from '$TMP_DIR/t44_reg.mjs';
+let trapped = false;
+try { testNegAlloc64(); } catch (e) { trapped = true; }
+console.log('trap:' + trapped);
+")"
+WGC_REG_L1="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '1p')"
+WGC_REG_L2="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '2p')"
+WGC_REG_L3="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '3p')"
+WGC_REG_L4="$(printf '%s\n' "$WGC_REG_OUT" | sed -n '4p')"
+assert_eq "wasmgc_extern_init_print_order_1" "boot text" "$WGC_REG_L1"
+assert_eq "wasmgc_extern_init_print_order_2" "main text" "$WGC_REG_L2"
+assert_eq "wasmgc_foreign_and_arena_i64_alloc" "1567" "$WGC_REG_L3"
+assert_eq "wasmgc_neg_i64_alloc_traps" "trap:true" "$WGC_REG_L4"
+
+cat > "$TMP_DIR/t44_bad_extern.gsa" << 'EOF'
+extern "abs" def hostAbs(x: Int): Int
+def main(): Void = { let _ = hostAbs(-42); () }
+EOF
+WGC_BAD_EXT_ERR="$("$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_extern.wasm" "$TMP_DIR/t44_bad_extern.gsa" 2>&1 || true)"
+if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_extern.wasm" "$TMP_DIR/t44_bad_extern.gsa" >/dev/null 2>&1; then
+    echo "FAIL [wasmgc_reject_unsupported_extern]: expected unsupported extern 'abs' to fail compilation" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$WGC_BAD_EXT_ERR" | grep -q "WasmGC target does not support extern 'abs'"; then
+    echo "FAIL [wasmgc_reject_unsupported_extern_diag]: unexpected error output: $WGC_BAD_EXT_ERR" >&2
+    exit 1
+fi
+echo "PASS [wasmgc_reject_unsupported_extern]: rejected unsupported extern 'abs' with codegen diagnostic"
+PASS=$((PASS + 1))
 fi
 
 echo "All $PASS end-to-end test suites passed!"
