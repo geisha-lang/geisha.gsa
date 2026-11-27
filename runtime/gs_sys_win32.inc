@@ -930,30 +930,57 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
     return (src_rc == ERROR_SUCCESS) ? 0 : -1;
 }
 
-/* For a brand-new file staged with an owner-only protected DACL, restore default parent-inherited
- * permissions by applying an empty unprotected DACL so Windows propagates inheritable parent ACEs. */
+/* For a brand-new file staged with an owner-only protected DACL, obtain the exact kernel-computed
+ * default DACL (inheritable parent ACEs or fallback to the creator token's default DACL) by
+ * creating an empty sibling template with NULL SECURITY_ATTRIBUTES, copying its DACL onto `path`,
+ * and deleting the empty template. */
 int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
 {
     (void)base_mode;
     if (path == NULL || path[0] == '\0') return -1;
-    wchar_t *wp = gs_utf8_to_wide(path);
-    if (wp == NULL) return -1;
-    ACL emptyAcl;
-    if (!InitializeAcl(&emptyAcl, sizeof(emptyAcl), ACL_REVISION)) {
-        free(wp);
+    static volatile LONG gs_win_tmpl_seq = 0;
+    const char *s1 = strrchr(path, '\\');
+    const char *s2 = strrchr(path, '/');
+    const char *sep = (s1 > s2) ? s1 : s2;
+    size_t pfx_len = (sep != NULL) ? (size_t)(sep - path + 1) : 0;
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+    char *tmpl = (char *)malloc(pfx_len + 64);
+    if (tmpl == NULL) return -1;
+    if (pfx_len > 0) memcpy(tmpl, path, pfx_len);
+
+    wchar_t *wtmpl = NULL;
+    int created = 0;
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        LONG seq = InterlockedIncrement(&gs_win_tmpl_seq);
+        snprintf(tmpl + pfx_len, 64, ".gsp_%lu_%ld", pid, (long)seq);
+        wtmpl = gs_utf8_to_wide(tmpl);
+        if (wtmpl == NULL) {
+            free(tmpl);
+            return -1;
+        }
+        HANDLE h = CreateFileW(wtmpl, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            created = 1;
+            break;
+        }
+        DWORD err = GetLastError();
+        free(wtmpl);
+        wtmpl = NULL;
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) {
+            free(tmpl);
+            return -1;
+        }
+    }
+    if (!created) {
+        free(tmpl);
         return -1;
     }
-    DWORD rc = SetNamedSecurityInfoW(
-        wp,
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-        NULL,
-        NULL,
-        &emptyAcl,
-        NULL
-    );
-    free(wp);
-    return (rc == ERROR_SUCCESS) ? 0 : -1;
+    int32_t rc = gs_sys_copy_file_acl(tmpl, path);
+    DeleteFileW(wtmpl);
+    free(wtmpl);
+    free(tmpl);
+    return rc;
 }
 
 static int64_t gs_filetime_to_unix_ms(FILETIME ft)

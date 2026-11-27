@@ -496,14 +496,46 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
     return 0;
 }
 
-/* Set permissions for a brand-new file honoring the caller's process umask (`base_mode & ~umask`). */
+/* Set permissions/ACLs for a brand-new staged file by creating an empty kernel-default
+ * template sibling (`O_CREAT|O_EXCL|O_NOFOLLOW`, `base_mode`), copying its kernel-computed
+ * owner/group/mode/ACL onto `path`, and removing the empty template. Never mutates process umask
+ * and accurately reflects both umask and parent-directory default/inherited ACLs. */
 int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
 {
     if (path == NULL || path[0] == '\0' || base_mode < 0) return -1;
-    mode_t u = umask(0);
-    umask(u);
-    mode_t m = ((mode_t)(base_mode & 0777)) & ~u;
-    return (chmod(path, m) == 0) ? 0 : -1;
+    static unsigned int gs_umask_seq = 0;
+    const char *slash = strrchr(path, '/');
+    size_t pfx_len = (slash != NULL) ? (size_t)(slash - path + 1) : 0;
+    unsigned long pid = (unsigned long)getpid();
+    size_t buf_len = pfx_len + 64;
+    char *tmpl = (char *)malloc(buf_len);
+    if (tmpl == NULL) return -1;
+    if (pfx_len > 0) memcpy(tmpl, path, pfx_len);
+    mode_t m = (mode_t)(base_mode & 0777);
+
+    int created = 0;
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        unsigned int seq = __atomic_add_fetch(&gs_umask_seq, 1u, __ATOMIC_RELAXED);
+        snprintf(tmpl + pfx_len, 64, ".gsp_%lu_%u", pid, seq);
+        int fd = open(tmpl, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, m);
+        if (fd >= 0) {
+            close(fd);
+            created = 1;
+            break;
+        }
+        if (errno != EEXIST) {
+            free(tmpl);
+            return -1;
+        }
+    }
+    if (!created) {
+        free(tmpl);
+        return -1;
+    }
+    int32_t rc = gs_sys_copy_file_acl(tmpl, path);
+    unlink(tmpl);
+    free(tmpl);
+    return rc;
 }
 
 int64_t gs_sys_file_mtime_ms(const char *path)

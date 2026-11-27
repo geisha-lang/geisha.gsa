@@ -7057,15 +7057,31 @@ EOF
     fi
     rm -f "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa"
 
-    # POSIX umask 077 must be honored for brand-new generated files (must be 0o600, not hardcoded 0o644)
+    # POSIX umask 077 must be honored for brand-new generated files and match an ordinary sibling file's mode/ACL
     T44_UMASK_SITE="$TMP_DIR/t44_umask_site"
-    (umask 077 && cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_UMASK_SITE" --no-stdlib) >/dev/null
+    mkdir -p "$T44_UMASK_SITE"
+    (umask 077 && : > "$T44_UMASK_SITE/plain.ref" && cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_UMASK_SITE" --no-stdlib) >/dev/null
+    T44_UMASK_REF="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/plain.ref")"
     T44_UMASK_IDX="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/index.html")"
     T44_UMASK_MOD="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/modules/docdemo.math.html")"
     T44_UMASK_MF="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/.geisha-doc-manifest")"
-    if [ "$T44_UMASK_IDX" != "0o600" ] || [ "$T44_UMASK_MOD" != "0o600" ] || [ "$T44_UMASK_MF" != "0o600" ]; then
-        echo "FAIL [doc_umask_077_new_files]: expected 0o600 under umask 077, got index=$T44_UMASK_IDX mod=$T44_UMASK_MOD mf=$T44_UMASK_MF" >&2
+    if [ "$T44_UMASK_IDX" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_MOD" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_MF" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_REF" != "0o600" ]; then
+        echo "FAIL [doc_umask_077_new_files]: expected mode matching plain sibling ($T44_UMASK_REF == 0o600), got index=$T44_UMASK_IDX mod=$T44_UMASK_MOD mf=$T44_UMASK_MF" >&2
         exit 1
+    fi
+    if [ "$UNAME_S" = "Darwin" ]; then
+        T44_INH_SITE="$TMP_DIR/t44_mac_inh_site"
+        mkdir -p "$T44_INH_SITE"
+        if chmod +a "user:nobody deny read,file_inherit" "$T44_INH_SITE" 2>/dev/null; then
+            : > "$T44_INH_SITE/plain.ref"
+            (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_INH_SITE" --no-stdlib) >/dev/null
+            T44_REF_ACL="$(ls -le "$T44_INH_SITE/plain.ref" | grep 'user:nobody' || true)"
+            T44_DOC_ACL="$(ls -le "$T44_INH_SITE/index.html" | grep 'user:nobody' || true)"
+            if [ -n "$T44_REF_ACL" ] && [ -z "$T44_DOC_ACL" ]; then
+                echo "FAIL [doc_posix_inherited_acl]: expected new doc file to match sibling inherited macOS ACL" >&2
+                exit 1
+            fi
+        fi
     fi
 
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
@@ -7086,6 +7102,26 @@ if [ "$T44_IS_WIN" -eq 1 ]; then
     (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
     if ! MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" | grep -qi "DENY"; then
         echo "FAIL [doc_preserve_win_dacl]: expected explicit Windows DACL DENY ACE preserved after replacement" >&2
+        exit 1
+    fi
+
+    # Verify Windows directory writable by creator with NO inheritable ACEs falls back to creator's
+    # default DACL (matching ordinary sibling file creation) and remains readable across regeneration
+    T44_WIN_NOINH="$TMP_DIR/t44_win_noinh"
+    mkdir -p "$T44_WIN_NOINH"
+    T44_WIN_NOINH_W="$(cygpath -w "$T44_WIN_NOINH")"
+    T44_WIN_ACCT="${USERNAME:-$(whoami)}"
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_NOINH_W" /inheritance:r >/dev/null
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_NOINH_W" /grant "${T44_WIN_ACCT}:(F)" >/dev/null
+    printf 'plain\n' > "$T44_WIN_NOINH/plain.ref"
+    (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_WIN_NOINH" --no-stdlib) >/dev/null
+    if ! grep -q 'plain' "$T44_WIN_NOINH/plain.ref" || ! grep -q 'docdemo' "$T44_WIN_NOINH/index.html"; then
+        echo "FAIL [doc_win_no_inherit_dir_read]: generated index.html in non-inheriting dir must be readable like plain sibling" >&2
+        exit 1
+    fi
+    (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_WIN_NOINH" --no-stdlib) >/dev/null
+    if ! grep -q 'docdemo' "$T44_WIN_NOINH/index.html"; then
+        echo "FAIL [doc_win_no_inherit_dir_regen]: regeneration in non-inheriting dir must succeed and remain readable" >&2
         exit 1
     fi
 fi
