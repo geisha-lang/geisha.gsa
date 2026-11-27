@@ -675,6 +675,7 @@ def parseTomlValue(p: TomlParser): Result Value String = {
     }
 }
 
+/// Parse a TOML v1.0 document string into a `std.codec.Value` (`VObj`).
 pub def parse(raw: String): Result Value String = {
     let p = newTomlParser(raw);
     if (p.tpLen >= 3 && strByteAt(raw, 0) == 239 && strByteAt(raw, 1) == 187 && strByteAt(raw, 2) == 191) {
@@ -773,6 +774,7 @@ pub def parse(raw: String): Result Value String = {
     }
 }
 
+/// Parse `raw` as TOML and run typed `std.codec.Decoder` `dec` on the resulting value.
 pub def decodeString(dec: Decoder a, raw: String): Result a DecodeErr =
     match parse(raw) {
         Err(msg) -> Err(makeErr("$", msg)),
@@ -1032,6 +1034,7 @@ def emitTableBody(b: StringBuf, prefix: List String, fields: List (String, Value
     }
 }
 
+/// Serialize a `std.codec.Value` into canonical TOML text.
 pub def stringify(v: Value): String = {
     let b = bufNew();
     match v {
@@ -1044,5 +1047,613 @@ pub def stringify(v: Value): String = {
     bufToString(b)
 }
 
+/// Encode `x` via `Encode` and serialize it to canonical TOML text.
 pub def toToml(x): forall a. (Encode a) => a -> String =
     stringify(encode(x))
+
+// ---- Span-Based Comment-Preserving Patcher (`patch`) ----
+
+data SecKind {
+    SecRoot,
+    SecTable(List String),
+    SecArrTable(List String, Int),
+}
+
+data KvSpan {
+    MkKvSpan {
+        relKey: List String,
+        oldVal: Value,
+        lineStart: Int,
+        valStart: Int,
+        valEnd: Int,
+        lineEnd: Int,
+    },
+}
+
+data TomlSec {
+    MkTomlSec {
+        kind: SecKind,
+        secStart: Int,
+        bodyStart: Int,
+        secEnd: Int,
+        kvs: List KvSpan,
+    },
+}
+
+def pathEq(a: List String, b: List String): Bool = match (a, b) {
+    (Nil, Nil) -> true,
+    (Cons(ha, ta), Cons(hb, tb)) -> ha == hb && pathEq(ta, tb),
+    _ -> false,
+}
+
+def pathHasPrefix(path: List String, prefix: List String): Bool = match prefix {
+    Nil -> true,
+    Cons(hp, tp) -> match path {
+        Cons(h, t) -> h == hp && pathHasPrefix(t, tp),
+        Nil -> false,
+    },
+}
+
+def cleanValueOpt(v: Value): Option Value = match v {
+    VNull -> None,
+    VObj(fs) -> Some(VObj(cleanObjFields(fs))),
+    VArr(xs) -> {
+        let out = cellNew(Nil);
+        let cur = cellNew(xs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, r) -> {
+                    match cleanValueOpt(h) {
+                        Some(ch) -> cellSet(out, Cons(ch, cellGet(out))),
+                        None -> (),
+                    };
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        Some(VArr(listRev(cellGet(out))))
+    },
+    other -> Some(other),
+}
+
+def cleanObjFields(fs: List (String, Value)): List (String, Value) = {
+    let out = cellNew(Nil);
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), r) -> {
+                match cleanValueOpt(v) {
+                    Some(cv) -> cellSet(out, Cons((k, cv), cellGet(out))),
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(out))
+}
+
+def tomlValEq(a: Value, b: Value): Bool = match (a, b) {
+    (VNull, VNull) -> true,
+    (VBool(x), VBool(y)) -> x == y,
+    (VInt(x), VInt(y)) -> x == y,
+    (VFloat(x), VFloat(y)) -> floatToBits64(x) == floatToBits64(y),
+    (VStr(x), VStr(y)) -> x == y,
+    (VArr(xs), VArr(ys)) -> tomlListEq(xs, ys),
+    (VObj(fa), VObj(fb)) -> {
+        let ca = cleanObjFields(fa);
+        let cb = cleanObjFields(fb);
+        listLen(ca) == listLen(cb) && tomlFieldsSubset(ca, cb)
+    },
+    _ -> false,
+}
+
+def tomlListEq(xs: List Value, ys: List Value): Bool = match (xs, ys) {
+    (Nil, Nil) -> true,
+    (Cons(hx, tx), Cons(hy, ty)) -> tomlValEq(hx, hy) && tomlListEq(tx, ty),
+    _ -> false,
+}
+
+def tomlFieldsSubset(fa: List (String, Value), fb: List (String, Value)): Bool = match fa {
+    Nil -> true,
+    Cons((k, va), r) -> match objGet(fb, k) {
+        Some(vb) -> tomlValEq(va, vb) && tomlFieldsSubset(r, fb),
+        None -> false,
+    },
+}
+
+def lookupAtPath(fs: List (String, Value), path: List String): Option Value = match path {
+    Nil -> Some(VObj(fs)),
+    Cons(k, Nil) -> objGet(fs, k),
+    Cons(k, rest) -> match objGet(fs, k) {
+        Some(VObj(sub)) -> lookupAtPath(sub, rest),
+        _ -> None,
+    },
+}
+
+def objDeleteKey(fs: List (String, Value), key: String): List (String, Value) = match fs {
+    Nil -> Nil,
+    Cons((k, v), r) ->
+        if (k == key) objDeleteKey(r, key)
+        else Cons((k, v), objDeleteKey(r, key)),
+}
+
+def deleteAtPath(fs: List (String, Value), path: List String): List (String, Value) = match path {
+    Nil -> Nil,
+    Cons(k, Nil) -> objDeleteKey(fs, k),
+    Cons(k, rest) -> match objGet(fs, k) {
+        Some(VObj(sub)) -> {
+            let sub2 = deleteAtPath(sub, rest);
+            match sub2 {
+                Nil -> objDeleteKey(fs, k),
+                _ -> objSet(fs, k, VObj(sub2)),
+            }
+        },
+        _ -> fs,
+    },
+}
+
+def nthValue(xs: List Value, idx: Int): Option Value = match xs {
+    Nil -> None,
+    Cons(h, t) -> if (idx <= 0) Some(h) else nthValue(t, idx - 1),
+}
+
+def isArrayOfAnyObjs(xs: List Value): Bool = match xs {
+    Nil -> false,
+    _ -> {
+        let cur = cellNew(xs);
+        let ok = cellNew(true);
+        while (match cellGet(cur) { Nil -> false, _ -> cellGet(ok) }) {
+            match cellGet(cur) {
+                Cons(VObj(_), r) -> cellSet(cur, r),
+                _ -> cellSet(ok, false),
+            }
+        };
+        cellGet(ok)
+    },
+}
+
+def findLineStart(raw: String, pos: Int): Int = {
+    let i = cellNew(pos);
+    while (cellGet(i) > 0 && isHorizWs(strByteAt(raw, cellGet(i) - 1))) {
+        cellSet(i, cellGet(i) - 1)
+    };
+    cellGet(i)
+}
+
+def bumpArrCount(counts: List (List String, Int), hdr: List String): (Int, List (List String, Int)) = match counts {
+    Nil -> (0, [(hdr, 1)]),
+    Cons((p, c), r) ->
+        if (pathEq(p, hdr)) (c, Cons((p, c + 1), r))
+        else {
+            let (idx, r2) = bumpArrCount(r, hdr);
+            (idx, Cons((p, c), r2))
+        },
+}
+
+def lookupArrCount(counts: List (List String, Int), hdr: List String): Int = match counts {
+    Nil -> 0,
+    Cons((p, c), r) -> if (pathEq(p, hdr)) c else lookupArrCount(r, hdr),
+}
+
+def scanTomlSections(raw: String): Result (List TomlSec, List (List String, Int)) String = {
+    let p = newTomlParser(raw);
+    if (p.tpLen >= 3 && strByteAt(raw, 0) == 239 && strByteAt(raw, 1) == 187 && strByteAt(raw, 2) == 191) {
+        cellSet(p.tpPos, 3)
+    } else ();
+
+    let secsRev: Cell (List TomlSec) = cellNew(Nil);
+    let curKind: Cell SecKind = cellNew(SecRoot);
+    let curSecStart = cellNew(0);
+    let curBodyStart = cellNew(cellGet(p.tpPos));
+    let curKvs: Cell (List KvSpan) = cellNew(Nil);
+    let arrCounts: Cell (List (List String, Int)) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    while ({
+        skipWsAndComments(p);
+        peek(p) >= 0 && match cellGet(errOpt) { None -> true, Some(_) -> false }
+    }) {
+        let tokPos = cellGet(p.tpPos);
+        let lStart = findLineStart(raw, tokPos);
+        if (peek(p) == 91) {
+            cellSet(secsRev, Cons(MkTomlSec {
+                kind: cellGet(curKind),
+                secStart: cellGet(curSecStart),
+                bodyStart: cellGet(curBodyStart),
+                secEnd: lStart,
+                kvs: listRev(cellGet(curKvs)),
+            }, cellGet(secsRev)));
+            cellSet(curKvs, Nil);
+
+            if (peekAt(p, 1) == 91) {
+                let _ = bump(p);
+                let _ = bump(p);
+                match parseDottedKey(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(hdr) -> {
+                        skipInlineWs(p);
+                        if (peek(p) == 93 && peekAt(p, 1) == 93) {
+                            let _ = bump(p);
+                            let _ = bump(p);
+                            match expectLineEndOrEof(p) {
+                                Err(le) -> cellSet(errOpt, Some(le)),
+                                Ok(_) -> {
+                                    let (idx, nc) = bumpArrCount(cellGet(arrCounts), hdr);
+                                    cellSet(arrCounts, nc);
+                                    cellSet(curKind, SecArrTable(hdr, idx));
+                                    cellSet(curSecStart, lStart);
+                                    cellSet(curBodyStart, cellGet(p.tpPos))
+                                },
+                            }
+                        } else {
+                            cellSet(errOpt, Some(tomlErr(p, "expected ']]'")))
+                        }
+                    },
+                }
+            } else {
+                let _ = bump(p);
+                match parseDottedKey(p) {
+                    Err(e) -> cellSet(errOpt, Some(e)),
+                    Ok(hdr) -> {
+                        skipInlineWs(p);
+                        if (peek(p) == 93) {
+                            let _ = bump(p);
+                            match expectLineEndOrEof(p) {
+                                Err(le) -> cellSet(errOpt, Some(le)),
+                                Ok(_) -> {
+                                    cellSet(curKind, SecTable(hdr));
+                                    cellSet(curSecStart, lStart);
+                                    cellSet(curBodyStart, cellGet(p.tpPos))
+                                },
+                            }
+                        } else {
+                            cellSet(errOpt, Some(tomlErr(p, "expected ']'")))
+                        }
+                    },
+                }
+            }
+        } else {
+            match parseDottedKey(p) {
+                Err(e) -> cellSet(errOpt, Some(e)),
+                Ok(relKey) -> {
+                    skipInlineWs(p);
+                    if (peek(p) != 61) {
+                        cellSet(errOpt, Some(tomlErr(p, "expected '='")))
+                    } else {
+                        let _ = bump(p);
+                        skipInlineWs(p);
+                        let vStart = cellGet(p.tpPos);
+                        match parseTomlValue(p) {
+                            Err(ve) -> cellSet(errOpt, Some(ve)),
+                            Ok(oldV) -> {
+                                let vEnd = cellGet(p.tpPos);
+                                match expectLineEndOrEof(p) {
+                                    Err(le) -> cellSet(errOpt, Some(le)),
+                                    Ok(_) -> {
+                                        let lEnd = cellGet(p.tpPos);
+                                        cellSet(curKvs, Cons(MkKvSpan {
+                                            relKey: relKey,
+                                            oldVal: oldV,
+                                            lineStart: lStart,
+                                            valStart: vStart,
+                                            valEnd: vEnd,
+                                            lineEnd: lEnd,
+                                        }, cellGet(curKvs)))
+                                    },
+                                }
+                            },
+                        }
+                    }
+                },
+            }
+        }
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> {
+            let finalSecs = listRev(Cons(MkTomlSec {
+                kind: cellGet(curKind),
+                secStart: cellGet(curSecStart),
+                bodyStart: cellGet(curBodyStart),
+                secEnd: p.tpLen,
+                kvs: listRev(cellGet(curKvs)),
+            }, cellGet(secsRev)));
+            Ok((finalSecs, cellGet(arrCounts)))
+        },
+    }
+}
+
+def rawMentionsPrefix(secs: List TomlSec, targetPrefix: List String): Bool = match secs {
+    Nil -> false,
+    Cons(s, rest) -> {
+        let hit = match s.kind {
+            SecRoot -> kvsMentionPrefix(Nil, s.kvs, targetPrefix),
+            SecTable(tp) ->
+                pathHasPrefix(tp, targetPrefix) || kvsMentionPrefix(tp, s.kvs, targetPrefix),
+            SecArrTable(ap, _) ->
+                pathHasPrefix(ap, targetPrefix),
+        };
+        if (hit) true else rawMentionsPrefix(rest, targetPrefix)
+    },
+}
+
+def kvsMentionPrefix(secPrefix: List String, kvs: List KvSpan, targetPrefix: List String): Bool = match kvs {
+    Nil -> false,
+    Cons(kv, r) -> {
+        let fp = listAppend(secPrefix, kv.relKey);
+        if (pathHasPrefix(fp, targetPrefix)) true
+        else kvsMentionPrefix(secPrefix, r, targetPrefix)
+    },
+}
+
+def secHasInlineObjKv(kvs: List KvSpan): Bool = match kvs {
+    Nil -> false,
+    Cons(kv, r) -> match kv.oldVal {
+        VObj(_) -> true,
+        _ -> secHasInlineObjKv(r),
+    },
+}
+
+def canPatchValueInline(oldVal: Value, newVal: Value): Bool = match newVal {
+    VNull -> false,
+    VObj(subFs) -> match oldVal {
+        VObj(_) -> !objHasNestedTables(subFs),
+        _ -> false,
+    },
+    VArr(xs) -> !isArrayOfNonEmptyObjs(xs),
+    _ -> true,
+}
+
+def ensureEndsWithNewline(b: StringBuf, lastEmittedNl: Cell Bool): Void =
+    if (!cellGet(lastEmittedNl)) {
+        bufPushByte(b, 10);
+        cellSet(lastEmittedNl, true)
+    } else ()
+
+def pushRawSlice(b: StringBuf, raw: String, start: Int, end: Int, lastEmittedNl: Cell Bool): Void =
+    if (end > start) {
+        bufPushStr(b, ptrSliceFromStr(raw, start, end - start));
+        cellSet(lastEmittedNl, strByteAt(raw, end - 1) == 10)
+    } else ()
+
+def emitArrTableBlock(b: StringBuf, hdrPath: List String, itemFs: List (String, Value), lastEmittedNl: Cell Bool): Void = {
+    ensureEndsWithNewline(b, lastEmittedNl);
+    bufPushStr(b, "\n[[");
+    bufPushStr(b, formatKeyPath(hdrPath));
+    bufPushStr(b, "]]\n");
+    cellSet(lastEmittedNl, true);
+    let cf = cellNew(itemFs);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons((ik, iv), rf) -> {
+                bufPushStr(b, formatTomlKey(ik));
+                bufPushStr(b, " = ");
+                emitInlineValue(b, iv);
+                bufPushByte(b, 10);
+                cellSet(lastEmittedNl, true);
+                cellSet(cf, rf)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+/// Update `raw` TOML document to match `next` (`VObj`) while preserving comments,
+/// blank lines, key order, and unmodified literal formatting.
+pub def patch(raw: String, next: Value): Result String String = {
+    let origVal = parse(raw)?;
+    let nextRootFs = match next {
+        VObj(fs) -> cleanObjFields(fs),
+        _ -> returnPatchErr("TOML patch target must be a table (VObj)")?,
+    };
+    if (tomlValEq(origVal, VObj(nextRootFs))) {
+        Ok(raw)
+    } else {
+        let (allSecs, arrCounts) = scanTomlSections(raw)?;
+        let remRoot: Cell (List (String, Value)) = cellNew(nextRootFs);
+        let out = bufNew();
+        let lastNl = cellNew(true);
+
+        let cs = cellNew(allSecs);
+        while (match cellGet(cs) { Nil -> false, _ -> true }) {
+            match cellGet(cs) {
+                Cons(sec, restSecs) -> {
+                    match sec.kind {
+                        SecArrTable(hdrPath, idx) -> {
+                            let nextArrOpt = lookupAtPath(nextRootFs, hdrPath);
+                            let totalOrig = lookupArrCount(arrCounts, hdrPath);
+                            match nextArrOpt {
+                                Some(VArr(items)) if (isArrayOfAnyObjs(items)) -> {
+                                    let newLen = listLen(items);
+                                    if (idx < newLen) {
+                                        let itemFs = match nthValue(items, idx) {
+                                            Some(VObj(ifs)) -> ifs,
+                                            _ -> Nil,
+                                        };
+                                        let remItem: Cell (List (String, Value)) = cellNew(itemFs);
+                                        pushRawSlice(out, raw, sec.secStart, sec.bodyStart, lastNl);
+                                        let cursor = cellNew(sec.bodyStart);
+                                        let ckv = cellNew(sec.kvs);
+                                        while (match cellGet(ckv) { Nil -> false, _ -> true }) {
+                                            match cellGet(ckv) {
+                                                Cons(kv, rkv) -> {
+                                                    pushRawSlice(out, raw, cellGet(cursor), kv.lineStart, lastNl);
+                                                    match lookupAtPath(itemFs, kv.relKey) {
+                                                        Some(nv) -> {
+                                                            if (tomlValEq(kv.oldVal, nv)) {
+                                                                pushRawSlice(out, raw, kv.lineStart, kv.lineEnd, lastNl)
+                                                            } else {
+                                                                pushRawSlice(out, raw, kv.lineStart, kv.valStart, lastNl);
+                                                                emitInlineValue(out, nv);
+                                                                cellSet(lastNl, false);
+                                                                pushRawSlice(out, raw, kv.valEnd, kv.lineEnd, lastNl)
+                                                            };
+                                                            cellSet(remItem, deleteAtPath(cellGet(remItem), kv.relKey))
+                                                        },
+                                                        None -> (),
+                                                    };
+                                                    cellSet(cursor, kv.lineEnd);
+                                                    cellSet(ckv, rkv)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        // Append any newly added fields in this array-table element
+                                        let extraItemFs = cellGet(remItem);
+                                        match extraItemFs {
+                                            Cons(_, _) -> {
+                                                ensureEndsWithNewline(out, lastNl);
+                                                let ce = cellNew(extraItemFs);
+                                                while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                                                    match cellGet(ce) {
+                                                        Cons((ek, ev), re) -> {
+                                                            bufPushStr(out, formatTomlKey(ek));
+                                                            bufPushStr(out, " = ");
+                                                            emitInlineValue(out, ev);
+                                                            bufPushByte(out, 10);
+                                                            cellSet(lastNl, true);
+                                                            cellSet(ce, re)
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                }
+                                            },
+                                            Nil -> (),
+                                        };
+                                        pushRawSlice(out, raw, cellGet(cursor), sec.secEnd, lastNl)
+                                    } else ();
+
+                                    // After the last original `[[hdrPath]]` block, emit any newly appended blocks
+                                    if (idx + 1 == totalOrig) {
+                                        let appIdx = cellNew(totalOrig);
+                                        while (cellGet(appIdx) < newLen) {
+                                            let ai = cellGet(appIdx);
+                                            match nthValue(items, ai) {
+                                                Some(VObj(afs)) -> emitArrTableBlock(out, hdrPath, afs, lastNl),
+                                                _ -> (),
+                                            };
+                                            cellSet(appIdx, ai + 1)
+                                        };
+                                        cellSet(remRoot, deleteAtPath(cellGet(remRoot), hdrPath))
+                                    } else ()
+                                },
+                                _ -> (),
+                            }
+                        },
+                        _ -> {
+                            let tblPath = match sec.kind {
+                                SecTable(tp) -> tp,
+                                _ -> Nil,
+                            };
+                            let isRoot = match sec.kind { SecRoot -> true, _ -> false };
+                            let tblTargetOpt = lookupAtPath(nextRootFs, tblPath);
+                            let keepSection = isRoot || (match tblTargetOpt { Some(VObj(_)) -> true, _ -> false });
+                            if (keepSection) {
+                                let tblFs = match tblTargetOpt {
+                                    Some(VObj(tfs)) -> tfs,
+                                    _ -> Nil,
+                                };
+                                pushRawSlice(out, raw, sec.secStart, sec.bodyStart, lastNl);
+                                let cursor = cellNew(sec.bodyStart);
+                                let ckv = cellNew(sec.kvs);
+                                while (match cellGet(ckv) { Nil -> false, _ -> true }) {
+                                    match cellGet(ckv) {
+                                        Cons(kv, rkv) -> {
+                                            pushRawSlice(out, raw, cellGet(cursor), kv.lineStart, lastNl);
+                                            let fullKvPath = listAppend(tblPath, kv.relKey);
+                                            match lookupAtPath(tblFs, kv.relKey) {
+                                                Some(nv) if (canPatchValueInline(kv.oldVal, nv)) -> {
+                                                    if (tomlValEq(kv.oldVal, nv)) {
+                                                        pushRawSlice(out, raw, kv.lineStart, kv.lineEnd, lastNl)
+                                                    } else {
+                                                        pushRawSlice(out, raw, kv.lineStart, kv.valStart, lastNl);
+                                                        emitInlineValue(out, nv);
+                                                        cellSet(lastNl, false);
+                                                        pushRawSlice(out, raw, kv.valEnd, kv.lineEnd, lastNl)
+                                                    };
+                                                    cellSet(remRoot, deleteAtPath(cellGet(remRoot), fullKvPath))
+                                                },
+                                                _ -> (),
+                                            };
+                                            cellSet(cursor, kv.lineEnd);
+                                            cellSet(ckv, rkv)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+
+                                // Append brand-new inline keys belonging directly to `tblPath`
+                                let hasInlineObjs = isCompactInlineTableParent(tblPath) || secHasInlineObjKv(sec.kvs);
+                                let remTblFs = match lookupAtPath(cellGet(remRoot), tblPath) {
+                                    Some(VObj(rfs)) -> rfs,
+                                    _ -> Nil,
+                                };
+                                let cf = cellNew(remTblFs);
+                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons((fk, fv), rf) -> {
+                                            let childPath = listAppend(tblPath, [fk]);
+                                            if (!rawMentionsPrefix(allSecs, childPath)) {
+                                                let emitHere = match fv {
+                                                    VNull -> false,
+                                                    VObj(subFs) -> hasInlineObjs && !objHasNestedTables(subFs),
+                                                    VArr(xs) -> !isArrayOfNonEmptyObjs(xs),
+                                                    _ -> true,
+                                                };
+                                                if (emitHere) {
+                                                    if (!isRoot || strLen(bufToString(out)) > 0) {
+                                                        ensureEndsWithNewline(out, lastNl)
+                                                    } else ();
+                                                    bufPushStr(out, formatTomlKey(fk));
+                                                    bufPushStr(out, " = ");
+                                                    emitInlineValue(out, fv);
+                                                    bufPushByte(out, 10);
+                                                    cellSet(lastNl, true);
+                                                    cellSet(remRoot, deleteAtPath(cellGet(remRoot), childPath))
+                                                } else ()
+                                            } else ();
+                                            cellSet(cf, rf)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+
+                                // If `[tblPath]` was an explicit empty table in `next`, mark it emitted
+                                if (!isRoot) {
+                                    match lookupAtPath(cellGet(remRoot), tblPath) {
+                                        Some(VObj(Nil)) -> cellSet(remRoot, deleteAtPath(cellGet(remRoot), tblPath)),
+                                        _ -> (),
+                                    }
+                                } else ();
+
+                                pushRawSlice(out, raw, cellGet(cursor), sec.secEnd, lastNl)
+                            } else ()
+                        },
+                    };
+                    cellSet(cs, restSecs)
+                },
+                Nil -> (),
+            }
+        };
+
+        // Emit any remaining brand-new tables / array-of-tables at EOF
+        let leftover = cellGet(remRoot);
+        match leftover {
+            Cons(_, _) -> {
+                let curText = bufToString(out);
+                let hadContent = strLen(curText) > 0;
+                if (hadContent) ensureEndsWithNewline(out, lastNl) else ();
+                emitTableBody(out, Nil, leftover, cellNew(hadContent))
+            },
+            Nil -> (),
+        };
+
+        Ok(bufToString(out))
+    }
+}
+
+def returnPatchErr(msg: String): Result (List (String, Value)) String = Err(msg)

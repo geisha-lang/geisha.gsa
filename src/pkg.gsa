@@ -1299,18 +1299,69 @@ def detectPkgSrcDirs(pkgRoot: String, mf: Manifest, fallbackAlias: String): List
     }
 }
 
+def optStrOr(over: Option String, base: Option String): Option String = match over {
+    Some(_) -> over,
+    None -> base,
+}
+
+def mergeLocalTargetCfg(base: TargetCfg, over: TargetCfg): TargetCfg = MkTargetCfg {
+    tcCSources: appendUniqueList(base.tcCSources, over.tcCSources),
+    tcCFlags: appendUniqueList(base.tcCFlags, over.tcCFlags),
+    tcLinkFlags: appendUniqueList(base.tcLinkFlags, over.tcLinkFlags),
+    tcExtraUnits: listAppend(base.tcExtraUnits, over.tcExtraUnits),
+    tcExports: appendUniqueList(base.tcExports, over.tcExports),
+    tcWebAssets: appendUniqueList(base.tcWebAssets, over.tcWebAssets),
+    tcOwnsMain: base.tcOwnsMain || over.tcOwnsMain,
+    tcBootSymbol: optStrOr(over.tcBootSymbol, base.tcBootSymbol),
+}
+
+def mergeLocalAppleBundleCfg(base: AppleBundleCfg, over: AppleBundleCfg): AppleBundleCfg = MkAppleBundleCfg {
+    abBundleId: optStrOr(over.abBundleId, base.abBundleId),
+    abBundleName: optStrOr(over.abBundleName, base.abBundleName),
+    abVersion: optStrOr(over.abVersion, base.abVersion),
+    abMinOs: optStrOr(over.abMinOs, base.abMinOs),
+    abFrameworks: appendUniqueList(base.abFrameworks, over.abFrameworks),
+    abWeakFrameworks: appendUniqueList(base.abWeakFrameworks, over.abWeakFrameworks),
+    abLsuiElement: base.abLsuiElement || over.abLsuiElement,
+    abIsExtension: base.abIsExtension || over.abIsExtension,
+    abExtensionPoint: optStrOr(over.abExtensionPoint, base.abExtensionPoint),
+    abPrincipalClass: optStrOr(over.abPrincipalClass, base.abPrincipalClass),
+    abInfoPlist: optStrOr(over.abInfoPlist, base.abInfoPlist),
+    abEntitlements: optStrOr(over.abEntitlements, base.abEntitlements),
+    abIcon: optStrOr(over.abIcon, base.abIcon),
+    abResources: appendUniqueList(base.abResources, over.abResources),
+    abProvisioningProfile: optStrOr(over.abProvisioningProfile, base.abProvisioningProfile),
+    abEmbedExtensions: appendUniqueList(base.abEmbedExtensions, over.abEmbedExtensions),
+    abCodesign: optStrOr(over.abCodesign, base.abCodesign),
+}
+
 def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List DepDecl, List LockEntry) String = {
     let mfPath = pathJoin(projectDir, "geisha.toml");
     let rawMf = readFile(mfPath)?;
-    let mf = parseManifestToml(rawMf, pathBasename(absPath(projectDir)))?;
+    let mf0 = parseManifestToml(rawMf, pathBasename(absPath(projectDir)))?;
 
     let localMfPath = pathJoin(projectDir, "geisha.local.toml");
-    let localOverrides =
+    let (mf, localOverrides) =
         if (fileExists(localMfPath)) {
             let rawLocal = readFile(localMfPath)?;
-            let lmf = parseManifestToml(rawLocal, mf.mfName)?;
-            lmf.mfOverrides
-        } else Nil;
+            let lmf = parseManifestToml(rawLocal, mf0.mfName)?;
+            let mergedMf = MkManifest {
+                mfName: mf0.mfName,
+                mfVersion: mf0.mfVersion,
+                mfEntry: mf0.mfEntry,
+                mfSrcDir: mf0.mfSrcDir,
+                mfTests: mf0.mfTests,
+                mfDeps: mf0.mfDeps,
+                mfOverrides: mf0.mfOverrides,
+                mfNative: mergeLocalTargetCfg(mf0.mfNative, lmf.mfNative),
+                mfWasm: mergeLocalTargetCfg(mf0.mfWasm, lmf.mfWasm),
+                mfMacos: mergeLocalTargetCfg(mf0.mfMacos, lmf.mfMacos),
+                mfIos: mergeLocalTargetCfg(mf0.mfIos, lmf.mfIos),
+                mfMacosBundle: mergeLocalAppleBundleCfg(mf0.mfMacosBundle, lmf.mfMacosBundle),
+                mfIosBundle: mergeLocalAppleBundleCfg(mf0.mfIosBundle, lmf.mfIosBundle),
+            };
+            (mergedMf, lmf.mfOverrides)
+        } else (mf0, Nil);
 
     let allOverrides = listAppend(localOverrides, mf.mfOverrides);
 
@@ -2136,7 +2187,15 @@ pub def cmdAdd(args: List String): Result Void String = {
     let rawToml = readFile(mfPath)?;
     let rootVal = tomlParse(rawToml)?;
     let updatedRoot = upsertDepInManifestVal(rootVal, depKey, depValObj)?;
-    writeFile(mfPath, tomlStringify(updatedRoot))?;
+    let depLine = formatSingleDepTomlLine(depKey, depValObj);
+    let outText = match patchDepsTableText(rawToml, depKey, Some(depLine)) {
+        Some(patched) -> match tomlParse(patched) {
+            Ok(_) -> patched,
+            Err(_) -> tomlStringify(updatedRoot),
+        },
+        None -> tomlStringify(updatedRoot),
+    };
+    writeFile(mfPath, outText)?;
 
     let (_, _, resolved) = resolveProjectGraph(projDir, false, None, true)?;
     printLn("Added '" + depKey + "' to geisha.toml (" + intToStr(listLen(resolved)) + " package(s) resolved)");
@@ -2255,6 +2314,199 @@ def upsertFieldPair(fs: List (String, Value), key: String, val: Value): List (St
     if (!cellGet(found)) listAppend(cellGet(out), [(key, val)]) else cellGet(out)
 }
 
+def formatSingleDepTomlLine(depKey: String, depVal: Value): String = {
+    let snippet = tomlStringify(VObj([("deps", VObj([(depKey, depVal)]))]));
+    let lines = strSplitChar(snippet, '\n');
+    match lines {
+        Cons(_, Cons(line2, _)) -> strTrim(line2),
+        _ -> depKey + " = {}",
+    }
+}
+
+def stripTomlLineComment(line: String): String = {
+    let n = strLen(line);
+    let i = cellNew(0);
+    let inDq = cellNew(false);
+    let inSq = cellNew(false);
+    let cut = cellNew(n);
+    while (cellGet(i) < n && cellGet(cut) == n) {
+        let idx = cellGet(i);
+        let c = strByteAt(line, idx);
+        if (cellGet(inDq)) {
+            if (c == 92) cellSet(i, idx + 2)
+            else {
+                if (c == 34) cellSet(inDq, false) else ();
+                cellSet(i, idx + 1)
+            }
+        } else if (cellGet(inSq)) {
+            if (c == 39) cellSet(inSq, false) else ();
+            cellSet(i, idx + 1)
+        } else {
+            if (c == 34) { cellSet(inDq, true); cellSet(i, idx + 1) }
+            else if (c == 39) { cellSet(inSq, true); cellSet(i, idx + 1) }
+            else if (c == 35) cellSet(cut, idx)
+            else cellSet(i, idx + 1)
+        }
+    };
+    strTrim(strSlice(line, 0, cellGet(cut)))
+}
+
+def lineAssignedKey(cleanLine: String): Option String =
+    match strIndexOfByte(cleanLine, 61, 0) {
+        None -> None,
+        Some(eqIdx) -> {
+            let rawK = strTrim(strSlice(cleanLine, 0, eqIdx));
+            let kl = strLen(rawK);
+            if (kl >= 2 && ((strByteAt(rawK, 0) == 34 && strByteAt(rawK, kl - 1) == 34) || (strByteAt(rawK, 0) == 39 && strByteAt(rawK, kl - 1) == 39))) {
+                Some(strSlice(rawK, 1, kl - 1))
+            } else if (kl > 0) {
+                Some(rawK)
+            } else None
+        },
+    }
+
+def splitKeepLines(raw: String): List String = {
+    let n = strLen(raw);
+    let acc = cellNew(Nil);
+    let start = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        if (strByteAt(raw, idx) == 10) {
+            cellSet(acc, Cons(strSlice(raw, cellGet(start), idx + 1), cellGet(acc)));
+            cellSet(start, idx + 1)
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    if (cellGet(start) < n) {
+        cellSet(acc, Cons(strSlice(raw, cellGet(start), n), cellGet(acc)))
+    } else ();
+    listRev(cellGet(acc))
+}
+
+def patchDepsTableText(rawToml: String, depKey: String, newLineOpt: Option String): Option String = {
+    let lines = splitKeepLines(rawToml);
+    let curSec = cellNew("");
+    let sawDepsHdr = cellNew(false);
+    let sawSubDepsHdr = cellNew(false);
+    let matchedKey = cellNew(false);
+    let preDepsAndBody: Cell (List String) = cellNew(Nil);
+    let depsTrailingWs: Cell (List String) = cellNew(Nil);
+    let postDeps: Cell (List String) = cellNew(Nil);
+    let inPostDeps = cellNew(false);
+
+    let flushTrailingToBody = () -> {
+        let tw = listRev(cellGet(depsTrailingWs));
+        let ct = cellNew(tw);
+        while (match cellGet(ct) { Nil -> false, _ -> true }) {
+            match cellGet(ct) {
+                Cons(w, rw) -> {
+                    cellSet(preDepsAndBody, Cons(w, cellGet(preDepsAndBody)));
+                    cellSet(ct, rw)
+                },
+                Nil -> (),
+            }
+        };
+        cellSet(depsTrailingWs, Nil)
+    };
+
+    let cl = cellNew(lines);
+    while (match cellGet(cl) { Nil -> false, _ -> true }) {
+        match cellGet(cl) {
+            Cons(ln, rl) -> {
+                let clean = stripTomlLineComment(ln);
+                let isHdr = strLen(clean) >= 2 && strByteAt(clean, 0) == 91;
+                if (isHdr) {
+                    if (strStartsWith(clean, "[deps.") || strStartsWith(clean, "[[deps")) {
+                        cellSet(sawSubDepsHdr, true)
+                    } else ();
+                    if (cellGet(curSec) == "[deps]") {
+                        cellSet(inPostDeps, true)
+                    } else ();
+                    cellSet(curSec, clean);
+                    if (clean == "[deps]") {
+                        cellSet(sawDepsHdr, true);
+                        cellSet(inPostDeps, false);
+                        cellSet(preDepsAndBody, Cons(ln, cellGet(preDepsAndBody)))
+                    } else if (cellGet(inPostDeps)) {
+                        cellSet(postDeps, Cons(ln, cellGet(postDeps)))
+                    } else {
+                        cellSet(preDepsAndBody, Cons(ln, cellGet(preDepsAndBody)))
+                    }
+                } else if (cellGet(curSec) == "[deps]" && !cellGet(inPostDeps)) {
+                    if (strLen(strTrim(ln)) == 0) {
+                        cellSet(depsTrailingWs, Cons(ln, cellGet(depsTrailingWs)))
+                    } else {
+                        flushTrailingToBody();
+                        match lineAssignedKey(clean) {
+                            Some(k) if (k == depKey) -> {
+                                cellSet(matchedKey, true);
+                                match newLineOpt {
+                                    Some(nl) -> cellSet(preDepsAndBody, Cons(nl + "\n", cellGet(preDepsAndBody))),
+                                    None -> (),
+                                }
+                            },
+                            _ -> cellSet(preDepsAndBody, Cons(ln, cellGet(preDepsAndBody))),
+                        }
+                    }
+                } else if (cellGet(inPostDeps)) {
+                    cellSet(postDeps, Cons(ln, cellGet(postDeps)))
+                } else {
+                    cellSet(preDepsAndBody, Cons(ln, cellGet(preDepsAndBody)))
+                };
+                cellSet(cl, rl)
+            },
+            Nil -> (),
+        }
+    };
+
+    if (cellGet(sawSubDepsHdr)) None
+    else {
+        let out = bufNew();
+        let emitList = (xs: List String) -> {
+            let cx = cellNew(xs);
+            while (match cellGet(cx) { Nil -> false, _ -> true }) {
+                match cellGet(cx) {
+                    Cons(s, rx) -> { bufPushStr(out, s); cellSet(cx, rx) },
+                    Nil -> (),
+                }
+            }
+        };
+
+        emitList(listRev(cellGet(preDepsAndBody)));
+        if (cellGet(sawDepsHdr)) {
+            if (!cellGet(matchedKey)) {
+                match newLineOpt {
+                    Some(nl) -> {
+                        let curS = bufToString(out);
+                        if (strLen(curS) > 0 && strByteAt(curS, strLen(curS) - 1) != 10) {
+                            bufPushByte(out, 10)
+                        } else ();
+                        bufPushStr(out, nl + "\n")
+                    },
+                    None -> (),
+                }
+            } else ();
+            emitList(listRev(cellGet(depsTrailingWs)));
+            emitList(listRev(cellGet(postDeps)));
+            Some(bufToString(out))
+        } else {
+            match newLineOpt {
+                Some(nl) -> {
+                    let curS = bufToString(out);
+                    if (strLen(curS) > 0 && strByteAt(curS, strLen(curS) - 1) != 10) {
+                        bufPushByte(out, 10)
+                    } else ();
+                    if (strLen(curS) > 0) bufPushByte(out, 10) else ();
+                    bufPushStr(out, "[deps]\n" + nl + "\n");
+                    Some(bufToString(out))
+                },
+                None -> Some(rawToml),
+            }
+        }
+    }
+}
+
 pub def cmdRemove(args: List String): Result Void String = {
     let projDir = match findProjectRoot(".") {
         Some(d) -> d,
@@ -2295,7 +2547,14 @@ pub def cmdRemove(args: List String): Result Void String = {
                     Nil -> (),
                 }
             };
-            writeFile(mfPath, tomlStringify(VObj(cellGet(outFs))))?;
+            let outText = match patchDepsTableText(rawToml, targetAlias, None) {
+                Some(patched) -> match tomlParse(patched) {
+                    Ok(_) -> patched,
+                    Err(_) -> tomlStringify(VObj(cellGet(outFs))),
+                },
+                None -> tomlStringify(VObj(cellGet(outFs))),
+            };
+            writeFile(mfPath, outText)?;
             let _ = resolveProjectGraph(projDir, false, None, true)?;
             printLn("Removed '" + targetAlias + "' from geisha.toml");
             Ok(())

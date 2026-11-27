@@ -48,6 +48,10 @@ During multi-repo development, create an untracked `geisha.local.toml` (automati
 ```toml
 [overrides]
 "github.com/geisha-lang/crema" = { path = "../crema" }
+
+# Optional machine-local target & code-signing overrides (keeps geisha.toml CI-portable):
+[target.macos]
+codesign = "Apple Development"
 ```
 
 ---
