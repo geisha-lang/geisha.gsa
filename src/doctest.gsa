@@ -498,7 +498,7 @@ def normalizeCrLf(s: String): String = {
     while (cellGet(i) < n) {
         let idx = cellGet(i);
         let c = strByteAt(s, idx);
-        if (c == 13 && idx + 1 < n && strByteAt(s, idx + 1) == 10) {
+        if (c == 13) {
             ()
         } else {
             bufPushByte(b, c)
@@ -886,7 +886,8 @@ pub def cmdDocTest(
                                                             },
                                                             Some(exp) -> {
                                                                 let actual = strTrim(normalizeCrLf(out.stdout));
-                                                                if (actual == exp) {
+                                                                let want = strTrim(normalizeCrLf(exp));
+                                                                if (actual == want) {
                                                                     printLn("  [PASS] " + label);
                                                                     cellSet(passed, cellGet(passed) + 1)
                                                                 } else {
