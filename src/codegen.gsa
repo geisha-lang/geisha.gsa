@@ -569,11 +569,12 @@ data ModEmitCtx {
         mcPtrSize: Int,
         mcWasmExports: StrMap Bool,
         mcHasExplicitExports: Bool,
+        mcCExportSyms: StrMap Bool,
     },
 }
 
 // ============================================================================
-// C ABI Lowering for `@cstruct`, Pure `@export`, `@ctor`, & `cFnPtr`
+// C ABI Lowering for `extern data`, Pure `extern` Exports, `extern init`, & `cFnPtr`
 // ============================================================================
 
 data CAbiParamMode {
@@ -914,9 +915,7 @@ def emitCAbiTrampoline(
     let allGsVals = listRev(Cons("null", cellGet(gsArgValsRev)));
     let gsCallArgs = formatTypedArgs(allGsTys, allGsVals);
     let gsRetLlvm = getFnRetLlvmType(retGeishaTy);
-    let targetSym =
-        if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fd.fnName)) llvmSym("__gs_exp_" + fd.fnName)
-        else llvmSym(fd.fnName);
+    let targetSym = geishaCallImplSym(mctx, fd.fnName);
 
     let gsRes =
         if (gsRetLlvm == "void") {
@@ -996,6 +995,15 @@ def shouldExportSymbol(mctx: ModEmitCtx, fnName: String): Bool =
     } else {
         strMapContains(mctx.mcWasmExports, fnName)
     }
+
+def geishaFnSym(mctx: ModEmitCtx, fnName: String): String =
+    if (strMapContains(mctx.mcCExportSyms, fnName)) llvmSym("__gs_fn_" + fnName)
+    else llvmSym(fnName)
+
+def geishaCallImplSym(mctx: ModEmitCtx, fnName: String): String =
+    if (strMapContains(mctx.mcCExportSyms, fnName)) llvmSym("__gs_fn_" + fnName)
+    else if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
+    else llvmSym(fnName)
 
 def newFnEmitCtx(fnName: String): FnEmitCtx = {
     let blks: Vec BasicBlockBuf = vecNew();
@@ -1180,11 +1188,11 @@ def emitStaticClosureConst(mctx: ModEmitCtx, entryName: String): String = {
             bufPushStr(mctx.mcStrDecls, sym);
             if (mctx.mcIsWasm) {
                 bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, i32, {} } { ptr ");
-                bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
+                bufPushStr(mctx.mcStrDecls, geishaFnSym(mctx, entryName));
                 bufPushStr(mctx.mcStrDecls, ", i32 0, {} zeroinitializer }, align 8\n")
             } else {
                 bufPushStr(mctx.mcStrDecls, " = private unnamed_addr constant { ptr, {} } { ptr ");
-                bufPushStr(mctx.mcStrDecls, llvmSym(entryName));
+                bufPushStr(mctx.mcStrDecls, geishaFnSym(mctx, entryName));
                 bufPushStr(mctx.mcStrDecls, ", {} zeroinitializer }, align 8\n")
             };
             strMapInsert(mctx.mcConstPool, key, sym);
@@ -3430,7 +3438,7 @@ def genExpr(
                             calleeName == "printLn" || calleeName == "putNumber"
                             || calleeName == "putFloat" || calleeName == "putF32" || calleeName == "putChar";
                         let callPrefix = if (inTail && !isIoFn) "tail call " else "call ";
-                        let targetSym = llvmSym(calleeName);
+                        let targetSym = geishaFnSym(mctx, calleeName);
                         if (retLlvm == "void") {
                             emitLine(fctx, callPrefix + "void " + targetSym + "(" + typedArgsStr + ")");
                             "0"
@@ -3505,7 +3513,7 @@ def genExpr(
 
                     emitStore(fctx, "ptr", clsObjPtr, clsSlotPtr);
                     let fnFieldPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, 0);
-                    emitStore(fctx, "ptr", llvmSym(cls.clsEntry), fnFieldPtr);
+                    emitStore(fctx, "ptr", geishaFnSym(mctx, cls.clsEntry), fnFieldPtr);
 
                     let clsFvPtr = emitStructFieldPtr(fctx, clsStructTy, clsObjPtr, clsEnvFieldIdx);
                     let idx = cellNew(0);
@@ -3985,9 +3993,13 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         else emitTermLine(fctx, "ret " + retLlvm + " " + bodyVal)
     } else ();
 
-    let isExp = shouldExportSymbol(mctx, fd.fnName);
+    let isCExported = strMapContains(mctx.mcCExportSyms, fd.fnName);
+    let isExp = !isCExported && shouldExportSymbol(mctx, fd.fnName);
     let paramSigStr = strJoin(listRev(cellGet(paramSigPartsRev)), ", ");
-    if (!mctx.mcIsWasm && isExp) {
+    if (isCExported) {
+        let implHeader = "define internal " + retLlvm + " " + llvmSym("__gs_fn_" + fd.fnName) + "(" + paramSigStr + ") nounwind";
+        flushFunctionToBuf(out, implHeader, fctx)
+    } else if (!mctx.mcIsWasm && isExp) {
         let implSym = llvmSym("__gs_exp_" + fd.fnName);
         let implHeader = "define internal " + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind";
         flushFunctionToBuf(out, implHeader, fctx);
@@ -4419,9 +4431,7 @@ def emitGlobalCtors(
                     if (hasGlobalsOnce) {
                         bufPushStr(out, "  call void @__gs_init_globals_once()\n")
                     } else ();
-                    let targetSym =
-                        if (!mctx.mcIsWasm && shouldExportSymbol(mctx, fnName)) llvmSym("__gs_exp_" + fnName)
-                        else llvmSym(fnName);
+                    let targetSym = geishaCallImplSym(mctx, fnName);
                     bufPushStr(out, "  call void " + targetSym + "(ptr null)\n");
                     if (!mctx.mcIsWasm) {
                         bufPushStr(out, "  call void @gc_host_leave(i64 %tok)\n")
@@ -4652,6 +4662,18 @@ pub def emitProgramLlvmIrForArch(
     bufPushByte(globalsBuf, 10);
 
     let multiLinks = computeMultiExternLinks(prog.coreExterns, prog.coreExternNames);
+    let cExportSymMap: StrMap Bool = strMapNew();
+    let ccem = cellNew(prog.coreCExports);
+    while (match cellGet(ccem) { Nil -> false, _ -> true }) {
+        match cellGet(ccem) {
+            Cons((_, cSym), r) -> {
+                strMapInsert(cExportSymMap, cSym, true);
+                cellSet(ccem, r)
+            },
+            Nil -> (),
+        }
+    };
+
     let mctx = MkModEmitCtx {
         mcStrCnt: cellNew(0),
         mcStrDecls: bufNew(),
@@ -4671,6 +4693,7 @@ pub def emitProgramLlvmIrForArch(
         mcPtrSize: if (isWasm) 4 else 8,
         mcWasmExports: exportMap,
         mcHasExplicitExports: hasExplicit,
+        mcCExportSyms: cExportSymMap,
     };
 
     let fnsBuf = bufNew();
@@ -4704,7 +4727,7 @@ pub def emitProgramLlvmIrForArch(
         }
     };
 
-    // Emit pure C ABI export trampolines (`@export` / `@export("sym")`, no trailing `%fvs`)
+    // Emit pure C ABI export trampolines (`extern ["sym"] def ... = ...`, no trailing `%fvs`)
     let cce = cellNew(prog.coreCExports);
     while (match cellGet(cce) { Nil -> false, _ -> true }) {
         match cellGet(cce) {
@@ -4719,7 +4742,7 @@ pub def emitProgramLlvmIrForArch(
         }
     };
 
-    // Emit `@ctor` static constructors (`@llvm.global_ctors`)
+    // Emit `extern init` static constructors (`@llvm.global_ctors`)
     emitGlobalCtors(fnsBuf, mctx, prog.coreCtors, useGlobalsOnce);
 
     let out = bufNew();

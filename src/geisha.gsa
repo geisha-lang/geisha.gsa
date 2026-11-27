@@ -1016,6 +1016,7 @@ def generateDefaultIosPlist(
     version: String,
     minOs: String,
     isExtension: Bool,
+    extensionPointOpt: Option String,
     principalClassOpt: Option String
 ): String = {
     let b = bufNew();
@@ -1036,7 +1037,10 @@ def generateDefaultIosPlist(
     if (isExtension) {
         let pCls = match principalClassOpt { Some(c) -> c, None -> bundleName + "ViewController" };
         bufPushStr(b, "  <key>NSExtension</key>\n  <dict>\n");
-        bufPushStr(b, "    <key>NSExtensionPointIdentifier</key><string>com.apple.keyboard-service</string>\n");
+        match extensionPointOpt {
+            Some(ep) -> bufPushStr(b, "    <key>NSExtensionPointIdentifier</key><string>" + ep + "</string>\n"),
+            None -> (),
+        };
         bufPushStr(b, "    <key>NSExtensionPrincipalClass</key><string>" + pCls + "</string>\n");
         bufPushStr(b, "  </dict>\n")
     } else ();
@@ -1123,7 +1127,6 @@ def emitAppleBundleFromIr(
                 + shellQuoteArgs(tc.tcCSources)
                 + " " + shellQuote(tmpObj)
                 + " " + shellQuote(rtArchive)
-                + " -lobjc"
                 + shellQuoteArgs(tc.tcLinkFlags)
                 + " -o " + shellQuote(binPath);
             let rc2 = shell(cmdLink);
@@ -1151,7 +1154,7 @@ def emitAppleBundleFromIr(
                     None -> {
                         let genP =
                             if (isMacos) generateDefaultMacosPlist(bundleId, bundleName, version, minOs, ab.abLsuiElement, iconFileOpt)
-                            else generateDefaultIosPlist(bundleId, bundleName, version, minOs, isExt, ab.abPrincipalClass);
+                            else generateDefaultIosPlist(bundleId, bundleName, version, minOs, isExt, ab.abExtensionPoint, ab.abPrincipalClass);
                         writeFile(plistDst, genP)
                     },
                 }?;

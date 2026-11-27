@@ -119,12 +119,13 @@ pub def printShow(x: a): Void = ... // or with explicit scheme:
 
 ### Concurrency & FFI
 - `Send` concept is checked statically by the compiler for closures/values crossing thread boundaries (`std.task`, `std.actor`, `std.sync`).
-- `extern "c_symbol" def c_fn(x: Int): Ptr` binds C ABI functions (multiple typed declarations may alias the same symbol such as `"objc_msgSend"`); `extern ptr def call_fp(fp: Ptr, ...): Ret` invokes a typed C function pointer indirectly; `ForeignPtr` auto-borrows as `ScopedPtr` at `extern` boundaries with compiler keep-alive.
-- **Pure C ABI Exports, Callbacks, Structs & Static Constructors**:
-  - `@export` / `@export("c_sym")` on a monomorphic top-level `def` emits a pure C ABI symbol (no trailing `%fvs` closure param, wrapped in `gc_host_enter`/`gc_host_leave`).
-  - `cFnPtr(fn)` returns a C function pointer (`Ptr`) for a top-level Geisha function (synthesizing a thread-safe C callback trampoline) or an `extern` function (e.g. `cFnPtr(c_free)`).
-  - `@cstruct` on a single-constructor non-recursive `data` type enforces C ABI value-struct layout & calling convention (ARM64 HFA / SysV AMD64 / `sret` / `byval`, e.g. `CGPoint`, `CGRect`).
-  - `@ctor` / `@ctor(priority)` on a `() -> Void` top-level `def` registers a static constructor (`@llvm.global_ctors`), e.g. for registering Objective-C subclasses before `main`/`NSExtensionMain`.
+- All C ABI boundaries share the single `extern` keyword (zero `@` attributes):
+  - **C import**: `extern [noalloc] ["c_sym"] def fn(x: Int): Ptr` (multiple typed declarations may alias the same symbol such as `"objc_msgSend"`); `ForeignPtr` auto-borrows as `ScopedPtr` at `extern` boundaries with compiler keep-alive.
+  - **Indirect C function pointer call**: `extern ptr [noalloc] def call_fp(fp: Ptr, ...): Ret` invokes parameter 0 (`Ptr`) with exact C ABI signature.
+  - **Pure C ABI export**: `pub extern ["c_sym"] def fn(x: Int): Int = ...` (symmetric with import, distinguished by `= body`; omits trailing `%fvs` closure param and wraps in `gc_host_enter`/`gc_host_leave`).
+  - **C ABI value struct**: `pub extern data CGPoint { x: Float, y: Float }` enforces C ABI struct layout & calling convention (ARM64 HFA / SysV AMD64 / `sret` / `byval`).
+  - **Static constructor**: `extern init[(priority)] def setup(): Void = ...` emits `@llvm.global_ctors` (e.g. registering Objective-C subclasses before `main`/`NSExtensionMain`).
+  - **C function pointer / callback**: `cFnPtr(fn)` returns `Ptr` for an `extern` function or synthesizes a thread-safe C ABI callback trampoline for a monomorphic top-level Geisha function.
 
 ---
 
@@ -163,7 +164,6 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `sys.time` — monotonic/wall clock and sleep
 - `sys.net` — TCP/UDP networking sockets
 - `sys.ffi` — dynamic library loading (`dlOpen`, `dlOpenSelf`, `dlSym`, `dlClose`, `ptrToStrOpt`)
-- `sys.objc` — native Objective-C Runtime & Apple Blocks ABI (`Id a`, `objcClass`, `objcSel`, `withAutoreleasePool`, `nsString`, `fromNSString`, `objcAllocateClass`, `objcAddMethod`, `objcRegisterClass`, `objcSetAssocHandle`, `objcBlock0`/`objcBlock1Ptr`/`objcBlock2Ptr`/`objcBlock1Bool`/`objcBlockCustom`, typed `msgSend*`)
 
 ---
 
@@ -212,6 +212,7 @@ bundle_name     = "MyApp"
 min_os          = "16.0"
 frameworks      = ["UIKit", "Foundation", "QuartzCore"]
 is_extension    = false          # true => builds `.appex` with `-fapplication-extension -e _NSExtensionMain`
+extension_point = "com.apple.keyboard-service"
 principal_class = "MyViewCtrl"   # used when `is_extension = true`
 codesign        = "-"
 ```

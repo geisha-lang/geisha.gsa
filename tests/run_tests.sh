@@ -2123,7 +2123,7 @@ assert_eq "gc_shadow_wb_and_large_obj" "young-77-231|mid-1023|88" "$OUT_T33"
 echo "PASS [gc_shadow_wb_and_large_obj]: shadowed heap Cell write barrier, >4KB large object survival, and gc_set_mem_limit verified"
 PASS=$((PASS + 1))
 
-# 34. Pure C ABI `@export`, `@cstruct` (ARM64 HFA & x86_64 SysV), `cFnPtr`, `extern ptr`, `@ctor`, & `sys.ffi`
+# 34. Pure C ABI unified `extern` exports, `extern data` (ARM64 HFA & x86_64 SysV), `cFnPtr`, `extern ptr`, `extern init`, & `sys.ffi`
 cat > "$TMP_DIR/t34_cabi_host.c" << 'EOF'
 #include <stdint.h>
 #include <stdio.h>
@@ -2136,6 +2136,7 @@ typedef struct { int64_t a; int64_t b; int64_t c; } Big3;
 
 /* Pure C ABI exports from Geisha (NO trailing `void *fv`!) */
 extern int32_t gs_pure_add(int32_t a, int32_t b);
+extern int32_t defaultNameMul(int32_t a, int32_t b);
 extern CGRect gs_scale_rect(CGRect r, double k);
 extern Big3 gs_bump_big3(Big3 v);
 extern Mixed gs_bump_mixed(Mixed m);
@@ -2172,6 +2173,7 @@ double c_apply_rect_cb(double (*cb)(CGRect, int32_t), CGRect r, int32_t bonus) {
 
 int32_t c_check_exports(void) {
     int32_t s = gs_pure_add(19, 23);
+    int32_t p = defaultNameMul(6, 7);
     CGRect r0 = { { 1.0, 2.0 }, { 3.0, 4.0 } };
     CGRect r1 = gs_scale_rect(r0, 2.0);
     Big3 b0 = { 10, 20, 30 };
@@ -2179,6 +2181,7 @@ int32_t c_check_exports(void) {
     Mixed m0 = { 5, 2.5 };
     Mixed m1 = gs_bump_mixed(m0);
     int32_t ok = (s == 42)
+        && (p == 42)
         && (r1.origin.x == 2.0 && r1.origin.y == 4.0 && r1.size.w == 6.0 && r1.size.h == 8.0)
         && (b1.a == 11 && b1.b == 22 && b1.c == 33)
         && (m1.a == 6 && m1.b == 5.0);
@@ -2191,20 +2194,11 @@ use std.str.intToStr
 use std.option.{Some, None}
 use sys.ffi.{dlOpenSelf, dlSym}
 
-@cstruct
-pub data CGPoint { x: Float, y: Float }
-
-@cstruct
-pub data CGSize { w: Float, h: Float }
-
-@cstruct
-pub data CGRect { origin: CGPoint, size: CGSize }
-
-@cstruct
-pub data Mixed { a: Int, b: Float }
-
-@cstruct
-pub data Big3 { a: Int64, b: Int64, c: Int64 }
+pub extern data CGPoint { x: Float, y: Float }
+pub extern data CGSize { w: Float, h: Float }
+pub extern data CGRect { origin: CGPoint, size: CGSize }
+pub extern data Mixed { a: Int, b: Float }
+pub extern data Big3 { a: Int64, b: Int64, c: Int64 }
 
 extern "c_make_rect" def cMakeRect(p: CGPoint, s: CGSize): CGRect
 extern "c_rect_sum" def cRectSum(r: CGRect): Float
@@ -2214,30 +2208,27 @@ extern "c_apply_rect_cb" def cApplyRectCb(cb: Ptr, r: CGRect, bonus: Int): Float
 extern "c_check_exports" def cCheckExports(): Int
 extern ptr def callRectSumPtr(fnPtr: Ptr, r: CGRect): Float
 
+// Verify `@` remains an ordinary infix operator without newline ambiguity
+def (@)(a: Int, b: Int): Int = a * 10 + b
+
 def gCtorLog: Cell Int = cellNew(0)
 
-@ctor(200)
-def initSecond(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 2)
+extern init(200) def initSecond(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 2)
+extern init(100) def initFirst(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 1)
 
-@ctor(100)
-def initFirst(): Void = cellSet(gCtorLog, cellGet(gCtorLog) * 10 + 1)
+pub extern "gs_pure_add" def pureAdd(a: Int, b: Int): Int = a + b
+pub extern def defaultNameMul(a: Int, b: Int): Int = a * b
 
-@export("gs_pure_add")
-pub def pureAdd(a: Int, b: Int): Int = a + b
-
-@export("gs_scale_rect")
-pub def scaleRect(r: CGRect, k: Float): CGRect =
+pub extern "gs_scale_rect" def scaleRect(r: CGRect, k: Float): CGRect =
     CGRect {
         origin: CGPoint { x: r.origin.x * k, y: r.origin.y * k },
         size: CGSize { w: r.size.w * k, h: r.size.h * k },
     }
 
-@export("gs_bump_big3")
-pub def bumpBig3(v: Big3): Big3 =
+pub extern "gs_bump_big3" def bumpBig3(v: Big3): Big3 =
     Big3 { a: v.a + intToI64(1), b: v.b + intToI64(2), c: v.c + intToI64(3) }
 
-@export("gs_bump_mixed")
-pub def bumpMixed(m: Mixed): Mixed =
+pub extern "gs_bump_mixed" def bumpMixed(m: Mixed): Mixed =
     Mixed { a: m.a + 1, b: m.b * 2.0 }
 
 def rectCallback(r: CGRect, bonus: Int): Float =
@@ -2256,6 +2247,8 @@ def main(): Void = {
     let m = cMakeMixed(7, 3.0);
     let mSum = m.a + floatToInt(m.b);
     let expOk = cCheckExports();
+    let atOp = 3 @ 7;
+    let gsCallMul = defaultNameMul(3, 4);
     let dlOk = match dlSym(dlOpenSelf(), "strlen") {
         Some(_) -> 1,
         None -> 0,
@@ -2263,7 +2256,7 @@ def main(): Void = {
     printLn(
         intToStr(cellGet(gCtorLog)) + "|"
         + intToStr(s1) + "|" + intToStr(s2) + "|" + intToStr(cbRes) + "|"
-        + intToStr(bSum) + "|" + intToStr(mSum) + "|" + intToStr(expOk) + "|" + intToStr(dlOk)
+        + intToStr(bSum) + "|" + intToStr(mSum) + "|" + intToStr(expOk) + "|" + intToStr(dlOk) + "|" + intToStr(atOp) + "|" + intToStr(gsCallMul)
     )
 }
 EOF
@@ -2271,26 +2264,24 @@ EOF
 "$CC" $HOST_CC_TARGET -O2 -Wno-override-module -pthread \
     -x ir "$TMP_DIR/t34_cabi.ll" -x c "$TMP_DIR/t34_cabi_host.c" -x none "$GEISHA_RUNTIME" $HOST_CC_LIBS \
     -o "$TMP_DIR/t34_cabi"
-assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1" "$("$TMP_DIR/t34_cabi")"
+assert_eq "cabi_cstruct_export_ctor_cfnptr" "12|34|34|42|66|10|1|1|37|12" "$("$TMP_DIR/t34_cabi")"
 
-# Negative checks for `@cstruct`, `@ctor`, and `cFnPtr`
+# Negative checks for `extern data`, `extern init`, and `cFnPtr`
 cat > "$TMP_DIR/t34_bad_cstruct.gsa" << 'EOF'
-@cstruct
-data Bad { s: String }
+extern data Bad { s: String }
 def main(): Void = ()
 EOF
 if "$GEISHA_BIN" check "$TMP_DIR/t34_bad_cstruct.gsa" >/dev/null 2>&1; then
-    echo "FAIL [bad_cstruct_rejected]: @cstruct with String field should be rejected" >&2
+    echo "FAIL [bad_cstruct_rejected]: extern data with String field should be rejected" >&2
     exit 1
 fi
 
 cat > "$TMP_DIR/t34_bad_ctor.gsa" << 'EOF'
-@ctor
-def badInit(x: Int): Int = x
+extern init def badInit(x: Int): Int = x
 def main(): Void = ()
 EOF
 if "$GEISHA_BIN" check "$TMP_DIR/t34_bad_ctor.gsa" >/dev/null 2>&1; then
-    echo "FAIL [bad_ctor_rejected]: @ctor with non-()->Void signature should be rejected" >&2
+    echo "FAIL [bad_ctor_rejected]: extern init with non-()->Void signature should be rejected" >&2
     exit 1
 fi
 
@@ -2305,10 +2296,10 @@ if "$GEISHA_BIN" -e "$TMP_DIR/t34_bad_cfnptr.gsa" >/dev/null 2>&1; then
     echo "FAIL [bad_cfnptr_rejected]: cFnPtr on local closure should be rejected" >&2
     exit 1
 fi
-echo "PASS [cabi_primitives]: @export, @cstruct (HFA/SysV/sret), cFnPtr, extern ptr, @ctor, sys.ffi, & negative checks verified"
+echo "PASS [cabi_primitives]: unified extern export, extern data (HFA/SysV/sret), cFnPtr, extern ptr, extern init, sys.ffi, & negative checks verified"
 PASS=$((PASS + 1))
 
-# 35. Native Apple Objective-C Runtime, Blocks ABI, CGRect objc_msgSend, & Pure-Geisha macOS `.app` Bundle (macOS only)
+# 35. Direct C/ObjC Runtime interop (`extern data`, multi-sig `extern`, `extern init`, `cFnPtr`) & Apple `.app`/`.appex` Bundles (macOS only)
 if [ "$(uname -s)" = "Darwin" ]; then
     MAC_APP_DIR="$TMP_DIR/pure_objc_app"
     mkdir -p "$MAC_APP_DIR/src"
@@ -2322,86 +2313,72 @@ bundle_id    = "com.geisha.test.pureobjc"
 bundle_name  = "PureObjcTest"
 min_os       = "14.0"
 frameworks   = ["Foundation", "AppKit"]
+link_flags   = ["-lobjc"]
 lsui_element = true
 codesign     = "-"
 EOF
     cat > "$MAC_APP_DIR/src/main.gsa" << 'EOF'
 use std.str.intToStr
-use sys.objc.{
-    Id, NSString,
-    objcClass, objcSel, withId, idAdopt, idRetain, withAutoreleasePool,
-    nsString, fromNSString,
-    objcAllocateClass, objcAddMethod, objcRegisterClass,
-    objcSetAssocHandle, objcGetAssocHandle,
-    objcBlock0, objcBlock1Bool,
-    msgSend0, msgSend1Ptr, msgSendInt0, msgSendVoid1Ptr
-}
 
-@cstruct
-data CGPoint { x: Float, y: Float }
+extern data CGPoint { x: Float, y: Float }
+extern data CGSize { w: Float, h: Float }
+extern data CGRect { origin: CGPoint, size: CGSize }
 
-@cstruct
-data CGSize { w: Float, h: Float }
+extern "objc_getClass" def objcGetClass(name: String): Ptr
+extern "sel_registerName" def selReg(name: String): Ptr
+extern "objc_allocateClassPair" def objcAllocClass(sup: Ptr, name: String, extra: Int64): Ptr
+extern "class_addMethod" def classAddMethod(cls: Ptr, sel: Ptr, imp: Ptr, enc: String): Bool
+extern "objc_registerClassPair" def objcRegClass(cls: Ptr): Void
+extern "objc_autoreleasePoolPush" def arPush(): Ptr
+extern "objc_autoreleasePoolPop" def arPop(p: Ptr): Void
 
-@cstruct
-data CGRect { origin: CGPoint, size: CGSize }
-
+extern "objc_msgSend" def msgSend0(obj: Ptr, sel: Ptr): Ptr
+extern "objc_msgSend" def msgSendStr(obj: Ptr, sel: Ptr, s: String): Ptr
+extern "objc_msgSend" def msgSendInt0(obj: Ptr, sel: Ptr): Int
 extern "objc_msgSend" def msgSendValueWithRect(cls: Ptr, sel: Ptr, rect: CGRect): Ptr
 extern "objc_msgSend" def msgSendRectValue(obj: Ptr, sel: Ptr): CGRect
-extern "dispatch_get_global_queue" def c_dispatch_global_queue(ident: Int64, flags: Int64): Ptr
-extern "dispatch_sync" def c_dispatch_sync(queue: Ptr, block: ScopedPtr): Void
 
-def gAssocKey: Ptr = ptrAllocBytes(8)
+def gBonus: Cell Int = cellNew(32)
 
 def customComputeImp(self: Ptr, _cmd: Ptr): Int = {
-    let h = objcGetAssocHandle(self, gAssocKey);
-    let cell: Cell Int = gcHandleGet(h);
-    cellSet(cell, cellGet(cell) + 10);
-    cellGet(cell)
+    let _ = self;
+    let _ = _cmd;
+    cellSet(gBonus, cellGet(gBonus) + 10);
+    cellGet(gBonus)
 }
 
-@ctor
-def registerGeishaObjcClass(): Void = {
-    let cls = objcAllocateClass("NSObject", "GeishaNativeTestObj");
+extern init def registerGeishaObjcClass(): Void = {
+    let sup = objcGetClass("NSObject");
+    let cls = objcAllocClass(sup, "GeishaNativeTestObj", intToI64(0));
     if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "computeValue", cFnPtr(customComputeImp), "i@:");
-        objcRegisterClass(cls)
+        let _ = classAddMethod(cls, selReg("computeValue"), cFnPtr(customComputeImp), "i@:");
+        objcRegClass(cls)
     } else ()
 }
 
-def main(): Void = withAutoreleasePool(() -> {
-    // 1. NSString UTF-8 round-trip (ASCII + CJK)
-    let ns = nsString("句序-Slate-Talus");
-    let roundtrip = fromNSString(ns);
+def main(): Void = {
+    let pool = arPush();
+
+    // 1. NSString UTF-8 round-trip via direct `objc_msgSend`
+    let nsStrCls = objcGetClass("NSString");
+    let ns = msgSendStr(nsStrCls, selReg("stringWithUTF8String:"), "句序-Slate-Talus");
+    let roundtrip = ptrToString(msgSend0(ns, selReg("UTF8String")));
 
     // 2. CGRect HFA pass & return through real Apple Foundation `NSValue` via multi-sig `objc_msgSend`
-    let nsValCls = objcClass("NSValue");
+    let nsValCls = objcGetClass("NSValue");
     let inRect = CGRect { origin: CGPoint { x: 12.0, y: 34.0 }, size: CGSize { w: 100.0, h: 200.0 } };
-    let valObj = msgSendValueWithRect(nsValCls, objcSel("valueWithRect:"), inRect);
-    let outRect = msgSendRectValue(valObj, objcSel("rectValue"));
+    let valObj = msgSendValueWithRect(nsValCls, selReg("valueWithRect:"), inRect);
+    let outRect = msgSendRectValue(valObj, selReg("rectValue"));
     let rectSum = floatToInt(outRect.origin.x + outRect.origin.y + outRect.size.w + outRect.size.h);
 
-    // 3. Dynamic ObjC subclass registered in @ctor + associated GC handle
-    let testCls = objcClass("GeishaNativeTestObj");
-    let inst = idAdopt(msgSend0(msgSend0(testCls, objcSel("alloc")), objcSel("init")));
-    let st = cellNew(32);
-    let computed = withId(inst, (p) -> {
-        let raw = msgSend0(msgSend0(testCls, objcSel("alloc")), objcSel("init"));
-        let _ = p;
-        objcSetAssocHandle(raw, gAssocKey, gcHandleNew(st));
-        let v = msgSendInt0(raw, objcSel("computeValue"));
-        let _ = idAdopt(raw);
-        v
-    });
+    // 3. Dynamic ObjC subclass registered in `extern init`
+    let testCls = objcGetClass("GeishaNativeTestObj");
+    let inst = msgSend0(msgSend0(testCls, selReg("alloc")), selReg("init"));
+    let computed = msgSendInt0(inst, selReg("computeValue"));
 
-    // 4. Real Apple Objective-C Block executed via libdispatch `dispatch_sync`!
-    let blkCounter = cellNew(0);
-    let blk = objcBlock0(() -> cellSet(blkCounter, cellGet(blkCounter) + 77));
-    let q = c_dispatch_global_queue(intToI64(0), intToI64(0));
-    c_dispatch_sync(q, blk);
-
-    printLn(roundtrip + "|" + intToStr(rectSum) + "|" + intToStr(computed) + "|" + intToStr(cellGet(blkCounter)))
-})
+    printLn(roundtrip + "|" + intToStr(rectSum) + "|" + intToStr(computed));
+    arPop(pool)
+}
 EOF
     ABS_GEISHA_BIN="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
     ABS_GEISHA_RT="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
@@ -2414,8 +2391,8 @@ EOF
     plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
     codesign --verify "$APP_BUNDLE"
     OUT_MAC_APP="$("$APP_BUNDLE/Contents/MacOS/PureObjcTest")"
-    assert_eq "pure_geisha_objc_macos_app" "句序-Slate-Talus|346|42|77" "$OUT_MAC_APP"
-    echo "PASS [pure_geisha_objc_macos_app]: zero-.m pure Geisha macOS .app bundle + NSString + CGRect objc_msgSend + @ctor subclass + libdispatch ObjC Block verified!"
+    assert_eq "pure_geisha_objc_macos_app" "句序-Slate-Talus|346|42" "$OUT_MAC_APP"
+    echo "PASS [pure_geisha_objc_macos_app]: zero-.m pure Geisha macOS .app bundle + NSString + CGRect objc_msgSend + extern init subclass verified!"
     PASS=$((PASS + 1))
 
     # Also verify pure-Geisha iOS Simulator `.appex` extension packaging when iOS sim runtime is built
@@ -2433,17 +2410,21 @@ bundle_id       = "com.geisha.test.keyboard"
 bundle_name     = "GeishaKeyboard"
 min_os          = "16.0"
 frameworks      = ["Foundation", "UIKit"]
+link_flags      = ["-lobjc"]
 is_extension    = true
+extension_point = "com.apple.keyboard-service"
 principal_class = "GeishaKeyboardController"
 codesign        = "-"
 EOF
         cat > "$IOS_EXT_DIR/src/main.gsa" << 'EOF'
-use sys.objc.{objcAllocateClass, objcRegisterClass}
+extern "objc_getClass" def objcGetClass(name: String): Ptr
+extern "objc_allocateClassPair" def objcAllocClass(sup: Ptr, name: String, extra: Int64): Ptr
+extern "objc_registerClassPair" def objcRegClass(cls: Ptr): Void
 
-@ctor
-def registerKeyboardController(): Void = {
-    let cls = objcAllocateClass("UIInputViewController", "GeishaKeyboardController");
-    if (!ptrIsNull(cls)) objcRegisterClass(cls) else ()
+extern init def registerKeyboardController(): Void = {
+    let sup = objcGetClass("UIInputViewController");
+    let cls = objcAllocClass(sup, "GeishaKeyboardController", intToI64(0));
+    if (!ptrIsNull(cls)) objcRegClass(cls) else ()
 }
 EOF
         (cd "$IOS_EXT_DIR" && "$ABS_GEISHA_BIN" build --target ios-sim-app --runtime "$ABS_IOS_SIM_RT")
@@ -2453,11 +2434,11 @@ EOF
             exit 1
         fi
         plutil -lint "$EXT_BUNDLE/Info.plist" >/dev/null
-        if ! grep -q "GeishaKeyboardController" "$EXT_BUNDLE/Info.plist"; then
-            echo "FAIL [ios_sim_appex_plist]: missing NSExtensionPrincipalClass in Info.plist" >&2
+        if ! grep -q "GeishaKeyboardController" "$EXT_BUNDLE/Info.plist" || ! grep -q "com.apple.keyboard-service" "$EXT_BUNDLE/Info.plist"; then
+            echo "FAIL [ios_sim_appex_plist]: missing NSExtensionPrincipalClass or NSExtensionPointIdentifier in Info.plist" >&2
             exit 1
         fi
-        echo "PASS [ios_sim_appex_bundle]: pure Geisha iOS Simulator .appex extension with @ctor UIInputViewController subclass built and signed!"
+        echo "PASS [ios_sim_appex_bundle]: pure Geisha iOS Simulator .appex extension with extern init UIInputViewController subclass built and signed!"
         PASS=$((PASS + 1))
     fi
 fi

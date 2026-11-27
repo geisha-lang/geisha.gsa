@@ -145,6 +145,7 @@ bundle_name          = "MyApp"
 min_os               = "16.0"
 frameworks           = ["UIKit", "Foundation", "QuartzCore"]
 is_extension         = false         # set true for `.appex` (`-fapplication-extension -e _NSExtensionMain`)
+extension_point      = "com.apple.keyboard-service"
 principal_class      = "MyController"
 provisioning_profile = "iOS/embedded.mobileprovision"
 embed_extensions     = ["../my_keyboard/build/MyKeyboard.appex"]

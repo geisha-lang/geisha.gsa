@@ -4100,15 +4100,15 @@ def inferPass2Adts(ctx: InferCtx, baseMap: StrMap Scheme, rawDefs: List Def): Re
                         let isCS = hasAttrCStruct(d.attrs);
                         if (isCS) {
                             match userTparams {
-                                Cons(_, _) -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' cannot have type parameters")?,
+                                Cons(_, _) -> returnPatErr(d.dpos, "'extern data' type '" + d.ident + "' cannot have type parameters")?,
                                 Nil -> (),
                             };
                             match cellGet(vinfos) {
                                 Cons(vi0, Nil) -> match vi0.fieldTypes {
-                                    Nil -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' must have at least one field")?,
+                                    Nil -> returnPatErr(d.dpos, "'extern data' type '" + d.ident + "' must have at least one field")?,
                                     _ -> (),
                                 },
-                                _ -> returnPatErr(d.dpos, "@cstruct data type '" + d.ident + "' must have exactly one constructor")?,
+                                _ -> returnPatErr(d.dpos, "'extern data' type '" + d.ident + "' must have exactly one constructor")?,
                             }
                         } else ();
                         if (!strMapContains(ctx.adtReg, d.ident)) vecPush(ctx.adtNames, d.ident) else ();
@@ -5087,15 +5087,15 @@ def checkCStructFieldType(ctx: InferCtx, ty: Type, visiting: List String, sp: Sp
         TyCon(n) ->
             if (n == "Int" || n == "Int64" || n == "Float" || n == "Float32" || n == "Char" || n == "Bool" || n == "Ptr" || n == "ScopedPtr") Ok(())
             else if (listContainsStr(visiting, n)) {
-                Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' cannot be recursive through '" + n + "'"))
+                Err(formatSpanDiag("Type error", sp, "'extern data' '" + ownerName + "' cannot be recursive through '" + n + "'"))
             } else match strMapGet(ctx.adtReg, n) {
                 Some(ai) if (ai.isCStruct) -> match ai.variants {
                     Cons(vi, Nil) -> checkCStructFieldList(ctx, vi.fieldTypes, Cons(n, visiting), sp, ownerName),
                     _ -> Ok(()),
                 },
-                _ -> Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' field type '" + n + "' is not a C ABI scalar, Ptr, or @cstruct")),
+                _ -> Err(formatSpanDiag("Type error", sp, "'extern data' '" + ownerName + "' field type '" + n + "' is not a C ABI scalar, Ptr, or extern data")),
             },
-        _ -> Err(formatSpanDiag("Type error", sp, "@cstruct '" + ownerName + "' field type '" + typeToString(ty) + "' is not a valid C ABI type")),
+        _ -> Err(formatSpanDiag("Type error", sp, "'extern data' '" + ownerName + "' field type '" + typeToString(ty) + "' is not a valid C ABI type")),
     }
 
 def checkCStructFieldList(ctx: InferCtx, ts: List Type, visiting: List String, sp: Span, ownerName: String): Result Void String =
@@ -5125,14 +5125,14 @@ def validateAllCStructs(ctx: InferCtx, defs: List Def): Result Void String = {
                         } else (),
                     _ ->
                         if (hasAttrCStruct(d.attrs)) {
-                            returnPatErr(d.dpos, "@cstruct attribute is only valid on 'data' declarations")?
+                            returnPatErr(d.dpos, "'extern data' is only valid on 'data' declarations")?
                         } else (),
                 };
                 match d.item {
                     ItForm(_) -> (),
                     _ -> {
-                        if (hasAttrExport(d.attrs)) returnPatErr(d.dpos, "@export attribute is only valid on top-level 'def' functions")? else ();
-                        if (hasAttrCtor(d.attrs)) returnPatErr(d.dpos, "@ctor attribute is only valid on top-level 'def' functions")? else ()
+                        if (hasAttrExport(d.attrs)) returnPatErr(d.dpos, "'extern' export is only valid on top-level 'def' functions")? else ();
+                        if (hasAttrCtor(d.attrs)) returnPatErr(d.dpos, "'extern init' is only valid on top-level 'def' functions")? else ()
                     },
                 };
                 cellSet(cur, r)
@@ -5529,7 +5529,7 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                             let bodyTy = schemeBody(zf.ty);
                             let nonModeTps = filterNonModeStrings(schemeTypeParams(zf.ty));
                             match nonModeTps {
-                                Cons(_, _) -> returnPatErr(d.dpos, "@export/@ctor function '" + d.ident + "' must be monomorphic (no type parameters)")?,
+                                Cons(_, _) -> returnPatErr(d.dpos, "'extern' export/init function '" + d.ident + "' must be monomorphic (no type parameters)")?,
                                 Nil -> (),
                             };
                             match bodyTy {
@@ -5538,10 +5538,10 @@ pub def inferProgram(rawDefs: List Def): Result InferOutput String = {
                                         let retIsVoid = match rt { TyVoid -> true, TyCon("Void") -> true, _ -> false };
                                         match ps {
                                             Nil if (retIsVoid) -> (),
-                                            _ -> returnPatErr(d.dpos, "@ctor function '" + d.ident + "' must have signature () -> Void")?,
+                                            _ -> returnPatErr(d.dpos, "'extern init' function '" + d.ident + "' must have signature () -> Void")?,
                                         }
                                     } else (),
-                                _ -> returnPatErr(d.dpos, "@export/@ctor attribute on '" + d.ident + "' requires a function definition")?,
+                                _ -> returnPatErr(d.dpos, "'extern' export/init on '" + d.ident + "' requires a function definition")?,
                             }
                         } else ();
                         cellSet(finalRev, Cons(MkDef {
