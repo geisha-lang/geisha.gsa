@@ -808,13 +808,45 @@ def findIdentInSpan(src: String, ident: String, startByte: Int, endByte: Int): (
         let limit = e - nl;
         while (cellGet(i) <= limit && cellGet(found) < 0) {
             let cur = cellGet(i);
-            let matched = strStartsWith(strSlice(src, cur, cur + nl), ident);
-            let leftOk = !isWordIdent || cur == 0 || !isIdentContByte(strByteAt(src, cur - 1));
-            let rightOk = !isWordIdent || (cur + nl) >= n || !isIdentContByte(strByteAt(src, cur + nl));
-            if (matched && leftOk && rightOk) {
-                cellSet(found, cur)
+            let b = strByteAt(src, cur);
+            if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 47) {
+                let j = cellNew(cur + 2);
+                while (cellGet(j) < e && strByteAt(src, cellGet(j)) != 10) {
+                    cellSet(j, cellGet(j) + 1)
+                };
+                cellSet(i, cellGet(j))
+            } else if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 42) {
+                let j = cellNew(cur + 2);
+                let closed = cellNew(false);
+                while (cellGet(j) + 1 < e && !cellGet(closed)) {
+                    if (strByteAt(src, cellGet(j)) == 42 && strByteAt(src, cellGet(j) + 1) == 47) {
+                        cellSet(j, cellGet(j) + 2);
+                        cellSet(closed, true)
+                    } else cellSet(j, cellGet(j) + 1)
+                };
+                cellSet(i, if (cellGet(closed)) cellGet(j) else e)
+            } else if (b == 34) {
+                let j = cellNew(cur + 1);
+                let closed = cellNew(false);
+                while (cellGet(j) < e && !cellGet(closed)) {
+                    let cb = strByteAt(src, cellGet(j));
+                    if (cb == 92 && cellGet(j) + 1 < e) {
+                        cellSet(j, cellGet(j) + 2)
+                    } else if (cb == 34) {
+                        cellSet(j, cellGet(j) + 1);
+                        cellSet(closed, true)
+                    } else cellSet(j, cellGet(j) + 1)
+                };
+                cellSet(i, if (cellGet(closed)) cellGet(j) else e)
             } else {
-                cellSet(i, cur + 1)
+                let matched = strStartsWith(strSlice(src, cur, cur + nl), ident);
+                let leftOk = !isWordIdent || cur == 0 || !isIdentContByte(strByteAt(src, cur - 1));
+                let rightOk = !isWordIdent || (cur + nl) >= n || !isIdentContByte(strByteAt(src, cur + nl));
+                if (matched && leftOk && rightOk) {
+                    cellSet(found, cur)
+                } else {
+                    cellSet(i, cur + 1)
+                }
             }
         };
         let f = cellGet(found);
@@ -3287,12 +3319,125 @@ def resolveModAliasInItems(items: List ModuleItem, qual: String): String = {
     cellGet(res)
 }
 
+def extractQualBeforeIdent(src: String, fStart: Int, identStart: Int): Option String = {
+    let n = strLen(src);
+    let s = if (fStart < 0) 0 else if (fStart > n) n else fStart;
+    let e = if (identStart < s) s else if (identStart > n) n else identStart;
+    let i = cellNew(s);
+    let segsRev: Cell (List String) = cellNew(Nil);
+    let lastWasDot = cellNew(false);
+    let valid = cellNew(true);
+    while (cellGet(i) < e && cellGet(valid)) {
+        let cur = cellGet(i);
+        let b = strByteAt(src, cur);
+        if (b == 32 || b == 9 || b == 10 || b == 13) {
+            cellSet(i, cur + 1)
+        } else if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 47) {
+            let j = cellNew(cur + 2);
+            while (cellGet(j) < e && strByteAt(src, cellGet(j)) != 10) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            cellSet(i, cellGet(j))
+        } else if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 42) {
+            let j = cellNew(cur + 2);
+            let closed = cellNew(false);
+            while (cellGet(j) + 1 < e && !cellGet(closed)) {
+                if (strByteAt(src, cellGet(j)) == 42 && strByteAt(src, cellGet(j) + 1) == 47) {
+                    cellSet(j, cellGet(j) + 2);
+                    cellSet(closed, true)
+                } else cellSet(j, cellGet(j) + 1)
+            };
+            cellSet(i, if (cellGet(closed)) cellGet(j) else e)
+        } else if (b == 46) {
+            cellSet(lastWasDot, true);
+            cellSet(i, cur + 1)
+        } else if (isIdentStartByte(b)) {
+            let j = cellNew(cur + 1);
+            while (cellGet(j) < e && isIdentContByte(strByteAt(src, cellGet(j)))) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            cellSet(segsRev, Cons(strSlice(src, cur, cellGet(j)), cellGet(segsRev)));
+            cellSet(lastWasDot, false);
+            cellSet(i, cellGet(j))
+        } else {
+            cellSet(valid, false)
+        }
+    };
+    if (cellGet(valid) && cellGet(lastWasDot)) {
+        match listRev(cellGet(segsRev)) {
+            Nil -> None,
+            segs -> Some(strJoin(segs, ".")),
+        }
+    } else None
+}
+
+def skipWsAndBlockRev(src: String, i: Cell Int): Void = {
+    let keep = cellNew(true);
+    while (cellGet(i) >= 0 && cellGet(keep)) {
+        let b = strByteAt(src, cellGet(i));
+        if (b == 32 || b == 9 || b == 10 || b == 13) {
+            cellSet(i, cellGet(i) - 1)
+        } else if (b == 47 && cellGet(i) >= 1 && strByteAt(src, cellGet(i) - 1) == 42) {
+            let j = cellNew(cellGet(i) - 2);
+            let closed = cellNew(false);
+            while (cellGet(j) >= 1 && !cellGet(closed)) {
+                if (strByteAt(src, cellGet(j) - 1) == 47 && strByteAt(src, cellGet(j)) == 42) {
+                    cellSet(j, cellGet(j) - 2);
+                    cellSet(closed, true)
+                } else cellSet(j, cellGet(j) - 1)
+            };
+            if (cellGet(closed)) cellSet(i, cellGet(j)) else cellSet(keep, false)
+        } else cellSet(keep, false)
+    }
+}
+
+def extractQualImmediatelyBefore(src: String, identStart: Int): Option String = {
+    let i = cellNew(identStart - 1);
+    let segs: Cell (List String) = cellNew(Nil);
+    let sawDot = cellNew(false);
+    let done = cellNew(false);
+    while (!cellGet(done)) {
+        skipWsAndBlockRev(src, i);
+        if (cellGet(i) >= 0 && strByteAt(src, cellGet(i)) == 46) {
+            cellSet(sawDot, true);
+            cellSet(i, cellGet(i) - 1);
+            skipWsAndBlockRev(src, i);
+            if (cellGet(i) >= 0 && isIdentContByte(strByteAt(src, cellGet(i)))) {
+                let endSeg = cellGet(i) + 1;
+                while (cellGet(i) >= 0 && isIdentContByte(strByteAt(src, cellGet(i)))) {
+                    cellSet(i, cellGet(i) - 1)
+                };
+                let startSeg = cellGet(i) + 1;
+                cellSet(segs, Cons(strSlice(src, startSeg, endSeg), cellGet(segs)))
+            } else cellSet(done, true)
+        } else cellSet(done, true)
+    };
+    if (cellGet(sawDot)) {
+        match cellGet(segs) {
+            Nil -> None,
+            ss -> Some(strJoin(ss, ".")),
+        }
+    } else None
+}
+
+def allowOccAt(rscope: RenameScope, src: String, identStart: Int, origName: String, targetQn: String, forRename: Bool): Bool =
+    if (!forRename) true
+    else match extractQualImmediatelyBefore(src, identStart) {
+        Some(qual) -> {
+            let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
+            modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
+        },
+        None -> rscope.rsAllowUnaliased,
+    }
+
 def allowSiteRename(rscope: RenameScope, src: String, fStart: Int, s: Int, origName: String, targetQn: String): Bool =
-    if (s > fStart && strByteAt(src, s - 1) == 46) {
-        let qual = strTrim(strSlice(src, fStart, s - 1));
-        let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
-        modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
-    } else rscope.rsAllowUnaliased
+    match extractQualBeforeIdent(src, fStart, s) {
+        Some(qual) -> {
+            let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
+            modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
+        },
+        None -> rscope.rsAllowUnaliased,
+    }
 
 def findEnclosingScopeItems(items: List ModuleItem, posStart: Int, posEnd: Int): List ModuleItem = {
     let cur = cellNew(items);
@@ -3495,16 +3640,19 @@ def collectTopDefOccsInForm(
                         if (f.pos.fileId == fileId && patHi > patLo) {
                             match target.stKind {
                                 SkTopDef if (patContainsCtor(arm.pat, targetQn)) -> {
-                                    if (!forRename || rscope.rsAllowUnaliased) {
-                                        let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
-                                        let co = cellNew(occs);
-                                        while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                            match cellGet(co) {
-                                                Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
-                                                Nil -> (),
-                                            }
+                                    let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
+                                    let co = cellNew(occs);
+                                    while (match cellGet(co) { Nil -> false, _ -> true }) {
+                                        match cellGet(co) {
+                                            Cons((s, e), ro) -> {
+                                                if (allowOccAt(rscope, src, s, target.stName, targetQn, forRename)) {
+                                                    pushOcc(seen, outRev, uri, src, s, e)
+                                                } else ();
+                                                cellSet(co, ro)
+                                            },
+                                            Nil -> (),
                                         }
-                                    } else ()
+                                    }
                                 },
                                 SkField if (patContainsStructField(arm.pat, inf, targetQn, target.stName)) -> {
                                     let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
@@ -3810,7 +3958,8 @@ def checkScopeUnaliasedImportConflict(inf: InferOutput, exports: StrMap NameInfo
 }
 
 def collectTypeAnnotOccsInForm(
-    uri: String, src: String, f: Form, fileId: Int, typeName: String,
+    uri: String, src: String, f: Form, fileId: Int, rscope: RenameScope,
+    typeName: String, targetQn: String, forRename: Bool,
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
     if (f.pos.fileId != fileId) ()
@@ -3823,13 +3972,18 @@ def collectTypeAnnotOccsInForm(
                 let co = cellNew(occs);
                 while (match cellGet(co) { Nil -> false, _ -> true }) {
                     match cellGet(co) {
-                        Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                        Cons((s, e), ro) -> {
+                            if (allowOccAt(rscope, src, s, typeName, targetQn, forRename)) {
+                                pushOcc(seen, outRev, uri, src, s, e)
+                            } else ();
+                            cellSet(co, ro)
+                        },
                         Nil -> (),
                     }
                 }
             } else ();
-            collectTypeAnnotOccsInForm(uri, src, rhs, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInForm(uri, src, body, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, rhs, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, body, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
         ExAbs(_, _, body) -> {
             if (body.pos.start > f.pos.start) {
@@ -3837,82 +3991,89 @@ def collectTypeAnnotOccsInForm(
                 let co = cellNew(occs);
                 while (match cellGet(co) { Nil -> false, _ -> true }) {
                     match cellGet(co) {
-                        Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                        Cons((s, e), ro) -> {
+                            if (allowOccAt(rscope, src, s, typeName, targetQn, forRename)) {
+                                pushOcc(seen, outRev, uri, src, s, e)
+                            } else ();
+                            cellSet(co, ro)
+                        },
                         Nil -> (),
                     }
                 }
             } else ();
-            collectTypeAnnotOccsInForm(uri, src, body, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, body, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
-        ExTuple(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
-        ExList(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
-        ExBlock(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
+        ExTuple(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
+        ExList(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
+        ExBlock(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
         ExStructInit(_, fs) -> {
             let cf = cellNew(fs);
             while (match cellGet(cf) { Nil -> false, _ -> true }) {
                 match cellGet(cf) {
-                    Cons((_, fv), r) -> { collectTypeAnnotOccsInForm(uri, src, fv, fileId, typeName, seen, outRev); cellSet(cf, r) },
+                    Cons((_, fv), r) -> { collectTypeAnnotOccsInForm(uri, src, fv, fileId, rscope, typeName, targetQn, forRename, seen, outRev); cellSet(cf, r) },
                     Nil -> (),
                 }
             }
         },
         ExApply(c, args) -> {
-            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInList(uri, src, args, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInList(uri, src, args, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
         ExBin(_, l, r) -> {
-            collectTypeAnnotOccsInForm(uri, src, l, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInForm(uri, src, r, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, l, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, r, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
-        ExUn(_, s) -> collectTypeAnnotOccsInForm(uri, src, s, fileId, typeName, seen, outRev),
+        ExUn(_, s) -> collectTypeAnnotOccsInForm(uri, src, s, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
         ExIf(c, t, e) -> {
-            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInForm(uri, src, t, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInForm(uri, src, e, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, t, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, e, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
         ExWhile(c, b) -> {
-            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
-            collectTypeAnnotOccsInForm(uri, src, b, fileId, typeName, seen, outRev)
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, b, fileId, rscope, typeName, targetQn, forRename, seen, outRev)
         },
         ExMatch(scrut, arms) -> {
-            collectTypeAnnotOccsInForm(uri, src, scrut, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, scrut, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
             let ca = cellNew(arms);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
                 match cellGet(ca) {
                     Cons(arm, r) -> {
                         match arm.guard {
-                            Some(g) -> collectTypeAnnotOccsInForm(uri, src, g, fileId, typeName, seen, outRev),
+                            Some(g) -> collectTypeAnnotOccsInForm(uri, src, g, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
                             None -> (),
                         };
-                        collectTypeAnnotOccsInForm(uri, src, arm.body, fileId, typeName, seen, outRev);
+                        collectTypeAnnotOccsInForm(uri, src, arm.body, fileId, rscope, typeName, targetQn, forRename, seen, outRev);
                         cellSet(ca, r)
                     },
                     Nil -> (),
                 }
             }
         },
-        ExField(base, _) -> collectTypeAnnotOccsInForm(uri, src, base, fileId, typeName, seen, outRev),
-        ExTry(inner) -> collectTypeAnnotOccsInForm(uri, src, inner, fileId, typeName, seen, outRev),
+        ExField(base, _) -> collectTypeAnnotOccsInForm(uri, src, base, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
+        ExTry(inner) -> collectTypeAnnotOccsInForm(uri, src, inner, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
         ExLit(_) -> (),
         ExVar(_) -> (),
     }
 }
 
 def collectTypeAnnotOccsInList(
-    uri: String, src: String, fs: List Form, fileId: Int, typeName: String,
+    uri: String, src: String, fs: List Form, fileId: Int, rscope: RenameScope,
+    typeName: String, targetQn: String, forRename: Bool,
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
     let cur = cellNew(fs);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
-            Cons(h, r) -> { collectTypeAnnotOccsInForm(uri, src, h, fileId, typeName, seen, outRev); cellSet(cur, r) },
+            Cons(h, r) -> { collectTypeAnnotOccsInForm(uri, src, h, fileId, rscope, typeName, targetQn, forRename, seen, outRev); cellSet(cur, r) },
             Nil -> (),
         }
     }
 }
 
 def collectTypeOccsInDef(
-    wd: WorkspaceDoc, d: Def, target: SymTarget, includeDecl: Bool,
+    wd: WorkspaceDoc, d: Def, rscope: RenameScope, target: SymTarget, targetQn: String,
+    includeDecl: Bool, forRename: Bool,
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
     let isDeclSelf = wd.wdCanon == target.stDeclCanon && d.dpos.start == target.stDeclDefStart && d.dpos.end == target.stDeclDefEnd;
@@ -3927,11 +4088,16 @@ def collectTypeOccsInDef(
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
-                    Cons((s, e), ro) -> { pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e); cellSet(co, ro) },
+                    Cons((s, e), ro) -> {
+                        if (allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename)) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                        } else ();
+                        cellSet(co, ro)
+                    },
                     Nil -> (),
                 }
             };
-            collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, f, wd.wdFileId, target.stName, seen, outRev)
+            collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, f, wd.wdFileId, rscope, target.stName, targetQn, forRename, seen, outRev)
         },
         ItInstance(_, _, _, impls) -> {
             let headEnd = match strIndexOfByte(wd.wdText, 123, d.dpos.start) {
@@ -3942,7 +4108,12 @@ def collectTypeOccsInDef(
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
-                    Cons((s, e), ro) -> { pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e); cellSet(co, ro) },
+                    Cons((s, e), ro) -> {
+                        if (allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename)) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                        } else ();
+                        cellSet(co, ro)
+                    },
                     Nil -> (),
                 }
             };
@@ -3950,7 +4121,7 @@ def collectTypeOccsInDef(
             while (match cellGet(ci) { Nil -> false, _ -> true }) {
                 match cellGet(ci) {
                     Cons(mi, ri) -> {
-                        collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, mi.implBody, wd.wdFileId, target.stName, seen, outRev);
+                        collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, mi.implBody, wd.wdFileId, rscope, target.stName, targetQn, forRename, seen, outRev);
                         cellSet(ci, ri)
                     },
                     Nil -> (),
@@ -3964,7 +4135,7 @@ def collectTypeOccsInDef(
                 match cellGet(co) {
                     Cons((s, e), ro) -> {
                         let isHeaderToken = isDeclSelf && s == declS && e == declE;
-                        if (!isHeaderToken || includeDecl) {
+                        if ((!isHeaderToken || includeDecl) && (isHeaderToken || allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename))) {
                             pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
                         } else ();
                         cellSet(co, ro)
@@ -4130,9 +4301,9 @@ def collectSymbolOccurrences(
                                                     rsItems: scopeItems,
                                                     rsAllowUnaliased: allowUnaliased,
                                                 };
-                                                // If target is a type/concept, scan AST type-annotation & declaration regions (never expression bodies)
-                                                if (target.stIsType && (!forRenDoc || allowUnaliased)) {
-                                                    collectTypeOccsInDef(wd, d, target, includeDecl, seen, outRev)
+                                                // If target is a type/concept, scan AST type-annotation & declaration regions (per-site alias check)
+                                                if (target.stIsType) {
+                                                    collectTypeOccsInDef(wd, d, rscope, target, targetQn, includeDecl, forRenDoc, seen, outRev)
                                                 } else ();
                                                 match d.item {
                                                     ItForm(f) -> {

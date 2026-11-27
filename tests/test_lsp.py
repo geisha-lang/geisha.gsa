@@ -1378,6 +1378,96 @@ def main() -> int:
         )
         assert res_k.returncode == 0 and res_k.stdout.strip() == "7", f"renamed two-hop alias failed to run: rc={res_k.returncode} stdout={res_k.stdout!r} stderr={res_k.stderr!r}"
 
+        # (l) Qualified access with whitespace / comments between `.` and ident: `m2. load()`, `m2./*source*/load()`, `m2./*load*/load()`
+        qws_dir = root / "qual_ws_proj"
+        qws_dir.mkdir(parents=True)
+        q_m2_path = qws_dir / "m2.gsa"
+        q_usr_path = qws_dir / "user.gsa"
+        q_m2_src = "pub def load(): Int = 7\n"
+        q_usr_src = (
+            "use std.str.intToStr\n"
+            "use m2\n"
+            "def main(): Void = printLn(intToStr(m2. load() + m2./*source*/load() + m2./*load*/load()))\n"
+        )
+        q_m2_path.write_text(q_m2_src, encoding="utf-8")
+        q_usr_path.write_text(q_usr_src, encoding="utf-8")
+        q_m2_uri = path_to_uri(q_m2_path)
+        q_usr_uri = path_to_uri(q_usr_path)
+        client.notifications.clear()
+        for u, t in ((q_m2_uri, q_m2_src), (q_usr_uri, q_usr_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_qws = client.request("textDocument/rename", {
+            "textDocument": {"uri": q_m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "freshName",
+        })
+        assert "result" in ren_qws, f"expected qualified whitespace/comment rename to succeed: {ren_qws}"
+        ch_qws = ren_qws["result"]["changes"]
+        new_q_m2 = apply_edits(q_m2_src, ch_qws[q_m2_uri])
+        new_q_usr = apply_edits(q_usr_src, ch_qws[q_usr_uri])
+        assert "m2. freshName()" in new_q_usr and "m2./*source*/freshName()" in new_q_usr and "m2./*load*/freshName()" in new_q_usr, f"unexpected qualified rename: {new_q_usr!r}"
+        run_l_dir = root / "run_qual_ws"
+        run_l_dir.mkdir(parents=True)
+        (run_l_dir / "m2.gsa").write_text(new_q_m2, encoding="utf-8")
+        (run_l_dir / "user.gsa").write_text(new_q_usr, encoding="utf-8")
+        res_l = subprocess.run(
+            [abs_geisha_bin, "run", str(run_l_dir / "user.gsa")],
+            cwd=str(run_l_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_l.returncode == 0 and res_l.stdout.strip() == "21", f"renamed qualified ws/comment calls failed to run: rc={res_l.returncode} stdout={res_l.stdout!r} stderr={res_l.stderr!r}"
+
+        # (m) Qualified type annotation `use a` + `def valOf(x: a.Marker): Int = x.val` -> rename `a.Marker` -> `NewMarker` rewrites `a.Marker` and runs -> `7`
+        qt_dir = root / "qual_type_proj"
+        qt_dir.mkdir(parents=True)
+        qt_a_path = qt_dir / "a.gsa"
+        qt_u_path = qt_dir / "user.gsa"
+        qt_a_src = (
+            "pub data Marker { MkMarker { val: Int } }\n"
+            "pub def mk(): Marker = MkMarker { val: 7 }\n"
+        )
+        qt_u_src = (
+            "use std.str.intToStr\n"
+            "use a\n"
+            "def valOf(x: a.Marker): Int = x.val\n"
+            "def main(): Void = printLn(intToStr(valOf(a.mk())))\n"
+        )
+        qt_a_path.write_text(qt_a_src, encoding="utf-8")
+        qt_u_path.write_text(qt_u_src, encoding="utf-8")
+        qt_a_uri = path_to_uri(qt_a_path)
+        qt_u_uri = path_to_uri(qt_u_path)
+        client.notifications.clear()
+        for u, t in ((qt_a_uri, qt_a_src), (qt_u_uri, qt_u_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_qt = client.request("textDocument/rename", {
+            "textDocument": {"uri": qt_a_uri},
+            "position": {"line": 0, "character": 9},
+            "newName": "NewMarker",
+        })
+        assert "result" in ren_qt, f"expected qualified type rename to succeed: {ren_qt}"
+        ch_qt = ren_qt["result"]["changes"]
+        new_qt_a = apply_edits(qt_a_src, ch_qt[qt_a_uri])
+        new_qt_u = apply_edits(qt_u_src, ch_qt[qt_u_uri])
+        assert "def valOf(x: a.NewMarker): Int = x.val" in new_qt_u, f"expected `a.Marker` rewritten to `a.NewMarker`, got: {new_qt_u!r}"
+        run_m_dir = root / "run_qual_type"
+        run_m_dir.mkdir(parents=True)
+        (run_m_dir / "a.gsa").write_text(new_qt_a, encoding="utf-8")
+        (run_m_dir / "user.gsa").write_text(new_qt_u, encoding="utf-8")
+        res_m = subprocess.run(
+            [abs_geisha_bin, "run", str(run_m_dir / "user.gsa")],
+            cwd=str(run_m_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_m.returncode == 0 and res_m.stdout.strip() == "7", f"renamed qualified type annotation failed to run: rc={res_m.returncode} stdout={res_m.stdout!r} stderr={res_m.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
