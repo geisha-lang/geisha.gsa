@@ -3297,7 +3297,7 @@ def genExpr(
                             CAbiRetSret(sTy, aln) -> {
                                 let sb = emitEntryAlloca(fctx, sTy);
                                 cellSet(callArgPartsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln) + " " + sb, cellGet(callArgPartsRev)));
-                                cellSet(fnSigPartsRev, Cons("ptr sret(" + sTy + ") align " + intToStr(aln), cellGet(fnSigPartsRev)));
+                                cellSet(fnSigPartsRev, Cons("ptr", cellGet(fnSigPartsRev)));
                                 Some((sb, sTy, aln))
                             },
                             _ -> None,
@@ -3342,7 +3342,7 @@ def genExpr(
                                             if (useByval) {
                                                 let declP = "ptr byval(" + sTy + ") align " + intToStr(aln);
                                                 cellSet(callArgPartsRev, Cons(declP + " " + tmp, cellGet(callArgPartsRev)));
-                                                cellSet(fnSigPartsRev, Cons(declP, cellGet(fnSigPartsRev)))
+                                                cellSet(fnSigPartsRev, Cons("ptr", cellGet(fnSigPartsRev)))
                                             } else {
                                                 cellSet(callArgPartsRev, Cons("ptr " + tmp, cellGet(callArgPartsRev)));
                                                 cellSet(fnSigPartsRev, Cons("ptr", cellGet(fnSigPartsRev)))
