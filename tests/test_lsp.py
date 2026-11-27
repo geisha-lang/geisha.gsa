@@ -1767,6 +1767,75 @@ def main() -> int:
         )
         assert res_t.returncode == 0 and res_t.stdout.strip() == "21", f"renamed paren/unit-tuple/let field patterns failed to run: rc={res_t.returncode} stdout={res_t.stdout!r} stderr={res_t.stderr!r}"
 
+        # (u) Cursor-initiated rename inside patterns:
+        #   (u1) cursor on `Other { x: right }` field label -> renames `Other.x`, leaves `Point.x` untouched, runs -> `10`
+        #   (u2) cursor on `Point { x: x } -> x` LEFT of `:` -> renames `Point.x` field (NOT local `x`), runs -> `7`
+        #   (u3) cursor on `Point { x: x } -> x` RIGHT of `:` -> renames local binder `x` (NOT field `Point.x`), runs -> `7`
+        u1_line = "    Both { p: Point { x: left }, q: Other { x: right } } -> left + right,"
+        other_x_col = u1_line.index("Other { x:") + len("Other { ")
+        ren_u1 = client.request("textDocument/rename", {
+            "textDocument": {"uri": nf_uri},
+            "position": {"line": 5, "character": other_x_col},
+            "newName": "otherCoord",
+        })
+        assert "result" in ren_u1, f"expected cursor-on-Other.x rename to succeed: {ren_u1}"
+        new_u1 = apply_edits(nf_src, ren_u1["result"]["changes"][nf_uri])
+        assert "data Point { Point { x: Int } }" in new_u1 and "data Other { Other { otherCoord: Int } }" in new_u1, f"expected ONLY Other.x renamed: {new_u1!r}"
+        assert "Both { p: Point { x: left }, q: Other { otherCoord: right } } -> left + right," in new_u1, f"unexpected u1 pattern: {new_u1!r}"
+        run_u1_dir = root / "run_cursor_other_x"
+        run_u1_dir.mkdir(parents=True)
+        (run_u1_dir / "main.gsa").write_text(new_u1, encoding="utf-8")
+        res_u1 = subprocess.run([abs_geisha_bin, "run", str(run_u1_dir / "main.gsa")], cwd=str(run_u1_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_u1.returncode == 0 and res_u1.stdout.strip() == "10", f"u1 failed: rc={res_u1.returncode} stdout={res_u1.stdout!r} stderr={res_u1.stderr!r}"
+
+        u23_dir = root / "cursor_pat_x_x_proj"
+        u23_dir.mkdir(parents=True)
+        u23_path = u23_dir / "main.gsa"
+        u23_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int } }\n"
+            "def getX(p: Point): Int = match p {\n"
+            "    Point { x: x } -> x,\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(getX(Point { x: 7 })))\n"
+        )
+        u23_path.write_text(u23_src, encoding="utf-8")
+        u23_uri = path_to_uri(u23_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": u23_uri, "languageId": "geisha", "version": 1, "text": u23_src}})
+        assert client.wait_diag_for(u23_uri) == []
+        pat_line = "    Point { x: x } -> x,"
+        left_x_col = pat_line.index("x: x")
+        right_x_col = pat_line.index(": x") + 2
+        # (u2) cursor on field label `x` (left of `:`)
+        ren_u2 = client.request("textDocument/rename", {
+            "textDocument": {"uri": u23_uri},
+            "position": {"line": 3, "character": left_x_col},
+            "newName": "coord",
+        })
+        assert "result" in ren_u2, f"expected cursor-on-field-label rename to succeed: {ren_u2}"
+        new_u2 = apply_edits(u23_src, ren_u2["result"]["changes"][u23_uri])
+        assert "data Point { Point { coord: Int } }" in new_u2 and "Point { coord: x } -> x," in new_u2 and "Point { coord: 7 }" in new_u2, f"unexpected u2 edits: {new_u2!r}"
+        run_u2_dir = root / "run_cursor_left_x"
+        run_u2_dir.mkdir(parents=True)
+        (run_u2_dir / "main.gsa").write_text(new_u2, encoding="utf-8")
+        res_u2 = subprocess.run([abs_geisha_bin, "run", str(run_u2_dir / "main.gsa")], cwd=str(run_u2_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_u2.returncode == 0 and res_u2.stdout.strip() == "7", f"u2 failed: rc={res_u2.returncode} stdout={res_u2.stdout!r} stderr={res_u2.stderr!r}"
+        # (u3) cursor on local binder `x` (right of `:`)
+        ren_u3 = client.request("textDocument/rename", {
+            "textDocument": {"uri": u23_uri},
+            "position": {"line": 3, "character": right_x_col},
+            "newName": "valX",
+        })
+        assert "result" in ren_u3, f"expected cursor-on-local-binder rename to succeed: {ren_u3}"
+        new_u3 = apply_edits(u23_src, ren_u3["result"]["changes"][u23_uri])
+        assert "data Point { Point { x: Int } }" in new_u3 and "Point { x: valX } -> valX," in new_u3 and "Point { x: 7 }" in new_u3, f"unexpected u3 edits: {new_u3!r}"
+        run_u3_dir = root / "run_cursor_right_x"
+        run_u3_dir.mkdir(parents=True)
+        (run_u3_dir / "main.gsa").write_text(new_u3, encoding="utf-8")
+        res_u3 = subprocess.run([abs_geisha_bin, "run", str(run_u3_dir / "main.gsa")], cwd=str(run_u3_dir), env=run_env, capture_output=True, text=True, timeout=60)
+        assert res_u3.returncode == 0 and res_u3.stdout.strip() == "7", f"u3 failed: rc={res_u3.returncode} stdout={res_u3.stdout!r} stderr={res_u3.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
