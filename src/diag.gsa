@@ -16,13 +16,29 @@ pub data SourceFile {
     MkSourceFile { sfPath: String, sfContent: String },
 }
 
+pub data DiagRecord {
+    MkDiagRecord {
+        drKind: String,
+        drFileId: Int,
+        drStart: Int,
+        drEnd: Int,
+        drMsg: String,
+        drHint: Option String,
+    },
+}
+
 def gDiagFiles: Cell (Vec SourceFile) = cellNew(vecNew())
 def gDiagLineTables: Cell (Vec (Option (Vec Int))) = cellNew(vecNew())
+def gLastDiag: Cell (Option DiagRecord) = cellNew(None)
 
 pub def diagReset(): Void = {
     cellSet(gDiagFiles, vecNew());
-    cellSet(gDiagLineTables, vecNew())
+    cellSet(gDiagLineTables, vecNew());
+    cellSet(gLastDiag, None)
 }
+
+pub def diagLastError(): Option DiagRecord =
+    cellGet(gLastDiag)
 
 pub def diagRegisterFile(path: String, src: String): Int = {
     let fs = cellGet(gDiagFiles);
@@ -151,6 +167,14 @@ pub def diagSpanTerm(sp: Span): Option String =
 
 def formatDiagInternal(kind: String, fileId: Int, startByte: Int, endByte: Int, msg: String, hintOpt: Option String, showNear: Bool): String = {
     let tag = shortDiagKind(kind);
+    cellSet(gLastDiag, Some(MkDiagRecord {
+        drKind: tag,
+        drFileId: fileId,
+        drStart: startByte,
+        drEnd: endByte,
+        drMsg: msg,
+        drHint: hintOpt,
+    }));
     let hintSuffix = match hintOpt {
         Some(h) -> "\n  hint: " + h,
         None -> "",

@@ -3699,4 +3699,8 @@ fi
 echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --write, --stdout, edge regressions, & semantic equivalence verified"
 PASS=$((PASS + 1))
 
+# 39. Built-in Language Server (`geisha lsp`) JSON-RPC 2.0 stdio round-trip
+python3 tests/test_lsp.py "$GEISHA_BIN"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

@@ -22,6 +22,8 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha build [--target native|wasm32|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3|-Os|-Oz|--opt <lvl>|--dev|--release] [-o out]`
    - **Source-level debugging (`lldb` / `gdb` / VS Code CodeLLDB)**: compile with `-g` / `--debug` (defaults to `-O0`, disables tail-call optimization, emits DWARF v4 line info + `@llvm.dbg.declare` local variables, and runs `dsymutil` on macOS). Load `~/.geisha/lib/geisha_lldb.py` in LLDB for formatted `String`, `Vec`, `Array`, `List`, `Option`, and boxed ADT inspection (see `docs/DEBUGGING.md`).
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
+5. **Editor / IDE integration (LSP)**:
+   - `geisha lsp` — start the built-in JSON-RPC 2.0 Language Server over stdio (diagnostics, hover with inferred types & `///` docs, go-to-definition, document symbols, completion)
 
 ---
 
