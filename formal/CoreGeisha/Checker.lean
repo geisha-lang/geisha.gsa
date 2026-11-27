@@ -1318,6 +1318,8 @@ structure Program where
   funs        : List FunDef
   externs     : List ExternDecl := []
   stackAllocs : List FnStackSpec := []
+  gcMasks     : List AdtGcMaskSpec := []
+  hasGcMasks  : Bool := false
   deriving Repr
 
 def Program.allFuns (p : Program) : List FunDef :=
@@ -1364,8 +1366,11 @@ def checkProgram (prog : Program) : Except String Unit :=
         match checkProgramEscape prog.allFuns prog.stackAllocs with
         | .error err => .error err
         | .ok () =>
-          if checkProgramGcLayouts prog.adts then .ok ()
-          else .error "GC pointer-mask layout verification failed"
+          match checkEmittedGcMasks prog.adts prog.hasGcMasks prog.gcMasks with
+          | .error err => .error err
+          | .ok () =>
+            if checkProgramGcLayouts prog.adts then .ok ()
+            else .error "GC pointer-mask layout verification failed"
   else
     .error "internal error: computed Send ADT set is not closed"
 
@@ -1421,19 +1426,23 @@ theorem checkProgram_components {prog : Program} (h : checkProgram prog = .ok ()
         | error _ => rw [hesc] at h; cases h
         | ok u3 =>
           rw [hesc] at h; dsimp only at h
-          split at h
-          · rename_i hgc
-            cases u3
-            refine ⟨?_, ?_, rfl, hgc⟩
-            · intro name fd hfd
-              have hmem := List.mem_of_find?_eq_some hfd
-              rcases List.mem_append.mp hmem with hfun | hext
-              · exact checkFunList_mem hcl hfl hfun
-              · rcases List.mem_map.mp hext with ⟨ed, _, rfl⟩
-                exact .trap .hostTrap ed.retTy
-            · exact checkProgramExhaustive_sound
-                (fun _ _ hfd => List.mem_of_find?_eq_some hfd) hexh
-          · cases h
+          cases hgcm : checkEmittedGcMasks prog.adts prog.hasGcMasks prog.gcMasks with
+          | error _ => rw [hgcm] at h; cases h
+          | ok u4 =>
+            rw [hgcm] at h; dsimp only at h
+            split at h
+            · rename_i hgc
+              cases u3; cases u4
+              refine ⟨?_, ?_, rfl, hgc⟩
+              · intro name fd hfd
+                have hmem := List.mem_of_find?_eq_some hfd
+                rcases List.mem_append.mp hmem with hfun | hext
+                · exact checkFunList_mem hcl hfl hfun
+                · rcases List.mem_map.mp hext with ⟨ed, _, rfl⟩
+                  exact .trap .hostTrap ed.retTy
+              · exact checkProgramExhaustive_sound
+                  (fun _ _ hfd => List.mem_of_find?_eq_some hfd) hexh
+            · cases h
   · cases h
 
 theorem checkProgram_sound {prog : Program} (h : checkProgram prog = .ok ()) :

@@ -455,11 +455,42 @@ def emitGcAllocForType(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, ty: Type)
         emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")")
     }
 
+def applyTypeArgs(base: Type, targs: List Type): Type = match targs {
+    Nil -> base,
+    Cons(a, r) -> applyTypeArgs(TyComp(base, a), r),
+}
+
+def computeFieldsGcMask64(fieldTys: List Type, startOff: Int): Option Int64 =
+    if (isNoscanList(fieldTys)) Some(intToI64(0))
+    else accumPtrMaskFields(fieldTys, startOff, intToI64(0))
+
+pub def initCodegenLayoutContext(prog: CoreProgram): Void = {
+    cellSet(gActiveAdtReg, prog.coreAdtReg);
+    cellSet(gActiveEscape, Some(prog.coreEscape));
+    cellSet(gActivePtrSize, 8);
+    cellSet(gUnboxMemo, strMapNew())
+}
+
+pub def computeCodegenVariantGcMaskSExpr(baseName: String, targs: List Type, fieldTys: List Type): String =
+    match fieldTys {
+        Nil -> "static",
+        _ -> {
+            let adtTy = applyTypeArgs(TyCon(baseName), targs);
+            match unboxedAdtFields(adtTy) {
+                Some(_) -> "unboxed",
+                None -> match computeFieldsGcMask64(fieldTys, 8) {
+                    Some(m) -> "(mask " + i64ToStr(m) + ")",
+                    None -> "conservative",
+                },
+            }
+        },
+    }
+
 def emitGcAllocForFields(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, fieldTys: List Type, startOff: Int): String =
     if (isNoscanList(fieldTys)) {
         emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
     } else if (!mctx.mcIsWasm) {
-        match accumPtrMaskFields(fieldTys, startOff, intToI64(0)) {
+        match computeFieldsGcMask64(fieldTys, startOff) {
             Some(mask) ->
                 if (mask == intToI64(0)) emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
                 else emitInlineNurseryAlloc(mctx, fctx, byteSz, false, true, mask, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
@@ -1582,19 +1613,31 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
             OpBitXor -> emitAssign(fctx, "xor " + ity + " " + lhs + ", " + rhs),
             OpShl ->
                 if (tyName == "Int64") {
-                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 63");
+                    let cnt64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
                     emitAssign(fctx, "shl i64 " + lhs + ", " + cnt64)
-                } else emitAssign(fctx, "shl i32 " + lhs + ", " + rhs),
+                } else {
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 31");
+                    emitAssign(fctx, "shl i32 " + lhs + ", " + m32)
+                },
             OpShr ->
                 if (tyName == "Int64") {
-                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 63");
+                    let cnt64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
                     emitAssign(fctx, "ashr i64 " + lhs + ", " + cnt64)
-                } else emitAssign(fctx, "ashr i32 " + lhs + ", " + rhs),
+                } else {
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 31");
+                    emitAssign(fctx, "ashr i32 " + lhs + ", " + m32)
+                },
             OpUshr ->
                 if (tyName == "Int64") {
-                    let cnt64 = emitAssign(fctx, "zext i32 " + rhs + " to i64");
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 63");
+                    let cnt64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
                     emitAssign(fctx, "lshr i64 " + lhs + ", " + cnt64)
-                } else emitAssign(fctx, "lshr i32 " + lhs + ", " + rhs),
+                } else {
+                    let m32 = emitAssign(fctx, "and i32 " + rhs + ", 31");
+                    emitAssign(fctx, "lshr i32 " + lhs + ", " + m32)
+                },
             OpEq -> emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + rhs),
             OpNe -> emitAssign(fctx, "icmp ne " + ity + " " + lhs + ", " + rhs),
             OpLt -> emitAssign(fctx, "icmp slt " + ity + " " + lhs + ", " + rhs),
@@ -1886,29 +1929,35 @@ def tryEmitIntrinsic(
     } else if (name == "bitShl") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        Some(emitAssign(fctx, "shl i32 " + a + ", " + b))
+        let m32 = emitAssign(fctx, "and i32 " + b + ", 31");
+        Some(emitAssign(fctx, "shl i32 " + a + ", " + m32))
     } else if (name == "bitShr") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        Some(emitAssign(fctx, "ashr i32 " + a + ", " + b))
+        let m32 = emitAssign(fctx, "and i32 " + b + ", 31");
+        Some(emitAssign(fctx, "ashr i32 " + a + ", " + m32))
     } else if (name == "bitUshr") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        Some(emitAssign(fctx, "lshr i32 " + a + ", " + b))
+        let m32 = emitAssign(fctx, "and i32 " + b + ", 31");
+        Some(emitAssign(fctx, "lshr i32 " + a + ", " + m32))
     } else if (name == "bitShl64") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        let m32 = emitAssign(fctx, "and i32 " + b32 + ", 63");
+        let b64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
         Some(emitAssign(fctx, "shl i64 " + a + ", " + b64))
     } else if (name == "bitShr64") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        let m32 = emitAssign(fctx, "and i32 " + b32 + ", 63");
+        let b64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
         Some(emitAssign(fctx, "ashr i64 " + a + ", " + b64))
     } else if (name == "bitUshr64") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let b32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
-        let b64 = emitAssign(fctx, "zext i32 " + b32 + " to i64");
+        let m32 = emitAssign(fctx, "and i32 " + b32 + ", 63");
+        let b64 = emitAssign(fctx, "zext i32 " + m32 + " to i64");
         Some(emitAssign(fctx, "lshr i64 " + a + ", " + b64))
     } else if (name == "bitPopCount") {
         let a = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);

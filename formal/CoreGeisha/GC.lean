@@ -1710,5 +1710,278 @@ theorem majorGc_reachable_iff (s : GcState) (roots : List ObjId) (oid : ObjId)
       have hEqV := majorGc_sound s roots _ hInv (Reachable.step hReachU hObjU hEdge hObjV)
       exact Reachable.step ih (hEqU.trans hObjU) hEdge (hEqV.trans hObjV)
 
+/-! ## Part 5: Exact LP64 Byte-Offset + Unboxed-ADT `codegen.gsa` GC Mask Verifier -/
+
+/-- Emitted GC allocation strategy for a concrete ADT constructor in `src/codegen.gsa`. -/
+inductive VariantGcMaskSpec where
+  | staticNullary : VariantGcMaskSpec
+  | unboxedValue  : VariantGcMaskSpec
+  | exactMask     : Nat → VariantGcMaskSpec
+  | conservative  : VariantGcMaskSpec
+  deriving Repr, BEq, DecidableEq
+
+/-- Per-ADT emitted GC mask table exported into `(gc-masks ...)` in `.gscore`. -/
+structure AdtGcMaskSpec where
+  adtName   : Ident
+  isCStruct : Bool := false
+  variants  : List (Nat × VariantGcMaskSpec)
+  deriving Repr, BEq
+
+private def abiAlignUp (offset align : Nat) : Nat :=
+  if align ≤ 1 then offset
+  else
+    let rem := offset % align
+    if rem == 0 then offset else offset + (align - rem)
+
+private def abiUnboxedFieldsFromSet (adts : List AdtDef) (unboxedSet : List Ident)
+    (adtName : Ident) : Option (List Ty) :=
+  if unboxedSet.contains adtName then
+    match adts.find? (·.name == adtName) with
+    | some { variants := [vinfo], .. } => some vinfo.fields
+    | _ => none
+  else
+    none
+
+mutual
+private def abiInlineUnboxRefs (unboxedSet : List Ident) : Ty → List Ident → List Ident
+  | .adt n, acc =>
+    if unboxedSet.contains n && !(acc.contains n) then n :: acc else acc
+  | .tuple ts, acc => abiInlineUnboxRefsList unboxedSet ts acc
+  | _, acc => acc
+
+private def abiInlineUnboxRefsList (unboxedSet : List Ident) : List Ty → List Ident → List Ident
+  | [], acc => acc
+  | t :: ts, acc => abiInlineUnboxRefsList unboxedSet ts (abiInlineUnboxRefs unboxedSet t acc)
+end
+
+private def abiInlineDirectRefs (adts : List AdtDef) (unboxedSet : List Ident) (curr : Ident) :
+    List Ident :=
+  match adts.find? (·.name == curr) with
+  | none => []
+  | some ainfo =>
+    ainfo.variants.foldl (fun acc vi => abiInlineUnboxRefsList unboxedSet vi.fields acc) []
+
+private def abiInlineCycleLoop (adts : List AdtDef) (unboxedSet : List Ident) (target : Ident) :
+    Nat → List Ident → List Ident → Bool
+  | 0, _, _ => false
+  | _ + 1, [], _ => false
+  | fuel + 1, curr :: rest, visited =>
+    let refs := abiInlineDirectRefs adts unboxedSet curr
+    if refs.contains target then true
+    else
+      let fresh := refs.filter (fun n => !(visited.contains n))
+      abiInlineCycleLoop adts unboxedSet target fuel (fresh ++ rest) (fresh ++ visited)
+
+/-- True iff `nm` transitively embeds itself by value through `unboxedSet` ADTs/tuples. -/
+def abiHasInlineUnboxCycle (adts : List AdtDef) (unboxedSet : List Ident) (nm : Ident) : Bool :=
+  abiInlineCycleLoop adts unboxedSet nm (adts.length + 1) [nm] []
+
+mutual
+/-- Exact LP64 `(byteSize, abiAlign)` layout matching `typeSizeAndAlignRec(..., 8)` in `src/codegen.gsa`. -/
+def abiTypeSizeAlign (adts : List AdtDef) (unboxedSet : List Ident)
+    (fuel : Nat) (ty : Ty) : Nat × Nat :=
+  match fuel, ty with
+  | _, .void => (1, 1)
+  | _, .bool => (1, 1)
+  | _, .char => (1, 1)
+  | _, .int => (4, 4)
+  | _, .float32 => (4, 4)
+  | _, .int64 => (8, 8)
+  | _, .float => (8, 8)
+  | f, .tuple elems => abiStructSizeAlign adts unboxedSet f elems
+  | 0, .adt _ => (8, 8)
+  | fuel' + 1, .adt n =>
+    match abiUnboxedFieldsFromSet adts unboxedSet n with
+    | some fs => abiStructSizeAlign adts unboxedSet fuel' fs
+    | none => (8, 8)
+  | _, _ => (8, 8)
+termination_by (fuel, sizeOf ty, 2)
+
+def abiStructSizeAlign (adts : List AdtDef) (unboxedSet : List Ident)
+    (fuel : Nat) (elems : List Ty) : Nat × Nat :=
+  if elems.isEmpty then (0, 1)
+  else
+    let (endOff, maxAl) := abiStructFieldsLoop adts unboxedSet fuel elems 0 1
+    (abiAlignUp endOff maxAl, maxAl)
+termination_by (fuel, sizeOf elems, 1)
+
+def abiStructFieldsLoop (adts : List AdtDef) (unboxedSet : List Ident)
+    (fuel : Nat) (list : List Ty) (off maxAl : Nat) : Nat × Nat :=
+  match list with
+  | [] => (off, maxAl)
+  | el :: rest =>
+    let (sz, al) := abiTypeSizeAlign adts unboxedSet fuel el
+    let aligned := abiAlignUp off al
+    let maxAl' := if al > maxAl then al else maxAl
+    abiStructFieldsLoop adts unboxedSet fuel rest (aligned + sz) maxAl'
+termination_by (fuel, sizeOf list, 0)
+end
+
+mutual
+/-- Exact counterpart of `isNoscanElemType` in `src/codegen.gsa`. -/
+def abiIsNoscan (adts : List AdtDef) (unboxedSet : List Ident) : Nat → Ty → Bool
+  | _, .void | _, .int | _, .int64 | _, .float | _, .float32
+  | _, .char | _, .bool | _, .scopedPtr | _, .arena => true
+  | 0, _ => false
+  | fuel + 1, .tuple es => abiIsNoscanList adts unboxedSet fuel es
+  | fuel + 1, .adt n =>
+    match abiUnboxedFieldsFromSet adts unboxedSet n with
+    | some fs => abiIsNoscanList adts unboxedSet fuel fs
+    | none => false
+  | _, _ => false
+termination_by fuel ty => (fuel, sizeOf ty)
+
+def abiIsNoscanList (adts : List AdtDef) (unboxedSet : List Ident) (fuel : Nat) : List Ty → Bool
+  | [] => true
+  | t :: ts => abiIsNoscan adts unboxedSet fuel t && abiIsNoscanList adts unboxedSet fuel ts
+termination_by list => (fuel, sizeOf list)
+end
+
+/-- Set a single pointer-word bit in `[1..39]`, rejecting unaligned, tag-word (`0`), or `≥ 40` offsets. -/
+def abiSetPtrWordBit (baseOff : Nat) (maskAcc : Nat) : Option Nat :=
+  if baseOff % 8 = 0 then
+    let w := baseOff / 8
+    if 0 < w ∧ w < maxMaskWords then
+      some (maskAcc ||| (1 <<< w))
+    else
+      none
+  else
+    none
+
+theorem abiSetPtrWordBit_bounds {baseOff maskAcc m : Nat}
+    (hLt : maskAcc < 2 ^ maxMaskWords) (hBit0 : maskAcc.testBit 0 = false)
+    (h : abiSetPtrWordBit baseOff maskAcc = some m) :
+    m < 2 ^ maxMaskWords ∧ m.testBit 0 = false := by
+  unfold abiSetPtrWordBit at h
+  split at h
+  · dsimp only at h
+    split at h
+    · rename_i hmod hbounds
+      injection h with h; subst h
+      have hw_ne0 : baseOff / 8 ≠ 0 := Nat.ne_of_gt hbounds.1
+      have hw_lt : baseOff / 8 < maxMaskWords := hbounds.2
+      refine ⟨?_, ?_⟩
+      · apply Nat.or_lt_two_pow hLt
+        rw [Nat.shiftLeft_eq, Nat.one_mul]
+        exact Nat.pow_lt_pow_right (by omega) hw_lt
+      · rw [Nat.testBit_or, hBit0, Bool.false_or, testBit_one_shiftLeft_eq]
+        exact decide_eq_false hw_ne0
+    · cases h
+  · cases h
+
+mutual
+/-- Exact counterpart of `accumPtrMaskType` in `src/codegen.gsa`. -/
+def abiAccumPtrMaskType (adts : List AdtDef) (unboxedSet : List Ident) :
+    Nat → Ty → Nat → Nat → Option Nat
+  | _, .void, _, maskAcc => some maskAcc
+  | 0, _, _, _ => none
+  | fuel + 1, .tuple es, baseOff, maskAcc =>
+    abiAccumPtrMaskFields adts unboxedSet fuel es baseOff maskAcc
+  | fuel + 1, .adt n, baseOff, maskAcc =>
+    match abiUnboxedFieldsFromSet adts unboxedSet n with
+    | some fs => abiAccumPtrMaskFields adts unboxedSet fuel fs baseOff maskAcc
+    | none =>
+      if abiIsNoscan adts unboxedSet 34 (.adt n) then some maskAcc
+      else abiSetPtrWordBit baseOff maskAcc
+  | _, ty, baseOff, maskAcc =>
+    if abiIsNoscan adts unboxedSet 34 ty then some maskAcc
+    else abiSetPtrWordBit baseOff maskAcc
+termination_by fuel ty _ _ => (fuel, sizeOf ty)
+
+def abiAccumPtrMaskFields (adts : List AdtDef) (unboxedSet : List Ident) :
+    Nat → List Ty → Nat → Nat → Option Nat
+  | _, [], _, maskAcc => some maskAcc
+  | 0, _ :: _, _, _ => none
+  | fuel + 1, el :: rest, off, maskAcc =>
+    let (sz, al) := abiTypeSizeAlign adts unboxedSet 34 el
+    let aligned := abiAlignUp off al
+    match abiAccumPtrMaskType adts unboxedSet fuel el aligned maskAcc with
+    | some m2 => abiAccumPtrMaskFields adts unboxedSet fuel rest (aligned + sz) m2
+    | none => none
+termination_by fuel list _ _ => (fuel, sizeOf list)
+end
+
+/-- Expected GC allocation & 40-bit pointer-mask spec for a boxed or nullary ADT variant on LP64. -/
+def abiExpectedBoxedVariantMask (adts : List AdtDef) (unboxedSet : List Ident)
+    (v : VariantDef) : VariantGcMaskSpec :=
+  if v.fields.isEmpty then
+    .staticNullary
+  else if abiIsNoscanList adts unboxedSet 34 v.fields then
+    .exactMask 0
+  else
+    match abiAccumPtrMaskFields adts unboxedSet 35 v.fields 8 0 with
+    | some m => .exactMask m
+    | none => .conservative
+
+/-- Decidable header-bit safety check on any `VariantGcMaskSpec`. -/
+def variantGcMaskSpecValid : VariantGcMaskSpec → Bool
+  | .staticNullary => true
+  | .unboxedValue => true
+  | .conservative => true
+  | .exactMask m => decide (m < 2 ^ maxMaskWords) && !m.testBit 0
+
+/-- Verify that every ADT variant's actual `codegen.gsa` GC pointer mask exported
+    in `.gscore` matches the independent Lean LP64 byte-offset + unboxing oracle
+    and satisfies 40-bit header & tag-word safety (`variantGcMaskSpecValid`). -/
+def checkEmittedGcMasks (adts : List AdtDef) (hasGcMasks : Bool)
+    (specs : List AdtGcMaskSpec) : Except String Unit :=
+  if !hasGcMasks then
+    .ok ()
+  else if specs.length != adts.length then
+    .error s!"gc-masks count ({specs.length}) does not match adts count ({adts.length})"
+  else
+    let unboxedSet : List Ident :=
+      (specs.filter (fun s =>
+        match s.variants with
+        | [(_, .unboxedValue)] => true
+        | _ => false)).map (·.adtName)
+    let rec checkAdts : List AdtDef → Except String Unit
+      | [] => .ok ()
+      | adt :: rest =>
+        match specs.find? (·.adtName == adt.name) with
+        | none => .error s!"missing gc-masks entry for ADT '{adt.name}'"
+        | some spec =>
+          if spec.variants.length != adt.variants.length then
+            .error s!"gc-masks variant count mismatch on ADT '{adt.name}'"
+          else
+            let rec checkVars : List VariantDef → Except String Unit
+              | [] => .ok ()
+              | v :: vs =>
+                match spec.variants.find? (·.1 == v.tag) with
+                | none => .error s!"missing vmask for ADT '{adt.name}' tag {v.tag}"
+                | some (_, .unboxedValue) =>
+                  if adt.variants.length != 1 || v.fields.isEmpty then
+                    .error s!"invalid unboxed ADT '{adt.name}': must have 1 non-empty variant"
+                  else if abiHasInlineUnboxCycle adts unboxedSet adt.name then
+                    .error s!"invalid unboxed ADT '{adt.name}': cyclic inline value layout"
+                  else
+                    let (sz, _) := abiStructSizeAlign adts unboxedSet 34 v.fields
+                    if !(spec.isCStruct || (0 < sz && sz ≤ 64)) then
+                      .error s!"invalid unboxed ADT '{adt.name}': byte size {sz} exceeds 64B without @repr(C)"
+                    else
+                      checkVars vs
+                | some (_, actual) =>
+                  if unboxedSet.contains adt.name then
+                    .error s!"inconsistent unboxed status on ADT '{adt.name}'"
+                  else
+                    let expected := abiExpectedBoxedVariantMask adts unboxedSet v
+                    if actual != expected then
+                      .error s!"GC pointer-mask mismatch on ADT '{adt.name}' variant {v.tag}: codegen emitted {repr actual}, Lean LP64 ABI expects {repr expected}"
+                    else if !(variantGcMaskSpecValid actual) then
+                      .error s!"invalid 40-bit GC header mask {repr actual} on ADT '{adt.name}' variant {v.tag}"
+                    else
+                      checkVars vs
+            match checkVars adt.variants with
+            | .error e => .error e
+            | .ok () => checkAdts rest
+    checkAdts adts
+
+theorem variantGcMaskSpecValid_sound {m : Nat}
+    (h : variantGcMaskSpecValid (.exactMask m) = true) :
+    m < 2 ^ maxMaskWords ∧ m.testBit 0 = false := by
+  simp only [variantGcMaskSpecValid, Bool.and_eq_true, decide_eq_true_eq, Bool.not_eq_true'] at h
+  exact h
+
 end CoreGeisha
+
 

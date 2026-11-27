@@ -7,5 +7,6 @@ import CoreGeisha.Exhaustive
 import CoreGeisha.Escape
 import CoreGeisha.Scoped
 import CoreGeisha.GC
+import CoreGeisha.Eval
 import CoreGeisha.Checker
 import CoreGeisha.Parser
