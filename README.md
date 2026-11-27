@@ -16,7 +16,7 @@
 
 ---
 
-**Geisha** (`.gsa`) is a self-hosting, statically typed functional-systems language with Hindley-Milner inference, scoped zero-copy memory, compile-time race freedom, and a **Lean 4**–verified core—compiling via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with a built-in Git/MVS package manager.
+**Geisha** (`.gsa`) is a self-hosting, statically typed functional-systems language with Hindley-Milner inference, scoped zero-copy memory, compile-time race freedom, and a **Lean 4**–verified core—compiling via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, as well as zero-dependency ES Module JavaScript + TypeScript `.d.ts` (`--target js`), with a built-in Git/MVS package manager.
 
 <sub>Named after the Gesha coffee varietal—prized not for dark-roast weight, but for transparency and a clean finish, with nothing muddy between origin and cup.</sub>
 
@@ -94,7 +94,9 @@ geisha run hello.gsa
 | `src/infer.gsa` | HM type inference, open Concepts/Instances, `Generic` deriving, `$Scoped` & `Send` checking, and Maranget exhaustiveness |
 | `src/core.gsa` | K-conversion, lambda lifting, closure conversion, worklist monomorphization, static Concept dispatch, and 2-phase escape analysis |
 | `src/codegen.gsa` | LP64 / Wasm32 ABI layout calculator, 40-bit pointer masks, and LLVM 20 opaque-pointer IR (`.ll`) emitter |
-| `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/iOS builder |
+| `src/codegen_js.gsa` | Core IR to zero-dependency ES Module JavaScript (`.mjs`) and TypeScript `.d.ts` emitter |
+| `src/playground.gsa` | Client-side zero-server Playground compiler engine (`make wasm-playground` → `build/geisha-playground.wasm`) |
+| `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/js/iOS builder |
 | `src/doc.gsa` | Built-in `geisha doc` signature & `///` doc-comment extractor |
 | `src/bench.gsa` | Built-in `geisha bench` microbenchmark discovery, harness synthesis, and text/`--json` runner |
 | `src/lsp.gsa` | Built-in `geisha lsp` JSON-RPC 2.0 Language Server over stdio (diagnostics, hover, definition, document symbols, completion) |

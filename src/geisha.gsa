@@ -25,6 +25,7 @@ use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForArchDebug}
+use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
 use doc.cmdDoc
 use bench.cmdBench
 use fmt.cmdFmt
@@ -74,6 +75,9 @@ data CliOpts {
         optExports: List String,
         optNoMain: Bool,
         optBootSym: Option String,
+        optStrip: Bool,
+        optSlimRuntime: Bool,
+        optNoDts: Bool,
         optOutPath: Option String,
         optSrcRoot: Option String,
         optLibPaths: List String,
@@ -104,7 +108,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "lsp"
 
 def isSupportedTarget(t: String): Bool =
-    t == "native" || t == "wasm32" || t == "ios" || t == "ios-sim"
+    t == "native" || t == "wasm32" || t == "js" || t == "ios" || t == "ios-sim"
     || t == "macos-app" || t == "ios-app" || t == "ios-sim-app"
 
 def parsePkgFlagSpec(spec: String): Result (String, String) String =
@@ -146,6 +150,9 @@ def parseCliArgs(): Result CliOpts String = {
         let exportsRev: Cell (List String) = cellNew(Nil);
         let noMain = cellNew(false);
         let bootSym: Cell (Option String) = cellNew(None);
+        let stripFlag = cellNew(false);
+        let slimRt = cellNew(false);
+        let noDts = cellNew(false);
         let outPath: Cell (Option String) = cellNew(None);
         let srcRoot: Cell (Option String) = cellNew(None);
         let libPathsRev: Cell (List String) = cellNew(Nil);
@@ -253,15 +260,24 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--boot-sym") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing symbol after '--boot-sym'"))
                 else { cellSet(bootSym, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+            } else if (a == "--strip") {
+                cellSet(stripFlag, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--slim-runtime") {
+                cellSet(slimRt, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--no-dts") {
+                cellSet(noDts, true);
+                cellSet(i, cellGet(i) + 1)
             } else if (a == "--dump-core") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing output path after '--dump-core'"))
                 else { cellSet(dumpCore, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
             } else if (a == "--target") {
-                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | js | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
                 else {
                     let t = argAt(cellGet(i) + 1);
                     if (isSupportedTarget(t)) { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
-                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
+                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, js, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
                 }
             } else if (a == "--export") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing function name after '--export'"))
@@ -322,6 +338,9 @@ def parseCliArgs(): Result CliOpts String = {
                 optExports: listRev(cellGet(exportsRev)),
                 optNoMain: cellGet(noMain),
                 optBootSym: cellGet(bootSym),
+                optStrip: cellGet(stripFlag),
+                optSlimRuntime: cellGet(slimRt),
+                optNoDts: cellGet(noDts),
                 optOutPath: cellGet(outPath),
                 optSrcRoot: cellGet(srcRoot),
                 optLibPaths: listRev(cellGet(libPathsRev)),
@@ -343,6 +362,9 @@ def parseCliArgs(): Result CliOpts String = {
         let exportsRev: Cell (List String) = cellNew(Nil);
         let noMain = cellNew(false);
         let bootSym: Cell (Option String) = cellNew(None);
+        let stripFlag = cellNew(false);
+        let slimRt = cellNew(false);
+        let noDts = cellNew(false);
         let outPath: Cell (Option String) = cellNew(None);
         let srcRoot: Cell (Option String) = cellNew(None);
         let libPathsRev: Cell (List String) = cellNew(Nil);
@@ -395,15 +417,24 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--boot-sym") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing symbol name after '--boot-sym'"))
                 else { cellSet(bootSym, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+            } else if (a == "--strip") {
+                cellSet(stripFlag, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--slim-runtime") {
+                cellSet(slimRt, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (a == "--no-dts") {
+                cellSet(noDts, true);
+                cellSet(i, cellGet(i) + 1)
             } else if (a == "--dump-core") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing output path after '--dump-core'"))
                 else { cellSet(dumpCore, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
             } else if (a == "--target") {
-                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing target name after '--target' (native | wasm32 | js | ios | ios-sim | macos-app | ios-app | ios-sim-app)"))
                 else {
                     let t = argAt(cellGet(i) + 1);
                     if (isSupportedTarget(t)) { cellSet(targetCell, t); cellSet(i, cellGet(i) + 2) }
-                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
+                    else cellSet(errOpt, Some("Unsupported target '" + t + "' (expected native, wasm32, js, ios, ios-sim, macos-app, ios-app, or ios-sim-app)"))
                 }
             } else if (a == "--export") {
                 if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing function name after '--export'"))
@@ -466,6 +497,9 @@ def parseCliArgs(): Result CliOpts String = {
                 optExports: listRev(cellGet(exportsRev)),
                 optNoMain: cellGet(noMain),
                 optBootSym: cellGet(bootSym),
+                optStrip: cellGet(stripFlag),
+                optSlimRuntime: cellGet(slimRt),
+                optNoDts: cellGet(noDts),
                 optOutPath: cellGet(outPath),
                 optSrcRoot: cellGet(srcRoot),
                 optLibPaths: listRev(cellGet(libPathsRev)),
@@ -903,6 +937,7 @@ def emitNativeExecutableFromIrDebug(
     let ccBin = shellQuote(resolveNativeCc());
     let envPfx = nativeEnvPrefix();
     let targetArchFlag = nativeTargetFlag();
+    let effOptFlag = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
     let sysLibs = nativeSysLibs();
     let isMac = currentHostOs() == "macos";
     let cDbgFlag = if (debugInfo) " -g" else "";
@@ -967,7 +1002,7 @@ def emitNativeExecutableFromIrDebug(
             if (!needsObjStage) {
                 let cmd =
                     envPfx + ccBin + targetArchFlag
-                    + optFlag + " -Wno-override-module -pthread -x ir "
+                    + effOptFlag + " -Wno-override-module -pthread -x ir "
                     + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
                     + shellQuoteArgs(tc.tcLinkFlags)
                     + sysLibs
@@ -981,7 +1016,7 @@ def emitNativeExecutableFromIrDebug(
                 let tmpObj = outBin + ".gsa.tmp.o";
                 let cmdIr =
                     envPfx + ccBin + targetArchFlag
-                    + optFlag + " -Wno-override-module -x ir -c "
+                    + effOptFlag + " -Wno-override-module -x ir -c "
                     + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
                 let rc1 = shell(cmdIr);
                 let _ = removeFile(tmpLl);
@@ -992,7 +1027,7 @@ def emitNativeExecutableFromIrDebug(
                 } else {
                     let cmdLink =
                         envPfx + ccBin + targetArchFlag
-                        + optFlag + cDbgFlag + " -pthread"
+                        + effOptFlag + cDbgFlag + " -pthread"
                         + shellQuoteArgs(tc.tcCFlags)
                         + shellQuoteArgs(tc.tcCSources)
                         + shellQuoteArgs(cellGet(extraObjs))
@@ -1116,6 +1151,73 @@ def emitStaticLibFromIr(
 ): Result Void String =
     emitStaticLibFromIrOpt(llText, outArchive, target, rtOverrideOpt, " -O2")
 
+def dtsPathForJsOut(outJs: String): String = {
+    let n = strLen(outJs);
+    if (strEndsWith(outJs, ".mjs")) strSlice(outJs, 0, n - 4) + ".d.ts"
+    else if (strEndsWith(outJs, ".js")) strSlice(outJs, 0, n - 3) + ".d.ts"
+    else outJs + ".d.ts"
+}
+
+def compileWithPkgSpecsToJs(
+    entryFile: String,
+    useProjectLoader: Bool,
+    rootSpec: PkgSpec,
+    extSpecs: List PkgSpec,
+    libPaths: List String,
+    dumpCoreOpt: Option String,
+    tc: TargetCfg,
+    outJsPath: String
+): Result Void String = {
+    let rawDefs =
+        if (useProjectLoader) {
+            loadProjectProgramWithPkgs(entryFile, rootSpec, extSpecs, libPaths)?
+        } else {
+            let src = readFile(entryFile)?;
+            loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
+        };
+    let inf = inferProgram(rawDefs)?;
+    let coreProg = lowerToCore(inf)?;
+    maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
+    let effExports = match tc.tcExports {
+        Nil -> collectRootPubFnNames(rawDefs, coreProg),
+        es -> es,
+    };
+    let jsCode = emitProgramJs(coreProg, effExports, tc.tcOwnsMain);
+    writeFile(outJsPath, jsCode)?;
+    if (tc.tcEmitDts) {
+        let dtsCode = emitProgramDts(coreProg, effExports, tc.tcOwnsMain);
+        writeFile(dtsPathForJsOut(outJsPath), dtsCode)?;
+        Ok(())
+    } else Ok(())
+}
+
+def isWasmOptDisabled(): Bool = match getEnv("GEISHA_DISABLE_TOOL") {
+    Some(v) -> v == "wasm-opt",
+    None -> false,
+}
+
+def findExeInPath(binName: String): Option String = match getEnv("PATH") {
+    None -> None,
+    Some(pathEnv) -> {
+        let dirs = strSplitChar(pathEnv, ':');
+        let cur = cellNew(dirs);
+        let found: Cell (Option String) = cellNew(None);
+        while (match cellGet(cur) { Nil -> false, _ -> match cellGet(found) { None -> true, Some(_) -> false } }) {
+            match cellGet(cur) {
+                Cons(d, r) -> {
+                    if (strLen(d) > 0) {
+                        let cand = pathJoin(d, binName);
+                        if (fileExists(cand)) cellSet(found, Some(cand)) else ()
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+}
+
 def emitWasmFromIrOpt(
     llText: String,
     outPath: String,
@@ -1125,11 +1227,13 @@ def emitWasmFromIrOpt(
     optFlag: String
 ): Result Void String = {
     let wasmCc = resolveWasmCc();
+    let effOptFlag = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
+    let isSizeOpt = effOptFlag == " -Oz" || effOptFlag == " -Os";
     if (compileOnly) {
         let tmpLl = outPath + ".tmp.ll";
         writeFile(tmpLl, llText)?;
         let cmd =
-            shellQuote(wasmCc) + " --target=wasm32" + optFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib -x ir -c "
+            shellQuote(wasmCc) + " --target=wasm32" + effOptFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib -x ir -c "
             + shellQuote(tmpLl) + " -o " + shellQuote(outPath);
         let rc = shell(cmd);
         let _ = removeFile(tmpLl);
@@ -1139,22 +1243,58 @@ def emitWasmFromIrOpt(
         let wasmRt = resolveWasmRuntimeObj(rtOverrideOpt)?;
         let tmpLl = outPath + ".tmp.ll";
         writeFile(tmpLl, llText)?;
+        let doStrip = match tc.tcStrip {
+            Some(b) -> b,
+            None -> isSizeOpt,
+        };
+        let stripFlag = if (doStrip) " -Wl,--strip-all" else "";
+        let rtExports =
+            if (tc.tcSlimRuntime) ""
+            else " -Wl,--export=gs_wasm_gc_collect -Wl,--export=gs_wasm_alloc -Wl,--export=gs_wasm_str_len -Wl,--export=gs_wasm_heap_used -Wl,--export=gs_wasm_heap_live";
         let cmd =
             shellQuote(wasmCc)
-            + " --target=wasm32" + optFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
+            + " --target=wasm32" + effOptFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
             + resolveWasmLdFlag()
             + shellQuoteArgs(tc.tcCFlags)
             + " -x ir " + shellQuote(tmpLl) + " -x none " + shellQuote(wasmRt)
             + shellQuoteArgs(tc.tcCSources)
             + shellQuoteArgs(tc.tcLinkFlags)
-            + " -Wl,--no-entry -Wl,--export-dynamic -Wl,--allow-undefined -Wl,--gc-sections -o "
-            + shellQuote(outPath);
+            + " -Wl,--no-entry -Wl,--allow-undefined -Wl,--gc-sections"
+            + stripFlag
+            + rtExports
+            + " -o " + shellQuote(outPath);
         let rc = shell(cmd);
         let _ = removeFile(tmpLl);
-        if (rc == 0) Ok(())
-        else Err("LLVM wasm32 backend failed while linking '" + outPath + "' (ensure lld/wasm-ld is installed)")
+        if (rc != 0) {
+            Err("LLVM wasm32 backend failed while linking '" + outPath + "' (ensure lld/wasm-ld is installed)")
+        } else {
+            // Optional post-link `wasm-opt -Oz` pass when available in size mode (via PATH lookup, no `command -v` probe)
+            if (isSizeOpt && !isWasmOptDisabled()) {
+                match findExeInPath("wasm-opt") {
+                    Some(wasmOptBin) -> {
+                        let optCmd =
+                            shellQuote(wasmOptBin)
+                            + " -Oz --enable-bulk-memory --enable-nontrapping-float-to-int "
+                            + shellQuote(outPath) + " -o " + shellQuote(outPath);
+                        let optRc = shell(optCmd);
+                        if (optRc == 0) Ok(())
+                        else Err("wasm-opt failed while optimizing '" + outPath + "'")
+                    },
+                    None -> Ok(()),
+                }
+            } else Ok(())
+        }
     }
 }
+
+def emitWasmFromIr(
+    llText: String,
+    outPath: String,
+    compileOnly: Bool,
+    tc: TargetCfg,
+    rtOverrideOpt: Option String
+): Result Void String =
+    emitWasmFromIrOpt(llText, outPath, compileOnly, tc, rtOverrideOpt, " -O2")
 
 def emitWasmFromIr(
     llText: String,
@@ -1300,9 +1440,10 @@ def emitAppleBundleFromIrDebug(
         let extFlags = if (isExt) " -fapplication-extension" else "";
         let extLinkFlags = if (isExt) " -fapplication-extension -e _NSExtensionMain" else "";
         let cDbgFlag = if (debugInfo) " -g" else "";
+        let effOptFlag = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
 
         let cmdObj =
-            compilePrefix + extFlags + optFlag + " -Wno-override-module -x ir -c "
+            compilePrefix + extFlags + effOptFlag + " -Wno-override-module -x ir -c "
             + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
         let rc1 = shell(cmdObj);
         let _ = removeFile(tmpLl);
@@ -1311,7 +1452,7 @@ def emitAppleBundleFromIrDebug(
             Err("LLVM backend failed compiling object for Apple bundle '" + bundlePath + "'")
         } else {
             let cmdLink =
-                compilePrefix + extLinkFlags + optFlag + cDbgFlag + " -pthread"
+                compilePrefix + extLinkFlags + effOptFlag + cDbgFlag + " -pthread"
                 + shellQuoteArgs(tc.tcCFlags)
                 + shellQuoteArgs(tc.tcCSources)
                 + " " + shellQuote(tmpObj)
@@ -1419,7 +1560,8 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
             false, tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol, debugInfo
         )?;
         let outObj = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + ".o" };
-        emitNativeObjFromIrOpt(llText, outObj, optFlag)
+        let effOpt = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
+        emitNativeObjFromIrOpt(llText, outObj, effOpt)
     },
     cbCompileWasm: (entryFile, rootSpec, extSpecs, tc, compOnly, outOpt, dumpCoreOpt, rtOpt) -> {
         let llText = compileWithPkgSpecsToIrDebug(
@@ -1428,6 +1570,10 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
         )?;
         let outWasm = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + (if (compOnly) ".o" else ".wasm") };
         emitWasmFromIrOpt(llText, outWasm, compOnly, tc, rtOpt, optFlag)
+    },
+    cbCompileJs: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt) -> {
+        let outJs = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + ".mjs" };
+        compileWithPkgSpecsToJs(entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt, tc, outJs)
     },
     cbCompileAppleBundle: (target, entryFile, rootSpec, extSpecs, tc, ab, pkgName, pkgVersion, outOpt, dumpCoreOpt, rtOpt) -> {
         let noMainFlag = tc.tcOwnsMain || (target != "macos-app" && ab.abIsExtension);
@@ -1444,7 +1590,8 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             false, arch, tc.tcExports, true, tc.tcBootSymbol, debugInfo
         )?;
-        emitStaticLibFromIrOpt(llText, outArc, target, rtOpt, optFlag)
+        let effOpt = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
+        emitStaticLibFromIrOpt(llText, outArc, target, rtOpt, effOpt)
     },
     cbEmitIr: (entryFile, rootSpec, extSpecs, tc, isWasm, outOpt, dumpCoreOpt) -> {
         let llText = compileWithPkgSpecsToIrDebug(
@@ -1533,6 +1680,10 @@ def emptyPlainTargetCfg(): TargetCfg = MkTargetCfg {
     tcWebAssets: Nil,
     tcOwnsMain: false,
     tcBootSymbol: None,
+    tcOptLevel: None,
+    tcStrip: None,
+    tcSlimRuntime: false,
+    tcEmitDts: true,
 }
 
 def runUncachedScriptFile(
@@ -1678,8 +1829,12 @@ def printUsage(): Void = {
     printLn("  -g, --debug                    Emit DWARF debug info (defaults to -O0, disables TCO, runs dsymutil on macOS)");
     printLn("  -O<0|1|2|3|s|z>, --opt <lvl>   Set LLVM optimization level (--dev=-O0, --release=-O2; default: -O2, or -O0 with -g)");
     printLn("  --dump-core <file>             Dump Core Geisha S-expression IR (.gscore) for Lean 4 verifier");
-    printLn("  --target <target>              native | wasm32 | ios | ios-sim | macos-app | ios-app | ios-sim-app");
-    printLn("  --export <fn>                  Export function symbol on native or wasm32 (repeatable)");
+    printLn("  --target <target>              native | wasm32 | js | ios | ios-sim | macos-app | ios-app | ios-sim-app");
+    printLn("  --export <fn>                  Export function symbol on native, wasm32, or js (repeatable)");
+    printLn("  --opt[=]<0|1|2|3|s|z>          Optimization level (also -O0..-O3, -Os, -Oz, --dev, --release)");
+    printLn("  --strip                        Strip custom/name sections on wasm32");
+    printLn("  --slim-runtime                 Omit default gs_wasm_* host bridge exports on wasm32");
+    printLn("  --no-dts                       Skip TypeScript .d.ts generation on --target js");
     printLn("  --no-main                      Omit C main() wrapper (for custom native host entry)");
     printLn("  --boot-sym <sym>               Emit custom native global initializer symbol");
     printLn("  -c, --compile-only             Compile to object file (.o) without linking");
@@ -1722,6 +1877,10 @@ def runDriver(): Result Int String = {
                     opts.optExports,
                     opts.optNoMain,
                     opts.optBootSym,
+                    opts.optLevel,
+                    opts.optStrip,
+                    opts.optSlimRuntime,
+                    opts.optNoDts,
                     None,
                     cbs
                 )?;
@@ -1742,7 +1901,9 @@ def runDriver(): Result Int String = {
                         };
                         let bundlePath = cmdBuildProject(
                             projDir, opts.optTarget, false, false, opts.optOutPath, None,
-                            opts.optRuntime, opts.optExports, opts.optNoMain, opts.optBootSym, None, cbs
+                            opts.optRuntime, opts.optExports, opts.optNoMain, opts.optBootSym,
+                            opts.optLevel, opts.optStrip, opts.optSlimRuntime, opts.optNoDts,
+                            None, cbs
                         )?;
                         if (opts.optTarget == "macos-app") {
                             let rc = shell("open " + shellQuote(bundlePath));
@@ -1779,8 +1940,38 @@ def runDriver(): Result Int String = {
                     None -> returnDriverErr("No input .gsa file specified (run 'geisha --help' for usage)")?,
                 };
                 let isWasm = opts.optTarget == "wasm32";
+                let isJs = opts.optTarget == "js";
                 let useProjLoader = match opts.optSrcRoot { Some(_) -> true, None -> false };
                 let (rootSpec, extSpecs) = buildCliPkgGraph(inputFile, opts.optSrcRoot, opts.optPkgFlags, opts.optDepFlags);
+                let plainTc = MkTargetCfg {
+                    tcCSources: Nil,
+                    tcCFlags: Nil,
+                    tcLinkFlags: Nil,
+                    tcExtraUnits: Nil,
+                    tcExports: opts.optExports,
+                    tcWebAssets: Nil,
+                    tcOwnsMain: opts.optNoMain,
+                    tcBootSymbol: opts.optBootSym,
+                    tcOptLevel: opts.optLevel,
+                    tcStrip: if (opts.optStrip) Some(true) else None,
+                    tcSlimRuntime: opts.optSlimRuntime,
+                    tcEmitDts: !opts.optNoDts,
+                };
+                if (isJs) {
+                    if (opts.optEmitIr) {
+                        Err("cannot combine '--emit-llvm' with '--target js'")
+                    } else {
+                        let outJs = match opts.optOutPath {
+                            Some(p) -> p,
+                            None -> pathStem(inputFile) + ".mjs",
+                        };
+                        compileWithPkgSpecsToJs(
+                            inputFile, useProjLoader, rootSpec, extSpecs, opts.optLibPaths,
+                            opts.optDumpCore, plainTc, outJs
+                        )?;
+                        Ok(0)
+                    }
+                } else {
                 let arch =
                     if (isWasm) "wasm32"
                     else if (opts.optTarget == "ios" || opts.optTarget == "ios-sim" || opts.optTarget == "ios-app" || opts.optTarget == "ios-sim-app") "arm64"
@@ -1799,16 +1990,6 @@ def runDriver(): Result Int String = {
                     opts.optBootSym,
                     opts.optDebug
                 )?;
-                let plainTc = MkTargetCfg {
-                    tcCSources: Nil,
-                    tcCFlags: Nil,
-                    tcLinkFlags: Nil,
-                    tcExtraUnits: Nil,
-                    tcExports: opts.optExports,
-                    tcWebAssets: Nil,
-                    tcOwnsMain: opts.optNoMain,
-                    tcBootSymbol: opts.optBootSym,
-                };
                 if (opts.optEmitIr) {
                     match opts.optOutPath {
                         Some(outLl) -> { writeFile(outLl, llText)?; Ok(0) },
@@ -1842,6 +2023,7 @@ def runDriver(): Result Int String = {
                     };
                     emitNativeExecutableFromIrDebug(llText, outBin, plainTc, opts.optRuntime, opts.optDebug, optFlag)?;
                     Ok(0)
+                }
                 }
             },
         }

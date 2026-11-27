@@ -63,6 +63,10 @@ pub data TargetCfg {
         tcWebAssets: List String,
         tcOwnsMain: Bool,
         tcBootSymbol: Option String,
+        tcOptLevel: Option String,
+        tcStrip: Option Bool,
+        tcSlimRuntime: Bool,
+        tcEmitDts: Bool,
     },
 }
 
@@ -100,6 +104,7 @@ pub data Manifest {
         mfOverrides: List DepDecl,
         mfNative: TargetCfg,
         mfWasm: TargetCfg,
+        mfJs: TargetCfg,
         mfMacos: TargetCfg,
         mfIos: TargetCfg,
         mfMacosBundle: AppleBundleCfg,
@@ -141,6 +146,7 @@ pub data CompileCallbacks {
         cbCompileNativeExeSource: (String, String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String) -> Result Void String,
+        cbCompileJs: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String) -> Result String String,
         cbCompileTargetArchive: (String, String, PkgSpec, List PkgSpec, TargetCfg, String, Option String, Option String) -> Result Void String,
         cbEmitIr: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String) -> Result Void String,
@@ -176,6 +182,10 @@ def emptyTargetCfg(): TargetCfg = MkTargetCfg {
     tcWebAssets: Nil,
     tcOwnsMain: false,
     tcBootSymbol: None,
+    tcOptLevel: None,
+    tcStrip: None,
+    tcSlimRuntime: false,
+    tcEmitDts: true,
 }
 
 def emptyManifest(fallbackName: String): Manifest = MkManifest {
@@ -189,6 +199,7 @@ def emptyManifest(fallbackName: String): Manifest = MkManifest {
     mfOverrides: Nil,
     mfNative: emptyTargetCfg(),
     mfWasm: emptyTargetCfg(),
+    mfJs: emptyTargetCfg(),
     mfMacos: emptyTargetCfg(),
     mfIos: emptyTargetCfg(),
     mfMacosBundle: emptyAppleBundleCfg(),
@@ -550,6 +561,9 @@ def parseAppleBundleCfgValue(vOpt: Option Value): Result AppleBundleCfg String =
     Some(_) -> Err("expected '[target.<name>]' to be a TOML table"),
 }
 
+def returnTargetCfgErr(msg: String): Result (Option String) String = Err(msg)
+def returnTargetCfgBoolErr(msg: String): Result (Option Bool) String = Err(msg)
+
 def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOpt {
     None -> Ok(emptyTargetCfg()),
     Some(VObj(fs)) -> {
@@ -564,6 +578,19 @@ def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOp
         let webAs = asStrList(optFieldAlt(fs, "web_assets", "web-assets"))?;
         let ownsM = asBoolOr(optFieldAlt(fs, "owns_main", "owns-main"), false);
         let bootS = asStrOpt(optFieldAlt(fs, "boot_symbol", "boot-symbol"));
+        let optLvl = match asStrOpt(lookupVal(fs, "opt")) {
+            Some(lvl) ->
+                if (lvl == "0" || lvl == "1" || lvl == "2" || lvl == "3" || lvl == "s" || lvl == "z") Some(lvl)
+                else returnTargetCfgErr("invalid '[target.*]' opt '" + lvl + "' (expected \"0\", \"1\", \"2\", \"3\", \"s\", or \"z\")")?,
+            None -> None,
+        };
+        let stripFlag: Option Bool = match lookupVal(fs, "strip") {
+            Some(VBool(b)) -> Some(b),
+            Some(_) -> returnTargetCfgBoolErr("expected '[target.*]' field 'strip' to be a boolean")?,
+            None -> None,
+        };
+        let slimRt = asBoolOr(optFieldAlt(fs, "slim_runtime", "slim-runtime"), false);
+        let emitDts = asBoolOr(lookupVal(fs, "dts"), true);
 
         // Generic declarative `[[target.native.when]]` conditional blocks (`os`, `tool`, `pkg_config`, `compiler`, `defines`)
         match lookupVal(fs, "when") {
@@ -635,6 +662,10 @@ def parseTargetCfgValue(vOpt: Option Value): Result TargetCfg String = match vOp
             tcWebAssets: webAs,
             tcOwnsMain: ownsM,
             tcBootSymbol: bootS,
+            tcOptLevel: optLvl,
+            tcStrip: stripFlag,
+            tcSlimRuntime: slimRt,
+            tcEmitDts: emitDts,
         })
     },
     Some(_) -> Err("expected '[target.<name>]' to be a TOML table"),
@@ -752,17 +783,18 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
             let benches2 = asStrList(lookupVal(fs, "bench"))?;
             let deps = parseDepTable(lookupVal(fs, "deps"))?;
             let overrides = parseDepTable(lookupVal(fs, "overrides"))?;
-            let (nativeCfg, wasmCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
+            let (nativeCfg, wasmCfg, jsCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
                 Some(VObj(tfs)) -> {
                     let nc = parseTargetCfgValue(lookupVal(tfs, "native"))?;
                     let wc = parseTargetCfgValue(lookupVal(tfs, "wasm32"))?;
+                    let jc = parseTargetCfgValue(lookupVal(tfs, "js"))?;
                     let mc = parseTargetCfgValue(lookupVal(tfs, "macos"))?;
                     let ic = parseTargetCfgValue(lookupVal(tfs, "ios"))?;
                     let mb = parseAppleBundleCfgValue(lookupVal(tfs, "macos"))?;
                     let ib = parseAppleBundleCfgValue(lookupVal(tfs, "ios"))?;
-                    (nc, wc, mc, ic, mb, ib)
+                    (nc, wc, jc, mc, ic, mb, ib)
                 },
-                None -> (emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyAppleBundleCfg(), emptyAppleBundleCfg()),
+                None -> (emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyAppleBundleCfg(), emptyAppleBundleCfg()),
                 Some(_) -> returnManifestErr("expected '[target]' to be a TOML table")?,
             };
             Ok(MkManifest {
@@ -776,6 +808,7 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
                 mfOverrides: overrides,
                 mfNative: nativeCfg,
                 mfWasm: wasmCfg,
+                mfJs: jsCfg,
                 mfMacos: macosCfg,
                 mfIos: iosCfg,
                 mfMacosBundle: macosBundle,
@@ -786,7 +819,7 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
     }
 }
 
-def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
+def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
 
 pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
     let rootVal = tomlParse(raw)?;
@@ -1319,6 +1352,10 @@ def mergeLocalTargetCfg(base: TargetCfg, over: TargetCfg): TargetCfg = MkTargetC
     tcWebAssets: appendUniqueList(base.tcWebAssets, over.tcWebAssets),
     tcOwnsMain: base.tcOwnsMain || over.tcOwnsMain,
     tcBootSymbol: optStrOr(over.tcBootSymbol, base.tcBootSymbol),
+    tcOptLevel: optStrOr(over.tcOptLevel, base.tcOptLevel),
+    tcStrip: match over.tcStrip { Some(_) -> over.tcStrip, None -> base.tcStrip },
+    tcSlimRuntime: base.tcSlimRuntime || over.tcSlimRuntime,
+    tcEmitDts: base.tcEmitDts && over.tcEmitDts,
 }
 
 def mergeLocalAppleBundleCfg(base: AppleBundleCfg, over: AppleBundleCfg): AppleBundleCfg = MkAppleBundleCfg {
@@ -1362,6 +1399,7 @@ def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List 
                 mfOverrides: mf0.mfOverrides,
                 mfNative: mergeLocalTargetCfg(mf0.mfNative, lmf.mfNative),
                 mfWasm: mergeLocalTargetCfg(mf0.mfWasm, lmf.mfWasm),
+                mfJs: mergeLocalTargetCfg(mf0.mfJs, lmf.mfJs),
                 mfMacos: mergeLocalTargetCfg(mf0.mfMacos, lmf.mfMacos),
                 mfIos: mergeLocalTargetCfg(mf0.mfIos, lmf.mfIos),
                 mfMacosBundle: mergeLocalAppleBundleCfg(mf0.mfMacosBundle, lmf.mfMacosBundle),
@@ -1925,9 +1963,14 @@ def mergeTargetConfigsFor(
     target: String,
     cliExports: List String,
     cliNoMain: Bool,
-    cliBootSym: Option String
+    cliBootSym: Option String,
+    cliOptLevel: Option String,
+    cliStrip: Bool,
+    cliSlimRuntime: Bool,
+    cliNoDts: Bool
 ): TargetCfg = {
     let isWasm = target == "wasm32";
+    let isJs = target == "js";
     let isMacApp = target == "macos-app";
     let isIos = target == "ios" || target == "ios-sim" || target == "ios-app" || target == "ios-sim-app";
     let cSrcs = cellNew(Nil);
@@ -1938,8 +1981,12 @@ def mergeTargetConfigsFor(
     let webAs = cellNew(Nil);
     let ownsM = cellNew(cliNoMain);
     let bootS: Cell (Option String) = cellNew(cliBootSym);
+    let optLvl: Cell (Option String) = cellNew(None);
+    let stripF: Cell (Option Bool) = cellNew(None);
+    let slimRt = cellNew(cliSlimRuntime);
+    let emitDts = cellNew(!cliNoDts);
 
-    let applyOne = (baseDir: String, tc: TargetCfg) -> {
+    let applyDep = (baseDir: String, tc: TargetCfg) -> {
         cellSet(cSrcs, appendUniqueList(cellGet(cSrcs), resolveRelList(baseDir, tc.tcCSources)));
         cellSet(cFlgs, appendUniqueList(cellGet(cFlgs), tc.tcCFlags));
         // Preserve link flag order (e.g. `-framework Cocoa -framework QuartzCore` repeats `-framework`!)
@@ -1968,17 +2015,33 @@ def mergeTargetConfigsFor(
         }
     };
 
+    let applyRoot = (baseDir: String, tc: TargetCfg) -> {
+        applyDep(baseDir, tc);
+        match tc.tcOptLevel {
+            Some(ol) -> cellSet(optLvl, Some(ol)),
+            None -> (),
+        };
+        match tc.tcStrip {
+            Some(sb) -> cellSet(stripF, Some(sb)),
+            None -> (),
+        };
+        if (tc.tcSlimRuntime) cellSet(slimRt, true) else ();
+        if (!tc.tcEmitDts) cellSet(emitDts, false) else ()
+    };
+
     let cur = cellNew(resolvedPkgs);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(rp, r) -> {
                 if (isWasm) {
-                    applyOne(rp.rpRootDir, rp.rpManifest.mfWasm)
+                    applyDep(rp.rpRootDir, rp.rpManifest.mfWasm)
+                } else if (isJs) {
+                    applyDep(rp.rpRootDir, rp.rpManifest.mfJs)
                 } else if (isIos) {
-                    applyOne(rp.rpRootDir, rp.rpManifest.mfIos)
+                    applyDep(rp.rpRootDir, rp.rpManifest.mfIos)
                 } else {
-                    applyOne(rp.rpRootDir, rp.rpManifest.mfNative);
-                    if (isMacApp) applyOne(rp.rpRootDir, rp.rpManifest.mfMacos) else ()
+                    applyDep(rp.rpRootDir, rp.rpManifest.mfNative);
+                    if (isMacApp) applyDep(rp.rpRootDir, rp.rpManifest.mfMacos) else ()
                 };
                 cellSet(cur, r)
             },
@@ -1987,14 +2050,18 @@ def mergeTargetConfigsFor(
     };
 
     if (isWasm) {
-        applyOne(projectDir, rootMf.mfWasm)
+        applyRoot(projectDir, rootMf.mfWasm)
+    } else if (isJs) {
+        applyRoot(projectDir, rootMf.mfJs)
     } else if (isIos) {
-        applyOne(projectDir, rootMf.mfIos)
+        applyRoot(projectDir, rootMf.mfIos)
     } else {
-        applyOne(projectDir, rootMf.mfNative);
-        if (isMacApp) applyOne(projectDir, rootMf.mfMacos) else ()
+        applyRoot(projectDir, rootMf.mfNative);
+        if (isMacApp) applyRoot(projectDir, rootMf.mfMacos) else ()
     };
     cellSet(exps, appendUniqueList(cellGet(exps), cliExports));
+    let finalOpt = optStrOr(cliOptLevel, cellGet(optLvl));
+    let finalStrip = if (cliStrip) Some(true) else cellGet(stripF);
 
     MkTargetCfg {
         tcCSources: cellGet(cSrcs),
@@ -2005,6 +2072,10 @@ def mergeTargetConfigsFor(
         tcWebAssets: cellGet(webAs),
         tcOwnsMain: cellGet(ownsM),
         tcBootSymbol: cellGet(bootS),
+        tcOptLevel: finalOpt,
+        tcStrip: finalStrip,
+        tcSlimRuntime: cellGet(slimRt),
+        tcEmitDts: cellGet(emitDts),
     }
 }
 
@@ -2017,7 +2088,7 @@ pub def mergeTargetConfigs(
     cliNoMain: Bool,
     cliBootSym: Option String
 ): TargetCfg =
-    mergeTargetConfigsFor(projectDir, rootMf, resolvedPkgs, if (isWasm) "wasm32" else "native", cliExports, cliNoMain, cliBootSym)
+    mergeTargetConfigsFor(projectDir, rootMf, resolvedPkgs, if (isWasm) "wasm32" else "native", cliExports, cliNoMain, cliBootSym, None, false, false, false)
 
 pub def toLoaderPkgSpecs(resolved: List ResolvedPkg): List PkgSpec = {
     let out = cellNew(Nil);
@@ -2611,15 +2682,23 @@ pub def cmdBuildProject(
     cliExports: List String,
     cliNoMain: Bool,
     cliBootSym: Option String,
+    cliOptLevel: Option String,
+    cliStrip: Bool,
+    cliSlimRuntime: Bool,
+    cliNoDts: Bool,
     entryOverrideOpt: Option String,
     cbs: CompileCallbacks
 ): Result String String = {
     let (rootMf, rootSpec, resolvedPkgs) = resolveProjectGraph(projectDir, false, None, true)?;
     let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
     let isWasm = target == "wasm32";
+    let isJs = target == "js";
     let isAppleBundle = target == "macos-app" || target == "ios-app" || target == "ios-sim-app";
     let isIosLib = target == "ios" || target == "ios-sim";
-    let mergedTc = mergeTargetConfigsFor(projectDir, rootMf, resolvedPkgs, target, cliExports, cliNoMain, cliBootSym);
+    let mergedTc = mergeTargetConfigsFor(
+        projectDir, rootMf, resolvedPkgs, target, cliExports, cliNoMain, cliBootSym,
+        cliOptLevel, cliStrip, cliSlimRuntime, cliNoDts
+    );
     let entryFile = match entryOverrideOpt {
         Some(ef) -> ef,
         None -> resolveDefaultEntryFile(projectDir, rootMf)?,
@@ -2629,9 +2708,18 @@ pub def cmdBuildProject(
     let needBuildDir = match outPathOpt { None -> !emitIr, Some(_) -> false };
     let _ = if (needBuildDir) mkdirAll(buildDir)? else ();
 
-    if (emitIr) {
+    if (emitIr && isJs) {
+        Err("cannot combine '--emit-llvm' with '--target js'")
+    } else if (emitIr) {
         cbs.cbEmitIr(entryFile, rootSpec, extSpecs, mergedTc, isWasm, outPathOpt, dumpCoreOpt)?;
         Ok(match outPathOpt { Some(p) -> p, None -> "<stdout>" })
+    } else if (isJs) {
+        let defaultOut = pathJoin(buildDir, rootMf.mfName + ".mjs");
+        let outJs = match outPathOpt { Some(p) -> p, None -> defaultOut };
+        ensureParentDirExists(outJs)?;
+        cbs.cbCompileJs(entryFile, rootSpec, extSpecs, mergedTc, Some(outJs), dumpCoreOpt)?;
+        let _ = copyWebAssetsRec(mergedTc.tcWebAssets, pathDirname(outJs))?;
+        Ok(outJs)
     } else if (isWasm) {
         let defaultOut = pathJoin(buildDir, rootMf.mfName + (if (compileOnly) ".o" else ".wasm"));
         let outWasm = match outPathOpt { Some(p) -> p, None -> defaultOut };
@@ -2696,7 +2784,7 @@ pub def cmdRun(
                 Some(d) -> d,
                 None -> returnMatErr("no geisha.toml found in current or parent directories")?,
             };
-            cmdBuildProject(projDir, "native", false, false, None, None, rtOverrideOpt, Nil, false, None, None, cbs)?
+            cmdBuildProject(projDir, "native", false, false, None, None, rtOverrideOpt, Nil, false, None, None, false, false, false, None, cbs)?
         },
     };
 
@@ -2801,6 +2889,10 @@ pub def cmdTest(rtOverrideOpt: Option String, cbs: CompileCallbacks): Result Voi
         tcWebAssets: Nil,
         tcOwnsMain: false,
         tcBootSymbol: None,
+        tcOptLevel: None,
+        tcStrip: None,
+        tcSlimRuntime: false,
+        tcEmitDts: false,
     };
 
     let buildDir = pathJoin(projDir, "build/tests");
