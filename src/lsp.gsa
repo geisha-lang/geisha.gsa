@@ -2133,6 +2133,7 @@ data OccSpan {
         occText: String,
         occStart: Int,
         occEnd: Int,
+        occReplace: Option String,
     },
 }
 
@@ -2918,7 +2919,17 @@ def pushOcc(seen: StrMap Bool, outRev: Cell (List OccSpan), uri: String, text: S
         let key = uri + "#" + intToStr(s) + ":" + intToStr(e);
         if (!strMapContains(seen, key)) {
             strMapInsert(seen, key, true);
-            cellSet(outRev, Cons(MkOccSpan { occUri: uri, occText: text, occStart: s, occEnd: e }, cellGet(outRev)))
+            cellSet(outRev, Cons(MkOccSpan { occUri: uri, occText: text, occStart: s, occEnd: e, occReplace: None }, cellGet(outRev)))
+        } else ()
+    } else ()
+}
+
+def pushOccReplace(seen: StrMap Bool, outRev: Cell (List OccSpan), uri: String, text: String, s: Int, e: Int, rep: String): Void = {
+    if (e > s) {
+        let key = uri + "#" + intToStr(s) + ":" + intToStr(e);
+        if (!strMapContains(seen, key)) {
+            strMapInsert(seen, key, true);
+            cellSet(outRev, Cons(MkOccSpan { occUri: uri, occText: text, occStart: s, occEnd: e, occReplace: Some(rep) }, cellGet(outRev)))
         } else ()
     } else ()
 }
@@ -3493,35 +3504,193 @@ def findTypeTokIndicesInTypeDecl(toks: Vec Token, ident: String, lo: Int, hi: In
     listRev(cellGet(outRev))
 }
 
-def findFieldLabelTokIndicesInSpan(toks: Vec Token, fieldName: String, lo: Int, hi: Int): List Int = {
+def findPatStartTokIdx(toks: Vec Token, patLo: Int, patHi: Int): Int = {
     let n = vecLen(toks);
     let d = dummyEofTok();
     let i = cellNew(0);
-    let braceDepth = cellNew(0);
-    let outRev: Cell (List Int) = cellNew(Nil);
-    while (cellGet(i) < n) {
+    let found = cellNew(-1);
+    while (cellGet(i) < n && cellGet(found) < 0) {
         let idx = cellGet(i);
         let tok = vecGetOr(toks, idx, d);
-        if (tok.span.start >= hi) {
+        if (tok.span.start >= patHi) {
             cellSet(i, n)
-        } else {
-            if (tok.span.start >= lo && tok.span.end <= hi) {
-                match tok.kind {
-                    TkLBrace -> cellSet(braceDepth, cellGet(braceDepth) + 1),
-                    TkRBrace -> if (cellGet(braceDepth) > 0) cellSet(braceDepth, cellGet(braceDepth) - 1) else (),
-                    TkIdent(nm) if (nm == fieldName && cellGet(braceDepth) > 0) -> {
-                        let followedByColon = if (idx + 1 < n) {
-                            match vecGetOr(toks, idx + 1, d).kind { TkSym(s) if (s == ":") -> true, _ -> false }
-                        } else false;
-                        if (followedByColon) cellSet(outRev, Cons(idx, cellGet(outRev))) else ()
+        } else if (tok.span.start >= patLo) {
+            match tok.kind {
+                TkLBrace -> cellSet(i, idx + 1),
+                TkComma -> cellSet(i, idx + 1),
+                _ -> cellSet(found, idx),
+            }
+        } else cellSet(i, idx + 1)
+    };
+    cellGet(found)
+}
+
+def skipDottedPathInToks(toks: Vec Token, cur: Cell Int, hi: Int): Void = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    if (cellGet(cur) < n && vecGetOr(toks, cellGet(cur), d).span.start < hi) {
+        cellSet(cur, cellGet(cur) + 1);
+        let more = cellNew(true);
+        while (cellGet(more) && cellGet(cur) + 1 < n) {
+            let t = vecGetOr(toks, cellGet(cur), d);
+            if (t.span.start >= hi) cellSet(more, false)
+            else match t.kind {
+                TkDot -> cellSet(cur, cellGet(cur) + 2),
+                _ -> cellSet(more, false),
+            }
+        }
+    } else ()
+}
+
+def collectPatFieldOccsWithToks(
+    pat: Pattern,
+    toks: Vec Token,
+    cur: Cell Int,
+    hi: Int,
+    uri: String,
+    src: String,
+    inf: InferOutput,
+    targetField: String,
+    targetAdtQn: String,
+    newNameOpt: Option String,
+    seen: StrMap Bool,
+    outRev: Cell (List OccSpan)
+): Void = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    if (cellGet(cur) >= n || vecGetOr(toks, cellGet(cur), d).span.start >= hi) ()
+    else match pat {
+        PatWild -> cellSet(cur, cellGet(cur) + 1),
+        PatVar(_) -> cellSet(cur, cellGet(cur) + 1),
+        PatLit(_) -> {
+            match vecGetOr(toks, cellGet(cur), d).kind {
+                TkSym(s) if (s == "-") -> cellSet(cur, cellGet(cur) + 2),
+                _ -> cellSet(cur, cellGet(cur) + 1),
+            }
+        },
+        PatTuple(ps) -> {
+            match vecGetOr(toks, cellGet(cur), d).kind {
+                TkLParen -> cellSet(cur, cellGet(cur) + 1),
+                _ -> (),
+            };
+            let cp = cellNew(ps);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(p, rp) -> {
+                        collectPatFieldOccsWithToks(p, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
+                        if (cellGet(cur) < n) {
+                            match vecGetOr(toks, cellGet(cur), d).kind {
+                                TkComma -> cellSet(cur, cellGet(cur) + 1),
+                                _ -> (),
+                            }
+                        } else ();
+                        cellSet(cp, rp)
                     },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(cur) < n) {
+                match vecGetOr(toks, cellGet(cur), d).kind {
+                    TkRParen -> cellSet(cur, cellGet(cur) + 1),
+                    _ -> (),
+                }
+            } else ()
+        },
+        PatCtor(_, ps) -> {
+            skipDottedPathInToks(toks, cur, hi);
+            match ps {
+                Nil -> (),
+                _ -> {
+                    if (cellGet(cur) < n) {
+                        match vecGetOr(toks, cellGet(cur), d).kind {
+                            TkLParen -> cellSet(cur, cellGet(cur) + 1),
+                            _ -> (),
+                        }
+                    } else ();
+                    let cp = cellNew(ps);
+                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                        match cellGet(cp) {
+                            Cons(p, rp) -> {
+                                collectPatFieldOccsWithToks(p, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
+                                if (cellGet(cur) < n) {
+                                    match vecGetOr(toks, cellGet(cur), d).kind {
+                                        TkComma -> cellSet(cur, cellGet(cur) + 1),
+                                        _ -> (),
+                                    }
+                                } else ();
+                                cellSet(cp, rp)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    if (cellGet(cur) < n) {
+                        match vecGetOr(toks, cellGet(cur), d).kind {
+                            TkRParen -> cellSet(cur, cellGet(cur) + 1),
+                            _ -> (),
+                        }
+                    } else ()
+                },
+            }
+        },
+        PatStruct(ctorQn, fs) -> {
+            skipDottedPathInToks(toks, cur, hi);
+            let matchesAdt = match lookupAdtForCtor(inf, ctorQn) {
+                Some(an) -> an == targetAdtQn,
+                None -> false,
+            };
+            if (cellGet(cur) < n) {
+                match vecGetOr(toks, cellGet(cur), d).kind {
+                    TkLBrace -> cellSet(cur, cellGet(cur) + 1),
                     _ -> (),
                 }
             } else ();
-            cellSet(i, idx + 1)
-        }
-    };
-    listRev(cellGet(outRev))
+            let cf = cellNew(fs);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons((fname, subPat), rf) -> {
+                        if (cellGet(cur) < n && vecGetOr(toks, cellGet(cur), d).span.start < hi) {
+                            let fTok = vecGetOr(toks, cellGet(cur), d);
+                            cellSet(cur, cellGet(cur) + 1);
+                            let hasColon = if (cellGet(cur) < n) {
+                                match vecGetOr(toks, cellGet(cur), d).kind {
+                                    TkSym(s) if (s == ":") -> true,
+                                    _ -> false,
+                                }
+                            } else false;
+                            if (hasColon) {
+                                cellSet(cur, cellGet(cur) + 1);
+                                if (matchesAdt && fname == targetField) {
+                                    pushOcc(seen, outRev, uri, src, fTok.span.start, fTok.span.end)
+                                } else ();
+                                collectPatFieldOccsWithToks(subPat, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev)
+                            } else {
+                                if (matchesAdt && fname == targetField) {
+                                    match newNameOpt {
+                                        Some(nn) -> pushOccReplace(seen, outRev, uri, src, fTok.span.start, fTok.span.end, nn + ": " + fname),
+                                        None -> pushOcc(seen, outRev, uri, src, fTok.span.start, fTok.span.end),
+                                    }
+                                } else ()
+                            };
+                            if (cellGet(cur) < n) {
+                                match vecGetOr(toks, cellGet(cur), d).kind {
+                                    TkComma -> cellSet(cur, cellGet(cur) + 1),
+                                    _ -> (),
+                                }
+                            } else ()
+                        } else ();
+                        cellSet(cf, rf)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (cellGet(cur) < n) {
+                match vecGetOr(toks, cellGet(cur), d).kind {
+                    TkRBrace -> cellSet(cur, cellGet(cur) + 1),
+                    _ -> (),
+                }
+            } else ()
+        },
+    }
 }
 
 def extractQualBeforeTokIdx(toks: Vec Token, idx: Int): Option String = {
@@ -3786,18 +3955,11 @@ def collectTopDefOccsInForm(
                                     }
                                 },
                                 SkField if (patContainsStructField(arm.pat, inf, targetQn, target.stName)) -> {
-                                    let occs = findFieldLabelTokIndicesInSpan(rscope.rsToks, target.stName, patLo, patHi);
-                                    let co = cellNew(occs);
-                                    while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                        match cellGet(co) {
-                                            Cons(tidx, ro) -> {
-                                                let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
-                                                pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end);
-                                                cellSet(co, ro)
-                                            },
-                                            Nil -> (),
-                                        }
-                                    }
+                                    let startIdx = findPatStartTokIdx(rscope.rsToks, patLo, patHi);
+                                    if (startIdx >= 0) {
+                                        let curTok = cellNew(startIdx);
+                                        collectPatFieldOccsWithToks(arm.pat, rscope.rsToks, curTok, patHi, uri, src, inf, target.stName, targetQn, newNameOpt, seen, outRev)
+                                    } else ()
                                 },
                                 _ -> (),
                             }
@@ -4604,9 +4766,10 @@ def handleRename(ss: ServerState, params: Value): Result Value (Int, String) = {
                                         while (match cellGet(co) { Nil -> false, _ -> true }) {
                                             match cellGet(co) {
                                                 Cons(occ, r) -> {
+                                                    let editText = match occ.occReplace { Some(rep) -> rep, None -> newName };
                                                     let edit = VObj([
                                                         ("range", makeLspRange(occ.occText, occ.occStart, occ.occEnd)),
-                                                        ("newText", VStr(newName)),
+                                                        ("newText", VStr(editText)),
                                                     ]);
                                                     match strMapGet(byUri, occ.occUri) {
                                                         Some(prev) -> strMapInsert(byUri, occ.occUri, Cons(edit, prev)),

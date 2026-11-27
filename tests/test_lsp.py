@@ -1638,6 +1638,85 @@ def main() -> int:
         )
         assert res_q.returncode == 0 and res_q.stdout.strip() == "7", f"renamed field pattern program failed to run: rc={res_q.returncode} stdout={res_q.stdout!r} stderr={res_q.stderr!r}"
 
+        # (r) Shorthand struct pattern field rename: `Point { x } -> x` expands to `Point { coord: x } -> x`, compiles & runs -> `7`
+        sh_dir = root / "field_shorthand_proj"
+        sh_dir.mkdir(parents=True)
+        sh_path = sh_dir / "main.gsa"
+        sh_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int, y: Int } }\n"
+            "def getX(p: Point): Int = match p {\n"
+            "    Point { x } -> x,\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(getX(Point { x: 7, y: 2 })))\n"
+        )
+        sh_path.write_text(sh_src, encoding="utf-8")
+        sh_uri = path_to_uri(sh_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": sh_uri, "languageId": "geisha", "version": 1, "text": sh_src}})
+        assert client.wait_diag_for(sh_uri) == []
+        ren_sh = client.request("textDocument/rename", {
+            "textDocument": {"uri": sh_uri},
+            "position": {"line": 1, "character": 21},
+            "newName": "coord",
+        })
+        assert "result" in ren_sh, f"expected shorthand field pattern rename to succeed: {ren_sh}"
+        new_sh = apply_edits(sh_src, ren_sh["result"]["changes"][sh_uri])
+        assert "Point { coord: x } -> x," in new_sh, f"shorthand `Point {{ x }}` must expand to `Point {{ coord: x }}`, got: {new_sh!r}"
+        run_r_dir = root / "run_field_shorthand"
+        run_r_dir.mkdir(parents=True)
+        (run_r_dir / "main.gsa").write_text(new_sh, encoding="utf-8")
+        res_r = subprocess.run(
+            [abs_geisha_bin, "run", str(run_r_dir / "main.gsa")],
+            cwd=str(run_r_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_r.returncode == 0 and res_r.stdout.strip() == "7", f"renamed shorthand field pattern failed to run: rc={res_r.returncode} stdout={res_r.stdout!r} stderr={res_r.stderr!r}"
+
+        # (s) Nested struct pattern with same-named field on a different type: `Both { p: Point { x: left }, q: Other { x: right } }` -> renames ONLY `Point.x`, leaves `Other.x` untouched, runs -> `10`
+        nf_dir = root / "nested_field_pat_proj"
+        nf_dir.mkdir(parents=True)
+        nf_path = nf_dir / "main.gsa"
+        nf_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int } }\n"
+            "data Other { Other { x: Int } }\n"
+            "data Both { Both { p: Point, q: Other } }\n"
+            "def total(b: Both): Int = match b {\n"
+            "    Both { p: Point { x: left }, q: Other { x: right } } -> left + right,\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(total(Both { p: Point { x: 7 }, q: Other { x: 3 } })))\n"
+        )
+        nf_path.write_text(nf_src, encoding="utf-8")
+        nf_uri = path_to_uri(nf_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": nf_uri, "languageId": "geisha", "version": 1, "text": nf_src}})
+        assert client.wait_diag_for(nf_uri) == []
+        ren_nf = client.request("textDocument/rename", {
+            "textDocument": {"uri": nf_uri},
+            "position": {"line": 1, "character": 21},
+            "newName": "coord",
+        })
+        assert "result" in ren_nf, f"expected nested struct pattern rename to succeed: {ren_nf}"
+        new_nf = apply_edits(nf_src, ren_nf["result"]["changes"][nf_uri])
+        assert "Both { p: Point { coord: left }, q: Other { x: right } } -> left + right," in new_nf, f"only Point.x should be renamed, Other.x untouched: {new_nf!r}"
+        assert "Both { p: Point { coord: 7 }, q: Other { x: 3 } }" in new_nf, f"only Point init field should be renamed: {new_nf!r}"
+        run_s_dir = root / "run_nested_field_pat"
+        run_s_dir.mkdir(parents=True)
+        (run_s_dir / "main.gsa").write_text(new_nf, encoding="utf-8")
+        res_s = subprocess.run(
+            [abs_geisha_bin, "run", str(run_s_dir / "main.gsa")],
+            cwd=str(run_s_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_s.returncode == 0 and res_s.stdout.strip() == "10", f"renamed nested field pattern failed to run: rc={res_s.returncode} stdout={res_s.stdout!r} stderr={res_s.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None
