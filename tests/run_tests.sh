@@ -5246,6 +5246,20 @@ if "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_bad_exp2.wasm" "$TMP_DIR/t44_
 fi
 echo "PASS [wasmgc_reject_reserved_exports]: rejected reserved exports '__geisha_init' and 'instantiate'"
 PASS=$((PASS + 1))
+
+cat > "$TMP_DIR/t44_alias_exp.gsa" << 'EOF'
+pub def default(): Int = 101
+pub def _gs_exp(): Int = 202
+pub def URL(s: String): String = "url:" + s
+def main(): Void = ()
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_alias_exp.wasm" "$TMP_DIR/t44_alias_exp.gsa"
+WGC_ALIAS_RES="$(node --input-type=module -e '
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(process.argv[1]).href);
+console.log(m.default() + "|" + m._gs_exp() + "|" + m.URL("ok"));
+' "$TMP_DIR/t44_alias_exp.mjs")"
+assert_eq "wasmgc_esm_alias_exports" "101|202|url:ok" "$WGC_ALIAS_RES"
 fi
 
 echo "All $PASS end-to-end test suites passed!"

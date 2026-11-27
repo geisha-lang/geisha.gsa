@@ -3556,6 +3556,7 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
 
     let expPairs = collectWgcExportPairs(prog, exports);
     let ce = cellNew(expPairs);
+    let expIdx = cellNew(0);
     let hasMainExp = cellNew(false);
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
@@ -3585,12 +3586,15 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
                                 Nil -> (),
                             }
                         };
+                        let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
+                        cellSet(expIdx, cellGet(expIdx) + 1);
                         let callExpr = "wasmExports[\"" + expName + "\"](" + strJoin(listRev(cellGet(pCallsRev)), ", ") + ")";
                         if (isVoidTy(retTy)) {
-                            bufPushStr(out, "export function " + expName + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { " + callExpr + "; }\n")
+                            bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { " + callExpr + "; }\n")
                         } else {
-                            bufPushStr(out, "export function " + expName + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { return " + wgcRetToJs(retTy, callExpr) + "; }\n")
-                        }
+                            bufPushStr(out, "function " + localFn + "(" + strJoin(listRev(cellGet(pNamesRev)), ", ") + ") { return " + wgcRetToJs(retTy, callExpr) + "; }\n")
+                        };
+                        bufPushStr(out, "export { " + localFn + " as " + expName + " };\n")
                     },
                     None -> (),
                 };
@@ -3602,7 +3606,7 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
 
     if (strMapContains(prog.coreFns, "main")) {
         if (!cellGet(hasMainExp)) {
-            bufPushStr(out, "export function main() { wasmExports.main(); }\n")
+            bufPushStr(out, "function _gs_export_main() { wasmExports.main(); }\nexport { _gs_export_main as main };\n")
         } else ();
         if (!noMain) {
             bufPushStr(out, "wasmExports.main();\n")
@@ -3631,6 +3635,7 @@ pub def emitProgramWasmGcDts(prog: CoreProgram, exports: List String, noMain: Bo
     bufPushStr(out, "export declare function instantiate(bytesOrBuf?: BufferSource, extraImports?: WebAssembly.Imports): Promise<WebAssembly.Instance>;\n\n");
     let expPairs = collectWgcExportPairs(prog, exports);
     let hasMainExp = cellNew(false);
+    let expIdx = cellNew(0);
     let ce = cellNew(expPairs);
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
@@ -3657,7 +3662,10 @@ pub def emitProgramWasmGcDts(prog: CoreProgram, exports: List String, noMain: Bo
                                 Nil -> (),
                             }
                         };
-                        bufPushStr(out, "export declare function " + expName + "(" + strJoin(listRev(cellGet(pRev)), ", ") + "): " + wgcTypeToTs(retTy) + ";\n")
+                        let localFn = "_gs_export_" + intToStr(cellGet(expIdx));
+                        cellSet(expIdx, cellGet(expIdx) + 1);
+                        bufPushStr(out, "declare function " + localFn + "(" + strJoin(listRev(cellGet(pRev)), ", ") + "): " + wgcTypeToTs(retTy) + ";\n");
+                        bufPushStr(out, "export { " + localFn + " as " + expName + " };\n")
                     },
                     None -> (),
                 };
@@ -3667,7 +3675,7 @@ pub def emitProgramWasmGcDts(prog: CoreProgram, exports: List String, noMain: Bo
         }
     };
     if (strMapContains(prog.coreFns, "main") && !cellGet(hasMainExp)) {
-        bufPushStr(out, "export declare function main(): void;\n")
+        bufPushStr(out, "declare function _gs_export_main(): void;\nexport { _gs_export_main as main };\n")
     } else ();
     let _ = noMain;
     bufToString(out)
