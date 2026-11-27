@@ -7027,6 +7027,26 @@ sys.exit(r.returncode)' "$T44_SW_LIMIT" "$T44_GEISHA_BIN" "$T44_CASE_SITE" "$T44
         exit 1
     fi
 
+    # Preserving existing file permissions (0600) across regeneration + long 237-byte output filename (no ENAMETOOLONG hang)
+    T44_LONG_NAME="m_$(python3 -c 'print("a" * 221)')"
+    cat > "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa" << 'EOF'
+pub def longModFn(): Int = 7
+EOF
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    T44_LONG_HTML="$T44_CASE_SITE/modules/caseproj.${T44_LONG_NAME}.html"
+    if [ ! -f "$T44_LONG_HTML" ]; then
+        echo "FAIL [doc_long_filename_237]: expected 237-byte module filename to generate cleanly without ENAMETOOLONG" >&2
+        exit 1
+    fi
+    chmod 600 "$T44_LONG_HTML"
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    T44_MODE_AFTER="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_LONG_HTML")"
+    if [ "$T44_MODE_AFTER" != "0o600" ]; then
+        echo "FAIL [doc_preserve_file_mode]: expected 0o600 preserved on replacement, got $T44_MODE_AFTER" >&2
+        exit 1
+    fi
+    rm -f "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa"
+
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
     printf 'not a dir\n' > "$TMP_DIR/notes"
     T44_BS_OUT="$TMP_DIR/notes\\site"

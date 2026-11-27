@@ -407,6 +407,14 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
     return (chmod(path, (mode_t)(mode & 07777)) == 0) ? 0 : -1;
 }
 
+int32_t gs_sys_file_mode(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    return (int32_t)(st.st_mode & 07777);
+}
+
 int64_t gs_sys_file_mtime_ms(const char *path)
 {
     if (path == NULL) return -1;

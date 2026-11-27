@@ -5,17 +5,18 @@ use std.result.{Result, Ok, Err}
 use std.list.{listRev, listLen}
 use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.{intToStr, strStartsWith, strEndsWith, strTrim, strJoin, strSplitChar, strContains}
-use std.path.pathJoin
+use std.path.{pathJoin, pathDirname}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
 use std.codec.{Value, VStr, VInt, VArr, VObj}
 use std.json.{stringify, stringifyPretty}
 use sys.env.hostOs
-use sys.fs.{mkdirAll, writeFile, readFile, readDir, fileExists, removeFile, renameFile}
+use sys.fs.{mkdirAll, writeFile, readFile, readDir, fileExists, removeFile, renameFile, chmod}
 
 extern "gs_sys_lstat_kind" def c_site_lstat_kind(path: String): Int
 extern "gs_sys_getpid" def c_site_getpid(): Int
 extern "gs_sys_fopen" def c_site_fopen(path: String, mode: String): Ptr
 extern "fclose" def c_site_fclose(fp: Ptr): Int
+extern "gs_sys_file_mode" def c_site_file_mode(path: String): Int
 
 def gSiteTmpSeq: Cell Int = cellNew(0)
 
@@ -1334,21 +1335,37 @@ def ensureRealDir(dir: String): Result Void String = {
     }
 }
 
-// Allocate a collision-free sibling path using PID + monotonic counter, verified unused via `lstat`.
-def allocUniqueSiblingPath(basePath: String, tag: String): String = {
+// Allocate a short, collision-free sibling path in `pathDirname(targetPath)` using PID + monotonic
+// counter (`<dir>/.<tag>_<pid>_<seq>`). Short names avoid ENAMETOOLONG on long target filenames,
+// and any `lstat < 0` error fails immediately instead of looping.
+def allocUniqueSiblingPath(targetPath: String, tag: String): Result String String = {
+    let dir = pathDirname(targetPath);
     let pidStr = intToStr(c_site_getpid());
     let cand = cellNew("");
+    let errOpt: Cell (Option String) = cellNew(None);
     let found = cellNew(false);
-    while (!cellGet(found)) {
-        let seq = cellGet(gSiteTmpSeq) + 1;
-        cellSet(gSiteTmpSeq, seq);
-        let p = basePath + "." + tag + "-" + pidStr + "-" + intToStr(seq);
-        if (c_site_lstat_kind(p) == 0) {
-            cellSet(cand, p);
-            cellSet(found, true)
-        } else ()
+    let attempts = cellNew(0);
+    while (!cellGet(found) && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
+        if (cellGet(attempts) >= 10000) {
+            cellSet(errOpt, Some("exhausted unique temp path attempts in directory: " + dir))
+        } else {
+            cellSet(attempts, cellGet(attempts) + 1);
+            let seq = cellGet(gSiteTmpSeq) + 1;
+            cellSet(gSiteTmpSeq, seq);
+            let p = pathJoin(dir, "." + tag + "_" + pidStr + "_" + intToStr(seq));
+            let k = c_site_lstat_kind(p);
+            if (k == 0) {
+                cellSet(cand, p);
+                cellSet(found, true)
+            } else if (k < 0) {
+                cellSet(errOpt, Some("cannot inspect temp path in directory: " + dir))
+            } else ()
+        }
     };
-    cellGet(cand)
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(cellGet(cand)),
+    }
 }
 
 def checkExistingFileWritable(path: String): Result Void String = {
@@ -1360,11 +1377,11 @@ def checkExistingFileWritable(path: String): Result Void String = {
     }
 }
 
-// Write `content` to a brand-new unique sibling temporary file and verify full byte length
-// before touching the live target (prevents short-write truncation and never overwrites user files).
-def writeVerifiedTempFile(basePath: String, content: String): Result String String = {
+// Write `content` to a brand-new short unique sibling temporary file, verify full byte length,
+// and optionally inherit `preserveMode` (>= 0) before atomic `renameFile` replacement.
+def writeVerifiedTempFile(targetPath: String, content: String, preserveMode: Int): Result String String = {
     let wantLen = strLen(content);
-    let tmpPath = allocUniqueSiblingPath(basePath, "geisha-stage");
+    let tmpPath = allocUniqueSiblingPath(targetPath, "gst")?;
     match writeFile(tmpPath, content) {
         Err(e) -> {
             let _ = removeFile(tmpPath);
@@ -1378,7 +1395,15 @@ def writeVerifiedTempFile(basePath: String, content: String): Result String Stri
             Ok(chk) ->
                 if (strLen(chk) != wantLen) {
                     let _ = removeFile(tmpPath);
-                    Err("short write detected for doc output file: " + basePath)
+                    Err("short write detected for doc output file: " + targetPath)
+                } else if (preserveMode >= 0) {
+                    match chmod(tmpPath, preserveMode) {
+                        Ok(()) -> Ok(tmpPath),
+                        Err(ce) -> {
+                            let _ = removeFile(tmpPath);
+                            Err(ce)
+                        },
+                    }
                 } else {
                     Ok(tmpPath)
                 },
@@ -1583,9 +1608,12 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                         else Ok(());
                     match writableRes {
                         Err(e) -> cellSet(stageErrOpt, Some(e)),
-                        Ok(()) -> match writeVerifiedTempFile(full, content) {
-                            Err(e) -> cellSet(stageErrOpt, Some(e)),
-                            Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
+                        Ok(()) -> {
+                            let preserveMode = if (k == 1) c_site_file_mode(full) else -1;
+                            match writeVerifiedTempFile(full, content, preserveMode) {
+                                Err(e) -> cellSet(stageErrOpt, Some(e)),
+                                Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
+                            }
                         },
                     }
                 };
@@ -1619,18 +1647,23 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                                 let full = pathJoin(outDir, rel);
                                 let k = c_site_lstat_kind(full);
                                 if (k == 1) {
-                                    let bkpPath = allocUniqueSiblingPath(full, "geisha-bkp");
-                                    match renameFile(full, bkpPath) {
+                                    match allocUniqueSiblingPath(full, "gbk") {
                                         Err(e) -> {
                                             cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
                                             cellSet(txErrOpt, Some(e))
                                         },
-                                        Ok(()) -> match renameFile(tmpPath, full) {
-                                            Ok(()) -> cellSet(txLogRev, Cons(TxReplaced(full, bkpPath), cellGet(txLogRev))),
+                                        Ok(bkpPath) -> match renameFile(full, bkpPath) {
                                             Err(e) -> {
-                                                let _ = renameFile(bkpPath, full);
                                                 cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
                                                 cellSet(txErrOpt, Some(e))
+                                            },
+                                            Ok(()) -> match renameFile(tmpPath, full) {
+                                                Ok(()) -> cellSet(txLogRev, Cons(TxReplaced(full, bkpPath), cellGet(txLogRev))),
+                                                Err(e) -> {
+                                                    let _ = renameFile(bkpPath, full);
+                                                    cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                                    cellSet(txErrOpt, Some(e))
+                                                },
                                             },
                                         },
                                     }
@@ -1702,10 +1735,12 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
                                                         if (stKind == 0) {
                                                             ()
                                                         } else if (stKind == 1) {
-                                                            let bkpPath = allocUniqueSiblingPath(full, "geisha-del");
-                                                            match renameFile(full, bkpPath) {
-                                                                Ok(()) -> cellSet(txLogRev, Cons(TxDeleted(full, bkpPath), cellGet(txLogRev))),
-                                                                Err(re) -> cellSet(txErrOpt, Some("failed to remove stale doc artifact: " + full + " (" + re + ")")),
+                                                            match allocUniqueSiblingPath(full, "gdl") {
+                                                                Err(re) -> cellSet(txErrOpt, Some("failed to allocate stale backup path for: " + full + " (" + re + ")")),
+                                                                Ok(bkpPath) -> match renameFile(full, bkpPath) {
+                                                                    Ok(()) -> cellSet(txLogRev, Cons(TxDeleted(full, bkpPath), cellGet(txLogRev))),
+                                                                    Err(re) -> cellSet(txErrOpt, Some("failed to remove stale doc artifact: " + full + " (" + re + ")")),
+                                                                },
                                                             }
                                                         } else {
                                                             cellSet(txErrOpt, Some("cannot safely remove stale doc artifact: " + full))

@@ -792,6 +792,12 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
     return (rc == 0) ? 0 : -1;
 }
 
+int32_t gs_sys_file_mode(const char *path)
+{
+    (void)path;
+    return -1;
+}
+
 static int64_t gs_filetime_to_unix_ms(FILETIME ft)
 {
     uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
