@@ -17,6 +17,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha eval '<code>' [args...]` — evaluate an inline Geisha snippet (cached)
    - **Script mode**: standalone entry files support Unix shebang (`#!/usr/bin/env -S geisha run`) and top-level statements (`let` / expressions) without needing an explicit `def main()`
    - `geisha test`
+   - `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]` — run microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]` in `geisha.toml`, or `bench_*` functions) or standalone script mode (outputs mean/median/min/max/ops/sec, with `--json` for CI/Agent regression tracking)
    - `geisha build [--target native|wasm32|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3] [-o out]`
    - **Source-level debugging (`lldb` / `gdb` / VS Code CodeLLDB)**: compile with `-g` / `--debug` (defaults to `-O0`, disables tail-call optimization, emits DWARF v4 line info + `@llvm.dbg.declare` local variables, and runs `dsymutil` on macOS). Load `~/.geisha/lib/geisha_lldb.py` in LLDB for formatted `String`, `Vec`, `Array`, `List`, `Option`, and boxed ADT inspection (see `docs/DEBUGGING.md`).
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
@@ -156,6 +157,7 @@ Run `geisha doc <module>` to get exact public signatures before using any module
 - `std.json` — JSON parser, AST, and serializer
 - `std.toml` — TOML parser, canonical serializer, and comment-preserving `patch`
 - `std.sha256` — SHA-256 hashing
+- `std.bench` — microbenchmarking (polymorphic `blackBox`, `blackBoxBarrier`, `BenchConfig`, `BenchStats`, `measure`, `bench`, `benchWith`, `benchGroup`, `formatStatsText`, `formatStatsJson`, `formatStatsJsonInFile`)
 
 ### `sys.*`
 - `sys.io` — stdout/stderr/stdin (`eprintLn`, ...)
@@ -175,6 +177,7 @@ name = "my_app"
 version = "0.1.0"
 # entry = "src/main.gsa"   # optional; defaults to src/main.gsa or src/<name>.gsa
 # src_dir = "src"
+# benches = ["benches/bench_core.gsa"]  # optional; defaults to benches/*.gsa or bench_* in src/
 
 [deps]
 crema = { git = "github.com/geisha-lang/crema", version = "0.1.0" }

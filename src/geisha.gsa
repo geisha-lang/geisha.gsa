@@ -26,6 +26,7 @@ use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
 use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForArchDebug}
 use doc.cmdDoc
+use bench.cmdBench
 use diag.{isFormattedDiag, diagReset, diagRegisteredFiles, MkSourceFile}
 use guide_bundle.embeddedAgentGuide
 use pkg.{
@@ -94,6 +95,7 @@ def isSubcommandWord(w: String): Bool =
     || w == "run"
     || w == "eval"
     || w == "test"
+    || w == "bench"
     || w == "doc"
     || w == "guide"
 
@@ -168,6 +170,20 @@ def parseCliArgs(): Result CliOpts String = {
                     cellSet(showHelp, true);
                     cellSet(i, cellGet(i) + 1)
                 } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && a == "--runtime") {
+                    if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing path after '--runtime'"))
+                    else { cellSet(rtPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
+                } else {
+                    cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
+                    cellSet(i, cellGet(i) + 1)
+                }
+            } else if (sub == "bench") {
+                if (a == "-h" || a == "--help") {
+                    cellSet(showHelp, true);
+                    cellSet(i, cellGet(i) + 1)
+                } else if (a == "--json") {
+                    cellSet(jsonOut, true);
+                    cellSet(i, cellGet(i) + 1)
+                } else if (a == "--runtime") {
                     if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing path after '--runtime'"))
                     else { cellSet(rtPath, Some(argAt(cellGet(i) + 1))); cellSet(i, cellGet(i) + 2) }
                 } else {
@@ -1348,6 +1364,13 @@ def makeCompileCallbacks(debugInfo: Bool, optFlag: String): CompileCallbacks = M
         let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryFile) };
         emitNativeExecutableFromIrDebug(llText, outBin, tc, rtOpt, debugInfo, optFlag)
     },
+    cbCompileNativeExeSource: (entryLabel, srcText, rootSpec, extSpecs, tc, outOpt, rtOpt) -> {
+        diagReset();
+        let rawDefs = loadSingleSourceProgramWithPkgsNamed(entryLabel, srcText, rootSpec, extSpecs, Nil)?;
+        let llText = compileLoadedDefsToIr(rawDefs, None, false, tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol)?;
+        let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryLabel) };
+        emitNativeExecutableFromIr(llText, outBin, tc, rtOpt)
+    },
     cbCompileNativeObj: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt) -> {
         let llText = compileWithPkgSpecsToIrDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
@@ -1599,6 +1622,7 @@ def printUsage(): Void = {
     printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
     printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
     printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
+    printLn("  geisha bench [file|filter]     Run microbenchmarks (--iters N --warmup N --rounds N --filter <pat> --json)");
     printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
     printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
     printLn("");
@@ -1699,6 +1723,7 @@ def runDriver(): Result Int String = {
             },
             Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
             Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
+            Some("bench") -> cmdBench(opts.optSubArgs, opts.optJson, opts.optRuntime, cbs),
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
             Some("guide") -> { printLn(embeddedAgentGuide()); Ok(0) },
             Some(other) -> Err("unknown subcommand: " + other),

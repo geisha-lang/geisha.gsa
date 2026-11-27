@@ -335,6 +335,7 @@ version = "0.1.0"
 # entry = "src/main.gsa"
 # src_dir = "src"
 # tests = ["tests/extra.gsa"]
+# benches = ["benches/core.gsa"]
 
 [deps]
 crema = { git = "github.com/geisha-lang/crema", version = "0.1.0" }
@@ -376,5 +377,6 @@ web_assets = ["host/web/runtime.js"]
 
 - `geisha check [file.gsa] [--json]`: Runs lex, parse, load, HM inference, exhaustiveness, and `Send` checks without invoking LLVM/clang. Diagnostics use compact 1D `file:line:col: error[kind]: ...` + `near:` + `line N:` + `hint:`.
 - `geisha doc [module|file] [--all]`: Prints public signatures and `///` doc comments for `std.*`, `sys.*`, and project/dependency modules.
+- `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]`: Runs microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]`, or `bench_*` functions) or standalone script mode using `std.bench` (`blackBox` polymorphic optimization barrier, warmup + multi-round stats).
 - `geisha guide`: Prints the built-in [`AGENT_GUIDE.md`](../AGENT_GUIDE.md).
 - `geisha build --dump-core <file.gscore>`: Emits Core Geisha S-expressions for translation validation against the Lean 4 checker (`make verify-core`).

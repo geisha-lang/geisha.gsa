@@ -1254,6 +1254,7 @@ def buildPreludeBaseMap(): StrMap Scheme = {
         ("scopedPtrCopyBytes", "(ScopedPtr, Int64, ScopedPtr, Int64, Int64) -> Void"),
         ("gcHandleNew", "forall a. a -> Int64"),
         ("gcHandleGet", "forall a. Int64 -> a"),
+        ("__blackBox", "forall a. a -> a"),
         ("gcHandleFree", "Int64 -> Void"),
         ("gcTrim", "() -> Void"),
         ("gcSetThresholds", "(Int64, Int64) -> Void"),

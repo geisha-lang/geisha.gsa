@@ -1822,14 +1822,22 @@ def emitNullableBoxToPair(fctx: FnEmitCtx, boxPtr: String, pairRetTy: Type): Str
     emitAssign(fctx, "insertvalue " + pairLlvmTy + " " + agg0 + ", " + elemLlvmTy + " " + valPhi + ", 1")
 }
 
+def emitClosureFnSlot(mctx: ModEmitCtx, fctx: FnEmitCtx, clsPtr: String): String =
+    if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", clsPtr, 0)
+    else emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0)
+
+def emitClosureFvsPtr(mctx: ModEmitCtx, fctx: FnEmitCtx, clsPtr: String): String =
+    if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", clsPtr, 2)
+    else emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1)
+
 def getOrEmitThunkRunner(mctx: ModEmitCtx, retTy: Type): String = {
     let rawSym = "__gs_thunk_runner__" + mangleConcTypeSym(retTy);
     let sym = llvmSym(rawSym);
     if (!strMapContains(mctx.mcSynthSet, rawSym)) {
         strMapInsert(mctx.mcSynthSet, rawSym, true);
         let rf = newFnEmitCtx(rawSym);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let callVal =
@@ -1859,8 +1867,8 @@ def getOrEmitActorRunner(mctx: ModEmitCtx, stateTy: Type, retTy: Type): String =
         let rf = newFnEmitCtx(rawSym);
         let stVal = unboxGeishaValue(rf, "%state_box", stateTy);
         let stLlvm = getValLlvmType(stateTy);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let callVal =
@@ -1887,8 +1895,8 @@ def getOrEmitTabulateRunner(mctx: ModEmitCtx, elemTy: Type): String = {
         let rf = newFnEmitCtx(rawSym);
         let elemLlvm = getValLlvmType(elemTy);
         let retLlvm = getFnRetLlvmType(elemTy);
-        let fvsPtr = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 1);
-        let fnSlot = emitStructFieldPtr(rf, "{ ptr, ptr }", "%cls_ptr", 0);
+        let fvsPtr = emitClosureFvsPtr(mctx, rf, "%cls_ptr");
+        let fnSlot = emitClosureFnSlot(mctx, rf, "%cls_ptr");
         let fnEntry = emitLoad(rf, "ptr", fnSlot);
         let elemsBase = emitGep(rf, "i8", "%arr_ptr", "8");
         let idxSlot = emitEntryAlloca(rf, "i32");
@@ -2135,7 +2143,24 @@ def tryEmitIntrinsic(
     locals: List (String, VarSlot),
     directLetVar: Option String
 ): Option String = {
-    if (name == "cellNew") {
+    if (name == "__blackBox") {
+        let a0 = nthArgTerm(args, 0);
+        let argVal = genExpr(mctx, fctx, a0, locals, false);
+        let valTy = schemeBody(a0.tscm);
+        match valTy {
+            TyVoid -> {
+                emitLine(fctx, "call void @gs_bench_black_box_void()");
+                Some("0")
+            },
+            _ -> {
+                let llvmTy = getValLlvmType(valTy);
+                let slot = emitEntryAlloca(fctx, llvmTy);
+                emitStore(fctx, llvmTy, argVal, slot);
+                emitLine(fctx, "call void @gs_bench_black_box_mem(ptr " + slot + ")");
+                Some(emitLoad(fctx, llvmTy, slot))
+            },
+        }
+    } else if (name == "cellNew") {
         let a0 = nthArgTerm(args, 0);
         let initVal = genExpr(mctx, fctx, a0, locals, false);
         let elemTy = schemeBody(a0.tscm);
@@ -2816,8 +2841,8 @@ def tryEmitIntrinsic(
         let fp = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let rawP = emitAssign(fctx, "call ptr @gc_foreign_ptr_get(ptr " + fp + ")");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -2838,8 +2863,8 @@ def tryEmitIntrinsic(
         let n64 = emitAssign(fctx, "sext i32 " + n32 + " to i64");
         let savedSp = emitAssign(fctx, "call ptr @llvm.stacksave.p0()");
         let bufPtr = emitAssign(fctx, "alloca i8, i64 " + n64 + ", align 16");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -2854,8 +2879,8 @@ def tryEmitIntrinsic(
     } else if (name == "withArena") {
         let clsPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let arenaPtr = emitAssign(fctx, "call ptr @gc_arena_new()");
-        let fnSlot = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 0);
-        let fvsPtr = emitStructFieldPtr(fctx, "{ ptr, ptr }", clsPtr, 1);
+        let fnSlot = emitClosureFnSlot(mctx, fctx, clsPtr);
+        let fvsPtr = emitClosureFvsPtr(mctx, fctx, clsPtr);
         let fnEntry = emitLoad(fctx, "ptr", fnSlot);
         let retLlvm = getFnRetLlvmType(retTy);
         let res =
@@ -3780,12 +3805,8 @@ def genExpr(
                     Nil -> (),
                 }
             };
-            let fvsPtr =
-                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 2)
-                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 1);
-            let fnEntryPtr =
-                if (mctx.mcIsWasm) emitStructFieldPtr(fctx, "{ ptr, i32, {} }", calleePtr, 0)
-                else emitStructFieldPtr(fctx, "{ ptr, ptr }", calleePtr, 0);
+            let fvsPtr = emitClosureFvsPtr(mctx, fctx, calleePtr);
+            let fnEntryPtr = emitClosureFnSlot(mctx, fctx, calleePtr);
             let fnEntry = emitLoad(fctx, "ptr", fnEntryPtr);
 
             let allTys = listRev(Cons("ptr", cellGet(argTysRev)));
@@ -4712,6 +4733,8 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
+        ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
@@ -4781,6 +4804,8 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_match_fail", "declare void @gs_match_fail() cold noreturn nounwind"),
         ("gs_bounds_fail", "declare void @gs_bounds_fail(i32, i32) cold noreturn nounwind"),
         ("gs_div_zero_fail", "declare void @gs_div_zero_fail() cold noreturn nounwind"),
+        ("gs_bench_black_box_mem", "declare void @gs_bench_black_box_mem(ptr) nounwind"),
+        ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),

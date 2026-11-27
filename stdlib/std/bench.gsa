@@ -1,0 +1,358 @@
+/// Microbenchmarking primitives, dead-code elimination barriers, and statistics (`std.bench`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.listRev
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{intToStr, i64ToStr, floatToStr, parseInt, strContains}
+use sys.time.monotonicNanos
+use sys.env.getEnv
+
+/// Prevents the compiler and LLVM optimizer from constant-folding or eliminating a value of any type.
+pub def blackBox(x: a): a = __blackBox(x)
+
+/// Compiler optimization barrier that prevents reordering or eliminating surrounding work.
+pub def blackBoxBarrier(): Void = __blackBox(())
+
+/// Configuration for benchmark warmup and sampling.
+/// Set `sampleIters` to `0` for automatic per-round iteration calibration.
+pub data BenchConfig {
+    warmupIters: Int,
+    sampleIters: Int,
+    rounds: Int,
+}
+
+/// Summary statistics produced by measuring a benchmark function.
+pub data BenchStats {
+    name: String,
+    iters: Int,
+    rounds: Int,
+    totalNs: Int64,
+    meanNs: Float,
+    medianNs: Float,
+    minNs: Float,
+    maxNs: Float,
+    opsPerSec: Float,
+}
+
+/// Default benchmark configuration (5 warmup iterations, auto-calibrated sample iterations, 11 rounds).
+pub def defaultConfig(): BenchConfig = BenchConfig {
+    warmupIters: 5,
+    sampleIters: 0,
+    rounds: 11,
+}
+
+def readEnvInt(key: String, fallback: Int, minVal: Int): Int = match getEnv(key) {
+    None -> fallback,
+    Some(raw) -> match parseInt(raw) {
+        Ok(v) if (v >= minVal) -> v,
+        _ -> fallback,
+    },
+}
+
+/// Read benchmark configuration from `GEISHA_BENCH_WARMUP`, `GEISHA_BENCH_ITERS`, and `GEISHA_BENCH_ROUNDS`.
+pub def envConfig(): BenchConfig = {
+    let d = defaultConfig();
+    BenchConfig {
+        warmupIters: readEnvInt("GEISHA_BENCH_WARMUP", d.warmupIters, 0),
+        sampleIters: readEnvInt("GEISHA_BENCH_ITERS", d.sampleIters, 0),
+        rounds: readEnvInt("GEISHA_BENCH_ROUNDS", d.rounds, 1),
+    }
+}
+
+def i64ToFloat(v: Int64): Float = {
+    let neg = v < intToI64(0);
+    let absV = if (neg) -v else v;
+    let chunk = intToI64(1000000000);
+    let hi = absV / chunk;
+    let lo = i64ToInt(absV % chunk);
+    let f = if (hi == intToI64(0)) {
+        intToFloat(lo)
+    } else {
+        let hi2 = hi / chunk;
+        let mid = i64ToInt(hi % chunk);
+        if (hi2 == intToI64(0)) {
+            intToFloat(mid) * 1000000000.0 + intToFloat(lo)
+        } else {
+            intToFloat(i64ToInt(hi2)) * 1000000000000000000.0
+            + intToFloat(mid) * 1000000000.0
+            + intToFloat(lo)
+        }
+    };
+    if (neg) -f else f
+}
+
+def runLoop(n: Int, f: () -> Void): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        f();
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def calibrateBatchIters(f: () -> Void): Int = {
+    let targetNs = intToI64(1000000);
+    let batch = cellNew(1);
+    let done = cellNew(false);
+    while (!cellGet(done)) {
+        let n = cellGet(batch);
+        let t0 = monotonicNanos();
+        runLoop(n, f);
+        let dt = monotonicNanos() - t0;
+        if (dt >= targetNs || n >= 1000000) {
+            cellSet(done, true)
+        } else {
+            let next = n * 2;
+            cellSet(batch, if (next > 1000000) 1000000 else next)
+        }
+    };
+    cellGet(batch)
+}
+
+def sortFloatsInPlace(arr: MutArray Float, n: Int): Void = {
+    let i = cellNew(1);
+    while (cellGet(i) < n) {
+        let key = arrayGet(arr, cellGet(i));
+        let j = cellNew(cellGet(i) - 1);
+        while (cellGet(j) >= 0 && arrayGet(arr, cellGet(j)) > key) {
+            let jj = cellGet(j);
+            arraySet(arr, jj + 1, arrayGet(arr, jj));
+            cellSet(j, jj - 1)
+        };
+        arraySet(arr, cellGet(j) + 1, key);
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+/// Measure `f` using `cfg` (warmup + multi-round sampling) and return statistical results.
+pub def measure(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
+    if (cfg.warmupIters > 0) {
+        runLoop(cfg.warmupIters, f)
+    } else ();
+
+    let batchIters =
+        if (cfg.sampleIters > 0) cfg.sampleIters
+        else calibrateBatchIters(f);
+    let numRounds = if (cfg.rounds > 0) cfg.rounds else 1;
+
+    let samples = arrayNew(numRounds, 0.0);
+    let totalNsCell = cellNew(intToI64(0));
+    let sumNsCell = cellNew(0.0);
+    let batchF = intToFloat(batchIters);
+
+    let r = cellNew(0);
+    while (cellGet(r) < numRounds) {
+        let t0 = monotonicNanos();
+        runLoop(batchIters, f);
+        let dt = monotonicNanos() - t0;
+        let clampedDt = if (dt < intToI64(0)) intToI64(0) else dt;
+        cellSet(totalNsCell, cellGet(totalNsCell) + clampedDt);
+        let nsPerIter = i64ToFloat(clampedDt) / batchF;
+        arraySet(samples, cellGet(r), nsPerIter);
+        cellSet(sumNsCell, cellGet(sumNsCell) + nsPerIter);
+        cellSet(r, cellGet(r) + 1)
+    };
+
+    sortFloatsInPlace(samples, numRounds);
+    let minNs = arrayGet(samples, 0);
+    let maxNs = arrayGet(samples, numRounds - 1);
+    let medianNs =
+        if (numRounds % 2 == 1) arrayGet(samples, numRounds / 2)
+        else (arrayGet(samples, numRounds / 2 - 1) + arrayGet(samples, numRounds / 2)) / 2.0;
+    let meanNs = cellGet(sumNsCell) / intToFloat(numRounds);
+    let opsPerSec = if (meanNs > 0.0) 1000000000.0 / meanNs else 0.0;
+
+    BenchStats {
+        name: name,
+        iters: batchIters,
+        rounds: numRounds,
+        totalNs: cellGet(totalNsCell),
+        meanNs: meanNs,
+        medianNs: medianNs,
+        minNs: minNs,
+        maxNs: maxNs,
+        opsPerSec: opsPerSec,
+    }
+}
+
+def isNonFiniteFloat(f: Float): Bool = {
+    let bits = floatToBits64(f);
+    let expMask = (intToI64(2047)) << 52;
+    (bits & expMask) == expMask
+}
+
+def formatLargeFloat2(v: Float): String = {
+    let billion = 1000000000.0;
+    let rounded = v + 0.005;
+    if (rounded >= 1000000000000000000.0) {
+        "999999999999999999.00"
+    } else {
+        let b = bufNew();
+        let hi = floatToInt(rounded / billion);
+        let rem = rounded - intToFloat(hi) * billion;
+        let lo = floatToInt(rem);
+        let frac = floatToInt((rem - intToFloat(lo)) * 100.0);
+        let cFrac = if (frac < 0) 0 else if (frac > 99) 99 else frac;
+        bufPushStr(b, intToStr(hi));
+        let loStr = intToStr(if (lo < 0) 0 else lo);
+        let pad = cellNew(9 - strLen(loStr));
+        while (cellGet(pad) > 0) {
+            bufPushByte(b, 48);
+            cellSet(pad, cellGet(pad) - 1)
+        };
+        bufPushStr(b, loStr);
+        bufPushByte(b, 46);
+        if (cFrac < 10) bufPushByte(b, 48) else ();
+        bufPushStr(b, intToStr(cFrac));
+        bufToString(b)
+    }
+}
+
+def formatFloat2(f: Float): String =
+    if (isNonFiniteFloat(f)) "0.00"
+    else {
+        let neg = f < 0.0;
+        let v = if (neg) -f else f;
+        let pfx = if (neg) "-" else "";
+        if (v + 0.005 < 1000000000.0) {
+            let rounded = v + 0.005;
+            let whole = floatToInt(rounded);
+            let frac = floatToInt((rounded - intToFloat(whole)) * 100.0);
+            let cFrac = if (frac < 0) 0 else if (frac > 99) 99 else frac;
+            pfx + intToStr(whole) + "." + (if (cFrac < 10) "0" else "") + intToStr(cFrac)
+        } else {
+            pfx + formatLargeFloat2(v)
+        }
+    }
+
+def formatJsonFloat(f: Float): String =
+    if (isNonFiniteFloat(f)) "0.0"
+    else {
+        let neg = f < 0.0;
+        let v = if (neg) -f else f;
+        if (v < 1000000000.0) floatToStr(f)
+        else (if (neg) "-" else "") + formatLargeFloat2(v)
+    }
+
+/// Format a duration in nanoseconds with automatic unit scaling (`ns`, `us`, `ms`, `s`).
+pub def formatDurationNs(ns: Float): String =
+    if (ns < 1000.0) formatFloat2(ns) + " ns"
+    else if (ns < 1000000.0) formatFloat2(ns / 1000.0) + " us"
+    else if (ns < 1000000000.0) formatFloat2(ns / 1000000.0) + " ms"
+    else formatFloat2(ns / 1000000000.0) + " s"
+
+/// Format throughput in operations per second (`ops/s`, `K ops/s`, `M ops/s`, `G ops/s`).
+pub def formatOpsPerSec(ops: Float): String =
+    if (ops >= 1000000000.0) formatFloat2(ops / 1000000000.0) + " G ops/s"
+    else if (ops >= 1000000.0) formatFloat2(ops / 1000000.0) + " M ops/s"
+    else if (ops >= 1000.0) formatFloat2(ops / 1000.0) + " K ops/s"
+    else formatFloat2(ops) + " ops/s"
+
+def jsonEscape(s: String): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i));
+        if (ch == 34) bufPushStr(b, "\\\"")
+        else if (ch == 92) bufPushStr(b, "\\\\")
+        else if (ch == 10) bufPushStr(b, "\\n")
+        else if (ch == 13) bufPushStr(b, "\\r")
+        else if (ch == 9) bufPushStr(b, "\\t")
+        else bufPushByte(b, ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+/// Format `BenchStats` as a human-readable single-line summary.
+pub def formatStatsText(s: BenchStats): String =
+    s.name
+    + " | mean: " + formatDurationNs(s.meanNs)
+    + " | median: " + formatDurationNs(s.medianNs)
+    + " | min: " + formatDurationNs(s.minNs)
+    + " | max: " + formatDurationNs(s.maxNs)
+    + " | " + formatOpsPerSec(s.opsPerSec)
+    + " (" + intToStr(s.iters) + " iters x " + intToStr(s.rounds) + " rounds)"
+
+/// Format `BenchStats` as a compact JSON object string with an optional `"file"` field.
+pub def formatStatsJsonInFile(s: BenchStats, fileOpt: Option String): String = {
+    let fileField = match fileOpt {
+        Some(f) if (strLen(f) > 0) -> ",\"file\":\"" + jsonEscape(f) + "\"",
+        _ -> "",
+    };
+    "{\"name\":\"" + jsonEscape(s.name) + "\""
+    + fileField
+    + ",\"iters\":" + intToStr(s.iters)
+    + ",\"rounds\":" + intToStr(s.rounds)
+    + ",\"total_ns\":" + i64ToStr(s.totalNs)
+    + ",\"mean_ns\":" + formatJsonFloat(s.meanNs)
+    + ",\"median_ns\":" + formatJsonFloat(s.medianNs)
+    + ",\"min_ns\":" + formatJsonFloat(s.minNs)
+    + ",\"max_ns\":" + formatJsonFloat(s.maxNs)
+    + ",\"ops_per_sec\":" + formatJsonFloat(s.opsPerSec)
+    + "}"
+}
+
+/// Format `BenchStats` as a pure, compact JSON object string.
+pub def formatStatsJson(s: BenchStats): String =
+    formatStatsJsonInFile(s, None)
+
+def matchesBenchFilter(name: String): Bool = match getEnv("GEISHA_BENCH_FILTER") {
+    None -> true,
+    Some(pat) if (strLen(pat) == 0) -> true,
+    Some(pat) -> strContains(name, pat),
+}
+
+def isJsonOutputMode(): Bool = match getEnv("GEISHA_BENCH_JSON") {
+    Some(v) -> v == "1" || v == "true",
+    None -> false,
+}
+
+/// Run a benchmark with explicit `BenchConfig`, printing text or JSON based on `GEISHA_BENCH_JSON`.
+pub def benchWith(name: String, cfg: BenchConfig, f: () -> Void): BenchStats = {
+    if (!matchesBenchFilter(name)) {
+        BenchStats {
+            name: name,
+            iters: 0,
+            rounds: 0,
+            totalNs: intToI64(0),
+            meanNs: 0.0,
+            medianNs: 0.0,
+            minNs: 0.0,
+            maxNs: 0.0,
+            opsPerSec: 0.0,
+        }
+    } else {
+        let s = measure(name, cfg, f);
+        if (isJsonOutputMode()) {
+            printLn(formatStatsJsonInFile(s, getEnv("GEISHA_BENCH_FILE")))
+        } else {
+            printLn(formatStatsText(s))
+        };
+        s
+    }
+}
+
+/// Run a benchmark using `envConfig()` (respecting `geisha bench` flags `--iters`, `--warmup`, `--rounds`, `--filter`, `--json`).
+pub def bench(name: String, f: () -> Void): BenchStats =
+    benchWith(name, envConfig(), f)
+
+/// Run a named group of benchmarks, prefixing each entry as `<groupName>/<itemName>`.
+pub def benchGroup(groupName: String, items: List (String, () -> Void)): List BenchStats = {
+    let cfg = envConfig();
+    let acc = cellNew(Nil);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((nm, fn), rest) -> {
+                let fullName = if (strLen(groupName) > 0) groupName + "/" + nm else nm;
+                let s = benchWith(fullName, cfg, fn);
+                if (s.rounds > 0) cellSet(acc, Cons(s, cellGet(acc))) else ();
+                cellSet(cur, rest)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(acc))
+}

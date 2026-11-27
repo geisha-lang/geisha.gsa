@@ -1930,6 +1930,7 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "scopedPtrReadF64Le64" || name == "scopedPtrWriteF64Le64"
     || name == "scopedPtrCopyBytes"
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
+    || name == "__blackBox"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"
