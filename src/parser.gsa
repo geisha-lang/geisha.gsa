@@ -695,7 +695,7 @@ pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 
 // Patterns
 // ============================================================================
 
-def parseStructPatFields(p: Parser): Result (List (String, Pattern)) String = {
+def parseStructPatFields(p: Parser): Result (List (String, Pattern, Span, Bool)) String = {
     let _ = expectLBrace(p)?;
     let acc = cellNew(Nil);
     let more = cellNew(true);
@@ -703,9 +703,13 @@ def parseStructPatFields(p: Parser): Result (List (String, Pattern)) String = {
         match peekTok(p).kind {
             TkRBrace -> cellSet(more, false),
             _ -> {
+                let fSp = peekTok(p).span;
                 let fname = parseLowerIdent(p)?;
-                let pat = if (eatSym(p, ":")) parsePattern(p)? else PatVar(fname);
-                cellSet(acc, listAppend(cellGet(acc), [(fname, pat)]));
+                let (pat, isShort) = if (eatSym(p, ":")) {
+                    let sub = parsePattern(p)?;
+                    (sub, false)
+                } else (PatVar(fname), true);
+                cellSet(acc, listAppend(cellGet(acc), [(fname, pat, fSp, isShort)]));
                 if (!eatComma(p)) cellSet(more, false) else ()
             },
         }

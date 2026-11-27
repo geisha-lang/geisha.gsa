@@ -951,7 +951,7 @@ def collectPatVarNames(pat: Pattern, acc: Cell (List String)): Void = match pat 
         let cur = cellNew(fs);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
-                Cons((_, p), r) -> { collectPatVarNames(p, acc); cellSet(cur, r) },
+                Cons((_, p, _, _), r) -> { collectPatVarNames(p, acc); cellSet(cur, r) },
                 Nil -> (),
             }
         }
@@ -2567,7 +2567,7 @@ def findPatTargetInPat(pat: Pattern, inf: InferOutput, word: String): Option (Bo
             let found: Cell (Option (Bool, String)) = cellNew(None);
             while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons((fn, p), r) -> {
+                    Cons((fn, p, _, _), r) -> {
                         if (fn == word) {
                             match lookupAdtForCtor(inf, qname) {
                                 Some(adtName) -> cellSet(found, Some((true, adtName))),
@@ -3234,7 +3234,7 @@ def patContainsCtor(pat: Pattern, targetQn: String): Bool = match pat {
             let found = cellNew(false);
             while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons((_, p), r) -> { if (patContainsCtor(p, targetQn)) cellSet(found, true) else (); cellSet(cur, r) },
+                    Cons((_, p, _, _), r) -> { if (patContainsCtor(p, targetQn)) cellSet(found, true) else (); cellSet(cur, r) },
                     Nil -> (),
                 }
             };
@@ -3264,7 +3264,7 @@ def patContainsStructField(pat: Pattern, inf: InferOutput, targetAdtQn: String, 
         let found = cellNew(false);
         while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
-                Cons((fn, p), r) -> {
+                Cons((fn, p, _, _), r) -> {
                     if ((matchAdt && fn == fieldName) || patContainsStructField(p, inf, targetAdtQn, fieldName)) {
                         cellSet(found, true)
                     } else ();
@@ -3504,193 +3504,73 @@ def findTypeTokIndicesInTypeDecl(toks: Vec Token, ident: String, lo: Int, hi: In
     listRev(cellGet(outRev))
 }
 
-def findPatStartTokIdx(toks: Vec Token, patLo: Int, patHi: Int): Int = {
-    let n = vecLen(toks);
-    let d = dummyEofTok();
-    let i = cellNew(0);
-    let found = cellNew(-1);
-    while (cellGet(i) < n && cellGet(found) < 0) {
-        let idx = cellGet(i);
-        let tok = vecGetOr(toks, idx, d);
-        if (tok.span.start >= patHi) {
-            cellSet(i, n)
-        } else if (tok.span.start >= patLo) {
-            match tok.kind {
-                TkLBrace -> cellSet(i, idx + 1),
-                TkComma -> cellSet(i, idx + 1),
-                _ -> cellSet(found, idx),
-            }
-        } else cellSet(i, idx + 1)
-    };
-    cellGet(found)
-}
-
-def skipDottedPathInToks(toks: Vec Token, cur: Cell Int, hi: Int): Void = {
-    let n = vecLen(toks);
-    let d = dummyEofTok();
-    if (cellGet(cur) < n && vecGetOr(toks, cellGet(cur), d).span.start < hi) {
-        cellSet(cur, cellGet(cur) + 1);
-        let more = cellNew(true);
-        while (cellGet(more) && cellGet(cur) + 1 < n) {
-            let t = vecGetOr(toks, cellGet(cur), d);
-            if (t.span.start >= hi) cellSet(more, false)
-            else match t.kind {
-                TkDot -> cellSet(cur, cellGet(cur) + 2),
-                _ -> cellSet(more, false),
-            }
-        }
-    } else ()
-}
-
-def collectPatFieldOccsWithToks(
+def collectPatFieldOccsFromAst(
     pat: Pattern,
-    toks: Vec Token,
-    cur: Cell Int,
-    hi: Int,
     uri: String,
     src: String,
+    fileId: Int,
     inf: InferOutput,
     targetField: String,
     targetAdtQn: String,
     newNameOpt: Option String,
     seen: StrMap Bool,
     outRev: Cell (List OccSpan)
-): Void = {
-    let n = vecLen(toks);
-    let d = dummyEofTok();
-    if (cellGet(cur) >= n || vecGetOr(toks, cellGet(cur), d).span.start >= hi) ()
-    else match pat {
-        PatWild -> cellSet(cur, cellGet(cur) + 1),
-        PatVar(_) -> cellSet(cur, cellGet(cur) + 1),
-        PatLit(_) -> {
-            match vecGetOr(toks, cellGet(cur), d).kind {
-                TkSym(s) if (s == "-") -> cellSet(cur, cellGet(cur) + 2),
-                _ -> cellSet(cur, cellGet(cur) + 1),
-            }
-        },
-        PatTuple(ps) -> {
-            match vecGetOr(toks, cellGet(cur), d).kind {
-                TkLParen -> cellSet(cur, cellGet(cur) + 1),
-                _ -> (),
-            };
-            let cp = cellNew(ps);
-            while (match cellGet(cp) { Nil -> false, _ -> true }) {
-                match cellGet(cp) {
-                    Cons(p, rp) -> {
-                        collectPatFieldOccsWithToks(p, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
-                        if (cellGet(cur) < n) {
-                            match vecGetOr(toks, cellGet(cur), d).kind {
-                                TkComma -> cellSet(cur, cellGet(cur) + 1),
-                                _ -> (),
-                            }
-                        } else ();
-                        cellSet(cp, rp)
-                    },
-                    Nil -> (),
-                }
-            };
-            if (cellGet(cur) < n) {
-                match vecGetOr(toks, cellGet(cur), d).kind {
-                    TkRParen -> cellSet(cur, cellGet(cur) + 1),
-                    _ -> (),
-                }
-            } else ()
-        },
-        PatCtor(_, ps) -> {
-            skipDottedPathInToks(toks, cur, hi);
-            match ps {
+): Void = match pat {
+    PatWild -> (),
+    PatVar(_) -> (),
+    PatLit(_) -> (),
+    PatTuple(ps) -> {
+        let cp = cellNew(ps);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(p, rp) -> {
+                    collectPatFieldOccsFromAst(p, uri, src, fileId, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
+                    cellSet(cp, rp)
+                },
                 Nil -> (),
-                _ -> {
-                    if (cellGet(cur) < n) {
-                        match vecGetOr(toks, cellGet(cur), d).kind {
-                            TkLParen -> cellSet(cur, cellGet(cur) + 1),
-                            _ -> (),
+            }
+        }
+    },
+    PatCtor(_, ps) -> {
+        let cp = cellNew(ps);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(p, rp) -> {
+                    collectPatFieldOccsFromAst(p, uri, src, fileId, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
+                    cellSet(cp, rp)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    PatStruct(ctorQn, fs) -> {
+        let matchesAdt = match lookupAdtForCtor(inf, ctorQn) {
+            Some(an) -> an == targetAdtQn,
+            None -> false,
+        };
+        let cf = cellNew(fs);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons((fname, subPat, fSp, isShort), rf) -> {
+                    if (matchesAdt && fname == targetField && fSp.fileId == fileId && fSp.end > fSp.start) {
+                        if (isShort) {
+                            match newNameOpt {
+                                Some(nn) -> pushOccReplace(seen, outRev, uri, src, fSp.start, fSp.end, nn + ": " + fname),
+                                None -> pushOcc(seen, outRev, uri, src, fSp.start, fSp.end),
+                            }
+                        } else {
+                            pushOcc(seen, outRev, uri, src, fSp.start, fSp.end)
                         }
                     } else ();
-                    let cp = cellNew(ps);
-                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
-                        match cellGet(cp) {
-                            Cons(p, rp) -> {
-                                collectPatFieldOccsWithToks(p, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev);
-                                if (cellGet(cur) < n) {
-                                    match vecGetOr(toks, cellGet(cur), d).kind {
-                                        TkComma -> cellSet(cur, cellGet(cur) + 1),
-                                        _ -> (),
-                                    }
-                                } else ();
-                                cellSet(cp, rp)
-                            },
-                            Nil -> (),
-                        }
-                    };
-                    if (cellGet(cur) < n) {
-                        match vecGetOr(toks, cellGet(cur), d).kind {
-                            TkRParen -> cellSet(cur, cellGet(cur) + 1),
-                            _ -> (),
-                        }
-                    } else ()
+                    if (!isShort) {
+                        collectPatFieldOccsFromAst(subPat, uri, src, fileId, inf, targetField, targetAdtQn, newNameOpt, seen, outRev)
+                    } else ();
+                    cellSet(cf, rf)
                 },
+                Nil -> (),
             }
-        },
-        PatStruct(ctorQn, fs) -> {
-            skipDottedPathInToks(toks, cur, hi);
-            let matchesAdt = match lookupAdtForCtor(inf, ctorQn) {
-                Some(an) -> an == targetAdtQn,
-                None -> false,
-            };
-            if (cellGet(cur) < n) {
-                match vecGetOr(toks, cellGet(cur), d).kind {
-                    TkLBrace -> cellSet(cur, cellGet(cur) + 1),
-                    _ -> (),
-                }
-            } else ();
-            let cf = cellNew(fs);
-            while (match cellGet(cf) { Nil -> false, _ -> true }) {
-                match cellGet(cf) {
-                    Cons((fname, subPat), rf) -> {
-                        if (cellGet(cur) < n && vecGetOr(toks, cellGet(cur), d).span.start < hi) {
-                            let fTok = vecGetOr(toks, cellGet(cur), d);
-                            cellSet(cur, cellGet(cur) + 1);
-                            let hasColon = if (cellGet(cur) < n) {
-                                match vecGetOr(toks, cellGet(cur), d).kind {
-                                    TkSym(s) if (s == ":") -> true,
-                                    _ -> false,
-                                }
-                            } else false;
-                            if (hasColon) {
-                                cellSet(cur, cellGet(cur) + 1);
-                                if (matchesAdt && fname == targetField) {
-                                    pushOcc(seen, outRev, uri, src, fTok.span.start, fTok.span.end)
-                                } else ();
-                                collectPatFieldOccsWithToks(subPat, toks, cur, hi, uri, src, inf, targetField, targetAdtQn, newNameOpt, seen, outRev)
-                            } else {
-                                if (matchesAdt && fname == targetField) {
-                                    match newNameOpt {
-                                        Some(nn) -> pushOccReplace(seen, outRev, uri, src, fTok.span.start, fTok.span.end, nn + ": " + fname),
-                                        None -> pushOcc(seen, outRev, uri, src, fTok.span.start, fTok.span.end),
-                                    }
-                                } else ()
-                            };
-                            if (cellGet(cur) < n) {
-                                match vecGetOr(toks, cellGet(cur), d).kind {
-                                    TkComma -> cellSet(cur, cellGet(cur) + 1),
-                                    _ -> (),
-                                }
-                            } else ()
-                        } else ();
-                        cellSet(cf, rf)
-                    },
-                    Nil -> (),
-                }
-            };
-            if (cellGet(cur) < n) {
-                match vecGetOr(toks, cellGet(cur), d).kind {
-                    TkRBrace -> cellSet(cur, cellGet(cur) + 1),
-                    _ -> (),
-                }
-            } else ()
-        },
-    }
+        }
+    },
 }
 
 def extractQualBeforeTokIdx(toks: Vec Token, idx: Int): Option String = {
@@ -3936,9 +3816,9 @@ def collectTopDefOccsInForm(
                     Cons(arm, r) -> {
                         let patLo = cellGet(prevArmEnd);
                         let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
-                        if (f.pos.fileId == fileId && patHi > patLo) {
+                        if (f.pos.fileId == fileId) {
                             match target.stKind {
-                                SkTopDef if (patContainsCtor(arm.pat, targetQn)) -> {
+                                SkTopDef if (patHi > patLo && patContainsCtor(arm.pat, targetQn)) -> {
                                     let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, patLo, patHi);
                                     let co = cellNew(occs);
                                     while (match cellGet(co) { Nil -> false, _ -> true }) {
@@ -3954,13 +3834,8 @@ def collectTopDefOccsInForm(
                                         }
                                     }
                                 },
-                                SkField if (patContainsStructField(arm.pat, inf, targetQn, target.stName)) -> {
-                                    let startIdx = findPatStartTokIdx(rscope.rsToks, patLo, patHi);
-                                    if (startIdx >= 0) {
-                                        let curTok = cellNew(startIdx);
-                                        collectPatFieldOccsWithToks(arm.pat, rscope.rsToks, curTok, patHi, uri, src, inf, target.stName, targetQn, newNameOpt, seen, outRev)
-                                    } else ()
-                                },
+                                SkField ->
+                                    collectPatFieldOccsFromAst(arm.pat, uri, src, fileId, inf, target.stName, targetQn, newNameOpt, seen, outRev),
                                 _ -> (),
                             }
                         } else ();

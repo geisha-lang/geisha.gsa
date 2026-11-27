@@ -524,9 +524,9 @@ def collectPatVarsInList(ps: List Pattern, acc: List String): List String = matc
     Cons(h, t) -> collectPatVarsInList(t, collectPatVarsList(h, acc)),
 }
 
-def collectPatVarsInNamed(fs: List (String, Pattern), acc: List String): List String = match fs {
+def collectPatVarsInNamed(fs: List (String, Pattern, Span, Bool), acc: List String): List String = match fs {
     Nil -> acc,
-    Cons((_, p), t) -> collectPatVarsInNamed(t, collectPatVarsList(p, acc)),
+    Cons((_, p, _, _), t) -> collectPatVarsInNamed(t, collectPatVarsList(p, acc)),
 }
 
 // Pattern normalization (converts `PatStruct` -> positional `PatCtor` and collects typed local bindings)
@@ -559,9 +559,9 @@ def listNthTypeOrVoid(ts: List Type, idx: Int): Type = match ts {
     Cons(h, t) -> if (idx == 0) h else listNthTypeOrVoid(t, idx - 1),
 }
 
-def lookupNamedPatOrWild(named: List (String, Pattern), target: String): Pattern = match named {
+def lookupNamedPatOrWild(named: List (String, Pattern, Span, Bool), target: String): Pattern = match named {
     Nil -> PatWild,
-    Cons((k, p), r) -> if (k == target) p else lookupNamedPatOrWild(r, target),
+    Cons((k, p, _, _), r) -> if (k == target) p else lookupNamedPatOrWild(r, target),
 }
 
 def normalizeAndCollectPattern(ctx: KCtx, pat: Pattern, scrutTy: Type): (Pattern, List (String, Scheme)) = match pat {

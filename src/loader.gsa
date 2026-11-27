@@ -480,7 +480,7 @@ def collectPatVars(p: Pattern, bound: Cell (List String)): Void = match p {
     PatStruct(_, fs) -> {
         let c = cellNew(fs);
         while (match cellGet(c) { Nil -> false, _ -> true }) {
-            match cellGet(c) { Cons((_, sp), r) -> { collectPatVars(sp, bound); cellSet(c, r) }, Nil -> () }
+            match cellGet(c) { Cons((_, sp, _, _), r) -> { collectPatVars(sp, bound); cellSet(c, r) }, Nil -> () }
         }
     },
     _ -> (),
@@ -1129,11 +1129,11 @@ def rewritePatListInMod(ctx: ModRewriteCtx, ps: List Pattern, bound: Cell (List 
     },
 }
 
-def rewritePatStructFields(ctx: ModRewriteCtx, fs: List (String, Pattern), bound: Cell (List String)): List (String, Pattern) = match fs {
+def rewritePatStructFields(ctx: ModRewriteCtx, fs: List (String, Pattern, Span, Bool), bound: Cell (List String)): List (String, Pattern, Span, Bool) = match fs {
     Nil -> Nil,
-    Cons((k, p), t) -> {
+    Cons((k, p, fSp, isShort), t) -> {
         let np = rewritePatInMod(ctx, p, bound);
-        Cons((k, np), rewritePatStructFields(ctx, t, bound))
+        Cons((k, np, fSp, isShort), rewritePatStructFields(ctx, t, bound))
     },
 }
 

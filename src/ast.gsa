@@ -267,7 +267,7 @@ pub data Pattern {
     PatLit(Lit),
     PatTuple(List Pattern),
     PatCtor(String, List Pattern),
-    PatStruct(String, List (String, Pattern)),
+    PatStruct(String, List (String, Pattern, Span, Bool)),
 }
 
 pub data MatchArm {

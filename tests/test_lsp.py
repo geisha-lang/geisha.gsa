@@ -1717,6 +1717,56 @@ def main() -> int:
         )
         assert res_s.returncode == 0 and res_s.stdout.strip() == "10", f"renamed nested field pattern failed to run: rc={res_s.returncode} stdout={res_s.stdout!r} stderr={res_s.stderr!r}"
 
+        # (t) Parenthesized pattern `(Point { x }) -> x`, unit tuple `((), Point { x }) -> x`, and `let Point { x } = p; x` destructuring
+        adv_dir = root / "adv_field_pat_proj"
+        adv_dir.mkdir(parents=True)
+        adv_path = adv_dir / "main.gsa"
+        adv_src = (
+            "use std.str.intToStr\n"
+            "data Point { Point { x: Int } }\n"
+            "def fParen(p: Point): Int = match p {\n"
+            "    (Point { x }) -> x,\n"
+            "}\n"
+            "def fUnitTup(p: Point): Int = match ((), p) {\n"
+            "    ((), Point { x }) -> x,\n"
+            "}\n"
+            "def fLet(p: Point): Int = {\n"
+            "    let Point { x } = p;\n"
+            "    x\n"
+            "}\n"
+            "def main(): Void = {\n"
+            "    let p = Point { x: 7 };\n"
+            "    printLn(intToStr(fParen(p) + fUnitTup(p) + fLet(p)))\n"
+            "}\n"
+        )
+        adv_path.write_text(adv_src, encoding="utf-8")
+        adv_uri = path_to_uri(adv_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": adv_uri, "languageId": "geisha", "version": 1, "text": adv_src}})
+        assert client.wait_diag_for(adv_uri) == []
+        ren_adv = client.request("textDocument/rename", {
+            "textDocument": {"uri": adv_uri},
+            "position": {"line": 1, "character": 21},
+            "newName": "coord",
+        })
+        assert "result" in ren_adv, f"expected parenthesized/unit-tuple/let field rename to succeed: {ren_adv}"
+        new_adv = apply_edits(adv_src, ren_adv["result"]["changes"][adv_uri])
+        assert "(Point { coord: x }) -> x," in new_adv, f"parenthesized pattern mismatch: {new_adv!r}"
+        assert "((), Point { coord: x }) -> x," in new_adv, f"unit tuple pattern mismatch: {new_adv!r}"
+        assert "let Point { coord: x } = p;" in new_adv, f"let destructuring mismatch: {new_adv!r}"
+        run_t_dir = root / "run_adv_field_pat"
+        run_t_dir.mkdir(parents=True)
+        (run_t_dir / "main.gsa").write_text(new_adv, encoding="utf-8")
+        res_t = subprocess.run(
+            [abs_geisha_bin, "run", str(run_t_dir / "main.gsa")],
+            cwd=str(run_t_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_t.returncode == 0 and res_t.stdout.strip() == "21", f"renamed paren/unit-tuple/let field patterns failed to run: rc={res_t.returncode} stdout={res_t.stdout!r} stderr={res_t.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

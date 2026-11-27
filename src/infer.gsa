@@ -2225,7 +2225,7 @@ def inferPatternInner(
                                     let cur = cellNew(namedPats);
                                     while (match cellGet(cur) { Nil -> false, _ -> true }) {
                                         match cellGet(cur) {
-                                            Cons((fnm, fpat), r) -> {
+                                            Cons((fnm, fpat, _, _), r) -> {
                                                 match listIndexStr(declNames, fnm, 0) {
                                                     None -> returnPatErr(sp, "Variant '" + cname + "' has no field '" + fnm + "'")?,
                                                     Some(idx) -> {
@@ -3182,9 +3182,9 @@ def extendBoundWithPatList(ps: List Pattern, bound: List String): List String = 
     Cons(p, r) -> extendBoundWithPatList(r, extendBoundWithPattern(p, bound)),
 }
 
-def extendBoundWithNamedPats(fs: List (String, Pattern), bound: List String): List String = match fs {
+def extendBoundWithNamedPats(fs: List (String, Pattern, Span, Bool), bound: List String): List String = match fs {
     Nil -> bound,
-    Cons((_, p), r) -> extendBoundWithNamedPats(r, extendBoundWithPattern(p, bound)),
+    Cons((_, p, _, _), r) -> extendBoundWithNamedPats(r, extendBoundWithPattern(p, bound)),
 }
 
 def typeContainsScopedList(adtReg: StrMap AdtInfo, subst: StrMap Type, ts: List Type, visiting: List String): Bool = match ts {
@@ -3481,9 +3481,9 @@ def normalizeStructPatList(ctx: InferCtx, ps: List Pattern): List Pattern = matc
     Cons(h, t) -> Cons(normalizeStructPat(ctx, h), normalizeStructPatList(ctx, t)),
 }
 
-def lookupNamedPat(named: List (String, Pattern), target: String): Pattern = match named {
+def lookupNamedPat(named: List (String, Pattern, Span, Bool), target: String): Pattern = match named {
     Nil -> PatWild,
-    Cons((k, p), r) -> if (k == target) p else lookupNamedPat(r, target),
+    Cons((k, p, _, _), r) -> if (k == target) p else lookupNamedPat(r, target),
 }
 
 def repeatWilds(n: Int): List Pattern =
