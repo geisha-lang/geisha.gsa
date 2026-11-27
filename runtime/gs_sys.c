@@ -1304,4 +1304,67 @@ int32_t gs_pipe_poll2(int32_t fd0, int32_t fd1, int32_t timeout_ms)
     }
 }
 
+int32_t gs_proc_signal_group_only(int32_t pgid, int32_t sig_kind)
+{
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)pgid;
+    (void)sig_kind;
+    return -1;
+#else
+    if (pgid <= 0) return -1;
+    int sig = SIGTERM;
+    if (sig_kind == 1) sig = SIGKILL;
+    else if (sig_kind == 2) sig = SIGINT;
+    // Strictly signal the process group `-pgid`; NEVER fall back to `+pgid`
+    // so an unrelated recycled PID can never be signaled.
+    if (kill(-(pid_t)pgid, sig) == 0 || errno == ESRCH) return 0;
+    return -1;
+#endif
+}
+
+int32_t gs_proc_poll_exited_no_reap(int32_t pid)
+{
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)pid;
+    return 0;
+#else
+    if (pid <= 0) return 0;
+    siginfo_t si;
+    memset(&si, 0, sizeof(si));
+    for (;;) {
+        int r = waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT);
+        if (r == 0) {
+            return (si.si_pid == (pid_t)pid) ? 1 : 0;
+        }
+        if (errno == EINTR) continue;
+        return -1;
+    }
+#endif
+}
+
+static volatile sig_atomic_t g_gs_watch_stop = 0;
+
+static void gs_watch_sig_handler(int sig)
+{
+    (void)sig;
+    g_gs_watch_stop = 1;
+}
+
+void gs_watch_install_signal_handlers(void)
+{
+    g_gs_watch_stop = 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = gs_watch_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
+}
+
+int32_t gs_watch_should_stop(void)
+{
+    return g_gs_watch_stop ? 1 : 0;
+}
+
 #endif /* !defined(_WIN32) */

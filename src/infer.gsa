@@ -2136,7 +2136,7 @@ def inferPatternInner(
 ): Result (Type, List (String, Scheme)) String = match pat {
     PatWild -> Ok((freshVar(ctx), Nil)),
     PatLit(l) -> Ok((litType(l), Nil)),
-    PatVar(v) ->
+    PatVar(v, _) ->
         if (listContainsStr(cellGet(seenVars), v)) {
             Err(typeErr(sp, "Duplicate variable '" + v + "' in pattern"))
         } else {
@@ -2225,7 +2225,7 @@ def inferPatternInner(
                                     let cur = cellNew(namedPats);
                                     while (match cellGet(cur) { Nil -> false, _ -> true }) {
                                         match cellGet(cur) {
-                                            Cons((fnm, fpat), r) -> {
+                                            Cons((fnm, fpat, _, _), r) -> {
                                                 match listIndexStr(declNames, fnm, 0) {
                                                     None -> returnPatErr(sp, "Variant '" + cname + "' has no field '" + fnm + "'")?,
                                                     Some(idx) -> {
@@ -3171,7 +3171,7 @@ def extendBoundWithVarDecls(ps: List VarDecl, bound: List String): List String =
 def extendBoundWithPattern(pat: Pattern, bound: List String): List String = match pat {
     PatWild -> bound,
     PatLit(_) -> bound,
-    PatVar(v) -> Cons(v, bound),
+    PatVar(v, _) -> Cons(v, bound),
     PatTuple(ps) -> extendBoundWithPatList(ps, bound),
     PatCtor(_, ps) -> extendBoundWithPatList(ps, bound),
     PatStruct(_, fs) -> extendBoundWithNamedPats(fs, bound),
@@ -3182,9 +3182,9 @@ def extendBoundWithPatList(ps: List Pattern, bound: List String): List String = 
     Cons(p, r) -> extendBoundWithPatList(r, extendBoundWithPattern(p, bound)),
 }
 
-def extendBoundWithNamedPats(fs: List (String, Pattern), bound: List String): List String = match fs {
+def extendBoundWithNamedPats(fs: List (String, Pattern, Span, Bool), bound: List String): List String = match fs {
     Nil -> bound,
-    Cons((_, p), r) -> extendBoundWithNamedPats(r, extendBoundWithPattern(p, bound)),
+    Cons((_, p, _, _), r) -> extendBoundWithNamedPats(r, extendBoundWithPattern(p, bound)),
 }
 
 def typeContainsScopedList(adtReg: StrMap AdtInfo, subst: StrMap Type, ts: List Type, visiting: List String): Bool = match ts {
@@ -3439,7 +3439,7 @@ def checkClosureCapturesNamed(
 
 def isWildPat(p: Pattern): Bool = match p {
     PatWild -> true,
-    PatVar(_) -> true,
+    PatVar(_, _) -> true,
     _ -> false,
 }
 
@@ -3481,9 +3481,9 @@ def normalizeStructPatList(ctx: InferCtx, ps: List Pattern): List Pattern = matc
     Cons(h, t) -> Cons(normalizeStructPat(ctx, h), normalizeStructPatList(ctx, t)),
 }
 
-def lookupNamedPat(named: List (String, Pattern), target: String): Pattern = match named {
+def lookupNamedPat(named: List (String, Pattern, Span, Bool), target: String): Pattern = match named {
     Nil -> PatWild,
-    Cons((k, p), r) -> if (k == target) p else lookupNamedPat(r, target),
+    Cons((k, p, _, _), r) -> if (k == target) p else lookupNamedPat(r, target),
 }
 
 def repeatWilds(n: Int): List Pattern =
@@ -4354,7 +4354,7 @@ def buildFieldProdExpr(v: VariantInfo, idx: Int, total: Int, sp: Span): Form =
 def buildFieldProdPat(idx: Int, total: Int): Pattern =
     if (total <= 0) PatCtor("Unit", Nil)
     else {
-        let namedPat = PatCtor("Named", [PatWild, PatVar("$df" + intToStr(idx))]);
+        let namedPat = PatCtor("Named", [PatWild, PatVar("$df" + intToStr(idx), emptySpan())]);
         if (idx + 1 >= total) namedPat
         else PatCtor("Prod", [namedPat, buildFieldProdPat(idx + 1, total)])
     }
@@ -4364,7 +4364,7 @@ def buildVariantCtorPat(v: VariantInfo): Pattern = {
     let psRev = cellNew(Nil);
     let i = cellNew(0);
     while (cellGet(i) < n) {
-        cellSet(psRev, Cons(PatVar("$df" + intToStr(cellGet(i))), cellGet(psRev)));
+        cellSet(psRev, Cons(PatVar("$df" + intToStr(cellGet(i)), emptySpan()), cellGet(psRev)));
         cellSet(i, cellGet(i) + 1)
     };
     PatCtor(v.vname, listRev(cellGet(psRev)))

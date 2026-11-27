@@ -441,14 +441,14 @@ def extractModuleImports(items: List ModuleItem): List (String, String, String) 
         match cellGet(cur) {
             Cons(ModUse(_, u), r) -> {
                 match u {
-                    UseSingle(segs) -> match splitLastSeg(segs) {
+                    UseSingle(segs, _) -> match splitLastSeg(segs) {
                         Some((modSegs, sym)) ->
                             if (match modSegs { Nil -> false, _ -> true }) {
                                 cellSet(rev, Cons((sym, strJoin(modSegs, "."), sym), cellGet(rev)))
                             } else (),
                         None -> (),
                     },
-                    UseAlias(segs, alias) -> match splitLastSeg(segs) {
+                    UseAlias(segs, alias, _) -> match splitLastSeg(segs) {
                         Some((modSegs, sym)) ->
                             if (match modSegs { Nil -> false, _ -> true }) {
                                 cellSet(rev, Cons((alias, strJoin(modSegs, "."), sym), cellGet(rev)))

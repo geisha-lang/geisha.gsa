@@ -436,10 +436,37 @@ void *gs_sys_fopen(const char *path, const char *mode)
 {
     if (path == NULL || mode == NULL) return NULL;
     wchar_t *wp = gs_utf8_to_wide(path);
-    wchar_t *wm = gs_utf8_to_wide(mode);
-    if (wp == NULL || wm == NULL) {
+    if (wp == NULL) return NULL;
+    /* For read-only opens, grant FILE_SHARE_DELETE so concurrent atomic
+     * replace/rename (e.g. editors or `os.replace` during `--watch`) never
+     * fails with ERROR_ACCESS_DENIED (WinError 5). */
+    if (mode[0] == 'r' && strchr(mode, '+') == NULL) {
+        HANDLE h = CreateFileW(
+            wp,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
         free(wp);
-        free(wm);
+        if (h == INVALID_HANDLE_VALUE) return NULL;
+        int flags = _O_RDONLY | (strchr(mode, 'b') != NULL ? _O_BINARY : _O_TEXT);
+        int fd = _open_osfhandle((intptr_t)h, flags);
+        if (fd < 0) {
+            CloseHandle(h);
+            return NULL;
+        }
+        FILE *fp = _fdopen(fd, mode);
+        if (fp == NULL) {
+            _close(fd);
+            return NULL;
+        }
+        return (void *)fp;
+    }
+    wchar_t *wm = gs_utf8_to_wide(mode);
+    if (wm == NULL) {
+        free(wp);
         return NULL;
     }
     FILE *fp = _wfopen(wp, wm);
@@ -2389,4 +2416,42 @@ int32_t gs_sys_shell(const char *cmd)
     int rc = _wsystem(wcmd);
     free(wcmd);
     return (int32_t)rc;
+}
+
+int32_t gs_proc_signal_group_only(int32_t pgid, int32_t sig_kind)
+{
+    return gs_proc_signal(pgid, sig_kind, 1);
+}
+
+int32_t gs_proc_poll_exited_no_reap(int32_t pid)
+{
+    HANDLE hProc = NULL;
+    if (!gs_proc_acquire(pid, &hProc, NULL) || hProc == NULL) return -1;
+    DWORD w = WaitForSingleObject(hProc, 0);
+    gs_proc_release(pid, 0, NULL, NULL);
+    if (w == WAIT_OBJECT_0) return 1;
+    if (w == WAIT_TIMEOUT) return 0;
+    return -1;
+}
+
+static volatile LONG g_gs_watch_stop = 0;
+
+static BOOL WINAPI gs_watch_ctrl_handler(DWORD ctrl_type)
+{
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        InterlockedExchange(&g_gs_watch_stop, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void gs_watch_install_signal_handlers(void)
+{
+    InterlockedExchange(&g_gs_watch_stop, 0);
+    (void)SetConsoleCtrlHandler(gs_watch_ctrl_handler, TRUE);
+}
+
+int32_t gs_watch_should_stop(void)
+{
+    return InterlockedCompareExchange(&g_gs_watch_stop, 0, 0) != 0 ? 1 : 0;
 }
