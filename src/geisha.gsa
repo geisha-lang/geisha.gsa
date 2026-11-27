@@ -15,7 +15,11 @@ use std.path.{pathStem, pathJoin, pathDirname, pathBasename}
 use sys.env.{argCount, argAt, getEnv}
 use sys.fs.{readFile, writeFile, removeFile, removeDirAll, fileExists, mkdirAll, isDir, readDir}
 use sys.io.eprintLn
-use sys.proc.{ExitStatus, Exited, Signaled, exit, shell, command, cmdEnv, spawn as procSpawn, childWait}
+use sys.proc.{
+    Child, Signal, SigTerm, SigKill, ExitStatus, Exited, Signaled,
+    exit, shell, command, cmdEnv, cmdOwnGroup,
+    spawn as procSpawn, childTryWait, childWait, childWaitTimeout, childSignal
+}
 use std.task.sleepMs
 use ast.{addUniqueStr, sortUniqueStrings}
 use loader.{
@@ -60,6 +64,8 @@ extern "gs_proc_spawn" def c_proc_spawn(
 extern "gs_proc_wait" def c_proc_wait(pid: Int, nohang: Int): Int64
 extern "gs_sys_getpid" def c_getpid(): Int
 extern "gs_sys_rename" def c_rename(oldPath: String, newPath: String): Int
+extern "gs_watch_install_signal_handlers" def c_watch_install_signal_handlers(): Void
+extern "gs_watch_should_stop" def c_watch_should_stop(): Int
 
 def currentHostOs(): String = {
     let p = c_host_os();
@@ -3199,16 +3205,148 @@ def watchPollIntervalMs(): Int =
         None -> 250,
     }
 
+def stopWatchChild(activeChild: Cell (Option Child)): Void =
+    match cellGet(activeChild) {
+        None -> (),
+        Some(ch) -> {
+            let _ = childSignal(ch, SigTerm);
+            match childWaitTimeout(ch, 1500) {
+                Ok(Some(_)) -> (),
+                _ -> {
+                    let _ = childSignal(ch, SigKill);
+                    let _ = childWait(ch);
+                    ()
+                },
+            };
+            cellSet(activeChild, None)
+        },
+    }
+
+def buildCachedScriptBin(
+    gsaFile: String,
+    rtOverrideOpt: Option String,
+    optLevel: String,
+    optDebug: Bool,
+    noCache: Bool
+): Result String String = {
+    let rtArchive = resolveRuntimeArchive(rtOverrideOpt)?;
+    let entrySrc = readFile(gsaFile)?;
+    let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
+    mkdirAll(cacheDir)?;
+    let key = strSlice(
+        sha256Hex("script\n" + scriptCompilerFingerprint(rtArchive) + "\nO" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "\n" + gsaFile + "\n" + entrySrc),
+        0,
+        24
+    );
+    let binPath = pathJoin(cacheDir, "s_" + key + hostExeExt());
+    let depsPath = binPath + ".deps";
+    if (!noCache && fileExists(binPath) && verifyScriptDeps(depsPath)) {
+        Ok(binPath)
+    } else {
+        diagReset();
+        let rootSpec = MkPkgSpec {
+            pkgId: "",
+            pkgName: "",
+            srcRoots: [pathDirname(gsaFile)],
+            deps: Nil,
+        };
+        let llText = compileWithPkgSpecsToIrDebug(
+            gsaFile, true, rootSpec, Nil, Nil, None, false, Nil, false, None, optDebug
+        )?;
+        let tmpBin = pathJoin(cacheDir, "s_" + key + ".tmp." + intToStr(c_getpid()) + hostExeExt());
+        emitNativeExecutableFromIrDebug(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt, optDebug, " -O" + optLevel)?;
+        writeScriptDeps(depsPath, gsaFile)?;
+        if (c_rename(tmpBin, binPath) != 0) {
+            let _ = removeFile(tmpBin);
+            Err("failed to cache compiled script binary at '" + binPath + "'")
+        } else {
+            Ok(binPath)
+        }
+    }
+}
+
+def runWatchProcessLoop(
+    label: String,
+    watchDirs: List String,
+    extraFiles: List String,
+    appArgs: List String,
+    buildBin: () -> Result String String
+): Result Int String = {
+    c_watch_install_signal_handlers();
+    let pollMs = watchPollIntervalMs();
+    let lastSnap = cellNew(computeWatchSnapshot(watchDirs, extraFiles));
+    let firstRun = cellNew(true);
+    let activeChild: Cell (Option Child) = cellNew(None);
+    while (c_watch_should_stop() == 0) {
+        stopWatchChild(activeChild);
+        clearWatchScreen();
+        if (cellGet(firstRun)) {
+            eprintLn("[watch] Starting " + label + "...");
+            cellSet(firstRun, false)
+        } else {
+            eprintLn("[watch] Change detected — restarting " + label + "...")
+        };
+        match buildBin() {
+            Ok(binPath) ->
+                if (c_watch_should_stop() == 0) {
+                    let cmd = cmdOwnGroup(command(binPath, appArgs), true);
+                    match procSpawn(cmd) {
+                        Ok(ch) -> cellSet(activeChild, Some(ch)),
+                        Err(e) -> {
+                            eprintLn("error: " + e);
+                            eprintLn("[watch] Watching for changes...")
+                        },
+                    }
+                } else (),
+            Err(msg) -> {
+                if (isFormattedDiag(msg)) eprintLn(msg)
+                else eprintLn("error: " + msg);
+                eprintLn("[watch] Watching for changes...")
+            },
+        };
+        let changed = cellNew(false);
+        while (!cellGet(changed) && c_watch_should_stop() == 0) {
+            match cellGet(activeChild) {
+                Some(ch) -> match childTryWait(ch) {
+                    Ok(Some(Exited(rc))) -> {
+                        cellSet(activeChild, None);
+                        if (rc != 0) eprintLn("[watch] Exited with status " + intToStr(rc) + ". Watching for changes...")
+                        else eprintLn("[watch] Done. Watching for changes...")
+                    },
+                    Ok(Some(Signaled(sig))) -> {
+                        cellSet(activeChild, None);
+                        eprintLn("[watch] Exited with signal " + intToStr(sig) + ". Watching for changes...")
+                    },
+                    Ok(None) -> (),
+                    Err(_) -> cellSet(activeChild, None),
+                },
+                None -> (),
+            };
+            if (c_watch_should_stop() == 0) {
+                sleepMs(pollMs);
+                let nextSnap = computeWatchSnapshot(watchDirs, extraFiles);
+                if (nextSnap != cellGet(lastSnap)) {
+                    cellSet(lastSnap, nextSnap);
+                    cellSet(changed, true)
+                } else ()
+            } else ()
+        }
+    };
+    stopWatchChild(activeChild);
+    Ok(0)
+}
+
 def runWatchLoop(
     label: String,
     watchDirs: List String,
     extraFiles: List String,
     runOnce: () -> Result Int String
 ): Result Int String = {
+    c_watch_install_signal_handlers();
     let pollMs = watchPollIntervalMs();
     let lastSnap = cellNew(computeWatchSnapshot(watchDirs, extraFiles));
     let firstRun = cellNew(true);
-    while (true) {
+    while (c_watch_should_stop() == 0) {
         clearWatchScreen();
         if (cellGet(firstRun)) {
             eprintLn("[watch] Starting " + label + "...");
@@ -3227,7 +3365,7 @@ def runWatchLoop(
             },
         };
         let changed = cellNew(false);
-        while (!cellGet(changed)) {
+        while (!cellGet(changed) && c_watch_should_stop() == 0) {
             sleepMs(pollMs);
             let nextSnap = computeWatchSnapshot(watchDirs, extraFiles);
             if (nextSnap != cellGet(lastSnap)) {
@@ -3330,14 +3468,30 @@ def runDriver(): Result Int String = {
                                 Some(pr) -> pr,
                                 None -> if (strLen(dir) == 0) "." else dir,
                             };
-                            runWatchLoop("geisha run " + gsaFile, [watchRoot], [gsaFile], runOnce)
+                            runWatchProcessLoop(
+                                "geisha run " + gsaFile,
+                                [watchRoot],
+                                [gsaFile],
+                                opts.optSubArgs,
+                                () -> buildCachedScriptBin(gsaFile, opts.optRuntime, effOptLevel, opts.optDebug, opts.optNoCache)
+                            )
                         },
                         None -> {
                             let projDir = match findProjectRoot(".") {
                                 Some(d) -> d,
                                 None -> returnDriverErr("no geisha.toml found in current or parent directories")?,
                             };
-                            runWatchLoop("geisha run", [projDir], [pathJoin(projDir, "geisha.toml")], runOnce)
+                            if (opts.optTarget == "macos-app" || opts.optTarget == "ios-sim-app") {
+                                runWatchLoop("geisha run", [projDir], [pathJoin(projDir, "geisha.toml")], runOnce)
+                            } else {
+                                runWatchProcessLoop(
+                                    "geisha run",
+                                    [projDir],
+                                    [pathJoin(projDir, "geisha.toml")],
+                                    opts.optSubArgs,
+                                    () -> cmdBuildProject(projDir, "native", false, false, None, None, opts.optRuntime, Nil, false, None, None, false, false, false, None, cbs)
+                                )
+                            }
                         },
                     }
                 } else {

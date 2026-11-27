@@ -2008,9 +2008,15 @@ def headTypeConName(ty: Type): Option String = match ty {
     _ -> None,
 }
 
+def isWinDrivePath(p: String): Bool =
+    strLen(p) >= 2 && isAsciiLetter(strByteAt(p, 0)) && strByteAt(p, 1) == 58
+
 def isUserSourceFile(files: Vec SourceFile, fileId: Int): Bool =
     match getSourceFileFromVec(files, fileId) {
-        Some(sf) -> strLen(sf.sfPath) > 0 && (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath)),
+        Some(sf) ->
+            strLen(sf.sfPath) > 0
+            && !strStartsWith(sf.sfPath, "<")
+            && (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || isWinDrivePath(sf.sfPath) || fileExists(sf.sfPath)),
         None -> false,
     }
 
@@ -2854,6 +2860,20 @@ def pushOcc(seen: StrMap Bool, outRev: Cell (List OccSpan), uri: String, text: S
     } else ()
 }
 
+def localsContainSpan(locals: List LocalBind, sp: Span): Bool = match locals {
+    Nil -> false,
+    Cons(lb, r) -> if (spanEq(lb.lbSpan, sp)) true else localsContainSpan(r, sp),
+}
+
+// True if `name` is bound in `locals` strictly inside `targetDefSpan` (appears before `targetDefSpan` in the innermost-first list).
+def localsBindInsideTarget(locals: List LocalBind, name: String, targetDefSpan: Span): Bool = match locals {
+    Nil -> false,
+    Cons(lb, r) ->
+        if (spanEq(lb.lbSpan, targetDefSpan)) false
+        else if (lb.lbName == name) true
+        else localsBindInsideTarget(r, name, targetDefSpan),
+}
+
 def collectLocalOccsInForm(
     uri: String,
     src: String,
@@ -2862,6 +2882,8 @@ def collectLocalOccsInForm(
     locals: List LocalBind,
     targetDefSpan: Span,
     includeDecl: Bool,
+    newNameOpt: Option String,
+    conflict: Cell (Option String),
     seen: StrMap Bool,
     outRev: Cell (List OccSpan)
 ): Void = {
@@ -2871,21 +2893,35 @@ def collectLocalOccsInForm(
             if (f.pos.fileId == fileId) {
                 match lookupLocalBind(locals, name) {
                     Some(lb) if (spanEq(lb.lbSpan, targetDefSpan)) -> {
+                        match newNameOpt {
+                            Some(nn) if (nn != name) -> match lookupLocalBind(locals, nn) {
+                                Some(confLb) if (!spanEq(confLb.lbSpan, targetDefSpan)) ->
+                                    cellSet(conflict, Some("Renaming '" + name + "' to '" + nn + "' would be captured by an existing binding '" + nn + "'")),
+                                _ -> (),
+                            },
+                            _ -> (),
+                        };
                         let (s, e) = findIdentInSpan(src, name, f.pos.start, f.pos.end);
                         pushOcc(seen, outRev, uri, src, s, e)
                     },
-                    _ -> (),
+                    _ -> match newNameOpt {
+                        Some(nn) if (shortSymName(name) == nn && localsContainSpan(locals, targetDefSpan)) ->
+                            if (!localsBindInsideTarget(locals, nn, targetDefSpan)) {
+                                cellSet(conflict, Some("Renaming to '" + nn + "' would capture an existing reference to '" + nn + "'"))
+                            } else (),
+                        _ -> (),
+                    },
                 }
             } else (),
-        ExTuple(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
-        ExList(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
-        ExBlock(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
+        ExTuple(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
+        ExList(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
+        ExBlock(es) -> collectLocalOccsInList(uri, src, es, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
         ExStructInit(_, fields) -> {
             let cf = cellNew(fields);
             while (match cellGet(cf) { Nil -> false, _ -> true }) {
                 match cellGet(cf) {
                     Cons((_, fv), r) -> {
-                        collectLocalOccsInForm(uri, src, fv, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
+                        collectLocalOccsInForm(uri, src, fv, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
                         cellSet(cf, r)
                     },
                     Nil -> (),
@@ -2893,55 +2929,77 @@ def collectLocalOccsInForm(
             }
         },
         ExApply(callee, args) -> {
-            collectLocalOccsInForm(uri, src, callee, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
-            collectLocalOccsInList(uri, src, args, fileId, locals, targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, callee, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            collectLocalOccsInList(uri, src, args, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
         ExAbs(ps, _, body) -> {
             let nextLocals = cellNew(locals);
+            let targetInParams = cellNew(false);
             if (f.pos.fileId == fileId && f.pos.start < body.pos.start) {
                 let cp = cellNew(ps);
                 while (match cellGet(cp) { Nil -> false, _ -> true }) {
                     match cellGet(cp) {
                         Cons(vd, r) -> {
                             let bsp = locateBinderSpan(src, fileId, vd.vname, f.pos.start, body.pos.start);
-                            if (includeDecl && spanEq(bsp, targetDefSpan)) {
-                                pushOcc(seen, outRev, uri, src, bsp.start, bsp.end)
+                            if (spanEq(bsp, targetDefSpan)) {
+                                cellSet(targetInParams, true);
+                                if (includeDecl) pushOcc(seen, outRev, uri, src, bsp.start, bsp.end) else ()
                             } else ();
                             cellSet(nextLocals, Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: vd.vscm }, cellGet(nextLocals)));
                             cellSet(cp, r)
                         },
                         Nil -> (),
                     }
-                }
+                };
+                if (cellGet(targetInParams)) {
+                    match newNameOpt {
+                        Some(nn) -> {
+                            let cp2 = cellNew(ps);
+                            while (match cellGet(cp2) { Nil -> false, _ -> true }) {
+                                match cellGet(cp2) {
+                                    Cons(vd, r) -> {
+                                        let bsp = locateBinderSpan(src, fileId, vd.vname, f.pos.start, body.pos.start);
+                                        if (!spanEq(bsp, targetDefSpan) && vd.vname == nn) {
+                                            cellSet(conflict, Some("Duplicate parameter name '" + nn + "' in scope"))
+                                        } else ();
+                                        cellSet(cp2, r)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        None -> (),
+                    }
+                } else ()
             } else ();
-            collectLocalOccsInForm(uri, src, body, fileId, cellGet(nextLocals), targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, body, fileId, cellGet(nextLocals), targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
         ExBin(_, lhs, rhs) -> {
-            collectLocalOccsInForm(uri, src, lhs, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
-            collectLocalOccsInForm(uri, src, rhs, fileId, locals, targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, lhs, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            collectLocalOccsInForm(uri, src, rhs, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
-        ExUn(_, sub) -> collectLocalOccsInForm(uri, src, sub, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
+        ExUn(_, sub) -> collectLocalOccsInForm(uri, src, sub, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
         ExLet(vd, rhs, body) -> {
-            collectLocalOccsInForm(uri, src, rhs, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
+            collectLocalOccsInForm(uri, src, rhs, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
             let bindEnd = if (rhs.pos.start > f.pos.start) rhs.pos.start else f.pos.end;
             let bsp = locateBinderSpan(src, fileId, vd.vname, f.pos.start, bindEnd);
             if (includeDecl && spanEq(bsp, targetDefSpan)) {
                 pushOcc(seen, outRev, uri, src, bsp.start, bsp.end)
             } else ();
             let nextLocals = Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: vd.vscm }, locals);
-            collectLocalOccsInForm(uri, src, body, fileId, nextLocals, targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, body, fileId, nextLocals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
         ExIf(c, t, e) -> {
-            collectLocalOccsInForm(uri, src, c, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
-            collectLocalOccsInForm(uri, src, t, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
-            collectLocalOccsInForm(uri, src, e, fileId, locals, targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, c, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            collectLocalOccsInForm(uri, src, t, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            collectLocalOccsInForm(uri, src, e, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
         ExWhile(c, b) -> {
-            collectLocalOccsInForm(uri, src, c, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
-            collectLocalOccsInForm(uri, src, b, fileId, locals, targetDefSpan, includeDecl, seen, outRev)
+            collectLocalOccsInForm(uri, src, c, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            collectLocalOccsInForm(uri, src, b, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
         },
         ExMatch(scrut, arms) -> {
-            collectLocalOccsInForm(uri, src, scrut, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
+            collectLocalOccsInForm(uri, src, scrut, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
             let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
             let ca = cellNew(arms);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
@@ -2952,6 +3010,8 @@ def collectLocalOccsInForm(
                         let patLo = cellGet(prevArmEnd);
                         let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
                         let armLocals = cellNew(locals);
+                        let targetInArm = cellNew(false);
+                        let armNewBinds: Cell (List LocalBind) = cellNew(Nil);
                         let cn = cellNew(listRev(cellGet(patNames)));
                         while (match cellGet(cn) { Nil -> false, _ -> true }) {
                             match cellGet(cn) {
@@ -2964,21 +3024,43 @@ def collectLocalOccsInForm(
                                         } else {
                                             locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end)
                                         };
-                                    if (includeDecl && spanEq(bsp, targetDefSpan)) {
-                                        pushOcc(seen, outRev, uri, src, bsp.start, bsp.end)
+                                    if (spanEq(bsp, targetDefSpan)) {
+                                        cellSet(targetInArm, true);
+                                        if (includeDecl) pushOcc(seen, outRev, uri, src, bsp.start, bsp.end) else ()
                                     } else ();
-                                    cellSet(armLocals, Cons(MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot }, cellGet(armLocals)));
+                                    let lb = MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot };
+                                    cellSet(armNewBinds, Cons(lb, cellGet(armNewBinds)));
+                                    cellSet(armLocals, Cons(lb, cellGet(armLocals)));
                                     cellSet(cn, rn)
                                 },
                                 Nil -> (),
                             }
                         };
+                        if (cellGet(targetInArm)) {
+                            match newNameOpt {
+                                Some(nn) -> {
+                                    let cb = cellNew(cellGet(armNewBinds));
+                                    while (match cellGet(cb) { Nil -> false, _ -> true }) {
+                                        match cellGet(cb) {
+                                            Cons(lb, rb) -> {
+                                                if (!spanEq(lb.lbSpan, targetDefSpan) && lb.lbName == nn) {
+                                                    cellSet(conflict, Some("Duplicate pattern binding '" + nn + "' in match arm"))
+                                                } else ();
+                                                cellSet(cb, rb)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                },
+                                None -> (),
+                            }
+                        } else ();
                         let al = cellGet(armLocals);
                         match arm.guard {
-                            Some(g) -> collectLocalOccsInForm(uri, src, g, fileId, al, targetDefSpan, includeDecl, seen, outRev),
+                            Some(g) -> collectLocalOccsInForm(uri, src, g, fileId, al, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
                             None -> (),
                         };
-                        collectLocalOccsInForm(uri, src, arm.body, fileId, al, targetDefSpan, includeDecl, seen, outRev);
+                        collectLocalOccsInForm(uri, src, arm.body, fileId, al, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
                         if (arm.body.pos.end > cellGet(prevArmEnd)) cellSet(prevArmEnd, arm.body.pos.end) else ();
                         cellSet(ca, r)
                     },
@@ -2986,21 +3068,22 @@ def collectLocalOccsInForm(
                 }
             }
         },
-        ExField(base, _) -> collectLocalOccsInForm(uri, src, base, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
-        ExTry(inner) -> collectLocalOccsInForm(uri, src, inner, fileId, locals, targetDefSpan, includeDecl, seen, outRev),
+        ExField(base, _) -> collectLocalOccsInForm(uri, src, base, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
+        ExTry(inner) -> collectLocalOccsInForm(uri, src, inner, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
     }
 }
 
 def collectLocalOccsInList(
     uri: String, src: String, fs: List Form, fileId: Int,
     locals: List LocalBind, targetDefSpan: Span, includeDecl: Bool,
+    newNameOpt: Option String, conflict: Cell (Option String),
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
     let cur = cellNew(fs);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(h, r) -> {
-                collectLocalOccsInForm(uri, src, h, fileId, locals, targetDefSpan, includeDecl, seen, outRev);
+                collectLocalOccsInForm(uri, src, h, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -3152,9 +3235,12 @@ def collectTopDefOccsInForm(
     locals: List LocalBind,
     target: SymTarget,
     targetQn: String,
+    newNameOpt: Option String,
+    conflict: Cell (Option String),
     seen: StrMap Bool,
     outRev: Cell (List OccSpan)
 ): Void = {
+    let forRename = match newNameOpt { Some(_) -> true, None -> false };
     match f.node {
         ExLit(_) -> (),
         ExVar(qn) ->
@@ -3164,14 +3250,28 @@ def collectTopDefOccsInForm(
                         let shadowed = match lookupLocalBind(locals, qn) { Some(_) -> true, None -> false };
                         if (!shadowed) {
                             let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
-                            pushOcc(seen, outRev, uri, src, s, e)
+                            let exactNameMatch = e > s && strSlice(src, s, e) == target.stName;
+                            if (exactNameMatch) {
+                                match newNameOpt {
+                                    Some(nn) if (nn != target.stName) -> match lookupLocalBind(locals, nn) {
+                                        Some(_) -> cellSet(conflict, Some("Renaming '" + target.stName + "' to '" + nn + "' would be shadowed by a local binding")),
+                                        None -> (),
+                                    },
+                                    _ -> (),
+                                };
+                                pushOcc(seen, outRev, uri, src, s, e)
+                            } else if (!forRename) {
+                                // Explicit local alias usage (e.g. `loadA` from `use a.{load as loadA}`):
+                                // include in Find All References, but do not overwrite alias during rename.
+                                pushOcc(seen, outRev, uri, src, f.pos.start, f.pos.end)
+                            } else ()
                         } else ()
                     },
                     _ -> (),
                 }
             } else (),
         ExField(base, fname) -> {
-            collectTopDefOccsInForm(uri, src, inf, base, fileId, locals, target, targetQn, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, base, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
             if (f.pos.fileId == fileId) {
                 match target.stKind {
                     SkField if (fname == target.stName) ->
@@ -3192,7 +3292,11 @@ def collectTopDefOccsInForm(
                 match target.stKind {
                     SkTopDef if (ctorQn == targetQn) -> {
                         let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
-                        pushOcc(seen, outRev, uri, src, s, e)
+                        if (e > s && strSlice(src, s, e) == target.stName) {
+                            pushOcc(seen, outRev, uri, src, s, e)
+                        } else if (!forRename) {
+                            pushOcc(seen, outRev, uri, src, s, e)
+                        } else ()
                     },
                     SkField -> {
                         let matchAdt = match lookupAdtForCtor(inf, ctorQn) {
@@ -3225,19 +3329,19 @@ def collectTopDefOccsInForm(
             while (match cellGet(cf2) { Nil -> false, _ -> true }) {
                 match cellGet(cf2) {
                     Cons((_, fv), r) -> {
-                        collectTopDefOccsInForm(uri, src, inf, fv, fileId, locals, target, targetQn, seen, outRev);
+                        collectTopDefOccsInForm(uri, src, inf, fv, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
                         cellSet(cf2, r)
                     },
                     Nil -> (),
                 }
             }
         },
-        ExTuple(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, seen, outRev),
-        ExList(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, seen, outRev),
-        ExBlock(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, seen, outRev),
+        ExTuple(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExList(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExBlock(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
         ExApply(callee, args) -> {
-            collectTopDefOccsInForm(uri, src, inf, callee, fileId, locals, target, targetQn, seen, outRev);
-            collectTopDefOccsInList(uri, src, inf, args, fileId, locals, target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, callee, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInList(uri, src, inf, args, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExAbs(ps, _, body) -> {
             let nextLocals = cellNew(locals);
@@ -3251,29 +3355,29 @@ def collectTopDefOccsInForm(
                     Nil -> (),
                 }
             };
-            collectTopDefOccsInForm(uri, src, inf, body, fileId, cellGet(nextLocals), target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, body, fileId, cellGet(nextLocals), target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExBin(_, lhs, rhs) -> {
-            collectTopDefOccsInForm(uri, src, inf, lhs, fileId, locals, target, targetQn, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, lhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
-        ExUn(_, sub) -> collectTopDefOccsInForm(uri, src, inf, sub, fileId, locals, target, targetQn, seen, outRev),
+        ExUn(_, sub) -> collectTopDefOccsInForm(uri, src, inf, sub, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
         ExLet(vd, rhs, body) -> {
-            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
             let nextLocals = Cons(MkLocalBind { lbName: vd.vname, lbSpan: f.pos, lbScheme: vd.vscm }, locals);
-            collectTopDefOccsInForm(uri, src, inf, body, fileId, nextLocals, target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, body, fileId, nextLocals, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExIf(c, t, e) -> {
-            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, t, fileId, locals, target, targetQn, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, e, fileId, locals, target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, t, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, e, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExWhile(c, b) -> {
-            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, b, fileId, locals, target, targetQn, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, b, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExMatch(scrut, arms) -> {
-            collectTopDefOccsInForm(uri, src, inf, scrut, fileId, locals, target, targetQn, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, scrut, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
             let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
             let ca = cellNew(arms);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
@@ -3321,10 +3425,10 @@ def collectTopDefOccsInForm(
                         };
                         let al = cellGet(armLocals);
                         match arm.guard {
-                            Some(g) -> collectTopDefOccsInForm(uri, src, inf, g, fileId, al, target, targetQn, seen, outRev),
+                            Some(g) -> collectTopDefOccsInForm(uri, src, inf, g, fileId, al, target, targetQn, newNameOpt, conflict, seen, outRev),
                             None -> (),
                         };
-                        collectTopDefOccsInForm(uri, src, inf, arm.body, fileId, al, target, targetQn, seen, outRev);
+                        collectTopDefOccsInForm(uri, src, inf, arm.body, fileId, al, target, targetQn, newNameOpt, conflict, seen, outRev);
                         if (arm.body.pos.end > cellGet(prevArmEnd)) cellSet(prevArmEnd, arm.body.pos.end) else ();
                         cellSet(ca, r)
                     },
@@ -3332,25 +3436,38 @@ def collectTopDefOccsInForm(
                 }
             }
         },
-        ExTry(inner) -> collectTopDefOccsInForm(uri, src, inf, inner, fileId, locals, target, targetQn, seen, outRev),
+        ExTry(inner) -> collectTopDefOccsInForm(uri, src, inf, inner, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
     }
 }
 
 def collectTopDefOccsInList(
     uri: String, src: String, inf: InferOutput, fs: List Form, fileId: Int,
     locals: List LocalBind, target: SymTarget, targetQn: String,
+    newNameOpt: Option String, conflict: Cell (Option String),
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
     let cur = cellNew(fs);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(h, r) -> {
-                collectTopDefOccsInForm(uri, src, inf, h, fileId, locals, target, targetQn, seen, outRev);
+                collectTopDefOccsInForm(uri, src, inf, h, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
                 cellSet(cur, r)
             },
             Nil -> (),
         }
     }
+}
+
+def qnameModulePrefix(qn: String): String = {
+    let n = strLen(qn);
+    let lastDot = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        if (strByteAt(qn, cellGet(i)) == 46) cellSet(lastDot, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let ld = cellGet(lastDot);
+    if (ld > 0) strSlice(qn, 0, ld) else ""
 }
 
 def collectUseImportOccs(
@@ -3362,7 +3479,10 @@ def collectUseImportOccs(
 ): Void = match wd.wdParsed {
     None -> (),
     Some(fm) -> {
-        let wantsImport = cellNew(false);
+        let targetMod = qnameModulePrefix(targetQn);
+        // Collect exact matching module prefixes from parsed `ModUse` items
+        let matchedSingleMods: Cell (List String) = cellNew(Nil);
+        let matchedMultiMods: Cell (List String) = cellNew(Nil);
         let cur = cellNew(fm.items);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
@@ -3370,24 +3490,28 @@ def collectUseImportOccs(
                     match u {
                         UseSingle(segs) -> {
                             let full = strJoin(segs, ".");
-                            if (full == targetQn || (shortSymName(full) == target.stName && strEndsWith(targetQn, "." + target.stName))) {
-                                cellSet(wantsImport, true)
+                            if (full == targetQn) {
+                                cellSet(matchedSingleMods, Cons(qnameModulePrefix(full), cellGet(matchedSingleMods)))
                             } else ()
                         },
                         UseMulti(modSegs, specs) -> {
                             let modKey = strJoin(modSegs, ".");
-                            let cs = cellNew(specs);
-                            while (match cellGet(cs) { Nil -> false, _ -> true }) {
-                                match cellGet(cs) {
-                                    Cons(sp, rs) -> {
-                                        if (sp.orig == target.stName && (modKey + "." + sp.orig == targetQn || strEndsWith(targetQn, "." + sp.orig))) {
-                                            cellSet(wantsImport, true)
-                                        } else ();
-                                        cellSet(cs, rs)
-                                    },
-                                    Nil -> (),
-                                }
-                            }
+                            if (modKey == targetMod) {
+                                let cs = cellNew(specs);
+                                let hit = cellNew(false);
+                                while (!cellGet(hit) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                                    match cellGet(cs) {
+                                        Cons(sp, rs) -> {
+                                            if (sp.orig == target.stName) cellSet(hit, true) else ();
+                                            cellSet(cs, rs)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                if (cellGet(hit)) {
+                                    cellSet(matchedMultiMods, Cons(modKey, cellGet(matchedMultiMods)))
+                                } else ()
+                            } else ()
                         },
                         _ -> (),
                     };
@@ -3397,10 +3521,17 @@ def collectUseImportOccs(
                 Nil -> (),
             }
         };
-        if (cellGet(wantsImport)) {
-            // Scan `use ...` lines in `wd.wdText` for word-boundary occurrences of `target.stName`
+        let hasAny = match (cellGet(matchedSingleMods), cellGet(matchedMultiMods)) {
+            (Nil, Nil) -> false,
+            _ -> true,
+        };
+        if (hasAny && strLen(targetMod) > 0) {
             let src = wd.wdText;
             let n = strLen(src);
+            let singlePrefix1 = "use " + targetMod + "." + target.stName;
+            let singlePrefix2 = "pub use " + targetMod + "." + target.stName;
+            let multiPrefix1 = "use " + targetMod + ".{";
+            let multiPrefix2 = "pub use " + targetMod + ".{";
             let pos = cellNew(0);
             while (cellGet(pos) < n) {
                 let lineStart = cellGet(pos);
@@ -3409,30 +3540,53 @@ def collectUseImportOccs(
                     None -> n,
                 };
                 let trimmed = strTrim(strSlice(src, lineStart, lineEnd));
-                if (strStartsWith(trimmed, "use ") || strStartsWith(trimmed, "pub use ")) {
-                    let occs = findAllIdentsInSpan(src, target.stName, lineStart, lineEnd);
-                    let co = cellNew(occs);
-                    while (match cellGet(co) { Nil -> false, _ -> true }) {
-                        match cellGet(co) {
-                            Cons((s, e), ro) -> {
-                                // Only match after the module prefix (e.g. after `.` or `{` or `,`)
-                                if (s > lineStart && strByteAt(src, s - 1) != 32) {
-                                    pushOcc(seen, outRev, wd.wdUri, src, s, e)
-                                } else if (s > lineStart) {
-                                    // Could be `use helper.{Boxed, doubleVal}` where space follows `,`
-                                    let p = cellNew(s - 1);
-                                    while (cellGet(p) > lineStart && strByteAt(src, cellGet(p)) == 32) {
-                                        cellSet(p, cellGet(p) - 1)
-                                    };
-                                    let prevB = strByteAt(src, cellGet(p));
-                                    if (prevB == 44 || prevB == 123 || prevB == 46) {
-                                        pushOcc(seen, outRev, wd.wdUri, src, s, e)
-                                    } else ()
-                                } else ();
-                                cellSet(co, ro)
-                            },
-                            Nil -> (),
-                        }
+                // 1. Exact `use <targetMod>.<orig>`
+                let isSingleLine =
+                    (strStartsWith(trimmed, singlePrefix1) && (strLen(trimmed) == strLen(singlePrefix1) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix1)))))
+                    || (strStartsWith(trimmed, singlePrefix2) && (strLen(trimmed) == strLen(singlePrefix2) || !isIdentContByte(strByteAt(trimmed, strLen(singlePrefix2)))));
+                if (isSingleLine) {
+                    let modDot = targetMod + ".";
+                    match extractAfterPrefix(strSlice(src, lineStart, lineEnd), modDot) {
+                        Some(after) -> {
+                            let relOff = (lineEnd - lineStart) - strLen(after);
+                            let symStart = lineStart + relOff;
+                            let symEnd = symStart + strLen(target.stName);
+                            if (symEnd <= lineEnd && strSlice(src, symStart, symEnd) == target.stName) {
+                                pushOcc(seen, outRev, wd.wdUri, src, symStart, symEnd)
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                } else ();
+                // 2. Exact `use <targetMod>.{ ... }` — match ONLY orig names before `as`, never aliases or other modules
+                if (strStartsWith(trimmed, multiPrefix1) || strStartsWith(trimmed, multiPrefix2)) {
+                    match strIndexOfByte(src, 123, lineStart) {
+                        Some(openBrace) if (openBrace < lineEnd) -> {
+                            let closeBrace = match strIndexOfByte(src, 125, openBrace + 1) {
+                                Some(cb) if (cb <= lineEnd) -> cb,
+                                _ -> lineEnd,
+                            };
+                            let occs = findAllIdentsInSpan(src, target.stName, openBrace + 1, closeBrace);
+                            let co = cellNew(occs);
+                            while (match cellGet(co) { Nil -> false, _ -> true }) {
+                                match cellGet(co) {
+                                    Cons((s, e), ro) -> {
+                                        // Ensure this token is preceded by `{` or `,` (optional spaces), NOT by `as`!
+                                        let p = cellNew(s - 1);
+                                        while (cellGet(p) > openBrace && (strByteAt(src, cellGet(p)) == 32 || strByteAt(src, cellGet(p)) == 9)) {
+                                            cellSet(p, cellGet(p) - 1)
+                                        };
+                                        let prevB = strByteAt(src, cellGet(p));
+                                        if (prevB == 123 || prevB == 44) {
+                                            pushOcc(seen, outRev, wd.wdUri, src, s, e)
+                                        } else ();
+                                        cellSet(co, ro)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        _ -> (),
                     }
                 } else ();
                 cellSet(pos, if (lineEnd < n) lineEnd + 1 else n)
@@ -3441,7 +3595,181 @@ def collectUseImportOccs(
     },
 }
 
-def collectSymbolOccurrences(ss: ServerState, currentDoc: DocState, target: SymTarget, includeDecl: Bool): List OccSpan = {
+def collectTypeAnnotOccsInForm(
+    uri: String, src: String, f: Form, fileId: Int, typeName: String,
+    seen: StrMap Bool, outRev: Cell (List OccSpan)
+): Void = {
+    if (f.pos.fileId != fileId) ()
+    else match f.node {
+        ExLet(vd, rhs, body) -> {
+            let bindEnd = if (rhs.pos.start > f.pos.start) rhs.pos.start else f.pos.end;
+            let (_, be) = findIdentInSpan(src, vd.vname, f.pos.start, bindEnd);
+            if (be > f.pos.start && hasColonBeforeEq(src, be, bindEnd)) {
+                let occs = findAllIdentsInSpan(src, typeName, be, bindEnd);
+                let co = cellNew(occs);
+                while (match cellGet(co) { Nil -> false, _ -> true }) {
+                    match cellGet(co) {
+                        Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                        Nil -> (),
+                    }
+                }
+            } else ();
+            collectTypeAnnotOccsInForm(uri, src, rhs, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, body, fileId, typeName, seen, outRev)
+        },
+        ExAbs(_, _, body) -> {
+            if (body.pos.start > f.pos.start) {
+                let occs = findAllIdentsInSpan(src, typeName, f.pos.start, body.pos.start);
+                let co = cellNew(occs);
+                while (match cellGet(co) { Nil -> false, _ -> true }) {
+                    match cellGet(co) {
+                        Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                        Nil -> (),
+                    }
+                }
+            } else ();
+            collectTypeAnnotOccsInForm(uri, src, body, fileId, typeName, seen, outRev)
+        },
+        ExTuple(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
+        ExList(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
+        ExBlock(es) -> collectTypeAnnotOccsInList(uri, src, es, fileId, typeName, seen, outRev),
+        ExStructInit(_, fs) -> {
+            let cf = cellNew(fs);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons((_, fv), r) -> { collectTypeAnnotOccsInForm(uri, src, fv, fileId, typeName, seen, outRev); cellSet(cf, r) },
+                    Nil -> (),
+                }
+            }
+        },
+        ExApply(c, args) -> {
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInList(uri, src, args, fileId, typeName, seen, outRev)
+        },
+        ExBin(_, l, r) -> {
+            collectTypeAnnotOccsInForm(uri, src, l, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, r, fileId, typeName, seen, outRev)
+        },
+        ExUn(_, s) -> collectTypeAnnotOccsInForm(uri, src, s, fileId, typeName, seen, outRev),
+        ExIf(c, t, e) -> {
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, t, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, e, fileId, typeName, seen, outRev)
+        },
+        ExWhile(c, b) -> {
+            collectTypeAnnotOccsInForm(uri, src, c, fileId, typeName, seen, outRev);
+            collectTypeAnnotOccsInForm(uri, src, b, fileId, typeName, seen, outRev)
+        },
+        ExMatch(scrut, arms) -> {
+            collectTypeAnnotOccsInForm(uri, src, scrut, fileId, typeName, seen, outRev);
+            let ca = cellNew(arms);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(arm, r) -> {
+                        match arm.guard {
+                            Some(g) -> collectTypeAnnotOccsInForm(uri, src, g, fileId, typeName, seen, outRev),
+                            None -> (),
+                        };
+                        collectTypeAnnotOccsInForm(uri, src, arm.body, fileId, typeName, seen, outRev);
+                        cellSet(ca, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ExField(base, _) -> collectTypeAnnotOccsInForm(uri, src, base, fileId, typeName, seen, outRev),
+        ExTry(inner) -> collectTypeAnnotOccsInForm(uri, src, inner, fileId, typeName, seen, outRev),
+        ExLit(_) -> (),
+        ExVar(_) -> (),
+    }
+}
+
+def collectTypeAnnotOccsInList(
+    uri: String, src: String, fs: List Form, fileId: Int, typeName: String,
+    seen: StrMap Bool, outRev: Cell (List OccSpan)
+): Void = {
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, r) -> { collectTypeAnnotOccsInForm(uri, src, h, fileId, typeName, seen, outRev); cellSet(cur, r) },
+            Nil -> (),
+        }
+    }
+}
+
+def collectTypeOccsInDef(
+    wd: WorkspaceDoc, d: Def, target: SymTarget, includeDecl: Bool,
+    seen: StrMap Bool, outRev: Cell (List OccSpan)
+): Void = {
+    let isDeclSelf = wd.wdCanon == target.stDeclCanon && d.dpos.start == target.stDeclDefStart && d.dpos.end == target.stDeclDefEnd;
+    let (declS, declE) = if (isDeclSelf) findIdentInSpan(wd.wdText, target.stName, d.dpos.start, d.dpos.end) else (-1, -1);
+    match d.item {
+        ItForm(f) -> {
+            let bodyStart = match f.node {
+                ExAbs(_, _, body) -> if (body.pos.start > d.dpos.start) body.pos.start else d.dpos.end,
+                _ -> if (f.pos.start > d.dpos.start) f.pos.start else d.dpos.end,
+            };
+            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, bodyStart);
+            let co = cellNew(occs);
+            while (match cellGet(co) { Nil -> false, _ -> true }) {
+                match cellGet(co) {
+                    Cons((s, e), ro) -> { pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e); cellSet(co, ro) },
+                    Nil -> (),
+                }
+            };
+            collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, f, wd.wdFileId, target.stName, seen, outRev)
+        },
+        ItInstance(_, _, _, impls) -> {
+            let headEnd = match strIndexOfByte(wd.wdText, 123, d.dpos.start) {
+                Some(ob) if (ob < d.dpos.end) -> ob,
+                _ -> d.dpos.end,
+            };
+            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, headEnd);
+            let co = cellNew(occs);
+            while (match cellGet(co) { Nil -> false, _ -> true }) {
+                match cellGet(co) {
+                    Cons((s, e), ro) -> { pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e); cellSet(co, ro) },
+                    Nil -> (),
+                }
+            };
+            let ci = cellNew(impls);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) {
+                    Cons(mi, ri) -> {
+                        collectTypeAnnotOccsInForm(wd.wdUri, wd.wdText, mi.implBody, wd.wdFileId, target.stName, seen, outRev);
+                        cellSet(ci, ri)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        _ -> {
+            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, d.dpos.end);
+            let co = cellNew(occs);
+            while (match cellGet(co) { Nil -> false, _ -> true }) {
+                match cellGet(co) {
+                    Cons((s, e), ro) -> {
+                        let isHeaderToken = isDeclSelf && s == declS && e == declE;
+                        if (!isHeaderToken || includeDecl) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                        } else ();
+                        cellSet(co, ro)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+}
+
+def collectSymbolOccurrences(
+    ss: ServerState,
+    currentDoc: DocState,
+    target: SymTarget,
+    includeDecl: Bool,
+    newNameOpt: Option String,
+    conflict: Cell (Option String)
+): List OccSpan = {
     let seen: StrMap Bool = strMapNew();
     let outRev: Cell (List OccSpan) = cellNew(Nil);
     match target.stKind {
@@ -3459,13 +3787,15 @@ def collectSymbolOccurrences(ss: ServerState, currentDoc: DocState, target: SymT
                                             ExAbs(ps, _, body) -> {
                                                 let headEnd = if (body.pos.start > d.dpos.start) body.pos.start else d.dpos.end;
                                                 let acc = cellNew(Nil);
+                                                let targetInParams = cellNew(false);
                                                 let cp = cellNew(ps);
                                                 while (match cellGet(cp) { Nil -> false, _ -> true }) {
                                                     match cellGet(cp) {
                                                         Cons(vd, rp) -> {
                                                             let bsp = locateBinderSpan(currentDoc.dsText, currentDoc.dsFileId, vd.vname, d.dpos.start, headEnd);
-                                                            if (includeDecl && spanEq(bsp, target.stDefSpan)) {
-                                                                pushOcc(seen, outRev, currentDoc.dsUri, currentDoc.dsText, bsp.start, bsp.end)
+                                                            if (spanEq(bsp, target.stDefSpan)) {
+                                                                cellSet(targetInParams, true);
+                                                                if (includeDecl) pushOcc(seen, outRev, currentDoc.dsUri, currentDoc.dsText, bsp.start, bsp.end) else ()
                                                             } else ();
                                                             cellSet(acc, Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: vd.vscm }, cellGet(acc)));
                                                             cellSet(cp, rp)
@@ -3473,18 +3803,38 @@ def collectSymbolOccurrences(ss: ServerState, currentDoc: DocState, target: SymT
                                                         Nil -> (),
                                                     }
                                                 };
+                                                if (cellGet(targetInParams)) {
+                                                    match newNameOpt {
+                                                        Some(nn) -> {
+                                                            let cp2 = cellNew(ps);
+                                                            while (match cellGet(cp2) { Nil -> false, _ -> true }) {
+                                                                match cellGet(cp2) {
+                                                                    Cons(vd, rp) -> {
+                                                                        let bsp = locateBinderSpan(currentDoc.dsText, currentDoc.dsFileId, vd.vname, d.dpos.start, headEnd);
+                                                                        if (!spanEq(bsp, target.stDefSpan) && vd.vname == nn) {
+                                                                            cellSet(conflict, Some("Duplicate parameter name '" + nn + "' in scope"))
+                                                                        } else ();
+                                                                        cellSet(cp2, rp)
+                                                                    },
+                                                                    Nil -> (),
+                                                                }
+                                                            }
+                                                        },
+                                                        None -> (),
+                                                    }
+                                                } else ();
                                                 cellGet(acc)
                                             },
                                             _ -> Nil,
                                         };
-                                        collectLocalOccsInForm(currentDoc.dsUri, currentDoc.dsText, f, currentDoc.dsFileId, defLocals, target.stDefSpan, includeDecl, seen, outRev)
+                                        collectLocalOccsInForm(currentDoc.dsUri, currentDoc.dsText, f, currentDoc.dsFileId, defLocals, target.stDefSpan, includeDecl, newNameOpt, conflict, seen, outRev)
                                     },
                                     ItInstance(_, _, _, impls) -> {
                                         let ci = cellNew(impls);
                                         while (match cellGet(ci) { Nil -> false, _ -> true }) {
                                             match cellGet(ci) {
                                                 Cons(mi, ri) -> {
-                                                    collectLocalOccsInForm(currentDoc.dsUri, currentDoc.dsText, mi.implBody, currentDoc.dsFileId, Nil, target.stDefSpan, includeDecl, seen, outRev);
+                                                    collectLocalOccsInForm(currentDoc.dsUri, currentDoc.dsText, mi.implBody, currentDoc.dsFileId, Nil, target.stDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
                                                     cellSet(ci, ri)
                                                 },
                                                 Nil -> (),
@@ -3528,22 +3878,9 @@ def collectSymbolOccurrences(ss: ServerState, currentDoc: DocState, target: SymT
                                     match cellGet(cd) {
                                         Cons(d, rd) -> {
                                             if (d.dpos.fileId == wd.wdFileId) {
-                                                // If target is a type/concept, also scan type annotation regions in `d.dpos`
+                                                // If target is a type/concept, scan AST type-annotation & declaration regions (never expression bodies)
                                                 if (target.stIsType) {
-                                                    let isDeclSelf = wd.wdCanon == target.stDeclCanon && d.dpos.start == target.stDeclDefStart && d.dpos.end == target.stDeclDefEnd;
-                                                    let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, d.dpos.end);
-                                                    let co = cellNew(occs);
-                                                    while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                                        match cellGet(co) {
-                                                            Cons((s, e), ro) -> {
-                                                                if (!isDeclSelf || includeDecl) {
-                                                                    pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
-                                                                } else ();
-                                                                cellSet(co, ro)
-                                                            },
-                                                            Nil -> (),
-                                                        }
-                                                    }
+                                                    collectTypeOccsInDef(wd, d, target, includeDecl, seen, outRev)
                                                 } else ();
                                                 match d.item {
                                                     ItForm(f) -> {
@@ -3564,14 +3901,14 @@ def collectSymbolOccurrences(ss: ServerState, currentDoc: DocState, target: SymT
                                                             },
                                                             _ -> Nil,
                                                         };
-                                                        collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, f, wd.wdFileId, defLocals, target, targetQn, seen, outRev)
+                                                        collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, f, wd.wdFileId, defLocals, target, targetQn, newNameOpt, conflict, seen, outRev)
                                                     },
                                                     ItInstance(_, _, _, impls) -> {
                                                         let ci = cellNew(impls);
                                                         while (match cellGet(ci) { Nil -> false, _ -> true }) {
                                                             match cellGet(ci) {
                                                                 Cons(mi, ri) -> {
-                                                                    collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, mi.implBody, wd.wdFileId, Nil, target, targetQn, seen, outRev);
+                                                                    collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, mi.implBody, wd.wdFileId, Nil, target, targetQn, newNameOpt, conflict, seen, outRev);
                                                                     cellSet(ci, ri)
                                                                 },
                                                                 Nil -> (),
@@ -3619,7 +3956,8 @@ def handleReferences(ss: ServerState, params: Value): Value = {
                 match resolveTargetAtOffset(doc, off) {
                     None -> VArr(Nil),
                     Some((target, _, _)) -> {
-                        let occs = collectSymbolOccurrences(ss, doc, target, includeDecl);
+                        let noConflict: Cell (Option String) = cellNew(None);
+                        let occs = collectSymbolOccurrences(ss, doc, target, includeDecl, None, noConflict);
                         let locsRev: Cell (List Value) = cellNew(Nil);
                         let co = cellNew(occs);
                         while (match cellGet(co) { Nil -> false, _ -> true }) {
@@ -3686,46 +4024,52 @@ def handleRename(ss: ServerState, params: Value): Result Value (Int, String) = {
                         let off = lspPosToOffset(doc.dsText, line, ch);
                         match resolveTargetAtOffset(doc, off) {
                             Some((target, _, _)) if (target.stRenameable) -> {
-                                let occs = collectSymbolOccurrences(ss, doc, target, true);
-                                // Group TextEdits by URI
-                                let byUri: StrMap (List Value) = strMapNew();
-                                let urisRev: Cell (List String) = cellNew(Nil);
-                                let co = cellNew(occs);
-                                while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                    match cellGet(co) {
-                                        Cons(occ, r) -> {
-                                            let edit = VObj([
-                                                ("range", makeLspRange(occ.occText, occ.occStart, occ.occEnd)),
-                                                ("newText", VStr(newName)),
-                                            ]);
-                                            match strMapGet(byUri, occ.occUri) {
-                                                Some(prev) -> strMapInsert(byUri, occ.occUri, Cons(edit, prev)),
-                                                None -> {
-                                                    strMapInsert(byUri, occ.occUri, [edit]);
-                                                    cellSet(urisRev, Cons(occ.occUri, cellGet(urisRev)))
+                                let conflict: Cell (Option String) = cellNew(None);
+                                let occs = collectSymbolOccurrences(ss, doc, target, true, Some(newName), conflict);
+                                match cellGet(conflict) {
+                                    Some(cmsg) -> Err((-32602, cmsg)),
+                                    None -> {
+                                        // Group TextEdits by URI
+                                        let byUri: StrMap (List Value) = strMapNew();
+                                        let urisRev: Cell (List String) = cellNew(Nil);
+                                        let co = cellNew(occs);
+                                        while (match cellGet(co) { Nil -> false, _ -> true }) {
+                                            match cellGet(co) {
+                                                Cons(occ, r) -> {
+                                                    let edit = VObj([
+                                                        ("range", makeLspRange(occ.occText, occ.occStart, occ.occEnd)),
+                                                        ("newText", VStr(newName)),
+                                                    ]);
+                                                    match strMapGet(byUri, occ.occUri) {
+                                                        Some(prev) -> strMapInsert(byUri, occ.occUri, Cons(edit, prev)),
+                                                        None -> {
+                                                            strMapInsert(byUri, occ.occUri, [edit]);
+                                                            cellSet(urisRev, Cons(occ.occUri, cellGet(urisRev)))
+                                                        },
+                                                    };
+                                                    cellSet(co, r)
                                                 },
-                                            };
-                                            cellSet(co, r)
-                                        },
-                                        Nil -> (),
-                                    }
-                                };
-                                let changeFieldsRev: Cell (List (String, Value)) = cellNew(Nil);
-                                let cu = cellNew(listRev(cellGet(urisRev)));
-                                while (match cellGet(cu) { Nil -> false, _ -> true }) {
-                                    match cellGet(cu) {
-                                        Cons(u, ru) -> {
-                                            let edits = match strMapGet(byUri, u) {
-                                                Some(es) -> listRev(es),
-                                                None -> Nil,
-                                            };
-                                            cellSet(changeFieldsRev, Cons((u, VArr(edits)), cellGet(changeFieldsRev)));
-                                            cellSet(cu, ru)
-                                        },
-                                        Nil -> (),
-                                    }
-                                };
-                                Ok(VObj([("changes", VObj(listRev(cellGet(changeFieldsRev))))]))
+                                                Nil -> (),
+                                            }
+                                        };
+                                        let changeFieldsRev: Cell (List (String, Value)) = cellNew(Nil);
+                                        let cu = cellNew(listRev(cellGet(urisRev)));
+                                        while (match cellGet(cu) { Nil -> false, _ -> true }) {
+                                            match cellGet(cu) {
+                                                Cons(u, ru) -> {
+                                                    let edits = match strMapGet(byUri, u) {
+                                                        Some(es) -> listRev(es),
+                                                        None -> Nil,
+                                                    };
+                                                    cellSet(changeFieldsRev, Cons((u, VArr(edits)), cellGet(changeFieldsRev)));
+                                                    cellSet(cu, ru)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        };
+                                        Ok(VObj([("changes", VObj(listRev(cellGet(changeFieldsRev))))]))
+                                    },
+                                }
                             },
                             _ -> Err((-32602, "Cannot rename symbol at this position")),
                         }
@@ -4348,6 +4692,35 @@ def computeUseInsertOffset(src: String): Int = {
     cellGet(lastUseEnd)
 }
 
+def computeModuleKeyForFile(fp: String, srcRoots: List String): String = {
+    let fc = loaderCanonicalPath(fp);
+    let cur = cellNew(srcRoots);
+    let found: Cell (Option String) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(sr, r) -> {
+                let sr0 = loaderCanonicalPath(sr);
+                let srCanon =
+                    if (strLen(sr0) > 1 && strEndsWith(sr0, "/")) strSlice(sr0, 0, strLen(sr0) - 1)
+                    else sr0;
+                let pfx = srCanon + "/";
+                if (strStartsWith(fc, pfx) && strEndsWith(fc, ".gsa")) {
+                    let rel = strSlice(fc, strLen(pfx), strLen(fc) - 4);
+                    let segs = strSplitChar(rel, '/');
+                    let joined = strJoin(segs, ".");
+                    if (strLen(joined) > 0) cellSet(found, Some(joined)) else ()
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(found) {
+        Some(mk) -> mk,
+        None -> pathStem(fp),
+    }
+}
+
 def addImportSuggestionsForSym(
     ss: ServerState,
     doc: DocState,
@@ -4388,6 +4761,7 @@ def addImportSuggestionsForSym(
     };
     // 2. Search sibling / project `.gsa` files (and open docs)
     let docCanon = loaderCanonicalPath(doc.dsPath);
+    let (rootSpec, _) = resolveDocPkgSpecs(doc.dsPath);
     let candPaths: Cell (List String) = cellNew(Nil);
     let searchDir = match findProjectRoot(pathDirname(doc.dsPath)) {
         Some(pr) -> pr,
@@ -4413,7 +4787,7 @@ def addImportSuggestionsForSym(
                         Some(txt) if (strContains(txt, symName)) ->
                             match parseFileModuleInFile(txt, Nil, 0) {
                                 Ok(fm) if (moduleItemsExportName(fm.items, symName)) -> {
-                                    let modKey = pathStem(fp);
+                                    let modKey = computeModuleKeyForFile(fp, rootSpec.srcRoots);
                                     let key = "import:" + modKey + "." + symName;
                                     if (!strMapContains(seen, key)) {
                                         strMapInsert(seen, key, true);

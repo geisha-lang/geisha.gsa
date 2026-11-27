@@ -2183,3 +2183,15 @@ int32_t gs_sys_shell(const char *cmd)
     free(wcmd);
     return (int32_t)rc;
 }
+
+static volatile LONG g_gs_watch_stop = 0;
+
+void gs_watch_install_signal_handlers(void)
+{
+    g_gs_watch_stop = 0;
+}
+
+int32_t gs_watch_should_stop(void)
+{
+    return g_gs_watch_stop ? 1 : 0;
+}

@@ -1143,4 +1143,29 @@ int32_t gs_pipe_poll2(int32_t fd0, int32_t fd1, int32_t timeout_ms)
     }
 }
 
+static volatile sig_atomic_t g_gs_watch_stop = 0;
+
+static void gs_watch_sig_handler(int sig)
+{
+    (void)sig;
+    g_gs_watch_stop = 1;
+}
+
+void gs_watch_install_signal_handlers(void)
+{
+    g_gs_watch_stop = 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = gs_watch_sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
+}
+
+int32_t gs_watch_should_stop(void)
+{
+    return g_gs_watch_stop ? 1 : 0;
+}
+
 #endif /* !defined(_WIN32) */

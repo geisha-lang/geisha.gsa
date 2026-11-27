@@ -767,6 +767,175 @@ def main() -> int:
         imp2_actions = ca_imp2["result"]
         assert any("use myutil.magicNum" in a["edit"]["changes"][imp_uri][0]["newText"] for a in imp2_actions), f"expected myutil.magicNum auto-import: {imp2_actions}"
 
+        # 11h. Regression tests: variable capture rejection, same-name aliased imports across modules, nested module auto-import
+        def apply_edits(text: str, edits: list[dict]) -> str:
+            # Apply LSP TextEdits in reverse document order
+            lines = text.splitlines(keepends=True)
+            def pos_to_idx(l: int, c: int) -> int:
+                return sum(len(lines[i]) for i in range(l)) + c
+            indexed = sorted(
+                ((pos_to_idx(e["range"]["start"]["line"], e["range"]["start"]["character"]),
+                  pos_to_idx(e["range"]["end"]["line"], e["range"]["end"]["character"]),
+                  e["newText"]) for e in edits),
+                key=lambda x: (x[0], x[1]),
+                reverse=True,
+            )
+            out = text
+            for s, e, nt in indexed:
+                out = out[:s] + nt + out[e:]
+            return out
+
+        # 11h-1: Variable capture rejection on rename (forward capture, reverse capture, duplicate param)
+        cap_path = qa_dir / "capture.gsa"
+        cap_src = (
+            "def f(x: Int): Int = {\n"
+            "    let y = 9;\n"
+            "    x + y\n"
+            "}\n"
+            "def g(a: Int, b: Int): Int = a + b\n"
+        )
+        cap_path.write_text(cap_src, encoding="utf-8")
+        cap_uri = path_to_uri(cap_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": cap_uri, "languageId": "geisha", "version": 1, "text": cap_src},
+        })
+        assert client.wait_diag_for(cap_uri) == []
+        # Rename param `x` -> `y` (would be captured by `let y = 9`)
+        cap_fwd = client.request("textDocument/rename", {
+            "textDocument": {"uri": cap_uri},
+            "position": {"line": 0, "character": 6},
+            "newName": "y",
+        })
+        assert "error" in cap_fwd and cap_fwd["error"]["code"] == -32602, f"expected -32602 on forward capture: {cap_fwd}"
+        # Rename `let y` -> `x` (would capture param `x` in `x + y`)
+        cap_rev = client.request("textDocument/rename", {
+            "textDocument": {"uri": cap_uri},
+            "position": {"line": 1, "character": 8},
+            "newName": "x",
+        })
+        assert "error" in cap_rev and cap_rev["error"]["code"] == -32602, f"expected -32602 on reverse capture: {cap_rev}"
+        # Rename param `a` -> `b` (duplicate parameter)
+        cap_dup = client.request("textDocument/rename", {
+            "textDocument": {"uri": cap_uri},
+            "position": {"line": 4, "character": 6},
+            "newName": "b",
+        })
+        assert "error" in cap_dup and cap_dup["error"]["code"] == -32602, f"expected -32602 on duplicate param: {cap_dup}"
+
+        # 11h-2: Cross-file same-named imports with explicit `as` aliases (`use a.{load as loadA}` + `use b.{load as loadB}`)
+        al_dir = root / "alias_proj"
+        al_dir.mkdir(parents=True)
+        ma_path = al_dir / "a.gsa"
+        mb_path = al_dir / "b.gsa"
+        mmain_path = al_dir / "main.gsa"
+        ma_src = "pub def load(): Int = 1\n"
+        mb_src = "pub def load(): Int = 2\n"
+        mmain_src = (
+            "use a.{load as loadA}\n"
+            "use b.{load as loadB}\n"
+            "def main(): Int = loadA() + loadB()\n"
+        )
+        ma_path.write_text(ma_src, encoding="utf-8")
+        mb_path.write_text(mb_src, encoding="utf-8")
+        mmain_path.write_text(mmain_src, encoding="utf-8")
+        ma_uri = path_to_uri(ma_path)
+        mb_uri = path_to_uri(mb_path)
+        mmain_uri = path_to_uri(mmain_path)
+        client.notifications.clear()
+        for u, t in ((ma_uri, ma_src), (mb_uri, mb_src), (mmain_uri, mmain_src)):
+            client.notify("textDocument/didOpen", {
+                "textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t},
+            })
+            assert client.wait_diag_for(u) == []
+
+        # References on `a.load` must NOT include `b.gsa` or line 1 (`use b.{load as loadB}`)
+        refs_a = client.request("textDocument/references", {
+            "textDocument": {"uri": ma_uri},
+            "position": {"line": 0, "character": 8},
+            "context": {"includeDeclaration": True},
+        })
+        refs_a_uris = {r["uri"] for r in refs_a["result"]}
+        assert mb_uri not in refs_a_uris, f"b.gsa leaked into a.load references: {refs_a}"
+        mmain_ref_lines = sorted(r["range"]["start"]["line"] for r in refs_a["result"] if r["uri"] == mmain_uri)
+        assert mmain_ref_lines == [0, 2], f"expected a.load refs in main.gsa on lines [0, 2], got {refs_a}"
+
+        # Rename `a.load` -> `fetchA`: only rewrites `a.gsa` and `load` in `use a.{load as loadA}`, preserving `loadA` and leaving `b` untouched!
+        ren_a = client.request("textDocument/rename", {
+            "textDocument": {"uri": ma_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        ch_a = ren_a["result"]["changes"]
+        assert mb_uri not in ch_a, f"b.gsa must not be edited when renaming a.load: {ch_a}"
+        new_ma = apply_edits(ma_src, ch_a[ma_uri])
+        new_mmain = apply_edits(mmain_src, ch_a[mmain_uri])
+        assert new_ma == "pub def fetchA(): Int = 1\n", f"unexpected renamed a.gsa: {new_ma!r}"
+        assert new_mmain == (
+            "use a.{fetchA as loadA}\n"
+            "use b.{load as loadB}\n"
+            "def main(): Int = loadA() + loadB()\n"
+        ), f"unexpected renamed main.gsa: {new_mmain!r}"
+        # Verify renamed files typecheck cleanly with 0 diagnostics!
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ma_uri, "version": 2}, "contentChanges": [{"text": new_ma}]})
+        assert client.wait_diag_for(ma_uri) == []
+        client.notify("textDocument/didChange", {"textDocument": {"uri": mmain_uri, "version": 2}, "contentChanges": [{"text": new_mmain}]})
+        assert client.wait_diag_for(mmain_uri) == []
+
+        # 11h-3: Nested module auto-import quick fix (`src/nested/helper.gsa` -> `use nested.helper.widgetMagic`) + verify 0 diagnostics after applying!
+        nest_dir = root / "nested_imp_proj"
+        (nest_dir / "src" / "nested").mkdir(parents=True)
+        (nest_dir / "geisha.toml").write_text('name = "nested_imp"\nversion = "0.1.0"\n', encoding="utf-8")
+        (nest_dir / "src" / "nested" / "helper.gsa").write_text("pub def widgetMagic(): Int = 88\n", encoding="utf-8")
+        nmain_path = nest_dir / "src" / "main.gsa"
+        nmain_src = "def main(): Int = widgetMagic()\n"
+        nmain_path.write_text(nmain_src, encoding="utf-8")
+        nmain_uri = path_to_uri(nmain_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": nmain_uri, "languageId": "geisha", "version": 1, "text": nmain_src},
+        })
+        ndiags = client.wait_diag_for(nmain_uri)
+        assert len(ndiags) == 1 and "widgetMagic" in ndiags[0]["message"]
+        ca_nest = client.request("textDocument/codeAction", {
+            "textDocument": {"uri": nmain_uri},
+            "range": ndiags[0]["range"],
+            "context": {"diagnostics": ndiags},
+        })
+        nest_act = next(
+            (a for a in ca_nest["result"] if "use nested.helper.widgetMagic" in a["edit"]["changes"][nmain_uri][0]["newText"]),
+            None,
+        )
+        assert nest_act is not None, f"expected nested.helper auto-import quickfix, got: {ca_nest}"
+        fixed_nmain = apply_edits(nmain_src, nest_act["edit"]["changes"][nmain_uri])
+        client.notify("textDocument/didChange", {
+            "textDocument": {"uri": nmain_uri, "version": 2},
+            "contentChanges": [{"text": fixed_nmain}],
+        })
+        assert client.wait_diag_for(nmain_uri) == [], f"applied nested auto-import still has diagnostics! source:\n{fixed_nmain}"
+
+        # 11h-4: Recursive type self-reference preserved when includeDeclaration=False, and type rename does NOT touch unrelated expression bodies
+        rec_path = qa_dir / "rec_type.gsa"
+        rec_src = (
+            "use std.option.{Option, Some, None}\n"
+            "data Node { val: Int, next: Option Node }\n"
+            "def f(n: Node): Int = n.val\n"
+        )
+        rec_path.write_text(rec_src, encoding="utf-8")
+        rec_uri = path_to_uri(rec_path)
+        client.notify("textDocument/didOpen", {
+            "textDocument": {"uri": rec_uri, "languageId": "geisha", "version": 1, "text": rec_src},
+        })
+        assert client.wait_diag_for(rec_uri) == []
+        refs_rec_excl = client.request("textDocument/references", {
+            "textDocument": {"uri": rec_uri},
+            "position": {"line": 1, "character": 6},
+            "context": {"includeDeclaration": False},
+        })
+        rec_excl_positions = sorted((r["range"]["start"]["line"], r["range"]["start"]["character"]) for r in refs_rec_excl["result"])
+        assert (1, 35) in rec_excl_positions and (2, 9) in rec_excl_positions, f"expected recursive self-ref (1,35) & sig ref (2,9), got {rec_excl_positions}"
+        assert (1, 5) not in rec_excl_positions, f"declaration header (1,5) must be excluded when includeDeclaration=False: {rec_excl_positions}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

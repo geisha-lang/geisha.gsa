@@ -4005,8 +4005,8 @@ echo "PASS [geisha_fmt_suite]: comments, full syntax, idempotency, --check, --wr
 PASS=$((PASS + 1))
 
 # 39. Built-in Language Server (`geisha lsp`) JSON-RPC 2.0 stdio round-trip
-python3 tests/test_lsp.py "$GEISHA_BIN"
-python3 tests/test_watch.py "$GEISHA_BIN"
+${PYTHON:-python3} tests/test_lsp.py "$GEISHA_BIN"
+${PYTHON:-python3} tests/test_watch.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
 # 40. Wasm32 Size Optimization Mode, --target js (ES Module + .d.ts + [target.js]), & geisha-playground.wasm
