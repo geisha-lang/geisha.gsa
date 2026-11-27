@@ -144,10 +144,10 @@ static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
 static size_t _large_total_bytes = 0;
 
-/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 4 MB hot working set; drained by gc_trim) */
+/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 2 MB hot working set; drained by gc_trim) */
 #define LARGE_CACHE_MAX_BYTES       (1024u * 1024u)
 #define LARGE_CACHE_BUCKETS         (LARGE_CACHE_MAX_BYTES / GC_PAGE_SIZE)
-#define LARGE_CACHE_MAX_TOTAL_BYTES (4u * 1024u * 1024u)
+#define LARGE_CACHE_MAX_TOTAL_BYTES (2u * 1024u * 1024u)
 static void *_large_cache_buckets[LARGE_CACHE_BUCKETS];
 static size_t _large_cache_bytes = 0;
 
@@ -2024,7 +2024,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         _consecutive_minors = 0;
         _last_major_live_bytes = total_live_bytes;
         size_t headroom = total_live_bytes / 2u;
-        if (headroom > 8u * 1024u * 1024u) headroom = 8u * 1024u * 1024u;
+        if (headroom > 4u * 1024u * 1024u) headroom = 4u * 1024u * 1024u;
         size_t next_major = total_live_bytes + headroom;
         if (next_major < MIN_MAJOR_THRESHOLD_BYTES && _init_threshold_bytes >= MIN_GC_THRESHOLD_BYTES) {
             next_major = MIN_MAJOR_THRESHOLD_BYTES;
