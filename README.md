@@ -1,8 +1,22 @@
-# Geisha
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.svg">
+    <img alt="Geisha — Clarity, all the way down." src="docs/assets/hero-light.svg" width="100%">
+  </picture>
+</p>
 
-> **Clarity, all the way down.**
+<p align="center">
+  <a href="docs/SPEC.md">Language Spec</a> ·
+  <a href="docs/GETTING_STARTED.md">Getting Started</a> ·
+  <a href="docs/PACKAGES_AND_TARGETS.md">Packages &amp; Targets</a> ·
+  <a href="AGENT_GUIDE.md">Agent Guide</a> ·
+  <a href="formal/SPEC.md">Lean 4 Proofs</a>
+</p>
 
-Geisha (`.gsa`) is a self-hosting, statically typed functional-systems language with Hindley-Milner inference, scoped zero-copy memory, compile-time race freedom, and a **Lean 4**–verified core—compiling via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with a built-in Git/MVS package manager.
+---
+
+**Geisha** (`.gsa`) is a self-hosting, statically typed functional-systems language with Hindley-Milner inference, scoped zero-copy memory, compile-time race freedom, and a **Lean 4**–verified core—compiling via **LLVM 20** to `native`, `wasm32`, `ios`, and `ios-sim`, with a built-in Git/MVS package manager.
 
 <sub>Named after the Gesha coffee varietal—prized not for dark-roast weight, but for transparency and a clean finish, with nothing muddy between origin and cup.</sub>
 

@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Geisha — Clarity, all the way down.">
+  <title>Geisha — Clarity, all the way down.</title>
+  <defs>
+    <radialGradient id="cascaraGlow" cx="78%" cy="48%" r="36%">
+      <stop offset="0%" stop-color="#D1432A" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#D1432A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="stageBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#201E1C"/>
+      <stop offset="100%" stop-color="#121110"/>
+    </linearGradient>
+    <filter id="stageShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="26" stdDeviation="28" flood-color="#000000" flood-opacity="0.62"/>
+    </filter>
+    <clipPath id="canvasClip">
+      <rect width="1280" height="640" rx="12"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#canvasClip)">
+    <!-- Deep Obsidian Canvas -->
+    <rect width="1280" height="640" fill="#141312"/>
+    <rect width="1280" height="640" fill="url(#cascaraGlow)"/>
+
+    <!-- Subtle Dual-Center Botanical Lune Rings -->
+    <circle cx="1000" cy="310" r="125" fill="none" stroke="#FAF8F5" stroke-opacity="0.065" stroke-width="1.2"/>
+  <circle cx="1014" cy="302" r="180" fill="none" stroke="#FAF8F5" stroke-opacity="0.057" stroke-width="1.2"/>
+  <circle cx="1000" cy="310" r="240" fill="none" stroke="#FAF8F5" stroke-opacity="0.049" stroke-width="1.2"/>
+  <circle cx="1014" cy="302" r="305" fill="none" stroke="#FAF8F5" stroke-opacity="0.041" stroke-width="1.2"/>
+  <circle cx="1000" cy="310" r="378" fill="none" stroke="#FAF8F5" stroke-opacity="0.033" stroke-width="1.2"/>
+  <circle cx="1014" cy="302" r="460" fill="none" stroke="#FAF8F5" stroke-opacity="0.025" stroke-width="1.2"/>
+
+    <!-- Top Technical Pills -->
+    <g transform="translate(72, 58)">
+      <rect x="0" y="0" width="116" height="28" rx="14" fill="#D1432A" fill-opacity="0.14" stroke="#D1432A" stroke-opacity="0.55" stroke-width="1"/>
+      <text x="58" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" font-weight="500" letter-spacing="0.9" fill="#F28B76">GEISHA v0.2</text>
+
+      <rect x="130" y="0" width="108" height="28" rx="14" fill="#FAF8F5" fill-opacity="0.04" stroke="#FAF8F5" stroke-opacity="0.16" stroke-width="1"/>
+      <text x="184" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" letter-spacing="0.9" fill="#D4CFC7">LLVM 20 IR</text>
+
+      <rect x="252" y="0" width="152" height="28" rx="14" fill="#FAF8F5" fill-opacity="0.04" stroke="#FAF8F5" stroke-opacity="0.16" stroke-width="1"/>
+      <text x="328" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" letter-spacing="0.9" fill="#D4CFC7">LEAN 4 · 0 SORRY</text>
+
+      <rect x="418" y="0" width="102" height="28" rx="14" fill="#FAF8F5" fill-opacity="0.04" stroke="#FAF8F5" stroke-opacity="0.16" stroke-width="1"/>
+      <text x="469" y="18" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" letter-spacing="0.9" fill="#D4CFC7">GIT + MVS</text>
+    </g>
+
+    <!-- Main Hero Typography -->
+    <text x="72" y="192" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="600" letter-spacing="3.2" fill="#9E978E">GEISHA PROGRAMMING LANGUAGE</text>
+
+    <text x="72" y="274" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="70" font-weight="600" letter-spacing="-2.4" fill="#FAF8F5">Clarity,</text>
+    <text x="72" y="346" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="70" font-weight="600" letter-spacing="-2.4" fill="#FAF8F5">all the way <tspan fill="#D1432A">down.</tspan></text>
+
+    <text x="72" y="400" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="18" fill="#B7B0A6">
+      <tspan x="72" dy="0" font-weight="600" fill="#FAF8F5">Light as ML on the surface; exact to the metal underneath.</tspan>
+      <tspan x="72" dy="29">Hindley-Milner inference, scoped zero-copy memory, and race-free</tspan>
+      <tspan x="72" dy="27">concurrency—compiling to native, WebAssembly, and iOS.</tspan>
+    </text>
+
+    <!-- Bottom Pipeline Strip -->
+    <line x1="72" y1="542" x2="778" y2="542" stroke="#FAF8F5" stroke-opacity="0.11" stroke-width="1"/>
+    <text x="72" y="576" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="12.5" fill="#9E978E">
+      <tspan fill="#FAF8F5" font-weight="500">.gsa</tspan> source<tspan dx="16">&#8594;</tspan><tspan dx="16" fill="#FAF8F5" font-weight="500">Core IR</tspan> (Lean 4 proved)<tspan dx="16">&#8594;</tspan><tspan dx="16" fill="#FAF8F5" font-weight="500">LLVM 20</tspan> (native · wasm32 · ios)
+    </text>
+
+    <!-- Right Emblem Stage with Botanical Lune G (Logo C) -->
+    <rect x="845" y="145" width="310" height="310" rx="64" fill="url(#stageBg)" stroke="#FAF8F5" stroke-opacity="0.13" stroke-width="1.2" filter="url(#stageShadow)"/>
+    <g transform="translate(890, 190) scale(0.859375)">
+      <path d="M 201.54 66.29 A 96 96 0 1 0 181.68 207.59 A 14 14 0 0 0 171.11 178.74 A 62 62 0 1 1 190.86 85.83 A 15 15 0 0 0 201.54 66.29 Z" fill="#FAF8F5"/><path d="M 118 128 C 138 110, 182 112, 223.25 116.00 A 96 96 0 0 1 205.67 184.43 C 193.67 190.43, 185.97 166.97, 183.97 162.97 C 188 150, 190 142, 152 142 C 134 142, 122 136, 118 128 Z" fill="#D1432A"/>
+    </g>
+    <text x="1000" y="492" text-anchor="middle" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" letter-spacing="1.1" fill="#9E978E">SYNTAX &#8644; PROOF · BOTANICAL LUNE</text>
+  </g>
+</svg>

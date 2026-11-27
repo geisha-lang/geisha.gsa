@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="Geisha — Clarity, all the way down.">
+  <title>Geisha — Clarity, all the way down.</title>
+  <defs>
+    <radialGradient id="warmGlow" cx="86%" cy="18%" r="48%">
+      <stop offset="0%" stop-color="#D1432A" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#D1432A" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="cardShadow" x="-8%" y="-6%" width="116%" height="118%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#141312" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Parchment Canvas -->
+  <rect width="1280" height="640" rx="12" fill="#FAF8F5"/>
+
+  <!-- Right Specimen Tinted Column Bg (x=722..1244, y=36..534) -->
+  <rect x="722" y="36" width="522" height="498" fill="#F2EEE7"/>
+  <rect x="36" y="36" width="1208" height="568" fill="url(#warmGlow)"/>
+
+  <!-- Swiss Grid Frame & Dividers -->
+  <rect x="36" y="36" width="1208" height="568" fill="none" stroke="#141312" stroke-opacity="0.18" stroke-width="1.5"/>
+  <line x1="722" y1="36" x2="722" y2="534" stroke="#141312" stroke-opacity="0.14" stroke-width="1.5"/>
+  <line x1="36" y1="534" x2="1244" y2="534" stroke="#141312" stroke-opacity="0.16" stroke-width="1.5"/>
+
+  <!-- Left Column: Eyebrow Lockup -->
+  <g transform="translate(80, 76) scale(0.171875)">
+    <path d="M 201.54 66.29 A 96 96 0 1 0 181.68 207.59 A 14 14 0 0 0 171.11 178.74 A 62 62 0 1 1 190.86 85.83 A 15 15 0 0 0 201.54 66.29 Z" fill="#141312"/><path d="M 118 128 C 138 110, 182 112, 223.25 116.00 A 96 96 0 0 1 205.67 184.43 C 193.67 190.43, 185.97 166.97, 183.97 162.97 C 188 150, 190 142, 152 142 C 134 142, 122 136, 118 128 Z" fill="#D1432A"/>
+  </g>
+  <text x="136" y="106" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="23" font-weight="700" letter-spacing="-0.5" fill="#141312">Geisha</text>
+
+  <circle cx="446" cy="99" r="3.8" fill="#D1432A"/>
+  <text x="458" y="103" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" font-weight="500" letter-spacing="0.9" fill="#6E685F">LOT 0.2 · .GSA · SELF-HOSTED</text>
+
+  <!-- Editorial Headline -->
+  <text x="80" y="232" font-family="'Instrument Serif', 'Didot', 'Bodoni 72', 'Charter', 'Baskerville', 'Iowan Old Style', 'Georgia', serif" font-size="78" font-weight="400" letter-spacing="-1.2" fill="#141312">Clarity,</text>
+  <text x="80" y="310" font-family="'Instrument Serif', 'Didot', 'Bodoni 72', 'Charter', 'Baskerville', 'Iowan Old Style', 'Georgia', serif" font-size="78" font-style="italic" font-weight="400" letter-spacing="-0.8" fill="#D1432A">all the way down.</text>
+
+  <!-- Positioning Copy -->
+  <text x="82" y="372" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="16" fill="#383531">
+    <tspan x="82" dy="0">A statically typed functional-systems language with </tspan><tspan font-weight="600" fill="#141312">Hindley-Milner</tspan>
+    <tspan x="82" dy="25"><tspan font-weight="600" fill="#141312">inference</tspan>, <tspan font-weight="600" fill="#141312">scoped zero-copy memory</tspan>, compile-time race freedom, and</tspan>
+    <tspan x="82" dy="25">a <tspan font-weight="600" fill="#141312">Lean 4–verified core</tspan>—compiled via <tspan font-weight="600" fill="#141312">LLVM 20</tspan>.</tspan>
+  </text>
+
+  <!-- Origin Epigraph -->
+  <line x1="84" y1="458" x2="84" y2="498" stroke="#D1432A" stroke-width="2.2"/>
+  <text x="98" y="473" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="12.5" fill="#6E685F">
+    <tspan x="98" dy="0">Named after the Gesha coffee varietal—prized not for dark-roast weight, but for</tspan>
+    <tspan x="98" dy="19">transparency and a clean finish, with nothing muddy between origin and cup.</tspan>
+  </text>
+
+  <!-- Right Column: Code Specimen Header -->
+  <text x="760" y="86" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11" letter-spacing="0.7" fill="#6E685F">SPECIMEN // SHAPE.GSA</text>
+  <text x="1206" y="86" text-anchor="end" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11" letter-spacing="0.7" fill="#6E685F">HM + EXHAUSTIVE + SEND</text>
+
+  <!-- Obsidian Code Card -->
+  <rect x="760" y="102" width="446" height="398" rx="10" fill="#141312" filter="url(#cardShadow)"/>
+
+  <g font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="12.5" fill="#EFECE6">
+    <text x="784" y="138"><tspan fill="#E26D54" font-weight="600">pub data</tspan> <tspan fill="#E5B96E">Shape</tspan> : <tspan fill="#E5B96E">Eq</tspan>, <tspan fill="#E5B96E">Show</tspan> &#123;</text>
+    <text x="814" y="160"><tspan fill="#E5B96E">Circle</tspan>(<tspan fill="#E5B96E">Float</tspan>),</text>
+    <text x="814" y="182"><tspan fill="#E5B96E">Rect</tspan> &#123; w: <tspan fill="#E5B96E">Float</tspan>, h: <tspan fill="#E5B96E">Float</tspan> &#125;,</text>
+    <text x="784" y="204">&#125;</text>
+
+    <text x="784" y="242"><tspan fill="#E26D54" font-weight="600">def</tspan> <tspan fill="#8AC6B6">area</tspan>(s: <tspan fill="#E5B96E">Shape</tspan>): <tspan fill="#E5B96E">Float</tspan> = <tspan fill="#E26D54" font-weight="600">match</tspan> s &#123;</text>
+    <text x="814" y="264"><tspan fill="#E5B96E">Circle</tspan>(r)</text>
+    <text x="918" y="264"><tspan fill="#A8A29A">-&gt;</tspan> <tspan fill="#D99B66">3.14159265</tspan> * r * r,</text>
+    <text x="814" y="286"><tspan fill="#E5B96E">Rect</tspan> &#123; w, h &#125;</text>
+    <text x="918" y="286"><tspan fill="#A8A29A">-&gt;</tspan> w * h,</text>
+    <text x="784" y="308">&#125;</text>
+
+    <text x="784" y="346"><tspan fill="#E26D54" font-weight="600">def</tspan> <tspan fill="#8AC6B6">sample</tspan>() = <tspan fill="#8AC6B6">withArena</tspan>(<tspan fill="#D99B66">4096</tspan>, _a <tspan fill="#A8A29A">-&gt;</tspan></text>
+    <text x="814" y="368"><tspan fill="#8AC6B6">parTabulate</tspan>(<tspan fill="#D99B66">4</tspan>, i <tspan fill="#A8A29A">-&gt;</tspan> <tspan fill="#8AC6B6">area</tspan>(<tspan fill="#E5B96E">Circle</tspan>(<tspan fill="#8AC6B6">intToFloat</tspan>(i))))</text>
+    <text x="784" y="390">)</text>
+  </g>
+
+  <!-- Code Card Diagnostic Footer -->
+  <line x1="784" y1="452" x2="1182" y2="452" stroke="#FAF8F5" stroke-opacity="0.1" stroke-width="1"/>
+  <text x="784" y="476" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" font-weight="500" fill="#6CC4A1">&#10003; geisha check · 0 sorry</text>
+  <text x="1182" y="476" text-anchor="end" font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="11.5" fill="#9E978E">stage2.ll == stage3.ll</text>
+
+  <!-- Bottom 5-Column Lot Metadata Strip (5 x 241.6px) -->
+  <line x1="277.6" y1="534" x2="277.6" y2="604" stroke="#141312" stroke-opacity="0.12" stroke-width="1"/>
+  <line x1="519.2" y1="534" x2="519.2" y2="604" stroke="#141312" stroke-opacity="0.12" stroke-width="1"/>
+  <line x1="760.8" y1="534" x2="760.8" y2="604" stroke="#141312" stroke-opacity="0.12" stroke-width="1"/>
+  <line x1="1002.4" y1="534" x2="1002.4" y2="604" stroke="#141312" stroke-opacity="0.12" stroke-width="1"/>
+
+  <g font-family="'JetBrains Mono', 'SFMono-Regular', ui-monospace, 'SF Mono', 'PT Mono', 'Menlo', 'Consolas', monospace" font-size="10" letter-spacing="0.9" fill="#6E685F">
+    <text x="58" y="562">01 / TYPE SYSTEM</text>
+    <text x="300" y="562">02 / MEMORY</text>
+    <text x="541" y="562">03 / CONCURRENCY</text>
+    <text x="783" y="562">04 / SEMANTICS</text>
+    <text x="1024" y="562">05 / TARGETS</text>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="600" fill="#141312">
+    <text x="58" y="585">HM · Open Concepts</text>
+    <text x="300" y="585">$Scoped · Escape + TLAB</text>
+    <text x="541" y="585">Coinductive Send · Actor</text>
+    <text x="783" y="585">Lean 4 Mechanized Core</text>
+    <text x="1024" y="585">native · wasm32 · ios</text>
+  </g>
+</svg>
