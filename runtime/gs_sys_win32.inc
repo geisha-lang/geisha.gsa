@@ -436,10 +436,37 @@ void *gs_sys_fopen(const char *path, const char *mode)
 {
     if (path == NULL || mode == NULL) return NULL;
     wchar_t *wp = gs_utf8_to_wide(path);
-    wchar_t *wm = gs_utf8_to_wide(mode);
-    if (wp == NULL || wm == NULL) {
+    if (wp == NULL) return NULL;
+    /* For read-only opens, grant FILE_SHARE_DELETE so concurrent atomic
+     * replace/rename (e.g. editors or `os.replace` during `--watch`) never
+     * fails with ERROR_ACCESS_DENIED (WinError 5). */
+    if (mode[0] == 'r' && strchr(mode, '+') == NULL) {
+        HANDLE h = CreateFileW(
+            wp,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
         free(wp);
-        free(wm);
+        if (h == INVALID_HANDLE_VALUE) return NULL;
+        int flags = _O_RDONLY | (strchr(mode, 'b') != NULL ? _O_BINARY : _O_TEXT);
+        int fd = _open_osfhandle((intptr_t)h, flags);
+        if (fd < 0) {
+            CloseHandle(h);
+            return NULL;
+        }
+        FILE *fp = _fdopen(fd, mode);
+        if (fp == NULL) {
+            _close(fd);
+            return NULL;
+        }
+        return (void *)fp;
+    }
+    wchar_t *wm = gs_utf8_to_wide(mode);
+    if (wm == NULL) {
+        free(wp);
         return NULL;
     }
     FILE *fp = _wfopen(wp, wm);
