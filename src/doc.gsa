@@ -54,7 +54,7 @@ def formatConstraints(cs: List ConstraintSpec): String = match cs {
     },
 }
 
-def formatScheme(scm: Scheme): String = match scm {
+pub def formatScheme(scm: Scheme): String = match scm {
     ScmMono(t) -> typeToString(t),
     ScmPoly(_, t) -> typeToString(t),
     ScmPolyConstrained(_, cs, t) -> formatConstraints(cs) + typeToString(t),
@@ -98,7 +98,7 @@ def formatFieldDecls(fs: List FieldDecl): String = {
     strJoin(cellGet(parts), ", ")
 }
 
-def formatVariant(v: VariantDef): String = match v.vbody {
+pub def formatVariant(v: VariantDef): String = match v.vbody {
     VarUnit -> v.vname,
     VarTuple(fs) -> v.vname + "(" + formatFieldDecls(fs) + ")",
     VarStruct(fs) -> v.vname + " { " + formatFieldDecls(fs) + " }",
@@ -124,7 +124,7 @@ def formatParamsFromAbs(ps: List VarDecl): String = {
 }
 
 // Extract contiguous `///` doc comment lines immediately preceding `startByte`.
-def extractDocComment(src: String, startByte: Int): List String = {
+pub def extractDocComment(src: String, startByte: Int): List String = {
     let n = strLen(src);
     let pos = if (startByte < 0) 0 else if (startByte > n) n else startByte;
 
@@ -172,7 +172,7 @@ def formatDefExternPrefix(attrs: List DefAttr): String = match attrs {
     Cons(AttrCtor(_), _) -> "extern init ",
 }
 
-def formatDefSig(d: Def): String = {
+pub def formatDefSig(d: Def): String = {
     let visPfx = (if (isPublicVis(d.vis)) "pub " else "") + formatDefExternPrefix(d.attrs);
     match d.item {
         ItAlg(tparams, variants) -> {

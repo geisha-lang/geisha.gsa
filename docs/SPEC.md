@@ -379,4 +379,5 @@ web_assets = ["host/web/runtime.js"]
 - `geisha doc [module|file] [--all]`: Prints public signatures and `///` doc comments for `std.*`, `sys.*`, and project/dependency modules.
 - `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]`: Runs microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]`, or `bench_*` functions) or standalone script mode using `std.bench` (`blackBox` polymorphic optimization barrier, warmup + multi-round stats).
 - `geisha guide`: Prints the built-in [`AGENT_GUIDE.md`](../AGENT_GUIDE.md).
+- `geisha lsp [--stdio]`: Starts the built-in JSON-RPC 2.0 Language Server over stdio (live diagnostics, hover with inferred types and `///` docs, go-to-definition, document symbols, and completion).
 - `geisha build --dump-core <file.gscore>`: Emits Core Geisha S-expressions for translation validation against the Lean 4 checker (`make verify-core`).

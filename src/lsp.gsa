@@ -1,0 +1,2190 @@
+// Geisha Language Server Protocol (LSP 3.17 over stdio JSON-RPC 2.0)
+//
+// Reuses the compiler frontend (`lexer`, `parser`, `loader`, `infer`, `core`, `doc`, `diag`)
+// and `std.json` to provide live diagnostics, hover (inferred types + `///` docs),
+// go-to-definition, document symbols, and completion (local/imported symbols + `std.*`/`sys.*`).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend}
+use std.vec.{Vec, vecNew, vecLen, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains, strMapRemove}
+use std.buf.{bufNew, bufPushByte, bufPushStr, bufToString}
+use std.str.{
+    intToStr, parseInt, strStartsWith, strEndsWith,
+    strIndexOfByte, strSplitChar, strJoin, strTrim
+}
+use std.char.{isIdentStartByte, isIdentContByte}
+use std.path.pathDirname
+use std.codec.{Value, VNull, VBool, VInt, VStr, VArr, VObj}
+use std.json.{parse as jsonParse, stringify as jsonStringify}
+use sys.fs.fileExists
+use sys.io.eprintLn
+use ast.{
+    Span, MkSpan, isPublicVis,
+    Scheme, ScmSlot,
+    VarDecl, Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
+    MatchArm, Form,
+    Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
+    ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    VariantBody, VarStruct, VariantDef, MethodDecl,
+    Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
+    Def, UseSpec, useSpecLocalName,
+    UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
+    ModuleItem, ModDef, ModUse, ModSub,
+    FileModule
+}
+use diag.{
+    SourceFile, MkSourceFile,
+    diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError
+}
+use parser.parseFileModuleInFile
+use loader.{
+    PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed,
+    loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay
+}
+use infer.{InferOutput, inferProgram, preludePrimSpecs}
+use core.lowerToCore
+use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
+use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
+use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, sanitizeIdentAlias}
+
+extern "gs_pipe_read" def gs_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
+extern "gs_pipe_write" def gs_pipe_write(fd: Int, buf: String, len: Int): Int
+
+// ============================================================================
+// Buffered stdio JSON-RPC 2.0 Framing (Content-Length)
+// ============================================================================
+
+data StdinReader {
+    MkStdinReader {
+        srBuf: Ptr,
+        srCap: Int,
+        srPos: Cell Int,
+        srLen: Cell Int,
+    },
+}
+
+def stdinReaderNew(): StdinReader = {
+    let cap = 65536;
+    MkStdinReader {
+        srBuf: ptrAllocBytes(cap),
+        srCap: cap,
+        srPos: cellNew(0),
+        srLen: cellNew(0),
+    }
+}
+
+def stdinReadByte(r: StdinReader): Int = {
+    let pos = cellGet(r.srPos);
+    let len = cellGet(r.srLen);
+    if (pos < len) {
+        cellSet(r.srPos, pos + 1);
+        ptrByteAt(r.srBuf, pos)
+    } else {
+        let got = gs_pipe_read(0, r.srBuf, r.srCap);
+        if (got <= 0) {
+            -1
+        } else {
+            cellSet(r.srPos, 1);
+            cellSet(r.srLen, got);
+            ptrByteAt(r.srBuf, 0)
+        }
+    }
+}
+
+def stdinReadLine(r: StdinReader): Option String = {
+    let b = bufNew();
+    let any = cellNew(false);
+    let done = cellNew(false);
+    while (!cellGet(done)) {
+        let ch = stdinReadByte(r);
+        if (ch < 0) {
+            cellSet(done, true)
+        } else {
+            cellSet(any, true);
+            if (ch == 10) {
+                cellSet(done, true)
+            } else if (ch != 13) {
+                bufPushByte(b, ch)
+            } else ()
+        }
+    };
+    if (!cellGet(any)) None else Some(bufToString(b))
+}
+
+def stdinReadExact(r: StdinReader, n: Int): Option String = {
+    let b = bufNew();
+    let rem = cellNew(n);
+    let ok = cellNew(true);
+    while (cellGet(rem) > 0 && cellGet(ok)) {
+        let ch = stdinReadByte(r);
+        if (ch < 0) {
+            cellSet(ok, false)
+        } else {
+            bufPushByte(b, ch);
+            cellSet(rem, cellGet(rem) - 1)
+        }
+    };
+    if (cellGet(ok)) Some(bufToString(b)) else None
+}
+
+def writeAllStdout(s: String): Void = {
+    let total = strLen(s);
+    if (total > 0) {
+        let _ = gs_pipe_write(1, s, total);
+        ()
+    } else ()
+}
+
+def sendRpcValue(v: Value): Void = {
+    let body = jsonStringify(v);
+    let frame = "Content-Length: " + intToStr(strLen(body)) + "\r\n\r\n" + body;
+    writeAllStdout(frame)
+}
+
+def sendRpcResponse(idVal: Value, resultVal: Value): Void =
+    sendRpcValue(VObj([
+        ("jsonrpc", VStr("2.0")),
+        ("id", idVal),
+        ("result", resultVal),
+    ]))
+
+def sendRpcError(idVal: Value, code: Int, message: String): Void =
+    sendRpcValue(VObj([
+        ("jsonrpc", VStr("2.0")),
+        ("id", idVal),
+        ("error", VObj([
+            ("code", VInt(intToI64(code))),
+            ("message", VStr(message)),
+        ])),
+    ]))
+
+def sendRpcNotification(method: String, paramsVal: Value): Void =
+    sendRpcValue(VObj([
+        ("jsonrpc", VStr("2.0")),
+        ("method", VStr(method)),
+        ("params", paramsVal),
+    ]))
+
+def toLowerAscii(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c >= 65 && c <= 90) bufPushByte(b, c + 32) else bufPushByte(b, c);
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+def readLspMessage(r: StdinReader): Option String = {
+    let contentLen = cellNew(-1);
+    let eof = cellNew(false);
+    let inHeaders = cellNew(true);
+    while (cellGet(inHeaders) && !cellGet(eof)) {
+        match stdinReadLine(r) {
+            None -> cellSet(eof, true),
+            Some(line) -> {
+                if (strLen(line) == 0) {
+                    if (cellGet(contentLen) >= 0) cellSet(inHeaders, false) else ()
+                } else {
+                    match strIndexOfByte(line, 58, 0) {
+                        Some(col) -> {
+                            let k = toLowerAscii(strTrim(strSlice(line, 0, col)));
+                            let v = strTrim(strSlice(line, col + 1, strLen(line)));
+                            if (k == "content-length") {
+                                match parseInt(v) {
+                                    Ok(n) -> cellSet(contentLen, n),
+                                    Err(_) -> (),
+                                }
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                }
+            },
+        }
+    };
+    if (cellGet(eof) || cellGet(contentLen) < 0) None
+    else stdinReadExact(r, cellGet(contentLen))
+}
+
+// ============================================================================
+// JSON Value Helpers
+// ============================================================================
+
+def objGet(v: Value, key: String): Option Value = match v {
+    VObj(fields) -> {
+        let cur = cellNew(fields);
+        let found: Cell (Option Value) = cellNew(None);
+        while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((k, val), r) -> {
+                    if (k == key) cellSet(found, Some(val)) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+    _ -> None,
+}
+
+def objGetStr(v: Value, key: String): Option String = match objGet(v, key) {
+    Some(VStr(s)) -> Some(s),
+    _ -> None,
+}
+
+def objGetInt(v: Value, key: String): Option Int = match objGet(v, key) {
+    Some(VInt(n)) -> Some(i64ToInt(n)),
+    _ -> None,
+}
+
+// ============================================================================
+// URI <-> Path & UTF-8 / UTF-16 Position Mapping (with CRLF & UTF-8 defense)
+// ============================================================================
+
+def hexDigitVal(b: Int): Int =
+    if (b >= 48 && b <= 57) b - 48
+    else if (b >= 65 && b <= 70) b - 55
+    else if (b >= 97 && b <= 102) b - 87
+    else -1
+
+def hexUpperByte(n: Int): Int =
+    if (n < 10) 48 + n else 55 + n
+
+def percentDecode(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (c == 37 && idx + 2 < n) {
+            let h1 = hexDigitVal(strByteAt(s, idx + 1));
+            let h2 = hexDigitVal(strByteAt(s, idx + 2));
+            if (h1 >= 0 && h2 >= 0) {
+                bufPushByte(b, (h1 << 4) | h2);
+                cellSet(i, idx + 3)
+            } else {
+                bufPushByte(b, c);
+                cellSet(i, idx + 1)
+            }
+        } else {
+            bufPushByte(b, c);
+            cellSet(i, idx + 1)
+        }
+    };
+    bufToString(b)
+}
+
+def isUriSafeByte(c: Int): Bool =
+    (c >= 65 && c <= 90)
+    || (c >= 97 && c <= 122)
+    || (c >= 48 && c <= 57)
+    || c == 47 || c == 45 || c == 95 || c == 46 || c == 126 || c == 58
+
+def percentEncodePath(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let c = strByteAt(s, idx);
+        if (isUriSafeByte(c)) {
+            bufPushByte(b, c)
+        } else {
+            bufPushByte(b, 37);
+            bufPushByte(b, hexUpperByte((c >>> 4) & 15));
+            bufPushByte(b, hexUpperByte(c & 15))
+        };
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+def isAsciiLetter(c: Int): Bool =
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
+def stripWinLeadingSlash(dec: String): String =
+    if (strLen(dec) >= 3 && strByteAt(dec, 0) == 47 && isAsciiLetter(strByteAt(dec, 1)) && strByteAt(dec, 2) == 58) {
+        strSlice(dec, 1, strLen(dec))
+    } else dec
+
+def uriToPath(uri: String): String =
+    if (strStartsWith(uri, "file://")) {
+        let rest = strSlice(uri, 7, strLen(uri));
+        if (strStartsWith(rest, "/")) {
+            // Local file URI: `file:///Users/...` or `file:///C:/...`
+            stripWinLeadingSlash(percentDecode(rest))
+        } else if (strStartsWith(rest, "localhost/")) {
+            let localPart = strSlice(rest, 9, strLen(rest));
+            stripWinLeadingSlash(percentDecode(localPart))
+        } else {
+            // UNC authority URI: `file://server/share/...` -> `//server/share/...`
+            "//" + percentDecode(rest)
+        }
+    } else uri
+
+def pathToUri(path: String): String =
+    if (strStartsWith(path, "file://")) path
+    else if (strStartsWith(path, "//")) "file://" + percentEncodePath(strSlice(path, 2, strLen(path)))
+    else if (strStartsWith(path, "/")) "file://" + percentEncodePath(path)
+    else "file:///" + percentEncodePath(path)
+
+def isUtf8Cont(b: Int): Bool = b >= 128 && b < 192
+
+// Returns `(byteStep, utf16Width)` for the UTF-8 sequence starting at `idx`.
+// Defends against stray continuation bytes, truncated sequences, and `\r\n`.
+def utf8StepAt(src: String, n: Int, idx: Int): (Int, Int) = {
+    let b = strByteAt(src, idx);
+    if (b == 13 && idx + 1 < n && strByteAt(src, idx + 1) == 10) {
+        (1, 0)
+    } else if (b < 128) {
+        (1, 1)
+    } else if (b >= 192 && b < 224) {
+        if (idx + 1 < n && isUtf8Cont(strByteAt(src, idx + 1))) (2, 1) else (1, 1)
+    } else if (b >= 224 && b < 240) {
+        if (idx + 2 < n && isUtf8Cont(strByteAt(src, idx + 1)) && isUtf8Cont(strByteAt(src, idx + 2))) (3, 1)
+        else (1, 1)
+    } else if (b >= 240 && b < 248) {
+        if (idx + 3 < n && isUtf8Cont(strByteAt(src, idx + 1)) && isUtf8Cont(strByteAt(src, idx + 2)) && isUtf8Cont(strByteAt(src, idx + 3))) (4, 2)
+        else (1, 1)
+    } else {
+        // Stray continuation byte (0x80..0xBF) or invalid lead (>= 0xF8)
+        (1, 0)
+    }
+}
+
+def offsetToLspPos(src: String, byteOff: Int): (Int, Int) = {
+    let n = strLen(src);
+    let target = if (byteOff < 0) 0 else if (byteOff > n) n else byteOff;
+    let line = cellNew(0);
+    let col = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < target) {
+        let idx = cellGet(i);
+        let b = strByteAt(src, idx);
+        if (b == 10) {
+            cellSet(line, cellGet(line) + 1);
+            cellSet(col, 0);
+            cellSet(i, idx + 1)
+        } else {
+            let (step, w16) = utf8StepAt(src, n, idx);
+            cellSet(col, cellGet(col) + w16);
+            cellSet(i, idx + step)
+        }
+    };
+    (cellGet(line), cellGet(col))
+}
+
+def lspPosToOffset(src: String, targetLine: Int, targetChar: Int): Int = {
+    let n = strLen(src);
+    let line = cellNew(0);
+    let col = cellNew(0);
+    let i = cellNew(0);
+    let done = cellNew(false);
+    while (cellGet(i) < n && !cellGet(done)) {
+        let curLine = cellGet(line);
+        let curCol = cellGet(col);
+        if (curLine > targetLine || (curLine == targetLine && curCol >= targetChar)) {
+            cellSet(done, true)
+        } else {
+            let idx = cellGet(i);
+            let b = strByteAt(src, idx);
+            if (b == 10) {
+                if (curLine == targetLine) {
+                    cellSet(done, true)
+                } else {
+                    cellSet(line, curLine + 1);
+                    cellSet(col, 0);
+                    cellSet(i, idx + 1)
+                }
+            } else if (b == 13 && idx + 1 < n && strByteAt(src, idx + 1) == 10) {
+                if (curLine == targetLine) {
+                    cellSet(done, true)
+                } else {
+                    cellSet(i, idx + 1)
+                }
+            } else {
+                let (step, w16) = utf8StepAt(src, n, idx);
+                cellSet(col, curCol + w16);
+                cellSet(i, idx + step)
+            }
+        }
+    };
+    let res = cellGet(i);
+    if (res > n) n else res
+}
+
+def makeLspPos(line: Int, ch: Int): Value =
+    VObj([
+        ("line", VInt(intToI64(line))),
+        ("character", VInt(intToI64(ch))),
+    ])
+
+def makeLspRange(src: String, startByte: Int, endByte: Int): Value = {
+    let n = strLen(src);
+    let s = if (startByte < 0) 0 else if (startByte > n) n else startByte;
+    let e0 = if (endByte < s) s else if (endByte > n) n else endByte;
+    let e = if (e0 == s && s < n) s + 1 else e0;
+    let (sl, sc) = offsetToLspPos(src, s);
+    let (el, ec) = offsetToLspPos(src, e);
+    VObj([
+        ("start", makeLspPos(sl, sc)),
+        ("end", makeLspPos(el, ec)),
+    ])
+}
+
+// ============================================================================
+// Document State & Frontend Analysis
+// ============================================================================
+
+data DocState {
+    MkDocState {
+        dsUri: String,
+        dsPath: String,
+        dsText: String,
+        dsVersion: Int,
+        dsParsed: Option FileModule,
+        dsInfer: Option InferOutput,
+        dsFiles: Vec SourceFile,
+        dsFileId: Int,
+        dsDiagTargetUri: Option String,
+    },
+}
+
+data ServerState {
+    MkServerState {
+        ssDocs: StrMap DocState,
+        ssCanonToUri: StrMap String,
+        ssOpenUris: Cell (List String),
+        ssShuttingDown: Cell Bool,
+        ssRootDir: Cell (Option String),
+    },
+}
+
+def resolveClientUriForPath(ss: ServerState, path: String): String =
+    match strMapGet(ss.ssCanonToUri, loaderCanonicalPath(path)) {
+        Some(clientUri) -> clientUri,
+        None -> pathToUri(path),
+    }
+
+def trackOpenUri(ss: ServerState, uri: String): Void = {
+    let cur = cellGet(ss.ssOpenUris);
+    let found = cellNew(false);
+    let it = cellNew(cur);
+    while (match cellGet(it) { Nil -> false, _ -> !cellGet(found) }) {
+        match cellGet(it) {
+            Cons(u, r) -> { if (u == uri) cellSet(found, true) else (); cellSet(it, r) },
+            Nil -> (),
+        }
+    };
+    if (!cellGet(found)) cellSet(ss.ssOpenUris, Cons(uri, cur)) else ()
+}
+
+def untrackOpenUri(ss: ServerState, uri: String): Void = {
+    let accRev = cellNew(Nil);
+    let it = cellNew(cellGet(ss.ssOpenUris));
+    while (match cellGet(it) { Nil -> false, _ -> true }) {
+        match cellGet(it) {
+            Cons(u, r) -> {
+                if (u != uri) cellSet(accRev, Cons(u, cellGet(accRev))) else ();
+                cellSet(it, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellSet(ss.ssOpenUris, listRev(cellGet(accRev)))
+}
+
+def resolveDocPkgSpecs(filePath: String): (PkgSpec, List PkgSpec) = {
+    let dir = pathDirname(filePath);
+    let searchDir = if (strLen(dir) == 0) "." else dir;
+    match findProjectRoot(searchDir) {
+        Some(projDir) -> match resolveProjectGraph(projDir, false, None, false) {
+            Ok((rootMf, rootSpec, resolvedPkgs)) -> {
+                let extSpecs0 = toLoaderPkgSpecs(resolvedPkgs);
+                let roots = listAppend(rootSpec.srcRoots, [searchDir]);
+                if (rootMf.mfName != "") {
+                    let selfPkgId = "__self_" + sanitizeIdentAlias(rootMf.mfName);
+                    let selfPkgSpec = MkPkgSpec {
+                        pkgId: selfPkgId,
+                        pkgName: rootMf.mfName,
+                        srcRoots: rootSpec.srcRoots,
+                        deps: rootSpec.deps,
+                    };
+                    let mergedRoot = MkPkgSpec {
+                        pkgId: rootSpec.pkgId,
+                        pkgName: rootSpec.pkgName,
+                        srcRoots: roots,
+                        deps: listAppend(rootSpec.deps, [(rootMf.mfName, selfPkgId)]),
+                    };
+                    (mergedRoot, Cons(selfPkgSpec, extSpecs0))
+                } else {
+                    let mergedRoot = MkPkgSpec {
+                        pkgId: rootSpec.pkgId,
+                        pkgName: rootSpec.pkgName,
+                        srcRoots: roots,
+                        deps: rootSpec.deps,
+                    };
+                    (mergedRoot, extSpecs0)
+                }
+            },
+            Err(_) -> (MkPkgSpec { pkgId: "", pkgName: "", srcRoots: [searchDir], deps: Nil }, Nil),
+        },
+        None -> (MkPkgSpec { pkgId: "", pkgName: "", srcRoots: [searchDir], deps: Nil }, Nil),
+    }
+}
+
+def getSourceFileFromVec(files: Vec SourceFile, fileId: Int): Option SourceFile =
+    if (fileId <= 0 || fileId > vecLen(files)) None
+    else Some(vecGetOr(files, fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }))
+
+def buildDiagWithTarget(ss: ServerState, docUri: String, docPath: String, docText: String, errMsg: String, files: Vec SourceFile): (String, Value) =
+    match diagLastError() {
+        Some(rec) -> {
+            let fullMsg = match rec.drHint {
+                Some(h) -> rec.drMsg + "\nhint: " + h,
+                None -> rec.drMsg,
+            };
+            let docCanon = loaderCanonicalPath(docPath);
+            match getSourceFileFromVec(files, rec.drFileId) {
+                Some(sf) if (sf.sfPath == docPath || loaderCanonicalPath(sf.sfPath) == docCanon) ->
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, rec.drStart, rec.drEnd)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+                Some(sf) if (strLen(sf.sfPath) > 0 && (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath))) ->
+                    (resolveClientUriForPath(ss, sf.sfPath), VObj([
+                        ("range", makeLspRange(sf.sfContent, rec.drStart, rec.drEnd)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+                Some(sf) if (strLen(sf.sfPath) > 0) ->
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, 0, 1)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(sf.sfPath + ": " + fullMsg)),
+                    ])),
+                _ ->
+                    (docUri, VObj([
+                        ("range", makeLspRange(docText, 0, 1)),
+                        ("severity", VInt(intToI64(1))),
+                        ("code", VStr(rec.drKind)),
+                        ("source", VStr("geisha")),
+                        ("message", VStr(fullMsg)),
+                    ])),
+            }
+        },
+        None ->
+            (docUri, VObj([
+                ("range", makeLspRange(docText, 0, 1)),
+                ("severity", VInt(intToI64(1))),
+                ("source", VStr("geisha")),
+                ("message", VStr(errMsg)),
+            ])),
+    }
+
+def runFrontendCheck(path: String, text: String, rootSpec: PkgSpec, extSpecs: List PkgSpec): Result InferOutput String = {
+    let rawDefs = loadSingleSourceProgramWithPkgsNamed(path, text, rootSpec, extSpecs, Nil)?;
+    let inf = inferProgram(rawDefs)?;
+    let _ = lowerToCore(inf)?;
+    Ok(inf)
+}
+
+def clearStaleForeignDiag(prevDocOpt: Option DocState, currentUri: String, newTargetUri: Option String): Void =
+    match prevDocOpt {
+        Some(prev) -> match prev.dsDiagTargetUri {
+            Some(oldTarget) if (oldTarget != currentUri) -> {
+                let stillSame = match newTargetUri {
+                    Some(nt) -> nt == oldTarget,
+                    None -> false,
+                };
+                if (!stillSame) {
+                    sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                        ("uri", VStr(oldTarget)),
+                        ("diagnostics", VArr(Nil)),
+                    ]))
+                } else ()
+            },
+            _ -> (),
+        },
+        None -> (),
+    }
+
+def analyzeSingleDoc(ss: ServerState, uri: String, text: String, version: Int): Void = {
+    let path = uriToPath(uri);
+    let prevDocOpt = strMapGet(ss.ssDocs, uri);
+
+    // Always try a standalone parse for DocumentSymbol / Completion resilience
+    diagReset();
+    let parseFid = diagRegisterFile(path, text);
+    let parsedOpt = match parseFileModuleInFile(text, Nil, parseFid) {
+        Ok(fm) -> Some(fm),
+        Err(_) -> match prevDocOpt {
+            Some(prev) -> prev.dsParsed,
+            None -> None,
+        },
+    };
+
+    // Full frontend analysis: load (with in-memory overlays) + infer + core lowering
+    diagReset();
+    let (rootSpec, extSpecs) = resolveDocPkgSpecs(path);
+    let checkRes = runFrontendCheck(path, text, rootSpec, extSpecs);
+    let filesSnap = diagRegisteredFiles();
+
+    match checkRes {
+        Ok(inf) -> {
+            clearStaleForeignDiag(prevDocOpt, uri, None);
+            let st = MkDocState {
+                dsUri: uri,
+                dsPath: path,
+                dsText: text,
+                dsVersion: version,
+                dsParsed: parsedOpt,
+                dsInfer: Some(inf),
+                dsFiles: filesSnap,
+                dsFileId: 1,
+                dsDiagTargetUri: None,
+            };
+            strMapInsert(ss.ssDocs, uri, st);
+            sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                ("uri", VStr(uri)),
+                ("diagnostics", VArr(Nil)),
+            ]))
+        },
+        Err(errMsg) -> {
+            let (targetUri, diagObj) = buildDiagWithTarget(ss, uri, path, text, errMsg, filesSnap);
+            let foreignOpt = if (targetUri != uri) Some(targetUri) else None;
+            clearStaleForeignDiag(prevDocOpt, uri, foreignOpt);
+            let keepInf = match prevDocOpt {
+                Some(prev) -> prev.dsInfer,
+                None -> None,
+            };
+            let keepFiles = match prevDocOpt {
+                Some(prev) -> if (vecLen(prev.dsFiles) > 0) prev.dsFiles else filesSnap,
+                None -> filesSnap,
+            };
+            let st = MkDocState {
+                dsUri: uri,
+                dsPath: path,
+                dsText: text,
+                dsVersion: version,
+                dsParsed: parsedOpt,
+                dsInfer: keepInf,
+                dsFiles: keepFiles,
+                dsFileId: 1,
+                dsDiagTargetUri: foreignOpt,
+            };
+            strMapInsert(ss.ssDocs, uri, st);
+            if (targetUri != uri) {
+                sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                    ("uri", VStr(uri)),
+                    ("diagnostics", VArr(Nil)),
+                ]))
+            } else ();
+            sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                ("uri", VStr(targetUri)),
+                ("diagnostics", VArr([diagObj])),
+            ]))
+        },
+    }
+}
+
+def refreshOtherOpenDocs(ss: ServerState, skipUri: String): Void = {
+    let cur = cellNew(cellGet(ss.ssOpenUris));
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(otherUri, r) -> {
+                if (otherUri != skipUri) {
+                    match strMapGet(ss.ssDocs, otherUri) {
+                        Some(doc) -> analyzeSingleDoc(ss, doc.dsUri, doc.dsText, doc.dsVersion),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def analyzeAndPublish(ss: ServerState, uri: String, text: String, version: Int): Void = {
+    let path = uriToPath(uri);
+    strMapInsert(ss.ssCanonToUri, loaderCanonicalPath(path), uri);
+    loaderSetOverlay(path, text);
+    trackOpenUri(ss, uri);
+    analyzeSingleDoc(ss, uri, text, version);
+    refreshOtherOpenDocs(ss, uri)
+}
+
+// ============================================================================
+// Identifier Scanning, Word-Boundary Search & Doc Comment Formatting
+// ============================================================================
+
+def identAtOffset(src: String, off: Int): Option (String, Int, Int) = {
+    let n = strLen(src);
+    if (n == 0) None
+    else {
+        let p0 = if (off < 0) 0 else if (off >= n) n - 1 else off;
+        let p =
+            if (isIdentContByte(strByteAt(src, p0))) p0
+            else if (p0 > 0 && isIdentContByte(strByteAt(src, p0 - 1))) p0 - 1
+            else -1;
+        if (p < 0) None
+        else {
+            let s = cellNew(p);
+            while (cellGet(s) > 0 && isIdentContByte(strByteAt(src, cellGet(s) - 1))) {
+                cellSet(s, cellGet(s) - 1)
+            };
+            let e = cellNew(p + 1);
+            while (cellGet(e) < n && isIdentContByte(strByteAt(src, cellGet(e)))) {
+                cellSet(e, cellGet(e) + 1)
+            };
+            let st = cellGet(s);
+            let en = cellGet(e);
+            if (en > st && isIdentStartByte(strByteAt(src, st))) {
+                Some((strSlice(src, st, en), st, en))
+            } else None
+        }
+    }
+}
+
+// Word-boundary identifier search within `[startByte, endByte)`.
+def findIdentInSpan(src: String, ident: String, startByte: Int, endByte: Int): (Int, Int) = {
+    let n = strLen(src);
+    let nl = strLen(ident);
+    let s = if (startByte < 0) 0 else if (startByte > n) n else startByte;
+    let e = if (endByte < s) s else if (endByte > n) n else endByte;
+    if (nl == 0 || s + nl > e) (s, if (e > s) e else s)
+    else {
+        let isWordIdent = isIdentStartByte(strByteAt(ident, 0));
+        let i = cellNew(s);
+        let found = cellNew(-1);
+        let limit = e - nl;
+        while (cellGet(i) <= limit && cellGet(found) < 0) {
+            let cur = cellGet(i);
+            let matched = strStartsWith(strSlice(src, cur, cur + nl), ident);
+            let leftOk = !isWordIdent || cur == 0 || !isIdentContByte(strByteAt(src, cur - 1));
+            let rightOk = !isWordIdent || (cur + nl) >= n || !isIdentContByte(strByteAt(src, cur + nl));
+            if (matched && leftOk && rightOk) {
+                cellSet(found, cur)
+            } else {
+                cellSet(i, cur + 1)
+            }
+        };
+        let f = cellGet(found);
+        if (f >= 0) (f, f + nl) else (s, if (e > s) e else s)
+    }
+}
+
+def stripDocPrefix(line: String): String =
+    if (strStartsWith(line, "/// ")) strSlice(line, 4, strLen(line))
+    else if (strStartsWith(line, "///")) strSlice(line, 3, strLen(line))
+    else line
+
+def formatDocCommentMarkdown(src: String, startByte: Int): String = {
+    let lines = extractDocComment(src, startByte);
+    match lines {
+        Nil -> "",
+        _ -> {
+            let cleanedRev = cellNew(Nil);
+            let cur = cellNew(lines);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(l, r) -> {
+                        cellSet(cleanedRev, Cons(stripDocPrefix(l), cellGet(cleanedRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            strJoin(listRev(cellGet(cleanedRev)), "\n")
+        },
+    }
+}
+
+def shortSymName(qname: String): String = {
+    let segs = strSplitChar(qname, '.');
+    let last = cellNew(qname);
+    let cur = cellNew(segs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(s, r) -> { cellSet(last, s); cellSet(cur, r) },
+            Nil -> (),
+        }
+    };
+    cellGet(last)
+}
+
+// ============================================================================
+// AST Traversal for Innermost Expression & Local Bindings
+// ============================================================================
+
+data LocalBind {
+    MkLocalBind {
+        lbName: String,
+        lbSpan: Span,
+        lbScheme: Scheme,
+    },
+}
+
+data FoundForm {
+    MkFoundForm {
+        ffForm: Form,
+        ffSize: Int,
+        ffLocals: List LocalBind,
+    },
+}
+
+def spanContains(sp: Span, fileId: Int, off: Int): Bool =
+    sp.fileId == fileId && sp.start <= off && off <= sp.end
+
+def spanSize(sp: Span): Int =
+    if (sp.end >= sp.start) sp.end - sp.start else 0
+
+def locateBinderSpan(src: String, fileId: Int, name: String, lo: Int, hi: Int): Span = {
+    let (s, e) = findIdentInSpan(src, name, lo, hi);
+    MkSpan { fileId: fileId, start: s, end: e }
+}
+
+def collectPatVarNames(pat: Pattern, acc: Cell (List String)): Void = match pat {
+    PatVar(v) -> cellSet(acc, Cons(v, cellGet(acc))),
+    PatWild -> (),
+    PatLit(_) -> (),
+    PatTuple(ps) -> {
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> { collectPatVarNames(p, acc); cellSet(cur, r) },
+                Nil -> (),
+            }
+        }
+    },
+    PatCtor(_, ps) -> {
+        let cur = cellNew(ps);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(p, r) -> { collectPatVarNames(p, acc); cellSet(cur, r) },
+                Nil -> (),
+            }
+        }
+    },
+    PatStruct(_, fs) -> {
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, p), r) -> { collectPatVarNames(p, acc); cellSet(cur, r) },
+                Nil -> (),
+            }
+        }
+    },
+}
+
+def searchFormList(src: String, fs: List Form, fileId: Int, off: Int, locals: List LocalBind, best: Cell (Option FoundForm)): Void = {
+    let cur = cellNew(fs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(h, r) -> {
+                searchFormAt(src, h, fileId, off, locals, best);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def searchFormAt(src: String, f: Form, fileId: Int, off: Int, locals: List LocalBind, best: Cell (Option FoundForm)): Void = {
+    if (spanContains(f.pos, fileId, off)) {
+        let sz = spanSize(f.pos);
+        let better = match cellGet(best) {
+            None -> true,
+            Some(prev) -> sz <= prev.ffSize,
+        };
+        if (better) {
+            cellSet(best, Some(MkFoundForm { ffForm: f, ffSize: sz, ffLocals: locals }))
+        } else ()
+    } else ();
+    match f.node {
+        ExLit(_) -> (),
+        ExVar(_) -> (),
+        ExTuple(es) -> searchFormList(src, es, fileId, off, locals, best),
+        ExList(es) -> searchFormList(src, es, fileId, off, locals, best),
+        ExBlock(es) -> searchFormList(src, es, fileId, off, locals, best),
+        ExStructInit(_, fields) -> {
+            let cur = cellNew(fields);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons((_, fv), r) -> {
+                        searchFormAt(src, fv, fileId, off, locals, best);
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ExApply(callee, args) -> {
+            searchFormAt(src, callee, fileId, off, locals, best);
+            searchFormList(src, args, fileId, off, locals, best)
+        },
+        ExAbs(ps, _, body) -> {
+            let nextLocals = cellNew(locals);
+            if (f.pos.start < body.pos.start) {
+                let cur = cellNew(ps);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(vd, r) -> {
+                            let bsp = locateBinderSpan(src, fileId, vd.vname, f.pos.start, body.pos.start);
+                            cellSet(nextLocals, Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: vd.vscm }, cellGet(nextLocals)));
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            } else ();
+            searchFormAt(src, body, fileId, off, cellGet(nextLocals), best)
+        },
+        ExBin(_, lhs, rhs) -> {
+            searchFormAt(src, lhs, fileId, off, locals, best);
+            searchFormAt(src, rhs, fileId, off, locals, best)
+        },
+        ExUn(_, sub) -> searchFormAt(src, sub, fileId, off, locals, best),
+        ExLet(vd, rhs, body) -> {
+            searchFormAt(src, rhs, fileId, off, locals, best);
+            let bindEnd = if (rhs.pos.start > f.pos.start) rhs.pos.start else f.pos.end;
+            let bsp = locateBinderSpan(src, fileId, vd.vname, f.pos.start, bindEnd);
+            let bindScm = match vd.vscm { ScmSlot -> rhs.ty, sc -> sc };
+            let nextLocals = Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: bindScm }, locals);
+            searchFormAt(src, body, fileId, off, nextLocals, best)
+        },
+        ExIf(c, t, e) -> {
+            searchFormAt(src, c, fileId, off, locals, best);
+            searchFormAt(src, t, fileId, off, locals, best);
+            searchFormAt(src, e, fileId, off, locals, best)
+        },
+        ExWhile(c, b) -> {
+            searchFormAt(src, c, fileId, off, locals, best);
+            searchFormAt(src, b, fileId, off, locals, best)
+        },
+        ExMatch(scrut, arms) -> {
+            searchFormAt(src, scrut, fileId, off, locals, best);
+            let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(arm, r) -> {
+                        let patNames: Cell (List String) = cellNew(Nil);
+                        collectPatVarNames(arm.pat, patNames);
+                        let patLo = cellGet(prevArmEnd);
+                        let patHi = if (arm.body.pos.start > patLo) arm.body.pos.start else f.pos.end;
+                        let armLocals = cellNew(locals);
+                        let cn = cellNew(listRev(cellGet(patNames)));
+                        while (match cellGet(cn) { Nil -> false, _ -> true }) {
+                            match cellGet(cn) {
+                                Cons(vn, rn) -> {
+                                    // Destructuring `let (a, b) = rhs` places binders before `scrut`
+                                    let bsp =
+                                        if (patHi > patLo) {
+                                            let (s1, e1) = findIdentInSpan(src, vn, patLo, patHi);
+                                            if (s1 < e1 && strSlice(src, s1, e1) == vn) MkSpan { fileId: fileId, start: s1, end: e1 }
+                                            else locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end)
+                                        } else {
+                                            locateBinderSpan(src, fileId, vn, f.pos.start, f.pos.end)
+                                        };
+                                    cellSet(armLocals, Cons(MkLocalBind { lbName: vn, lbSpan: bsp, lbScheme: ScmSlot }, cellGet(armLocals)));
+                                    cellSet(cn, rn)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let al = cellGet(armLocals);
+                        match arm.guard {
+                            Some(g) -> searchFormAt(src, g, fileId, off, al, best),
+                            None -> (),
+                        };
+                        searchFormAt(src, arm.body, fileId, off, al, best);
+                        if (arm.body.pos.end > cellGet(prevArmEnd)) cellSet(prevArmEnd, arm.body.pos.end) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ExField(base, _) -> searchFormAt(src, base, fileId, off, locals, best),
+        ExTry(inner) -> searchFormAt(src, inner, fileId, off, locals, best),
+    }
+}
+
+def findInnermostFormInDefs(src: String, defs: List Def, fileId: Int, off: Int): Option FoundForm = {
+    let best: Cell (Option FoundForm) = cellNew(None);
+    let cur = cellNew(defs);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(f) -> {
+                        let defLocals: List LocalBind = match f.node {
+                            ExAbs(ps, _, body) -> {
+                                let headEnd = if (body.pos.start > d.dpos.start) body.pos.start else d.dpos.end;
+                                let acc = cellNew(Nil);
+                                let cp = cellNew(ps);
+                                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                                    match cellGet(cp) {
+                                        Cons(vd, rp) -> {
+                                            let bsp = locateBinderSpan(src, fileId, vd.vname, d.dpos.start, headEnd);
+                                            cellSet(acc, Cons(MkLocalBind { lbName: vd.vname, lbSpan: bsp, lbScheme: vd.vscm }, cellGet(acc)));
+                                            cellSet(cp, rp)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                cellGet(acc)
+                            },
+                            _ -> Nil,
+                        };
+                        searchFormAt(src, f, fileId, off, defLocals, best)
+                    },
+                    ItInstance(_, _, _, impls) -> {
+                        let ci = cellNew(impls);
+                        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                            match cellGet(ci) {
+                                Cons(mi, ri) -> {
+                                    searchFormAt(src, mi.implBody, fileId, off, Nil, best);
+                                    cellSet(ci, ri)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(best)
+}
+
+def defHasVariant(d: Def, name: String): Bool = match d.item {
+    ItAlg(_, vs) -> {
+        let cur = cellNew(vs);
+        let found = cellNew(false);
+        while (match cellGet(cur) { Nil -> false, _ -> !cellGet(found) }) {
+            match cellGet(cur) {
+                Cons(v, r) -> {
+                    if (v.vname == name) cellSet(found, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+    _ -> false,
+}
+
+def defHasVariantSuffix(d: Def, suffix: String): Bool = match d.item {
+    ItAlg(_, vs) -> {
+        let cur = cellNew(vs);
+        let found = cellNew(false);
+        while (match cellGet(cur) { Nil -> false, _ -> !cellGet(found) }) {
+            match cellGet(cur) {
+                Cons(v, r) -> {
+                    if (strEndsWith(v.vname, suffix)) cellSet(found, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+    _ -> false,
+}
+
+def defHasMethod(d: Def, name: String): Bool = match d.item {
+    ItConcept(_, _, _, ms) -> {
+        let cur = cellNew(ms);
+        let found = cellNew(false);
+        while (match cellGet(cur) { Nil -> false, _ -> !cellGet(found) }) {
+            match cellGet(cur) {
+                Cons(m, r) -> {
+                    if (m.mname == name) cellSet(found, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+    _ -> false,
+}
+
+def defHasMethodSuffix(d: Def, suffix: String): Bool = match d.item {
+    ItConcept(_, _, _, ms) -> {
+        let cur = cellNew(ms);
+        let found = cellNew(false);
+        while (match cellGet(cur) { Nil -> false, _ -> !cellGet(found) }) {
+            match cellGet(cur) {
+                Cons(m, r) -> {
+                    if (strEndsWith(m.mname, suffix)) cellSet(found, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+    _ -> false,
+}
+
+def lookupDefExact(defs: List Def, name: String): Option Def = {
+    let cur = cellNew(defs);
+    let found: Cell (Option Def) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(d, r) -> {
+                if (d.ident == name || defHasVariant(d, name) || defHasMethod(d, name)) {
+                    cellSet(found, Some(d))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def lookupDefLoose(defs: List Def, name: String): Option Def =
+    match lookupDefExact(defs, name) {
+        Some(d) -> Some(d),
+        None -> {
+            let suffix = "." + name;
+            let cur = cellNew(defs);
+            let found: Cell (Option Def) = cellNew(None);
+            while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(d, r) -> {
+                        if (strEndsWith(d.ident, suffix) || defHasVariantSuffix(d, suffix) || defHasMethodSuffix(d, suffix)) {
+                            cellSet(found, Some(d))
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(found)
+        },
+    }
+
+def lookupDefAtOffset(defs: List Def, fileId: Int, off: Int): Option Def = {
+    let cur = cellNew(defs);
+    let found: Cell (Option Def) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(d, r) -> {
+                if (spanContains(d.dpos, fileId, off)) cellSet(found, Some(d)) else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def lookupLocalBind(locals: List LocalBind, name: String): Option LocalBind = match locals {
+    Nil -> None,
+    Cons(lb, r) -> if (lb.lbName == name) Some(lb) else lookupLocalBind(r, name),
+}
+
+def docForDef(files: Vec SourceFile, d: Def): String =
+    match getSourceFileFromVec(files, d.dpos.fileId) {
+        Some(sf) -> formatDocCommentMarkdown(sf.sfContent, d.dpos.start),
+        None -> "",
+    }
+
+def findParsedDefByName(items: List ModuleItem, name: String): Option Def = {
+    let cur = cellNew(items);
+    let found: Cell (Option Def) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(_, d), r) -> {
+                if (d.ident == name || defHasVariant(d, name) || defHasMethod(d, name)) {
+                    cellSet(found, Some(d))
+                } else ();
+                cellSet(cur, r)
+            },
+            Cons(ModSub(_, _, subItems, _), r) -> {
+                match findParsedDefByName(subItems, name) {
+                    Some(sd) -> cellSet(found, Some(sd)),
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+// ============================================================================
+// Hover (`textDocument/hover`)
+// ============================================================================
+
+def makeHoverResult(md: String, rangeOpt: Option Value): Value = {
+    let contents = VObj([
+        ("kind", VStr("markdown")),
+        ("value", VStr(md)),
+    ]);
+    match rangeOpt {
+        Some(r) -> VObj([("contents", contents), ("range", r)]),
+        None -> VObj([("contents", contents)]),
+    }
+}
+
+def formatHoverBlock(codeLine: String, docMd: String): String =
+    if (strLen(docMd) > 0) "```geisha\n" + codeLine + "\n```\n\n" + docMd
+    else "```geisha\n" + codeLine + "\n```"
+
+def hoverForWordInScope(doc: DocState, inf: InferOutput, locals: List LocalBind, word: String, ws: Int, we: Int): Option Value = {
+    let wrng = Some(makeLspRange(doc.dsText, ws, we));
+    match lookupLocalBind(locals, word) {
+        Some(lb) -> match lb.lbScheme {
+            ScmSlot -> None,
+            sc -> Some(makeHoverResult(formatHoverBlock(lb.lbName + ": " + formatScheme(sc), ""), wrng)),
+        },
+        None -> match lookupDefLoose(inf.defs, word) {
+            Some(d) -> {
+                let sig = match d.item {
+                    ItForm(f) -> shortSymName(d.ident) + ": " + formatScheme(f.ty),
+                    _ -> formatDefSig(d),
+                };
+                let docStr = docForDef(doc.dsFiles, d);
+                Some(makeHoverResult(formatHoverBlock(sig, docStr), wrng))
+            },
+            None -> None,
+        },
+    }
+}
+
+def handleHover(ss: ServerState, params: Value): Value = {
+    let uriOpt = match objGet(params, "textDocument") {
+        Some(td) -> objGetStr(td, "uri"),
+        None -> None,
+    };
+    let posOpt = objGet(params, "position");
+    match (uriOpt, posOpt) {
+        (Some(uri), Some(pos)) -> match (strMapGet(ss.ssDocs, uri), objGetInt(pos, "line"), objGetInt(pos, "character")) {
+            (Some(doc), Some(line), Some(ch)) -> {
+                let off = lspPosToOffset(doc.dsText, line, ch);
+                let wordOpt = identAtOffset(doc.dsText, off);
+                let fromInfer: Option Value = match doc.dsInfer {
+                    None -> None,
+                    Some(inf) -> {
+                        match findInnermostFormInDefs(doc.dsText, inf.defs, doc.dsFileId, off) {
+                            Some(ff) -> {
+                                let f: Form = ff.ffForm;
+                                let tyStr = formatScheme(f.ty);
+                                let rng = Some(makeLspRange(doc.dsText, f.pos.start, f.pos.end));
+                                match f.node {
+                                    ExVar(qname) -> {
+                                        let docStr = match lookupDefExact(inf.defs, qname) {
+                                            Some(d) -> docForDef(doc.dsFiles, d),
+                                            None -> "",
+                                        };
+                                        let label = shortSymName(qname);
+                                        Some(makeHoverResult(formatHoverBlock(label + ": " + tyStr, docStr), rng))
+                                    },
+                                    ExStructInit(qname, _) -> {
+                                        let docStr = match lookupDefExact(inf.defs, qname) {
+                                            Some(d) -> docForDef(doc.dsFiles, d),
+                                            None -> "",
+                                        };
+                                        let label = shortSymName(qname);
+                                        Some(makeHoverResult(formatHoverBlock(label + ": " + tyStr, docStr), rng))
+                                    },
+                                    ExLit(_) ->
+                                        Some(makeHoverResult(formatHoverBlock(tyStr, ""), rng)),
+                                    _ -> {
+                                        // On compound nodes (let/match/abs/block/apply), prefer local binder or constructor under cursor
+                                        let byWord = match wordOpt {
+                                            Some((word, ws, we)) -> hoverForWordInScope(doc, inf, ff.ffLocals, word, ws, we),
+                                            None -> None,
+                                        };
+                                        match byWord {
+                                            Some(v) -> Some(v),
+                                            None -> Some(makeHoverResult(formatHoverBlock(tyStr, ""), rng)),
+                                        }
+                                    },
+                                }
+                            },
+                            None -> match lookupDefAtOffset(inf.defs, doc.dsFileId, off) {
+                                Some(d) -> {
+                                    let sig = match d.item {
+                                        ItForm(f) -> d.ident + ": " + formatScheme(f.ty),
+                                        _ -> formatDefSig(d),
+                                    };
+                                    let docStr = docForDef(doc.dsFiles, d);
+                                    Some(makeHoverResult(formatHoverBlock(sig, docStr), Some(makeLspRange(doc.dsText, d.dpos.start, d.dpos.end))))
+                                },
+                                None -> match wordOpt {
+                                    Some((word, ws, we)) -> hoverForWordInScope(doc, inf, Nil, word, ws, we),
+                                    None -> None,
+                                },
+                            },
+                        }
+                    },
+                };
+                match fromInfer {
+                    Some(v) -> v,
+                    None -> match (doc.dsParsed, wordOpt) {
+                        (Some(fm), Some((word, ws, we))) -> match findParsedDefByName(fm.items, word) {
+                            Some(d) -> {
+                                let sig = formatDefSig(d);
+                                let docStr = formatDocCommentMarkdown(doc.dsText, d.dpos.start);
+                                makeHoverResult(formatHoverBlock(sig, docStr), Some(makeLspRange(doc.dsText, ws, we)))
+                            },
+                            None -> VNull,
+                        },
+                        _ -> VNull,
+                    },
+                }
+            },
+            _ -> VNull,
+        },
+        _ -> VNull,
+    }
+}
+
+// ============================================================================
+// Go to Definition (`textDocument/definition`)
+// ============================================================================
+
+def makeLocationFromSpan(ss: ServerState, files: Vec SourceFile, currentUri: String, currentText: String, currentFileId: Int, sp: Span): Option Value =
+    if (sp.fileId == currentFileId) {
+        Some(VObj([
+            ("uri", VStr(currentUri)),
+            ("range", makeLspRange(currentText, sp.start, sp.end)),
+        ]))
+    } else {
+        match getSourceFileFromVec(files, sp.fileId) {
+            Some(sf) ->
+                if (strStartsWith(sf.sfPath, "/") || strStartsWith(sf.sfPath, "//") || fileExists(sf.sfPath)) {
+                    Some(VObj([
+                        ("uri", VStr(resolveClientUriForPath(ss, sf.sfPath))),
+                        ("range", makeLspRange(sf.sfContent, sp.start, sp.end)),
+                    ]))
+                } else None,
+            None -> None,
+        }
+    }
+
+def handleDefinition(ss: ServerState, params: Value): Value = {
+    let uriOpt = match objGet(params, "textDocument") {
+        Some(td) -> objGetStr(td, "uri"),
+        None -> None,
+    };
+    let posOpt = objGet(params, "position");
+    match (uriOpt, posOpt) {
+        (Some(uri), Some(pos)) -> match (strMapGet(ss.ssDocs, uri), objGetInt(pos, "line"), objGetInt(pos, "character")) {
+            (Some(doc), Some(line), Some(ch)) -> {
+                let off = lspPosToOffset(doc.dsText, line, ch);
+                let wordOpt = identAtOffset(doc.dsText, off);
+                let fromInfer: Option Value = match doc.dsInfer {
+                    None -> None,
+                    Some(inf) -> {
+                        let byForm: Option Value = match findInnermostFormInDefs(doc.dsText, inf.defs, doc.dsFileId, off) {
+                            Some(ff) -> match ff.ffForm.node {
+                                ExVar(qname) -> match lookupLocalBind(ff.ffLocals, qname) {
+                                    Some(lb) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
+                                    None -> match lookupDefExact(inf.defs, qname) {
+                                        Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                        None -> None,
+                                    },
+                                },
+                                ExStructInit(qname, _) -> match lookupDefExact(inf.defs, qname) {
+                                    Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                    None -> None,
+                                },
+                                _ -> match wordOpt {
+                                    Some((word, _, _)) -> match lookupLocalBind(ff.ffLocals, word) {
+                                        Some(lb) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, lb.lbSpan),
+                                        None -> None,
+                                    },
+                                    None -> None,
+                                },
+                            },
+                            None -> None,
+                        };
+                        match byForm {
+                            Some(v) -> Some(v),
+                            None -> match wordOpt {
+                                Some((word, _, _)) -> match lookupDefLoose(inf.defs, word) {
+                                    Some(d) -> makeLocationFromSpan(ss, doc.dsFiles, doc.dsUri, doc.dsText, doc.dsFileId, d.dpos),
+                                    None -> None,
+                                },
+                                None -> None,
+                            },
+                        }
+                    },
+                };
+                match fromInfer {
+                    Some(v) -> v,
+                    None -> match (doc.dsParsed, wordOpt) {
+                        (Some(fm), Some((word, _, _))) -> match findParsedDefByName(fm.items, word) {
+                            Some(d) -> VObj([
+                                ("uri", VStr(doc.dsUri)),
+                                ("range", makeLspRange(doc.dsText, d.dpos.start, d.dpos.end)),
+                            ]),
+                            None -> VNull,
+                        },
+                        _ -> VNull,
+                    },
+                }
+            },
+            _ -> VNull,
+        },
+        _ -> VNull,
+    }
+}
+
+// ============================================================================
+// Document Symbols (`textDocument/documentSymbol`)
+// ============================================================================
+
+def defSymbolKind(d: Def): Int = match d.item {
+    ItAlg(_, vs) -> match vs {
+        Cons(v, Nil) -> match v.vbody { VarStruct(_) -> 23, _ -> 10 },
+        _ -> 10,
+    },
+    ItAlias(_, _) -> 26,
+    ItConcept(_, _, _, _) -> 11,
+    ItInstance(_, _, _, _) -> 5,
+    ItExtern(_, _, _, _) -> 12,
+    ItForm(f) -> match f.node {
+        ExAbs(_, _, _) -> 12,
+        _ -> 13,
+    },
+}
+
+def defSymbolName(d: Def): String = match d.item {
+    ItInstance(cname, _, _, _) -> "instance " + cname,
+    _ -> d.ident,
+}
+
+def buildDefSymbol(src: String, d: Def): Value = {
+    let fullRange = makeLspRange(src, d.dpos.start, d.dpos.end);
+    let selKey = match d.item { ItInstance(cname, _, _, _) -> cname, _ -> d.ident };
+    let (selS, selE) = findIdentInSpan(src, selKey, d.dpos.start, d.dpos.end);
+    let selRange = makeLspRange(src, selS, selE);
+    let children: List Value = match d.item {
+        ItAlg(_, vs) -> {
+            let accRev = cellNew(Nil);
+            let cur = cellNew(vs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(v, r) -> {
+                        let (vs1, ve1) = findIdentInSpan(src, v.vname, d.dpos.start, d.dpos.end);
+                        let vr = makeLspRange(src, vs1, ve1);
+                        cellSet(accRev, Cons(VObj([
+                            ("name", VStr(v.vname)),
+                            ("detail", VStr(formatVariant(v))),
+                            ("kind", VInt(intToI64(22))),
+                            ("range", vr),
+                            ("selectionRange", vr),
+                        ]), cellGet(accRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(accRev))
+        },
+        ItConcept(_, _, _, ms) -> {
+            let accRev = cellNew(Nil);
+            let cur = cellNew(ms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(m, r) -> {
+                        let (ms1, me1) = findIdentInSpan(src, m.mname, d.dpos.start, d.dpos.end);
+                        let mr = makeLspRange(src, ms1, me1);
+                        cellSet(accRev, Cons(VObj([
+                            ("name", VStr(m.mname)),
+                            ("detail", VStr(formatScheme(m.mty))),
+                            ("kind", VInt(intToI64(6))),
+                            ("range", mr),
+                            ("selectionRange", mr),
+                        ]), cellGet(accRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(accRev))
+        },
+        _ -> Nil,
+    };
+    let baseFields = [
+        ("name", VStr(defSymbolName(d))),
+        ("detail", VStr(formatDefSig(d))),
+        ("kind", VInt(intToI64(defSymbolKind(d)))),
+        ("range", fullRange),
+        ("selectionRange", selRange),
+    ];
+    match children {
+        Nil -> VObj(baseFields),
+        cs -> VObj(listAppend(baseFields, [("children", VArr(cs))])),
+    }
+}
+
+def isSyntheticDerivedDef(d: Def): Bool =
+    strStartsWith(d.ident, "instance_") && match d.item {
+        ItInstance(_, _, _, _) -> false,
+        _ -> true,
+    }
+
+def buildModuleSymbols(src: String, items: List ModuleItem): List Value = {
+    let accRev = cellNew(Nil);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(_, d), r) -> {
+                if (!isSyntheticDerivedDef(d)) {
+                    cellSet(accRev, Cons(buildDefSymbol(src, d), cellGet(accRev)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Cons(ModSub(_, subName, subItems, sp), r) -> {
+                let rng = makeLspRange(src, sp.start, sp.end);
+                let (selS, selE) = findIdentInSpan(src, subName, sp.start, sp.end);
+                let selRng = makeLspRange(src, selS, selE);
+                let subSyms = buildModuleSymbols(src, subItems);
+                cellSet(accRev, Cons(VObj([
+                    ("name", VStr(subName)),
+                    ("kind", VInt(intToI64(2))),
+                    ("range", rng),
+                    ("selectionRange", selRng),
+                    ("children", VArr(subSyms)),
+                ]), cellGet(accRev)));
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(accRev))
+}
+
+def handleDocumentSymbol(ss: ServerState, params: Value): Value = {
+    let uriOpt = match objGet(params, "textDocument") {
+        Some(td) -> objGetStr(td, "uri"),
+        None -> None,
+    };
+    match uriOpt {
+        Some(uri) -> match strMapGet(ss.ssDocs, uri) {
+            Some(doc) -> match doc.dsParsed {
+                Some(fm) -> VArr(buildModuleSymbols(doc.dsText, fm.items)),
+                None -> VArr(Nil),
+            },
+            None -> VArr(Nil),
+        },
+        None -> VArr(Nil),
+    }
+}
+
+// ============================================================================
+// Completion (`textDocument/completion`)
+// ============================================================================
+
+def makeCompItem(label: String, kind: Int, detail: String, docMd: String): Value = {
+    let f0 = [
+        ("label", VStr(label)),
+        ("kind", VInt(intToI64(kind))),
+    ];
+    let f1 = if (strLen(detail) > 0) listAppend(f0, [("detail", VStr(detail))]) else f0;
+    let f2 =
+        if (strLen(docMd) > 0) {
+            listAppend(f1, [("documentation", VObj([("kind", VStr("markdown")), ("value", VStr(docMd))]))])
+        } else f1;
+    VObj(f2)
+}
+
+def addUniqueComp(seen: StrMap Bool, outRev: Cell (List Value), label: String, kind: Int, detail: String, docMd: String, prefix: String): Void = {
+    if (strLen(label) > 0 && !strMapContains(seen, label)) {
+        let matches =
+            if (strLen(prefix) == 0) true
+            else strStartsWith(toLowerAscii(label), toLowerAscii(prefix));
+        if (matches) {
+            strMapInsert(seen, label, true);
+            cellSet(outRev, Cons(makeCompItem(label, kind, detail, docMd), cellGet(outRev)))
+        } else ()
+    } else ()
+}
+
+def completionKindForDef(d: Def): Int = match d.item {
+    ItAlg(_, _) -> 13,
+    ItAlias(_, _) -> 7,
+    ItConcept(_, _, _, _) -> 8,
+    ItInstance(_, _, _, _) -> 7,
+    ItExtern(_, _, _, _) -> 3,
+    ItForm(f) -> match f.node {
+        ExAbs(_, _, _) -> 3,
+        _ -> 6,
+    },
+}
+
+def collectDefsFromModuleItems(
+    src: String,
+    items: List ModuleItem,
+    onlyPub: Bool,
+    seen: StrMap Bool,
+    outRev: Cell (List Value),
+    prefix: String
+): Void = {
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(vis, d), r) -> {
+                if (!onlyPub || isPublicVis(vis)) {
+                    let sig = formatDefSig(d);
+                    let docMd = formatDocCommentMarkdown(src, d.dpos.start);
+                    match d.item {
+                        ItInstance(_, _, _, _) -> (),
+                        _ -> addUniqueComp(seen, outRev, d.ident, completionKindForDef(d), sig, docMd, prefix),
+                    };
+                    match d.item {
+                        ItAlg(_, vs) -> {
+                            let cv = cellNew(vs);
+                            while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                                match cellGet(cv) {
+                                    Cons(v, rv) -> {
+                                        addUniqueComp(seen, outRev, v.vname, 4, formatVariant(v), "", prefix);
+                                        cellSet(cv, rv)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        ItConcept(_, _, _, ms) -> {
+                            let cm = cellNew(ms);
+                            while (match cellGet(cm) { Nil -> false, _ -> true }) {
+                                match cellGet(cm) {
+                                    Cons(m, rm) -> {
+                                        addUniqueComp(seen, outRev, m.mname, 2, formatScheme(m.mty), "", prefix);
+                                        cellSet(cm, rm)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        _ -> (),
+                    }
+                } else ();
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    }
+}
+
+def collectBuiltinModuleExports(modKey: String, seen: StrMap Bool, outRev: Cell (List Value), prefix: String): Bool =
+    match builtinModuleSource(modKey) {
+        None -> false,
+        Some(src) -> {
+            match parseFileModuleInFile(src, Nil, 0) {
+                Ok(fm) -> {
+                    collectDefsFromModuleItems(src, fm.items, true, seen, outRev, prefix);
+                    true
+                },
+                Err(_) -> false,
+            }
+        },
+    }
+
+def resolveImportedAliasModKey(items: List ModuleItem, aliasName: String): Option String = {
+    let cur = cellNew(items);
+    let found: Cell (Option String) = cellNew(None);
+    while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, UseAlias(segs, al)), r) -> {
+                if (al == aliasName) cellSet(found, Some(strJoin(segs, "."))) else ();
+                cellSet(cur, r)
+            },
+            Cons(ModUse(_, UseSingle(segs)), r) -> {
+                let full = strJoin(segs, ".");
+                if (shortSymName(full) == aliasName) cellSet(found, Some(full)) else ();
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
+def extractDotQualifier(src: String, off: Int): (String, String) = {
+    let n = strLen(src);
+    let end = if (off < 0) 0 else if (off > n) n else off;
+    let p = cellNew(end);
+    while (cellGet(p) > 0 && isIdentContByte(strByteAt(src, cellGet(p) - 1))) {
+        cellSet(p, cellGet(p) - 1)
+    };
+    let partial = strSlice(src, cellGet(p), end);
+    if (cellGet(p) > 0 && strByteAt(src, cellGet(p) - 1) == 46) {
+        let qEnd = cellGet(p) - 1;
+        let qStart = cellNew(qEnd);
+        while (cellGet(qStart) > 0 && (isIdentContByte(strByteAt(src, cellGet(qStart) - 1)) || strByteAt(src, cellGet(qStart) - 1) == 46)) {
+            cellSet(qStart, cellGet(qStart) - 1)
+        };
+        (strSlice(src, cellGet(qStart), qEnd), partial)
+    } else {
+        ("", partial)
+    }
+}
+
+def linePrefixBefore(src: String, off: Int): String = {
+    let n = strLen(src);
+    let end = if (off < 0) 0 else if (off > n) n else off;
+    let s = cellNew(end);
+    while (cellGet(s) > 0 && strByteAt(src, cellGet(s) - 1) != 10) {
+        cellSet(s, cellGet(s) - 1)
+    };
+    strTrim(strSlice(src, cellGet(s), end))
+}
+
+def collectUseImportsCompletion(items: List ModuleItem, seen: StrMap Bool, outRev: Cell (List Value), prefix: String): Void = {
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseMulti(modSegs, specs) -> {
+                        let modKey = strJoin(modSegs, ".");
+                        let cs = cellNew(specs);
+                        while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                            match cellGet(cs) {
+                                Cons(sp, rs) -> {
+                                    addUniqueComp(seen, outRev, useSpecLocalName(sp), 3, "from " + modKey, "", prefix);
+                                    cellSet(cs, rs)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    UseSingle(segs) -> {
+                        let full = strJoin(segs, ".");
+                        addUniqueComp(seen, outRev, shortSymName(full), 3, "from " + full, "", prefix)
+                    },
+                    UseAlias(segs, al) -> {
+                        let full = strJoin(segs, ".");
+                        addUniqueComp(seen, outRev, al, 9, "alias for " + full, "", prefix)
+                    },
+                    UseGlob(segs) -> {
+                        let modKey = strJoin(segs, ".");
+                        let _ = collectBuiltinModuleExports(modKey, seen, outRev, prefix);
+                        ()
+                    },
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    }
+}
+
+def addBuiltinSubmodules(rootPrefix: String, seen: StrMap Bool, outRev: Cell (List Value), partial: String): Void = {
+    let want = rootPrefix + ".";
+    let cur = cellNew(builtinModuleKeys());
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(k, r) -> {
+                if (strStartsWith(k, want)) {
+                    let sub = strSlice(k, strLen(want), strLen(k));
+                    addUniqueComp(seen, outRev, sub, 9, "builtin module " + k, "", partial)
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def addGeishaKeywordsAndBuiltins(seen: StrMap Bool, outRev: Cell (List Value), prefix: String): Void = {
+    let kws = [
+        "def", "pub", "data", "type", "concept", "instance", "use", "mod",
+        "open", "as", "let", "in", "if", "else", "while", "match", "extern",
+        "noalloc", "init", "ptr", "forall", "true", "false",
+        "Void", "Int", "Int64", "Float", "Float32", "Bool", "Char", "String",
+        "List", "Cell", "MutArray", "ImmArray", "Ptr", "ForeignPtr", "ScopedPtr",
+        "Arena", "Send", "Task", "Actor", "Chan", "MVar", "AtomicInt",
+        "Nil", "Cons", "std", "sys"
+    ];
+    let ck = cellNew(kws);
+    while (match cellGet(ck) { Nil -> false, _ -> true }) {
+        match cellGet(ck) {
+            Cons(k, r) -> {
+                addUniqueComp(seen, outRev, k, 14, "keyword / builtin", "", prefix);
+                cellSet(ck, r)
+            },
+            Nil -> (),
+        }
+    };
+    let showInternal = strStartsWith(prefix, "__");
+    let cp = cellNew(preludePrimSpecs());
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons((nm, sig), r) -> {
+                if (showInternal || !strStartsWith(nm, "__")) {
+                    addUniqueComp(seen, outRev, nm, 3, sig, "", prefix)
+                } else ();
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def handleCompletion(ss: ServerState, params: Value): Value = {
+    let uriOpt = match objGet(params, "textDocument") {
+        Some(td) -> objGetStr(td, "uri"),
+        None -> None,
+    };
+    let posOpt = objGet(params, "position");
+    match (uriOpt, posOpt) {
+        (Some(uri), Some(pos)) -> match (strMapGet(ss.ssDocs, uri), objGetInt(pos, "line"), objGetInt(pos, "character")) {
+            (Some(doc), Some(line), Some(ch)) -> {
+                let off = lspPosToOffset(doc.dsText, line, ch);
+                let (qual, partial) = extractDotQualifier(doc.dsText, off);
+                let seen: StrMap Bool = strMapNew();
+                let itemsRev: Cell (List Value) = cellNew(Nil);
+
+                if (strLen(qual) > 0) {
+                    if (qual == "std" || qual == "sys") {
+                        addBuiltinSubmodules(qual, seen, itemsRev, partial)
+                    } else {
+                        let resolvedKey = match doc.dsParsed {
+                            Some(fm) -> match resolveImportedAliasModKey(fm.items, qual) {
+                                Some(rk) -> rk,
+                                None -> qual,
+                            },
+                            None -> qual,
+                        };
+                        let okBuiltin = collectBuiltinModuleExports(resolvedKey, seen, itemsRev, partial);
+                        if (!okBuiltin) {
+                            match doc.dsInfer {
+                                Some(inf) -> {
+                                    let pfx = resolvedKey + ".";
+                                    let cd = cellNew(inf.defs);
+                                    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                                        match cellGet(cd) {
+                                            Cons(d, r) -> {
+                                                if (strStartsWith(d.ident, pfx) && isPublicVis(d.vis)) {
+                                                    let shortName = strSlice(d.ident, strLen(pfx), strLen(d.ident));
+                                                    let sig = match d.item {
+                                                        ItForm(f) -> formatScheme(f.ty),
+                                                        _ -> formatDefSig(d),
+                                                    };
+                                                    let docMd = docForDef(doc.dsFiles, d);
+                                                    addUniqueComp(seen, itemsRev, shortName, completionKindForDef(d), sig, docMd, partial)
+                                                } else ();
+                                                cellSet(cd, r)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                },
+                                None -> (),
+                            }
+                        } else ()
+                    }
+                } else {
+                    let linePfx = linePrefixBefore(doc.dsText, off);
+                    if (strStartsWith(linePfx, "use ") || strStartsWith(linePfx, "pub use ")) {
+                        let ck = cellNew(builtinModuleKeys());
+                        while (match cellGet(ck) { Nil -> false, _ -> true }) {
+                            match cellGet(ck) {
+                                Cons(k, r) -> {
+                                    addUniqueComp(seen, itemsRev, k, 9, "builtin module", "", partial);
+                                    cellSet(ck, r)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    } else ();
+                    match doc.dsParsed {
+                        Some(fm) -> {
+                            collectDefsFromModuleItems(doc.dsText, fm.items, false, seen, itemsRev, partial);
+                            collectUseImportsCompletion(fm.items, seen, itemsRev, partial)
+                        },
+                        None -> (),
+                    };
+                    match doc.dsInfer {
+                        Some(inf) -> {
+                            let cd = cellNew(inf.defs);
+                            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                                match cellGet(cd) {
+                                    Cons(d, r) -> {
+                                        if (d.dpos.fileId == doc.dsFileId && !isSyntheticDerivedDef(d)) {
+                                            let sig = match d.item {
+                                                ItForm(f) -> formatScheme(f.ty),
+                                                _ -> formatDefSig(d),
+                                            };
+                                            addUniqueComp(seen, itemsRev, d.ident, completionKindForDef(d), sig, docForDef(doc.dsFiles, d), partial)
+                                        } else ();
+                                        cellSet(cd, r)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                        None -> (),
+                    };
+                    addGeishaKeywordsAndBuiltins(seen, itemsRev, partial)
+                };
+
+                VObj([
+                    ("isIncomplete", VBool(false)),
+                    ("items", VArr(listRev(cellGet(itemsRev)))),
+                ])
+            },
+            _ -> VArr(Nil),
+        },
+        _ -> VArr(Nil),
+    }
+}
+
+// ============================================================================
+// JSON-RPC Dispatcher & Main Loop
+// ============================================================================
+
+def handleInitialize(ss: ServerState, params: Value): Value = {
+    match objGetStr(params, "rootUri") {
+        Some(ru) -> cellSet(ss.ssRootDir, Some(uriToPath(ru))),
+        None -> match objGetStr(params, "rootPath") {
+            Some(rp) -> cellSet(ss.ssRootDir, Some(rp)),
+            None -> (),
+        },
+    };
+    VObj([
+        ("capabilities", VObj([
+            ("textDocumentSync", VObj([
+                ("openClose", VBool(true)),
+                ("change", VInt(intToI64(1))),
+                ("save", VObj([("includeText", VBool(true))])),
+            ])),
+            ("hoverProvider", VBool(true)),
+            ("definitionProvider", VBool(true)),
+            ("documentSymbolProvider", VBool(true)),
+            ("completionProvider", VObj([
+                ("triggerCharacters", VArr([VStr(".")])),
+            ])),
+        ])),
+        ("serverInfo", VObj([
+            ("name", VStr("geisha-lsp")),
+            ("version", VStr("0.1.0")),
+        ])),
+    ])
+}
+
+def handleDidOpen(ss: ServerState, params: Value): Void =
+    match objGet(params, "textDocument") {
+        Some(td) -> match (objGetStr(td, "uri"), objGetStr(td, "text")) {
+            (Some(uri), Some(text)) -> {
+                let ver = match objGetInt(td, "version") { Some(v) -> v, None -> 0 };
+                analyzeAndPublish(ss, uri, text, ver)
+            },
+            _ -> (),
+        },
+        None -> (),
+    }
+
+def handleDidChange(ss: ServerState, params: Value): Void =
+    match (objGet(params, "textDocument"), objGet(params, "contentChanges")) {
+        (Some(td), Some(VArr(changes))) -> match objGetStr(td, "uri") {
+            Some(uri) -> {
+                let ver = match objGetInt(td, "version") { Some(v) -> v, None -> 0 };
+                let lastText: Cell (Option String) = cellNew(None);
+                let cur = cellNew(changes);
+                while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                    match cellGet(cur) {
+                        Cons(ch, r) -> {
+                            match objGetStr(ch, "text") {
+                                Some(t) -> cellSet(lastText, Some(t)),
+                                None -> (),
+                            };
+                            cellSet(cur, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                match cellGet(lastText) {
+                    Some(text) -> analyzeAndPublish(ss, uri, text, ver),
+                    None -> (),
+                }
+            },
+            None -> (),
+        },
+        _ -> (),
+    }
+
+def handleDidSave(ss: ServerState, params: Value): Void =
+    match objGet(params, "textDocument") {
+        Some(td) -> match objGetStr(td, "uri") {
+            Some(uri) -> {
+                let prevVer = match strMapGet(ss.ssDocs, uri) {
+                    Some(doc) -> doc.dsVersion,
+                    None -> 0,
+                };
+                match objGetStr(params, "text") {
+                    Some(text) -> analyzeAndPublish(ss, uri, text, prevVer),
+                    None -> match strMapGet(ss.ssDocs, uri) {
+                        Some(doc) -> analyzeAndPublish(ss, uri, doc.dsText, doc.dsVersion),
+                        None -> (),
+                    },
+                }
+            },
+            None -> (),
+        },
+        None -> (),
+    }
+
+def handleDidClose(ss: ServerState, params: Value): Void =
+    match objGet(params, "textDocument") {
+        Some(td) -> match objGetStr(td, "uri") {
+            Some(uri) -> {
+                let prevOpt = strMapGet(ss.ssDocs, uri);
+                let path = uriToPath(uri);
+                clearStaleForeignDiag(prevOpt, uri, None);
+                let _ = strMapRemove(ss.ssCanonToUri, loaderCanonicalPath(path));
+                loaderRemoveOverlay(path);
+                untrackOpenUri(ss, uri);
+                let _ = strMapRemove(ss.ssDocs, uri);
+                sendRpcNotification("textDocument/publishDiagnostics", VObj([
+                    ("uri", VStr(uri)),
+                    ("diagnostics", VArr(Nil)),
+                ]));
+                refreshOtherOpenDocs(ss, uri)
+            },
+            None -> (),
+        },
+        None -> (),
+    }
+
+def validateLspArgs(args: List String): Result Void String = {
+    let cur = cellNew(args);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--stdio") {
+                    ()
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha lsp': '" + a + "' (usage: geisha lsp [--stdio])"))
+                } else {
+                    cellSet(errOpt, Some("unexpected argument for 'geisha lsp': '" + a + "' (usage: geisha lsp [--stdio])"))
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
+pub def cmdLsp(args: List String): Result Int String = {
+    validateLspArgs(args)?;
+    let ss = MkServerState {
+        ssDocs: strMapNew(),
+        ssCanonToUri: strMapNew(),
+        ssOpenUris: cellNew(Nil),
+        ssShuttingDown: cellNew(false),
+        ssRootDir: cellNew(None),
+    };
+    let reader = stdinReaderNew();
+    let running = cellNew(true);
+    let exitCode = cellNew(0);
+
+    while (cellGet(running)) {
+        match readLspMessage(reader) {
+            None -> cellSet(running, false),
+            Some(rawJson) -> match jsonParse(rawJson) {
+                Err(e) -> eprintLn("geisha lsp: invalid JSON-RPC payload: " + e),
+                Ok(msg) -> {
+                    let idOpt = objGet(msg, "id");
+                    let methodOpt = objGetStr(msg, "method");
+                    let params = match objGet(msg, "params") {
+                        Some(p) -> p,
+                        None -> VObj(Nil),
+                    };
+                    match methodOpt {
+                        None -> (),
+                        Some(method) ->
+                            if (method == "exit") {
+                                cellSet(exitCode, if (cellGet(ss.ssShuttingDown)) 0 else 1);
+                                cellSet(running, false)
+                            } else if (cellGet(ss.ssShuttingDown)) {
+                                match idOpt {
+                                    Some(idVal) -> sendRpcError(idVal, -32600, "Server is shutting down"),
+                                    None -> (),
+                                }
+                            } else if (method == "initialize") {
+                                let res = handleInitialize(ss, params);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, res), None -> () }
+                            } else if (method == "initialized") {
+                                ()
+                            } else if (method == "shutdown") {
+                                cellSet(ss.ssShuttingDown, true);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, VNull), None -> () }
+                            } else if (method == "textDocument/didOpen") {
+                                handleDidOpen(ss, params)
+                            } else if (method == "textDocument/didChange") {
+                                handleDidChange(ss, params)
+                            } else if (method == "textDocument/didSave") {
+                                handleDidSave(ss, params)
+                            } else if (method == "textDocument/didClose") {
+                                handleDidClose(ss, params)
+                            } else if (method == "textDocument/hover") {
+                                let res = handleHover(ss, params);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, res), None -> () }
+                            } else if (method == "textDocument/definition") {
+                                let res = handleDefinition(ss, params);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, res), None -> () }
+                            } else if (method == "textDocument/documentSymbol") {
+                                let res = handleDocumentSymbol(ss, params);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, res), None -> () }
+                            } else if (method == "textDocument/completion") {
+                                let res = handleCompletion(ss, params);
+                                match idOpt { Some(idVal) -> sendRpcResponse(idVal, res), None -> () }
+                            } else if (strStartsWith(method, "$/")) {
+                                ()
+                            } else {
+                                match idOpt {
+                                    Some(idVal) -> sendRpcError(idVal, -32601, "Method not found: " + method),
+                                    None -> (),
+                                }
+                            },
+                    }
+                },
+            },
+        }
+    };
+    Ok(cellGet(exitCode))
+}

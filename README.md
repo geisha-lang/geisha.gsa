@@ -97,7 +97,8 @@ geisha run hello.gsa
 | `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/iOS builder |
 | `src/doc.gsa` | Built-in `geisha doc` signature & `///` doc-comment extractor |
 | `src/bench.gsa` | Built-in `geisha bench` microbenchmark discovery, harness synthesis, and text/`--json` runner |
-| `src/geisha.gsa` | Unified CLI driver (`init`, `add`, `remove`, `fetch`, `update`, `build`, `check`, `run`, `eval`, `test`, `bench`, `doc`, `guide`) |
+| `src/lsp.gsa` | Built-in `geisha lsp` JSON-RPC 2.0 Language Server over stdio (diagnostics, hover, definition, document symbols, completion) |
+| `src/geisha.gsa` | Unified CLI driver (`init`, `add`, `remove`, `fetch`, `update`, `build`, `check`, `run`, `eval`, `test`, `bench`, `doc`, `fmt`, `guide`, `lsp`) |
 
 ---
 
