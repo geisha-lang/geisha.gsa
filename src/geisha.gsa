@@ -28,6 +28,7 @@ use codegen.{CguIr, MkCguIr, emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, em
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
 use codegen_wasmgc.{emitProgramWasmGc, writeWasmGcBinary, emitProgramWasmGcGlue, emitProgramWasmGcDts}
 use doc.cmdDoc
+use doctest.cmdDocTest
 use bench.cmdBench
 use fmt.cmdFmt
 use lsp.cmdLsp
@@ -101,6 +102,7 @@ data CliOpts {
         optRuntime: Option String,
         optInput: Option String,
         optJson: Bool,
+        optDocTest: Bool,
         optSingleCgu: Bool,
         optNoCache: Bool,
         optHelp: Bool,
@@ -180,6 +182,7 @@ def parseCliArgs(): Result CliOpts String = {
         let rtPath: Cell (Option String) = cellNew(None);
         let inPath: Cell (Option String) = cellNew(None);
         let jsonOut = cellNew(false);
+        let docTestFlag = cellNew(false);
         let showHelp = cellNew(false);
         let restArgsRev: Cell (List String) = cellNew(Nil);
         let afterDashDash = cellNew(false);
@@ -340,6 +343,23 @@ def parseCliArgs(): Result CliOpts String = {
             } else if (a == "--no-cache") {
                 cellSet(noCache, true);
                 cellSet(i, cellGet(i) + 1)
+            } else if (sub == "test" && a == "--doc") {
+                cellSet(docTestFlag, true);
+                cellSet(i, cellGet(i) + 1)
+            } else if (sub == "test" && a == "--filter") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing pattern after '--filter'"))
+                else {
+                    cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
+                    cellSet(restArgsRev, Cons(argAt(cellGet(i) + 1), cellGet(restArgsRev)));
+                    cellSet(i, cellGet(i) + 2)
+                }
+            } else if (sub == "test" && a == "--timeout") {
+                if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing milliseconds after '--timeout'"))
+                else {
+                    cellSet(restArgsRev, Cons(a, cellGet(restArgsRev)));
+                    cellSet(restArgsRev, Cons(argAt(cellGet(i) + 1), cellGet(restArgsRev)));
+                    cellSet(i, cellGet(i) + 2)
+                }
             } else if ((sub == "run" || sub == "check") && match cellGet(inPath) { None -> true, Some(_) -> false } && !strStartsWith(a, "-")) {
                 cellSet(inPath, Some(a));
                 cellSet(i, cellGet(i) + 1)
@@ -376,6 +396,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optRuntime: cellGet(rtPath),
                 optInput: cellGet(inPath),
                 optJson: cellGet(jsonOut),
+                optDocTest: cellGet(docTestFlag),
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
                 optHelp: cellGet(showHelp),
@@ -545,6 +566,7 @@ def parseCliArgs(): Result CliOpts String = {
                 optRuntime: cellGet(rtPath),
                 optInput: cellGet(inPath),
                 optJson: false,
+                optDocTest: false,
                 optSingleCgu: cellGet(singleCgu),
                 optNoCache: cellGet(noCache),
                 optHelp: cellGet(showHelp),
@@ -2724,6 +2746,12 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
         let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryLabel) + hostExeExt() };
         emitNativeExecutableFromIr(llText, outBin, tc, rtOpt)
     },
+    cbCheckSource: (entryLabel, srcText, rootSpec, extSpecs) -> {
+        diagReset();
+        let rawDefs = loadSingleSourceProgramWithPkgsNamed(entryLabel, srcText, rootSpec, extSpecs, Nil)?;
+        let inf = inferProgram(rawDefs)?;
+        lowerToCoreForCheck(inf)
+    },
     cbCompileNativeObj: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt) -> {
         let llText = compileWithPkgSpecsToIrDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
@@ -3117,9 +3145,9 @@ def printUsage(): Void = {
     printLn("  geisha check [file.gsa]        Fast frontend type/exhaustiveness/Send check (--json)");
     printLn("  geisha run [file.gsa] [args..] Build & run project or cached standalone script");
     printLn("  geisha eval '<code>' [args..]  Evaluate inline Geisha script (cached)");
-    printLn("  geisha test                    Build & run project test suite (tests/*.gsa)");
+    printLn("  geisha test [--doc]            Build & run project test suite (tests/*.gsa) or doctests (`--doc`)");
     printLn("  geisha bench [file|filter]     Run microbenchmarks (--iters N --warmup N --rounds N --filter <pat> --json)");
-    printLn("  geisha doc [module|file]       List modules or print public API signatures (--all)");
+    printLn("  geisha doc [module|file]       Inspect API signatures or generate static HTML/JSON docs (--html, --out <dir>, --json, --all)");
     printLn("  geisha fmt [options] [paths..] Format .gsa files in-place (--check, --write, --stdout)");
     printLn("  geisha guide                   Print compact Geisha language & pitfall guide for Agents");
     printLn("  geisha lsp                     Start JSON-RPC Language Server over stdio");
@@ -3235,7 +3263,9 @@ def runDriver(): Result Int String = {
                     },
             },
             Some("eval") -> runEvalSubcmd(opts.optSubArgs, opts.optRuntime),
-            Some("test") -> { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
+            Some("test") ->
+                if (opts.optDocTest) { cmdDocTest(opts.optSubArgs, opts.optRuntime, cbs)?; Ok(0) }
+                else { cmdTest(opts.optRuntime, cbs)?; Ok(0) },
             Some("bench") -> cmdBench(opts.optSubArgs, opts.optJson, opts.optRuntime, cbs),
             Some("doc") -> { cmdDoc(opts.optSubArgs)?; Ok(0) },
             Some("fmt") -> cmdFmt(opts.optSubArgs),
