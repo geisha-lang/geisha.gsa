@@ -1025,6 +1025,80 @@ def main() -> int:
             client.notify("textDocument/didChange", {"textDocument": {"uri": u, "version": 2}, "contentChanges": [{"text": t}]})
             assert client.wait_diag_for(u) == []
 
+        # 11h-7: Inline `ModSub` lexical scope conflict check:
+        # (a) Unaliased `use m2.load` + `def fetchA` in same `pub mod inner` -> rejected (-32602)
+        # (b) `def fetchA` in independent sibling `pub mod other` -> allowed!
+        # (c) Aliased `use m2.load as loadA` + `def fetchA` in same `pub mod inner` -> allowed!
+        ms_dir = root / "modsub_conflict_proj"
+        ms_dir.mkdir(parents=True)
+        m2_path = ms_dir / "m2.gsa"
+        ms_user_path = ms_dir / "ms_user.gsa"
+        m2_src = "pub def load(): Int = 7\n"
+        ms_conflict_src = (
+            "pub mod inner {\n"
+            "    use m2.load\n"
+            "    def fetchA(): Int = 93\n"
+            "    pub def run(): Int = load() + fetchA()\n"
+            "}\n"
+        )
+        m2_path.write_text(m2_src, encoding="utf-8")
+        ms_user_path.write_text(ms_conflict_src, encoding="utf-8")
+        m2_uri = path_to_uri(m2_path)
+        ms_user_uri = path_to_uri(ms_user_path)
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": m2_uri, "languageId": "geisha", "version": 1, "text": m2_src}})
+        assert client.wait_diag_for(m2_uri) == []
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": ms_user_uri, "languageId": "geisha", "version": 1, "text": ms_conflict_src}})
+        assert client.wait_diag_for(ms_user_uri) == []
+
+        # (a) Same ModSub conflict -> must reject with -32602
+        ren_ms_bad = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "error" in ren_ms_bad and ren_ms_bad["error"]["code"] == -32602, f"expected -32602 on ModSub unaliased conflict: {ren_ms_bad}"
+
+        # (b) Independent sibling ModSub with `fetchA` -> allowed!
+        ms_sibling_src = (
+            "pub mod inner {\n"
+            "    use m2.load\n"
+            "    pub def run(): Int = load()\n"
+            "}\n"
+            "pub mod other {\n"
+            "    pub def fetchA(): Int = 93\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 2}, "contentChanges": [{"text": ms_sibling_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_ms_sib = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "result" in ren_ms_sib and ms_user_uri in ren_ms_sib["result"]["changes"], f"expected sibling ModSub rename allowed: {ren_ms_sib}"
+
+        # (c) Explicit alias `use m2.load as loadA` + `def fetchA` in same ModSub -> allowed!
+        ms_alias_src = (
+            "pub mod inner {\n"
+            "    use m2.load as loadA\n"
+            "    def fetchA(): Int = 93\n"
+            "    pub def run(): Int = loadA() + fetchA()\n"
+            "}\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 3}, "contentChanges": [{"text": ms_alias_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_ms_al = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "result" in ren_ms_al and ms_user_uri in ren_ms_al["result"]["changes"], f"expected aliased ModSub rename allowed: {ren_ms_al}"
+        new_ms_al = apply_edits(ms_alias_src, ren_ms_al["result"]["changes"][ms_user_uri])
+        assert "use m2.fetchA as loadA" in new_ms_al and "loadA() + fetchA()" in new_ms_al, f"unexpected aliased ModSub rename: {new_ms_al!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

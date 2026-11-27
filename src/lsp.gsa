@@ -3624,6 +3624,28 @@ def docImportsTargetUnaliased(items: List ModuleItem, targetQn: String, origName
     cellGet(found)
 }
 
+def checkScopeUnaliasedImportConflict(items: List ModuleItem, targetQn: String, origName: String, newName: String): Bool = {
+    if (docImportsTargetUnaliased(items, targetQn, origName) && moduleHasBindingNamed(items, newName, -1, -1)) {
+        true
+    } else {
+        let cur = cellNew(items);
+        let found = cellNew(false);
+        while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(ModSub(_, _, subItems, _), r) -> {
+                    if (checkScopeUnaliasedImportConflict(subItems, targetQn, origName, newName)) {
+                        cellSet(found, true)
+                    } else ();
+                    cellSet(cur, r)
+                },
+                Cons(_, r) -> cellSet(cur, r),
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    }
+}
+
 def collectTypeAnnotOccsInForm(
     uri: String, src: String, f: Form, fileId: Int, typeName: String,
     seen: StrMap Bool, outRev: Cell (List OccSpan)
@@ -3898,10 +3920,8 @@ def collectSymbolOccurrences(
                                                     if (moduleHasBindingNamed(fm.items, nn, target.stDeclDefStart, target.stDeclDefEnd)) {
                                                         cellSet(conflict, Some("Symbol '" + nn + "' already exists in this module"))
                                                     } else ()
-                                                } else if (docImportsTargetUnaliased(fm.items, targetQn, target.stName)) {
-                                                    if (moduleHasBindingNamed(fm.items, nn, -1, -1)) {
-                                                        cellSet(conflict, Some("Renaming to '" + nn + "' conflicts with an existing binding in '" + wd.wdPath + "'"))
-                                                    } else ()
+                                                } else if (checkScopeUnaliasedImportConflict(fm.items, targetQn, target.stName, nn)) {
+                                                    cellSet(conflict, Some("Renaming to '" + nn + "' conflicts with an existing binding in '" + wd.wdPath + "'"))
                                                 } else (),
                                             None -> (),
                                         },
