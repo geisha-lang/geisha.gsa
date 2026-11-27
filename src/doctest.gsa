@@ -491,6 +491,8 @@ def collectGsaFilesRec(dir: String, outRev: Cell (List String)): Void =
         },
     }
 
+// Fold only line-ending `\r+\n` (handling both `\r\n` and Windows text-mode `\r\r\n`) to `\n`,
+// preserving standalone `\r` bytes (e.g. `"A\rB"`).
 def normalizeCrLf(s: String): String = {
     let n = strLen(s);
     let b = bufNew();
@@ -499,11 +501,25 @@ def normalizeCrLf(s: String): String = {
         let idx = cellGet(i);
         let c = strByteAt(s, idx);
         if (c == 13) {
-            ()
+            let j = cellNew(idx);
+            while (cellGet(j) < n && strByteAt(s, cellGet(j)) == 13) {
+                cellSet(j, cellGet(j) + 1)
+            };
+            if (cellGet(j) < n && strByteAt(s, cellGet(j)) == 10) {
+                bufPushByte(b, 10);
+                cellSet(i, cellGet(j) + 1)
+            } else {
+                let k = cellNew(idx);
+                while (cellGet(k) < cellGet(j)) {
+                    bufPushByte(b, 13);
+                    cellSet(k, cellGet(k) + 1)
+                };
+                cellSet(i, cellGet(j))
+            }
         } else {
-            bufPushByte(b, c)
-        };
-        cellSet(i, idx + 1)
+            bufPushByte(b, c);
+            cellSet(i, idx + 1)
+        }
     };
     bufToString(b)
 }

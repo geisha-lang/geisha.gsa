@@ -6979,7 +6979,9 @@ EOF
         exit 1
     fi
 
-    # Short write (`RLIMIT_FSIZE`) must fail without truncating existing live files
+    # Short write (`RLIMIT_FSIZE` smaller than existing file!) must fail without truncating existing live files,
+    # and pre-existing user file `app.js.geisha-doc-tmp` must remain untouched.
+    printf 'user-owned-tmp-sentinel\n' > "$T44_CASE_SITE/app.js.geisha-doc-tmp"
     T44_ORIG_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
     cat > "$T44_CASE_PROJ/src/writer2.gsa" << 'EOF'
 /// Big doc update that exceeds RLIMIT_FSIZE to verify short-write rollback safety.
@@ -6992,7 +6994,8 @@ pub def bigFn6(): Int = 6
 pub def bigFn7(): Int = 7
 pub def bigFn8(): Int = 8
 EOF
-    T44_SW_LIMIT=$((T44_ORIG_SZ + 200))
+    T44_SW_LIMIT=$((T44_ORIG_SZ - 400))
+    if [ "$T44_SW_LIMIT" -lt 1024 ]; then T44_SW_LIMIT=1024; fi
     set +e
     python3 -c 'import resource, subprocess, sys
 lim = int(sys.argv[1])
@@ -7003,7 +7006,24 @@ sys.exit(r.returncode)' "$T44_SW_LIMIT" "$T44_GEISHA_BIN" "$T44_CASE_SITE" "$T44
     set -e
     T44_AFTER_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
     if [ "$T44_SW_RC" -eq 0 ] || [ "$T44_AFTER_SZ" != "$T44_ORIG_SZ" ] || ! grep -q 'v3Api' "$T44_CASE_SITE/modules/caseproj.writer2.html"; then
-        echo "FAIL [doc_short_write_rollback]: RLIMIT_FSIZE short write must fail without truncating live file (orig=$T44_ORIG_SZ after=$T44_AFTER_SZ rc=$T44_SW_RC)" >&2
+        echo "FAIL [doc_short_write_rollback]: RLIMIT_FSIZE (< orig) short write must fail without truncating live file (orig=$T44_ORIG_SZ after=$T44_AFTER_SZ rc=$T44_SW_RC)" >&2
+        exit 1
+    fi
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if [ ! -f "$T44_CASE_SITE/app.js.geisha-doc-tmp" ] || ! grep -q 'user-owned-tmp-sentinel' "$T44_CASE_SITE/app.js.geisha-doc-tmp"; then
+        echo "FAIL [doc_preserve_user_tmp_file]: pre-existing app.js.geisha-doc-tmp must not be overwritten or deleted" >&2
+        exit 1
+    fi
+    # Stale deletion failure (`chmod 555 modules/` while removing `writer2.gsa`) must roll back `src/` and `index.html` too
+    rm -f "$T44_CASE_PROJ/src/writer2.gsa"
+    chmod 555 "$T44_CASE_SITE/modules"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_STALE_RB_RC=$?
+    set -e
+    chmod 755 "$T44_CASE_SITE/modules"
+    if [ "$T44_STALE_RB_RC" -eq 0 ] || [ ! -f "$T44_CASE_SITE/src/caseproj.writer2.html" ] || ! grep -q 'caseproj.writer2.html' "$T44_CASE_SITE/index.html"; then
+        echo "FAIL [doc_stale_del_fail_rollback]: stale deletion failure must roll back src/ and index.html" >&2
         exit 1
     fi
 
@@ -7038,6 +7058,23 @@ EOF
 T44_MODDOC_OUT="$("$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_MODDOC")"
 if ! printf '%s' "$T44_MODDOC_OUT" | grep -q "Doctest summary: 1 passed, 0 failed, 0 ignored (1 total)."; then
     echo "FAIL [doctest_moddoc_crlf]: expected //! module doctest + CRLF expect to pass, got: $T44_MODDOC_OUT" >&2
+    exit 1
+fi
+# Standalone `\r` inside `"A\rB"` must NOT be stripped to match `// expect: AB`
+T44_BARE_CR="$TMP_DIR/t44_bare_cr.gsa"
+cat > "$T44_BARE_CR" << 'EOF'
+/// ```geisha
+/// printLn("A\rB")
+/// // expect: AB
+/// ```
+pub def ok(): Int = 1
+EOF
+set +e
+"$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_BARE_CR" >/dev/null 2>&1
+T44_BARE_CR_RC=$?
+set -e
+if [ "$T44_BARE_CR_RC" -eq 0 ]; then
+    echo "FAIL [doctest_preserve_bare_cr]: printLn(\"A\\rB\") must NOT match // expect: AB" >&2
     exit 1
 fi
 echo "PASS [geisha_doc_doctest_regressions]: compile_fail CC isolation, lexer doc scan, lstat symlink guard, scoped type links, DOM search, stale cleanup, module targets, //! & CRLF"

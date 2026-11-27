@@ -13,6 +13,11 @@ use sys.env.hostOs
 use sys.fs.{mkdirAll, writeFile, readFile, readDir, fileExists, removeFile, renameFile}
 
 extern "gs_sys_lstat_kind" def c_site_lstat_kind(path: String): Int
+extern "gs_sys_getpid" def c_site_getpid(): Int
+extern "gs_sys_fopen" def c_site_fopen(path: String, mode: String): Ptr
+extern "fclose" def c_site_fclose(fp: Ptr): Int
+
+def gSiteTmpSeq: Cell Int = cellNew(0)
 
 pub data DocItem {
     MkDocItem {
@@ -1329,46 +1334,140 @@ def ensureRealDir(dir: String): Result Void String = {
     }
 }
 
-// Write `content` to `path` safely:
-//   1. Refuse symlink/junction (`3`/`4`) or directory (`2`) targets.
-//   2. Pre-write to a same-volume temporary file and verify full byte length before touching
-//      `path` so short writes (e.g. RLIMIT_FSIZE / ENOSPC) never truncate the live target file.
-//   3. Write `path`, verify full byte length, and clean up the temporary file.
-def writeDocFileSafe(path: String, content: String): Result Void String = {
-    let k = c_site_lstat_kind(path);
-    if (k == 3 || k == 4) Err("refusing to overwrite symlinked doc output file: " + path)
-    else if (k == 2) Err("refusing to overwrite directory as doc output file: " + path)
+// Allocate a collision-free sibling path using PID + monotonic counter, verified unused via `lstat`.
+def allocUniqueSiblingPath(basePath: String, tag: String): String = {
+    let pidStr = intToStr(c_site_getpid());
+    let cand = cellNew("");
+    let found = cellNew(false);
+    while (!cellGet(found)) {
+        let seq = cellGet(gSiteTmpSeq) + 1;
+        cellSet(gSiteTmpSeq, seq);
+        let p = basePath + "." + tag + "-" + pidStr + "-" + intToStr(seq);
+        if (c_site_lstat_kind(p) == 0) {
+            cellSet(cand, p);
+            cellSet(found, true)
+        } else ()
+    };
+    cellGet(cand)
+}
+
+def checkExistingFileWritable(path: String): Result Void String = {
+    let fp = c_site_fopen(path, "r+b");
+    if (ptrIsNull(fp)) Err("existing doc output file is not writable: " + path)
     else {
-        let wantLen = strLen(content);
-        let tmpPath = path + ".geisha-doc-tmp";
-        let tk = c_site_lstat_kind(tmpPath);
-        if (tk == 3 || tk == 4 || tk == 2) {
-            Err("refusing to use unsafe temp doc output path: " + tmpPath)
-        } else {
-            match writeFile(tmpPath, content) {
-                Err(e) -> {
+        let _ = c_site_fclose(fp);
+        Ok(())
+    }
+}
+
+// Write `content` to a brand-new unique sibling temporary file and verify full byte length
+// before touching the live target (prevents short-write truncation and never overwrites user files).
+def writeVerifiedTempFile(basePath: String, content: String): Result String String = {
+    let wantLen = strLen(content);
+    let tmpPath = allocUniqueSiblingPath(basePath, "geisha-stage");
+    match writeFile(tmpPath, content) {
+        Err(e) -> {
+            let _ = removeFile(tmpPath);
+            Err(e)
+        },
+        Ok(()) -> match readFile(tmpPath) {
+            Err(e) -> {
+                let _ = removeFile(tmpPath);
+                Err("failed to verify staged doc output file: " + e)
+            },
+            Ok(chk) ->
+                if (strLen(chk) != wantLen) {
                     let _ = removeFile(tmpPath);
-                    Err(e)
+                    Err("short write detected for doc output file: " + basePath)
+                } else {
+                    Ok(tmpPath)
                 },
-                Ok(()) -> match readFile(tmpPath) {
-                    Err(e) -> {
-                        let _ = removeFile(tmpPath);
-                        Err("failed to verify temp doc output file: " + e)
-                    },
-                    Ok(chk) ->
-                        if (strLen(chk) != wantLen) {
-                            let _ = removeFile(tmpPath);
-                            Err("short write detected for doc output file: " + path)
-                        } else {
-                            let _ = removeFile(tmpPath);
-                            writeFile(path, content)?;
-                            match readFile(path) {
-                                Ok(chk2) if (strLen(chk2) == wantLen) -> Ok(()),
-                                _ -> Err("short write detected while committing doc output file: " + path),
+        },
+    }
+}
+
+data TxOp {
+    TxCreated(String),
+    TxReplaced(String, String),
+    TxDeleted(String, String),
+    TxRenamed(String, String),
+}
+
+def rollbackTxOps(ops: List TxOp): Option String = {
+    let errOpt: Cell (Option String) = cellNew(None);
+    let cur = cellNew(ops);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(op, r) -> {
+                match op {
+                    TxCreated(livePath) ->
+                        if (c_site_lstat_kind(livePath) != 0 && !removeFile(livePath)) {
+                            match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to remove created file: " + livePath)),
+                                Some(_) -> (),
                             }
+                        } else (),
+                    TxReplaced(livePath, bkpPath) -> {
+                        let _ = removeFile(livePath);
+                        match renameFile(bkpPath, livePath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to restore " + livePath + ": " + e)),
+                                Some(_) -> (),
+                            },
+                        }
+                    },
+                    TxDeleted(livePath, bkpPath) ->
+                        match renameFile(bkpPath, livePath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to restore deleted file " + livePath + ": " + e)),
+                                Some(_) -> (),
+                            },
                         },
-                },
-            }
+                    TxRenamed(oldPath, newPath) ->
+                        match renameFile(newPath, oldPath) {
+                            Ok(()) -> (),
+                            Err(e) -> match cellGet(errOpt) {
+                                None -> cellSet(errOpt, Some("rollback failed to undo rename " + newPath + ": " + e)),
+                                Some(_) -> (),
+                            },
+                        },
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(errOpt)
+}
+
+def cleanupTxBackups(ops: List TxOp): Void = {
+    let cur = cellNew(ops);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(op, r) -> {
+                match op {
+                    TxReplaced(_, bkpPath) -> { let _ = removeFile(bkpPath); () },
+                    TxDeleted(_, bkpPath) -> { let _ = removeFile(bkpPath); () },
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    }
+}
+
+def cleanupTempFiles(tmps: List (String, String)): Void = {
+    let cur = cellNew(tmps);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((_, tmpPath), r) -> {
+                let _ = removeFile(tmpPath);
+                cellSet(cur, r)
+            },
+            Nil -> (),
         }
     }
 }
@@ -1393,23 +1492,6 @@ def stripKnownSubdirPrefix(rel: String): (String, String) =
     if (strStartsWith(rel, "modules/")) ("modules", strSlice(rel, 8, strLen(rel)))
     else if (strStartsWith(rel, "src/")) ("src", strSlice(rel, 4, strLen(rel)))
     else ("", rel)
-
-def rollbackWrittenFiles(outDir: String, backups: List (String, Option String)): Void = {
-    let cur = cellNew(backups);
-    while (match cellGet(cur) { Nil -> false, _ -> true }) {
-        match cellGet(cur) {
-            Cons((rel, origOpt), r) -> {
-                let full = pathJoin(outDir, rel);
-                match origOpt {
-                    Some(orig) -> { let _ = writeFile(full, orig); () },
-                    None -> { let _ = removeFile(full); () },
-                };
-                cellSet(cur, r)
-            },
-            Nil -> (),
-        }
-    }
-}
 
 pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): Result Void String = {
     let modDir = pathJoin(outDir, "modules");
@@ -1472,167 +1554,189 @@ pub def generateDocSite(site: DocSiteData, outDir: String, emitDocJson: Bool): R
     } else ();
     stageFile("index.html", renderIndexPage(site));
 
-    // Include a union `.geisha-doc-manifest` (new + previously tracked entries) in the
-    // transactional write phase BEFORE any stale file is deleted: if `.geisha-doc-manifest`
-    // is read-only or fails to write, every newly written file is rolled back and zero old
-    // pages are deleted.
-    let unionPrevRev: Cell (List String) = cellNew(Nil);
-    let cu = cellNew(prevFiles);
-    while (match cellGet(cu) { Nil -> false, _ -> true }) {
-        match cellGet(cu) {
-            Cons(rawRel, ru) -> {
-                let rel = strTrim(rawRel);
-                if (isSafeRelManifestPath(rel)) {
-                    match strMapGet(generatedSet, rel) {
-                        None -> cellSet(unionPrevRev, Cons(rel, cellGet(unionPrevRev))),
-                        Some(_) -> (),
-                    }
-                } else ();
-                cellSet(cu, ru)
-            },
-            Nil -> (),
-        }
-    };
-    let generatedLines = listRev(cellGet(generatedRev));
-    let unionManifestContent = match listRev(cellGet(unionPrevRev)) {
-        Nil -> strJoin(generatedLines, "\n") + "\n",
-        up -> strJoin(generatedLines, "\n") + "\n" + strJoin(up, "\n") + "\n",
-    };
-    cellSet(stagedRev, Cons((".geisha-doc-manifest", unionManifestContent), cellGet(stagedRev)));
+    // Include `.geisha-doc-manifest` in the same atomic rename transaction so any failure
+    // (including read-only manifest, short write, or stale deletion failure) rolls back ALL
+    // created, replaced, renamed, and deleted files cleanly via `renameFile`.
+    let finalManifestContent = strJoin(listRev(cellGet(generatedRev)), "\n") + "\n";
+    cellSet(stagedRev, Cons((".geisha-doc-manifest", finalManifestContent), cellGet(stagedRev)));
 
-    // 2. Transactional publish with pre-write backup recording and full rollback on any
-    //    write/short-write/permission/symlink failure.
+    // 2. Pre-stage every new file into a unique verified sibling temp file AND validate every
+    //    live target path BEFORE modifying a single live file.
     let staged = listRev(cellGet(stagedRev));
-    let backupsRev: Cell (List (String, Option String)) = cellNew(Nil);
-    let writeErrOpt: Cell (Option String) = cellNew(None);
-    let cs = cellNew(staged);
-    while (match cellGet(writeErrOpt) { None -> true, Some(_) -> false } && match cellGet(cs) { Nil -> false, _ -> true }) {
-        match cellGet(cs) {
+    let readyRev: Cell (List (String, String)) = cellNew(Nil);
+    let stageErrOpt: Cell (Option String) = cellNew(None);
+    let cs0 = cellNew(staged);
+    while (match cellGet(stageErrOpt) { None -> true, Some(_) -> false } && match cellGet(cs0) { Nil -> false, _ -> true }) {
+        match cellGet(cs0) {
             Cons((rel, content), rs) -> {
                 let full = pathJoin(outDir, rel);
                 let k = c_site_lstat_kind(full);
                 if (k == 3 || k == 4) {
-                    cellSet(writeErrOpt, Some("refusing to overwrite symlinked doc output file: " + full))
+                    cellSet(stageErrOpt, Some("refusing to overwrite symlinked doc output file: " + full))
                 } else if (k == 2) {
-                    cellSet(writeErrOpt, Some("refusing to overwrite directory as doc output file: " + full))
+                    cellSet(stageErrOpt, Some("refusing to overwrite directory as doc output file: " + full))
+                } else if (k < 0) {
+                    cellSet(stageErrOpt, Some("cannot inspect existing doc output file: " + full))
                 } else {
-                    let prevOptRes =
-                        if (k == 1) {
-                            match readFile(full) {
-                                Ok(orig) -> Ok(Some(orig)),
-                                Err(e) -> Err(e),
-                            }
-                        } else if (k == 0) {
-                            Ok(None)
-                        } else {
-                            Err("cannot inspect existing doc output file: " + full)
-                        };
-                    match prevOptRes {
-                        Err(e) -> cellSet(writeErrOpt, Some(e)),
-                        Ok(prevOpt) -> {
-                            // Record backup BEFORE writing so even a partial/short write is rolled back.
-                            cellSet(backupsRev, Cons((rel, prevOpt), cellGet(backupsRev)));
-                            match writeDocFileSafe(full, content) {
-                                Err(e) -> cellSet(writeErrOpt, Some(e)),
-                                Ok(()) -> (),
-                            }
+                    let writableRes =
+                        if (k == 1) checkExistingFileWritable(full)
+                        else Ok(());
+                    match writableRes {
+                        Err(e) -> cellSet(stageErrOpt, Some(e)),
+                        Ok(()) -> match writeVerifiedTempFile(full, content) {
+                            Err(e) -> cellSet(stageErrOpt, Some(e)),
+                            Ok(tmpPath) -> cellSet(readyRev, Cons((rel, tmpPath), cellGet(readyRev))),
                         },
                     }
                 };
-                cellSet(cs, rs)
+                cellSet(cs0, rs)
             },
             Nil -> (),
         }
     };
 
-    match cellGet(writeErrOpt) {
+    match cellGet(stageErrOpt) {
         Some(e) -> {
-            rollbackWrittenFiles(outDir, cellGet(backupsRev));
+            cleanupTempFiles(cellGet(readyRev));
             Err(e)
         },
         None -> {
-            // 3. Clean stale artifacts using actual directory entries (`readDir`), propagating errors.
-            let modDirEntries = buildDirEntrySet(modDir)?;
-            let srcDirEntries = buildDirEntrySet(srcDir)?;
-            let retainedRev: Cell (List String) = cellNew(Nil);
-            let cleanupErrOpt: Cell (Option String) = cellNew(None);
-            let cp = cellNew(prevFiles);
-            while (match cellGet(cp) { Nil -> false, _ -> true }) {
-                match cellGet(cp) {
-                    Cons(rawRel, rp) -> {
-                        let rel = strTrim(rawRel);
-                        if (isSafeRelManifestPath(rel)) {
-                            match strMapGet(generatedSet, rel) {
-                                None -> {
-                                    let skipDelete = match strMapGet(generatedLowerMap, asciiToLower(rel)) {
-                                        Some(newRel) -> {
-                                            let (oldDirTag, oldBase) = stripKnownSubdirPrefix(rel);
-                                            let (newDirTag, newBase) = stripKnownSubdirPrefix(newRel);
-                                            if (oldDirTag == newDirTag && (oldDirTag == "modules" || oldDirTag == "src")) {
-                                                let entries = if (oldDirTag == "modules") modDirEntries else srcDirEntries;
-                                                let hasOld = match strMapGet(entries, oldBase) { Some(_) -> true, None -> false };
-                                                let hasNew = match strMapGet(entries, newBase) { Some(_) -> true, None -> false };
-                                                if (hasOld && hasNew) {
-                                                    false
-                                                } else if (hasOld && !hasNew) {
-                                                    match renameFile(pathJoin(outDir, rel), pathJoin(outDir, newRel)) {
-                                                        Ok(()) -> (),
-                                                        Err(re) -> {
-                                                            cellSet(retainedRev, Cons(rel, cellGet(retainedRev)));
-                                                            match cellGet(cleanupErrOpt) {
-                                                                None -> cellSet(cleanupErrOpt, Some(re)),
-                                                                Some(_) -> (),
-                                                            }
-                                                        },
-                                                    };
-                                                    true
-                                                } else {
-                                                    true
-                                                }
-                                            } else false
+            // 3. Atomic `renameFile` swap of all staged files + transactional stale cleanup.
+            //    Every live file replacement/deletion moves the old file to a unique backup path
+            //    so rollback is pure `renameFile` (never re-writes or truncates under RLIMIT_FSIZE).
+            let ready = listRev(cellGet(readyRev));
+            let txLogRev: Cell (List TxOp) = cellNew(Nil);
+            let txErrOpt: Cell (Option String) = cellNew(None);
+            let remainingRev: Cell (List (String, String)) = cellNew(Nil);
+
+            let cr = cellNew(ready);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((rel, tmpPath), rest) -> {
+                        match cellGet(txErrOpt) {
+                            Some(_) -> cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev))),
+                            None -> {
+                                let full = pathJoin(outDir, rel);
+                                let k = c_site_lstat_kind(full);
+                                if (k == 1) {
+                                    let bkpPath = allocUniqueSiblingPath(full, "geisha-bkp");
+                                    match renameFile(full, bkpPath) {
+                                        Err(e) -> {
+                                            cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                            cellSet(txErrOpt, Some(e))
                                         },
-                                        None -> false,
-                                    };
-                                    if (!skipDelete) {
-                                        let full = pathJoin(outDir, rel);
-                                        let stKind = c_site_lstat_kind(full);
-                                        if (stKind == 0) {
-                                            ()
-                                        } else if (stKind == 1) {
-                                            let removed = removeFile(full);
-                                            if (!removed || c_site_lstat_kind(full) != 0) {
-                                                cellSet(retainedRev, Cons(rel, cellGet(retainedRev)));
-                                                match cellGet(cleanupErrOpt) {
-                                                    None -> cellSet(cleanupErrOpt, Some("failed to remove stale doc artifact: " + full)),
-                                                    Some(_) -> (),
-                                                }
-                                            } else ()
-                                        } else {
-                                            cellSet(retainedRev, Cons(rel, cellGet(retainedRev)));
-                                            match cellGet(cleanupErrOpt) {
-                                                None -> cellSet(cleanupErrOpt, Some("cannot safely remove stale doc artifact: " + full)),
-                                                Some(_) -> (),
-                                            }
-                                        }
-                                    } else ()
-                                },
-                                Some(_) -> (),
-                            }
-                        } else ();
-                        cellSet(cp, rp)
+                                        Ok(()) -> match renameFile(tmpPath, full) {
+                                            Ok(()) -> cellSet(txLogRev, Cons(TxReplaced(full, bkpPath), cellGet(txLogRev))),
+                                            Err(e) -> {
+                                                let _ = renameFile(bkpPath, full);
+                                                cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                                cellSet(txErrOpt, Some(e))
+                                            },
+                                        },
+                                    }
+                                } else if (k == 0) {
+                                    match renameFile(tmpPath, full) {
+                                        Ok(()) -> cellSet(txLogRev, Cons(TxCreated(full), cellGet(txLogRev))),
+                                        Err(e) -> {
+                                            cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                            cellSet(txErrOpt, Some(e))
+                                        },
+                                    }
+                                } else {
+                                    cellSet(remainingRev, Cons((rel, tmpPath), cellGet(remainingRev)));
+                                    cellSet(txErrOpt, Some("unexpected target state for doc output file: " + full))
+                                }
+                            },
+                        };
+                        cellSet(cr, rest)
                     },
                     Nil -> (),
                 }
             };
-            let manifestLines = listRev(cellGet(generatedRev));
-            let manifestContent = match listRev(cellGet(retainedRev)) {
-                Nil -> strJoin(manifestLines, "\n") + "\n",
-                ret -> strJoin(manifestLines, "\n") + "\n" + strJoin(ret, "\n") + "\n",
-            };
-            writeDocFileSafe(manifestPath, manifestContent)?;
-            match cellGet(cleanupErrOpt) {
-                Some(e) -> Err(e),
-                None -> Ok(()),
+
+            // 4. Transactional stale cleanup (inside the same rollback scope):
+            //    move stale files to unique backup paths; if ANY stale removal fails, roll back
+            //    the entire transaction (restoring old site, old pages, and old manifest).
+            if (match cellGet(txErrOpt) { None -> true, Some(_) -> false }) {
+                match buildDirEntrySet(modDir) {
+                    Err(e) -> cellSet(txErrOpt, Some(e)),
+                    Ok(modDirEntries) -> match buildDirEntrySet(srcDir) {
+                        Err(e) -> cellSet(txErrOpt, Some(e)),
+                        Ok(srcDirEntries) -> {
+                            let cp = cellNew(prevFiles);
+                            while (match cellGet(txErrOpt) { None -> true, Some(_) -> false } && match cellGet(cp) { Nil -> false, _ -> true }) {
+                                match cellGet(cp) {
+                                    Cons(rawRel, rp) -> {
+                                        let rel = strTrim(rawRel);
+                                        if (isSafeRelManifestPath(rel)) {
+                                            match strMapGet(generatedSet, rel) {
+                                                None -> {
+                                                    let skipDelete = match strMapGet(generatedLowerMap, asciiToLower(rel)) {
+                                                        Some(newRel) -> {
+                                                            let (oldDirTag, oldBase) = stripKnownSubdirPrefix(rel);
+                                                            let (newDirTag, newBase) = stripKnownSubdirPrefix(newRel);
+                                                            if (oldDirTag == newDirTag && (oldDirTag == "modules" || oldDirTag == "src")) {
+                                                                let entries = if (oldDirTag == "modules") modDirEntries else srcDirEntries;
+                                                                let hasOld = match strMapGet(entries, oldBase) { Some(_) -> true, None -> false };
+                                                                let hasNew = match strMapGet(entries, newBase) { Some(_) -> true, None -> false };
+                                                                if (hasOld && hasNew) {
+                                                                    false
+                                                                } else if (hasOld && !hasNew) {
+                                                                    let oldFull = pathJoin(outDir, rel);
+                                                                    let newFull = pathJoin(outDir, newRel);
+                                                                    match renameFile(oldFull, newFull) {
+                                                                        Ok(()) -> cellSet(txLogRev, Cons(TxRenamed(oldFull, newFull), cellGet(txLogRev))),
+                                                                        Err(re) -> cellSet(txErrOpt, Some(re)),
+                                                                    };
+                                                                    true
+                                                                } else {
+                                                                    true
+                                                                }
+                                                            } else false
+                                                        },
+                                                        None -> false,
+                                                    };
+                                                    if (!skipDelete && match cellGet(txErrOpt) { None -> true, Some(_) -> false }) {
+                                                        let full = pathJoin(outDir, rel);
+                                                        let stKind = c_site_lstat_kind(full);
+                                                        if (stKind == 0) {
+                                                            ()
+                                                        } else if (stKind == 1) {
+                                                            let bkpPath = allocUniqueSiblingPath(full, "geisha-del");
+                                                            match renameFile(full, bkpPath) {
+                                                                Ok(()) -> cellSet(txLogRev, Cons(TxDeleted(full, bkpPath), cellGet(txLogRev))),
+                                                                Err(re) -> cellSet(txErrOpt, Some("failed to remove stale doc artifact: " + full + " (" + re + ")")),
+                                                            }
+                                                        } else {
+                                                            cellSet(txErrOpt, Some("cannot safely remove stale doc artifact: " + full))
+                                                        }
+                                                    } else ()
+                                                },
+                                                Some(_) -> (),
+                                            }
+                                        } else ();
+                                        cellSet(cp, rp)
+                                    },
+                                    Nil -> (),
+                                }
+                            }
+                        },
+                    },
+                }
+            } else ();
+
+            match cellGet(txErrOpt) {
+                None -> {
+                    cleanupTxBackups(cellGet(txLogRev));
+                    Ok(())
+                },
+                Some(e) -> {
+                    cleanupTempFiles(cellGet(remainingRev));
+                    match rollbackTxOps(cellGet(txLogRev)) {
+                        None -> Err(e),
+                        Some(rbErr) -> Err(e + " (rollback error: " + rbErr + ")"),
+                    }
+                },
             }
         },
     }
