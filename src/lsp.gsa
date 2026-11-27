@@ -44,7 +44,7 @@ use loader.{
     loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay
 }
 use infer.{InferOutput, inferProgram, preludePrimSpecs}
-use core.lowerToCore
+use core.lowerToCoreForCheck
 use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, sanitizeIdentAlias}
@@ -600,7 +600,7 @@ def buildDiagWithTarget(ss: ServerState, docUri: String, docPath: String, docTex
 def runFrontendCheck(path: String, text: String, rootSpec: PkgSpec, extSpecs: List PkgSpec): Result InferOutput String = {
     let rawDefs = loadSingleSourceProgramWithPkgsNamed(path, text, rootSpec, extSpecs, Nil)?;
     let inf = inferProgram(rawDefs)?;
-    let _ = lowerToCore(inf)?;
+    lowerToCoreForCheck(inf)?;
     Ok(inf)
 }
 

@@ -183,8 +183,8 @@ def extractModuleItems(
     items: List ModuleItem,
     inlineOut: Cell (List LoadedMod)
 ): (List (Visibility, Def), List (Visibility, UseItem), List String) = {
-    let defs = cellNew(Nil);
-    let imps = cellNew(Nil);
+    let defsRev = cellNew(Nil);
+    let impsRev = cellNew(Nil);
     let subs = cellNew(Nil);
     let cur = cellNew(items);
     let curKey = strJoin(modPath, ".");
@@ -192,11 +192,11 @@ def extractModuleItems(
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(ModDef(vis, d), r) -> {
-                cellSet(defs, listAppend(cellGet(defs), [(vis, d)]));
+                cellSet(defsRev, Cons((vis, d), cellGet(defsRev)));
                 cellSet(cur, r)
             },
             Cons(ModUse(vis, u), r) -> {
-                cellSet(imps, listAppend(cellGet(imps), [(vis, u)]));
+                cellSet(impsRev, Cons((vis, u), cellGet(impsRev)));
                 cellSet(cur, r)
             },
             Cons(ModDecl(_, childName), r) -> {
@@ -223,7 +223,7 @@ def extractModuleItems(
             Nil -> (),
         }
     };
-    (cellGet(defs), cellGet(imps), cellGet(subs))
+    (listRev(cellGet(defsRev)), listRev(cellGet(impsRev)), cellGet(subs))
 }
 
 def resolveModFilePathInDir(srcRoot: String, segs: List String): Option String = match segs {
@@ -930,8 +930,8 @@ def resolveModuleImports(
     avail: StrMap NameInfo,
     allExportKeys: Vec String
 ): Result (List (String, String), List (String, String)) String = {
-    let mappings: Cell (List (String, String)) = cellNew(Nil);
-    let modAliases: Cell (List (String, String)) = cellNew(Nil);
+    let mappingsRev: Cell (List (String, String)) = cellNew(Nil);
+    let modAliasesRev: Cell (List (String, String)) = cellNew(Nil);
     let errCell: Cell (Option String) = cellNew(None);
     let cur = cellNew(imports);
 
@@ -944,12 +944,12 @@ def resolveModuleImports(
                 match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
-                            cellSet(mappings, listAppend(cellGet(mappings), [(itemName, info.qualifiedName)]))
+                            cellSet(mappingsRev, Cons((itemName, info.qualifiedName), cellGet(mappingsRev)))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
                     None -> {
                         match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
                             Some(canonMod) ->
-                                cellSet(modAliases, listAppend(cellGet(modAliases), [(itemName, canonMod)])),
+                                cellSet(modAliasesRev, Cons((itemName, canonMod), cellGet(modAliasesRev))),
                             None ->
                                 cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
                         }
@@ -964,12 +964,12 @@ def resolveModuleImports(
                 match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
-                            cellSet(mappings, listAppend(cellGet(mappings), [(alias, info.qualifiedName)]))
+                            cellSet(mappingsRev, Cons((alias, info.qualifiedName), cellGet(mappingsRev)))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
                     None -> {
                         match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
                             Some(canonMod) ->
-                                cellSet(modAliases, listAppend(cellGet(modAliases), [(alias, canonMod)])),
+                                cellSet(modAliasesRev, Cons((alias, canonMod), cellGet(modAliasesRev))),
                             None ->
                                 cellSet(errCell, Some("item '" + itemName + "' not found in module '" + modStr + "'")),
                         }
@@ -990,7 +990,7 @@ def resolveModuleImports(
                                     match strMapGet(avail, fullKey) {
                                         Some(info) ->
                                             if (info.isPublic || info.definedInMod == curMod) {
-                                                cellSet(mappings, listAppend(cellGet(mappings), [(useSpecLocalName(sp), info.qualifiedName)]))
+                                                cellSet(mappingsRev, Cons((useSpecLocalName(sp), info.qualifiedName), cellGet(mappingsRev)))
                                             } else cellSet(errCell, Some("cannot import private item '" + sp.orig + "' from module '" + baseStr + "'")),
                                         None -> cellSet(errCell, Some("item '" + sp.orig + "' not found in module '" + baseStr + "'")),
                                     };
@@ -1017,7 +1017,7 @@ def resolveModuleImports(
                                     match strMapGet(avail, k) {
                                         Some(info) ->
                                             if (info.isPublic && info.definedInMod == "") {
-                                                cellSet(mappings, listAppend(cellGet(mappings), [(k, info.qualifiedName)]))
+                                                cellSet(mappingsRev, Cons((k, info.qualifiedName), cellGet(mappingsRev)))
                                             } else (),
                                         None -> (),
                                     }
@@ -1028,7 +1028,7 @@ def resolveModuleImports(
                                     match strMapGet(avail, k) {
                                         Some(info) ->
                                             if (info.isPublic) {
-                                                cellSet(mappings, listAppend(cellGet(mappings), [(rem, info.qualifiedName)]))
+                                                cellSet(mappingsRev, Cons((rem, info.qualifiedName), cellGet(mappingsRev)))
                                             } else (),
                                         None -> (),
                                     }
@@ -1046,7 +1046,7 @@ def resolveModuleImports(
 
     match cellGet(errCell) {
         Some(e) -> Err(e),
-        None -> Ok((cellGet(mappings), cellGet(modAliases))),
+        None -> Ok((listRev(cellGet(mappingsRev)), listRev(cellGet(modAliasesRev)))),
     }
 }
 
@@ -1606,13 +1606,13 @@ def compileLoadedCache(
 
     let stateMap: StrMap Int = strMapNew();
     let topoOut: Cell (List String) = cellNew(Nil);
-    let allKeyList = cellNew(Nil);
+    let allKeyListRev = cellNew(Nil);
     let i2 = cellNew(0);
     while (cellGet(i2) < totalMods) {
-        cellSet(allKeyList, listAppend(cellGet(allKeyList), [vecGetOr(orderKeys, cellGet(i2), "")]));
+        cellSet(allKeyListRev, Cons(vecGetOr(orderKeys, cellGet(i2), ""), cellGet(allKeyListRev)));
         cellSet(i2, cellGet(i2) + 1)
     };
-    topoVisitList(cellGet(allKeyList), depsMap, stateMap, topoOut)?;
+    topoVisitList(listRev(cellGet(allKeyListRev)), depsMap, stateMap, topoOut)?;
     let topoKeys = cellGet(topoOut);
 
     let avail: StrMap NameInfo = strMapNew();
@@ -1629,9 +1629,9 @@ def compileLoadedCache(
         match cellGet(curT) {
             Cons(mk, rT) -> {
                 let pref = mk;
-                let ownV = cellNew(Nil);
-                let ownT = cellNew(Nil);
-                let ownC = cellNew(Nil);
+                let ownVRev = cellNew(Nil);
+                let ownTRev = cellNew(Nil);
+                let ownCRev = cellNew(Nil);
                 match strMapGet(cache, mk) {
                     Some(m) -> {
                         let curD = cellNew(m.defs);
@@ -1651,11 +1651,11 @@ def compileLoadedCache(
                                         _ -> (),
                                     };
                                     if (pref != "") {
-                                        cellSet(ownV, listAppend(cellGet(ownV), [(orig, qname)]));
+                                        cellSet(ownVRev, Cons((orig, qname), cellGet(ownVRev)));
                                         match d.item {
-                                            ItAlg(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
-                                            ItAlias(_, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
-                                            ItConcept(_, _, _, _) -> cellSet(ownT, listAppend(cellGet(ownT), [(orig, qname)])),
+                                            ItAlg(_, _) -> cellSet(ownTRev, Cons((orig, qname), cellGet(ownTRev))),
+                                            ItAlias(_, _) -> cellSet(ownTRev, Cons((orig, qname), cellGet(ownTRev))),
+                                            ItConcept(_, _, _, _) -> cellSet(ownTRev, Cons((orig, qname), cellGet(ownTRev))),
                                             _ -> (),
                                         }
                                     } else ();
@@ -1673,8 +1673,8 @@ def compileLoadedCache(
                                                             definedInMod: pref,
                                                         });
                                                         if (pref != "") {
-                                                            cellSet(ownV, listAppend(cellGet(ownV), [(vd.vname, qctor)]));
-                                                            cellSet(ownC, listAppend(cellGet(ownC), [(vd.vname, qctor)]))
+                                                            cellSet(ownVRev, Cons((vd.vname, qctor), cellGet(ownVRev)));
+                                                            cellSet(ownCRev, Cons((vd.vname, qctor), cellGet(ownCRev)))
                                                         } else ();
                                                         cellSet(curV, rV)
                                                     },
@@ -1694,7 +1694,7 @@ def compileLoadedCache(
                                                             definedInMod: pref,
                                                         });
                                                         if (pref != "") {
-                                                            cellSet(ownV, listAppend(cellGet(ownV), [(md.mname, qm)]))
+                                                            cellSet(ownVRev, Cons((md.mname, qm), cellGet(ownVRev)))
                                                         } else ();
                                                         cellSet(curM, rM)
                                                     },
@@ -1712,9 +1712,9 @@ def compileLoadedCache(
                     },
                     None -> (),
                 };
-                strMapInsert(modOwnVals, mk, cellGet(ownV));
-                strMapInsert(modOwnTys, mk, cellGet(ownT));
-                strMapInsert(modOwnCtors, mk, cellGet(ownC));
+                strMapInsert(modOwnVals, mk, listRev(cellGet(ownVRev)));
+                strMapInsert(modOwnTys, mk, listRev(cellGet(ownTRev)));
+                strMapInsert(modOwnCtors, mk, listRev(cellGet(ownCRev)));
                 cellSet(curT, rT)
             },
             Nil -> (),
@@ -1733,7 +1733,7 @@ def compileLoadedCache(
         registerExport(avail, allExportKeys, "std.actor.Actor", MkNameInfo { qualifiedName: "Actor", isPublic: true, definedInMod: "std.actor" })
     } else ();
 
-    let outDefs: Cell (List Def) = cellNew(Nil);
+    let outDefsRev: Cell (List Def) = cellNew(Nil);
     let curM2 = cellNew(topoKeys);
     let errFinal: Cell (Option String) = cellNew(None);
 
@@ -1926,7 +1926,7 @@ def compileLoadedCache(
                                                 },
                                                 _ -> (),
                                             };
-                                            cellSet(outDefs, listAppend(cellGet(outDefs), [rw]));
+                                            cellSet(outDefsRev, Cons(rw, cellGet(outDefsRev)));
                                             cellSet(curDefs, rDef)
                                         },
                                         Nil -> (),
@@ -1950,7 +1950,7 @@ def compileLoadedCache(
 
     match cellGet(errFinal) {
         Some(e) -> Err(e),
-        None -> Ok(cellGet(outDefs)),
+        None -> Ok(listRev(cellGet(outDefsRev))),
     }
 }
 

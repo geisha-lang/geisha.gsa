@@ -4529,8 +4529,8 @@ def synthesizeDerivedMethodImpls(
 
 def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) String = {
     // Pass 4: Process Instance declarations & synthesize concrete/generic method `Def`s
-    let synthDefs = cellNew(Nil);
-    let userInstList = cellNew(Nil);
+    let synthDefsRev = cellNew(Nil);
+    let userInstListRev = cellNew(Nil);
     let cur4 = cellNew(rawDefs);
     while (match cellGet(cur4) { Nil -> false, _ -> true }) {
         match cellGet(cur4) {
@@ -4656,13 +4656,13 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
                                                     annot: Some(mScm),
                                                     node: mi.implBody.node,
                                                 };
-                                                cellSet(synthDefs, listAppend(cellGet(synthDefs), [MkDef {
+                                                cellSet(synthDefsRev, Cons(MkDef {
                                                     ident: mangledFn,
                                                     dpos: d.dpos,
                                                     vis: VisPublic,
                                                     attrs: Nil,
                                                     item: ItForm(bform),
-                                                }]))
+                                                }, cellGet(synthDefsRev)))
                                             },
                                         };
                                         cellSet(cm, rm)
@@ -4680,7 +4680,7 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
                                 methodImpls: implMap,
                             };
                             cellSet(ctx.instanceReg, Cons(instInfo, cellGet(ctx.instanceReg)));
-                            cellSet(userInstList, listAppend(cellGet(userInstList), [(instInfo, d.dpos)]))
+                            cellSet(userInstListRev, Cons((instInfo, d.dpos), cellGet(userInstListRev)))
                         },
                     },
                     _ -> (),
@@ -4692,7 +4692,7 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
     };
 
     // Pass 4.5: Verify every user instance satisfies all superclass instances
-    let cur4b = cellNew(cellGet(userInstList));
+    let cur4b = cellNew(listRev(cellGet(userInstListRev)));
     while (match cellGet(cur4b) { Nil -> false, _ -> true }) {
         match cellGet(cur4b) {
             Cons((instInfo, sp), r) -> {
@@ -4720,7 +4720,7 @@ def inferPass4Instances(ctx: InferCtx, rawDefs: List Def): Result (List Def) Str
         }
     };
 
-    Ok(cellGet(synthDefs))
+    Ok(listRev(cellGet(synthDefsRev)))
 }
 
 def pinHeadAdtModeToLocal(modeAdtSet: StrMap Bool, ty: Type): Type = match ty {

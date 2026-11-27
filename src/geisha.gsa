@@ -22,7 +22,7 @@ use loader.{
     loadSingleSourceProgramWithPkgsNamed, loadProjectProgramWithPkgs
 }
 use infer.inferProgram
-use core.{lowerToCore, lowerToCoreForCheck}
+use core.{lowerToCore, lowerToCoreOpt, lowerToCoreForCheck}
 use core_dump.dumpCoreProgramSExpr
 use codegen.{CguIr, MkCguIr, emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForTarget, emitProgramLlvmIrForTargetDebug, emitProgramLlvmIrCgusForTargetDebug}
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
@@ -737,7 +737,7 @@ def compileLoadedDefsToIrForArchDebug(
     debugInfo: Bool
 ): Result String String = {
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCore(inf)?;
+    let coreProg = lowerToCoreOpt(inf, true, !debugInfo)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     Ok(emitProgramLlvmIrForTargetDebug(
         coreProg, isWasm, targetArch, if (isWasm) "wasm" else currentHostOs(), exports, noMain, bootSymOpt, debugInfo
@@ -1643,7 +1643,7 @@ def compileLoadedDefsToCgusForArchDebug(
     singleCgu: Bool
 ): Result (List CguIr) String = {
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCore(inf)?;
+    let coreProg = lowerToCoreOpt(inf, true, !debugInfo)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let targetOs = if (isWasm) "wasm" else currentHostOs();
     if (singleCgu) {

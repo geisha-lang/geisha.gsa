@@ -4830,4 +4830,83 @@ EOF
 "$ABS_GEISHA_42" --runtime "$ABS_RT_42" -o "$TMP_DIR/t42_rt_perf" "$TMP_DIR/t42_rt_perf.gsa"
 assert_eq "par_tabulate_small_and_gc_coalesce" "4000" "$("$TMP_DIR/t42_rt_perf")"
 
+echo "[Test 43] Strict 32-bit Int literal diagnostics & cross-module Core leaf inlining / SIMD fabs..."
+cat > "$TMP_DIR/t43_bad_int1.gsa" << 'EOF'
+def main(): Void = { let x = 3000000000; let _ = x; () }
+EOF
+cat > "$TMP_DIR/t43_bad_int2.gsa" << 'EOF'
+def main(): Void = { let x = 18446744073709551616; let _ = x; () }
+EOF
+cat > "$TMP_DIR/t43_bad_int3.gsa" << 'EOF'
+def main(): Void = { let x = -2147483649; let _ = x; () }
+EOF
+for bf in "$TMP_DIR/t43_bad_int1.gsa" "$TMP_DIR/t43_bad_int2.gsa" "$TMP_DIR/t43_bad_int3.gsa"; do
+    set +e
+    T43_ERR="$("$GEISHA_BIN" check "$bf" 2>&1)"
+    T43_RC=$?
+    set -e
+    if [ "$T43_RC" -eq 0 ] || ! printf "%s" "$T43_ERR" | grep -q "out of 32-bit Int range" || ! printf "%s" "$T43_ERR" | grep -q "append '.0' for Float"; then
+        echo "FAIL [strict_int32_literal_diag]: expected range error with hint for $bf, got rc=$T43_RC: $T43_ERR" >&2
+        exit 1
+    fi
+done
+echo "PASS [strict_int32_literal_diag]: out-of-range decimal integer literals rejected with span hint"
+PASS=$((PASS + 1))
+
+cat > "$TMP_DIR/t43_leaf_simd.gsa" << 'EOF'
+use std.math.{abs, fma}
+use std.bits.popCount
+use std.option.{Option, Some, None, unwrapOr}
+use std.str.{intToStr, floatToStr}
+
+def clampF(x: Float, lo: Float, hi: Float): Float =
+    if (x < lo) lo else if (x > hi) hi else x
+
+def stepMetric(x: Float): Float = clampF(fma(abs(x), 1.0, 0.0), 0.0, 100.0)
+
+def sumAbsArr(arr: MutArray Float, n: Int): Float = {
+    let acc = cellNew(0.0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        cellSet(acc, cellGet(acc) + abs(arrayGet(arr, idx)));
+        cellSet(i, idx + 1)
+    };
+    cellGet(acc)
+}
+
+def main(): Void = {
+    let min32 = -2147483648;
+    let max32 = 2147483647;
+    let arr = arrayNew(64, -2.5);
+    arraySet(arr, 7, 12.5);
+    let s = sumAbsArr(arr, 64);
+    let m = stepMetric(-150.0) + stepMetric(42.5);
+    let pc = popCount(255) + unwrapOr(Some(10), 0) + unwrapOr(None, 5) + (min32 + max32);
+    printLn(floatToStr(s) + "|" + floatToStr(m) + "|" + intToStr(pc))
+}
+EOF
+"$GEISHA_BIN" -e -o "$TMP_DIR/t43_leaf_simd.ll" "$TMP_DIR/t43_leaf_simd.gsa"
+T43_REL_FN="$(sed -n '/^define .*@sumAbsArr(/,/^}/p' "$TMP_DIR/t43_leaf_simd.ll")"
+if [ -z "$T43_REL_FN" ] || printf "%s\n" "$T43_REL_FN" | grep -q '@std\.math\.abs' || ! printf "%s\n" "$T43_REL_FN" | grep -q '@llvm\.fabs\.f64'; then
+    echo "FAIL [leaf_inline_std_math_abs]: expected std.math.abs to inline to @llvm.fabs.f64 in sumAbsArr IR" >&2
+    exit 1
+fi
+if printf "%s\n" "$T43_REL_FN" | grep -q '@gc_safepoint_slow'; then
+    echo "FAIL [leaf_inline_no_loop_safepoint]: expected zero @gc_safepoint_slow in inlined sumAbsArr loop" >&2
+    exit 1
+fi
+"$GEISHA_BIN" -g -e -o "$TMP_DIR/t43_leaf_dbg.ll" "$TMP_DIR/t43_leaf_simd.gsa"
+T43_DBG_FN="$(sed -n '/^define .*@sumAbsArr(/,/^}/p' "$TMP_DIR/t43_leaf_dbg.ll")"
+if [ -z "$T43_DBG_FN" ] || ! printf "%s\n" "$T43_DBG_FN" | grep -q '@std\.math\.abs'; then
+    echo "FAIL [leaf_inline_disabled_in_debug]: expected -g debug build to preserve @std.math.abs call" >&2
+    exit 1
+fi
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t43_leaf_simd" "$TMP_DIR/t43_leaf_simd.gsa"
+assert_eq "leaf_inline_native_run" "170.0|142.5|22" "$("$TMP_DIR/t43_leaf_simd")"
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t43_leaf_simd.mjs" "$TMP_DIR/t43_leaf_simd.gsa"
+    assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
+fi
+
 echo "All $PASS end-to-end test suites passed!"
