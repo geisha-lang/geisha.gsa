@@ -1,0 +1,1333 @@
+// Canonical Geisha Source Code Formatter (`geisha fmt [--check] [--write] [--stdout] [paths...]`)
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.{listRev, listAppend}
+use std.vec.{Vec, vecNew, vecPush, vecPop, vecLen, vecGetOr}
+use std.buf.{StringBuf, bufNew, bufPushByte, bufPushStr, bufToString}
+use std.char.{isDigitByte, isIdentStartByte, isIdentContByte, isUpperByte, isLowerByte}
+use std.str.{strStartsWith, strEndsWith, intToStr}
+use std.path.pathJoin
+use sys.fs.{fileExists, isDir, readFile, readDir}
+use sys.io.{print, eprintLn}
+use ast.sortUniqueStrings
+use lexer.isOpByte
+use diag.{diagReset, diagRegisterFile}
+use parser.parseFileModuleInFile
+use pkg.findProjectRoot
+
+extern "gs_sys_write_atomic" def c_fmt_write_atomic(path: String, buf: String, len: Int64, mode: Int): Int
+
+def writeFileAtomicSafe(path: String, content: String): Result Void String =
+    if (c_fmt_write_atomic(path, content, intToI64(strLen(content)), -1) == 0) Ok(())
+    else Err("failed to atomically write file: " + path)
+
+// ============================================================================
+// Lossless Token Stream (Preserving Comments, Raw Literals, Shebang, Newlines)
+// ============================================================================
+
+data FTokKind {
+    FtIdent,
+    FtKeyword,
+    FtInt,
+    FtFloat,
+    FtStr,
+    FtChar,
+    FtSym,
+    FtQuestion,
+    FtLParen,
+    FtRParen,
+    FtLBrace,
+    FtRBrace,
+    FtLBracket,
+    FtRBracket,
+    FtComma,
+    FtSemi,
+    FtDot,
+    FtLineComment,
+    FtBlockComment,
+    FtShebang,
+    FtNewline,
+}
+
+data FTok {
+    MkFTok { kind: FTokKind, raw: String },
+}
+
+def emptyFTok(): FTok = MkFTok { kind: FtNewline, raw: "" }
+
+def isKeywordWord(w: String): Bool =
+    w == "def"
+    || w == "extern"
+    || w == "if"
+    || w == "else"
+    || w == "while"
+    || w == "let"
+    || w == "in"
+    || w == "type"
+    || w == "data"
+    || w == "match"
+    || w == "concept"
+    || w == "instance"
+    || w == "forall"
+    || w == "pub"
+    || w == "use"
+    || w == "mod"
+    || w == "open"
+    || w == "as"
+    || w == "true"
+    || w == "false"
+    || w == "Void"
+
+def isTriviaTok(t: FTok): Bool = match t.kind {
+    FtLineComment -> true,
+    FtBlockComment -> true,
+    FtShebang -> true,
+    FtNewline -> true,
+    _ -> false,
+}
+
+def isRadixDigit(b: Int, radix: Int): Bool =
+    if (radix == 16) {
+        (b >= 48 && b <= 57) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+    } else if (radix == 8) {
+        b >= 48 && b <= 55
+    } else if (radix == 2) {
+        b == 48 || b == 49
+    } else {
+        isDigitByte(b)
+    }
+
+def trimTrailingSpaces(src: String, start: Int, end: Int): String = {
+    let e = cellNew(end);
+    while (cellGet(e) > start && (strByteAt(src, cellGet(e) - 1) == 32 || strByteAt(src, cellGet(e) - 1) == 9 || strByteAt(src, cellGet(e) - 1) == 13)) {
+        cellSet(e, cellGet(e) - 1)
+    };
+    strSlice(src, start, cellGet(e))
+}
+
+def normalizeBlockComment(src: String, start: Int, end: Int): String = {
+    let b = bufNew();
+    let i = cellNew(start);
+    while (cellGet(i) < end) {
+        let cur = cellGet(i);
+        let ch = strByteAt(src, cur);
+        if (ch == 13 && cur + 1 < end && strByteAt(src, cur + 1) == 10) {
+            cellSet(i, cur + 1)
+        } else {
+            bufPushByte(b, ch);
+            cellSet(i, cur + 1)
+        }
+    };
+    bufToString(b)
+}
+
+def lexForFmt(src: String): Vec FTok = {
+    let len = strLen(src);
+    let out: Vec FTok = vecNew();
+    let i = cellNew(0);
+
+    // Preserve optional Unix shebang (`#!...`) on line 1
+    if (len >= 2 && strByteAt(src, 0) == 35 && strByteAt(src, 1) == 33) {
+        cellSet(i, 2);
+        while (cellGet(i) < len && strByteAt(src, cellGet(i)) != 10) {
+            cellSet(i, cellGet(i) + 1)
+        };
+        vecPush(out, MkFTok { kind: FtShebang, raw: trimTrailingSpaces(src, 0, cellGet(i)) })
+    } else ();
+
+    while (cellGet(i) < len) {
+        let start = cellGet(i);
+        let b = strByteAt(src, start);
+
+        if (b == 32 || b == 9 || b == 13) {
+            cellSet(i, start + 1)
+        } else if (b == 10) {
+            vecPush(out, MkFTok { kind: FtNewline, raw: "\n" });
+            cellSet(i, start + 1)
+        } else if (b == 47 && start + 1 < len && strByteAt(src, start + 1) == 47) {
+            cellSet(i, start + 2);
+            while (cellGet(i) < len && strByteAt(src, cellGet(i)) != 10) {
+                cellSet(i, cellGet(i) + 1)
+            };
+            vecPush(out, MkFTok { kind: FtLineComment, raw: trimTrailingSpaces(src, start, cellGet(i)) })
+        } else if (b == 47 && start + 1 < len && strByteAt(src, start + 1) == 42) {
+            cellSet(i, start + 2);
+            let closed = cellNew(false);
+            while (cellGet(i) + 1 < len && !cellGet(closed)) {
+                let k = cellGet(i);
+                if (strByteAt(src, k) == 42 && strByteAt(src, k + 1) == 47) {
+                    cellSet(i, k + 2);
+                    cellSet(closed, true)
+                } else {
+                    cellSet(i, k + 1)
+                }
+            };
+            if (!cellGet(closed)) cellSet(i, len) else ();
+            vecPush(out, MkFTok { kind: FtBlockComment, raw: normalizeBlockComment(src, start, cellGet(i)) })
+        } else if (b == 40) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtLParen, raw: "(" })
+        } else if (b == 41) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtRParen, raw: ")" })
+        } else if (b == 123) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtLBrace, raw: "{" })
+        } else if (b == 125) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtRBrace, raw: "}" })
+        } else if (b == 91) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtLBracket, raw: "[" })
+        } else if (b == 93) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtRBracket, raw: "]" })
+        } else if (b == 44) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtComma, raw: "," })
+        } else if (b == 59) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtSemi, raw: ";" })
+        } else if (b == 46) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtDot, raw: "." })
+        } else if (isIdentStartByte(b)) {
+            cellSet(i, start + 1);
+            while (cellGet(i) < len && isIdentContByte(strByteAt(src, cellGet(i)))) {
+                cellSet(i, cellGet(i) + 1)
+            };
+            let word = strSlice(src, start, cellGet(i));
+            let k = if (isKeywordWord(word)) FtKeyword else FtIdent;
+            vecPush(out, MkFTok { kind: k, raw: word })
+        } else if (isDigitByte(b)) {
+            let radix =
+                if (b == 48 && start + 1 < len) {
+                    let b1 = strByteAt(src, start + 1);
+                    if (b1 == 120 || b1 == 88) 16
+                    else if (b1 == 111 || b1 == 79) 8
+                    else if (b1 == 98 || b1 == 66) 2
+                    else 10
+                } else 10;
+            if (radix != 10) {
+                cellSet(i, start + 2);
+                while (cellGet(i) < len && (isRadixDigit(strByteAt(src, cellGet(i)), radix) || strByteAt(src, cellGet(i)) == 95)) {
+                    cellSet(i, cellGet(i) + 1)
+                };
+                vecPush(out, MkFTok { kind: FtInt, raw: strSlice(src, start, cellGet(i)) })
+            } else {
+                cellSet(i, start + 1);
+                while (cellGet(i) < len && (isDigitByte(strByteAt(src, cellGet(i))) || strByteAt(src, cellGet(i)) == 95)) {
+                    cellSet(i, cellGet(i) + 1)
+                };
+                let isFloat = cellNew(false);
+                if (cellGet(i) + 1 < len && strByteAt(src, cellGet(i)) == 46 && isDigitByte(strByteAt(src, cellGet(i) + 1))) {
+                    cellSet(isFloat, true);
+                    cellSet(i, cellGet(i) + 1);
+                    while (cellGet(i) < len && (isDigitByte(strByteAt(src, cellGet(i))) || strByteAt(src, cellGet(i)) == 95)) {
+                        cellSet(i, cellGet(i) + 1)
+                    };
+                    if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 101 || strByteAt(src, cellGet(i)) == 69)) {
+                        let expSave = cellGet(i);
+                        cellSet(i, expSave + 1);
+                        if (cellGet(i) < len && (strByteAt(src, cellGet(i)) == 43 || strByteAt(src, cellGet(i)) == 45)) {
+                            cellSet(i, cellGet(i) + 1)
+                        } else ();
+                        let dStart = cellGet(i);
+                        while (cellGet(i) < len && (isDigitByte(strByteAt(src, cellGet(i))) || strByteAt(src, cellGet(i)) == 95)) {
+                            cellSet(i, cellGet(i) + 1)
+                        };
+                        if (cellGet(i) == dStart) cellSet(i, expSave) else ()
+                    } else ()
+                } else ();
+                let k = if (cellGet(isFloat)) FtFloat else FtInt;
+                vecPush(out, MkFTok { kind: k, raw: strSlice(src, start, cellGet(i)) })
+            }
+        } else if (b == 34) {
+            cellSet(i, start + 1);
+            let doneStr = cellNew(false);
+            while (cellGet(i) < len && !cellGet(doneStr)) {
+                let cur = cellGet(i);
+                let ch = strByteAt(src, cur);
+                if (ch == 34) {
+                    cellSet(i, cur + 1);
+                    cellSet(doneStr, true)
+                } else if (ch == 92 && cur + 1 < len) {
+                    cellSet(i, cur + 2)
+                } else {
+                    cellSet(i, cur + 1)
+                }
+            };
+            vecPush(out, MkFTok { kind: FtStr, raw: strSlice(src, start, cellGet(i)) })
+        } else if (b == 39) {
+            if (start + 3 < len && strByteAt(src, start + 1) == 92 && strByteAt(src, start + 3) == 39) {
+                cellSet(i, start + 4)
+            } else if (start + 2 < len && strByteAt(src, start + 2) == 39) {
+                cellSet(i, start + 3)
+            } else {
+                cellSet(i, start + 1)
+            };
+            vecPush(out, MkFTok { kind: FtChar, raw: strSlice(src, start, cellGet(i)) })
+        } else if (b == 63 && !(start + 1 < len && (strByteAt(src, start + 1) == 63 || strByteAt(src, start + 1) == 62 || strByteAt(src, start + 1) == 61 || strByteAt(src, start + 1) == 58))) {
+            cellSet(i, start + 1);
+            vecPush(out, MkFTok { kind: FtQuestion, raw: "?" })
+        } else if (isOpByte(b)) {
+            cellSet(i, start + 1);
+            let keepOp = cellNew(true);
+            while (cellGet(i) < len && cellGet(keepOp)) {
+                let cur = cellGet(i);
+                let nb = strByteAt(src, cur);
+                if (nb == 47 && cur + 1 < len && (strByteAt(src, cur + 1) == 47 || strByteAt(src, cur + 1) == 42)) {
+                    cellSet(keepOp, false)
+                } else if (isOpByte(nb)) {
+                    cellSet(i, cur + 1)
+                } else {
+                    cellSet(keepOp, false)
+                }
+            };
+            vecPush(out, MkFTok { kind: FtSym, raw: strSlice(src, start, cellGet(i)) })
+        } else {
+            cellSet(i, start + 1)
+        }
+    };
+    out
+}
+
+// ============================================================================
+// Line Grouping & Blank-Line Normalization
+// ============================================================================
+
+def lineFirstCodeIdx(line: Vec FTok): Int = {
+    let n = vecLen(line);
+    let i = cellNew(0);
+    let found = cellNew(-1);
+    while (cellGet(i) < n && cellGet(found) < 0) {
+        let t = vecGetOr(line, cellGet(i), emptyFTok());
+        if (!isTriviaTok(t)) cellSet(found, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def lineLastCodeIdx(line: Vec FTok): Int = {
+    let i = cellNew(vecLen(line) - 1);
+    let found = cellNew(-1);
+    while (cellGet(i) >= 0 && cellGet(found) < 0) {
+        let t = vecGetOr(line, cellGet(i), emptyFTok());
+        if (!isTriviaTok(t)) cellSet(found, cellGet(i)) else ();
+        cellSet(i, cellGet(i) - 1)
+    };
+    cellGet(found)
+}
+
+def lineEndsWithLBrace(line: Vec FTok): Bool = {
+    let idx = lineLastCodeIdx(line);
+    if (idx < 0) false
+    else match vecGetOr(line, idx, emptyFTok()).kind {
+        FtLBrace -> true,
+        _ -> false,
+    }
+}
+
+def lineStartsWithRBrace(line: Vec FTok): Bool = {
+    let idx = lineFirstCodeIdx(line);
+    if (idx < 0) false
+    else match vecGetOr(line, idx, emptyFTok()).kind {
+        FtRBrace -> true,
+        _ -> false,
+    }
+}
+
+def splitAndNormalizeLines(toks: Vec FTok): Vec (Vec FTok) = {
+    let rawLines: Vec (Vec FTok) = vecNew();
+    let curLine: Cell (Vec FTok) = cellNew(vecNew());
+    let n = vecLen(toks);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let t = vecGetOr(toks, cellGet(i), emptyFTok());
+        match t.kind {
+            FtNewline -> {
+                vecPush(rawLines, cellGet(curLine));
+                cellSet(curLine, vecNew())
+            },
+            _ -> vecPush(cellGet(curLine), t),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    if (vecLen(cellGet(curLine)) > 0) {
+        vecPush(rawLines, cellGet(curLine))
+    } else ();
+
+    let emptyLine: Vec FTok = vecNew();
+    let total = vecLen(rawLines);
+
+    // Find first and last non-blank line
+    let firstNonBlank = cellNew(0);
+    while (cellGet(firstNonBlank) < total && vecLen(vecGetOr(rawLines, cellGet(firstNonBlank), emptyLine)) == 0) {
+        cellSet(firstNonBlank, cellGet(firstNonBlank) + 1)
+    };
+    let lastNonBlank = cellNew(total - 1);
+    while (cellGet(lastNonBlank) >= 0 && vecLen(vecGetOr(rawLines, cellGet(lastNonBlank), emptyLine)) == 0) {
+        cellSet(lastNonBlank, cellGet(lastNonBlank) - 1)
+    };
+
+    let out: Vec (Vec FTok) = vecNew();
+    let k = cellNew(cellGet(firstNonBlank));
+    let endIdx = cellGet(lastNonBlank);
+    while (cellGet(k) <= endIdx) {
+        let idx = cellGet(k);
+        let ln = vecGetOr(rawLines, idx, emptyLine);
+        if (vecLen(ln) == 0) {
+            let outLen = vecLen(out);
+            let prevBlank = outLen == 0 || vecLen(vecGetOr(out, outLen - 1, emptyLine)) == 0;
+            let prevLBrace = outLen > 0 && lineEndsWithLBrace(vecGetOr(out, outLen - 1, emptyLine));
+            // Look ahead to next non-blank line
+            let nxt = cellNew(idx + 1);
+            while (cellGet(nxt) <= endIdx && vecLen(vecGetOr(rawLines, cellGet(nxt), emptyLine)) == 0) {
+                cellSet(nxt, cellGet(nxt) + 1)
+            };
+            let nextRBrace = cellGet(nxt) <= endIdx && lineStartsWithRBrace(vecGetOr(rawLines, cellGet(nxt), emptyLine));
+            if (!prevBlank && !prevLBrace && !nextRBrace) {
+                vecPush(out, ln)
+            } else ()
+        } else {
+            vecPush(out, ln)
+        };
+        cellSet(k, idx + 1)
+    };
+    out
+}
+
+// ============================================================================
+// Indentation & Context Frame Stack
+// ============================================================================
+
+data IndentFrame {
+    MkIndentFrame {
+        delim: Int,
+        baseIndent: Int,
+        bodyIndent: Int,
+        openedLine: Int,
+        isUseBrace: Bool,
+        isDataBrace: Bool,
+        isDataParen: Bool,
+        isConceptBrace: Bool,
+        isDefParamParen: Bool,
+        eqHanging: Cell Bool,
+        ifHanging: Cell Bool,
+        contHanging: Cell Bool,
+        typeHanging: Cell Bool,
+    },
+}
+
+def mkRootFrame(): IndentFrame = MkIndentFrame {
+    delim: 0,
+    baseIndent: 0,
+    bodyIndent: 0,
+    openedLine: -1,
+    isUseBrace: false,
+    isDataBrace: false,
+    isDataParen: false,
+    isConceptBrace: false,
+    isDefParamParen: false,
+    eqHanging: cellNew(false),
+    ifHanging: cellNew(false),
+    contHanging: cellNew(false),
+    typeHanging: cellNew(false),
+}
+
+def clearHanging(f: IndentFrame): Void = {
+    cellSet(f.eqHanging, false);
+    cellSet(f.ifHanging, false);
+    cellSet(f.contHanging, false);
+    cellSet(f.typeHanging, false)
+}
+
+def frameIndent(f: IndentFrame): Int =
+    f.bodyIndent
+    + (if (cellGet(f.eqHanging)) 1 else 0)
+    + (if (cellGet(f.ifHanging)) 1 else 0)
+    + (if (cellGet(f.contHanging)) 1 else 0)
+
+def stackTop(st: Vec IndentFrame): IndentFrame =
+    vecGetOr(st, vecLen(st) - 1, mkRootFrame())
+
+def isDeclOrStmtKeyword(raw: String): Bool =
+    raw == "pub"
+    || raw == "def"
+    || raw == "data"
+    || raw == "type"
+    || raw == "concept"
+    || raw == "instance"
+    || raw == "extern"
+    || raw == "use"
+    || raw == "open"
+    || raw == "mod"
+
+def isCloserTok(t: FTok): Bool = match t.kind {
+    FtRBrace -> true,
+    FtRParen -> true,
+    FtRBracket -> true,
+    _ -> false,
+}
+
+def isValueEndingTok(t: FTok): Bool = match t.kind {
+    FtIdent -> true,
+    FtInt -> true,
+    FtFloat -> true,
+    FtStr -> true,
+    FtChar -> true,
+    FtRParen -> true,
+    FtRBracket -> true,
+    FtRBrace -> true,
+    FtQuestion -> true,
+    FtKeyword -> t.raw == "true" || t.raw == "false" || t.raw == "Void",
+    _ -> false,
+}
+
+def isBinaryContStartTok(t: FTok, prevLineEndedWithValue: Bool): Bool = match t.kind {
+    FtSym ->
+        if (t.raw == "!" || t.raw == "~" || t.raw == "=" || t.raw == ":" || t.raw == "->" || t.raw == "=>") false
+        else if (t.raw == "-") prevLineEndedWithValue
+        else true,
+    _ -> false,
+}
+
+def isTrailingBinOpTok(t: FTok): Bool = match t.kind {
+    FtSym ->
+        t.raw != "=" && t.raw != "->" && t.raw != "=>" && t.raw != ":" && t.raw != "!" && t.raw != "~",
+    _ -> false,
+}
+
+def lineStartsWithHeaderKw(line: Vec FTok, target: String): Bool = {
+    let n = vecLen(line);
+    let i = cellNew(0);
+    let matched = cellNew(false);
+    let done = cellNew(false);
+    while (cellGet(i) < n && !cellGet(done)) {
+        let t = vecGetOr(line, cellGet(i), emptyFTok());
+        if (isTriviaTok(t)) {
+            cellSet(i, cellGet(i) + 1)
+        } else if (t.raw == "pub" || t.raw == "extern") {
+            cellSet(i, cellGet(i) + 1)
+        } else {
+            if (t.raw == target) cellSet(matched, true) else ();
+            cellSet(done, true)
+        }
+    };
+    cellGet(matched)
+}
+
+def lineEndsWithBareIfCond(line: Vec FTok): Bool = {
+    let lastIdx = lineLastCodeIdx(line);
+    if (lastIdx < 0) false
+    else match vecGetOr(line, lastIdx, emptyFTok()).kind {
+        FtRParen -> {
+            let n = vecLen(line);
+            let i = cellNew(0);
+            let matched = cellNew(false);
+            while (cellGet(i) < lastIdx && !cellGet(matched)) {
+                let t = vecGetOr(line, cellGet(i), emptyFTok());
+                if (t.raw == "if") {
+                    let p = cellNew(cellGet(i) + 1);
+                    while (cellGet(p) < n && isTriviaTok(vecGetOr(line, cellGet(p), emptyFTok()))) {
+                        cellSet(p, cellGet(p) + 1)
+                    };
+                    if (cellGet(p) < lastIdx && match vecGetOr(line, cellGet(p), emptyFTok()).kind { FtLParen -> true, _ -> false }) {
+                        let depth = cellNew(0);
+                        let closedEarly = cellNew(false);
+                        let j = cellNew(cellGet(p));
+                        while (cellGet(j) <= lastIdx && !cellGet(closedEarly)) {
+                            match vecGetOr(line, cellGet(j), emptyFTok()).kind {
+                                FtLParen -> cellSet(depth, cellGet(depth) + 1),
+                                FtRParen -> {
+                                    cellSet(depth, cellGet(depth) - 1);
+                                    if (cellGet(depth) == 0 && cellGet(j) < lastIdx) {
+                                        cellSet(closedEarly, true)
+                                    } else ()
+                                },
+                                _ -> (),
+                            };
+                            cellSet(j, cellGet(j) + 1)
+                        };
+                        if (!cellGet(closedEarly) && cellGet(depth) == 0) {
+                            cellSet(matched, true)
+                        } else ()
+                    } else ()
+                } else ();
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellGet(matched)
+        },
+        _ -> false,
+    }
+}
+
+def lineHasUnclosedInlineIf(line: Vec FTok): Bool = {
+    let fc = lineFirstCodeIdx(line);
+    if (fc < 0) false
+    else {
+        let firstRaw = vecGetOr(line, fc, emptyFTok()).raw;
+        if (firstRaw == "if" || firstRaw == "else") false
+        else {
+            let n = vecLen(line);
+            let i = cellNew(fc);
+            let depth = cellNew(0);
+            let ifCount = cellNew(0);
+            let elseCount = cellNew(0);
+            while (cellGet(i) < n) {
+                let t = vecGetOr(line, cellGet(i), emptyFTok());
+                match t.kind {
+                    FtLParen -> cellSet(depth, cellGet(depth) + 1),
+                    FtLBrace -> cellSet(depth, cellGet(depth) + 1),
+                    FtLBracket -> cellSet(depth, cellGet(depth) + 1),
+                    FtRParen -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtRBrace -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtRBracket -> if (cellGet(depth) > 0) cellSet(depth, cellGet(depth) - 1) else (),
+                    FtKeyword ->
+                        if (cellGet(depth) == 0) {
+                            if (t.raw == "if") cellSet(ifCount, cellGet(ifCount) + 1)
+                            else if (t.raw == "else") cellSet(elseCount, cellGet(elseCount) + 1)
+                            else ()
+                        } else (),
+                    _ -> (),
+                };
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellGet(ifCount) > cellGet(elseCount)
+        }
+    }
+}
+
+def isPureUnaryChain(raw: String): Bool = {
+    let len = strLen(raw);
+    if (len == 0 || raw == "!=" || raw == "->") false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < len && cellGet(ok)) {
+            let b = strByteAt(raw, cellGet(i));
+            if (b != 33 && b != 126 && b != 45) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+// ============================================================================
+// Horizontal Spacing Engine (Within a Single Line)
+// ============================================================================
+
+def isUnaryPrefixContext(prevOpt: Option FTok, prevLineEndedWithValue: Bool): Bool = match prevOpt {
+    None -> !prevLineEndedWithValue,
+    Some(p) -> match p.kind {
+        FtLParen -> true,
+        FtLBracket -> true,
+        FtLBrace -> true,
+        FtComma -> true,
+        FtSemi -> true,
+        FtSym -> true,
+        FtKeyword -> p.raw != "true" && p.raw != "false" && p.raw != "Void",
+        _ -> false,
+    },
+}
+
+def isParenOp(line: Vec FTok, idx: Int): Bool =
+    if (idx <= 0 || idx + 1 >= vecLen(line)) false
+    else match (
+        vecGetOr(line, idx - 1, emptyFTok()).kind,
+        vecGetOr(line, idx, emptyFTok()).kind,
+        vecGetOr(line, idx + 1, emptyFTok()).kind
+    ) {
+        (FtLParen, FtSym, FtRParen) -> true,
+        _ -> false,
+    }
+
+def isUpperStart(s: String): Bool =
+    strLen(s) > 0 && isUpperByte(strByteAt(s, 0))
+
+def isLowerStart(s: String): Bool =
+    strLen(s) > 0 && isLowerByte(strByteAt(s, 0))
+
+def formatLineTokens(
+    line: Vec FTok,
+    topFrame: IndentFrame,
+    prevLineEndedWithValue: Bool,
+    out: StringBuf
+): Bool = {
+    let n = vecLen(line);
+    let inUse = topFrame.isUseBrace || lineStartsWithHeaderKw(line, "use");
+    let isDataLine = lineStartsWithHeaderKw(line, "data");
+    let isConceptLine = lineStartsWithHeaderKw(line, "concept");
+    let isInstanceLine = lineStartsWithHeaderKw(line, "instance");
+    let isTypeLine = lineStartsWithHeaderKw(line, "type");
+    let isDefLine = lineStartsWithHeaderKw(line, "def");
+    let isLetLine = lineStartsWithHeaderKw(line, "let");
+
+    let inType = cellNew(
+        (isInstanceLine || isConceptLine || topFrame.isDataBrace || topFrame.isDataParen || topFrame.isConceptBrace || cellGet(topFrame.typeHanging))
+        && !isDefLine
+    );
+    let seenForall = cellNew(false);
+    let seenEq = cellNew(false);
+    let seenRetColon = cellNew(false);
+    let braceDepth = cellNew(0);
+    let parenDepth = cellNew(0);
+    let expectCondParen = cellNew(false);
+    let condParenTarget = cellNew(-1);
+    let prevClosedCond = cellNew(false);
+    let prevCodeOpt: Cell (Option FTok) = cellNew(None);
+    let prevTokOpt: Cell (Option FTok) = cellNew(None);
+    let prevWasUnary = cellNew(false);
+    let prevWasForallDot = cellNew(false);
+
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let cur = vecGetOr(line, idx, emptyFTok());
+        let curIsParenOp = isParenOp(line, idx);
+        let prevIsParenOp = isParenOp(line, idx - 1);
+
+        // Determine if current `:` is a deriving/superclass ` : `
+        let curIsHeaderColon = match cur.kind {
+            FtSym -> cur.raw == ":" && cellGet(braceDepth) == 0 && (isDataLine || isConceptLine),
+            _ -> false,
+        };
+
+        // Determine if current token is unary prefix (`!`, `~`, unary `-`, or pure prefix chain like `~-` / `!!`)
+        let curIsUnary =
+            if (curIsParenOp) false
+            else match cur.kind {
+                FtSym ->
+                    if (cur.raw == "!" || cur.raw == "~") true
+                    else if (isPureUnaryChain(cur.raw)) {
+                        cellGet(prevClosedCond) || isUnaryPrefixContext(cellGet(prevCodeOpt), prevLineEndedWithValue)
+                    } else false,
+                _ -> false,
+            };
+
+        // Decide whether to emit a space before `cur`
+        let needSpace = match cellGet(prevTokOpt) {
+            None -> false,
+            Some(prev) ->
+                if (cellGet(prevWasUnary)) {
+                    // Keep space between consecutive unary prefix operators (e.g. `~ -x`, `- -x`, `! !b`)
+                    match cur.kind {
+                        FtSym -> true,
+                        _ -> false,
+                    }
+                } else if (cellGet(prevWasForallDot)) {
+                    true
+                } else if (curIsParenOp || prevIsParenOp) {
+                    false
+                } else match cur.kind {
+                    FtLineComment -> true,
+                    FtBlockComment -> match prev.kind {
+                        FtLParen -> false,
+                        FtLBracket -> false,
+                        FtLBrace -> false,
+                        _ -> true,
+                    },
+                    FtComma -> false,
+                    FtSemi -> false,
+                    FtDot -> false,
+                    FtQuestion -> false,
+                    FtRParen -> false,
+                    FtRBracket -> false,
+                    FtRBrace -> match prev.kind {
+                        FtLBrace -> false,
+                        _ -> !inUse,
+                    },
+                    FtLParen -> match prev.kind {
+                        FtLParen -> false,
+                        FtLBracket -> false,
+                        FtDot -> false,
+                        FtRParen -> cellGet(prevClosedCond),
+                        FtRBracket -> false,
+                        FtRBrace -> true,
+                        FtLBrace -> !inUse,
+                        FtComma -> true,
+                        FtSemi -> true,
+                        FtSym -> true,
+                        FtKeyword -> true,
+                        FtIdent ->
+                            if (isDataLine && cellGet(braceDepth) == 0) {
+                                // `data Pipe(Int)` has no space; `data Wrapper a (a)` has space after lowercase type param
+                                isLowerStart(prev.raw)
+                            } else if (cellGet(inType)) {
+                                // Inside `data { Variant(Int) }`: variant ctor before `(` has no space if preceded by `{` or `,` or start of line
+                                if ((topFrame.isDataBrace || (isDataLine && cellGet(braceDepth) == 1)) && isUpperStart(prev.raw) && cellGet(parenDepth) == 0) {
+                                    let wasFieldType =
+                                        if (idx >= 2) {
+                                            match vecGetOr(line, idx - 2, emptyFTok()).kind {
+                                                FtSym -> true,
+                                                FtIdent -> true,
+                                                FtLParen -> true,
+                                                _ -> false,
+                                            }
+                                        } else false;
+                                    wasFieldType
+                                } else true
+                            } else false,
+                        _ -> true,
+                    },
+                    FtLBracket -> match prev.kind {
+                        FtLParen -> false,
+                        FtLBracket -> false,
+                        FtDot -> false,
+                        FtLBrace -> !inUse,
+                        _ -> true,
+                    },
+                    FtLBrace -> match prev.kind {
+                        FtDot -> false,
+                        FtLParen -> false,
+                        FtLBracket -> false,
+                        _ -> true,
+                    },
+                    FtSym ->
+                        if (cur.raw == ":") {
+                            curIsHeaderColon
+                        } else if (cur.raw == "*" && match prev.kind { FtDot -> true, _ -> false }) {
+                            false
+                        } else match prev.kind {
+                            FtLParen -> false,
+                            FtLBracket -> false,
+                            FtLBrace -> !inUse,
+                            FtDot -> false,
+                            _ -> true,
+                        },
+                    _ -> match prev.kind {
+                        FtLParen -> false,
+                        FtLBracket -> false,
+                        FtDot -> false,
+                        FtLBrace -> !inUse,
+                        _ -> true,
+                    },
+                },
+        };
+
+        if (needSpace) bufPushByte(out, 32) else ();
+        bufPushStr(out, cur.raw);
+
+        // Update state after emitting `cur`
+        let isForallDot = cellGet(seenForall) && match cur.kind { FtDot -> true, _ -> false };
+        cellSet(prevWasForallDot, isForallDot);
+        if (isForallDot) cellSet(seenForall, false) else ();
+
+        let justClosedCond = cellNew(false);
+        match cur.kind {
+            FtKeyword ->
+                if (cur.raw == "forall") {
+                    cellSet(seenForall, true);
+                    cellSet(inType, true)
+                } else if (cur.raw == "if" || cur.raw == "while") {
+                    cellSet(expectCondParen, true)
+                } else (),
+            FtLBrace -> {
+                cellSet(braceDepth, cellGet(braceDepth) + 1);
+                if (isDataLine || isConceptLine) cellSet(inType, true)
+                else if (isInstanceLine) cellSet(inType, false)
+                else ()
+            },
+            FtRBrace -> {
+                if (cellGet(braceDepth) > 0) cellSet(braceDepth, cellGet(braceDepth) - 1) else ()
+            },
+            FtLParen -> {
+                if (cellGet(expectCondParen)) {
+                    cellSet(condParenTarget, cellGet(parenDepth));
+                    cellSet(expectCondParen, false)
+                } else ();
+                cellSet(parenDepth, cellGet(parenDepth) + 1)
+            },
+            FtRParen -> {
+                if (cellGet(parenDepth) > 0) cellSet(parenDepth, cellGet(parenDepth) - 1) else ();
+                if (cellGet(condParenTarget) >= 0 && cellGet(parenDepth) == cellGet(condParenTarget)) {
+                    cellSet(justClosedCond, true);
+                    cellSet(condParenTarget, -1)
+                } else ();
+                if (cellGet(parenDepth) == 0 && isDefLine && !cellGet(seenRetColon)) cellSet(inType, false) else ()
+            },
+            FtComma -> {
+                if (cellGet(parenDepth) == 1 && isDefLine && !cellGet(seenRetColon) && !isTypeLine && !isInstanceLine && !isConceptLine) {
+                    cellSet(inType, false)
+                } else ()
+            },
+            FtSym ->
+                if (cur.raw == ":") {
+                    let prevWasRParen = match cellGet(prevCodeOpt) {
+                        Some(p) -> match p.kind { FtRParen -> true, _ -> false },
+                        None -> false,
+                    };
+                    if ((prevWasRParen || (isDefLine && cellGet(parenDepth) == 0)) && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
+                        cellSet(seenRetColon, true);
+                        cellSet(inType, true)
+                    } else if ((isDefLine || isLetLine || topFrame.isDefParamParen) && !cellGet(seenEq) && cellGet(braceDepth) == 0) {
+                        cellSet(inType, true)
+                    } else if (isConceptLine || topFrame.isConceptBrace || topFrame.isDataBrace || isDataLine) {
+                        cellSet(inType, true)
+                    } else if (topFrame.delim == 0 && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
+                        // Top-level forward declaration `ident: Type` without `=`
+                        cellSet(inType, true)
+                    } else if (cellGet(parenDepth) > 0 && cellGet(braceDepth) == 0) {
+                        cellSet(inType, true)
+                    } else ()
+                } else if (cur.raw == "=") {
+                    cellSet(seenEq, true);
+                    if (isTypeLine) cellSet(inType, true)
+                    else cellSet(inType, false)
+                } else if (cur.raw == "->") {
+                    if (!cellGet(inType)) ()
+                    else if (
+                        (isDefLine && cellGet(seenEq))
+                        || (!isDefLine && !topFrame.isDefParamParen && !topFrame.isDataParen && !isTypeLine && !isConceptLine && !topFrame.isConceptBrace && !topFrame.isDataBrace && !cellGet(topFrame.typeHanging))
+                    ) {
+                        cellSet(inType, false)
+                    } else ()
+                } else (),
+            _ -> (),
+        };
+
+        cellSet(prevWasUnary, curIsUnary);
+        cellSet(prevTokOpt, Some(cur));
+        if (!isTriviaTok(cur)) {
+            cellSet(prevClosedCond, cellGet(justClosedCond));
+            cellSet(prevCodeOpt, Some(cur))
+        } else ();
+
+        cellSet(i, idx + 1)
+    };
+    cellGet(prevClosedCond)
+}
+
+def pushIndent(out: StringBuf, level: Int): Void = {
+    let n = level * 4;
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        bufPushByte(out, 32);
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def isCommentOnlyLine(line: Vec FTok): Bool =
+    vecLen(line) > 0 && lineFirstCodeIdx(line) < 0
+
+def nextCodeLineFirstTok(lines: Vec (Vec FTok), fromIdx: Int): Option FTok = {
+    let total = vecLen(lines);
+    let emptyLine: Vec FTok = vecNew();
+    let i = cellNew(fromIdx);
+    let found: Cell (Option FTok) = cellNew(None);
+    while (cellGet(i) < total && match cellGet(found) { None -> true, Some(_) -> false }) {
+        let ln = vecGetOr(lines, cellGet(i), emptyLine);
+        let fc = lineFirstCodeIdx(ln);
+        if (fc >= 0) {
+            cellSet(found, Some(vecGetOr(ln, fc, emptyFTok())))
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+/// Format a syntactically valid Geisha source string canonically.
+pub def formatSource(src: String): String = {
+    let toks = lexForFmt(src);
+    let lines = splitAndNormalizeLines(toks);
+    let total = vecLen(lines);
+    if (total == 0) ""
+    else {
+        let out = bufNew();
+        let stack: Vec IndentFrame = vecNew();
+        vecPush(stack, mkRootFrame());
+        let emptyLine: Vec FTok = vecNew();
+        let prevLineEndedWithValue = cellNew(false);
+
+        let li = cellNew(0);
+        while (cellGet(li) < total) {
+            let idx = cellGet(li);
+            let ln = vecGetOr(lines, idx, emptyLine);
+            if (vecLen(ln) == 0) {
+                if (vecLen(stack) == 1) {
+                    clearHanging(stackTop(stack));
+                    cellSet(prevLineEndedWithValue, false)
+                } else ();
+                bufPushByte(out, 10)
+            } else if (isCommentOnlyLine(ln)) {
+                let firstTok = vecGetOr(ln, 0, emptyFTok());
+                match firstTok.kind {
+                    FtShebang -> {
+                        bufPushStr(out, firstTok.raw);
+                        bufPushByte(out, 10)
+                    },
+                    _ -> {
+                        let top = stackTop(stack);
+                        match nextCodeLineFirstTok(lines, idx + 1) {
+                            None -> clearHanging(top),
+                            Some(nt) ->
+                                if (isDeclOrStmtKeyword(nt.raw)) {
+                                    clearHanging(top)
+                                } else if (nt.raw == "else") {
+                                    cellSet(top.ifHanging, false);
+                                    cellSet(top.contHanging, false)
+                                } else (),
+                        };
+                        let indent = frameIndent(stackTop(stack));
+                        pushIndent(out, indent);
+                        let _ = formatLineTokens(ln, stackTop(stack), cellGet(prevLineEndedWithValue), out);
+                        bufPushByte(out, 10)
+                    },
+                }
+            } else {
+                // Code line: first pop any leading closing delimiters
+                let n = vecLen(ln);
+                let scanIdx = cellNew(0);
+                let poppedAny = cellNew(false);
+                let poppedBase = cellNew(0);
+                let leadDone = cellNew(false);
+                while (cellGet(scanIdx) < n && !cellGet(leadDone)) {
+                    let t = vecGetOr(ln, cellGet(scanIdx), emptyFTok());
+                    if (isTriviaTok(t)) {
+                        cellSet(scanIdx, cellGet(scanIdx) + 1)
+                    } else if (isCloserTok(t) && vecLen(stack) > 1) {
+                        match vecPop(stack) {
+                            Some(fr) -> {
+                                cellSet(poppedAny, true);
+                                cellSet(poppedBase, fr.baseIndent)
+                            },
+                            None -> (),
+                        };
+                        cellSet(scanIdx, cellGet(scanIdx) + 1)
+                    } else {
+                        cellSet(leadDone, true)
+                    }
+                };
+
+                let top = stackTop(stack);
+                let lineIndent =
+                    if (cellGet(poppedAny)) {
+                        cellGet(poppedBase)
+                    } else {
+                        let fc = lineFirstCodeIdx(ln);
+                        let firstCode = vecGetOr(ln, fc, emptyFTok());
+                        if (isDeclOrStmtKeyword(firstCode.raw)) {
+                            clearHanging(top)
+                        } else if (firstCode.raw == "else") {
+                            cellSet(top.ifHanging, false);
+                            cellSet(top.contHanging, false)
+                        } else if (isBinaryContStartTok(firstCode, cellGet(prevLineEndedWithValue))) {
+                            if ((top.delim == 0 || top.delim == 123) && !cellGet(top.eqHanging) && !cellGet(top.ifHanging)) {
+                                cellSet(top.contHanging, true)
+                            } else ()
+                        } else ();
+                        frameIndent(top)
+                    };
+
+                pushIndent(out, lineIndent);
+                let endedCondParen = formatLineTokens(ln, top, cellGet(prevLineEndedWithValue), out);
+                bufPushByte(out, 10);
+
+                // Update delimiter stack for remaining tokens on this line
+                let isUseLine = lineStartsWithHeaderKw(ln, "use");
+                let isDataLine = lineStartsWithHeaderKw(ln, "data");
+                let isConceptLine = lineStartsWithHeaderKw(ln, "concept");
+                let isDefLine = lineStartsWithHeaderKw(ln, "def");
+                let isTypeLine = lineStartsWithHeaderKw(ln, "type");
+                let effectiveBase = cellNew(lineIndent);
+                let sawEqOnLine = cellNew(false);
+                let j = cellNew(cellGet(scanIdx));
+                while (cellGet(j) < n) {
+                    let t = vecGetOr(ln, cellGet(j), emptyFTok());
+                    match t.kind {
+                        FtLBrace -> vecPush(stack, MkIndentFrame {
+                            delim: 123,
+                            baseIndent: cellGet(effectiveBase),
+                            bodyIndent: cellGet(effectiveBase) + 1,
+                            openedLine: idx,
+                            isUseBrace: isUseLine,
+                            isDataBrace: isDataLine || stackTop(stack).isDataBrace,
+                            isDataParen: false,
+                            isConceptBrace: isConceptLine,
+                            isDefParamParen: false,
+                            eqHanging: cellNew(false),
+                            ifHanging: cellNew(false),
+                            contHanging: cellNew(false),
+                            typeHanging: cellNew(false),
+                        }),
+                        FtLParen -> {
+                            let curTop = stackTop(stack);
+                            vecPush(stack, MkIndentFrame {
+                                delim: 40,
+                                baseIndent: cellGet(effectiveBase),
+                                bodyIndent: cellGet(effectiveBase) + 1,
+                                openedLine: idx,
+                                isUseBrace: false,
+                                isDataBrace: false,
+                                isDataParen: isDataLine || curTop.isDataBrace || curTop.isDataParen,
+                                isConceptBrace: false,
+                                isDefParamParen: isDefLine,
+                                eqHanging: cellNew(false),
+                                ifHanging: cellNew(false),
+                                contHanging: cellNew(false),
+                                typeHanging: cellNew(false),
+                            })
+                        },
+                        FtLBracket -> vecPush(stack, MkIndentFrame {
+                            delim: 91,
+                            baseIndent: cellGet(effectiveBase),
+                            bodyIndent: cellGet(effectiveBase) + 1,
+                            openedLine: idx,
+                            isUseBrace: false,
+                            isDataBrace: false,
+                            isDataParen: false,
+                            isConceptBrace: false,
+                            isDefParamParen: false,
+                            eqHanging: cellNew(false),
+                            ifHanging: cellNew(false),
+                            contHanging: cellNew(false),
+                            typeHanging: cellNew(false),
+                        }),
+                        FtRBrace -> if (vecLen(stack) > 1) {
+                            match vecPop(stack) {
+                                Some(fr) -> cellSet(effectiveBase, fr.baseIndent),
+                                None -> (),
+                            }
+                        } else (),
+                        FtRParen -> if (vecLen(stack) > 1) {
+                            match vecPop(stack) {
+                                Some(fr) -> cellSet(effectiveBase, fr.baseIndent),
+                                None -> (),
+                            }
+                        } else (),
+                        FtRBracket -> if (vecLen(stack) > 1) {
+                            match vecPop(stack) {
+                                Some(fr) -> cellSet(effectiveBase, fr.baseIndent),
+                                None -> (),
+                            }
+                        } else (),
+                        FtSym -> if (t.raw == "=") cellSet(sawEqOnLine, true) else (),
+                        _ -> (),
+                    };
+                    cellSet(j, cellGet(j) + 1)
+                };
+
+                // Update hanging flags on the current top frame after this line
+                let newTop = stackTop(stack);
+                let lc = lineLastCodeIdx(ln);
+                let lastCode = vecGetOr(ln, lc, emptyFTok());
+                cellSet(prevLineEndedWithValue, isValueEndingTok(lastCode) && !endedCondParen);
+
+                if (newTop.openedLine != idx) {
+                    if (cellGet(sawEqOnLine) && !isTypeLine) {
+                        cellSet(newTop.typeHanging, false)
+                    } else ();
+                    match lastCode.kind {
+                        FtSemi -> clearHanging(newTop),
+                        FtComma ->
+                            if (newTop.delim != 0) clearHanging(newTop) else (),
+                        FtSym ->
+                            if (lastCode.raw == "=") {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.ifHanging, false);
+                                cellSet(newTop.contHanging, false);
+                                cellSet(newTop.typeHanging, isTypeLine)
+                            } else if (lastCode.raw == "->") {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.ifHanging, false);
+                                cellSet(newTop.contHanging, false)
+                            } else if (lastCode.raw == ":") {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.ifHanging, false);
+                                cellSet(newTop.contHanging, false);
+                                cellSet(newTop.typeHanging, true)
+                            } else if (isTrailingBinOpTok(lastCode)) {
+                                if ((newTop.delim == 0 || newTop.delim == 123) && !cellGet(newTop.eqHanging) && !cellGet(newTop.ifHanging)) {
+                                    cellSet(newTop.contHanging, true)
+                                } else ()
+                            } else (),
+                        FtKeyword ->
+                            if (lastCode.raw == "else") {
+                                cellSet(newTop.ifHanging, true);
+                                cellSet(newTop.contHanging, false)
+                            } else (),
+                        FtRParen ->
+                            if (lineEndsWithBareIfCond(ln)) {
+                                cellSet(newTop.ifHanging, true);
+                                cellSet(newTop.contHanging, false)
+                            } else if (lineHasUnclosedInlineIf(ln)) {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.contHanging, false)
+                            } else (),
+                        _ ->
+                            if (lineHasUnclosedInlineIf(ln)) {
+                                cellSet(newTop.eqHanging, true);
+                                cellSet(newTop.contHanging, false)
+                            } else (),
+                    }
+                } else ()
+            };
+            cellSet(li, idx + 1)
+        };
+        bufToString(out)
+    }
+}
+
+// ============================================================================
+// File Discovery & `geisha fmt` CLI Entrypoint
+// ============================================================================
+
+def shouldSkipDirName(name: String): Bool =
+    name == "."
+    || name == ".."
+    || strStartsWith(name, ".")
+    || name == "build"
+    || name == "dist"
+    || name == "target"
+    || name == "node_modules"
+
+def collectGsaFilesRec(dir: String, out: Cell (List String)): Void =
+    match readDir(dir) {
+        Err(_) -> (),
+        Ok(entries) -> {
+            let cur = cellNew(entries);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(name, r) -> {
+                        if (!shouldSkipDirName(name)) {
+                            let full = if (dir == ".") name else pathJoin(dir, name);
+                            if (isDir(full)) {
+                                collectGsaFilesRec(full, out)
+                            } else if (strEndsWith(name, ".gsa")) {
+                                cellSet(out, Cons(full, cellGet(out)))
+                            } else ()
+                        } else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+    }
+
+def collectTargetFiles(paths: List String): Result (List String) String = {
+    let acc: Cell (List String) = cellNew(Nil);
+    match paths {
+        Nil -> {
+            let root = match findProjectRoot(".") {
+                Some(d) -> d,
+                None -> ".",
+            };
+            collectGsaFilesRec(root, acc);
+            Ok(sortUniqueStrings(cellGet(acc)))
+        },
+        _ -> {
+            let cur = cellNew(paths);
+            let errOpt: Cell (Option String) = cellNew(None);
+            while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+                match cellGet(cur) {
+                    Cons(p, r) -> {
+                        if (isDir(p)) {
+                            collectGsaFilesRec(p, acc)
+                        } else if (fileExists(p)) {
+                            cellSet(acc, Cons(p, cellGet(acc)))
+                        } else {
+                            cellSet(errOpt, Some("path not found: '" + p + "'"))
+                        };
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            match cellGet(errOpt) {
+                Some(e) -> Err(e),
+                None -> Ok(sortUniqueStrings(cellGet(acc))),
+            }
+        },
+    }
+}
+
+def formatOneFile(path: String): Result (String, String) String = {
+    let src = readFile(path)?;
+    diagReset();
+    let fid = diagRegisterFile(path, src);
+    let _ = parseFileModuleInFile(src, Nil, fid)?;
+    let formatted = formatSource(src);
+    Ok((src, formatted))
+}
+
+pub def cmdFmt(args: List String): Result Int String = {
+    let checkMode = cellNew(false);
+    let writeMode = cellNew(false);
+    let stdoutMode = cellNew(false);
+    let pathsRev: Cell (List String) = cellNew(Nil);
+    let errOpt: Cell (Option String) = cellNew(None);
+
+    let cur = cellNew(args);
+    while (match cellGet(cur) { Nil -> false, _ -> match cellGet(errOpt) { None -> true, Some(_) -> false } }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--check") {
+                    cellSet(checkMode, true)
+                } else if (a == "--write" || a == "-w") {
+                    cellSet(writeMode, true)
+                } else if (a == "--stdout") {
+                    cellSet(stdoutMode, true)
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha fmt': '" + a + "' (expected --check, --write, or --stdout)"))
+                } else {
+                    cellSet(pathsRev, Cons(a, cellGet(pathsRev)))
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None ->
+            if (cellGet(checkMode) && cellGet(writeMode)) {
+                Err("cannot combine '--check' and '--write'")
+            } else if (cellGet(checkMode) && cellGet(stdoutMode)) {
+                Err("cannot combine '--check' and '--stdout'")
+            } else if (cellGet(writeMode) && cellGet(stdoutMode)) {
+                Err("cannot combine '--write' and '--stdout'")
+            } else {
+                let files = collectTargetFiles(listRev(cellGet(pathsRev)))?;
+                let unformattedCount = cellNew(0);
+                let fc = cellNew(files);
+                let runErr: Cell (Option String) = cellNew(None);
+                while (match cellGet(fc) { Nil -> false, _ -> match cellGet(runErr) { None -> true, Some(_) -> false } }) {
+                    match cellGet(fc) {
+                        Cons(path, r) -> {
+                            match formatOneFile(path) {
+                                Err(e) -> cellSet(runErr, Some(e)),
+                                Ok((orig, formatted)) -> {
+                                    if (cellGet(stdoutMode)) {
+                                        print(formatted)
+                                    } else if (cellGet(checkMode)) {
+                                        if (formatted != orig) {
+                                            eprintLn("needs formatting: " + path);
+                                            cellSet(unformattedCount, cellGet(unformattedCount) + 1)
+                                        } else ()
+                                    } else {
+                                        if (formatted != orig) {
+                                            match writeFileAtomicSafe(path, formatted) {
+                                                Ok(_) -> (),
+                                                Err(we) -> cellSet(runErr, Some("failed to write '" + path + "': " + we)),
+                                            }
+                                        } else ()
+                                    }
+                                },
+                            };
+                            cellSet(fc, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                match cellGet(runErr) {
+                    Some(e) -> Err(e),
+                    None ->
+                        if (cellGet(checkMode) && cellGet(unformattedCount) > 0) Ok(1)
+                        else Ok(0),
+                }
+            },
+    }
+}
