@@ -462,13 +462,19 @@ int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_
     return 0;
 }
 
-/* Copy POSIX permission bits AND platform ACLs (macOS copyfile COPYFILE_ACL, Linux POSIX ACL xattr)
- * from `src` to `dst`. Fails closed (-1) if permission or ACL preservation fails. */
+/* Copy POSIX owner/group, permission bits AND platform ACLs (macOS copyfile COPYFILE_ACL,
+ * Linux POSIX ACL xattr) from `src` to `dst`. Fails closed (-1) if ownership, permission,
+ * or ACL preservation fails. */
 int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
 {
     if (src == NULL || dst == NULL || src[0] == '\0' || dst[0] == '\0') return -1;
     struct stat st;
+    struct stat dst_st;
     if (lstat(src, &st) != 0) return -1;
+    if (lstat(dst, &dst_st) != 0) return -1;
+    if (dst_st.st_uid != st.st_uid || dst_st.st_gid != st.st_gid) {
+        if (chown(dst, st.st_uid, st.st_gid) != 0) return -1;
+    }
     if (chmod(dst, st.st_mode & 07777) != 0) return -1;
 #ifdef __APPLE__
     if (copyfile(src, dst, NULL, COPYFILE_ACL) != 0) return -1;
@@ -488,6 +494,16 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
     }
 #endif
     return 0;
+}
+
+/* Set permissions for a brand-new file honoring the caller's process umask (`base_mode & ~umask`). */
+int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
+{
+    if (path == NULL || path[0] == '\0' || base_mode < 0) return -1;
+    mode_t u = umask(0);
+    umask(u);
+    mode_t m = ((mode_t)(base_mode & 0777)) & ~u;
+    return (chmod(path, m) == 0) ? 0 : -1;
 }
 
 int64_t gs_sys_file_mtime_ms(const char *path)

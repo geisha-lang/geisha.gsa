@@ -806,11 +806,66 @@ int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_
     if (path == NULL || path[0] == '\0' || len < 0 || (len > 0 && buf == NULL)) return -1;
     wchar_t *wp = gs_utf8_to_wide(path);
     if (wp == NULL) return -1;
-    HANDLE h = CreateFileW(wp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        DWORD err = GetLastError();
+
+    /* Build a restrictive owner-only protected DACL so the staged file is never
+     * readable by other users between CreateFileW and gs_sys_copy_file_acl. */
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
         free(wp);
-        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return 1;
+        return -1;
+    }
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+    if (need == 0) {
+        CloseHandle(tok);
+        free(wp);
+        return -1;
+    }
+    TOKEN_USER *tu = (TOKEN_USER *)malloc(need);
+    if (tu == NULL || !GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+        free(tu);
+        CloseHandle(tok);
+        free(wp);
+        return -1;
+    }
+    CloseHandle(tok);
+
+    EXPLICIT_ACCESSW ea;
+    ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = FILE_ALL_ACCESS;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName = (LPWCH)tu->User.Sid;
+
+    PACL ownerDacl = NULL;
+    if (SetEntriesInAclW(1, &ea, NULL, &ownerDacl) != ERROR_SUCCESS || ownerDacl == NULL) {
+        free(tu);
+        free(wp);
+        return -1;
+    }
+    SECURITY_DESCRIPTOR sd;
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorDacl(&sd, TRUE, ownerDacl, FALSE) ||
+        !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        LocalFree(ownerDacl);
+        free(tu);
+        free(wp);
+        return -1;
+    }
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+
+    HANDLE h = CreateFileW(wp, GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD createErr = (h == INVALID_HANDLE_VALUE) ? GetLastError() : ERROR_SUCCESS;
+    LocalFree(ownerDacl);
+    free(tu);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(wp);
+        if (createErr == ERROR_FILE_EXISTS || createErr == ERROR_ALREADY_EXISTS) return 1;
         return -1;
     }
     const uint8_t *p = (const uint8_t *)buf;
@@ -873,6 +928,32 @@ int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
     free(wsrc);
     free(wdst);
     return (src_rc == ERROR_SUCCESS) ? 0 : -1;
+}
+
+/* For a brand-new file staged with an owner-only protected DACL, restore default parent-inherited
+ * permissions by applying an empty unprotected DACL so Windows propagates inheritable parent ACEs. */
+int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
+{
+    (void)base_mode;
+    if (path == NULL || path[0] == '\0') return -1;
+    wchar_t *wp = gs_utf8_to_wide(path);
+    if (wp == NULL) return -1;
+    ACL emptyAcl;
+    if (!InitializeAcl(&emptyAcl, sizeof(emptyAcl), ACL_REVISION)) {
+        free(wp);
+        return -1;
+    }
+    DWORD rc = SetNamedSecurityInfoW(
+        wp,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        &emptyAcl,
+        NULL
+    );
+    free(wp);
+    return (rc == ERROR_SUCCESS) ? 0 : -1;
 }
 
 static int64_t gs_filetime_to_unix_ms(FILETIME ft)

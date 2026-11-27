@@ -18,6 +18,7 @@ extern "gs_sys_fopen" def c_site_fopen(path: String, mode: String): Ptr
 extern "fclose" def c_site_fclose(fp: Ptr): Int
 extern "gs_sys_write_excl" def c_site_write_excl(path: String, buf: String, len: Int64, mode: Int): Int
 extern "gs_sys_copy_file_acl" def c_site_copy_file_acl(src: String, dst: String): Int
+extern "gs_sys_apply_umask_mode" def c_site_apply_umask_mode(path: String, baseMode: Int): Int
 
 def gSiteTmpSeq: Cell Int = cellNew(0)
 
@@ -1432,15 +1433,11 @@ def writeVerifiedTempFile(targetPath: String, content: String, copyFromExisting:
                             Err("failed to preserve permissions/ACL from: " + targetPath)
                         } else Ok(tmpPath)
                     } else {
-                        // Brand-new file: grant standard readable permissions on POSIX
-                        if (hostOs() != "windows") {
-                            match chmod(tmpPath, 0o644) {
-                                Ok(()) -> Ok(tmpPath),
-                                Err(ce) -> {
-                                    let _ = removeFile(tmpPath);
-                                    Err(ce)
-                                },
-                            }
+                        // Brand-new file: honor caller's process umask (0666 & ~umask) on POSIX
+                        // or restore default parent-inherited DACL on Windows.
+                        if (c_site_apply_umask_mode(tmpPath, 0o666) != 0) {
+                            let _ = removeFile(tmpPath);
+                            Err("failed to apply default file permissions for: " + targetPath)
                         } else Ok(tmpPath)
                     },
             }

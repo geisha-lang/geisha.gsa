@@ -7057,6 +7057,17 @@ EOF
     fi
     rm -f "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa"
 
+    # POSIX umask 077 must be honored for brand-new generated files (must be 0o600, not hardcoded 0o644)
+    T44_UMASK_SITE="$TMP_DIR/t44_umask_site"
+    (umask 077 && cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_UMASK_SITE" --no-stdlib) >/dev/null
+    T44_UMASK_IDX="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/index.html")"
+    T44_UMASK_MOD="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/modules/docdemo.math.html")"
+    T44_UMASK_MF="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/.geisha-doc-manifest")"
+    if [ "$T44_UMASK_IDX" != "0o600" ] || [ "$T44_UMASK_MOD" != "0o600" ] || [ "$T44_UMASK_MF" != "0o600" ]; then
+        echo "FAIL [doc_umask_077_new_files]: expected 0o600 under umask 077, got index=$T44_UMASK_IDX mod=$T44_UMASK_MOD mf=$T44_UMASK_MF" >&2
+        exit 1
+    fi
+
     # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
     printf 'not a dir\n' > "$TMP_DIR/notes"
     T44_BS_OUT="$TMP_DIR/notes\\site"
