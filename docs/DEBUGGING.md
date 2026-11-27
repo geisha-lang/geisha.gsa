@@ -19,7 +19,7 @@ geisha -g -O2 -o app main.gsa
 ```
 
 What `-g` / `--debug` does:
-- Emits DWARF v4 metadata (`!DICompileUnit`, `!DIFile`, `!DISubprogram`, `!DILocation`, `#dbg_declare`, `!DILocalVariable`, and Geisha primitive / Tuple / ADT types).
+- Emits DWARF v4 metadata (`!DICompileUnit`, `!DIFile`, `!DISubprogram`, `!DILocation`, `@llvm.dbg.declare`, `!DILocalVariable`, and Geisha primitive / Tuple / ADT types).
 - Defaults LLVM optimization to `-O0` (unless `-O1`/`-O2`/`-O3` is explicitly passed) and disables tail-call optimization so every stack frame and local variable remains inspectable.
 - On **macOS**, compiles via an intermediate `.o` and runs `dsymutil <binary>` to generate `<binary>.dSYM` before cleaning up `.o`.
 - On **Linux**, links DWARF sections directly into the ELF binary.

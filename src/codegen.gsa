@@ -1419,13 +1419,13 @@ def dbgEmitLocalVar(
                 + ", type: !" + intToStr(varDbgTy) + ")"
             );
             let locId = dbgGetOrCreateLoc(mctx, fctx, sp);
-            bufPushStr(bb.bbInstrs, "    #dbg_declare(ptr ");
+            bufPushStr(bb.bbInstrs, "  call void @llvm.dbg.declare(metadata ptr ");
             bufPushStr(bb.bbInstrs, slotPtr);
-            bufPushStr(bb.bbInstrs, ", !");
+            bufPushStr(bb.bbInstrs, ", metadata !");
             bufPushStr(bb.bbInstrs, intToStr(varId));
-            bufPushStr(bb.bbInstrs, ", !DIExpression(), !");
+            bufPushStr(bb.bbInstrs, ", metadata !DIExpression()), !dbg !");
             bufPushStr(bb.bbInstrs, intToStr(locId));
-            bufPushStr(bb.bbInstrs, ")\n")
+            bufPushByte(bb.bbInstrs, 10)
         } else ()
     } else ()
 
@@ -5356,6 +5356,7 @@ pub def emitProgramLlvmIrForArchDebug(
 
     bufPushBuf(out, fnsBuf);
     if (debugInfo) {
+        bufPushStr(out, "declare void @llvm.dbg.declare(metadata, metadata, metadata) nounwind readnone speculatable willreturn\n\n");
         let dwVerId = dbgAllocId(mctx);
         let diVerId = dbgAllocId(mctx);
         dbgEmitNode(mctx, dwVerId, "!{i32 7, !\"Dwarf Version\", i32 4}");

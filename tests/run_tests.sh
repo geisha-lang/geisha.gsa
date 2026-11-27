@@ -2870,7 +2870,7 @@ if grep -q "!DICompileUnit" "$TMP_DIR/t37_nodbg.ll"; then
     exit 1
 fi
 "$GEISHA_BIN" -g -e -o "$TMP_DIR/t37_dbg.ll" "$TMP_DIR/t37_dwarf.gsa"
-for tok in "!DICompileUnit" "!DISubprogram" "!DILocation" "#dbg_declare" "!DILocalVariable"; do
+for tok in "!DICompileUnit" "!DISubprogram" "!DILocation" "@llvm.dbg.declare" "!DILocalVariable"; do
     if ! grep -q "$tok" "$TMP_DIR/t37_dbg.ll"; then
         echo "FAIL [dwarf_ir_metadata]: missing $tok in -g IR" >&2
         exit 1
