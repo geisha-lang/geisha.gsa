@@ -5,12 +5,12 @@ use std.result.{Result, Ok, Err}
 use std.buf.{bufNew, bufPushPtr, bufToString}
 use std.list.listRev
 
-extern "fopen" def c_fopen(path: String, mode: String): Ptr
+extern "gs_sys_fopen" def c_fopen(path: String, mode: String): Ptr
 extern "fclose" def c_fclose(fp: Ptr): Int
 extern "fread" def c_fread(buf: Ptr, size: Int64, nitems: Int64, fp: Ptr): Int64
 extern "fwrite" def c_fwrite(buf: String, size: Int64, nitems: Int64, fp: Ptr): Int64
 extern "gs_sys_file_exists" def c_file_exists(path: String): Int
-extern "remove" def c_remove(path: String): Int
+extern "gs_sys_remove" def c_remove(path: String): Int
 extern "gs_sys_rmdir" def c_rmdir(path: String): Int
 extern "gs_sys_lstat_kind" def c_lstat_kind(path: String): Int
 extern "gs_sys_host_os" def c_fs_host_os(): Ptr
@@ -177,6 +177,7 @@ pub def removeDirAll(path: String): Bool = {
     let kind = c_lstat_kind(target);
     if (kind == 0) true
     else if (kind < 0) false
+    else if (kind == 4) removeDir(target)
     else if (kind != 2) removeFile(target)
     else match readDir(target) {
         Err(_) -> false,

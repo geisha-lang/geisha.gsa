@@ -15,6 +15,11 @@ export async function createGeishaPlayground(wasmSource) {
   const envImports = {
     access: () => -1,
     gs_sys_file_exists: () => 0,
+    gs_sys_fopen: () => 0,
+    gs_sys_remove: () => -1,
+    gs_sys_rmdir: () => -1,
+    gs_sys_lstat_kind: () => 0,
+    gs_sys_getenv: () => 0,
     fopen: () => 0,
     fclose: () => 0,
     fread: () => 0n,

@@ -56,6 +56,7 @@ typedef struct gc_page_t {
 typedef struct gc_chunk_t {
     struct gc_chunk_t *next;
     uintptr_t base;
+    void *raw_base;
     size_t first_data_page;
     gc_page_t pages[GC_PAGES_PER_CHUNK];
 } gc_chunk_t;

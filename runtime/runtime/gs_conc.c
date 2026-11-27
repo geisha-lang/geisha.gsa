@@ -10,16 +10,17 @@
 
 #include "../include/gs_conc.h"
 #include "../include/gc.h"
+#include "../include/gs_os_thread.h"
 
-#include <errno.h>
-#include <pthread.h>
-#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#if !defined(_WIN32)
 #include <time.h>
 #include <unistd.h>
+#endif
+
+extern int64_t gs_sys_time_mono_ns(void);
 
 /* ============================================================================
  * GC-Tracked Concurrent Object Registry
@@ -40,45 +41,45 @@ typedef struct gs_conc_hdr_t {
     struct gs_conc_hdr_t *prev;
 } gs_conc_hdr_t;
 
-static pthread_mutex_t _reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static gs_mutex_t _reg_mu = GS_MUTEX_INIT;
 static gs_conc_hdr_t *_reg_head = NULL;
 
 static void reg_insert(gs_conc_hdr_t *node)
 {
-    pthread_mutex_lock(&_reg_mu);
+    gs_mutex_lock(&_reg_mu);
     node->prev = NULL;
     node->next = _reg_head;
     if (_reg_head != NULL) {
         _reg_head->prev = node;
     }
     _reg_head = node;
-    pthread_mutex_unlock(&_reg_mu);
+    gs_mutex_unlock(&_reg_mu);
 }
 
 /* Lock-order-safe condition wait:
  * Releases `mu` BEFORE `gc_leave_blocking()` so a waking thread NEVER holds an object mutex while waiting for STW!
  */
-static void cond_wait_gc_safe(pthread_cond_t *cv, pthread_mutex_t *mu)
+static void cond_wait_gc_safe(gs_cond_t *cv, gs_mutex_t *mu)
 {
     jmp_buf jb;
-    _setjmp(jb);
+    GS_SAVE_REGS(jb);
     gc_enter_blocking(&jb);
-    pthread_cond_wait(cv, mu);
-    pthread_mutex_unlock(mu);
+    gs_cond_wait(cv, mu);
+    gs_mutex_unlock(mu);
     gc_leave_blocking();
-    pthread_mutex_lock(mu);
+    gs_mutex_lock(mu);
 }
 
-static int cond_timedwait_gc_safe(pthread_cond_t *cv, pthread_mutex_t *mu, const struct timespec *abstime)
+static bool cond_timedwait_ms_gc_safe(gs_cond_t *cv, gs_mutex_t *mu, uint32_t timeout_ms)
 {
     jmp_buf jb;
-    _setjmp(jb);
+    GS_SAVE_REGS(jb);
     gc_enter_blocking(&jb);
-    int rc = pthread_cond_timedwait(cv, mu, abstime);
-    pthread_mutex_unlock(mu);
+    bool timed_out = gs_cond_timedwait_ms(cv, mu, timeout_ms);
+    gs_mutex_unlock(mu);
     gc_leave_blocking();
-    pthread_mutex_lock(mu);
-    return rc;
+    gs_mutex_lock(mu);
+    return timed_out;
 }
 
 /* ============================================================================
@@ -121,9 +122,9 @@ int32_t gs_atomic_cas(void *a, int32_t expected, int32_t desired)
 
 typedef struct {
     gs_conc_hdr_t hdr;
-    pthread_mutex_t mu;
-    pthread_cond_t full_cv;
-    pthread_cond_t empty_cv;
+    gs_mutex_t mu;
+    gs_cond_t full_cv;
+    gs_cond_t empty_cv;
     bool is_full;
     void *val_box;
 } gs_mvar_t;
@@ -138,9 +139,9 @@ void *gs_mvar_new(void *init_box, int32_t is_full)
     m->hdr.kind = CONC_KIND_MVAR;
     m->hdr.gc_handle = (void *)handle;
     m->hdr.pinned_active = false;
-    pthread_mutex_init(&m->mu, NULL);
-    pthread_cond_init(&m->full_cv, NULL);
-    pthread_cond_init(&m->empty_cv, NULL);
+    gs_mutex_init(&m->mu);
+    gs_cond_init(&m->full_cv);
+    gs_cond_init(&m->empty_cv);
     m->is_full = (is_full != 0);
     m->val_box = (is_full != 0) ? (void *)keep_box : NULL;
 
@@ -152,55 +153,55 @@ void *gs_mvar_new(void *init_box, int32_t is_full)
 void *gs_mvar_take(void *mvar_handle)
 {
     gs_mvar_t *m = *(gs_mvar_t **)mvar_handle;
-    pthread_mutex_lock(&m->mu);
+    gs_mutex_lock(&m->mu);
     while (!m->is_full) {
         cond_wait_gc_safe(&m->full_cv, &m->mu);
     }
     void *out = m->val_box;
     m->val_box = NULL;
     m->is_full = false;
-    pthread_cond_signal(&m->empty_cv);
-    pthread_mutex_unlock(&m->mu);
+    gs_cond_signal(&m->empty_cv);
+    gs_mutex_unlock(&m->mu);
     return out;
 }
 
 void gs_mvar_put(void *mvar_handle, void *val_box)
 {
     gs_mvar_t *m = *(gs_mvar_t **)mvar_handle;
-    pthread_mutex_lock(&m->mu);
+    gs_mutex_lock(&m->mu);
     while (m->is_full) {
         cond_wait_gc_safe(&m->empty_cv, &m->mu);
     }
     m->val_box = val_box;
     m->is_full = true;
-    pthread_cond_broadcast(&m->full_cv);
-    pthread_mutex_unlock(&m->mu);
+    gs_cond_broadcast(&m->full_cv);
+    gs_mutex_unlock(&m->mu);
 }
 
 void *gs_mvar_read(void *mvar_handle)
 {
     gs_mvar_t *m = *(gs_mvar_t **)mvar_handle;
-    pthread_mutex_lock(&m->mu);
+    gs_mutex_lock(&m->mu);
     while (!m->is_full) {
         cond_wait_gc_safe(&m->full_cv, &m->mu);
     }
     void *out = m->val_box;
-    pthread_mutex_unlock(&m->mu);
+    gs_mutex_unlock(&m->mu);
     return out;
 }
 
 void *gs_mvar_try_take(void *mvar_handle)
 {
     gs_mvar_t *m = *(gs_mvar_t **)mvar_handle;
-    pthread_mutex_lock(&m->mu);
+    gs_mutex_lock(&m->mu);
     void *out = NULL;
     if (m->is_full) {
         out = m->val_box;
         m->val_box = NULL;
         m->is_full = false;
-        pthread_cond_signal(&m->empty_cv);
+        gs_cond_signal(&m->empty_cv);
     }
-    pthread_mutex_unlock(&m->mu);
+    gs_mutex_unlock(&m->mu);
     return out;
 }
 
@@ -210,9 +211,9 @@ void *gs_mvar_try_take(void *mvar_handle)
 
 typedef struct {
     gs_conc_hdr_t hdr;
-    pthread_mutex_t mu;
-    pthread_cond_t not_empty_cv;
-    pthread_cond_t not_full_cv;
+    gs_mutex_t mu;
+    gs_cond_t not_empty_cv;
+    gs_cond_t not_full_cv;
     bool bounded;
     bool closed;
     size_t max_cap;
@@ -231,9 +232,9 @@ void *gs_chan_new(int32_t capacity)
     ch->hdr.kind = CONC_KIND_CHAN;
     ch->hdr.gc_handle = (void *)handle;
     ch->hdr.pinned_active = false;
-    pthread_mutex_init(&ch->mu, NULL);
-    pthread_cond_init(&ch->not_empty_cv, NULL);
-    pthread_cond_init(&ch->not_full_cv, NULL);
+    gs_mutex_init(&ch->mu);
+    gs_cond_init(&ch->not_empty_cv);
+    gs_cond_init(&ch->not_full_cv);
 
     if (capacity > 0) {
         ch->bounded = true;
@@ -269,12 +270,12 @@ static void chan_grow_locked(gs_chan_t *ch)
 int32_t gs_chan_send(void *chan_handle, void *val_box)
 {
     gs_chan_t *ch = *(gs_chan_t **)chan_handle;
-    pthread_mutex_lock(&ch->mu);
+    gs_mutex_lock(&ch->mu);
     while (!ch->closed && ch->bounded && ch->len >= ch->max_cap) {
         cond_wait_gc_safe(&ch->not_full_cv, &ch->mu);
     }
     if (ch->closed) {
-        pthread_mutex_unlock(&ch->mu);
+        gs_mutex_unlock(&ch->mu);
         return 0;
     }
     if (!ch->bounded && ch->len >= ch->buf_cap) {
@@ -283,20 +284,20 @@ int32_t gs_chan_send(void *chan_handle, void *val_box)
     size_t tail = (ch->head + ch->len) % ch->buf_cap;
     ch->buf[tail] = val_box;
     ch->len++;
-    pthread_cond_signal(&ch->not_empty_cv);
-    pthread_mutex_unlock(&ch->mu);
+    gs_cond_signal(&ch->not_empty_cv);
+    gs_mutex_unlock(&ch->mu);
     return 1;
 }
 
 void *gs_chan_recv(void *chan_handle)
 {
     gs_chan_t *ch = *(gs_chan_t **)chan_handle;
-    pthread_mutex_lock(&ch->mu);
+    gs_mutex_lock(&ch->mu);
     while (ch->len == 0 && !ch->closed) {
         cond_wait_gc_safe(&ch->not_empty_cv, &ch->mu);
     }
     if (ch->len == 0) {
-        pthread_mutex_unlock(&ch->mu);
+        gs_mutex_unlock(&ch->mu);
         return NULL;
     }
     void *item = ch->buf[ch->head];
@@ -304,18 +305,18 @@ void *gs_chan_recv(void *chan_handle)
     ch->head = (ch->head + 1) % ch->buf_cap;
     ch->len--;
     if (ch->bounded) {
-        pthread_cond_signal(&ch->not_full_cv);
+        gs_cond_signal(&ch->not_full_cv);
     }
-    pthread_mutex_unlock(&ch->mu);
+    gs_mutex_unlock(&ch->mu);
     return item;
 }
 
 void *gs_chan_try_recv(void *chan_handle)
 {
     gs_chan_t *ch = *(gs_chan_t **)chan_handle;
-    pthread_mutex_lock(&ch->mu);
+    gs_mutex_lock(&ch->mu);
     if (ch->len == 0) {
-        pthread_mutex_unlock(&ch->mu);
+        gs_mutex_unlock(&ch->mu);
         return NULL;
     }
     void *item = ch->buf[ch->head];
@@ -323,28 +324,28 @@ void *gs_chan_try_recv(void *chan_handle)
     ch->head = (ch->head + 1) % ch->buf_cap;
     ch->len--;
     if (ch->bounded) {
-        pthread_cond_signal(&ch->not_full_cv);
+        gs_cond_signal(&ch->not_full_cv);
     }
-    pthread_mutex_unlock(&ch->mu);
+    gs_mutex_unlock(&ch->mu);
     return item;
 }
 
 void gs_chan_close(void *chan_handle)
 {
     gs_chan_t *ch = *(gs_chan_t **)chan_handle;
-    pthread_mutex_lock(&ch->mu);
+    gs_mutex_lock(&ch->mu);
     ch->closed = true;
-    pthread_cond_broadcast(&ch->not_empty_cv);
-    pthread_cond_broadcast(&ch->not_full_cv);
-    pthread_mutex_unlock(&ch->mu);
+    gs_cond_broadcast(&ch->not_empty_cv);
+    gs_cond_broadcast(&ch->not_full_cv);
+    gs_mutex_unlock(&ch->mu);
 }
 
 int32_t gs_chan_is_closed(void *chan_handle)
 {
     gs_chan_t *ch = *(gs_chan_t **)chan_handle;
-    pthread_mutex_lock(&ch->mu);
+    gs_mutex_lock(&ch->mu);
     bool c = ch->closed;
-    pthread_mutex_unlock(&ch->mu);
+    gs_mutex_unlock(&ch->mu);
     return c ? 1 : 0;
 }
 
@@ -361,10 +362,10 @@ typedef struct gs_task_t {
     struct gs_task_t *q_next;
 } gs_task_t;
 
-static pthread_once_t _pool_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t _pool_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t _pool_work_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t _task_event_cv = PTHREAD_COND_INITIALIZER;
+static gs_once_t _pool_once = GS_ONCE_INIT;
+static gs_mutex_t _pool_mu = GS_MUTEX_INIT;
+static gs_cond_t _pool_work_cv = GS_COND_INIT;
+static gs_cond_t _task_event_cv = GS_COND_INIT;
 
 static gs_task_t *_pool_q_head = NULL;
 static gs_task_t *_pool_q_tail = NULL;
@@ -376,7 +377,13 @@ int32_t gs_conc_num_cpu(void)
         int n = atoi(env_t);
         if (n >= 1 && n <= 256) return n;
     }
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long n = (long)si.dwNumberOfProcessors;
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (n < 2) return 2;
     if (n > 64) return 64;
     return (int32_t)n;
@@ -397,13 +404,13 @@ static gs_task_t *pool_pop_locked(void)
 
 static void task_complete(gs_task_t *t, void *res_box)
 {
-    pthread_mutex_lock(&_pool_mu);
+    gs_mutex_lock(&_pool_mu);
     t->res_box = res_box;
     t->cls_ptr = NULL;
     __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
     t->hdr.pinned_active = false;
-    pthread_cond_broadcast(&_task_event_cv);
-    pthread_mutex_unlock(&_pool_mu);
+    gs_cond_broadcast(&_task_event_cv);
+    gs_mutex_unlock(&_pool_mu);
 }
 
 static void execute_task(gs_task_t *t)
@@ -417,18 +424,18 @@ static void *pool_worker_main(void *arg)
     (void)arg;
     gc_thread_attach(__builtin_frame_address(0));
 
-    pthread_mutex_lock(&_pool_mu);
+    gs_mutex_lock(&_pool_mu);
     for (;;) {
         gs_task_t *t = pool_pop_locked();
         if (t != NULL) {
-            pthread_mutex_unlock(&_pool_mu);
+            gs_mutex_unlock(&_pool_mu);
             execute_task(t);
-            pthread_mutex_lock(&_pool_mu);
+            gs_mutex_lock(&_pool_mu);
         } else {
             cond_wait_gc_safe(&_pool_work_cv, &_pool_mu);
         }
     }
-    pthread_mutex_unlock(&_pool_mu);
+    gs_mutex_unlock(&_pool_mu);
     gc_thread_detach();
     return NULL;
 }
@@ -437,15 +444,10 @@ static void pool_init_once(void)
 {
     int32_t n = gs_conc_num_cpu();
     for (int32_t i = 0; i < n; i++) {
-        pthread_t tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        if (pthread_create(&tid, &attr, pool_worker_main, NULL) != 0) {
+        if (gs_thread_create(NULL, pool_worker_main, NULL, true) != 0) {
             fprintf(stderr, "Failed to spawn Geisha worker thread\n");
             abort();
         }
-        pthread_attr_destroy(&attr);
     }
 }
 
@@ -468,7 +470,7 @@ static gs_task_t *alloc_empty_task_with_handle(void **out_handle)
 
 void *gs_task_spawn(gs_thunk_runner_fn runner, void *cls_ptr)
 {
-    pthread_once(&_pool_once, pool_init_once);
+    gs_once_run(&_pool_once, pool_init_once);
 
     volatile void *keep_cls = cls_ptr;
     void *handle = NULL;
@@ -476,7 +478,7 @@ void *gs_task_spawn(gs_thunk_runner_fn runner, void *cls_ptr)
     t->runner = runner;
     t->cls_ptr = (void *)keep_cls;
 
-    pthread_mutex_lock(&_pool_mu);
+    gs_mutex_lock(&_pool_mu);
     if (_pool_q_tail == NULL) {
         _pool_q_head = t;
         _pool_q_tail = t;
@@ -484,10 +486,10 @@ void *gs_task_spawn(gs_thunk_runner_fn runner, void *cls_ptr)
         _pool_q_tail->q_next = t;
         _pool_q_tail = t;
     }
-    pthread_cond_signal(&_pool_work_cv);
+    gs_cond_signal(&_pool_work_cv);
     /* Also wake any `await` callers so they can work-help if all pool threads are busy in nested awaits! */
-    pthread_cond_broadcast(&_task_event_cv);
-    pthread_mutex_unlock(&_pool_mu);
+    gs_cond_broadcast(&_task_event_cv);
+    gs_mutex_unlock(&_pool_mu);
 
     return handle;
 }
@@ -499,20 +501,20 @@ void *gs_task_await(void *task_handle)
         return t->res_box;
     }
 
-    pthread_mutex_lock(&_pool_mu);
+    gs_mutex_lock(&_pool_mu);
     while (__atomic_load_n(&t->done, __ATOMIC_ACQUIRE) == 0) {
         /* Inline work-helping: dequeue and run pending pool tasks while waiting! */
         gs_task_t *other = pool_pop_locked();
         if (other != NULL) {
-            pthread_mutex_unlock(&_pool_mu);
+            gs_mutex_unlock(&_pool_mu);
             execute_task(other);
-            pthread_mutex_lock(&_pool_mu);
+            gs_mutex_lock(&_pool_mu);
         } else {
             cond_wait_gc_safe(&_task_event_cv, &_pool_mu);
         }
     }
     void *res = t->res_box;
-    pthread_mutex_unlock(&_pool_mu);
+    gs_mutex_unlock(&_pool_mu);
     return res;
 }
 
@@ -532,17 +534,12 @@ void gs_task_wait_any(void *mut_arr_ptr, int32_t count, int32_t timeout_ms)
     }
     int32_t target = (count < n) ? count : n;
 
-    struct timespec deadline;
     bool has_deadline = (timeout_ms >= 0);
-    if (has_deadline) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        int64_t total_us = (int64_t)tv.tv_usec + (int64_t)timeout_ms * 1000LL;
-        deadline.tv_sec = tv.tv_sec + (time_t)(total_us / 1000000LL);
-        deadline.tv_nsec = (long)((total_us % 1000000LL) * 1000LL);
-    }
+    int64_t deadline_ns = has_deadline
+        ? (gs_sys_time_mono_ns() + (int64_t)timeout_ms * 1000000LL)
+        : 0;
 
-    pthread_mutex_lock(&_pool_mu);
+    gs_mutex_lock(&_pool_mu);
     for (;;) {
         int32_t ready_cnt = 0;
         for (int32_t i = 0; i < n; i++) {
@@ -557,33 +554,40 @@ void gs_task_wait_any(void *mut_arr_ptr, int32_t count, int32_t timeout_ms)
         if (!has_deadline) {
             gs_task_t *other = pool_pop_locked();
             if (other != NULL) {
-                pthread_mutex_unlock(&_pool_mu);
+                gs_mutex_unlock(&_pool_mu);
                 execute_task(other);
-                pthread_mutex_lock(&_pool_mu);
+                gs_mutex_lock(&_pool_mu);
                 continue;
             }
             cond_wait_gc_safe(&_task_event_cv, &_pool_mu);
         } else {
-            int rc = cond_timedwait_gc_safe(&_task_event_cv, &_pool_mu, &deadline);
-            if (rc == ETIMEDOUT) {
+            int64_t rem_ns = deadline_ns - gs_sys_time_mono_ns();
+            if (rem_ns <= 0) {
+                break;
+            }
+            uint32_t wait_ms = (uint32_t)((rem_ns + 999999LL) / 1000000LL);
+            if (cond_timedwait_ms_gc_safe(&_task_event_cv, &_pool_mu, wait_ms)) {
                 break;
             }
         }
     }
-    pthread_mutex_unlock(&_pool_mu);
+    gs_mutex_unlock(&_pool_mu);
 }
 
 void gs_conc_sleep_ms(int32_t ms)
 {
     if (ms <= 0) return;
+    jmp_buf jb;
+    GS_SAVE_REGS(jb);
+    gc_enter_blocking(&jb);
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
     struct timespec req;
     req.tv_sec = ms / 1000;
     req.tv_nsec = (long)(ms % 1000) * 1000000L;
-
-    jmp_buf jb;
-    _setjmp(jb);
-    gc_enter_blocking(&jb);
     nanosleep(&req, NULL);
+#endif
     gc_leave_blocking();
 }
 
@@ -600,9 +604,9 @@ typedef struct gs_actor_msg_t {
 
 typedef struct {
     gs_conc_hdr_t hdr;
-    pthread_t tid;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    gs_thread_t tid;
+    gs_mutex_t mu;
+    gs_cond_t cv;
     gs_thunk_runner_fn init_runner;
     void *init_cls;
     void *state_box;
@@ -619,7 +623,7 @@ static void *actor_thread_main(void *arg)
 
     /* Initialize state `s` IN-PLACE on the actor's dedicated OS thread! */
     void *st_box = a->init_runner(a->init_cls);
-    pthread_mutex_lock(&a->mu);
+    gs_mutex_lock(&a->mu);
     a->state_box = st_box;
     a->init_cls = NULL;
 
@@ -630,7 +634,7 @@ static void *actor_thread_main(void *arg)
             if (a->q_head == NULL) {
                 a->q_tail = NULL;
             }
-            pthread_mutex_unlock(&a->mu);
+            gs_mutex_unlock(&a->mu);
 
             void *res_box = msg->runner(a->state_box, msg->handler_cls);
             if (msg->reply_task != NULL) {
@@ -638,7 +642,7 @@ static void *actor_thread_main(void *arg)
             }
             free(msg);
 
-            pthread_mutex_lock(&a->mu);
+            gs_mutex_lock(&a->mu);
         } else if (a->stop_requested) {
             break;
         } else {
@@ -647,7 +651,7 @@ static void *actor_thread_main(void *arg)
     }
 
     a->hdr.pinned_active = false;
-    pthread_mutex_unlock(&a->mu);
+    gs_mutex_unlock(&a->mu);
     gc_thread_detach();
     return NULL;
 }
@@ -662,15 +666,15 @@ void *gs_actor_spawn(gs_thunk_runner_fn init_runner, void *init_cls)
     a->hdr.kind = CONC_KIND_ACTOR;
     a->hdr.gc_handle = (void *)handle;
     a->hdr.pinned_active = true;
-    pthread_mutex_init(&a->mu, NULL);
-    pthread_cond_init(&a->cv, NULL);
+    gs_mutex_init(&a->mu);
+    gs_cond_init(&a->cv);
     a->init_runner = init_runner;
     a->init_cls = (void *)keep_cls;
 
     *handle = a;
     reg_insert(&a->hdr);
 
-    if (pthread_create(&a->tid, NULL, actor_thread_main, a) != 0) {
+    if (gs_thread_create(&a->tid, actor_thread_main, a, false) != 0) {
         fprintf(stderr, "Failed to spawn Geisha actor thread\n");
         abort();
     }
@@ -692,7 +696,7 @@ void *gs_actor_call(void *actor_handle, gs_actor_runner_fn runner, void *handler
     msg->handler_cls = (void *)keep_cls;
     msg->reply_task = reply;
 
-    pthread_mutex_lock(&a->mu);
+    gs_mutex_lock(&a->mu);
     if (a->q_tail == NULL) {
         a->q_head = msg;
         a->q_tail = msg;
@@ -700,8 +704,8 @@ void *gs_actor_call(void *actor_handle, gs_actor_runner_fn runner, void *handler
         a->q_tail->next = msg;
         a->q_tail = msg;
     }
-    pthread_cond_signal(&a->cv);
-    pthread_mutex_unlock(&a->mu);
+    gs_cond_signal(&a->cv);
+    gs_mutex_unlock(&a->mu);
 
     return task_handle;
 }
@@ -715,7 +719,7 @@ void gs_actor_send(void *actor_handle, gs_actor_runner_fn runner, void *handler_
     msg->handler_cls = handler_cls;
     msg->reply_task = NULL;
 
-    pthread_mutex_lock(&a->mu);
+    gs_mutex_lock(&a->mu);
     if (a->q_tail == NULL) {
         a->q_head = msg;
         a->q_tail = msg;
@@ -723,28 +727,28 @@ void gs_actor_send(void *actor_handle, gs_actor_runner_fn runner, void *handler_
         a->q_tail->next = msg;
         a->q_tail = msg;
     }
-    pthread_cond_signal(&a->cv);
-    pthread_mutex_unlock(&a->mu);
+    gs_cond_signal(&a->cv);
+    gs_mutex_unlock(&a->mu);
 }
 
 void gs_actor_stop(void *actor_handle)
 {
     gs_actor_t *a = *(gs_actor_t **)actor_handle;
-    pthread_mutex_lock(&a->mu);
+    gs_mutex_lock(&a->mu);
     if (a->joined) {
-        pthread_mutex_unlock(&a->mu);
+        gs_mutex_unlock(&a->mu);
         return;
     }
     a->stop_requested = true;
     a->joined = true;
-    pthread_cond_broadcast(&a->cv);
-    pthread_t tid = a->tid;
-    pthread_mutex_unlock(&a->mu);
+    gs_cond_broadcast(&a->cv);
+    gs_thread_t tid = a->tid;
+    gs_mutex_unlock(&a->mu);
 
     jmp_buf jb;
-    _setjmp(jb);
+    GS_SAVE_REGS(jb);
     gc_enter_blocking(&jb);
-    pthread_join(tid, NULL);
+    gs_thread_join(tid);
     gc_leave_blocking();
 }
 
@@ -829,17 +833,17 @@ void gs_conc_sweep_unreachable(void)
             switch (cur->kind) {
             case CONC_KIND_MVAR: {
                 gs_mvar_t *m = (gs_mvar_t *)cur;
-                pthread_mutex_destroy(&m->mu);
-                pthread_cond_destroy(&m->full_cv);
-                pthread_cond_destroy(&m->empty_cv);
+                gs_mutex_destroy(&m->mu);
+                gs_cond_destroy(&m->full_cv);
+                gs_cond_destroy(&m->empty_cv);
                 free(m);
                 break;
             }
             case CONC_KIND_CHAN: {
                 gs_chan_t *ch = (gs_chan_t *)cur;
-                pthread_mutex_destroy(&ch->mu);
-                pthread_cond_destroy(&ch->not_empty_cv);
-                pthread_cond_destroy(&ch->not_full_cv);
+                gs_mutex_destroy(&ch->mu);
+                gs_cond_destroy(&ch->not_empty_cv);
+                gs_cond_destroy(&ch->not_full_cv);
                 free(ch->buf);
                 free(ch);
                 break;
@@ -852,10 +856,10 @@ void gs_conc_sweep_unreachable(void)
             case CONC_KIND_ACTOR: {
                 gs_actor_t *a = (gs_actor_t *)cur;
                 if (!a->joined) {
-                    pthread_detach(a->tid);
+                    gs_thread_detach(a->tid);
                 }
-                pthread_mutex_destroy(&a->mu);
-                pthread_cond_destroy(&a->cv);
+                gs_mutex_destroy(&a->mu);
+                gs_cond_destroy(&a->cv);
                 free(a);
                 break;
             }
@@ -897,7 +901,7 @@ void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_f
     volatile void *keep_cls = cls_ptr;
 
     int32_t spawned = workers - 1;
-    pthread_t tids[32];
+    gs_thread_t tids[32];
     gs_tabulate_arg_t args[32];
     int32_t chunk = (n + workers - 1) / workers;
     int32_t launched = 0;
@@ -912,7 +916,7 @@ void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_f
         args[launched].hi = hi;
         args[launched].chunk_fn = chunk_fn;
         args[launched].cls_ptr = cls_ptr;
-        if (pthread_create(&tids[launched], NULL, tabulate_worker_entry, &args[launched]) == 0) {
+        if (gs_thread_create(&tids[launched], tabulate_worker_entry, &args[launched], false) == 0) {
             launched++;
         } else {
             chunk_fn(arr_ptr, lo, hi, cls_ptr);
@@ -925,10 +929,10 @@ void gs_conc_par_tabulate(void *arr_ptr, int32_t n, gs_tabulate_chunk_fn chunk_f
     }
 
     jmp_buf jb;
-    _setjmp(jb);
+    GS_SAVE_REGS(jb);
     gc_enter_blocking(&jb);
     for (int32_t i = 0; i < launched; i++) {
-        pthread_join(tids[i], NULL);
+        gs_thread_join(tids[i]);
     }
     gc_leave_blocking();
 

@@ -13,9 +13,9 @@ use std.str.{strStartsWith, strEndsWith, strIndexOfByte, strSplitChar, strJoin, 
 use std.sha256.sha256Hex
 use std.path.{pathStem, pathJoin, pathDirname, pathBasename}
 use sys.env.{argCount, argAt, getEnv}
-use sys.fs.{readFile, writeFile, removeFile, fileExists, mkdirAll}
+use sys.fs.{readFile, writeFile, removeFile, removeDirAll, fileExists, mkdirAll}
 use sys.io.eprintLn
-use sys.proc.{exit, shell}
+use sys.proc.{ExitStatus, Exited, exit, shell, command, cmdEnv, spawn as procSpawn, childWait}
 use ast.{addUniqueStr, sortUniqueStrings}
 use loader.{
     PkgSpec, MkPkgSpec,
@@ -591,16 +591,16 @@ def resolveWasmCc(): String =
             else "clang",
     }
 
-def resolveWasmLdFlag(): String =
+def resolveWasmLdArgs(): List String =
     match getEnv("WASM_LD") {
-        Some(l) if (strLen(l) > 0) -> " -fuse-ld=" + shellQuote(l),
+        Some(l) if (strLen(l) > 0) -> ["-fuse-ld=" + l],
         _ ->
-            if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"
-            else if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"
-            else if (fileExists("/usr/local/opt/lld/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld/bin/wasm-ld"
-            else if (fileExists("/usr/local/opt/lld@20/bin/wasm-ld")) " -fuse-ld=/usr/local/opt/lld@20/bin/wasm-ld"
-            else if (fileExists("/usr/lib/llvm-20/bin/wasm-ld")) " -fuse-ld=/usr/lib/llvm-20/bin/wasm-ld"
-            else "",
+            if (fileExists("/opt/homebrew/opt/lld/bin/wasm-ld")) ["-fuse-ld=/opt/homebrew/opt/lld/bin/wasm-ld"]
+            else if (fileExists("/opt/homebrew/opt/lld@20/bin/wasm-ld")) ["-fuse-ld=/opt/homebrew/opt/lld@20/bin/wasm-ld"]
+            else if (fileExists("/usr/local/opt/lld/bin/wasm-ld")) ["-fuse-ld=/usr/local/opt/lld/bin/wasm-ld"]
+            else if (fileExists("/usr/local/opt/lld@20/bin/wasm-ld")) ["-fuse-ld=/usr/local/opt/lld@20/bin/wasm-ld"]
+            else if (fileExists("/usr/lib/llvm-20/bin/wasm-ld")) ["-fuse-ld=/usr/lib/llvm-20/bin/wasm-ld"]
+            else Nil,
     }
 
 def resolveNativeCc(): String =
@@ -612,6 +612,9 @@ def resolveNativeCc(): String =
 def nativeEnvPrefix(): String =
     if (currentHostOs() == "macos") "MACOSX_DEPLOYMENT_TARGET=14.0 " else ""
 
+def nativeEnvVars(): List (String, String) =
+    if (currentHostOs() == "macos") [("MACOSX_DEPLOYMENT_TARGET", "14.0")] else Nil
+
 def nativeTargetFlag(): String =
     if (currentHostOs() == "macos") {
         let arch = currentHostArch();
@@ -620,8 +623,49 @@ def nativeTargetFlag(): String =
         else ""
     } else ""
 
+def nativeTargetArgs(): List String =
+    if (currentHostOs() == "macos") {
+        let arch = currentHostArch();
+        if (arch == "arm64") ["-target", "arm64-apple-macosx14.0"]
+        else if (arch == "x86_64") ["-target", "x86_64-apple-macosx14.0"]
+        else Nil
+    } else Nil
+
+def nativePthreadArgs(): List String =
+    if (currentHostOs() == "windows") Nil else ["-pthread"]
+
 def nativeSysLibs(): String =
-    if (currentHostOs() == "macos") "" else " -lm"
+    if (currentHostOs() == "macos") ""
+    else if (currentHostOs() == "windows") " -lws2_32 -lbcrypt"
+    else " -lm"
+
+def nativeSysLibArgs(): List String =
+    if (currentHostOs() == "macos") Nil
+    else if (currentHostOs() == "windows") ["-lws2_32", "-lbcrypt"]
+    else ["-lm"]
+
+def hostExeExt(): String =
+    if (currentHostOs() == "windows") ".exe" else ""
+
+def trimLeadingSpace(s: String): String =
+    if (strLen(s) > 0 && strByteAt(s, 0) == 32) strSlice(s, 1, strLen(s)) else s
+
+def runHostProc(program: String, args: List String, envVars: List (String, String)): Int = {
+    let c0 = command(program, args);
+    let c1 = match envVars { Nil -> c0, _ -> cmdEnv(c0, envVars) };
+    match procSpawn(c1) {
+        Err(_) -> 1,
+        Ok(child) -> match childWait(child) {
+            Ok(Exited(code)) -> code,
+            _ -> 1,
+        },
+    }
+}
+
+def concatArgLists(parts: List (List String)): List String = match parts {
+    Nil -> Nil,
+    Cons(xs, rest) -> listAppend(xs, concatArgLists(rest)),
+}
 
 def resolveRuntimeArchive(explicitOpt: Option String): Result String String =
     match explicitOpt {
@@ -973,13 +1017,14 @@ def emitNativeExecutableFromIrDebug(
     optFlag: String
 ): Result Void String = {
     let rtArchive = resolveRuntimeArchive(rtOverrideOpt)?;
-    let ccBin = shellQuote(resolveNativeCc());
-    let envPfx = nativeEnvPrefix();
-    let targetArchFlag = nativeTargetFlag();
-    let effOptFlag = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
-    let sysLibs = nativeSysLibs();
+    let ccProg = resolveNativeCc();
+    let envVars = nativeEnvVars();
+    let targetArgs = nativeTargetArgs();
+    let effOptArg = trimLeadingSpace(match tc.tcOptLevel { Some(lvl) -> "-O" + lvl, None -> optFlag });
+    let pthreadArgs = nativePthreadArgs();
+    let sysLibArgs = nativeSysLibArgs();
     let isMac = currentHostOs() == "macos";
-    let cDbgFlag = if (debugInfo) " -g" else "";
+    let dbgArgs = if (debugInfo) ["-g"] else Nil;
     let tmpLl = outBin + ".tmp.ll";
     writeFile(tmpLl, llText)?;
 
@@ -997,12 +1042,8 @@ def emitNativeExecutableFromIrDebug(
                         Cons(srcPath, rs) -> {
                             let objPath = outBin + ".unit" + intToStr(cellGet(uIdx)) + ".tmp.o";
                             cellSet(uIdx, cellGet(uIdx) + 1);
-                            let cmdU =
-                                envPfx + shellQuote(u.nuCompiler)
-                                + shellQuoteArgs(u.nuFlags)
-                                + " -c " + shellQuote(srcPath)
-                                + " -o " + shellQuote(objPath);
-                            let rcu = shell(cmdU);
+                            let uArgs = concatArgLists([u.nuFlags, ["-c", srcPath, "-o", objPath]]);
+                            let rcu = runHostProc(u.nuCompiler, uArgs, envVars);
                             if (rcu != 0) {
                                 cellSet(extraErr, Some("Native compiler '" + u.nuCompiler + "' failed on '" + srcPath + "'"))
                             } else {
@@ -1039,46 +1080,50 @@ def emitNativeExecutableFromIrDebug(
         },
         None ->
             if (!needsObjStage) {
-                let cmd =
-                    envPfx + ccBin + targetArchFlag
-                    + effOptFlag + " -Wno-override-module -pthread -x ir "
-                    + shellQuote(tmpLl) + " -x none " + shellQuote(rtArchive)
-                    + shellQuoteArgs(tc.tcLinkFlags)
-                    + sysLibs
-                    + " -o " + shellQuote(outBin);
-                let rc = shell(cmd);
+                let args = concatArgLists([
+                    targetArgs,
+                    [effOptArg, "-Wno-override-module"],
+                    pthreadArgs,
+                    ["-x", "ir", tmpLl, "-x", "none", rtArchive],
+                    tc.tcLinkFlags,
+                    sysLibArgs,
+                    ["-o", outBin]
+                ]);
+                let rc = runHostProc(ccProg, args, envVars);
                 let _ = removeFile(tmpLl);
                 if (rc == 0) Ok(())
                 else Err("C/LLVM backend failed while linking executable '" + outBin + "'")
             } else {
                 // Compile IR to `.o` first (required for ObjC/C host files and macOS `dsymutil` DWARF extraction)
                 let tmpObj = outBin + ".gsa.tmp.o";
-                let cmdIr =
-                    envPfx + ccBin + targetArchFlag
-                    + effOptFlag + " -Wno-override-module -x ir -c "
-                    + shellQuote(tmpLl) + " -o " + shellQuote(tmpObj);
-                let rc1 = shell(cmdIr);
+                let irArgs = concatArgLists([
+                    targetArgs,
+                    [effOptArg, "-Wno-override-module", "-x", "ir", "-c", tmpLl, "-o", tmpObj]
+                ]);
+                let rc1 = runHostProc(ccProg, irArgs, envVars);
                 let _ = removeFile(tmpLl);
                 if (rc1 != 0) {
                     let _ = removeFile(tmpObj);
                     cleanupExtraObjs();
                     Err("C/LLVM backend failed while compiling Geisha IR object for '" + outBin + "'")
                 } else {
-                    let cmdLink =
-                        envPfx + ccBin + targetArchFlag
-                        + effOptFlag + cDbgFlag + " -pthread"
-                        + shellQuoteArgs(tc.tcCFlags)
-                        + shellQuoteArgs(tc.tcCSources)
-                        + shellQuoteArgs(cellGet(extraObjs))
-                        + " " + shellQuote(tmpObj)
-                        + " " + shellQuote(rtArchive)
-                        + shellQuoteArgs(tc.tcLinkFlags)
-                        + sysLibs
-                        + " -o " + shellQuote(outBin);
-                    let rc2 = shell(cmdLink);
+                    let linkArgs = concatArgLists([
+                        targetArgs,
+                        [effOptArg],
+                        dbgArgs,
+                        pthreadArgs,
+                        tc.tcCFlags,
+                        tc.tcCSources,
+                        cellGet(extraObjs),
+                        [tmpObj, rtArchive],
+                        tc.tcLinkFlags,
+                        sysLibArgs,
+                        ["-o", outBin]
+                    ]);
+                    let rc2 = runHostProc(ccProg, linkArgs, envVars);
                     let rcDsym =
                         if (rc2 == 0 && debugInfo && isMac) {
-                            shell("dsymutil " + shellQuote(outBin))
+                            runHostProc("dsymutil", [outBin], Nil)
                         } else 0;
                     let _ = removeFile(tmpObj);
                     cleanupExtraObjs();
@@ -1101,22 +1146,27 @@ def emitNativeExecutableFromIr(
 def emitTargetObjFromIrOpt(llText: String, outObj: String, target: String, optFlag: String): Result Void String = {
     let tmpLl = outObj + ".tmp.ll";
     writeFile(tmpLl, llText)?;
-    let cmd =
+    let optArg = trimLeadingSpace(optFlag);
+    let rc =
         if (target == "ios") {
-            "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=16.0 "
-            + "xcrun --sdk iphoneos clang -target arm64-apple-ios16.0" + optFlag + " -Wno-override-module -x ir -c "
-            + shellQuote(tmpLl) + " -o " + shellQuote(outObj)
+            let cmd =
+                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=16.0 "
+                + "xcrun --sdk iphoneos clang -target arm64-apple-ios16.0" + optFlag + " -Wno-override-module -x ir -c "
+                + shellQuote(tmpLl) + " -o " + shellQuote(outObj);
+            shell(cmd)
         } else if (target == "ios-sim") {
-            "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=16.0 "
-            + "xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator" + optFlag + " -Wno-override-module -x ir -c "
-            + shellQuote(tmpLl) + " -o " + shellQuote(outObj)
+            let cmd =
+                "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer IPHONEOS_DEPLOYMENT_TARGET=16.0 "
+                + "xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator" + optFlag + " -Wno-override-module -x ir -c "
+                + shellQuote(tmpLl) + " -o " + shellQuote(outObj);
+            shell(cmd)
         } else {
-            let ccBin = shellQuote(resolveNativeCc());
-            nativeEnvPrefix() + ccBin + nativeTargetFlag()
-            + optFlag + " -Wno-override-module -x ir -c "
-            + shellQuote(tmpLl) + " -o " + shellQuote(outObj)
+            let args = concatArgLists([
+                nativeTargetArgs(),
+                [optArg, "-Wno-override-module", "-x", "ir", "-c", tmpLl, "-o", outObj]
+            ]);
+            runHostProc(resolveNativeCc(), args, nativeEnvVars())
         };
-    let rc = shell(cmd);
     let _ = removeFile(tmpLl);
     if (rc == 0) Ok(())
     else Err("C/LLVM backend failed while compiling object '" + outObj + "' for target '" + target + "'")
@@ -1167,16 +1217,20 @@ def emitStaticLibFromIrOpt(
     let rtArchive = resolveRuntimeArchiveForTarget(target, rtOverrideOpt)?;
     let tmpObj = outArchive + ".gsa.tmp.o";
     emitTargetObjFromIrOpt(llText, tmpObj, target, optFlag)?;
-    let cmd =
+    let rc =
         if (currentHostOs() == "macos") {
-            "libtool -static -o " + shellQuote(outArchive) + " " + shellQuote(tmpObj) + " " + shellQuote(rtArchive)
+            runHostProc("libtool", ["-static", "-o", outArchive, tmpObj, rtArchive], Nil)
+        } else if (currentHostOs() == "windows") {
+            let _ = removeFile(outArchive);
+            runHostProc("lld-link", ["/lib", "/nologo", "/out:" + outArchive, rtArchive, tmpObj], Nil)
         } else {
-            "rm -f " + shellQuote(outArchive)
-            + " && printf 'CREATE %s\\nADDLIB %s\\nADDMOD %s\\nSAVE\\nEND\\n' "
-            + shellQuote(outArchive) + " " + shellQuote(rtArchive) + " " + shellQuote(tmpObj)
-            + " | ar -M"
+            let cmd =
+                "rm -f " + shellQuote(outArchive)
+                + " && printf 'CREATE %s\\nADDLIB %s\\nADDMOD %s\\nSAVE\\nEND\\n' "
+                + shellQuote(outArchive) + " " + shellQuote(rtArchive) + " " + shellQuote(tmpObj)
+                + " | ar -M";
+            shell(cmd)
         };
-    let rc = shell(cmd);
     let _ = removeFile(tmpObj);
     if (rc == 0) Ok(())
     else Err("archiver failed while creating static library '" + outArchive + "'")
@@ -1238,7 +1292,9 @@ def isWasmOptDisabled(): Bool = match getEnv("GEISHA_DISABLE_TOOL") {
 def findExeInPath(binName: String): Option String = match getEnv("PATH") {
     None -> None,
     Some(pathEnv) -> {
-        let dirs = strSplitChar(pathEnv, ':');
+        let isWin = currentHostOs() == "windows";
+        let sepCh = if (isWin) ';' else ':';
+        let dirs = strSplitChar(pathEnv, sepCh);
         let cur = cellNew(dirs);
         let found: Cell (Option String) = cellNew(None);
         while (match cellGet(cur) { Nil -> false, _ -> match cellGet(found) { None -> true, Some(_) -> false } }) {
@@ -1246,7 +1302,11 @@ def findExeInPath(binName: String): Option String = match getEnv("PATH") {
                 Cons(d, r) -> {
                     if (strLen(d) > 0) {
                         let cand = pathJoin(d, binName);
-                        if (fileExists(cand)) cellSet(found, Some(cand)) else ()
+                        if (fileExists(cand)) cellSet(found, Some(cand))
+                        else if (isWin) {
+                            let candExe = pathJoin(d, binName + ".exe");
+                            if (fileExists(candExe)) cellSet(found, Some(candExe)) else ()
+                        } else ()
                     } else ();
                     cellSet(cur, r)
                 },
@@ -1266,15 +1326,13 @@ def emitWasmFromIrOpt(
     optFlag: String
 ): Result Void String = {
     let wasmCc = resolveWasmCc();
-    let effOptFlag = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> optFlag };
-    let isSizeOpt = effOptFlag == " -Oz" || effOptFlag == " -Os";
+    let effOptArg = trimLeadingSpace(match tc.tcOptLevel { Some(lvl) -> "-O" + lvl, None -> optFlag });
+    let isSizeOpt = effOptArg == "-Oz" || effOptArg == "-Os";
     if (compileOnly) {
         let tmpLl = outPath + ".tmp.ll";
         writeFile(tmpLl, llText)?;
-        let cmd =
-            shellQuote(wasmCc) + " --target=wasm32" + effOptFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib -x ir -c "
-            + shellQuote(tmpLl) + " -o " + shellQuote(outPath);
-        let rc = shell(cmd);
+        let args = ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib", "-x", "ir", "-c", tmpLl, "-o", outPath];
+        let rc = runHostProc(wasmCc, args, Nil);
         let _ = removeFile(tmpLl);
         if (rc == 0) Ok(())
         else Err("LLVM wasm32 backend failed while compiling object '" + outPath + "'")
@@ -1286,23 +1344,30 @@ def emitWasmFromIrOpt(
             Some(b) -> b,
             None -> isSizeOpt,
         };
-        let stripFlag = if (doStrip) " -Wl,--strip-all" else "";
-        let rtExports =
-            if (tc.tcSlimRuntime) ""
-            else " -Wl,--export=gs_wasm_gc_collect -Wl,--export=gs_wasm_alloc -Wl,--export=gs_wasm_str_len -Wl,--export=gs_wasm_heap_used -Wl,--export=gs_wasm_heap_live";
-        let cmd =
-            shellQuote(wasmCc)
-            + " --target=wasm32" + effOptFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
-            + resolveWasmLdFlag()
-            + shellQuoteArgs(tc.tcCFlags)
-            + " -x ir " + shellQuote(tmpLl) + " -x none " + shellQuote(wasmRt)
-            + shellQuoteArgs(tc.tcCSources)
-            + shellQuoteArgs(tc.tcLinkFlags)
-            + " -Wl,--no-entry -Wl,--allow-undefined -Wl,--gc-sections -Wl,--export-table"
-            + stripFlag
-            + rtExports
-            + " -o " + shellQuote(outPath);
-        let rc = shell(cmd);
+        let ldArgs = resolveWasmLdArgs();
+        let stripArgs = if (doStrip) ["-Wl,--strip-all"] else Nil;
+        let rtExportArgs =
+            if (tc.tcSlimRuntime) Nil
+            else [
+                "-Wl,--export=gs_wasm_gc_collect",
+                "-Wl,--export=gs_wasm_alloc",
+                "-Wl,--export=gs_wasm_str_len",
+                "-Wl,--export=gs_wasm_heap_used",
+                "-Wl,--export=gs_wasm_heap_live"
+            ];
+        let args = concatArgLists([
+            ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib"],
+            ldArgs,
+            tc.tcCFlags,
+            ["-x", "ir", tmpLl, "-x", "none", wasmRt],
+            tc.tcCSources,
+            tc.tcLinkFlags,
+            ["-Wl,--no-entry", "-Wl,--allow-undefined", "-Wl,--gc-sections", "-Wl,--export-table"],
+            stripArgs,
+            rtExportArgs,
+            ["-o", outPath]
+        ]);
+        let rc = runHostProc(wasmCc, args, Nil);
         let _ = removeFile(tmpLl);
         if (rc != 0) {
             Err("LLVM wasm32 backend failed while linking '" + outPath + "' (ensure lld/wasm-ld is installed)")
@@ -1311,11 +1376,8 @@ def emitWasmFromIrOpt(
             if (isSizeOpt && !isWasmOptDisabled()) {
                 match findExeInPath("wasm-opt") {
                     Some(wasmOptBin) -> {
-                        let optCmd =
-                            shellQuote(wasmOptBin)
-                            + " -Oz --enable-bulk-memory --enable-nontrapping-float-to-int "
-                            + shellQuote(outPath) + " -o " + shellQuote(outPath);
-                        let optRc = shell(optCmd);
+                        let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", outPath, "-o", outPath];
+                        let optRc = runHostProc(wasmOptBin, optArgs, Nil);
                         if (optRc == 0) Ok(())
                         else Err("wasm-opt failed while optimizing '" + outPath + "'")
                     },
@@ -1907,7 +1969,7 @@ def makeCompileIrJob(
         let hostArch = currentHostArch();
         let hasSpace = match strIndexOfByte(ccBin, 32, 0) { Some(_) -> true, None -> false };
         let macEnv = if (isMac) [("MACOSX_DEPLOYMENT_TARGET", minOs)] else Nil;
-        if (hasSpace) {
+        if (hasSpace && !fileExists(ccBin) && currentHostOs() != "windows") {
             let tgtFlag = if (isMac && (hostArch == "arm64" || hostArch == "x86_64")) " -target " + hostArch + "-apple-macosx" + minOs else "";
             let dbgStr = if (optDebug) " -g" else "";
             let shCmd = ccBin + tgtFlag + " " + optFlag + dbgStr + " -Wno-override-module -x ir -c " + shellQuote(cguLlPath) + " -o " + shellQuote(tmpObjPath);
@@ -2091,12 +2153,8 @@ def compileNativeUnitCached(
     let canDep = compilerSupportsDepfile(compiler);
     if (!canDep) {
         let tmpObj = pathJoin(natDir, "uncached_" + intToStr(c_getpid()) + "_" + intToStr(idx) + ".o");
-        let cmdU =
-            envPfx + shellQuote(compiler)
-            + shellQuoteArgs(effFlags)
-            + " -c " + shellQuote(srcPath)
-            + " -o " + shellQuote(tmpObj);
-        let rc = shell(cmdU);
+        let argsU = listAppend(effFlags, ["-c", srcPath, "-o", tmpObj]);
+        let rc = runHostProc(compiler, argsU, nativeEnvVars());
         if (rc != 0) {
             let _ = removeFile(tmpObj);
             Err("Native compiler '" + compiler + "' failed on '" + srcPath + "'")
@@ -2117,13 +2175,8 @@ def compileNativeUnitCached(
             let pidStr = intToStr(c_getpid());
             let tmpObj = objPath + ".tmp." + pidStr + "." + intToStr(idx) + ".o";
             let tmpDep = objPath + ".tmp." + pidStr + "." + intToStr(idx) + ".d";
-            let cmdU =
-                envPfx + shellQuote(compiler)
-                + shellQuoteArgs(effFlags)
-                + " -MD -MF " + shellQuote(tmpDep)
-                + " -c " + shellQuote(srcPath)
-                + " -o " + shellQuote(tmpObj);
-            let rc = shell(cmdU);
+            let argsU = listAppend(effFlags, ["-MD", "-MF", tmpDep, "-c", srcPath, "-o", tmpObj]);
+            let rc = runHostProc(compiler, argsU, nativeEnvVars());
             if (rc != 0) {
                 let _ = removeFile(tmpObj);
                 let _ = removeFile(tmpDep);
@@ -2276,19 +2329,23 @@ def emitNativeExecutableFromCgus(
     let (natObjs, natHit, natMiss, natCacheable, natDepPaths) = compileTargetNativeSourcesCached(cacheDir, noCache, tc, ccBin, envPfx, macTgtList, optFlag, optDebug)?;
     maybePrintCacheStats(listLen(cgus), cguHit, cguMiss, natHit, natMiss, optLevel);
 
-    let cmdLink =
-        envPfx + shellQuote(ccBin) + targetArchFlag
-        + " " + optFlag + (if (optDebug) " -g" else "") + " -pthread"
-        + shellQuoteArgs(natObjs)
-        + shellQuoteArgs(cguObjs)
-        + " " + shellQuote(rtArchive)
-        + shellQuoteArgs(tc.tcLinkFlags)
-        + sysLibs
-        + " -o " + shellQuote(outBin);
-    let rc = shell(cmdLink);
+    let dbgArgs = if (optDebug) ["-g"] else Nil;
+    let linkArgs = concatArgLists([
+        nativeTargetArgs(),
+        [optFlag],
+        dbgArgs,
+        nativePthreadArgs(),
+        natObjs,
+        cguObjs,
+        [rtArchive],
+        tc.tcLinkFlags,
+        nativeSysLibArgs(),
+        ["-o", outBin]
+    ]);
+    let rc = runHostProc(ccBin, linkArgs, nativeEnvVars());
     let rcDsym =
         if (rc == 0 && optDebug && currentHostOs() == "macos") {
-            shell("dsymutil " + shellQuote(outBin))
+            runHostProc("dsymutil", [outBin], Nil)
         } else 0;
     if (!natCacheable) {
         let co = cellNew(natObjs);
@@ -2327,34 +2384,38 @@ def emitWasmFromCgus(
         Some(b) -> b,
         None -> isSizeOpt,
     };
-    let stripFlag = if (doStrip) " -Wl,--strip-all" else "";
-    let rtExports =
-        if (tc.tcSlimRuntime) ""
-        else " -Wl,--export=gs_wasm_gc_collect -Wl,--export=gs_wasm_alloc -Wl,--export=gs_wasm_str_len -Wl,--export=gs_wasm_heap_used -Wl,--export=gs_wasm_heap_live";
-    let cmd =
-        shellQuote(wasmCc)
-        + " --target=wasm32 " + optFlag + " -mbulk-memory -mnontrapping-fptoint -Wno-override-module -nostdlib"
-        + resolveWasmLdFlag()
-        + shellQuoteArgs(tc.tcCFlags)
-        + shellQuoteArgs(cguObjs)
-        + " " + shellQuote(wasmRt)
-        + shellQuoteArgs(tc.tcCSources)
-        + shellQuoteArgs(tc.tcLinkFlags)
-        + " -Wl,--no-entry -Wl,--allow-undefined -Wl,--gc-sections -Wl,--export-table"
-        + stripFlag
-        + rtExports
-        + " -o " + shellQuote(outPath);
-    let rc = shell(cmd);
+    let ldArgs = resolveWasmLdArgs();
+    let stripArgs = if (doStrip) ["-Wl,--strip-all"] else Nil;
+    let rtExportArgs =
+        if (tc.tcSlimRuntime) Nil
+        else [
+            "-Wl,--export=gs_wasm_gc_collect",
+            "-Wl,--export=gs_wasm_alloc",
+            "-Wl,--export=gs_wasm_str_len",
+            "-Wl,--export=gs_wasm_heap_used",
+            "-Wl,--export=gs_wasm_heap_live"
+        ];
+    let args = concatArgLists([
+        ["--target=wasm32", optFlag, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib"],
+        ldArgs,
+        tc.tcCFlags,
+        cguObjs,
+        [wasmRt],
+        tc.tcCSources,
+        tc.tcLinkFlags,
+        ["-Wl,--no-entry", "-Wl,--allow-undefined", "-Wl,--gc-sections", "-Wl,--export-table"],
+        stripArgs,
+        rtExportArgs,
+        ["-o", outPath]
+    ]);
+    let rc = runHostProc(wasmCc, args, Nil);
     if (rc != 0) {
         Err("LLVM wasm32 backend failed while linking '" + outPath + "' (ensure lld/wasm-ld is installed)")
     } else if (isSizeOpt && !isWasmOptDisabled()) {
         match findExeInPath("wasm-opt") {
             Some(wasmOptBin) -> {
-                let optCmd =
-                    shellQuote(wasmOptBin)
-                    + " -Oz --enable-bulk-memory --enable-nontrapping-float-to-int "
-                    + shellQuote(outPath) + " -o " + shellQuote(outPath);
-                let optRc = shell(optCmd);
+                let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", outPath, "-o", outPath];
+                let optRc = runHostProc(wasmOptBin, optArgs, Nil);
                 if (optRc == 0) Ok(())
                 else Err("wasm-opt failed while optimizing '" + outPath + "'")
             },
@@ -2568,7 +2629,7 @@ def serializeProjGraphForKey(rootSpec: PkgSpec, extSpecs: List PkgSpec, tc: Targ
 
 def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noCache: Bool): CompileCallbacks = MkCompileCallbacks {
     cbCompileNativeExe: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt, rtOpt, cacheDirOpt) -> {
-        let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryFile) };
+        let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + hostExeExt() };
         let effOpt = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
         let cacheDir = effectiveCacheDir(cacheDirOpt);
         let rtArchive = resolveRuntimeArchive(rtOpt)?;
@@ -2616,7 +2677,7 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
         diagReset();
         let rawDefs = loadSingleSourceProgramWithPkgsNamed(entryLabel, srcText, rootSpec, extSpecs, Nil)?;
         let llText = compileLoadedDefsToIr(rawDefs, None, false, tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol)?;
-        let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryLabel) };
+        let outBin = match outOpt { Some(p) -> p, None -> pathStem(entryLabel) + hostExeExt() };
         emitNativeExecutableFromIr(llText, outBin, tc, rtOpt)
     },
     cbCompileNativeObj: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt) -> {
@@ -2852,7 +2913,7 @@ def writeScriptDeps(depsPath: String, skipPath: String): Result Void String = {
 }
 
 def execCachedScriptBin(binPath: String, appArgs: List String): Int =
-    shell(shellQuote(binPath) + shellQuoteArgs(appArgs))
+    runHostProc(binPath, appArgs, Nil)
 
 def emptyPlainTargetCfg(): TargetCfg = MkTargetCfg {
     tcCSources: Nil,
@@ -2888,12 +2949,12 @@ def runUncachedScriptFile(
     )?;
     let cacheDir = pathJoin(pathJoin(geishaHomeDir(), "cache"), "scripts");
     mkdirAll(cacheDir)?;
-    let tmpBin = pathJoin(cacheDir, "run_" + intToStr(c_getpid()));
+    let tmpBin = pathJoin(cacheDir, "run_" + intToStr(c_getpid()) + hostExeExt());
     emitNativeExecutableFromIrDebug(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt, debugInfo, optFlag)?;
     let rc = execCachedScriptBin(tmpBin, appArgs);
     let _ = removeFile(tmpBin);
     if (debugInfo && currentHostOs() == "macos") {
-        let _ = shell("rm -rf " + shellQuote(tmpBin + ".dSYM"));
+        let _ = removeDirAll(tmpBin + ".dSYM");
         ()
     } else ();
     Ok(rc)
@@ -2916,7 +2977,7 @@ def runCachedScriptFile(
         0,
         24
     );
-    let binPath = pathJoin(cacheDir, "s_" + key);
+    let binPath = pathJoin(cacheDir, "s_" + key + hostExeExt());
     let depsPath = binPath + ".deps";
     if (!noCache && fileExists(binPath) && verifyScriptDeps(depsPath)) {
         match getEnv("GEISHA_CACHE_STATS") {
@@ -2939,7 +3000,7 @@ def runCachedScriptFile(
         let llText = compileWithPkgSpecsToIrDebug(
             gsaFile, true, rootSpec, Nil, Nil, None, false, Nil, false, None, optDebug
         )?;
-        let tmpBin = binPath + ".tmp." + intToStr(c_getpid());
+        let tmpBin = pathJoin(cacheDir, "s_" + key + ".tmp." + intToStr(c_getpid()) + hostExeExt());
         emitNativeExecutableFromIrDebug(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt, optDebug, " -O" + optLevel)?;
         writeScriptDeps(depsPath, gsaFile)?;
         if (c_rename(tmpBin, binPath) != 0) {
@@ -2967,7 +3028,7 @@ def runEvalSubcmd(rawArgs: List String, rtOverrideOpt: Option String): Result In
                 0,
                 24
             );
-            let binPath = pathJoin(cacheDir, "e_" + key);
+            let binPath = pathJoin(cacheDir, "e_" + key + hostExeExt());
             let depsPath = binPath + ".deps";
             if (fileExists(binPath) && verifyScriptDeps(depsPath)) {
                 Ok(execCachedScriptBin(binPath, appArgs))
@@ -2981,7 +3042,7 @@ def runEvalSubcmd(rawArgs: List String, rtOverrideOpt: Option String): Result In
                 };
                 let rawDefs = loadSingleSourceProgramWithPkgsNamed("<eval>", code, rootSpec, Nil, Nil)?;
                 let llText = compileLoadedDefsToIr(rawDefs, None, false, Nil, false, None)?;
-                let tmpBin = binPath + ".tmp." + intToStr(c_getpid());
+                let tmpBin = pathJoin(cacheDir, "e_" + key + ".tmp." + intToStr(c_getpid()) + hostExeExt());
                 emitNativeExecutableFromIr(llText, tmpBin, emptyPlainTargetCfg(), rtOverrideOpt)?;
                 writeScriptDeps(depsPath, "<eval>")?;
                 if (c_rename(tmpBin, binPath) != 0) {
@@ -3229,7 +3290,7 @@ def runDriver(): Result Int String = {
                 } else {
                     let outBin = match opts.optOutPath {
                         Some(p) -> p,
-                        None -> pathStem(inputFile),
+                        None -> pathStem(inputFile) + hostExeExt(),
                     };
                     let cgus = compileWithPkgSpecsToCgusForArchDebug(
                         inputFile, useProjLoader, rootSpec, extSpecs, opts.optLibPaths,

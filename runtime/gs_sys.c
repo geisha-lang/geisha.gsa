@@ -1,3 +1,7 @@
+#if defined(_WIN32)
+#include "gs_sys_win32.inc"
+#else
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -133,7 +137,31 @@ int64_t gs_sys_fd_write(int32_t fd, const void *buf, int64_t len)
     return len;
 }
 
-/* ---- Filesystem helpers (`sys.fs`) ---- */
+/* ---- Filesystem & env helpers (`sys.fs`, `sys.env`) ---- */
+
+void gs_sys_normalize_args(int32_t *argc_ptr, char ***argv_ptr)
+{
+    (void)argc_ptr;
+    (void)argv_ptr;
+}
+
+const char *gs_sys_getenv(const char *name)
+{
+    if (name == NULL || name[0] == '\0') return NULL;
+    return getenv(name);
+}
+
+void *gs_sys_fopen(const char *path, const char *mode)
+{
+    if (path == NULL || mode == NULL) return NULL;
+    return (void *)fopen(path, mode);
+}
+
+int32_t gs_sys_remove(const char *path)
+{
+    if (path == NULL || path[0] == '\0') return -1;
+    return (remove(path) == 0) ? 0 : -1;
+}
 
 int32_t gs_sys_file_exists(const char *path)
 {
@@ -1099,3 +1127,5 @@ int32_t gs_pipe_poll2(int32_t fd0, int32_t fd1, int32_t timeout_ms)
         return -1;
     }
 }
+
+#endif /* !defined(_WIN32) */

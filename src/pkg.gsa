@@ -504,6 +504,9 @@ def pkgHostOs(): String = {
     if (ptrIsNull(p)) "posix" else ptrToString(p)
 }
 
+def pkgExeExt(): String =
+    if (pkgHostOs() == "windows") ".exe" else ""
+
 def splitWsTokens(s: String): List String = {
     let n = strLen(s);
     let acc = cellNew(Nil);
@@ -2804,7 +2807,7 @@ pub def cmdBuildProject(
         cbs.cbCompileNativeObj(entryFile, rootSpec, extSpecs, mergedTc, Some(outObj), dumpCoreOpt)?;
         Ok(outObj)
     } else {
-        let defaultBin = pathJoin(buildDir, rootMf.mfName);
+        let defaultBin = pathJoin(buildDir, rootMf.mfName + pkgExeExt());
         let outBin = match outPathOpt { Some(p) -> p, None -> defaultBin };
         ensureParentDirExists(outBin)?;
         cbs.cbCompileNativeExe(entryFile, rootSpec, extSpecs, mergedTc, Some(outBin), dumpCoreOpt, rtOverrideOpt, cacheDirOpt)?;
@@ -2822,7 +2825,7 @@ pub def cmdRun(
         Some(gsaFile) -> {
             let tmpDir = pathJoin(geishaHomeDir(), "tmp");
             mkdirAll(tmpDir)?;
-            let outBin = pathJoin(tmpDir, "run_" + intToStr(c_getpid()) + "_" + pathStem(gsaFile));
+            let outBin = pathJoin(tmpDir, "run_" + intToStr(c_getpid()) + "_" + pathStem(gsaFile) + pkgExeExt());
             let rootSpec = MkPkgSpec {
                 pkgId: "",
                 pkgName: "",
@@ -2957,7 +2960,7 @@ def runTestFilesRec(
     Nil -> Ok(acc),
     Cons(tf, rest) -> {
         let stem = pathStem(tf);
-        let outBin = pathJoin(buildDir, "test_" + stem);
+        let outBin = pathJoin(buildDir, "test_" + stem + pkgExeExt());
         let cacheDirOpt = Some(pathJoin(projDir, "build/cache"));
         cbs.cbCompileNativeExe(tf, testRootSpec, allExtSpecs, testTc, Some(outBin), None, rtOverrideOpt, cacheDirOpt)?;
         let rc = runCmdStatus(outBin, Nil, Some(projDir));

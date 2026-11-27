@@ -4601,4 +4601,33 @@ EOF
 "$CC" $HOST_CC_TARGET -O2 -Iruntime/include -pthread "$TMP_DIR/t39_blocking_roots.c" "$GEISHA_RUNTIME" $HOST_CC_LIBS -o "$TMP_DIR/t39_blocking_roots"
 assert_eq "blocking_capture_callee_saved_roots_O2" "1" "$("$TMP_DIR/t39_blocking_roots")"
 
+# ---- Test: explicit WASM_LD (including path with spaces) passes unquoted to -fuse-ld= ----
+REAL_WASM_LD=""
+for cand in \
+    /opt/homebrew/opt/lld/bin/wasm-ld \
+    /opt/homebrew/opt/lld@20/bin/wasm-ld \
+    /usr/local/opt/lld/bin/wasm-ld \
+    /usr/local/opt/lld@20/bin/wasm-ld \
+    /usr/lib/llvm-20/bin/wasm-ld \
+    "$(command -v wasm-ld 2>/dev/null || true)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        REAL_WASM_LD="$cand"
+        break
+    fi
+done
+if [ -n "$REAL_WASM_LD" ] && [ -f build/wasm_rt.o ]; then
+    mkdir -p "$TMP_DIR/ld with space"
+    ln -sf "$REAL_WASM_LD" "$TMP_DIR/ld with space/wasm-ld"
+    cat > "$TMP_DIR/t40_wasm_ld.gsa" <<'EOF'
+pub def add(a: Int, b: Int): Int = a + b
+def main(): Void = ()
+EOF
+    WASM_LD="$TMP_DIR/ld with space/wasm-ld" "$GEISHA_BIN" --target wasm32 --runtime build/wasm_rt.o -o "$TMP_DIR/t40_wasm_ld.wasm" "$TMP_DIR/t40_wasm_ld.gsa"
+    if [ -s "$TMP_DIR/t40_wasm_ld.wasm" ]; then
+        assert_eq "wasm_ld_env_with_spaces" "ok" "ok"
+    else
+        assert_eq "wasm_ld_env_with_spaces" "ok" "missing wasm output"
+    fi
+fi
+
 echo "All $PASS end-to-end test suites passed!"
