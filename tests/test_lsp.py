@@ -1275,6 +1275,109 @@ def main() -> int:
         )
         assert res_i.returncode == 0 and res_i.stdout.strip() == "100", f"renamed aliased re-export failed to run: rc={res_i.returncode} stdout={res_i.stdout!r} stderr={res_i.stderr!r}"
 
+        # (j) Same-spelling explicit alias stops propagation: `bridge_same.gsa` (`pub use m2.load as load`) + `use bridge_same.load`
+        same_dir = root / "same_alias_proj"
+        same_dir.mkdir(parents=True)
+        sa_m2_path = same_dir / "m2.gsa"
+        sa_br_path = same_dir / "bridge_same.gsa"
+        sa_usr_path = same_dir / "user.gsa"
+        sa_m2_src = "pub def load(): Int = 7\n"
+        sa_br_src = "pub use m2.load as load\n"
+        sa_usr_src = (
+            "use std.str.intToStr\n"
+            "use bridge_same.load\n"
+            "def main(): Void = printLn(intToStr(load()))\n"
+        )
+        sa_m2_path.write_text(sa_m2_src, encoding="utf-8")
+        sa_br_path.write_text(sa_br_src, encoding="utf-8")
+        sa_usr_path.write_text(sa_usr_src, encoding="utf-8")
+        sa_m2_uri = path_to_uri(sa_m2_path)
+        sa_br_uri = path_to_uri(sa_br_path)
+        sa_usr_uri = path_to_uri(sa_usr_path)
+        client.notifications.clear()
+        for u, t in ((sa_m2_uri, sa_m2_src), (sa_br_uri, sa_br_src), (sa_usr_uri, sa_usr_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_same = client.request("textDocument/rename", {
+            "textDocument": {"uri": sa_m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "freshName",
+        })
+        assert "result" in ren_same, f"expected same-spelling alias rename to succeed: {ren_same}"
+        ch_same = ren_same["result"]["changes"]
+        assert sa_usr_uri not in ch_same, f"downstream `use bridge_same.load` / `load()` must NOT be edited when bridge pins `as load`: {ch_same}"
+        new_sa_m2 = apply_edits(sa_m2_src, ch_same[sa_m2_uri])
+        new_sa_br = apply_edits(sa_br_src, ch_same[sa_br_uri])
+        assert new_sa_m2 == "pub def freshName(): Int = 7\n" and new_sa_br == "pub use m2.freshName as load\n", f"unexpected same-alias edits: {new_sa_m2!r}, {new_sa_br!r}"
+        run_j_dir = root / "run_same_alias"
+        run_j_dir.mkdir(parents=True)
+        (run_j_dir / "m2.gsa").write_text(new_sa_m2, encoding="utf-8")
+        (run_j_dir / "bridge_same.gsa").write_text(new_sa_br, encoding="utf-8")
+        (run_j_dir / "user.gsa").write_text(sa_usr_src, encoding="utf-8")
+        res_j = subprocess.run(
+            [abs_geisha_bin, "run", str(run_j_dir / "user.gsa")],
+            cwd=str(run_j_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_j.returncode == 0 and res_j.stdout.strip() == "7", f"renamed same-spelling alias failed to run: rc={res_j.returncode} stdout={res_j.stdout!r} stderr={res_j.stderr!r}"
+
+        # (k) Two-hop explicit alias round-trip (`load -> api -> load`): `hop1` (`pub use m2.load as api`), `hop2` (`pub use hop1.api as load`), `user` (`use hop2.load`)
+        hop_dir = root / "two_hop_alias_proj"
+        hop_dir.mkdir(parents=True)
+        h_m2_path = hop_dir / "m2.gsa"
+        h_1_path = hop_dir / "hop1.gsa"
+        h_2_path = hop_dir / "hop2.gsa"
+        h_usr_path = hop_dir / "user.gsa"
+        h_m2_src = "pub def load(): Int = 7\n"
+        h_1_src = "pub use m2.load as api\n"
+        h_2_src = "pub use hop1.api as load\n"
+        h_usr_src = (
+            "use std.str.intToStr\n"
+            "use hop2.load\n"
+            "def main(): Void = printLn(intToStr(load()))\n"
+        )
+        h_m2_path.write_text(h_m2_src, encoding="utf-8")
+        h_1_path.write_text(h_1_src, encoding="utf-8")
+        h_2_path.write_text(h_2_src, encoding="utf-8")
+        h_usr_path.write_text(h_usr_src, encoding="utf-8")
+        h_m2_uri = path_to_uri(h_m2_path)
+        h_1_uri = path_to_uri(h_1_path)
+        h_2_uri = path_to_uri(h_2_path)
+        h_usr_uri = path_to_uri(h_usr_path)
+        client.notifications.clear()
+        for u, t in ((h_m2_uri, h_m2_src), (h_1_uri, h_1_src), (h_2_uri, h_2_src), (h_usr_uri, h_usr_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_hop = client.request("textDocument/rename", {
+            "textDocument": {"uri": h_m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "freshName",
+        })
+        assert "result" in ren_hop, f"expected two-hop alias rename to succeed: {ren_hop}"
+        ch_hop = ren_hop["result"]["changes"]
+        assert h_2_uri not in ch_hop and h_usr_uri not in ch_hop, f"hop2/user must NOT be edited across explicit alias chain: {ch_hop}"
+        new_h_m2 = apply_edits(h_m2_src, ch_hop[h_m2_uri])
+        new_h_1 = apply_edits(h_1_src, ch_hop[h_1_uri])
+        assert new_h_m2 == "pub def freshName(): Int = 7\n" and new_h_1 == "pub use m2.freshName as api\n", f"unexpected two-hop edits: {new_h_m2!r}, {new_h_1!r}"
+        run_k_dir = root / "run_two_hop_alias"
+        run_k_dir.mkdir(parents=True)
+        (run_k_dir / "m2.gsa").write_text(new_h_m2, encoding="utf-8")
+        (run_k_dir / "hop1.gsa").write_text(new_h_1, encoding="utf-8")
+        (run_k_dir / "hop2.gsa").write_text(h_2_src, encoding="utf-8")
+        (run_k_dir / "user.gsa").write_text(h_usr_src, encoding="utf-8")
+        res_k = subprocess.run(
+            [abs_geisha_bin, "run", str(run_k_dir / "user.gsa")],
+            cwd=str(run_k_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_k.returncode == 0 and res_k.stdout.strip() == "7", f"renamed two-hop alias failed to run: rc={res_k.returncode} stdout={res_k.stdout!r} stderr={res_k.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

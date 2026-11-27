@@ -42,7 +42,7 @@ use diag.{
 }
 use parser.parseFileModuleInFile
 use loader.{
-    PkgSpec, MkPkgSpec, loadSingleSourceProgramWithPkgsNamed,
+    PkgSpec, MkPkgSpec, NameInfo, loadSingleSourceProgramWithPkgsNamed,
     loaderCanonicalPath, loaderSetOverlay, loaderRemoveOverlay, loaderLastPublicExports
 }
 use infer.{InferOutput, AdtInfo, VariantInfo, inferProgram, preludePrimSpecs}
@@ -476,7 +476,7 @@ data DocState {
         dsVersion: Int,
         dsParsed: Option FileModule,
         dsInfer: Option InferOutput,
-        dsExports: StrMap String,
+        dsExports: StrMap NameInfo,
         dsFiles: Vec SourceFile,
         dsFileId: Int,
         dsDiagTargetUri: Option String,
@@ -2111,7 +2111,7 @@ data WorkspaceDoc {
         wdText: String,
         wdParsed: Option FileModule,
         wdInfer: Option InferOutput,
-        wdExports: StrMap String,
+        wdExports: StrMap NameInfo,
         wdFiles: Vec SourceFile,
         wdFileId: Int,
     },
@@ -3256,6 +3256,78 @@ def patContainsStructField(pat: Pattern, inf: InferOutput, targetAdtQn: String, 
     _ -> false,
 }
 
+data RenameScope {
+    MkRenameScope {
+        rsExports: StrMap NameInfo,
+        rsItems: List ModuleItem,
+        rsAllowUnaliased: Bool,
+    },
+}
+
+def resolveModAliasInItems(items: List ModuleItem, qual: String): String = {
+    let cur = cellNew(items);
+    let res = cellNew(qual);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseAlias(segs, al, _) if (al == qual) -> cellSet(res, strJoin(segs, ".")),
+                    UseSingle(segs, _) -> {
+                        let full = strJoin(segs, ".");
+                        if (shortSymName(full) == qual) cellSet(res, full) else ()
+                    },
+                    _ -> (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def allowSiteRename(rscope: RenameScope, src: String, fStart: Int, s: Int, origName: String, targetQn: String): Bool =
+    if (s > fStart && strByteAt(src, s - 1) == 46) {
+        let qual = strTrim(strSlice(src, fStart, s - 1));
+        let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
+        modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
+    } else rscope.rsAllowUnaliased
+
+def findEnclosingScopeItems(items: List ModuleItem, posStart: Int, posEnd: Int): List ModuleItem = {
+    let cur = cellNew(items);
+    let res = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModSub(_, _, subItems, subSpan), r) -> {
+                if (posStart >= subSpan.start && posEnd <= subSpan.end) {
+                    cellSet(res, findEnclosingScopeItems(subItems, posStart, posEnd));
+                    cellSet(cur, Nil)
+                } else cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def scopeContainsDeclSpan(items: List ModuleItem, declStart: Int, declEnd: Int): Bool = {
+    let cur = cellNew(items);
+    let found = cellNew(false);
+    while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(_, d), r) -> {
+                if (d.dpos.start == declStart && d.dpos.end == declEnd) cellSet(found, true) else ();
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    cellGet(found)
+}
+
 def collectTopDefOccsInForm(
     uri: String,
     src: String,
@@ -3263,6 +3335,7 @@ def collectTopDefOccsInForm(
     f: Form,
     fileId: Int,
     locals: List LocalBind,
+    rscope: RenameScope,
     target: SymTarget,
     targetQn: String,
     newNameOpt: Option String,
@@ -3282,14 +3355,16 @@ def collectTopDefOccsInForm(
                             let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
                             let exactNameMatch = e > s && strSlice(src, s, e) == target.stName;
                             if (exactNameMatch) {
-                                match newNameOpt {
-                                    Some(nn) if (nn != target.stName) -> match lookupLocalBind(locals, nn) {
-                                        Some(_) -> cellSet(conflict, Some("Renaming '" + target.stName + "' to '" + nn + "' would be shadowed by a local binding")),
-                                        None -> (),
-                                    },
-                                    _ -> (),
-                                };
-                                pushOcc(seen, outRev, uri, src, s, e)
+                                if (!forRename || allowSiteRename(rscope, src, f.pos.start, s, target.stName, targetQn)) {
+                                    match newNameOpt {
+                                        Some(nn) if (nn != target.stName) -> match lookupLocalBind(locals, nn) {
+                                            Some(_) -> cellSet(conflict, Some("Renaming '" + target.stName + "' to '" + nn + "' would be shadowed by a local binding")),
+                                            None -> (),
+                                        },
+                                        _ -> (),
+                                    };
+                                    pushOcc(seen, outRev, uri, src, s, e)
+                                } else ()
                             } else if (!forRename) {
                                 // Explicit local alias usage (e.g. `loadA` from `use a.{load as loadA}`):
                                 // include in Find All References, but do not overwrite alias during rename.
@@ -3301,7 +3376,7 @@ def collectTopDefOccsInForm(
                 }
             } else (),
         ExField(base, fname) -> {
-            collectTopDefOccsInForm(uri, src, inf, base, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, base, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
             if (f.pos.fileId == fileId) {
                 match target.stKind {
                     SkField if (fname == target.stName) ->
@@ -3323,7 +3398,9 @@ def collectTopDefOccsInForm(
                     SkTopDef if (ctorQn == targetQn) -> {
                         let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
                         if (e > s && strSlice(src, s, e) == target.stName) {
-                            pushOcc(seen, outRev, uri, src, s, e)
+                            if (!forRename || allowSiteRename(rscope, src, f.pos.start, s, target.stName, targetQn)) {
+                                pushOcc(seen, outRev, uri, src, s, e)
+                            } else ()
                         } else if (!forRename) {
                             pushOcc(seen, outRev, uri, src, s, e)
                         } else ()
@@ -3359,19 +3436,19 @@ def collectTopDefOccsInForm(
             while (match cellGet(cf2) { Nil -> false, _ -> true }) {
                 match cellGet(cf2) {
                     Cons((_, fv), r) -> {
-                        collectTopDefOccsInForm(uri, src, inf, fv, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+                        collectTopDefOccsInForm(uri, src, inf, fv, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
                         cellSet(cf2, r)
                     },
                     Nil -> (),
                 }
             }
         },
-        ExTuple(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
-        ExList(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
-        ExBlock(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExTuple(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExList(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExBlock(es) -> collectTopDefOccsInList(uri, src, inf, es, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
         ExApply(callee, args) -> {
-            collectTopDefOccsInForm(uri, src, inf, callee, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
-            collectTopDefOccsInList(uri, src, inf, args, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, callee, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInList(uri, src, inf, args, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExAbs(ps, _, body) -> {
             let nextLocals = cellNew(locals);
@@ -3385,29 +3462,29 @@ def collectTopDefOccsInForm(
                     Nil -> (),
                 }
             };
-            collectTopDefOccsInForm(uri, src, inf, body, fileId, cellGet(nextLocals), target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, body, fileId, cellGet(nextLocals), rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExBin(_, lhs, rhs) -> {
-            collectTopDefOccsInForm(uri, src, inf, lhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, lhs, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
-        ExUn(_, sub) -> collectTopDefOccsInForm(uri, src, inf, sub, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExUn(_, sub) -> collectTopDefOccsInForm(uri, src, inf, sub, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
         ExLet(vd, rhs, body) -> {
-            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, rhs, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
             let nextLocals = Cons(MkLocalBind { lbName: vd.vname, lbSpan: f.pos, lbScheme: vd.vscm }, locals);
-            collectTopDefOccsInForm(uri, src, inf, body, fileId, nextLocals, target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, body, fileId, nextLocals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExIf(c, t, e) -> {
-            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, t, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, e, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, t, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, e, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExWhile(c, b) -> {
-            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
-            collectTopDefOccsInForm(uri, src, inf, b, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev)
+            collectTopDefOccsInForm(uri, src, inf, c, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, b, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
         },
         ExMatch(scrut, arms) -> {
-            collectTopDefOccsInForm(uri, src, inf, scrut, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+            collectTopDefOccsInForm(uri, src, inf, scrut, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
             let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
             let ca = cellNew(arms);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
@@ -3418,14 +3495,16 @@ def collectTopDefOccsInForm(
                         if (f.pos.fileId == fileId && patHi > patLo) {
                             match target.stKind {
                                 SkTopDef if (patContainsCtor(arm.pat, targetQn)) -> {
-                                    let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
-                                    let co = cellNew(occs);
-                                    while (match cellGet(co) { Nil -> false, _ -> true }) {
-                                        match cellGet(co) {
-                                            Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
-                                            Nil -> (),
+                                    if (!forRename || rscope.rsAllowUnaliased) {
+                                        let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
+                                        let co = cellNew(occs);
+                                        while (match cellGet(co) { Nil -> false, _ -> true }) {
+                                            match cellGet(co) {
+                                                Cons((s, e), ro) -> { pushOcc(seen, outRev, uri, src, s, e); cellSet(co, ro) },
+                                                Nil -> (),
+                                            }
                                         }
-                                    }
+                                    } else ()
                                 },
                                 SkField if (patContainsStructField(arm.pat, inf, targetQn, target.stName)) -> {
                                     let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
@@ -3455,10 +3534,10 @@ def collectTopDefOccsInForm(
                         };
                         let al = cellGet(armLocals);
                         match arm.guard {
-                            Some(g) -> collectTopDefOccsInForm(uri, src, inf, g, fileId, al, target, targetQn, newNameOpt, conflict, seen, outRev),
+                            Some(g) -> collectTopDefOccsInForm(uri, src, inf, g, fileId, al, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
                             None -> (),
                         };
-                        collectTopDefOccsInForm(uri, src, inf, arm.body, fileId, al, target, targetQn, newNameOpt, conflict, seen, outRev);
+                        collectTopDefOccsInForm(uri, src, inf, arm.body, fileId, al, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
                         if (arm.body.pos.end > cellGet(prevArmEnd)) cellSet(prevArmEnd, arm.body.pos.end) else ();
                         cellSet(ca, r)
                     },
@@ -3466,13 +3545,13 @@ def collectTopDefOccsInForm(
                 }
             }
         },
-        ExTry(inner) -> collectTopDefOccsInForm(uri, src, inf, inner, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExTry(inner) -> collectTopDefOccsInForm(uri, src, inf, inner, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
     }
 }
 
 def collectTopDefOccsInList(
     uri: String, src: String, inf: InferOutput, fs: List Form, fileId: Int,
-    locals: List LocalBind, target: SymTarget, targetQn: String,
+    locals: List LocalBind, rscope: RenameScope, target: SymTarget, targetQn: String,
     newNameOpt: Option String, conflict: Cell (Option String),
     seen: StrMap Bool, outRev: Cell (List OccSpan)
 ): Void = {
@@ -3480,7 +3559,7 @@ def collectTopDefOccsInList(
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(h, r) -> {
-                collectTopDefOccsInForm(uri, src, inf, h, fileId, locals, target, targetQn, newNameOpt, conflict, seen, outRev);
+                collectTopDefOccsInForm(uri, src, inf, h, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -3500,15 +3579,16 @@ def qnameModulePrefix(qn: String): String = {
     if (ld > 0) strSlice(qn, 0, ld) else ""
 }
 
-def exportResolvesToTarget(exports: StrMap String, exportKey: String, targetQn: String): Bool =
+def exportResolvesToTarget(exports: StrMap NameInfo, exportKey: String, targetQn: String): Bool =
     match strMapGet(exports, exportKey) {
-        Some(qn) -> qn == targetQn,
+        Some(info) -> !info.viaExplicitAlias && info.qualifiedName == targetQn,
         None -> false,
     }
 
 // True iff `modKey` exports `origName` resolving to `targetQn` (either directly or via
-// unaliased `pub use` / `pub open` re-export). Stops at any explicit `pub use ... as alias`.
-def modExportsTargetAsOrigName(exports: StrMap String, modKey: String, origName: String, targetQn: String): Bool = {
+// unaliased `pub use` / `pub open` re-export). Stops at any explicit `pub use ... as alias`
+// anywhere in the chain, even when `alias == origName`.
+def modExportsTargetAsOrigName(exports: StrMap NameInfo, modKey: String, origName: String, targetQn: String): Bool = {
     let targetMod = qnameModulePrefix(targetQn);
     (strLen(targetMod) > 0 && modKey == targetMod)
     || exportResolvesToTarget(exports, modKey + "." + origName, targetQn)
@@ -3583,7 +3663,7 @@ def collectUseImportOccs(
     Some(fm) -> collectUseImportOccsInItems(wd, fm.items, target, targetQn, seen, outRev),
 }
 
-def inferModuleExportsName(inf: InferOutput, exports: StrMap String, modKey: String, symName: String): Bool = {
+def inferModuleExportsName(inf: InferOutput, exports: StrMap NameInfo, modKey: String, symName: String): Bool = {
     let want = modKey + "." + symName;
     if (strMapContains(exports, want)) true
     else {
@@ -3611,7 +3691,7 @@ def inferModuleExportsName(inf: InferOutput, exports: StrMap String, modKey: Str
     }
 }
 
-def moduleHasBindingNamed(inf: InferOutput, exports: StrMap String, items: List ModuleItem, name: String, skipDefStart: Int, skipDefEnd: Int): Bool = {
+def moduleHasBindingNamed(inf: InferOutput, exports: StrMap NameInfo, items: List ModuleItem, name: String, skipDefStart: Int, skipDefEnd: Int): Bool = {
     let cur = cellNew(items);
     let found = cellNew(false);
     while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -3659,7 +3739,7 @@ def moduleHasBindingNamed(inf: InferOutput, exports: StrMap String, items: List 
     cellGet(found)
 }
 
-def docImportsTargetUnaliased(exports: StrMap String, items: List ModuleItem, targetQn: String, origName: String): Bool = {
+def docImportsTargetUnaliased(exports: StrMap NameInfo, items: List ModuleItem, targetQn: String, origName: String): Bool = {
     let cur = cellNew(items);
     let found = cellNew(false);
     while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -3707,7 +3787,7 @@ def docImportsTargetUnaliased(exports: StrMap String, items: List ModuleItem, ta
     cellGet(found)
 }
 
-def checkScopeUnaliasedImportConflict(inf: InferOutput, exports: StrMap String, items: List ModuleItem, targetQn: String, origName: String, newName: String): Bool = {
+def checkScopeUnaliasedImportConflict(inf: InferOutput, exports: StrMap NameInfo, items: List ModuleItem, targetQn: String, origName: String, newName: String): Bool = {
     if (docImportsTargetUnaliased(exports, items, targetQn, origName) && moduleHasBindingNamed(inf, exports, items, newName, -1, -1)) {
         true
     } else {
@@ -4032,13 +4112,26 @@ def collectSymbolOccurrences(
                                 };
 
                                 // Expression, pattern, and type-annotation sites in `wd.wdFileId`
+                                let forRenDoc = match newNameOpt { Some(_) -> true, None -> false };
                                 let cd = cellNew(inf.defs);
                                 while (match cellGet(cd) { Nil -> false, _ -> true }) {
                                     match cellGet(cd) {
                                         Cons(d, rd) -> {
                                             if (d.dpos.fileId == wd.wdFileId) {
+                                                let scopeItems = match wd.wdParsed {
+                                                    Some(fm) -> findEnclosingScopeItems(fm.items, d.dpos.start, d.dpos.end),
+                                                    None -> Nil,
+                                                };
+                                                let allowUnaliased =
+                                                    (wd.wdCanon == target.stDeclCanon && scopeContainsDeclSpan(scopeItems, target.stDeclDefStart, target.stDeclDefEnd))
+                                                    || docImportsTargetUnaliased(wd.wdExports, scopeItems, targetQn, target.stName);
+                                                let rscope = MkRenameScope {
+                                                    rsExports: wd.wdExports,
+                                                    rsItems: scopeItems,
+                                                    rsAllowUnaliased: allowUnaliased,
+                                                };
                                                 // If target is a type/concept, scan AST type-annotation & declaration regions (never expression bodies)
-                                                if (target.stIsType) {
+                                                if (target.stIsType && (!forRenDoc || allowUnaliased)) {
                                                     collectTypeOccsInDef(wd, d, target, includeDecl, seen, outRev)
                                                 } else ();
                                                 match d.item {
@@ -4060,14 +4153,14 @@ def collectSymbolOccurrences(
                                                             },
                                                             _ -> Nil,
                                                         };
-                                                        collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, f, wd.wdFileId, defLocals, target, targetQn, newNameOpt, conflict, seen, outRev)
+                                                        collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, f, wd.wdFileId, defLocals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev)
                                                     },
                                                     ItInstance(_, _, _, impls) -> {
                                                         let ci = cellNew(impls);
                                                         while (match cellGet(ci) { Nil -> false, _ -> true }) {
                                                             match cellGet(ci) {
                                                                 Cons(mi, ri) -> {
-                                                                    collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, mi.implBody, wd.wdFileId, Nil, target, targetQn, newNameOpt, conflict, seen, outRev);
+                                                                    collectTopDefOccsInForm(wd.wdUri, wd.wdText, inf, mi.implBody, wd.wdFileId, Nil, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
                                                                     cellSet(ci, ri)
                                                                 },
                                                                 Nil -> (),

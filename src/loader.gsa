@@ -63,7 +63,7 @@ pub data LoadedMod {
 }
 
 pub data NameInfo {
-    MkNameInfo { qualifiedName: String, isPublic: Bool, definedInMod: String },
+    MkNameInfo { qualifiedName: String, isPublic: Bool, definedInMod: String, viaExplicitAlias: Bool },
 }
 
 def defaultRootPkg(srcRoots: List String): PkgSpec = MkPkgSpec {
@@ -81,9 +81,9 @@ extern "gs_sys_realpath" def c_loader_realpath(path: String): Ptr
 extern "free" def c_loader_free(p: Ptr): Void
 
 def gLoaderOverlays: Cell (StrMap String) = cellNew(strMapNew())
-def gLoaderLastExports: Cell (StrMap String) = cellNew(strMapNew())
+def gLoaderLastExports: Cell (StrMap NameInfo) = cellNew(strMapNew())
 
-pub def loaderLastPublicExports(): StrMap String = cellGet(gLoaderLastExports)
+pub def loaderLastPublicExports(): StrMap NameInfo = cellGet(gLoaderLastExports)
 
 def normalizeOverlayPath(path: String): String = {
     let n = strLen(path);
@@ -932,8 +932,8 @@ def resolveModuleImports(
     legacyLibRoots: StrMap Bool,
     avail: StrMap NameInfo,
     allExportKeys: Vec String
-): Result (List (String, String), List (String, String)) String = {
-    let mappingsRev: Cell (List (String, String)) = cellNew(Nil);
+): Result (List (String, String, Bool), List (String, String)) String = {
+    let mappingsRev: Cell (List (String, String, Bool)) = cellNew(Nil);
     let modAliasesRev: Cell (List (String, String)) = cellNew(Nil);
     let errCell: Cell (Option String) = cellNew(None);
     let cur = cellNew(imports);
@@ -947,7 +947,7 @@ def resolveModuleImports(
                 match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
-                            cellSet(mappingsRev, Cons((itemName, info.qualifiedName), cellGet(mappingsRev)))
+                            cellSet(mappingsRev, Cons((itemName, info.qualifiedName, info.viaExplicitAlias), cellGet(mappingsRev)))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
                     None -> {
                         match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
@@ -967,7 +967,7 @@ def resolveModuleImports(
                 match lookupScopedItem(curPkg, curMod, modSegs, itemName, cache, legacyLibRoots, avail) {
                     Some(info) ->
                         if (info.isPublic || info.definedInMod == curMod) {
-                            cellSet(mappingsRev, Cons((alias, info.qualifiedName), cellGet(mappingsRev)))
+                            cellSet(mappingsRev, Cons((alias, info.qualifiedName, true), cellGet(mappingsRev)))
                         } else cellSet(errCell, Some("cannot import private item '" + itemName + "' from module '" + modStr + "'")),
                     None -> {
                         match translateModSegsForPkg(curPkg, curMod, path, cache, legacyLibRoots) {
@@ -993,7 +993,8 @@ def resolveModuleImports(
                                     match strMapGet(avail, fullKey) {
                                         Some(info) ->
                                             if (info.isPublic || info.definedInMod == curMod) {
-                                                cellSet(mappingsRev, Cons((useSpecLocalName(sp), info.qualifiedName), cellGet(mappingsRev)))
+                                                let viaAl = match sp.alias { Some(_) -> true, None -> info.viaExplicitAlias };
+                                                cellSet(mappingsRev, Cons((useSpecLocalName(sp), info.qualifiedName, viaAl), cellGet(mappingsRev)))
                                             } else cellSet(errCell, Some("cannot import private item '" + sp.orig + "' from module '" + baseStr + "'")),
                                         None -> cellSet(errCell, Some("item '" + sp.orig + "' not found in module '" + baseStr + "'")),
                                     };
@@ -1020,7 +1021,7 @@ def resolveModuleImports(
                                     match strMapGet(avail, k) {
                                         Some(info) ->
                                             if (info.isPublic && info.definedInMod == "") {
-                                                cellSet(mappingsRev, Cons((k, info.qualifiedName), cellGet(mappingsRev)))
+                                                cellSet(mappingsRev, Cons((k, info.qualifiedName, info.viaExplicitAlias), cellGet(mappingsRev)))
                                             } else (),
                                         None -> (),
                                     }
@@ -1031,7 +1032,7 @@ def resolveModuleImports(
                                     match strMapGet(avail, k) {
                                         Some(info) ->
                                             if (info.isPublic) {
-                                                cellSet(mappingsRev, Cons((rem, info.qualifiedName), cellGet(mappingsRev)))
+                                                cellSet(mappingsRev, Cons((rem, info.qualifiedName, info.viaExplicitAlias), cellGet(mappingsRev)))
                                             } else (),
                                         None -> (),
                                     }
@@ -1647,6 +1648,7 @@ def compileLoadedCache(
                                         qualifiedName: qname,
                                         isPublic: isPublicVis(vis),
                                         definedInMod: pref,
+                                        viaExplicitAlias: false,
                                     });
                                     match d.item {
                                         ItAlg(_, _) -> strMapInsert(typeOwners, qname, m.pkgOwner),
@@ -1674,6 +1676,7 @@ def compileLoadedCache(
                                                             qualifiedName: qctor,
                                                             isPublic: isPublicVis(vis),
                                                             definedInMod: pref,
+                                                            viaExplicitAlias: false,
                                                         });
                                                         if (pref != "") {
                                                             cellSet(ownVRev, Cons((vd.vname, qctor), cellGet(ownVRev)));
@@ -1695,6 +1698,7 @@ def compileLoadedCache(
                                                             qualifiedName: qm,
                                                             isPublic: isPublicVis(vis),
                                                             definedInMod: pref,
+                                                            viaExplicitAlias: false,
                                                         });
                                                         if (pref != "") {
                                                             cellSet(ownVRev, Cons((md.mname, qm), cellGet(ownVRev)))
@@ -1725,15 +1729,15 @@ def compileLoadedCache(
     };
 
     if (strMapContains(cache, "std.sync")) {
-        registerExport(avail, allExportKeys, "std.sync.AtomicInt", MkNameInfo { qualifiedName: "AtomicInt", isPublic: true, definedInMod: "std.sync" });
-        registerExport(avail, allExportKeys, "std.sync.MVar", MkNameInfo { qualifiedName: "MVar", isPublic: true, definedInMod: "std.sync" });
-        registerExport(avail, allExportKeys, "std.sync.Chan", MkNameInfo { qualifiedName: "Chan", isPublic: true, definedInMod: "std.sync" })
+        registerExport(avail, allExportKeys, "std.sync.AtomicInt", MkNameInfo { qualifiedName: "AtomicInt", isPublic: true, definedInMod: "std.sync", viaExplicitAlias: false });
+        registerExport(avail, allExportKeys, "std.sync.MVar", MkNameInfo { qualifiedName: "MVar", isPublic: true, definedInMod: "std.sync", viaExplicitAlias: false });
+        registerExport(avail, allExportKeys, "std.sync.Chan", MkNameInfo { qualifiedName: "Chan", isPublic: true, definedInMod: "std.sync", viaExplicitAlias: false })
     } else ();
     if (strMapContains(cache, "std.task")) {
-        registerExport(avail, allExportKeys, "std.task.Task", MkNameInfo { qualifiedName: "Task", isPublic: true, definedInMod: "std.task" })
+        registerExport(avail, allExportKeys, "std.task.Task", MkNameInfo { qualifiedName: "Task", isPublic: true, definedInMod: "std.task", viaExplicitAlias: false })
     } else ();
     if (strMapContains(cache, "std.actor")) {
-        registerExport(avail, allExportKeys, "std.actor.Actor", MkNameInfo { qualifiedName: "Actor", isPublic: true, definedInMod: "std.actor" })
+        registerExport(avail, allExportKeys, "std.actor.Actor", MkNameInfo { qualifiedName: "Actor", isPublic: true, definedInMod: "std.actor", viaExplicitAlias: false })
     } else ();
 
     let outDefsRev: Cell (List Def) = cellNew(Nil);
@@ -1753,12 +1757,12 @@ def compileLoadedCache(
                         match resolveModuleImports(m.imports, curPkg, pref, cache, legacyLibRoots, avail, allExportKeys) {
                             Err(e) -> cellSet(errFinal, Some(e)),
                             Ok((impPairs, modAliasPairs)) -> {
-                                let imapLookup: StrMap String = strMapNew();
+                                let imapLookup: StrMap (String, Bool) = strMapNew();
                                 let curIP = cellNew(impPairs);
                                 while (match cellGet(curIP) { Nil -> false, _ -> true }) {
                                     match cellGet(curIP) {
-                                        Cons((ln, qn), rIP) -> {
-                                            strMapInsert(imapLookup, ln, qn);
+                                        Cons((ln, qn, viaAl), rIP) -> {
+                                            strMapInsert(imapLookup, ln, (qn, viaAl));
                                             cellSet(curIP, rIP)
                                         },
                                         Nil -> (),
@@ -1773,17 +1777,17 @@ def compileLoadedCache(
                                                 UseSingle(p, _) -> {
                                                     let nm = listLastOr(p, "");
                                                     match strMapGet(imapLookup, nm) {
-                                                        Some(tq) -> {
+                                                        Some((tq, viaAl)) -> {
                                                             let ek = joinKeyPrefix(pref, nm);
-                                                            registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                            registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref, viaExplicitAlias: viaAl })
                                                         },
                                                         None -> (),
                                                     }
                                                 },
                                                 UseAlias(_, al, _) -> match strMapGet(imapLookup, al) {
-                                                    Some(tq) -> {
+                                                    Some((tq, _)) -> {
                                                         let ek = joinKeyPrefix(pref, al);
-                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref, viaExplicitAlias: true })
                                                     },
                                                     None -> (),
                                                 },
@@ -1794,9 +1798,10 @@ def compileLoadedCache(
                                                             Cons(sp, rS) -> {
                                                                 let ln = useSpecLocalName(sp);
                                                                 match strMapGet(imapLookup, ln) {
-                                                                    Some(tq) -> {
+                                                                    Some((tq, viaAl)) -> {
                                                                         let ek = joinKeyPrefix(pref, ln);
-                                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                                        let expViaAl = match sp.alias { Some(_) -> true, None -> viaAl };
+                                                                        registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref, viaExplicitAlias: expViaAl })
                                                                     },
                                                                     None -> (),
                                                                 };
@@ -1810,10 +1815,10 @@ def compileLoadedCache(
                                                     let curG = cellNew(impPairs);
                                                     while (match cellGet(curG) { Nil -> false, _ -> true }) {
                                                         match cellGet(curG) {
-                                                            Cons((ln, tq), rG) -> {
+                                                            Cons((ln, tq, viaAl), rG) -> {
                                                                 let ek = joinKeyPrefix(pref, ln);
                                                                 if (!strMapContains(avail, ek)) {
-                                                                    registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref })
+                                                                    registerExport(avail, allExportKeys, ek, MkNameInfo { qualifiedName: tq, isPublic: true, definedInMod: pref, viaExplicitAlias: viaAl })
                                                                 } else ();
                                                                 cellSet(curG, rG)
                                                             },
@@ -1848,7 +1853,7 @@ def compileLoadedCache(
                                 let curP = cellNew(impPairs);
                                 while (match cellGet(curP) { Nil -> false, _ -> true }) {
                                     match cellGet(curP) {
-                                        Cons((ln, qn), rP) -> {
+                                        Cons((ln, qn, _), rP) -> {
                                             strMapInsert(valMap, ln, qn);
                                             if (strLen(ln) > 0 && isUpperByte(strByteAt(ln, 0))) {
                                                 strMapInsert(tyMap, ln, qn);
@@ -1951,13 +1956,13 @@ def compileLoadedCache(
         }
     };
 
-    let pubExp: StrMap String = strMapNew();
+    let pubExp: StrMap NameInfo = strMapNew();
     let ekLen = vecLen(allExportKeys);
     let ekIdx = cellNew(0);
     while (cellGet(ekIdx) < ekLen) {
         let ek = vecGetOr(allExportKeys, cellGet(ekIdx), "");
         match strMapGet(avail, ek) {
-            Some(info) if (info.isPublic) -> strMapInsert(pubExp, ek, info.qualifiedName),
+            Some(info) if (info.isPublic) -> strMapInsert(pubExp, ek, info),
             _ -> (),
         };
         cellSet(ekIdx, cellGet(ekIdx) + 1)
