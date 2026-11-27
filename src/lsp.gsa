@@ -46,8 +46,8 @@ use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs}
 
-extern "read" def c_read(fd: Int, buf: Ptr, count: Int64): Int64
-extern "write" def c_write(fd: Int, buf: String, count: Int64): Int64
+extern "gs_pipe_read" def gs_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
+extern "gs_pipe_write" def gs_pipe_write(fd: Int, buf: String, len: Int): Int
 
 // ============================================================================
 // Buffered stdio JSON-RPC 2.0 Framing (Content-Length)
@@ -79,7 +79,7 @@ def stdinReadByte(r: StdinReader): Int = {
         cellSet(r.srPos, pos + 1);
         ptrByteAt(r.srBuf, pos)
     } else {
-        let got = i64ToInt(c_read(0, r.srBuf, intToI64(r.srCap)));
+        let got = gs_pipe_read(0, r.srBuf, r.srCap);
         if (got <= 0) {
             -1
         } else {
@@ -128,15 +128,10 @@ def stdinReadExact(r: StdinReader, n: Int): Option String = {
 
 def writeAllStdout(s: String): Void = {
     let total = strLen(s);
-    let off = cellNew(0);
-    let ok = cellNew(true);
-    while (cellGet(off) < total && cellGet(ok)) {
-        let cur = cellGet(off);
-        let chunk = if (cur == 0) s else strSlice(s, cur, total);
-        let written = i64ToInt(c_write(1, chunk, intToI64(total - cur)));
-        if (written <= 0) cellSet(ok, false)
-        else cellSet(off, cur + written)
-    }
+    if (total > 0) {
+        let _ = gs_pipe_write(1, s, total);
+        ()
+    } else ()
 }
 
 def sendRpcValue(v: Value): Void = {
@@ -1932,8 +1927,32 @@ def handleDidClose(ss: ServerState, params: Value): Void =
         None -> (),
     }
 
+def validateLspArgs(args: List String): Result Void String = {
+    let cur = cellNew(args);
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(a, r) -> {
+                if (a == "--stdio") {
+                    ()
+                } else if (strStartsWith(a, "-")) {
+                    cellSet(errOpt, Some("unknown option for 'geisha lsp': '" + a + "' (usage: geisha lsp [--stdio])"))
+                } else {
+                    cellSet(errOpt, Some("unexpected argument for 'geisha lsp': '" + a + "' (usage: geisha lsp [--stdio])"))
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
 pub def cmdLsp(args: List String): Result Int String = {
-    let _ = args;
+    validateLspArgs(args)?;
     let ss = MkServerState {
         ssDocs: strMapNew(),
         ssShuttingDown: cellNew(false),

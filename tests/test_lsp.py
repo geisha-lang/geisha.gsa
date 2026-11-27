@@ -12,9 +12,10 @@ from pathlib import Path
 
 
 class LspClient:
-    def __init__(self, geisha_bin: str, cwd: str) -> None:
+    def __init__(self, geisha_bin: str, cwd: str, extra_args: list[str] | None = None) -> None:
+        cmd = [geisha_bin, "lsp"] + (extra_args or [])
         self.proc = subprocess.Popen(
-            [geisha_bin, "lsp"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -89,6 +90,12 @@ def main() -> int:
     geisha_bin = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("GEISHA_BIN", "build/geisha2")
     geisha_bin = str(Path(geisha_bin).resolve())
 
+    # 0. CLI argument validation: reject unknown flags & positional args immediately (no hang), accept --stdio
+    bad_flag = subprocess.run([geisha_bin, "lsp", "--bogus"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    assert bad_flag.returncode != 0 and "--bogus" in bad_flag.stderr, f"expected error on --bogus: {bad_flag}"
+    bad_pos = subprocess.run([geisha_bin, "lsp", "extra.gsa"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+    assert bad_pos.returncode != 0 and "extra.gsa" in bad_pos.stderr, f"expected error on positional arg: {bad_pos}"
+
     with tempfile.TemporaryDirectory(prefix="geisha_lsp_test_") as td:
         root = Path(td)
         helper_path = root / "helper.gsa"
@@ -140,7 +147,7 @@ def main() -> int:
         main_uri = path_to_uri(main_path)
         helper_uri = path_to_uri(helper_path)
 
-        client = LspClient(geisha_bin, str(root))
+        client = LspClient(geisha_bin, str(root), extra_args=["--stdio"])
 
         # 1. initialize + initialized
         init_resp = client.request("initialize", {
