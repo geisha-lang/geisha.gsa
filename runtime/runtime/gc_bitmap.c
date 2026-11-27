@@ -655,12 +655,14 @@ static void large_table_remove_locked(gc_large_t *obj)
     }
 }
 
+#define GC_MIN_OS_PAGE_SIZE 4096u
 #define GC_LARGE_HDR_OFFSET ((sizeof(gc_large_t) + Header_size + 15u) & ~(size_t)15u)
+_Static_assert(GC_LARGE_HDR_OFFSET < GC_MIN_OS_PAGE_SIZE, "large object header offset must fit within 4 KB OS page");
 
 static inline gc_large_t *find_large_obj(uintptr_t payload_ptr)
 {
     if (_large_count == 0
-        || (payload_ptr & (GC_PAGE_SIZE - 1)) != GC_LARGE_HDR_OFFSET
+        || (payload_ptr & (uintptr_t)(GC_MIN_OS_PAGE_SIZE - 1u)) != GC_LARGE_HDR_OFFSET
         || payload_ptr < _min_large_addr
         || payload_ptr >= _max_large_addr) {
         return NULL;
@@ -996,10 +998,9 @@ void gc_write_barrier(void *container_ptr)
             return;
         }
         header_t *hp = (header_t *)hdr_addr;
-        if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
+        if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
             return;
         }
-        *hp |= HEADER_REMEMBERED_BIT;
     } else {
         /* Fast check: is it a small slab object? */
         gc_chunk_t *chunk = find_chunk(addr);
@@ -1017,10 +1018,9 @@ void gc_write_barrier(void *container_ptr)
                 return;
             }
             header_t *hp = (header_t *)hdr_addr;
-            if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
+            if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
                 return;
             }
-            *hp |= HEADER_REMEMBERED_BIT;
         } else {
             /* Large object check (e.g. large MutArray of pointers) */
             gc_large_t *lo = find_large_obj(addr);
@@ -1028,10 +1028,9 @@ void gc_write_barrier(void *container_ptr)
                 return;
             }
             header_t *hp = (header_t *)(addr - Header_size);
-            if ((*hp & HEADER_REMEMBERED_BIT) != 0) {
+            if ((__atomic_fetch_or(hp, HEADER_REMEMBERED_BIT, __ATOMIC_RELAXED) & HEADER_REMEMBERED_BIT) != 0) {
                 return;
             }
-            *hp |= HEADER_REMEMBERED_BIT;
         }
     }
 
@@ -1258,8 +1257,12 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
     pthread_mutex_unlock(&_gc_mu);
     gc_drain_cleanups_unlocked();
 
-    if (from_cache && zero_init) {
-        memset((void *)payload_ptr, 0, payload_words * WORD_SIZE);
+    if (from_cache) {
+        if (has_mask) {
+            zero_masked_words((void *)payload_ptr, ptr_mask);
+        } else if (zero_init) {
+            memset((void *)payload_ptr, 0, payload_words * WORD_SIZE);
+        }
     }
     return (void *)payload_ptr;
 }
@@ -2021,21 +2024,27 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     _bytes_alloc_since_gc = 0;
     _last_live_bytes = total_live_bytes;
 
+    size_t soft_headroom = 0;
+    if (_soft_mem_limit_bytes > 0) {
+        size_t budget = (_soft_mem_limit_bytes > total_live_bytes)
+                      ? (_soft_mem_limit_bytes - total_live_bytes)
+                      : 0u;
+        soft_headroom = budget / 2u;
+        size_t min_headroom = _soft_mem_limit_bytes / 8u;
+        if (min_headroom > 2u * 1024u * 1024u) min_headroom = 2u * 1024u * 1024u;
+        if (min_headroom < 256u * 1024u) min_headroom = 256u * 1024u;
+        if (soft_headroom < min_headroom) soft_headroom = min_headroom;
+    }
+
     if (is_major) {
         _major_collections++;
         _consecutive_minors = 0;
         _last_major_live_bytes = total_live_bytes;
         size_t next_major = total_live_bytes * 2u;
         if (_soft_mem_limit_bytes > 0) {
-            size_t budget = (_soft_mem_limit_bytes > total_live_bytes)
-                          ? (_soft_mem_limit_bytes - total_live_bytes)
-                          : 0u;
-            size_t cap_headroom = budget / 2u;
-            if (cap_headroom < 2u * 1024u * 1024u) cap_headroom = 2u * 1024u * 1024u;
-            size_t limited = total_live_bytes + cap_headroom;
+            size_t limited = total_live_bytes + soft_headroom;
             if (limited < next_major) next_major = limited;
-        }
-        if (next_major < MIN_MAJOR_THRESHOLD_BYTES && _init_threshold_bytes >= MIN_GC_THRESHOLD_BYTES) {
+        } else if (next_major < MIN_MAJOR_THRESHOLD_BYTES && _init_threshold_bytes >= MIN_GC_THRESHOLD_BYTES) {
             next_major = MIN_MAJOR_THRESHOLD_BYTES;
         } else if (next_major < _init_threshold_bytes * 4) {
             next_major = _init_threshold_bytes * 4;
@@ -2046,7 +2055,7 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
         _consecutive_minors++;
     }
 
-    /* Adaptive next-GC threshold: at least `_init_threshold_bytes`, scaling with live set */
+    /* Adaptive next-GC threshold: at least `_init_threshold_bytes` (unless constrained by soft limit), scaling with live set */
     size_t next_thresh = is_major ? (total_live_bytes / 2) : (total_live_bytes / 4);
     if (next_thresh < _init_threshold_bytes) {
         next_thresh = _init_threshold_bytes;
@@ -2054,6 +2063,9 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
     /* Cap nursery budget at 16 MB for responsive Minor GC pauses */
     if (_generational_enabled && !is_major && next_thresh > 16u * 1024u * 1024u) {
         next_thresh = 16u * 1024u * 1024u;
+    }
+    if (soft_headroom > 0 && next_thresh > soft_headroom) {
+        next_thresh = soft_headroom;
     }
     _gc_threshold_bytes = next_thresh;
 
@@ -2262,13 +2274,7 @@ void gc_trim(void)
     drain_large_cache_locked();
     reclaim_empty_chunks_locked(1);
     for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
-#if defined(MADV_FREE_REUSABLE)
-        madvise((void *)p->base, GC_PAGE_SIZE, MADV_FREE_REUSABLE);
-#elif defined(MADV_FREE)
-        madvise((void *)p->base, GC_PAGE_SIZE, MADV_FREE);
-#else
-        madvise((void *)p->base, GC_PAGE_SIZE, MADV_DONTNEED);
-#endif
+        release_page_memory((void *)p->base, GC_PAGE_SIZE);
     }
     pthread_mutex_unlock(&_gc_mu);
 }
