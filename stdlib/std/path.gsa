@@ -1,53 +1,103 @@
-// Portable POSIX path manipulation (`std.path`)
+// Portable POSIX & Windows path manipulation (`std.path`)
+//
+// Default functions follow the host OS path convention (POSIX `/` on macOS/Linux/Wasm;
+// `/` and `\` + drive prefixes on Windows). Explicit `*Win` variants parse Windows paths
+// on any host.
 
-pub def isAbsPath(p: String): Bool =
-    strLen(p) > 0 && strByteAt(p, 0) == 47
+extern "gs_sys_host_os" def c_path_host_os(): Ptr
 
-def trimTrailingSlash(p: String): String = {
+def isWinHost(): Bool = {
+    let p = c_path_host_os();
+    !ptrIsNull(p) && ptrToString(p) == "windows"
+}
+
+def isSepByte(winStyle: Bool, b: Int): Bool =
+    b == 47 || (winStyle && b == 92)
+
+def isAsciiAlpha(b: Int): Bool =
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+
+def hasDrivePrefix(winStyle: Bool, p: String): Bool =
+    winStyle && strLen(p) >= 2 && isAsciiAlpha(strByteAt(p, 0)) && strByteAt(p, 1) == 58
+
+def rootPrefixLen(winStyle: Bool, p: String): Int =
+    if (hasDrivePrefix(winStyle, p)) {
+        if (strLen(p) >= 3 && isSepByte(winStyle, strByteAt(p, 2))) 3 else 2
+    } else if (strLen(p) > 0 && isSepByte(winStyle, strByteAt(p, 0))) {
+        1
+    } else {
+        0
+    }
+
+def isAbsPathStyle(winStyle: Bool, p: String): Bool =
+    if (strLen(p) == 0) false
+    else if (isSepByte(winStyle, strByteAt(p, 0))) true
+    else hasDrivePrefix(winStyle, p) && strLen(p) >= 3 && isSepByte(winStyle, strByteAt(p, 2))
+
+def trimTrailingSlashStyle(winStyle: Bool, p: String): String = {
+    let minLen = rootPrefixLen(winStyle, p);
     let hi = cellNew(strLen(p));
-    while (cellGet(hi) > 1 && strByteAt(p, cellGet(hi) - 1) == 47) {
+    while (cellGet(hi) > minLen && isSepByte(winStyle, strByteAt(p, cellGet(hi) - 1))) {
         cellSet(hi, cellGet(hi) - 1)
     };
     strSlice(p, 0, cellGet(hi))
 }
 
-pub def pathJoin(base: String, child: String): String =
+def pathJoinStyle(winStyle: Bool, base: String, child: String): String =
     if (strLen(base) == 0 || base == ".") child
     else if (strLen(child) == 0) base
-    else if (isAbsPath(child)) child
+    else if (isAbsPathStyle(winStyle, child)) child
     else {
-        let b = trimTrailingSlash(base);
-        if (b == "/") "/" + child
+        let b = trimTrailingSlashStyle(winStyle, base);
+        let blen = strLen(b);
+        if (blen > 0 && isSepByte(winStyle, strByteAt(b, blen - 1))) b + child
         else b + "/" + child
     }
 
-def lastSlashIndex(p: String): Int = {
+def lastSlashIndexStyle(winStyle: Bool, p: String): Int = {
     let i = cellNew(strLen(p) - 1);
     let found = cellNew(-1);
     while (cellGet(i) >= 0 && cellGet(found) < 0) {
-        if (strByteAt(p, cellGet(i)) == 47) cellSet(found, cellGet(i))
+        if (isSepByte(winStyle, strByteAt(p, cellGet(i)))) cellSet(found, cellGet(i))
         else cellSet(i, cellGet(i) - 1)
     };
     cellGet(found)
 }
 
-pub def pathDirname(raw: String): String = {
-    let p = trimTrailingSlash(raw);
-    let idx = lastSlashIndex(p);
-    if (idx < 0) "."
-    else if (idx == 0) "/"
-    else strSlice(p, 0, idx)
+def pathDirnameStyle(winStyle: Bool, raw: String): String = {
+    let p = trimTrailingSlashStyle(winStyle, raw);
+    let rootLen = rootPrefixLen(winStyle, p);
+    if (rootLen > 0 && strLen(p) <= rootLen) p
+    else {
+        let idx = lastSlashIndexStyle(winStyle, p);
+        if (idx < 0) {
+            if (hasDrivePrefix(winStyle, p)) strSlice(p, 0, 2) else "."
+        } else if (idx == 0) {
+            strSlice(p, 0, 1)
+        } else if (hasDrivePrefix(winStyle, p) && idx == 2) {
+            strSlice(p, 0, 3)
+        } else {
+            strSlice(p, 0, idx)
+        }
+    }
 }
 
-pub def pathBasename(raw: String): String = {
-    let p = trimTrailingSlash(raw);
-    let idx = lastSlashIndex(p);
-    if (idx < 0) p
-    else strSlice(p, idx + 1, strLen(p))
+def pathBasenameStyle(winStyle: Bool, raw: String): String = {
+    let p = trimTrailingSlashStyle(winStyle, raw);
+    let rootLen = rootPrefixLen(winStyle, p);
+    if (rootLen > 0 && strLen(p) <= rootLen) p
+    else {
+        let idx = lastSlashIndexStyle(winStyle, p);
+        if (idx < 0) {
+            if (hasDrivePrefix(winStyle, p)) strSlice(p, 2, strLen(p)) else p
+        } else {
+            strSlice(p, idx + 1, strLen(p))
+        }
+    }
 }
 
-pub def pathStem(raw: String): String = {
-    let base = pathBasename(raw);
+def pathStemStyle(winStyle: Bool, raw: String): String = {
+    let base = pathBasenameStyle(winStyle, raw);
     let i = cellNew(strLen(base) - 1);
     let dotIdx = cellNew(-1);
     while (cellGet(i) > 0 && cellGet(dotIdx) < 0) {
@@ -58,9 +108,9 @@ pub def pathStem(raw: String): String = {
     else strSlice(base, 0, cellGet(dotIdx))
 }
 
-pub def pathWithExt(raw: String, ext: String): String = {
-    let p = trimTrailingSlash(raw);
-    let slashIdx = lastSlashIndex(p);
+def pathWithExtStyle(winStyle: Bool, raw: String, ext: String): String = {
+    let p = trimTrailingSlashStyle(winStyle, raw);
+    let slashIdx = lastSlashIndexStyle(winStyle, p);
     let i = cellNew(strLen(p) - 1);
     let dotIdx = cellNew(-1);
     while (cellGet(i) > slashIdx + 1 && cellGet(dotIdx) < 0) {
@@ -72,3 +122,29 @@ pub def pathWithExt(raw: String, ext: String): String = {
     else if (strByteAt(ext, 0) == 46) stemPart + ext
     else stemPart + "." + ext
 }
+
+/// Return `true` if `p` is an absolute path under the host OS path convention.
+pub def isAbsPath(p: String): Bool = isAbsPathStyle(isWinHost(), p)
+
+/// Join `base` and `child` using the host OS path convention.
+pub def pathJoin(base: String, child: String): String = pathJoinStyle(isWinHost(), base, child)
+
+/// Return the parent directory of `raw` under the host OS path convention.
+pub def pathDirname(raw: String): String = pathDirnameStyle(isWinHost(), raw)
+
+/// Return the final path component of `raw` under the host OS path convention.
+pub def pathBasename(raw: String): String = pathBasenameStyle(isWinHost(), raw)
+
+/// Return the filename stem (without extension) of `raw` under the host OS path convention.
+pub def pathStem(raw: String): String = pathStemStyle(isWinHost(), raw)
+
+/// Replace or append the extension of `raw` under the host OS path convention.
+pub def pathWithExt(raw: String, ext: String): String = pathWithExtStyle(isWinHost(), raw, ext)
+
+/// Explicit Windows-style path helpers (recognize `/`, `\`, and drive prefixes such as `C:\` on any host).
+pub def isAbsPathWin(p: String): Bool = isAbsPathStyle(true, p)
+pub def pathJoinWin(base: String, child: String): String = pathJoinStyle(true, base, child)
+pub def pathDirnameWin(raw: String): String = pathDirnameStyle(true, raw)
+pub def pathBasenameWin(raw: String): String = pathBasenameStyle(true, raw)
+pub def pathStemWin(raw: String): String = pathStemStyle(true, raw)
+pub def pathWithExtWin(raw: String, ext: String): String = pathWithExtStyle(true, raw, ext)

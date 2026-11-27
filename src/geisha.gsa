@@ -24,7 +24,7 @@ use loader.{
 use infer.inferProgram
 use core.lowerToCore
 use core_dump.dumpCoreProgramSExpr
-use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForArchDebug}
+use codegen.{emitProgramLlvmIrOpts, emitProgramLlvmIrForArch, emitProgramLlvmIrForTarget, emitProgramLlvmIrForTargetDebug}
 use codegen_js.{emitProgramJs, emitProgramDts, collectRootPubFnNames}
 use doc.cmdDoc
 use bench.cmdBench
@@ -43,8 +43,8 @@ extern "gs_sys_host_os" def c_host_os(): Ptr
 extern "gs_sys_host_arch" def c_host_arch(): Ptr
 extern "gs_sys_exe_path" def c_exe_path(): Ptr
 extern "gs_sys_file_size" def c_file_size(path: String): Int64
-extern "getpid" def c_getpid(): Int
-extern "rename" def c_rename(oldPath: String, newPath: String): Int
+extern "gs_sys_getpid" def c_getpid(): Int
+extern "gs_sys_rename" def c_rename(oldPath: String, newPath: String): Int
 
 def currentHostOs(): String = {
     let p = c_host_os();
@@ -656,7 +656,9 @@ def compileLoadedDefsToIrForArchDebug(
     let inf = inferProgram(rawDefs)?;
     let coreProg = lowerToCore(inf)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
-    Ok(emitProgramLlvmIrForArchDebug(coreProg, isWasm, targetArch, exports, noMain, bootSymOpt, debugInfo))
+    Ok(emitProgramLlvmIrForTargetDebug(
+        coreProg, isWasm, targetArch, if (isWasm) "wasm" else currentHostOs(), exports, noMain, bootSymOpt, debugInfo
+    ))
 }
 
 def compileLoadedDefsToIrForArch(

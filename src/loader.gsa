@@ -77,7 +77,7 @@ def defaultRootPkg(srcRoots: List String): PkgSpec = MkPkgSpec {
 // Optional In-Memory Source Overlays (used by `geisha lsp` for unsaved buffers)
 // ============================================================================
 
-extern "realpath" def c_loader_realpath(path: String, resolved: Ptr): Ptr
+extern "gs_sys_realpath" def c_loader_realpath(path: String): Ptr
 extern "free" def c_loader_free(p: Ptr): Void
 
 def gLoaderOverlays: Cell (StrMap String) = cellNew(strMapNew())
@@ -116,7 +116,7 @@ def normalizeOverlayPath(path: String): String = {
 }
 
 def resolveRealPathRec(p: String): String = {
-    let rp = c_loader_realpath(p, ptrNull());
+    let rp = c_loader_realpath(p);
     if (!ptrIsNull(rp)) {
         let b = bufNew();
         bufPushStr(b, ptrToString(rp));

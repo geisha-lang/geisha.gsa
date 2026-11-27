@@ -22,7 +22,7 @@ use pkg.{
     sanitizeIdentAlias, resolveRelList, mergeTargetConfigs
 }
 
-extern "getpid" def c_bench_getpid(): Int
+extern "gs_sys_getpid" def c_bench_getpid(): Int
 extern "gs_proc_spawn" def c_bench_proc_spawn(
     program: String,
     argBlob: String,
