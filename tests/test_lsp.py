@@ -1178,6 +1178,103 @@ def main() -> int:
         })
         assert "error" in ren_reexp_tgt and ren_reexp_tgt["error"]["code"] == -32602, f"expected -32602 on re-exported open bridge_tgt conflict: {ren_reexp_tgt}"
 
+        # Helper to compile & run a renamed multi-file project with `geisha run`
+        run_env = os.environ.copy()
+        if "GEISHA_RUNTIME" in run_env and run_env["GEISHA_RUNTIME"]:
+            run_env["GEISHA_RUNTIME"] = os.path.abspath(run_env["GEISHA_RUNTIME"])
+        abs_geisha_bin = os.path.abspath(geisha_bin)
+
+        # (h) Unaliased re-export propagation: `bridge_tgt.gsa` (`pub use m2.load`) + `use bridge_tgt.load` -> rename to `freshName` updates m2, bridge_tgt, AND `use bridge_tgt.load`, compiles & runs -> `7`
+        bridge_tgt_uri = path_to_uri(bridge_tgt_path)
+        ms_use_reexp_src = (
+            "use std.str.intToStr\n"
+            "use bridge_tgt.load\n"
+            "def main(): Void = printLn(intToStr(load()))\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": bridge_tgt_uri, "languageId": "geisha", "version": 1, "text": "pub use m2.load\n"}})
+        assert client.wait_diag_for(bridge_tgt_uri) == []
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 8}, "contentChanges": [{"text": ms_use_reexp_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        ren_prop = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "freshName",
+        })
+        assert "result" in ren_prop, f"expected unaliased re-export rename to succeed: {ren_prop}"
+        ch_prop = ren_prop["result"]["changes"]
+        new_m2_prop = apply_edits(m2_src, ch_prop[m2_uri])
+        new_bt_prop = apply_edits("pub use m2.load\n", ch_prop[bridge_tgt_uri])
+        new_usr_prop = apply_edits(ms_use_reexp_src, ch_prop[ms_user_uri])
+        assert new_bt_prop == "pub use m2.freshName\n", f"unexpected bridge_tgt: {new_bt_prop!r}"
+        assert new_usr_prop == "use std.str.intToStr\nuse bridge_tgt.freshName\ndef main(): Void = printLn(intToStr(freshName()))\n", f"expected `use bridge_tgt.load` updated too, got: {new_usr_prop!r}"
+        run_h_dir = root / "run_reexp_prop"
+        run_h_dir.mkdir(parents=True)
+        (run_h_dir / "m2.gsa").write_text(new_m2_prop, encoding="utf-8")
+        (run_h_dir / "bridge_tgt.gsa").write_text(new_bt_prop, encoding="utf-8")
+        (run_h_dir / "user.gsa").write_text(new_usr_prop, encoding="utf-8")
+        res_h = subprocess.run(
+            [abs_geisha_bin, "run", str(run_h_dir / "user.gsa")],
+            cwd=str(run_h_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_h.returncode == 0 and res_h.stdout.strip() == "7", f"renamed unaliased re-export failed to run: rc={res_h.returncode} stdout={res_h.stdout!r} stderr={res_h.stderr!r}"
+
+        # (i) Aliased re-export stops propagation: `bridge_api.gsa` (`pub use m2.load as api`) + `use bridge_api.api; def fetchA() = 93` -> rename `m2.load` -> `fetchA` SUCCEEDS without false conflict, compiles & runs -> `100`
+        bridge_api_path = ms_dir / "bridge_api.gsa"
+        bridge_api_src = "pub use m2.load as api\n"
+        bridge_api_path.write_text(bridge_api_src, encoding="utf-8")
+        bridge_api_uri = path_to_uri(bridge_api_path)
+        ms_use_api_src = (
+            "use std.str.intToStr\n"
+            "use bridge_api.api\n"
+            "def fetchA(): Int = 93\n"
+            "def main(): Void = printLn(intToStr(api() + fetchA()))\n"
+        )
+        client.notifications.clear()
+        client.notify("textDocument/didOpen", {"textDocument": {"uri": bridge_api_uri, "languageId": "geisha", "version": 1, "text": bridge_api_src}})
+        assert client.wait_diag_for(bridge_api_uri) == []
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": ms_user_uri, "version": 9}, "contentChanges": [{"text": ms_use_api_src}]})
+        assert client.wait_diag_for(ms_user_uri) == []
+        client.notify("textDocument/didClose", {"textDocument": {"uri": bridge_tgt_uri}})
+        _ = client.wait_diag_for(bridge_tgt_uri)
+        bridge_tgt_path.unlink()
+        ren_api = client.request("textDocument/rename", {
+            "textDocument": {"uri": m2_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "fetchA",
+        })
+        assert "result" in ren_api, f"expected aliased re-export rename to succeed without false conflict: {ren_api}"
+        ch_api = ren_api["result"]["changes"]
+        assert ms_user_uri not in ch_api, f"downstream `use bridge_api.api` must not be modified: {ch_api}"
+        new_m2_api = apply_edits(m2_src, ch_api[m2_uri])
+        new_bapi = apply_edits(bridge_api_src, ch_api[bridge_api_uri])
+        assert new_m2_api == "pub def fetchA(): Int = 7\n" and new_bapi == "pub use m2.fetchA as api\n", f"unexpected edits: {new_m2_api!r}, {new_bapi!r}"
+        client.notifications.clear()
+        client.notify("textDocument/didChange", {"textDocument": {"uri": m2_uri, "version": 2}, "contentChanges": [{"text": new_m2_api}]})
+        assert client.wait_diag_for(m2_uri) == []
+        client.notify("textDocument/didChange", {"textDocument": {"uri": bridge_api_uri, "version": 2}, "contentChanges": [{"text": new_bapi}]})
+        assert client.wait_diag_for(bridge_api_uri) == []
+        assert client.wait_diag_for(ms_user_uri) == []
+        run_i_dir = root / "run_reexp_api"
+        run_i_dir.mkdir(parents=True)
+        (run_i_dir / "m2.gsa").write_text(new_m2_api, encoding="utf-8")
+        (run_i_dir / "bridge_api.gsa").write_text(new_bapi, encoding="utf-8")
+        (run_i_dir / "user.gsa").write_text(ms_use_api_src, encoding="utf-8")
+        res_i = subprocess.run(
+            [abs_geisha_bin, "run", str(run_i_dir / "user.gsa")],
+            cwd=str(run_i_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_i.returncode == 0 and res_i.stdout.strip() == "100", f"renamed aliased re-export failed to run: rc={res_i.returncode} stdout={res_i.stdout!r} stderr={res_i.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

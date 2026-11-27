@@ -3500,12 +3500,25 @@ def qnameModulePrefix(qn: String): String = {
     if (ld > 0) strSlice(qn, 0, ld) else ""
 }
 
+def exportResolvesToTarget(exports: StrMap String, exportKey: String, targetQn: String): Bool =
+    match strMapGet(exports, exportKey) {
+        Some(qn) -> qn == targetQn,
+        None -> false,
+    }
+
+// True iff `modKey` exports `origName` resolving to `targetQn` (either directly or via
+// unaliased `pub use` / `pub open` re-export). Stops at any explicit `pub use ... as alias`.
+def modExportsTargetAsOrigName(exports: StrMap String, modKey: String, origName: String, targetQn: String): Bool = {
+    let targetMod = qnameModulePrefix(targetQn);
+    (strLen(targetMod) > 0 && modKey == targetMod)
+    || exportResolvesToTarget(exports, modKey + "." + origName, targetQn)
+}
+
 def collectUseImportOccsInItems(
     wd: WorkspaceDoc,
     items: List ModuleItem,
     target: SymTarget,
     targetQn: String,
-    targetMod: String,
     seen: StrMap Bool,
     outRev: Cell (List OccSpan)
 ): Void = {
@@ -3516,19 +3529,21 @@ def collectUseImportOccsInItems(
                 match u {
                     UseSingle(segs, sp) -> {
                         let full = strJoin(segs, ".");
-                        if (full == targetQn) {
+                        let mk = qnameModulePrefix(full);
+                        if (shortSymName(full) == target.stName && modExportsTargetAsOrigName(wd.wdExports, mk, target.stName, targetQn)) {
                             pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
                         } else ()
                     },
                     UseAlias(segs, _, sp) -> {
                         let full = strJoin(segs, ".");
-                        if (full == targetQn) {
+                        let mk = qnameModulePrefix(full);
+                        if (shortSymName(full) == target.stName && modExportsTargetAsOrigName(wd.wdExports, mk, target.stName, targetQn)) {
                             pushOcc(seen, outRev, wd.wdUri, wd.wdText, sp.start, sp.end)
                         } else ()
                     },
                     UseMulti(modSegs, specs) -> {
                         let modKey = strJoin(modSegs, ".");
-                        if (modKey == targetMod) {
+                        if (modExportsTargetAsOrigName(wd.wdExports, modKey, target.stName, targetQn)) {
                             let cs = cellNew(specs);
                             while (match cellGet(cs) { Nil -> false, _ -> true }) {
                                 match cellGet(cs) {
@@ -3548,7 +3563,7 @@ def collectUseImportOccsInItems(
                 cellSet(cur, r)
             },
             Cons(ModSub(_, _, subItems, _), r) -> {
-                collectUseImportOccsInItems(wd, subItems, target, targetQn, targetMod, seen, outRev);
+                collectUseImportOccsInItems(wd, subItems, target, targetQn, seen, outRev);
                 cellSet(cur, r)
             },
             Cons(_, r) -> cellSet(cur, r),
@@ -3565,10 +3580,7 @@ def collectUseImportOccs(
     outRev: Cell (List OccSpan)
 ): Void = match wd.wdParsed {
     None -> (),
-    Some(fm) -> {
-        let targetMod = qnameModulePrefix(targetQn);
-        collectUseImportOccsInItems(wd, fm.items, target, targetQn, targetMod, seen, outRev)
-    },
+    Some(fm) -> collectUseImportOccsInItems(wd, fm.items, target, targetQn, seen, outRev),
 }
 
 def inferModuleExportsName(inf: InferOutput, exports: StrMap String, modKey: String, symName: String): Bool = {
@@ -3647,14 +3659,7 @@ def moduleHasBindingNamed(inf: InferOutput, exports: StrMap String, items: List 
     cellGet(found)
 }
 
-def exportResolvesToTarget(exports: StrMap String, exportKey: String, targetQn: String): Bool =
-    match strMapGet(exports, exportKey) {
-        Some(qn) -> qn == targetQn,
-        None -> false,
-    }
-
 def docImportsTargetUnaliased(exports: StrMap String, items: List ModuleItem, targetQn: String, origName: String): Bool = {
-    let targetMod = qnameModulePrefix(targetQn);
     let cur = cellNew(items);
     let found = cellNew(false);
     while (!cellGet(found) && match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -3663,30 +3668,33 @@ def docImportsTargetUnaliased(exports: StrMap String, items: List ModuleItem, ta
                 match u {
                     UseSingle(segs, _) -> {
                         let full = strJoin(segs, ".");
-                        if (full == targetQn || exportResolvesToTarget(exports, full, targetQn)) cellSet(found, true) else ()
+                        let mk = qnameModulePrefix(full);
+                        if (shortSymName(full) == origName && modExportsTargetAsOrigName(exports, mk, origName, targetQn)) {
+                            cellSet(found, true)
+                        } else ()
                     },
                     UseGlob(segs) -> {
                         let mk = strJoin(segs, ".");
-                        if ((strLen(targetMod) > 0 && mk == targetMod) || exportResolvesToTarget(exports, mk + "." + origName, targetQn)) {
+                        if (modExportsTargetAsOrigName(exports, mk, origName, targetQn)) {
                             cellSet(found, true)
                         } else ()
                     },
                     UseMulti(modSegs, specs) -> {
                         let mk = strJoin(modSegs, ".");
-                        let cs = cellNew(specs);
-                        while (!cellGet(found) && match cellGet(cs) { Nil -> false, _ -> true }) {
-                            match cellGet(cs) {
-                                Cons(sp, rs) -> {
-                                    if (sp.orig == origName && match sp.alias { None -> true, Some(_) -> false }) {
-                                        if (mk == targetMod || exportResolvesToTarget(exports, mk + "." + sp.orig, targetQn)) {
+                        if (modExportsTargetAsOrigName(exports, mk, origName, targetQn)) {
+                            let cs = cellNew(specs);
+                            while (!cellGet(found) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                                match cellGet(cs) {
+                                    Cons(sp, rs) -> {
+                                        if (sp.orig == origName && match sp.alias { None -> true, Some(_) -> false }) {
                                             cellSet(found, true)
-                                        } else ()
-                                    } else ();
-                                    cellSet(cs, rs)
-                                },
-                                Nil -> (),
+                                        } else ();
+                                        cellSet(cs, rs)
+                                    },
+                                    Nil -> (),
+                                }
                             }
-                        }
+                        } else ()
                     },
                     _ -> (),
                 };
