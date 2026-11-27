@@ -7070,10 +7070,10 @@ if [ "$T44_IS_WIN" -eq 1 ]; then
     # Verify Windows explicit DACL preservation across atomic replacement
     T44_WIN_HTML="$T44_CASE_SITE/modules/caseproj.Reader.html"
     T44_WIN_HTML_W="$(cygpath -w "$T44_WIN_HTML")"
-    icacls "$T44_WIN_HTML_W" /inheritance:d >/dev/null
-    icacls "$T44_WIN_HTML_W" /deny "*S-1-5-7:(R)" >/dev/null
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" /inheritance:d >/dev/null
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" /deny "*S-1-5-7:(R)" >/dev/null
     (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
-    if ! icacls "$T44_WIN_HTML_W" | grep -qi "DENY"; then
+    if ! MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" | grep -qi "DENY"; then
         echo "FAIL [doc_preserve_win_dacl]: expected explicit Windows DACL DENY ACE preserved after replacement" >&2
         exit 1
     fi
