@@ -414,14 +414,41 @@ def accumPtrMaskFields(ts: List Type, startOff: Int, initMask: Int64): Option In
     if (cellGet(ok)) Some(cellGet(mask)) else None
 }
 
+def emitInlineNurseryAlloc(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    byteSz: Int,
+    noscan: Bool,
+    isMasked: Bool,
+    ptrMask: Int64,
+    fallbackCall: String
+): String = {
+    let payloadWords = if (byteSz <= 0) 1 else (byteSz + 7) / 8;
+    let totalBytes = (payloadWords + 1) * 8;
+    if (mctx.mcIsWasm || totalBytes > 512) {
+        emitAssign(fctx, fallbackCall)
+    } else {
+        let wBits = intToI64(payloadWords) << 3;
+        if (noscan) {
+            let hdrConst = wBits | intToI64(1);
+            emitAssign(fctx, "call ptr @__gs_tlab_alloc_atomic(i64 " + intToStr(totalBytes) + ", i64 " + i64ToStr(hdrConst) + ", i64 " + intToStr(byteSz) + ")")
+        } else if (isMasked) {
+            let hdrConst = wBits | intToI64(4) | (ptrMask << 24);
+            emitAssign(fctx, "call ptr @__gs_tlab_alloc_masked(i64 " + intToStr(totalBytes) + ", i64 " + i64ToStr(hdrConst) + ", i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(ptrMask) + ")")
+        } else {
+            emitAssign(fctx, fallbackCall)
+        }
+    }
+}
+
 def emitGcAllocForType(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, ty: Type): String =
     if (isNoscanElemType(ty)) {
-        emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+        emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
     } else if (!mctx.mcIsWasm) {
         match accumPtrMaskType(ty, 0, intToI64(0)) {
             Some(mask) ->
-                if (mask == intToI64(0)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
-                else emitAssign(fctx, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
+                if (mask == intToI64(0)) emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+                else emitInlineNurseryAlloc(mctx, fctx, byteSz, false, true, mask, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
             None -> emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")"),
         }
     } else {
@@ -430,12 +457,12 @@ def emitGcAllocForType(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, ty: Type)
 
 def emitGcAllocForFields(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, fieldTys: List Type, startOff: Int): String =
     if (isNoscanList(fieldTys)) {
-        emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+        emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
     } else if (!mctx.mcIsWasm) {
         match accumPtrMaskFields(fieldTys, startOff, intToI64(0)) {
             Some(mask) ->
-                if (mask == intToI64(0)) emitAssign(fctx, "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
-                else emitAssign(fctx, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
+                if (mask == intToI64(0)) emitInlineNurseryAlloc(mctx, fctx, byteSz, true, false, intToI64(0), "call ptr @gc_alloc_atomic_uninit(i64 " + intToStr(byteSz) + ")")
+                else emitInlineNurseryAlloc(mctx, fctx, byteSz, false, true, mask, "call ptr @gc_alloc_masked(i64 " + intToStr(byteSz) + ", i64 " + i64ToStr(mask) + ")"),
             None -> emitAssign(fctx, "call ptr @gc_alloc(i64 " + intToStr(byteSz) + ")"),
         }
     } else {
@@ -3908,7 +3935,93 @@ pub def emitProgramLlvmIrOpts(
     bufPushStr(globalsBuf, "@__gs_argc = internal global i32 0\n");
     bufPushStr(globalsBuf, "@__gs_argv = internal global ptr null\n");
     if (!isWasm) {
-        bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n")
+        bufPushStr(globalsBuf, "@__gs_gc_stw_requested = external global i32\n");
+        bufPushStr(globalsBuf, "@__gs_tls_thread = external thread_local global ptr\n");
+        bufPushStr(globalsBuf, "declare i64 @llvm.cttz.i64(i64, i1 immarg) nounwind willreturn memory(none)\n");
+        bufPushStr(globalsBuf, "define internal noalias nonnull ptr @__gs_tlab_alloc_atomic(i64 %totalBytes, i64 %hdrConst, i64 %byteSz) nounwind {\n");
+        bufPushStr(globalsBuf, "entry:\n");
+        bufPushStr(globalsBuf, "  %self = load ptr, ptr @__gs_tls_thread, align 8\n");
+        bufPushStr(globalsBuf, "  %has_thr = icmp ne ptr %self, null\n");
+        bufPushStr(globalsBuf, "  br i1 %has_thr, label %thr, label %slow\n");
+        bufPushStr(globalsBuf, "thr:\n");
+        bufPushStr(globalsBuf, "  %nurs = load ptr, ptr %self, align 8\n");
+        bufPushStr(globalsBuf, "  %has_nurs = icmp ne ptr %nurs, null\n");
+        bufPushStr(globalsBuf, "  br i1 %has_nurs, label %nurs_ok, label %slow\n");
+        bufPushStr(globalsBuf, "nurs_ok:\n");
+        bufPushStr(globalsBuf, "  %cur = load ptr, ptr %nurs, align 8\n");
+        bufPushStr(globalsBuf, "  %end_p = getelementptr inbounds i8, ptr %nurs, i64 8\n");
+        bufPushStr(globalsBuf, "  %end = load ptr, ptr %end_p, align 8\n");
+        bufPushStr(globalsBuf, "  %next = getelementptr inbounds i8, ptr %cur, i64 %totalBytes\n");
+        bufPushStr(globalsBuf, "  %fits = icmp ule ptr %next, %end\n");
+        bufPushStr(globalsBuf, "  br i1 %fits, label %fast, label %slow\n");
+        bufPushStr(globalsBuf, "fast:\n");
+        bufPushStr(globalsBuf, "  store ptr %next, ptr %nurs, align 8\n");
+        bufPushStr(globalsBuf, "  %cur_i = ptrtoint ptr %cur to i64\n");
+        bufPushStr(globalsBuf, "  %off = and i64 %cur_i, 262143\n");
+        bufPushStr(globalsBuf, "  %slot = lshr i64 %off, 3\n");
+        bufPushStr(globalsBuf, "  %widx = lshr i64 %slot, 6\n");
+        bufPushStr(globalsBuf, "  %bpos = and i64 %slot, 63\n");
+        bufPushStr(globalsBuf, "  %bit = shl i64 1, %bpos\n");
+        bufPushStr(globalsBuf, "  %bmap_base = getelementptr inbounds i8, ptr %nurs, i64 24\n");
+        bufPushStr(globalsBuf, "  %bmap_p = getelementptr inbounds i64, ptr %bmap_base, i64 %widx\n");
+        bufPushStr(globalsBuf, "  %old_w = load i64, ptr %bmap_p, align 8\n");
+        bufPushStr(globalsBuf, "  %new_w = or i64 %old_w, %bit\n");
+        bufPushStr(globalsBuf, "  store i64 %new_w, ptr %bmap_p, align 8\n");
+        bufPushStr(globalsBuf, "  store i64 %hdrConst, ptr %cur, align 8\n");
+        bufPushStr(globalsBuf, "  %res = getelementptr inbounds i8, ptr %cur, i64 8\n");
+        bufPushStr(globalsBuf, "  ret ptr %res\n");
+        bufPushStr(globalsBuf, "slow:\n");
+        bufPushStr(globalsBuf, "  %sres = tail call ptr @gc_alloc_atomic_uninit(i64 %byteSz) cold\n");
+        bufPushStr(globalsBuf, "  ret ptr %sres\n");
+        bufPushStr(globalsBuf, "}\n");
+        bufPushStr(globalsBuf, "define internal noalias nonnull ptr @__gs_tlab_alloc_masked(i64 %totalBytes, i64 %hdrConst, i64 %byteSz, i64 %ptrMask) nounwind {\n");
+        bufPushStr(globalsBuf, "entry:\n");
+        bufPushStr(globalsBuf, "  %self = load ptr, ptr @__gs_tls_thread, align 8\n");
+        bufPushStr(globalsBuf, "  %has_thr = icmp ne ptr %self, null\n");
+        bufPushStr(globalsBuf, "  br i1 %has_thr, label %thr, label %slow\n");
+        bufPushStr(globalsBuf, "thr:\n");
+        bufPushStr(globalsBuf, "  %nurs = load ptr, ptr %self, align 8\n");
+        bufPushStr(globalsBuf, "  %has_nurs = icmp ne ptr %nurs, null\n");
+        bufPushStr(globalsBuf, "  br i1 %has_nurs, label %nurs_ok, label %slow\n");
+        bufPushStr(globalsBuf, "nurs_ok:\n");
+        bufPushStr(globalsBuf, "  %cur = load ptr, ptr %nurs, align 8\n");
+        bufPushStr(globalsBuf, "  %end_p = getelementptr inbounds i8, ptr %nurs, i64 8\n");
+        bufPushStr(globalsBuf, "  %end = load ptr, ptr %end_p, align 8\n");
+        bufPushStr(globalsBuf, "  %next = getelementptr inbounds i8, ptr %cur, i64 %totalBytes\n");
+        bufPushStr(globalsBuf, "  %fits = icmp ule ptr %next, %end\n");
+        bufPushStr(globalsBuf, "  br i1 %fits, label %fast, label %slow\n");
+        bufPushStr(globalsBuf, "fast:\n");
+        bufPushStr(globalsBuf, "  store ptr %next, ptr %nurs, align 8\n");
+        bufPushStr(globalsBuf, "  %cur_i = ptrtoint ptr %cur to i64\n");
+        bufPushStr(globalsBuf, "  %off = and i64 %cur_i, 262143\n");
+        bufPushStr(globalsBuf, "  %slot = lshr i64 %off, 3\n");
+        bufPushStr(globalsBuf, "  %widx = lshr i64 %slot, 6\n");
+        bufPushStr(globalsBuf, "  %bpos = and i64 %slot, 63\n");
+        bufPushStr(globalsBuf, "  %bit = shl i64 1, %bpos\n");
+        bufPushStr(globalsBuf, "  %bmap_base = getelementptr inbounds i8, ptr %nurs, i64 24\n");
+        bufPushStr(globalsBuf, "  %bmap_p = getelementptr inbounds i64, ptr %bmap_base, i64 %widx\n");
+        bufPushStr(globalsBuf, "  %old_w = load i64, ptr %bmap_p, align 8\n");
+        bufPushStr(globalsBuf, "  %new_w = or i64 %old_w, %bit\n");
+        bufPushStr(globalsBuf, "  store i64 %new_w, ptr %bmap_p, align 8\n");
+        bufPushStr(globalsBuf, "  store i64 %hdrConst, ptr %cur, align 8\n");
+        bufPushStr(globalsBuf, "  %res = getelementptr inbounds i8, ptr %cur, i64 8\n");
+        bufPushStr(globalsBuf, "  %m0 = icmp ne i64 %ptrMask, 0\n");
+        bufPushStr(globalsBuf, "  br i1 %m0, label %zloop, label %zdone\n");
+        bufPushStr(globalsBuf, "zloop:\n");
+        bufPushStr(globalsBuf, "  %m = phi i64 [ %ptrMask, %fast ], [ %mnext, %zloop ]\n");
+        bufPushStr(globalsBuf, "  %tz = call i64 @llvm.cttz.i64(i64 %m, i1 true)\n");
+        bufPushStr(globalsBuf, "  %zp = getelementptr inbounds i64, ptr %res, i64 %tz\n");
+        bufPushStr(globalsBuf, "  store i64 0, ptr %zp, align 8\n");
+        bufPushStr(globalsBuf, "  %m1 = sub i64 %m, 1\n");
+        bufPushStr(globalsBuf, "  %mnext = and i64 %m, %m1\n");
+        bufPushStr(globalsBuf, "  %more = icmp ne i64 %mnext, 0\n");
+        bufPushStr(globalsBuf, "  br i1 %more, label %zloop, label %zdone\n");
+        bufPushStr(globalsBuf, "zdone:\n");
+        bufPushStr(globalsBuf, "  ret ptr %res\n");
+        bufPushStr(globalsBuf, "slow:\n");
+        bufPushStr(globalsBuf, "  %sres = tail call ptr @gc_alloc_masked(i64 %byteSz, i64 %ptrMask) cold\n");
+        bufPushStr(globalsBuf, "  ret ptr %sres\n");
+        bufPushStr(globalsBuf, "}\n")
     } else ();
 
     let exportMap: StrMap Bool = strMapNew();

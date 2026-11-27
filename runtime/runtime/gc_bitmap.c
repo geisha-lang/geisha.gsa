@@ -63,25 +63,25 @@ static uint32_t _class_inv_mul[GC_NUM_CLASSES];
 static bool _tables_inited = false;
 
 typedef struct gc_nursery_t {
-    struct gc_nursery_t *next;
-    struct gc_nursery_t *prev;
-    uintptr_t base;
     uintptr_t cur;
     uintptr_t end;
-    uint32_t live_count;
-    bool owned;
+    uintptr_t base;
     uint64_t alloc_bits[GC_NURSERY_BMAP_WORDS];
     uint64_t mark_bits[GC_NURSERY_BMAP_WORDS];
+    uint32_t live_count;
+    bool owned;
+    struct gc_nursery_t *next;
+    struct gc_nursery_t *prev;
 } gc_nursery_t;
 
 typedef struct gc_thread_t {
+    /* Offset 0: thread-local 256 KB bump-pointer nursery (read directly by inline TLAB LLVM IR) */
+    gc_nursery_t *nursery;
+
     uintptr_t root_start;
     uintptr_t safepoint_sp;
     jmp_buf safepoint_regs;
     int32_t state; /* atomic: THR_RUNNING / THR_BLOCKED / THR_PARKED / THR_IDLE */
-
-    /* Thread-local 256 KB contiguous bump-pointer nursery (3-instr fast alloc + O(1) reset) */
-    gc_nursery_t *nursery;
 
     /* Thread-local active slab page per size class (100% lock-free allocation fast path) */
     gc_page_t *local_pages[GC_NUM_CLASSES];
@@ -95,12 +95,18 @@ typedef struct gc_thread_t {
     struct gc_thread_t *prev;
 } gc_thread_t;
 
+_Static_assert(offsetof(gc_thread_t, nursery) == 0, "inline TLAB assumes nursery at offset 0 of gc_thread_t");
+_Static_assert(offsetof(gc_nursery_t, cur) == 0, "inline TLAB assumes cur at offset 0 of gc_nursery_t");
+_Static_assert(offsetof(gc_nursery_t, end) == 8, "inline TLAB assumes end at offset 8 of gc_nursery_t");
+_Static_assert(offsetof(gc_nursery_t, alloc_bits) == 24, "inline TLAB assumes alloc_bits at offset 24 of gc_nursery_t");
+
 static pthread_mutex_t _gc_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t _stw_park_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t _stw_resume_cv = PTHREAD_COND_INITIALIZER;
 static bool _stw_in_progress = false;
 
-static _Thread_local gc_thread_t *_tls_thread = NULL;
+_Thread_local gc_thread_t *__gs_tls_thread = NULL;
+#define _tls_thread __gs_tls_thread
 static gc_thread_t *_threads_head = NULL;
 static pthread_key_t _host_thr_key;
 static pthread_once_t _host_key_once = PTHREAD_ONCE_INIT;
@@ -138,15 +144,27 @@ static size_t _large_table_mask = 0;
 static size_t _large_count = 0;
 static size_t _large_total_bytes = 0;
 
-/* Small reuse cache for medium-large blocks (<= 256 KB) to avoid mmap/munmap churn */
-#define LARGE_CACHE_CAP 16u
-#define LARGE_CACHE_MAX_BYTES (256u * 1024u)
-typedef struct {
-    void *ptr;
-    size_t map_size;
-} gc_large_cache_entry_t;
-static gc_large_cache_entry_t _large_cache[LARGE_CACHE_CAP];
-static size_t _large_cache_len = 0;
+/* Size-classed span cache for medium-large blocks (<= 1 MB, capped at 16 MB total; drained by gc_trim) */
+#define LARGE_CACHE_MAX_BYTES       (1024u * 1024u)
+#define LARGE_CACHE_BUCKETS         (LARGE_CACHE_MAX_BYTES / GC_PAGE_SIZE)
+#define LARGE_CACHE_MAX_TOTAL_BYTES (16u * 1024u * 1024u)
+static void *_large_cache_buckets[LARGE_CACHE_BUCKETS];
+static size_t _large_cache_bytes = 0;
+
+static void drain_large_cache_locked(void)
+{
+    for (size_t b = 0; b < LARGE_CACHE_BUCKETS; b++) {
+        size_t msz = (b + 1u) * GC_PAGE_SIZE;
+        void *p = _large_cache_buckets[b];
+        _large_cache_buckets[b] = NULL;
+        while (p != NULL) {
+            void *next = *(void **)p;
+            munmap(p, msz);
+            p = next;
+        }
+    }
+    _large_cache_bytes = 0;
+}
 
 /* Two-phase GC Cleanup registry (non-resurrecting finalizers) & External Memory Pressure */
 typedef struct gc_cleanup_entry_t {
@@ -1183,20 +1201,21 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
 
     void *raw = NULL;
     bool from_cache = false;
-    if (map_size <= LARGE_CACHE_MAX_BYTES) {
-        for (size_t i = 0; i < _large_cache_len; i++) {
-            if (_large_cache[i].map_size == map_size) {
-                raw = _large_cache[i].ptr;
-                _large_cache[i] = _large_cache[--_large_cache_len];
-                from_cache = true;
-                break;
-            }
+    if (map_size >= GC_PAGE_SIZE && map_size <= LARGE_CACHE_MAX_BYTES) {
+        size_t b = (map_size >> GC_PAGE_SHIFT) - 1u;
+        if (_large_cache_buckets[b] != NULL) {
+            raw = _large_cache_buckets[b];
+            _large_cache_buckets[b] = *(void **)raw;
+            if (_large_cache_bytes >= map_size) _large_cache_bytes -= map_size;
+            else _large_cache_bytes = 0;
+            from_cache = true;
         }
     }
     if (raw == NULL) {
         raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
     if (raw == MAP_FAILED) {
+        drain_large_cache_locked();
         if (self != NULL) {
             if (!regs_saved) {
                 _setjmp(regs);
@@ -1206,6 +1225,7 @@ static void *alloc_large_object(size_t size_bytes, size_t payload_words, bool no
             self->safepoint_sp = (uintptr_t)&sp_marker;
         }
         gc_collect_locked(self, true);
+        drain_large_cache_locked();
         raw = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (raw == MAP_FAILED) {
             pthread_mutex_unlock(&_gc_mu);
@@ -1961,10 +1981,12 @@ static void gc_collect_locked(gc_thread_t *collector, bool force_major)
             size_t msz = lo->map_size;
             if (_large_total_bytes >= msz) _large_total_bytes -= msz;
             else _large_total_bytes = 0;
-            if (!is_major && msz <= LARGE_CACHE_MAX_BYTES && _large_cache_len < LARGE_CACHE_CAP) {
-                _large_cache[_large_cache_len].ptr = (void *)lo;
-                _large_cache[_large_cache_len].map_size = msz;
-                _large_cache_len++;
+            if (msz >= GC_PAGE_SIZE && msz <= LARGE_CACHE_MAX_BYTES &&
+                _large_cache_bytes + msz <= LARGE_CACHE_MAX_TOTAL_BYTES) {
+                size_t b = (msz >> GC_PAGE_SHIFT) - 1u;
+                *(void **)lo = _large_cache_buckets[b];
+                _large_cache_buckets[b] = (void *)lo;
+                _large_cache_bytes += msz;
             } else {
                 munmap(lo, msz);
             }
@@ -2187,10 +2209,7 @@ void gc_trim(void)
     geisha_rt_init();
     gc_collect_major();
     pthread_mutex_lock(&_gc_mu);
-    for (size_t i = 0; i < _large_cache_len; i++) {
-        munmap(_large_cache[i].ptr, _large_cache[i].map_size);
-    }
-    _large_cache_len = 0;
+    drain_large_cache_locked();
     reclaim_empty_chunks_locked(1);
     for (gc_page_t *p = _free_pages; p != NULL; p = p->next) {
 #if defined(MADV_FREE_REUSABLE)

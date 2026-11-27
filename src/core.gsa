@@ -3130,6 +3130,88 @@ def markVarsEscaping(vars: List String, allocMap: StrMap (Bool, List String), es
     },
 }
 
+def strListHas(xs: List String, target: String): Bool = match xs {
+    Nil -> false,
+    Cons(h, t) -> if (h == target) true else strListHas(t, target),
+}
+
+def cellOnlyGetSetList(vname: String, ts: List TaggedTerm): Bool = match ts {
+    Nil -> true,
+    Cons(h, t) -> cellOnlyGetSet(vname, h) && cellOnlyGetSetList(vname, t),
+}
+
+def cellOnlyGetSetArms(vname: String, arms: List CoreArm): Bool = match arms {
+    Nil -> true,
+    Cons(a, t) -> {
+        let gOk = match a.caGuard { Some(g) -> cellOnlyGetSet(vname, g), None -> true };
+        gOk && cellOnlyGetSet(vname, a.caBody) && cellOnlyGetSetArms(vname, t)
+    },
+}
+
+def cellOnlyGetSet(vname: String, term: TaggedTerm): Bool = match term.tnode {
+    TmLit(_) -> true,
+    TmGlobalVar(_) -> true,
+    TmVar(n) -> n != vname,
+    TmTuple(es) -> cellOnlyGetSetList(vname, es),
+    TmBlock(es) -> cellOnlyGetSetList(vname, es),
+    TmMakeCls(_, spec, body) -> !strListHas(spec.clsFvs, vname) && cellOnlyGetSet(vname, body),
+    TmApplyCls(fnT, args) -> cellOnlyGetSet(vname, fnT) && cellOnlyGetSetList(vname, args),
+    TmApplyDir(vd, args) ->
+        if (vd.vname == "cellGet") {
+            match args {
+                Cons(a0, Nil) -> match a0.tnode {
+                    TmVar(n) if (n == vname) -> true,
+                    _ -> cellOnlyGetSet(vname, a0),
+                },
+                _ -> cellOnlyGetSetList(vname, args),
+            }
+        } else if (vd.vname == "cellSet") {
+            match args {
+                Cons(a0, Cons(a1, Nil)) -> match a0.tnode {
+                    TmVar(n) if (n == vname) -> cellOnlyGetSet(vname, a1),
+                    _ -> cellOnlyGetSet(vname, a0) && cellOnlyGetSet(vname, a1),
+                },
+                _ -> cellOnlyGetSetList(vname, args),
+            }
+        } else {
+            cellOnlyGetSetList(vname, args)
+        },
+    TmBin(_, l, r) -> cellOnlyGetSet(vname, l) && cellOnlyGetSet(vname, r),
+    TmUn(_, e) -> cellOnlyGetSet(vname, e),
+    TmGetTag(e) -> cellOnlyGetSet(vname, e),
+    TmLet(vd, val, body) ->
+        if (vd.vname == vname) {
+            match val.tnode {
+                TmApplyDir(cvd, cargs) if (cvd.vname == "cellNew") ->
+                    cellOnlyGetSetList(vname, cargs) && cellOnlyGetSet(vname, body),
+                _ -> false,
+            }
+        } else {
+            cellOnlyGetSet(vname, val) && cellOnlyGetSet(vname, body)
+        },
+    TmIf(c, t, e) -> cellOnlyGetSet(vname, c) && cellOnlyGetSet(vname, t) && cellOnlyGetSet(vname, e),
+    TmWhile(c, b) -> cellOnlyGetSet(vname, c) && cellOnlyGetSet(vname, b),
+    TmMatch(s, arms) -> cellOnlyGetSet(vname, s) && cellOnlyGetSetArms(vname, arms),
+    TmMakeData(_, _, fs, _, _) -> cellOnlyGetSetList(vname, fs),
+}
+
+def collectPureLoopCells(b: TaggedTerm, loopKeys: List String): List String = {
+    let escLoop = cellNew(Nil);
+    let cur = cellNew(loopKeys);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(k, r) -> {
+                if (!cellOnlyGetSet(k, b)) {
+                    cellSet(escLoop, Cons(k, cellGet(escLoop)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(escLoop)
+}
+
 def analyzeAllocEscapes(
     tm: TaggedTerm,
     allocMap: StrMap (Bool, List String),
@@ -3274,7 +3356,8 @@ def analyzeAllocEscapes(
         let loopMap: StrMap (Bool, List String) = strMapNew();
         let loopKeys = cellNew(Nil);
         collectLocalAllocs(b, recAdts, loopMap, loopKeys);
-        markVarsEscaping(cellGet(loopKeys), allocMap, escaping, escList);
+        let escLoopKeys = collectPureLoopCells(b, cellGet(loopKeys));
+        markVarsEscaping(escLoopKeys, allocMap, escaping, escList);
         analyzeAllocEscapes(b, allocMap, escaping, escList, allParamEscapes, recAdts, true)
     },
     TmBin(_, l, r) -> {
