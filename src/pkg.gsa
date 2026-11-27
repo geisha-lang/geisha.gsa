@@ -104,6 +104,7 @@ pub data Manifest {
         mfOverrides: List DepDecl,
         mfNative: TargetCfg,
         mfWasm: TargetCfg,
+        mfWasmGc: TargetCfg,
         mfJs: TargetCfg,
         mfMacos: TargetCfg,
         mfIos: TargetCfg,
@@ -146,6 +147,7 @@ pub data CompileCallbacks {
         cbCompileNativeExeSource: (String, String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileNativeObj: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileWasm: (String, PkgSpec, List PkgSpec, TargetCfg, Bool, Option String, Option String, Option String, Option String) -> Result Void String,
+        cbCompileWasmGc: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileJs: (String, PkgSpec, List PkgSpec, TargetCfg, Option String, Option String) -> Result Void String,
         cbCompileAppleBundle: (String, String, PkgSpec, List PkgSpec, TargetCfg, AppleBundleCfg, String, String, Option String, Option String, Option String, Option String) -> Result String String,
         cbCompileTargetArchive: (String, String, PkgSpec, List PkgSpec, TargetCfg, String, Option String, Option String) -> Result Void String,
@@ -199,6 +201,7 @@ def emptyManifest(fallbackName: String): Manifest = MkManifest {
     mfOverrides: Nil,
     mfNative: emptyTargetCfg(),
     mfWasm: emptyTargetCfg(),
+    mfWasmGc: emptyTargetCfg(),
     mfJs: emptyTargetCfg(),
     mfMacos: emptyTargetCfg(),
     mfIos: emptyTargetCfg(),
@@ -824,18 +827,19 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
             let benches2 = asStrList(lookupVal(fs, "bench"))?;
             let deps = parseDepTable(lookupVal(fs, "deps"))?;
             let overrides = parseDepTable(lookupVal(fs, "overrides"))?;
-            let (nativeCfg, wasmCfg, jsCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
+            let (nativeCfg, wasmCfg, wasmGcCfg, jsCfg, macosCfg, iosCfg, macosBundle, iosBundle) = match lookupVal(fs, "target") {
                 Some(VObj(tfs)) -> {
                     let nc = parseTargetCfgValue(lookupVal(tfs, "native"))?;
                     let wc = parseTargetCfgValue(lookupVal(tfs, "wasm32"))?;
+                    let wgc = parseTargetCfgValue(lookupVal(tfs, "wasm-gc"))?;
                     let jc = parseTargetCfgValue(lookupVal(tfs, "js"))?;
                     let mc = parseTargetCfgValue(lookupVal(tfs, "macos"))?;
                     let ic = parseTargetCfgValue(lookupVal(tfs, "ios"))?;
                     let mb = parseAppleBundleCfgValue(lookupVal(tfs, "macos"))?;
                     let ib = parseAppleBundleCfgValue(lookupVal(tfs, "ios"))?;
-                    (nc, wc, jc, mc, ic, mb, ib)
+                    (nc, wc, wgc, jc, mc, ic, mb, ib)
                 },
-                None -> (emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyAppleBundleCfg(), emptyAppleBundleCfg()),
+                None -> (emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyTargetCfg(), emptyAppleBundleCfg(), emptyAppleBundleCfg()),
                 Some(_) -> returnManifestErr("expected '[target]' to be a TOML table")?,
             };
             Ok(MkManifest {
@@ -849,6 +853,7 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
                 mfOverrides: overrides,
                 mfNative: nativeCfg,
                 mfWasm: wasmCfg,
+                mfWasmGc: wasmGcCfg,
                 mfJs: jsCfg,
                 mfMacos: macosCfg,
                 mfIos: iosCfg,
@@ -860,7 +865,7 @@ pub def parseManifestToml(raw: String, fallbackName: String): Result Manifest St
     }
 }
 
-def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
+def returnManifestErr(msg: String): Result (TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, TargetCfg, AppleBundleCfg, AppleBundleCfg) String = Err(msg)
 
 pub def parseLockfileToml(raw: String): Result (List LockEntry) String = {
     let rootVal = tomlParse(raw)?;
@@ -1455,6 +1460,7 @@ def loadProjectManifestAndOverrides(projectDir: String): Result (Manifest, List 
                 mfOverrides: mf0.mfOverrides,
                 mfNative: mergeLocalTargetCfg(mf0.mfNative, lmf.mfNative),
                 mfWasm: mergeLocalTargetCfg(mf0.mfWasm, lmf.mfWasm),
+                mfWasmGc: mergeLocalTargetCfg(mf0.mfWasmGc, lmf.mfWasmGc),
                 mfJs: mergeLocalTargetCfg(mf0.mfJs, lmf.mfJs),
                 mfMacos: mergeLocalTargetCfg(mf0.mfMacos, lmf.mfMacos),
                 mfIos: mergeLocalTargetCfg(mf0.mfIos, lmf.mfIos),
@@ -2026,6 +2032,7 @@ def mergeTargetConfigsFor(
     cliNoDts: Bool
 ): TargetCfg = {
     let isWasm = target == "wasm32";
+    let isWasmGc = target == "wasm-gc";
     let isJs = target == "js";
     let isMacApp = target == "macos-app";
     let isIos = target == "ios" || target == "ios-sim" || target == "ios-app" || target == "ios-sim-app";
@@ -2091,6 +2098,8 @@ def mergeTargetConfigsFor(
             Cons(rp, r) -> {
                 if (isWasm) {
                     applyDep(rp.rpRootDir, rp.rpManifest.mfWasm)
+                } else if (isWasmGc) {
+                    applyDep(rp.rpRootDir, rp.rpManifest.mfWasmGc)
                 } else if (isJs) {
                     applyDep(rp.rpRootDir, rp.rpManifest.mfJs)
                 } else if (isIos) {
@@ -2107,6 +2116,8 @@ def mergeTargetConfigsFor(
 
     if (isWasm) {
         applyRoot(projectDir, rootMf.mfWasm)
+    } else if (isWasmGc) {
+        applyRoot(projectDir, rootMf.mfWasmGc)
     } else if (isJs) {
         applyRoot(projectDir, rootMf.mfJs)
     } else if (isIos) {
@@ -2748,6 +2759,7 @@ pub def cmdBuildProject(
     let (rootMf, rootSpec, resolvedPkgs) = resolveProjectGraph(projectDir, false, None, true)?;
     let extSpecs = toLoaderPkgSpecs(resolvedPkgs);
     let isWasm = target == "wasm32";
+    let isWasmGc = target == "wasm-gc";
     let isJs = target == "js";
     let isAppleBundle = target == "macos-app" || target == "ios-app" || target == "ios-sim-app";
     let isIosLib = target == "ios" || target == "ios-sim";
@@ -2765,11 +2777,18 @@ pub def cmdBuildProject(
     let needBuildDir = match outPathOpt { None -> !emitIr, Some(_) -> false };
     let _ = if (needBuildDir) mkdirAll(buildDir)? else ();
 
-    if (emitIr && isJs) {
-        Err("cannot combine '--emit-llvm' with '--target js'")
+    if (emitIr && (isJs || isWasmGc)) {
+        Err("cannot combine '--emit-llvm' with '--target " + target + "'")
     } else if (emitIr) {
         cbs.cbEmitIr(entryFile, rootSpec, extSpecs, mergedTc, isWasm, outPathOpt, dumpCoreOpt)?;
         Ok(match outPathOpt { Some(p) -> p, None -> "<stdout>" })
+    } else if (isWasmGc) {
+        let defaultOut = pathJoin(buildDir, rootMf.mfName + ".wasm");
+        let outWasm = match outPathOpt { Some(p) -> p, None -> defaultOut };
+        ensureParentDirExists(outWasm)?;
+        cbs.cbCompileWasmGc(entryFile, rootSpec, extSpecs, mergedTc, Some(outWasm), dumpCoreOpt)?;
+        let _ = copyWebAssetsRec(mergedTc.tcWebAssets, pathDirname(outWasm))?;
+        Ok(outWasm)
     } else if (isJs) {
         let defaultOut = pathJoin(buildDir, rootMf.mfName + ".mjs");
         let outJs = match outPathOpt { Some(p) -> p, None -> defaultOut };

@@ -4909,4 +4909,197 @@ if command -v node >/dev/null 2>&1; then
     assert_eq "leaf_inline_js_run" "170.0|142.5|22" "$(node "$TMP_DIR/t43_leaf_simd.mjs")"
 fi
 
+# 44. `--target wasm-gc`: Direct Geisha Core IR -> WasmGC binary (zero linear memory, structs/enums/closures/strings/arrays/JSON/GC stress + size comparison)
+if command -v node >/dev/null 2>&1; then
+cat > "$TMP_DIR/t44_wasmgc.gsa" << 'EOF'
+use std.str.{intToStr, i64ToStr}
+use std.buf.{bufNew, bufPushStr, bufToString}
+use std.result.{Ok, Err}
+use std.json.{parse, stringify}
+
+pub data Point { x: Int, y: Int }
+
+pub data Color { Red, Green, Blue }
+
+pub data Expr {
+    ELit(Int),
+    EAdd(Expr, Expr),
+    EMul(Expr, Expr),
+}
+
+def gBootFlag: Cell Int = cellNew(0)
+extern init def initWgcFlag(): Void = cellSet(gBootFlag, 77)
+
+def colorVal(c: Color): Int = match c {
+    Red -> 1,
+    Green -> 2,
+    Blue -> 3,
+}
+
+def evalExpr(e: Expr): Int = match e {
+    ELit(n) if (n < 0) -> 0 - n,
+    ELit(n) -> n,
+    EAdd(a, b) -> evalExpr(a) + evalExpr(b),
+    EMul(a, b) -> evalExpr(a) * evalExpr(b),
+}
+
+def sumTail(n: Int, acc: Int64): Int64 =
+    if (n <= 0) acc
+    else sumTail(n - 1, acc + intToI64(n))
+
+def makeAdder(base: Int): Int -> Int =
+    (x: Int) -> base + x
+
+def applyTwice(f: Int -> Int, x: Int): Int = f(f(x))
+
+def makeCounter(): () -> Int = {
+    let c = cellNew(0);
+    () -> {
+        let next = cellGet(c) + 1;
+        cellSet(c, next);
+        next
+    }
+}
+
+pub def gcStress(n: Int): Int = {
+    let acc = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let p = Point { x: cellGet(i), y: 1 };
+        let xs = Cons(p.x, Cons(p.y, Nil));
+        let v = match xs {
+            Cons(h, Cons(t, Nil)) -> h + t,
+            _ -> 0,
+        };
+        cellSet(acc, (cellGet(acc) + v) & 65535);
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(acc)
+}
+
+pub def greet(name: String): String = "Hello, " + name + "!"
+
+pub def add(a: Int, b: Int): Int = a + b
+
+def main(): Void = {
+    let p = Point { x: 10, y: 20 };
+    let cv = colorVal(Red) + colorVal(Green) + colorVal(Blue);
+    let ev = evalExpr(EAdd(EMul(ELit(-6), ELit(7)), ELit(p.x + p.y)));
+    let tail = sumTail(100000, intToI64(0));
+    let add5 = makeAdder(5);
+    let clsRes = applyTwice(add5, 32);
+    let ctr = makeCounter();
+    let csum = ctr() + ctr() + ctr();
+    let arr = parTabulate(5, (i: Int) -> i * i);
+    let arrSum = immArrayGet(arr, 4) + immArrayGet(arr, 3);
+    let b = bufNew();
+    bufPushStr(b, "wa");
+    bufPushStr(b, "smgc");
+    let s = bufToString(b);
+    let j = match parse("{\"a\":[1,true,\"ok\"]}") {
+        Ok(v) -> stringify(v),
+        Err(e) -> "ERR:" + e,
+    };
+    let gc = gcStress(50000);
+    printLn(
+        intToStr(cv) + "|"
+        + intToStr(ev) + "|"
+        + i64ToStr(tail) + "|"
+        + intToStr(clsRes) + "|"
+        + intToStr(csum) + "|"
+        + intToStr(arrSum) + "|"
+        + s + ":" + intToStr(strLen(s)) + "|"
+        + j + "|"
+        + intToStr(gc) + "|"
+        + intToStr(cellGet(gBootFlag))
+    )
+}
+EOF
+"$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t44_wasmgc.wasm" "$TMP_DIR/t44_wasmgc.gsa"
+if [ ! -f "$TMP_DIR/t44_wasmgc.wasm" ] || [ ! -f "$TMP_DIR/t44_wasmgc.mjs" ] || [ ! -f "$TMP_DIR/t44_wasmgc.d.ts" ]; then
+    echo "FAIL [wasmgc_outputs]: expected .wasm, .mjs, and .d.ts outputs" >&2
+    exit 1
+fi
+WGC_OUT="$(node --input-type=module -e "
+import fs from 'node:fs';
+import { add, greet, gcStress } from '$TMP_DIR/t44_wasmgc.mjs';
+const bytes = fs.readFileSync('$TMP_DIR/t44_wasmgc.wasm');
+const mod = new WebAssembly.Module(bytes);
+const memExports = WebAssembly.Module.exports(mod).filter(e => e.kind === 'memory');
+const memImports = WebAssembly.Module.imports(mod).filter(i => i.kind === 'memory');
+if (memExports.length !== 0 || memImports.length !== 0) {
+    throw new Error('Expected zero linear memory in WasmGC module');
+}
+console.log(add(19, 23) + '|' + greet('WasmGC') + '|' + gcStress(10000));
+")"
+WGC_MAIN_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '1p')"
+WGC_HOST_LINE="$(printf '%s\n' "$WGC_OUT" | sed -n '2p')"
+assert_eq "wasmgc_full_e2e_main" '6|72|5000050000|42|6|25|wasmgc:6|{"a":[1,true,"ok"]}|56872|77' "$WGC_MAIN_LINE"
+assert_eq "wasmgc_full_e2e_host" '42|Hello, WasmGC!|1032' "$WGC_HOST_LINE"
+
+# Verify --no-dts skips .d.ts
+"$GEISHA_BIN" --target wasm-gc --no-dts -o "$TMP_DIR/t44_nodts.wasm" "$TMP_DIR/t44_wasmgc.gsa"
+if [ -f "$TMP_DIR/t44_nodts.d.ts" ]; then
+    echo "FAIL [wasmgc_no_dts]: expected --no-dts to omit .d.ts" >&2
+    exit 1
+fi
+
+# Verify project-mode `geisha build --target wasm-gc` + zero-import raw WebAssembly.Instance + binary size comparison vs wasm32
+WGC_PROJ="$TMP_DIR/t44_wgc_proj"
+mkdir -p "$WGC_PROJ/src"
+cat > "$WGC_PROJ/geisha.toml" << 'EOF'
+name = "wgc_bench"
+version = "0.1.0"
+
+[target.wasm-gc]
+exports = ["runBench"]
+owns_main = true
+EOF
+cat > "$WGC_PROJ/src/main.gsa" << 'EOF'
+pub data Point { x: Int, y: Int }
+pub data Color { Red, Green, Blue }
+pub data Tree { Leaf(Int), Node(Tree, Tree) }
+
+def makeTree(depth: Int, v: Int): Tree =
+    if (depth <= 0) Leaf(v)
+    else Node(makeTree(depth - 1, v + 1), makeTree(depth - 1, v + 2))
+
+def sumTree(t: Tree): Int = match t {
+    Leaf(n) -> n,
+    Node(l, r) -> sumTree(l) + sumTree(r),
+}
+
+pub def runBench(n: Int): Int = {
+    let p = Point { x: n, y: 3 };
+    let c = match Red { Red -> 1, Green -> 2, Blue -> 3 };
+    let f = (k: Int) -> k + p.x + c;
+    sumTree(makeTree(6, f(p.y)))
+}
+
+def main(): Void = { let _ = runBench(5); () }
+EOF
+ABS_GEISHA_44="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+(cd "$WGC_PROJ" && "$ABS_GEISHA_44" build --target wasm-gc)
+WGC_RAW_RES="$(node -e "
+const fs = require('fs');
+const bytes = fs.readFileSync('$WGC_PROJ/build/wgc_bench.wasm');
+const mod = new WebAssembly.Module(bytes);
+const inst = new WebAssembly.Instance(mod);
+console.log(inst.exports.runBench(5) + '|' + bytes.length);
+")"
+WGC_RAW_VAL="$(printf '%s' "$WGC_RAW_RES" | cut -d'|' -f1)"
+WGC_RAW_SZ="$(printf '%s' "$WGC_RAW_RES" | cut -d'|' -f2)"
+assert_eq "wasmgc_proj_raw_instance" "1152" "$WGC_RAW_VAL"
+if [ -f "./build/wasm_rt.o" ]; then
+    "$GEISHA_BIN" --target wasm32 --opt z --strip --runtime ./build/wasm_rt.o --export runBench -o "$TMP_DIR/t44_w32.wasm" "$WGC_PROJ/src/main.gsa"
+    W32_SZ="$(wc -c < "$TMP_DIR/t44_w32.wasm" | tr -d ' ')"
+    if [ "$WGC_RAW_SZ" -ge "$W32_SZ" ]; then
+        echo "FAIL [wasmgc_size_smaller]: expected wasm-gc ($WGC_RAW_SZ bytes) < wasm32 ($W32_SZ bytes)" >&2
+        exit 1
+    fi
+    echo "PASS [wasmgc_size_comparison]: wasm-gc=${WGC_RAW_SZ}B vs wasm32(-Oz --strip)=${W32_SZ}B (zero linear memory)"
+    PASS=$((PASS + 1))
+fi
+fi
+
 echo "All $PASS end-to-end test suites passed!"

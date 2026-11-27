@@ -1,6 +1,6 @@
 # Geisha Language — Agent Quick Reference (`geisha guide`)
 
-Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative language with open Concepts/Instances, algebraic data types, exhaustive pattern matching, GC + `$Scoped` regions, `Send`-checked concurrency, and a decentralized Git/MVS package manager (`geisha.toml`), compiling to LLVM 20 IR (`native`, `wasm32`, `ios`, `ios-sim`) and zero-dependency ES Module JavaScript + TypeScript `.d.ts` (`js`).
+Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative language with open Concepts/Instances, algebraic data types, exhaustive pattern matching, GC + `$Scoped` regions, `Send`-checked concurrency, and a decentralized Git/MVS package manager (`geisha.toml`), compiling to LLVM 20 IR (`native`, `wasm32`, `ios`, `ios-sim`), native WebAssembly GC (`wasm-gc`, zero linear-memory GC runtime + companion `.mjs`/`.d.ts`), and zero-dependency ES Module JavaScript + TypeScript `.d.ts` (`js`).
 
 ## 1. Agent Workflow (Use These First!)
 
@@ -19,7 +19,7 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha test [--dev | --release | --opt 0|1|2|3|s|z | -O<lvl>] [--single-cgu] [--no-cache]` (defaults to `--opt 0` / `--dev` and shares `-O0` CGU & C `.o` caches with `geisha build --dev`; `geisha test --release` shares `-O2` caches with default `geisha build`)
    - `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]` — run microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]` in `geisha.toml`, or `bench_*` functions) or standalone script mode (outputs mean/median/min/max/ops/sec, with `--json` for CI/Agent regression tracking)
    - `geisha fmt [--check] [--write] [--stdout] [paths...]` — format `.gsa` files in-place (defaults to project/cwd; `--check` exits non-zero if any file needs formatting; `--stdout` prints formatted output)
-   - `geisha build [--target native|wasm32|js|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3|-Os|-Oz|--opt[=]<lvl>|--dev|--release] [--strip] [--slim-runtime] [--no-dts] [--single-cgu] [--no-cache] [-o out]` (splits multi-module programs into per-module LLVM CGUs compiled in parallel with content-addressed `.o` caching in `build/cache/cgu/` and `build/cache/native/`; override concurrency via `GEISHA_JOBS`)
+   - `geisha build [--target native|wasm32|wasm-gc|js|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3|-Os|-Oz|--opt[=]<lvl>|--dev|--release] [--strip] [--slim-runtime] [--no-dts] [--single-cgu] [--no-cache] [-o out]` (splits multi-module programs into per-module LLVM CGUs compiled in parallel with content-addressed `.o` caching in `build/cache/cgu/` and `build/cache/native/`; override concurrency via `GEISHA_JOBS`)
    - **Source-level debugging (`lldb` / `gdb` / VS Code CodeLLDB)**: compile with `-g` / `--debug` (defaults to `-O0`, disables tail-call optimization, emits DWARF v4 line info + `@llvm.dbg.declare` local variables, and runs `dsymutil` on macOS). Load `~/.geisha/lib/geisha_lldb.py` in LLDB for formatted `String`, `Vec`, `Array`, `List`, `Option`, and boxed ADT inspection (see `docs/DEBUGGING.md`).
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
 5. **Editor / IDE integration (LSP)**:
@@ -206,6 +206,12 @@ web_assets   = ["host/web/runtime.js"]
 opt          = "z"        # "0" | "1" | "2" (default) | "3" | "s" | "z" (defaults strip = true on s/z, runs optional wasm-opt unless GEISHA_DISABLE_TOOL=wasm-opt)
 strip        = true       # strip custom/name sections (set false to keep names even under opt = "z")
 slim_runtime = false      # true omits default gs_wasm_* bridge exports so --gc-sections drops unused GC
+
+[target.wasm-gc]
+exports      = ["add", "parseDoc"]
+web_assets   = ["host/web/index.html"]
+dts          = true       # emit companion .d.ts alongside .wasm + .mjs glue (default: true)
+owns_main    = false      # true skips auto-invoking main() in companion .mjs glue
 
 [target.js]
 exports      = ["add", "parseDoc"]
