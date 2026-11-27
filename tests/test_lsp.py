@@ -1468,6 +1468,98 @@ def main() -> int:
         )
         assert res_m.returncode == 0 and res_m.stdout.strip() == "7", f"renamed qualified type annotation failed to run: rc={res_m.returncode} stdout={res_m.stdout!r} stderr={res_m.stderr!r}"
 
+        # (n) Qualified type paths with line comment + newline (`a.// source\nMarker`) and block comment containing target text (`a./* a.Marker */Marker`)
+        qtc_dir = root / "qual_type_comment_proj"
+        qtc_dir.mkdir(parents=True)
+        qtc_a_path = qtc_dir / "a.gsa"
+        qtc_u_path = qtc_dir / "user.gsa"
+        qtc_a_src = (
+            "pub data Marker { MkMarker { val: Int } }\n"
+            "pub def mk(): Marker = MkMarker { val: 7 }\n"
+        )
+        qtc_u_src = (
+            "use std.str.intToStr\n"
+            "use a\n"
+            "def valOf1(x: a.// source\n"
+            "Marker): Int = x.val\n"
+            "def valOf2(x: a./* a.Marker */Marker): Int = x.val\n"
+            "def main(): Void = printLn(intToStr(valOf1(a.mk()) + valOf2(a.mk())))\n"
+        )
+        qtc_a_path.write_text(qtc_a_src, encoding="utf-8")
+        qtc_u_path.write_text(qtc_u_src, encoding="utf-8")
+        qtc_a_uri = path_to_uri(qtc_a_path)
+        qtc_u_uri = path_to_uri(qtc_u_path)
+        client.notifications.clear()
+        for u, t in ((qtc_a_uri, qtc_a_src), (qtc_u_uri, qtc_u_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_qtc = client.request("textDocument/rename", {
+            "textDocument": {"uri": qtc_a_uri},
+            "position": {"line": 0, "character": 9},
+            "newName": "NewMarker",
+        })
+        assert "result" in ren_qtc, f"expected commented qualified type rename to succeed: {ren_qtc}"
+        ch_qtc = ren_qtc["result"]["changes"]
+        new_qtc_a = apply_edits(qtc_a_src, ch_qtc[qtc_a_uri])
+        new_qtc_u = apply_edits(qtc_u_src, ch_qtc[qtc_u_uri])
+        assert "a.// source\nNewMarker" in new_qtc_u and "a./* a.Marker */NewMarker" in new_qtc_u, f"unexpected commented qualified type rename: {new_qtc_u!r}"
+        run_n_dir = root / "run_qual_type_comment"
+        run_n_dir.mkdir(parents=True)
+        (run_n_dir / "a.gsa").write_text(new_qtc_a, encoding="utf-8")
+        (run_n_dir / "user.gsa").write_text(new_qtc_u, encoding="utf-8")
+        res_n = subprocess.run(
+            [abs_geisha_bin, "run", str(run_n_dir / "user.gsa")],
+            cwd=str(run_n_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_n.returncode == 0 and res_n.stdout.strip() == "14", f"renamed commented qualified type failed to run: rc={res_n.returncode} stdout={res_n.stdout!r} stderr={res_n.stderr!r}"
+
+        # (o) Module and function share the same name: `use load` + `load.load()` -> rename `load.load` -> `freshName` updates ONLY second `load` and runs -> `7`
+        samemod_dir = root / "same_mod_fn_proj"
+        samemod_dir.mkdir(parents=True)
+        sm_m_path = samemod_dir / "load.gsa"
+        sm_u_path = samemod_dir / "user.gsa"
+        sm_m_src = "pub def load(): Int = 7\n"
+        sm_u_src = (
+            "use std.str.intToStr\n"
+            "use load\n"
+            "def main(): Void = printLn(intToStr(load.load()))\n"
+        )
+        sm_m_path.write_text(sm_m_src, encoding="utf-8")
+        sm_u_path.write_text(sm_u_src, encoding="utf-8")
+        sm_m_uri = path_to_uri(sm_m_path)
+        sm_u_uri = path_to_uri(sm_u_path)
+        client.notifications.clear()
+        for u, t in ((sm_m_uri, sm_m_src), (sm_u_uri, sm_u_src)):
+            client.notify("textDocument/didOpen", {"textDocument": {"uri": u, "languageId": "geisha", "version": 1, "text": t}})
+            assert client.wait_diag_for(u) == []
+        ren_sm = client.request("textDocument/rename", {
+            "textDocument": {"uri": sm_m_uri},
+            "position": {"line": 0, "character": 8},
+            "newName": "freshName",
+        })
+        assert "result" in ren_sm, f"expected same-name module/fn rename to succeed: {ren_sm}"
+        ch_sm = ren_sm["result"]["changes"]
+        new_sm_m = apply_edits(sm_m_src, ch_sm[sm_m_uri])
+        new_sm_u = apply_edits(sm_u_src, ch_sm[sm_u_uri])
+        assert new_sm_m == "pub def freshName(): Int = 7\n" and "load.freshName()" in new_sm_u and "use load\n" in new_sm_u, f"unexpected load.load() rename: {new_sm_m!r}, {new_sm_u!r}"
+        run_o_dir = root / "run_same_mod_fn"
+        run_o_dir.mkdir(parents=True)
+        (run_o_dir / "load.gsa").write_text(new_sm_m, encoding="utf-8")
+        (run_o_dir / "user.gsa").write_text(new_sm_u, encoding="utf-8")
+        res_o = subprocess.run(
+            [abs_geisha_bin, "run", str(run_o_dir / "user.gsa")],
+            cwd=str(run_o_dir),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert res_o.returncode == 0 and res_o.stdout.strip() == "7", f"renamed load.load() failed to run: rc={res_o.returncode} stdout={res_o.stdout!r} stderr={res_o.stderr!r}"
+
         # 12. shutdown -> requests return -32600; exit -> rc == 0
         shut = client.request("shutdown")
         assert shut["result"] is None

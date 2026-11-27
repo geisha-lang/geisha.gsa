@@ -40,6 +40,7 @@ use diag.{
     SourceFile, MkSourceFile,
     diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError
 }
+use lexer.{Token, MkToken, TokKind, TkIdent, TkDot, TkLBrace, TkEof, tokenizeInFile}
 use parser.parseFileModuleInFile
 use loader.{
     PkgSpec, MkPkgSpec, NameInfo, loadSingleSourceProgramWithPkgsNamed,
@@ -3293,8 +3294,11 @@ data RenameScope {
         rsExports: StrMap NameInfo,
         rsItems: List ModuleItem,
         rsAllowUnaliased: Bool,
+        rsToks: Vec Token,
     },
 }
+
+def dummyEofTok(): Token = MkToken { kind: TkEof, span: MkSpan { fileId: 0, start: 0, end: 0 }, hadNewline: false }
 
 def resolveModAliasInItems(items: List ModuleItem, qual: String): String = {
     let cur = cellNew(items);
@@ -3319,97 +3323,97 @@ def resolveModAliasInItems(items: List ModuleItem, qual: String): String = {
     cellGet(res)
 }
 
-def extractQualBeforeIdent(src: String, fStart: Int, identStart: Int): Option String = {
-    let n = strLen(src);
-    let s = if (fStart < 0) 0 else if (fStart > n) n else fStart;
-    let e = if (identStart < s) s else if (identStart > n) n else identStart;
-    let i = cellNew(s);
-    let segsRev: Cell (List String) = cellNew(Nil);
-    let lastWasDot = cellNew(false);
-    let valid = cellNew(true);
-    while (cellGet(i) < e && cellGet(valid)) {
-        let cur = cellGet(i);
-        let b = strByteAt(src, cur);
-        if (b == 32 || b == 9 || b == 10 || b == 13) {
-            cellSet(i, cur + 1)
-        } else if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 47) {
-            let j = cellNew(cur + 2);
-            while (cellGet(j) < e && strByteAt(src, cellGet(j)) != 10) {
-                cellSet(j, cellGet(j) + 1)
-            };
-            cellSet(i, cellGet(j))
-        } else if (b == 47 && cur + 1 < e && strByteAt(src, cur + 1) == 42) {
-            let j = cellNew(cur + 2);
-            let closed = cellNew(false);
-            while (cellGet(j) + 1 < e && !cellGet(closed)) {
-                if (strByteAt(src, cellGet(j)) == 42 && strByteAt(src, cellGet(j) + 1) == 47) {
-                    cellSet(j, cellGet(j) + 2);
-                    cellSet(closed, true)
-                } else cellSet(j, cellGet(j) + 1)
-            };
-            cellSet(i, if (cellGet(closed)) cellGet(j) else e)
-        } else if (b == 46) {
-            cellSet(lastWasDot, true);
-            cellSet(i, cur + 1)
-        } else if (isIdentStartByte(b)) {
-            let j = cellNew(cur + 1);
-            while (cellGet(j) < e && isIdentContByte(strByteAt(src, cellGet(j)))) {
-                cellSet(j, cellGet(j) + 1)
-            };
-            cellSet(segsRev, Cons(strSlice(src, cur, cellGet(j)), cellGet(segsRev)));
-            cellSet(lastWasDot, false);
-            cellSet(i, cellGet(j))
+def findTokIdxForSpanLastIdent(toks: Vec Token, lo: Int, hi: Int): Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let found = cellNew(-1);
+    while (cellGet(i) < n) {
+        let tok = vecGetOr(toks, cellGet(i), d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
         } else {
-            cellSet(valid, false)
+            if (tok.span.start >= lo && tok.span.end <= hi) {
+                match tok.kind {
+                    TkIdent(_) -> cellSet(found, cellGet(i)),
+                    _ -> (),
+                }
+            } else ();
+            cellSet(i, cellGet(i) + 1)
         }
     };
-    if (cellGet(valid) && cellGet(lastWasDot)) {
-        match listRev(cellGet(segsRev)) {
-            Nil -> None,
-            segs -> Some(strJoin(segs, ".")),
+    cellGet(found)
+}
+
+def findTokIdxForStructCtor(toks: Vec Token, lo: Int, hi: Int): Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let found = cellNew(-1);
+    while (cellGet(i) < n) {
+        let tok = vecGetOr(toks, cellGet(i), d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
+        } else if (tok.span.start >= lo && tok.span.end <= hi) {
+            match tok.kind {
+                TkLBrace -> cellSet(i, n),
+                TkIdent(_) -> {
+                    cellSet(found, cellGet(i));
+                    cellSet(i, cellGet(i) + 1)
+                },
+                _ -> cellSet(i, cellGet(i) + 1),
+            }
+        } else cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def findAllIdentTokIndicesInSpan(toks: Vec Token, ident: String, lo: Int, hi: Int): List Int = {
+    let n = vecLen(toks);
+    let d = dummyEofTok();
+    let i = cellNew(0);
+    let outRev: Cell (List Int) = cellNew(Nil);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let tok = vecGetOr(toks, idx, d);
+        if (tok.span.start >= hi) {
+            cellSet(i, n)
+        } else {
+            if (tok.span.start >= lo && tok.span.end <= hi) {
+                match tok.kind {
+                    TkIdent(nm) if (nm == ident) -> {
+                        let followedByDot = if (idx + 1 < n) {
+                            match vecGetOr(toks, idx + 1, d).kind { TkDot -> true, _ -> false }
+                        } else false;
+                        if (!followedByDot) cellSet(outRev, Cons(idx, cellGet(outRev))) else ()
+                    },
+                    _ -> (),
+                }
+            } else ();
+            cellSet(i, idx + 1)
         }
-    } else None
+    };
+    listRev(cellGet(outRev))
 }
 
-def skipWsAndBlockRev(src: String, i: Cell Int): Void = {
-    let keep = cellNew(true);
-    while (cellGet(i) >= 0 && cellGet(keep)) {
-        let b = strByteAt(src, cellGet(i));
-        if (b == 32 || b == 9 || b == 10 || b == 13) {
-            cellSet(i, cellGet(i) - 1)
-        } else if (b == 47 && cellGet(i) >= 1 && strByteAt(src, cellGet(i) - 1) == 42) {
-            let j = cellNew(cellGet(i) - 2);
-            let closed = cellNew(false);
-            while (cellGet(j) >= 1 && !cellGet(closed)) {
-                if (strByteAt(src, cellGet(j) - 1) == 47 && strByteAt(src, cellGet(j)) == 42) {
-                    cellSet(j, cellGet(j) - 2);
-                    cellSet(closed, true)
-                } else cellSet(j, cellGet(j) - 1)
-            };
-            if (cellGet(closed)) cellSet(i, cellGet(j)) else cellSet(keep, false)
-        } else cellSet(keep, false)
-    }
-}
-
-def extractQualImmediatelyBefore(src: String, identStart: Int): Option String = {
-    let i = cellNew(identStart - 1);
+def extractQualBeforeTokIdx(toks: Vec Token, idx: Int): Option String = {
+    let d = dummyEofTok();
+    let j = cellNew(idx - 1);
     let segs: Cell (List String) = cellNew(Nil);
     let sawDot = cellNew(false);
     let done = cellNew(false);
-    while (!cellGet(done)) {
-        skipWsAndBlockRev(src, i);
-        if (cellGet(i) >= 0 && strByteAt(src, cellGet(i)) == 46) {
-            cellSet(sawDot, true);
-            cellSet(i, cellGet(i) - 1);
-            skipWsAndBlockRev(src, i);
-            if (cellGet(i) >= 0 && isIdentContByte(strByteAt(src, cellGet(i)))) {
-                let endSeg = cellGet(i) + 1;
-                while (cellGet(i) >= 0 && isIdentContByte(strByteAt(src, cellGet(i)))) {
-                    cellSet(i, cellGet(i) - 1)
-                };
-                let startSeg = cellGet(i) + 1;
-                cellSet(segs, Cons(strSlice(src, startSeg, endSeg), cellGet(segs)))
-            } else cellSet(done, true)
+    while (!cellGet(done) && cellGet(j) >= 1) {
+        let cur = cellGet(j);
+        let isDot = match vecGetOr(toks, cur, d).kind { TkDot -> true, _ -> false };
+        if (isDot) {
+            match vecGetOr(toks, cur - 1, d).kind {
+                TkIdent(seg) -> {
+                    cellSet(sawDot, true);
+                    cellSet(segs, Cons(seg, cellGet(segs)));
+                    cellSet(j, cur - 2)
+                },
+                _ -> cellSet(done, true),
+            }
         } else cellSet(done, true)
     };
     if (cellGet(sawDot)) {
@@ -3420,18 +3424,9 @@ def extractQualImmediatelyBefore(src: String, identStart: Int): Option String = 
     } else None
 }
 
-def allowOccAt(rscope: RenameScope, src: String, identStart: Int, origName: String, targetQn: String, forRename: Bool): Bool =
+def allowTokIdxRename(rscope: RenameScope, idx: Int, origName: String, targetQn: String, forRename: Bool): Bool =
     if (!forRename) true
-    else match extractQualImmediatelyBefore(src, identStart) {
-        Some(qual) -> {
-            let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
-            modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
-        },
-        None -> rscope.rsAllowUnaliased,
-    }
-
-def allowSiteRename(rscope: RenameScope, src: String, fStart: Int, s: Int, origName: String, targetQn: String): Bool =
-    match extractQualBeforeIdent(src, fStart, s) {
+    else match extractQualBeforeTokIdx(rscope.rsToks, idx) {
         Some(qual) -> {
             let canonMod = resolveModAliasInItems(rscope.rsItems, qual);
             modExportsTargetAsOrigName(rscope.rsExports, canonMod, origName, targetQn)
@@ -3497,23 +3492,26 @@ def collectTopDefOccsInForm(
                     SkTopDef if (qn == targetQn) -> {
                         let shadowed = match lookupLocalBind(locals, qn) { Some(_) -> true, None -> false };
                         if (!shadowed) {
-                            let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
-                            let exactNameMatch = e > s && strSlice(src, s, e) == target.stName;
-                            if (exactNameMatch) {
-                                if (!forRename || allowSiteRename(rscope, src, f.pos.start, s, target.stName, targetQn)) {
-                                    match newNameOpt {
-                                        Some(nn) if (nn != target.stName) -> match lookupLocalBind(locals, nn) {
-                                            Some(_) -> cellSet(conflict, Some("Renaming '" + target.stName + "' to '" + nn + "' would be shadowed by a local binding")),
-                                            None -> (),
-                                        },
-                                        _ -> (),
-                                    };
-                                    pushOcc(seen, outRev, uri, src, s, e)
+                            let tidx = findTokIdxForSpanLastIdent(rscope.rsToks, f.pos.start, f.pos.end);
+                            if (tidx >= 0) {
+                                let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                                let exactNameMatch = match tok.kind { TkIdent(nm) -> nm == target.stName, _ -> false };
+                                if (exactNameMatch) {
+                                    if (allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename)) {
+                                        match newNameOpt {
+                                            Some(nn) if (nn != target.stName) -> match lookupLocalBind(locals, nn) {
+                                                Some(_) -> cellSet(conflict, Some("Renaming '" + target.stName + "' to '" + nn + "' would be shadowed by a local binding")),
+                                                None -> (),
+                                            },
+                                            _ -> (),
+                                        };
+                                        pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
+                                    } else ()
+                                } else if (!forRename) {
+                                    // Explicit local alias usage (e.g. `loadA` from `use a.{load as loadA}`):
+                                    // include in Find All References, but do not overwrite alias during rename.
+                                    pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
                                 } else ()
-                            } else if (!forRename) {
-                                // Explicit local alias usage (e.g. `loadA` from `use a.{load as loadA}`):
-                                // include in Find All References, but do not overwrite alias during rename.
-                                pushOcc(seen, outRev, uri, src, f.pos.start, f.pos.end)
                             } else ()
                         } else ()
                     },
@@ -3541,13 +3539,17 @@ def collectTopDefOccsInForm(
             if (f.pos.fileId == fileId) {
                 match target.stKind {
                     SkTopDef if (ctorQn == targetQn) -> {
-                        let (s, e) = findIdentInSpan(src, target.stName, f.pos.start, f.pos.end);
-                        if (e > s && strSlice(src, s, e) == target.stName) {
-                            if (!forRename || allowSiteRename(rscope, src, f.pos.start, s, target.stName, targetQn)) {
-                                pushOcc(seen, outRev, uri, src, s, e)
+                        let tidx = findTokIdxForStructCtor(rscope.rsToks, f.pos.start, f.pos.end);
+                        if (tidx >= 0) {
+                            let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                            let exactNameMatch = match tok.kind { TkIdent(nm) -> nm == target.stName, _ -> false };
+                            if (exactNameMatch) {
+                                if (allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename)) {
+                                    pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
+                                } else ()
+                            } else if (!forRename) {
+                                pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
                             } else ()
-                        } else if (!forRename) {
-                            pushOcc(seen, outRev, uri, src, s, e)
                         } else ()
                     },
                     SkField -> {
@@ -3640,13 +3642,14 @@ def collectTopDefOccsInForm(
                         if (f.pos.fileId == fileId && patHi > patLo) {
                             match target.stKind {
                                 SkTopDef if (patContainsCtor(arm.pat, targetQn)) -> {
-                                    let occs = findAllIdentsInSpan(src, target.stName, patLo, patHi);
+                                    let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, patLo, patHi);
                                     let co = cellNew(occs);
                                     while (match cellGet(co) { Nil -> false, _ -> true }) {
                                         match cellGet(co) {
-                                            Cons((s, e), ro) -> {
-                                                if (allowOccAt(rscope, src, s, target.stName, targetQn, forRename)) {
-                                                    pushOcc(seen, outRev, uri, src, s, e)
+                                            Cons(tidx, ro) -> {
+                                                if (allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename)) {
+                                                    let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                                                    pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
                                                 } else ();
                                                 cellSet(co, ro)
                                             },
@@ -3968,13 +3971,14 @@ def collectTypeAnnotOccsInForm(
             let bindEnd = if (rhs.pos.start > f.pos.start) rhs.pos.start else f.pos.end;
             let (_, be) = findIdentInSpan(src, vd.vname, f.pos.start, bindEnd);
             if (be > f.pos.start && hasColonBeforeEq(src, be, bindEnd)) {
-                let occs = findAllIdentsInSpan(src, typeName, be, bindEnd);
+                let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, typeName, be, bindEnd);
                 let co = cellNew(occs);
                 while (match cellGet(co) { Nil -> false, _ -> true }) {
                     match cellGet(co) {
-                        Cons((s, e), ro) -> {
-                            if (allowOccAt(rscope, src, s, typeName, targetQn, forRename)) {
-                                pushOcc(seen, outRev, uri, src, s, e)
+                        Cons(tidx, ro) -> {
+                            if (allowTokIdxRename(rscope, tidx, typeName, targetQn, forRename)) {
+                                let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                                pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
                             } else ();
                             cellSet(co, ro)
                         },
@@ -3987,13 +3991,14 @@ def collectTypeAnnotOccsInForm(
         },
         ExAbs(_, _, body) -> {
             if (body.pos.start > f.pos.start) {
-                let occs = findAllIdentsInSpan(src, typeName, f.pos.start, body.pos.start);
+                let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, typeName, f.pos.start, body.pos.start);
                 let co = cellNew(occs);
                 while (match cellGet(co) { Nil -> false, _ -> true }) {
                     match cellGet(co) {
-                        Cons((s, e), ro) -> {
-                            if (allowOccAt(rscope, src, s, typeName, targetQn, forRename)) {
-                                pushOcc(seen, outRev, uri, src, s, e)
+                        Cons(tidx, ro) -> {
+                            if (allowTokIdxRename(rscope, tidx, typeName, targetQn, forRename)) {
+                                let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                                pushOcc(seen, outRev, uri, src, tok.span.start, tok.span.end)
                             } else ();
                             cellSet(co, ro)
                         },
@@ -4084,13 +4089,14 @@ def collectTypeOccsInDef(
                 ExAbs(_, _, body) -> if (body.pos.start > d.dpos.start) body.pos.start else d.dpos.end,
                 _ -> if (f.pos.start > d.dpos.start) f.pos.start else d.dpos.end,
             };
-            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, bodyStart);
+            let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, d.dpos.start, bodyStart);
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
-                    Cons((s, e), ro) -> {
-                        if (allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename)) {
-                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                    Cons(tidx, ro) -> {
+                        if (allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename)) {
+                            let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, tok.span.start, tok.span.end)
                         } else ();
                         cellSet(co, ro)
                     },
@@ -4104,13 +4110,14 @@ def collectTypeOccsInDef(
                 Some(ob) if (ob < d.dpos.end) -> ob,
                 _ -> d.dpos.end,
             };
-            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, headEnd);
+            let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, d.dpos.start, headEnd);
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
-                    Cons((s, e), ro) -> {
-                        if (allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename)) {
-                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                    Cons(tidx, ro) -> {
+                        if (allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename)) {
+                            let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, tok.span.start, tok.span.end)
                         } else ();
                         cellSet(co, ro)
                     },
@@ -4129,14 +4136,15 @@ def collectTypeOccsInDef(
             }
         },
         _ -> {
-            let occs = findAllIdentsInSpan(wd.wdText, target.stName, d.dpos.start, d.dpos.end);
+            let occs = findAllIdentTokIndicesInSpan(rscope.rsToks, target.stName, d.dpos.start, d.dpos.end);
             let co = cellNew(occs);
             while (match cellGet(co) { Nil -> false, _ -> true }) {
                 match cellGet(co) {
-                    Cons((s, e), ro) -> {
-                        let isHeaderToken = isDeclSelf && s == declS && e == declE;
-                        if ((!isHeaderToken || includeDecl) && (isHeaderToken || allowOccAt(rscope, wd.wdText, s, target.stName, targetQn, forRename))) {
-                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, s, e)
+                    Cons(tidx, ro) -> {
+                        let tok = vecGetOr(rscope.rsToks, tidx, dummyEofTok());
+                        let isHeaderToken = isDeclSelf && tok.span.start == declS && tok.span.end == declE;
+                        if ((!isHeaderToken || includeDecl) && (isHeaderToken || allowTokIdxRename(rscope, tidx, target.stName, targetQn, forRename))) {
+                            pushOcc(seen, outRev, wd.wdUri, wd.wdText, tok.span.start, tok.span.end)
                         } else ();
                         cellSet(co, ro)
                     },
@@ -4284,6 +4292,10 @@ def collectSymbolOccurrences(
 
                                 // Expression, pattern, and type-annotation sites in `wd.wdFileId`
                                 let forRenDoc = match newNameOpt { Some(_) -> true, None -> false };
+                                let wdToks = match tokenizeInFile(wd.wdText, wd.wdFileId) {
+                                    Ok(tv) -> tv,
+                                    Err(_) -> vecNew(),
+                                };
                                 let cd = cellNew(inf.defs);
                                 while (match cellGet(cd) { Nil -> false, _ -> true }) {
                                     match cellGet(cd) {
@@ -4300,6 +4312,7 @@ def collectSymbolOccurrences(
                                                     rsExports: wd.wdExports,
                                                     rsItems: scopeItems,
                                                     rsAllowUnaliased: allowUnaliased,
+                                                    rsToks: wdToks,
                                                 };
                                                 // If target is a type/concept, scan AST type-annotation & declaration regions (per-site alias check)
                                                 if (target.stIsType) {
