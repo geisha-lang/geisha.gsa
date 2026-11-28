@@ -1545,7 +1545,7 @@ def compileWithPkgSpecsToWasmGc(
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCore(inf)?;
+    let coreProg = lowerToCoreMode(inf, cellGet(gContractMode))?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let effExports = match tc.tcExports {
         Nil -> collectRootPubFnNames(rawDefs, coreProg),

@@ -4040,7 +4040,7 @@ def isUserFnForVerifiedOpt(fd: FunDef): Bool =
     if (fd.fnSpan.fileId <= 0) false
     else match diagGetFile(fd.fnSpan.fileId) {
         Some(sf) ->
-            !strStartsWith(sf.sfPath, "<builtin:")
+            !strStartsWith(sf.sfPath, "<builtin")
             && !strStartsWith(sf.sfPath, "std/")
             && !strStartsWith(sf.sfPath, "sys/"),
         None -> false,
@@ -4074,7 +4074,11 @@ pub def computeVerifiedSafeFns(
     let ce = cellNew(exportedFns);
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
-            Cons(en, r) -> { strMapInsert(extCallable, en, true); cellSet(ce, r) },
+            Cons(en, r) -> {
+                strMapInsert(extCallable, en, true);
+                strMapInsert(extCallable, "$root." + en, true);
+                cellSet(ce, r)
+            },
             Nil -> (),
         }
     };

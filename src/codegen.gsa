@@ -1307,14 +1307,15 @@ def isAllZeroBitsTerm(tm: TaggedTerm): Bool = match tm.tnode {
 }
 
 def isDefaultWasmExport(fnName: String): Bool = {
-    let n = strLen(fnName);
-    if (n == 0 || fnName == "main") false
-    else if (n >= 2 && strByteAt(fnName, 0) == 95 && strByteAt(fnName, 1) == 95) false
+    let eff = if (strStartsWith(fnName, "$root.")) strSlice(fnName, 6, strLen(fnName)) else fnName;
+    let n = strLen(eff);
+    if (n == 0 || eff == "main") false
+    else if (n >= 2 && strByteAt(eff, 0) == 95 && strByteAt(eff, 1) == 95) false
     else {
         let ok = cellNew(true);
         let i = cellNew(0);
         while (cellGet(i) < n && cellGet(ok)) {
-            let c = strByteAt(fnName, cellGet(i));
+            let c = strByteAt(eff, cellGet(i));
             if (c == 46 || c == 36) cellSet(ok, false) else ();
             cellSet(i, cellGet(i) + 1)
         };
@@ -1322,13 +1323,16 @@ def isDefaultWasmExport(fnName: String): Bool = {
     }
 }
 
-def shouldExportSymbol(mctx: ModEmitCtx, fnName: String): Bool =
+def shouldExportSymbol(mctx: ModEmitCtx, fnName: String): Bool = {
+    let stripped = if (strStartsWith(fnName, "$root.")) strSlice(fnName, 6, strLen(fnName)) else fnName;
+    let inExplicit = strMapContains(mctx.mcWasmExports, fnName) || strMapContains(mctx.mcWasmExports, stripped);
     if (mctx.mcIsWasm) {
-        if (mctx.mcHasExplicitExports) strMapContains(mctx.mcWasmExports, fnName)
+        if (mctx.mcHasExplicitExports) inExplicit
         else isDefaultWasmExport(fnName)
     } else {
-        strMapContains(mctx.mcWasmExports, fnName)
+        inExplicit
     }
+}
 
 def recordUsedGeishaFnSym(mctx: ModEmitCtx, fnName: String, symName: String): String = {
     if (mctx.mcMultiCgu && !strMapContains(mctx.mcDefinedInCgu, symName) && !strMapContains(mctx.mcUsedFnSet, symName)) {
@@ -6037,8 +6041,9 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         }
     } else {
         let linkage = if (isExp) "" else privLinkage;
+        let wasmExpNm = if (strStartsWith(fd.fnName, "$root.")) strSlice(fd.fnName, 6, strLen(fd.fnName)) else fd.fnName;
         let exportAttr =
-            if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + fd.fnName + "\""
+            if (mctx.mcIsWasm && isExp) " \"wasm-export-name\"=\"" + wasmExpNm + "\""
             else x64SimdAttr;
         let header = "define " + linkage + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind" + exportAttr;
         flushFunctionToBuf(out, header, fctx)

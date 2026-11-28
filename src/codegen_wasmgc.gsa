@@ -1920,7 +1920,14 @@ def tryEmitBuiltinWgc(
 ): Bool = {
     let c = fctx.fcCode;
     let wm = fctx.fcMod;
-    if (name == "cellNew") {
+    if (name == "__gs_contract_fail") {
+        let cur = cellNew(args);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) { Cons(a, r) -> { emitTermDiscard(fctx, a, locals); cellSet(cur, r) }, Nil -> () }
+        };
+        bufPushByte(c, 0x00); // unreachable
+        true
+    } else if (name == "cellNew") {
         let a0 = nthArgTerm(args, 0);
         let elemWt = geishaTypeToWgc(wm, schemeBody(a0.tscm));
         let cellTy = internCellType(wm, elemWt);
@@ -3112,9 +3119,14 @@ def collectWgcExportPairs(prog: CoreProgram, cliExports: List String): List (Str
     while (match cellGet(cx) { Nil -> false, _ -> true }) {
         match cellGet(cx) {
             Cons(nm, r) -> {
-                if (strMapContains(prog.coreFns, nm) && !strMapContains(seen, nm)) {
-                    strMapInsert(seen, nm, true);
-                    cellSet(accRev, Cons((nm, nm), cellGet(accRev)))
+                let (fnName, expName) =
+                    if (strStartsWith(nm, "$root.")) (nm, strSlice(nm, 6, strLen(nm)))
+                    else if (strMapContains(prog.coreFns, nm)) (nm, nm)
+                    else if (strMapContains(prog.coreFns, "$root." + nm)) ("$root." + nm, nm)
+                    else (nm, nm);
+                if (strMapContains(prog.coreFns, fnName) && !strMapContains(seen, expName)) {
+                    strMapInsert(seen, expName, true);
+                    cellSet(accRev, Cons((fnName, expName), cellGet(accRev)))
                 } else ();
                 cellSet(cx, r)
             },

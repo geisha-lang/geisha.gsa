@@ -663,7 +663,49 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_missing.gscore" 2>/dev/null;
     exit 1
 fi
 
+# Z6b: Shadowed user `assume` MUST NOT act as built-in path assumption in geisha verify OR Lean geisha-check --verify-vcg
+cat > "$TMP_DIR/vcg_shadow_assume.gsa" << 'EOF'
+def assume(b: Bool): Void = ()
+def observe(x: Int): Int
+    ensures r -> r == 1
+= { assume(x == 1); x }
+def main(): Void = { let _ = observe(7); () }
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_shadow_assume.gscore" "$TMP_DIR/vcg_shadow_assume.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_shadow_assume_compiler]: geisha verify accepted bogus ensures via shadowed def assume!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_shadow_assume.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_shadow_assume.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_shadow_assume_lean]: Lean geisha-check --verify-vcg accepted bogus ensures via shadowed def assume!" >&2
+    exit 1
+fi
+
+# Z6b direct bare `.gscore` regression: even if a `.gscore` contains bare `(fun "assume" ...)` (unprefixed),
+# `verifyGscoreProgram` must alpha-rename shadowed decls and reject the unsound ensures!
+cat > "$TMP_DIR/vcg_bare_shadow_assume.gscore" << 'EOF'
+(program
+  (adts)
+  (externs)
+  (funs
+    (fun "assume" (("b" bool)) void (lit-unit))
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eq (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eq (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_shadow_assume.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_bare_shadow_assume_lean]: Lean geisha-check --verify-vcg accepted bare shadowed (fun \"assume\" ...)!" >&2
+    exit 1
+fi
+
 # D1: Production compiler verified kernels (`src/verified_kernels.gsa`) 100% cross-verified by Z3 and Lean 4 VCG
 "$GEISHA_BIN" verify --src-root . --dump-core "$TMP_DIR/verified_kernels.gscore" src/verified_kernels.gsa
 "$CHECKER_BIN" --verify-vcg "$TMP_DIR/verified_kernels.gscore"
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + D1 src/verified_kernels.gsa)"
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + Z6b shadowed assume + D1 src/verified_kernels.gsa)"

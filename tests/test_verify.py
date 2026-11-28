@@ -1626,7 +1626,112 @@ def main() -> int:
         z5d_blk = fn_ir_block(z5d_ll.read_text(encoding="utf-8"), "observe")
         assert "call void @llvm.assume" not in z5d_blk, f"Z5d builtin assert(false) emitted false @llvm.assume!\n{z5d_blk}"
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z5 adversarial/TCO/eval/zerosorts + cache isolation verified")
+        # Z6a/Z6c Adversarial: root-module private shadowing (`bitAnd`, `assert`, `cellGet`, `assume`)
+        # MUST NOT leak into unimporting sibling modules (`helper.gsa`) or `<builtin>/std.*`,
+        # and `--target wasm-gc --contracts=check` must trap on failed assertions.
+        z6_mod_dir = tmp / "z6_mod"
+        z6_mod_dir.mkdir()
+        (z6_mod_dir / "helper.gsa").write_text(
+            "pub def libraryBits(a: Int, b: Int): Int = bitAnd(a, b)\n"
+            "pub def libraryCheck(b: Bool): Void = assert(b)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (z6_mod_dir / "entry.gsa").write_text(
+            "use helper.{libraryBits, libraryCheck}\n"
+            "use std.str.intToStr\n"
+            "def bitAnd(a: Int, b: Int): Int = a + b\n"
+            "def assert(b: Bool): Void = ()\n"
+            "def main(): Void = { printLn(intToStr(libraryBits(3, 5))); libraryCheck(false) }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        # Native erase & --verified-opt: helper.libraryBits(3, 5) MUST print 1 (not 8)
+        for lbl, extra_flags in [("erase", []), ("vopt", ["--verified-opt", "--solver", z3_bin])]:
+            z6_bin = tmp / (f"z6_entry_{lbl}.exe" if sys.platform == "win32" else f"z6_entry_{lbl}")
+            r_z6b = run([geisha, *extra_flags, "--src-root", str(z6_mod_dir), "--runtime", runtime, "-o", str(z6_bin), str(z6_mod_dir / "entry.gsa")])
+            assert r_z6b.returncode == 0, f"Z6a ({lbl}) build failed:\n{r_z6b.stdout}\n{r_z6b.stderr}"
+            r_z6r = run([str(z6_bin)])
+            assert r_z6r.returncode == 0 and r_z6r.stdout.strip() == "1", (
+                f"Z6a ({lbl}) expected '1', got rc={r_z6r.returncode} out={r_z6r.stdout!r} err={r_z6r.stderr!r}"
+            )
+        # Native --contracts=check: helper.libraryBits(3, 5) prints 1 AND helper.libraryCheck(false) traps!
+        z6_chk_bin = tmp / ("z6_entry_check.exe" if sys.platform == "win32" else "z6_entry_check")
+        r_z6cb = run([geisha, "--contracts=check", "--src-root", str(z6_mod_dir), "--runtime", runtime, "-o", str(z6_chk_bin), str(z6_mod_dir / "entry.gsa")])
+        assert r_z6cb.returncode == 0, f"Z6a (check) build failed:\n{r_z6cb.stdout}\n{r_z6cb.stderr}"
+        r_z6cr = run([str(z6_chk_bin)])
+        assert r_z6cr.returncode != 0 and r_z6cr.stdout.strip() == "1" and "Contract error:" in (r_z6cr.stdout + r_z6cr.stderr), (
+            f"Z6a (check) expected trap after printing '1', got rc={r_z6cr.returncode} out={r_z6cr.stdout!r} err={r_z6cr.stderr!r}"
+        )
+
+        # Z6a: root-module `def cellGet(x: Int): Int = x + 1` with `use std.str.intToStr` MUST compile, verify 2/2, and print 7
+        z6_cell_src = tmp / "z6_user_cell_std.gsa"
+        z6_cell_src.write_text(
+            "use std.str.intToStr\n"
+            "def cellGet(x: Int): Int\n"
+            "    ensures r -> r == x + 1\n"
+            "= x + 1\n"
+            "def observe(): Int = { let x = cellGet(6); assert(x == 7); x }\n"
+            "def main(): Void = printLn(intToStr(observe()))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_z6cv = run([geisha, "verify", "--json", "--solver", z3_bin, str(z6_cell_src)])
+        assert r_z6cv.returncode == 0, f"Z6a user_cell_std verify failed:\n{r_z6cv.stdout}\n{r_z6cv.stderr}"
+        z6c_j = json.loads(r_z6cv.stdout)
+        assert z6c_j["ok"] is True and z6c_j["failed"] == 0 and z6c_j["unknown"] == 0 and z6c_j["proved"] >= 2, (
+            f"Z6a user_cell_std unexpected summary: {z6c_j}"
+        )
+        z6c_bin = tmp / ("z6_user_cell_std.exe" if sys.platform == "win32" else "z6_user_cell_std")
+        r_z6c_b = run([geisha, "--runtime", runtime, "-o", str(z6c_bin), str(z6_cell_src)])
+        assert r_z6c_b.returncode == 0, f"Z6a user_cell_std build failed:\n{r_z6c_b.stdout}\n{r_z6c_b.stderr}"
+        r_z6c_r = run([str(z6c_bin)])
+        assert r_z6c_r.returncode == 0 and r_z6c_r.stdout.strip() == "7", (
+            f"Z6a user_cell_std expected '7', got rc={r_z6c_r.returncode} out={r_z6c_r.stdout!r}"
+        )
+
+        # Z6a/Z6c: JS & WasmGC `--contracts=check` with root-module shadowing
+        node_bin = shutil.which("node")
+        if node_bin is not None:
+            z6_js = tmp / "z6_entry_check.mjs"
+            r_z6js = run([geisha, "--target", "js", "--contracts=check", "--src-root", str(z6_mod_dir), "-o", str(z6_js), str(z6_mod_dir / "entry.gsa")])
+            assert r_z6js.returncode == 0, f"Z6a JS check build failed:\n{r_z6js.stdout}\n{r_z6js.stderr}"
+            r_z6jsr = run([node_bin, str(z6_js)])
+            assert r_z6jsr.returncode != 0 and r_z6jsr.stdout.strip() == "1", (
+                f"Z6a JS check expected trap after '1', got rc={r_z6jsr.returncode} out={r_z6jsr.stdout!r} err={r_z6jsr.stderr!r}"
+            )
+
+            (z6_mod_dir / "wasm_entry.gsa").write_text(
+                "use helper.{libraryBits, libraryCheck}\n"
+                "def bitAnd(a: Int, b: Int): Int = a + b\n"
+                "def assert(b: Bool): Void = ()\n"
+                "pub def probe(): Int = libraryBits(3, 5)\n"
+                "pub def demand(): Void = libraryCheck(false)\n"
+                "def main(): Void = ()\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            z6_wgc = tmp / "z6_wgc_check.wasm"
+            r_z6w = run([geisha, "--target", "wasm-gc", "--contracts=check", "--src-root", str(z6_mod_dir), "-o", str(z6_wgc), str(z6_mod_dir / "wasm_entry.gsa")])
+            assert r_z6w.returncode == 0, f"Z6c WasmGC check build failed:\n{r_z6w.stdout}\n{r_z6w.stderr}"
+            z6_wgc_runner = tmp / "z6_wgc_run.mjs"
+            z6_wgc_runner.write_text(
+                f"import {{ probe, demand }} from {(tmp / 'z6_wgc_check.mjs').as_uri()!r};\n"
+                "const p = probe();\n"
+                "if (p !== 1) { console.error('BAD_PROBE', p); process.exit(2); }\n"
+                "let trapped = false;\n"
+                "try { demand(); } catch (e) { trapped = true; }\n"
+                "if (!trapped) { console.error('NO_TRAP'); process.exit(3); }\n"
+                "console.log('WGC_Z6_OK');\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            r_z6wr = run([node_bin, str(z6_wgc_runner)])
+            assert r_z6wr.returncode == 0 and "WGC_Z6_OK" in r_z6wr.stdout, (
+                f"Z6c WasmGC check runner failed:\nrc={r_z6wr.returncode}\nout={r_z6wr.stdout}\nerr={r_z6wr.stderr}"
+            )
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z6 adversarial/TCO/eval/zerosorts/mod-shadow/wasmgc-check + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
