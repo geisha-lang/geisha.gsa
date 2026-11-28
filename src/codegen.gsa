@@ -6023,7 +6023,8 @@ def emitTopLevelFunction(out: StringBuf, mctx: ModEmitCtx, fd: FunDef): Void = {
         let implHeader = "define " + privLinkage + retLlvm + " " + implSym + "(" + paramSigStr + ") nounwind" + x64SimdAttr;
         flushFunctionToBuf(out, implHeader, fctx);
         // Emit thread-safe C/Swift host entry trampoline for exported native symbol
-        bufPushStr(out, "define " + retLlvm + " " + llvmSym(fd.fnName) + "(" + paramSigStr + ") nounwind" + x64SimdAttr + " {\nentry:\n");
+        let pubExpNm = if (strStartsWith(fd.fnName, "$root.")) strSlice(fd.fnName, 6, strLen(fd.fnName)) else fd.fnName;
+        bufPushStr(out, "define " + retLlvm + " " + llvmSym(pubExpNm) + "(" + paramSigStr + ") nounwind" + x64SimdAttr + " {\nentry:\n");
         bufPushStr(out, "  %anchor = alloca i64, align 8\n");
         bufPushStr(out, "  store i64 0, ptr %anchor, align 8\n");
         bufPushStr(out, "  %tok = call i64 @gc_host_enter(ptr %anchor)\n");
@@ -7115,14 +7116,16 @@ def emitSingleCguUnit(
                 if (isCExp) {
                     strMapInsert(definedInCgu, "__gs_fn_" + fnm, true)
                 } else {
+                    let stripped = if (strStartsWith(fnm, "$root.")) strSlice(fnm, 6, strLen(fnm)) else fnm;
+                    let inExplicit = strMapContains(exportMap, fnm) || strMapContains(exportMap, stripped);
                     let isExp =
                         if (isWasm) {
-                            if (hasExplicit) strMapContains(exportMap, fnm)
+                            if (hasExplicit) inExplicit
                             else isDefaultWasmExport(fnm)
-                        } else strMapContains(exportMap, fnm);
+                        } else inExplicit;
                     if (!isWasm && isExp) {
                         strMapInsert(definedInCgu, "__gs_exp_" + fnm, true);
-                        strMapInsert(definedInCgu, fnm, true)
+                        strMapInsert(definedInCgu, stripped, true)
                     } else {
                         strMapInsert(definedInCgu, fnm, true)
                     }

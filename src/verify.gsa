@@ -4055,10 +4055,28 @@ def isUserFnForVerifiedOpt(fd: FunDef): Bool =
 ///      is false, `f` has at least one direct caller, `f` is NOT `main`/exported/extern/ctor,
 ///      NOT escaped as a closure/global, NOT called from a global initializer, and EVERY direct
 ///      caller of `f` is also Verified-Safe.
+def isDefaultWasmExportVerify(fnName: String): Bool = {
+    let eff = if (strStartsWith(fnName, "$root.")) strSlice(fnName, 6, strLen(fnName)) else fnName;
+    let n = strLen(eff);
+    if (n == 0 || eff == "main") false
+    else if (n >= 2 && strByteAt(eff, 0) == 95 && strByteAt(eff, 1) == 95) false
+    else {
+        let ok = cellNew(true);
+        let i = cellNew(0);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let c = strByteAt(eff, cellGet(i));
+            if (c == 46 || c == 36) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
 pub def computeVerifiedSafeFns(
     prog: CoreProgram,
     exportedFns: List String,
     isOpenWorld: Bool,
+    isWasm: Bool,
     solverBin: String,
     timeoutMs: Int
 ): Result (StrMap Bool) String = {
@@ -4071,6 +4089,7 @@ pub def computeVerifiedSafeFns(
     let extCallable: StrMap Bool = strMapNew();
 
     strMapInsert(extCallable, "main", true);
+    let hasExplicitExports = match exportedFns { Nil -> false, _ -> true };
     let ce = cellNew(exportedFns);
     while (match cellGet(ce) { Nil -> false, _ -> true }) {
         match cellGet(ce) {
@@ -4082,6 +4101,18 @@ pub def computeVerifiedSafeFns(
             Nil -> (),
         }
     };
+    if (isWasm && !hasExplicitExports) {
+        let cw = cellNew(prog.coreFnNames);
+        while (match cellGet(cw) { Nil -> false, _ -> true }) {
+            match cellGet(cw) {
+                Cons(fnm, r) -> {
+                    if (isDefaultWasmExportVerify(fnm)) strMapInsert(extCallable, fnm, true) else ();
+                    cellSet(cw, r)
+                },
+                Nil -> (),
+            }
+        }
+    } else ();
     let cex = cellNew(prog.coreExternNames);
     while (match cellGet(cex) { Nil -> false, _ -> true }) {
         match cellGet(cex) {

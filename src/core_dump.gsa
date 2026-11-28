@@ -1955,6 +1955,8 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "__gs_contract_fail"
     || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
     || name == "assert" || name == "assume"
+    || name == "__gs_builtin_assert" || name == "__gs_builtin_assume"
+    || name == "__gs_builtin_intToI64" || name == "__gs_builtin_i64ToInt"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"
@@ -2700,7 +2702,13 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
             } else ();
             bufPushByte(b, 41)
         } else {
-            let extSym = getOrRegisterCoreExtern(ctx, vd.vname, args, schemeBody(tm.tscm));
+            let dumpRawName =
+                if (!strMapContains(ctx.dcProg.coreExterns, vd.vname)
+                    && !strMapContains(ctx.dcProg.coreFns, vd.vname)
+                    && (vd.vname == "assert" || vd.vname == "assume" || vd.vname == "intToI64" || vd.vname == "i64ToInt"))
+                    "__gs_builtin_" + vd.vname
+                else vd.vname;
+            let extSym = getOrRegisterCoreExtern(ctx, dumpRawName, args, schemeBody(tm.tscm));
             bufPushStr(b, "(apply-dir ");
             pushQuotedStr(b, extSym);
             let cur = cellNew(args);

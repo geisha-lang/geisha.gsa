@@ -705,6 +705,28 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_shadow_assume.gscore" 2>/dev/n
     exit 1
 fi
 
+# Z7b legacy bare `(extern "assume" ...)` regression: unprefixed bare `assume` extern must fail-closed
+cat > "$TMP_DIR/vcg_bare_extern_assume.gscore" << 'EOF'
+(program
+  (adts)
+  (externs (extern "assume" (bool) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eq (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eq (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_extern_assume.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_bare_extern_assume_lean]: Lean geisha-check --verify-vcg accepted bare (extern \"assume\" ...)!" >&2
+    exit 1
+fi
+
 # D1: Production compiler verified kernels (`src/verified_kernels.gsa`) 100% cross-verified by Z3 and Lean 4 VCG
 "$GEISHA_BIN" verify --src-root . --dump-core "$TMP_DIR/verified_kernels.gscore" src/verified_kernels.gsa
 "$CHECKER_BIN" --verify-vcg "$TMP_DIR/verified_kernels.gscore"

@@ -8319,46 +8319,51 @@ private def canReachFn (graph : List (Ident × List Ident)) (src dst : Ident) : 
     if nbrs.contains dst then true
     else nbrs.any (fun next => canReachFn graph next dst fuel)
 
-private def renameShadowedIdent (isShadowed : Ident → Bool) (nm : Ident) : Ident :=
-  if isShadowed nm then "$shadow$" ++ nm else nm
+private def mapGscoreCallIdent (nm : Ident) : Ident :=
+  if nm == "__gs_builtin_assert" then "assert"
+  else if nm == "__gs_builtin_assume" then "assume"
+  else if nm == "__gs_builtin_intToI64" then "intToI64"
+  else if nm == "__gs_builtin_i64ToInt" then "i64ToInt"
+  else if nm == "assert" || nm == "assume" || nm == "intToI64" || nm == "i64ToInt" then "$bare$" ++ nm
+  else nm
 
 mutual
-  private def renameShadowedExpr (isShadowed : Ident → Bool) : Expr → Expr
+  private def renameShadowedExpr (f : Ident → Ident) : Expr → Expr
     | .lit l => .lit l
     | .var x => .var x
     | .loc l => .loc l
     | .taskRef t => .taskRef t
     | .syncRef k id => .syncRef k id
-    | .tuple es => .tuple (renameShadowedExprList isShadowed es)
-    | .block es => .block (renameShadowedExprList isShadowed es)
-    | .lam m ps rt b => .lam m ps rt (renameShadowedExpr isShadowed b)
-    | .apply f es => .apply (renameShadowedExpr isShadowed f) (renameShadowedExprList isShadowed es)
+    | .tuple es => .tuple (renameShadowedExprList f es)
+    | .block es => .block (renameShadowedExprList f es)
+    | .lam m ps rt b => .lam m ps rt (renameShadowedExpr f b)
+    | .apply fn es => .apply (renameShadowedExpr f fn) (renameShadowedExprList f es)
     | .applyDir nm es =>
-        .applyDir (renameShadowedIdent isShadowed nm) (renameShadowedExprList isShadowed es)
-    | .bin op a b => .bin op (renameShadowedExpr isShadowed a) (renameShadowedExpr isShadowed b)
-    | .un op a => .un op (renameShadowedExpr isShadowed a)
-    | .let_ x v b => .let_ x (renameShadowedExpr isShadowed v) (renameShadowedExpr isShadowed b)
+        .applyDir (f nm) (renameShadowedExprList f es)
+    | .bin op a b => .bin op (renameShadowedExpr f a) (renameShadowedExpr f b)
+    | .un op a => .un op (renameShadowedExpr f a)
+    | .let_ x v b => .let_ x (renameShadowedExpr f v) (renameShadowedExpr f b)
     | .if_ c t e =>
-        .if_ (renameShadowedExpr isShadowed c) (renameShadowedExpr isShadowed t) (renameShadowedExpr isShadowed e)
-    | .while_ c b => .while_ (renameShadowedExpr isShadowed c) (renameShadowedExpr isShadowed b)
-    | .match_ s arms => .match_ (renameShadowedExpr isShadowed s) (renameShadowedArms isShadowed arms)
-    | .makeData adt tag fs => .makeData adt tag (renameShadowedExprList isShadowed fs)
-    | .getTag e => .getTag (renameShadowedExpr isShadowed e)
-    | .cellNew e => .cellNew (renameShadowedExpr isShadowed e)
-    | .cellGet e => .cellGet (renameShadowedExpr isShadowed e)
-    | .cellSet c v => .cellSet (renameShadowedExpr isShadowed c) (renameShadowedExpr isShadowed v)
-    | .spawn e => .spawn (renameShadowedExpr isShadowed e)
-    | .await e => .await (renameShadowedExpr isShadowed e)
-    | .concPrim p es => .concPrim p (renameShadowedExprList isShadowed es)
+        .if_ (renameShadowedExpr f c) (renameShadowedExpr f t) (renameShadowedExpr f e)
+    | .while_ c b => .while_ (renameShadowedExpr f c) (renameShadowedExpr f b)
+    | .match_ s arms => .match_ (renameShadowedExpr f s) (renameShadowedArms f arms)
+    | .makeData adt tag fs => .makeData adt tag (renameShadowedExprList f fs)
+    | .getTag e => .getTag (renameShadowedExpr f e)
+    | .cellNew e => .cellNew (renameShadowedExpr f e)
+    | .cellGet e => .cellGet (renameShadowedExpr f e)
+    | .cellSet c v => .cellSet (renameShadowedExpr f c) (renameShadowedExpr f v)
+    | .spawn e => .spawn (renameShadowedExpr f e)
+    | .await e => .await (renameShadowedExpr f e)
+    | .concPrim p es => .concPrim p (renameShadowedExprList f es)
     | .trap t => .trap t
 
-  private def renameShadowedExprList (isShadowed : Ident → Bool) : List Expr → List Expr
+  private def renameShadowedExprList (f : Ident → Ident) : List Expr → List Expr
     | [] => []
-    | e :: es => renameShadowedExpr isShadowed e :: renameShadowedExprList isShadowed es
+    | e :: es => renameShadowedExpr f e :: renameShadowedExprList f es
 
-  private def renameShadowedArms (isShadowed : Ident → Bool) : List (Pat × Expr) → List (Pat × Expr)
+  private def renameShadowedArms (f : Ident → Ident) : List (Pat × Expr) → List (Pat × Expr)
     | [] => []
-    | (p, b) :: rest => (p, renameShadowedExpr isShadowed b) :: renameShadowedArms isShadowed rest
+    | (p, b) :: rest => (p, renameShadowedExpr f b) :: renameShadowedArms f rest
 end
 
 /-- Cross-verify a live `.gscore` program emitted by `geisha verify --dump-core`
@@ -8368,17 +8373,16 @@ end
     (e.g. Float equality, aliased mutable `Cell` calls, unannotated loops, or
     mutually recursive calls missing `decreases`). -/
 def verifyGscoreProgram (funs : List FunDef) (_externs : List ExternDecl := []) : Except String (Nat × List (Ident × SForm)) := do
-  -- 0. Alpha-rename any user-defined function whose name collides with a VCG built-in
-  --    (`assert`, `assume`, `intToI64`, `i64ToInt`) so shadowed user functions never trigger
-  --    built-in VCG rules (while preserving `.gscore` extern signature decls for genuine built-ins).
-  let isVcgBuiltin : Ident → Bool := fun nm =>
-    nm == "assert" || nm == "assume" || nm == "intToI64" || nm == "i64ToInt"
-  let isShadowed : Ident → Bool := fun nm =>
-    isVcgBuiltin nm && funs.any (·.name == nm)
+  -- 0. Fail-closed on any FunDef claiming reserved `__gs_builtin_*` names, and map explicit
+  --    `__gs_builtin_*` tags to true VCG built-ins while deflecting all bare legacy names
+  --    (`assert`, `assume`, `intToI64`, `i64ToInt`) to `$bare$<nm>` so neither shadowed FunDefs
+  --    nor unprefixed legacy extern decls can ever masquerade as built-in VCG primitives.
+  if funs.any (fun fd => fd.name.startsWith "__gs_builtin_") then
+    throw "VCG FAIL-CLOSED: user function name cannot start with reserved '__gs_builtin_' prefix"
   let funsAlpha : List FunDef := funs.map fun fd =>
     { fd with
-      name := renameShadowedIdent isShadowed fd.name
-      body := renameShadowedExpr isShadowed fd.body }
+      name := mapGscoreCallIdent fd.name
+      body := renameShadowedExpr mapGscoreCallIdent fd.body }
   -- 1. Normalize cast intrinsics and extract contracts & loop annotations for all user functions
   let extracted := funsAlpha.map fun fd =>
     let fdNorm : FunDef := { fd with body := normalizeCastsExpr fd.body }

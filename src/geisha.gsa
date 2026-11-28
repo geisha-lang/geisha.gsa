@@ -917,7 +917,7 @@ def compileLoadedDefsToIrForArchDebug(
         if (cellGet(gVerifiedOpt) && cellGet(gContractMode) != "check") {
             let keepProg = lowerToCoreOptMode(inf, true, false, "keep")?;
             let isOpenWorld = noMain || cellGet(gCompileOnly);
-            let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
+            let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, isWasm, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
             setVerifiedSafeFns(safeFns);
             prepareVerifiedOptCore(keepProg, safeFns, !debugInfo)
         } else {
@@ -1925,7 +1925,7 @@ def compileLoadedDefsToCgusForArchDebug(
         if (cellGet(gVerifiedOpt) && cellGet(gContractMode) != "check") {
             let keepProg = lowerToCoreOptMode(inf, true, false, "keep")?;
             let isOpenWorld = noMain || cellGet(gCompileOnly);
-            let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
+            let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, isWasm, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
             setVerifiedSafeFns(safeFns);
             prepareVerifiedOptCore(keepProg, safeFns, !debugInfo)
         } else {

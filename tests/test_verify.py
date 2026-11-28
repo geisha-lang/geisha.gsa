@@ -1731,7 +1731,73 @@ def main() -> int:
                 f"Z6c WasmGC check runner failed:\nrc={r_z6wr.returncode}\nout={r_z6wr.stdout}\nerr={r_z6wr.stderr}"
             )
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z6 adversarial/TCO/eval/zerosorts/mod-shadow/wasmgc-check + cache isolation verified")
+        # Z7a Adversarial: `--target wasm32 --verified-opt` WITHOUT `--export` still exports
+        # default-exported root functions (`isDefaultWasmExport`), so `requires y > 0` MUST NOT
+        # allow eliminating `div.zero` or emitting `@llvm.assume`.
+        z7a_src = tmp / "z7a_wasm_default_export.gsa"
+        z7a_src.write_text(
+            "pub def bitAnd(x: Int, y: Int): Int\n"
+            "    requires y > 0\n"
+            "= x / y\n"
+            "pub def divPositive(x: Int, y: Int): Int\n"
+            "    requires y > 0\n"
+            "= x / y\n"
+            "def main(): Void = { let _ = bitAnd(10, 2); let _ = divPositive(10, 2); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        z7a_ll = tmp / "z7a_wasm.ll"
+        r_z7a = run([geisha, "--target", "wasm32", "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z7a_ll), str(z7a_src)])
+        assert r_z7a.returncode == 0, f"Z7a wasm32 --verified-opt IR failed:\n{r_z7a.stdout}\n{r_z7a.stderr}"
+        z7a_ir = z7a_ll.read_text(encoding="utf-8")
+        for z7_fn in ['"$root.bitAnd"', "divPositive"]:
+            z7_blk = fn_ir_block(z7a_ir, z7_fn)
+            assert "div.zero" in z7_blk, f"Z7a default wasm32 export {z7_fn} elided div.zero!\n{z7_blk}"
+            assert "call void @llvm.assume" not in z7_blk, f"Z7a default wasm32 export {z7_fn} emitted @llvm.assume!\n{z7_blk}"
+
+        # Z7c: Native `-c --no-main --export bitAnd` AND `pub extern def bitAnd` on root-shadowed
+        # `bitAnd(a, b) = a + b` MUST export C symbol `bitAnd` (not `$root.bitAnd`) and return 8.
+        z7c_call_c = tmp / "z7c_call_export.c"
+        z7c_call_c.write_text(
+            "#include <stdint.h>\n"
+            "#include <stdio.h>\n"
+            "extern int32_t bitAnd(int32_t a, int32_t b);\n"
+            "int main(void) { printf(\"%d\\n\", bitAnd(3, 5)); return 0; }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        for z7c_lbl, z7c_code, z7c_flags in [
+            (
+                "cli_export",
+                "pub def bitAnd(a: Int, b: Int): Int = a + b\n",
+                ["-c", "--no-main", "--export", "bitAnd"],
+            ),
+            (
+                "pub_extern",
+                "pub extern def bitAnd(a: Int, b: Int): Int = a + b\n",
+                ["-c", "--no-main"],
+            ),
+        ]:
+            z7c_gsa = tmp / f"z7c_{z7c_lbl}.gsa"
+            z7c_gsa.write_text(z7c_code, encoding="utf-8", newline="\n")
+            z7c_obj = tmp / f"z7c_{z7c_lbl}.o"
+            r_z7co = run([geisha, *z7c_flags, "-o", str(z7c_obj), str(z7c_gsa)])
+            assert r_z7co.returncode == 0, f"Z7c ({z7c_lbl}) compile -c failed:\n{r_z7co.stdout}\n{r_z7co.stderr}"
+            z7c_bin = tmp / (f"z7c_{z7c_lbl}.exe" if sys.platform == "win32" else f"z7c_{z7c_lbl}")
+            lk_cmd = [*cc_base, "-O2", str(z7c_call_c), str(z7c_obj), runtime]
+            if sys.platform != "win32":
+                lk_cmd.append("-pthread")
+            if sys.platform.startswith("linux"):
+                lk_cmd.append("-lm")
+            lk_cmd.extend(["-o", str(z7c_bin)])
+            r_z7cl = run(lk_cmd)
+            assert r_z7cl.returncode == 0, f"Z7c ({z7c_lbl}) C client link failed:\n{r_z7cl.stdout}\n{r_z7cl.stderr}"
+            r_z7cr = run([str(z7c_bin)])
+            assert r_z7cr.returncode == 0 and r_z7cr.stdout.strip() == "8", (
+                f"Z7c ({z7c_lbl}) expected '8', got rc={r_z7cr.returncode} out={r_z7cr.stdout!r} err={r_z7cr.stderr!r}"
+            )
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z7 adversarial/TCO/eval/zerosorts/mod-shadow/wasmgc-check/wasm-default-exp/native-exp + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
