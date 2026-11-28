@@ -95,7 +95,6 @@ geisha run hello.gsa
 | `src/core.gsa` | K-conversion, lambda lifting, closure conversion, worklist monomorphization, static Concept dispatch, and 2-phase escape analysis |
 | `src/codegen.gsa` | LP64 / Wasm32 ABI layout calculator, 40-bit pointer masks, and LLVM 20 opaque-pointer IR (`.ll`) emitter |
 | `src/codegen_js.gsa` | Core IR to zero-dependency ES Module JavaScript (`.mjs`) and TypeScript `.d.ts` emitter |
-| `src/playground.gsa` | Client-side zero-server Playground compiler engine (`make wasm-playground` → `build/geisha-playground.wasm`) |
 | `src/pkg.gsa` | Zero-server Git/MVS package manager (`geisha.toml`, `geisha.local.toml`, `geisha.lock`), `~/.geisha/cache`, and native/wasm32/js/iOS builder |
 | `src/doc.gsa` | Built-in `geisha doc` signature & `///` doc-comment extractor |
 | `src/bench.gsa` | Built-in `geisha bench` microbenchmark discovery, harness synthesis, and text/`--json` runner |

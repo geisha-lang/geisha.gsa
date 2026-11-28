@@ -4048,7 +4048,7 @@ PASS=$((PASS + 1))
 "$PYTHON" tests/test_watch.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
-# 40. Wasm32 Size Optimization Mode, --target js (ES Module + .d.ts + [target.js]), & geisha-playground.wasm
+# 40. Wasm32 Size Optimization Mode & --target js (ES Module + .d.ts + [target.js])
 if command -v node >/dev/null 2>&1; then
     # 37a. Wasm32 size optimization (--opt z --strip --slim-runtime) & backward-compat default exports
     if [ -f "./build/wasm_rt.o" ]; then
@@ -4356,22 +4356,6 @@ EOF
         console.log(String(doubleIt(21)));
     ')"
     assert_eq "js_pkg_build_target_js" "42" "$T37_PROJ_JS_OUT"
-
-    # 37d. geisha-playground.wasm end-to-end client-side compile + run in Node
-    if [ -f "./build/wasm_rt.o" ] && [ -f "./src/playground.gsa" ]; then
-        PG_WASM="$TMP_DIR/geisha-playground.wasm"
-        "$GEISHA_BIN" --src-root src --target wasm32 --opt z --strip --runtime ./build/wasm_rt.o -o "$PG_WASM" src/playground.gsa
-        T37_PG_OUT="$(node --input-type=module -e '
-            import fs from "node:fs";
-            import { createGeishaPlayground } from "./playground/geisha-playground.mjs";
-            const pg = await createGeishaPlayground(fs.readFileSync(process.argv[1]));
-            const okChk = pg.check("def f(x: Int): Int = x + 1\ndef main(): Void = ()");
-            const badChk = pg.check("def bad(x: Int): String = x + 1");
-            const runRes = await pg.runJs("use std.str.intToStr\nuse std.list.listLen\npub def inc(x: Int): Int = x + 1\ndef main(): Void = printLn(\"pg:\" + intToStr(inc(listLen([10, 20, 30]))))");
-            console.log([okChk.ok, badChk.ok, badChk.error.includes("expected `String`"), runRes.ok, runRes.dts.includes("export declare function inc("), runRes.stdout.join(",")].join("|"));
-        ' "$PG_WASM")"
-        assert_eq "geisha_playground_wasm_e2e" "true|false|true|true|true|pg:4" "$T37_PG_OUT"
-    fi
 
     # 39f. Cross-PR CLI contract: `--target js` + `-e` must error, and `-Oz` / `--opt=z` / `--dev` / `--release` accepted
     if "$GEISHA_BIN" --target js -e "$TMP_DIR/t37_js.gsa" >/dev/null 2>&1; then
