@@ -1,0 +1,384 @@
+name: Ecosystem CI
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'stdlib/**'
+      - 'runtime/**'
+      - 'Makefile'
+      - 'scripts/gen_stdlib.py'
+      - 'scripts/ecosystem_discover.py'
+      - '.github/ecosystem.json'
+      - '.github/workflows/ecosystem.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'stdlib/**'
+      - 'runtime/**'
+      - 'Makefile'
+      - 'scripts/gen_stdlib.py'
+      - 'scripts/ecosystem_discover.py'
+      - '.github/ecosystem.json'
+      - '.github/workflows/ecosystem.yml'
+  schedule:
+    # Daily at 03:00 UTC (11:00 CST) to catch drift with downstream updates
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Optional single geisha-lang repo to test (blank = all)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecosystem-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  discover:
+    name: Discover Ecosystem Repos
+    runs-on: ubuntu-24.04
+    outputs:
+      linux_matrix: ${{ steps.scan.outputs.linux_matrix }}
+      macos_matrix: ${{ steps.scan.outputs.macos_matrix }}
+      has_linux: ${{ steps.scan.outputs.has_linux }}
+      has_macos: ${{ steps.scan.outputs.has_macos }}
+      total: ${{ steps.scan.outputs.total }}
+    steps:
+      - name: Checkout compiler repo
+        uses: actions/checkout@v4
+
+      - name: Discover geisha-lang repositories
+        id: scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ecosystem_discover.py \
+            --repo "${{ inputs.repo || '' }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  build-toolchain-linux:
+    name: Build Compiler Artifact (linux-x86_64)
+    needs: discover
+    if: needs.discover.outputs.has_linux == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout compiler repo
+        uses: actions/checkout@v4
+
+      - name: Install Clang & Wasm32 toolchain
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
+          sudo apt-get update
+          sudo apt-get install -y clang lld xz-utils
+
+      - name: Build Stage-2 Geisha compiler & runtimes
+        run: |
+          make runtime wasm-runtime stage1 stage2
+          mkdir -p toolchain/bin toolchain/lib
+          cp build/geisha2 toolchain/bin/geisha
+          cp build/libgeisha_runtime.a toolchain/lib/libgeisha_runtime.a
+          cp build/wasm_rt.o toolchain/lib/wasm_rt.o
+
+      - name: Upload Linux toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geisha-toolchain-linux
+          path: toolchain/
+          retention-days: 1
+
+  build-toolchain-macos:
+    name: Build Compiler Artifact (darwin-arm64)
+    needs: discover
+    if: needs.discover.outputs.has_macos == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Checkout compiler repo
+        uses: actions/checkout@v4
+
+      - name: Install LLVM/Wasm32 toolchain
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          brew list lld >/dev/null 2>&1 || brew install lld
+          command -v xz >/dev/null 2>&1 || brew install xz
+          if [ -d /opt/homebrew/opt/llvm/bin ]; then
+            echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+          fi
+          if [ -d /opt/homebrew/opt/lld/bin ]; then
+            echo "/opt/homebrew/opt/lld/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Build Stage-2 Geisha compiler & Apple/Wasm runtimes
+        run: |
+          make runtime wasm-runtime runtime-ios-sim stage1 stage2
+          mkdir -p toolchain/bin toolchain/lib
+          cp build/geisha2 toolchain/bin/geisha
+          cp build/libgeisha_runtime.a toolchain/lib/libgeisha_runtime.a
+          cp build/wasm_rt.o toolchain/lib/wasm_rt.o
+          cp build/libgeisha_runtime_ios_sim.a toolchain/lib/libgeisha_runtime_ios_sim.a
+
+      - name: Upload macOS toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geisha-toolchain-macos
+          path: toolchain/
+          retention-days: 1
+
+  test-linux:
+    name: Ecosystem (${{ matrix.label }})
+    needs: [discover, build-toolchain-linux]
+    if: needs.discover.outputs.has_linux == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.linux_matrix) }}
+    steps:
+      - name: Download Geisha toolchain
+        uses: actions/download-artifact@v4
+        with:
+          name: geisha-toolchain-linux
+          path: ~/.geisha
+
+      - name: Configure Geisha PATH
+        run: |
+          chmod +x "$HOME/.geisha/bin/geisha"
+          echo "$HOME/.geisha/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Node.js (when required)
+        if: contains(matrix.deps, 'node')
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install system dependencies
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure*.list
+          sudo apt-get update
+          PKGS="clang xz-utils curl ca-certificates"
+          if [[ " ${{ join(matrix.deps, ' ') }} " == *" wasm "* ]]; then
+            PKGS="$PKGS lld"
+          fi
+          if [[ " ${{ join(matrix.deps, ' ') }} " == *" openssl "* ]]; then
+            PKGS="$PKGS pkg-config libssl-dev"
+          fi
+          if [[ " ${{ join(matrix.deps, ' ') }} " == *" openblas "* ]]; then
+            PKGS="$PKGS pkg-config libopenblas-dev"
+          fi
+          sudo apt-get install -y $PKGS
+
+          if [[ " ${{ join(matrix.deps, ' ') }} " == *" duckdb "* ]]; then
+            TMP_DUCK="$(mktemp -d)"
+            curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-shared-libs-linux-amd64.tar.gz" -o "$TMP_DUCK/duckdb.tar.gz"
+            tar -xzf "$TMP_DUCK/duckdb.tar.gz" -C "$TMP_DUCK"
+            sudo cp "$TMP_DUCK"/libduckdb.so* /usr/local/lib/
+            curl -fsSL "https://raw.githubusercontent.com/duckdb/duckdb/v2.0.1/src/include/duckdb.h" -o "$TMP_DUCK/duckdb.h"
+            sudo cp "$TMP_DUCK/duckdb.h" /usr/local/include/duckdb.h
+            sudo ldconfig
+            rm -rf "$TMP_DUCK"
+          fi
+
+      - name: Clone geisha-lang/${{ matrix.repo }}
+        id: clone
+        run: |
+          git clone --depth 1 --branch "${{ matrix.default_branch }}" "https://github.com/geisha-lang/${{ matrix.repo }}.git" repo
+          SHA="$(git -C repo rev-parse --short HEAD)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Run ecosystem checks for ${{ matrix.label }}
+        id: check
+        working-directory: repo
+        run: |
+          ${{ matrix.cmd }}
+
+      - name: Record result
+        if: always()
+        env:
+          LABEL: ${{ matrix.label }}
+          REPO: ${{ matrix.repo }}
+          OS: ${{ matrix.os }}
+          SHA: ${{ steps.clone.outputs.sha }}
+          OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          mkdir -p result
+          export SAFE_NAME="$(printf '%s' "$LABEL" | tr -cs 'A-Za-z0-9._-' '_')"
+          python3 - <<'PY'
+          import json, os
+          out_path = os.path.join("result", os.environ["SAFE_NAME"] + ".json")
+          with open(out_path, "w", encoding="utf-8") as f:
+              json.dump({
+                  "label": os.environ["LABEL"],
+                  "repo": os.environ["REPO"],
+                  "os": os.environ["OS"],
+                  "sha": os.environ["SHA"],
+                  "outcome": os.environ["OUTCOME"],
+              }, f)
+          PY
+        shell: bash
+
+      - name: Upload result marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eco-result-linux-${{ strategy.job-index }}
+          path: result/*.json
+          retention-days: 1
+
+  test-macos:
+    name: Ecosystem (${{ matrix.label }})
+    needs: [discover, build-toolchain-macos]
+    if: needs.discover.outputs.has_macos == 'true'
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.macos_matrix) }}
+    steps:
+      - name: Download Geisha toolchain
+        uses: actions/download-artifact@v4
+        with:
+          name: geisha-toolchain-macos
+          path: ~/.geisha
+
+      - name: Configure Geisha & LLVM PATH
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          chmod +x "$HOME/.geisha/bin/geisha"
+          echo "$HOME/.geisha/bin" >> "$GITHUB_PATH"
+          command -v xz >/dev/null 2>&1 || brew install xz
+          if [[ " ${{ join(matrix.deps, ' ') }} " == *" wasm "* ]]; then
+            brew list llvm >/dev/null 2>&1 || brew install llvm
+            brew list lld >/dev/null 2>&1 || brew install lld
+            if [ -d /opt/homebrew/opt/llvm/bin ]; then
+              echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+            fi
+            if [ -d /opt/homebrew/opt/lld/bin ]; then
+              echo "/opt/homebrew/opt/lld/bin" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      - name: Clone geisha-lang/${{ matrix.repo }}
+        id: clone
+        run: |
+          git clone --depth 1 --branch "${{ matrix.default_branch }}" "https://github.com/geisha-lang/${{ matrix.repo }}.git" repo
+          SHA="$(git -C repo rev-parse --short HEAD)"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Run ecosystem checks for ${{ matrix.label }}
+        id: check
+        working-directory: repo
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          ${{ matrix.cmd }}
+
+      - name: Record result
+        if: always()
+        env:
+          LABEL: ${{ matrix.label }}
+          REPO: ${{ matrix.repo }}
+          OS: ${{ matrix.os }}
+          SHA: ${{ steps.clone.outputs.sha }}
+          OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          mkdir -p result
+          export SAFE_NAME="$(printf '%s' "$LABEL" | tr -cs 'A-Za-z0-9._-' '_')"
+          python3 - <<'PY'
+          import json, os
+          out_path = os.path.join("result", os.environ["SAFE_NAME"] + ".json")
+          with open(out_path, "w", encoding="utf-8") as f:
+              json.dump({
+                  "label": os.environ["LABEL"],
+                  "repo": os.environ["REPO"],
+                  "os": os.environ["OS"],
+                  "sha": os.environ["SHA"],
+                  "outcome": os.environ["OUTCOME"],
+              }, f)
+          PY
+        shell: bash
+
+      - name: Upload result marker
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eco-result-macos-${{ strategy.job-index }}
+          path: result/*.json
+          retention-days: 1
+
+  summary:
+    name: Ecosystem Summary
+    needs: [discover, build-toolchain-linux, build-toolchain-macos, test-linux, test-macos]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all result markers
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: eco-result-*
+          path: eco-results
+          merge-multiple: true
+
+      - name: Render Ecosystem Summary
+        env:
+          LINUX_BUILD: ${{ needs.build-toolchain-linux.result }}
+          MACOS_BUILD: ${{ needs.build-toolchain-macos.result }}
+          LINUX_TEST: ${{ needs.test-linux.result }}
+          MACOS_TEST: ${{ needs.test-macos.result }}
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, sys
+
+          rows = []
+          for p in sorted(glob.glob("eco-results/*.json")):
+              with open(p, encoding="utf-8") as f:
+                  rows.append(json.load(f))
+
+          rows.sort(key=lambda r: (r["repo"], r["os"], r["label"]))
+
+          lines = [
+              "## Geisha Ecosystem Regression Report",
+              "",
+              "| Target | Repo | Commit | Runner | Status |",
+              "|---|---|---|---|---|",
+          ]
+          failed = []
+          for r in rows:
+              ok = r.get("outcome") == "success"
+              icon = "✅ pass" if ok else f"❌ {r.get('outcome', 'unknown')}"
+              if not ok:
+                  failed.append(r["label"])
+              repo = r["repo"]
+              sha = r.get("sha") or "-"
+              lines.append(
+                  f"| `{r['label']}` | [geisha-lang/{repo}](https://github.com/geisha-lang/{repo}) | `{sha}` | `{r['os']}` | {icon} |"
+              )
+
+          if not rows:
+              lines.append("| *(no downstream results collected)* | - | - | - | ⚠️ |")
+
+          summary_text = "\n".join(lines) + "\n"
+          print(summary_text)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(summary_text)
+
+          bad_jobs = [
+              k for k in ("LINUX_BUILD", "MACOS_BUILD", "LINUX_TEST", "MACOS_TEST")
+              if os.environ.get(k) not in ("success", "skipped")
+          ]
+          if failed or bad_jobs:
+              print(f"Ecosystem regression detected: failed_targets={failed}, failed_jobs={bad_jobs}", file=sys.stderr)
+              sys.exit(1)
+          PY

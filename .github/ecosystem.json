@@ -1,0 +1,85 @@
+{
+  "org": "geisha-lang",
+  "exclude": [
+    "geisha.gsa",
+    "geisha-vscode",
+    "geisha.tmLanguage",
+    "geisha-lang.github.io",
+    "miko",
+    "Geisha"
+  ],
+  "default_target": {
+    "os": "ubuntu-24.04",
+    "deps": [],
+    "cmd": "(if grep -qE '^[[:space:]]*entry[[:space:]]*=' geisha.toml || [ -f src/main.gsa ]; then geisha check; fi) && geisha test"
+  },
+  "overrides": {
+    "parsec.gsa": {
+      "deps": ["wasm"],
+      "cmd": "geisha check && geisha doc parsec >/dev/null && geisha test"
+    },
+    "regex.gsa": {
+      "deps": ["wasm", "node"],
+      "cmd": "geisha check && geisha doc regex >/dev/null && geisha test && geisha --src-root src --target js -o /tmp/regex_spec.mjs tests/spec.gsa && node /tmp/regex_spec.mjs && geisha --src-root src --target wasm32 --opt z --strip -o /tmp/regex_spec.wasm tests/spec.gsa && test -s /tmp/regex_spec.wasm"
+    },
+    "datetime.gsa": {
+      "deps": ["node"],
+      "cmd": "geisha check && geisha doc datetime >/dev/null && geisha test && geisha --src-root src --target js -o /tmp/datetime_spec.mjs tests/spec.gsa && node /tmp/datetime_spec.mjs"
+    },
+    "crypto.gsa": {
+      "deps": ["wasm", "node"],
+      "cmd": "geisha check && geisha doc crypto >/dev/null && geisha test && geisha --src-root src --target js -o /tmp/crypto_spec.mjs tests/spec.gsa && node /tmp/crypto_spec.mjs && geisha --src-root src --target wasm32 --opt z --strip -o /tmp/crypto_spec.wasm tests/spec.gsa && test -s /tmp/crypto_spec.wasm"
+    },
+    "starter.gsa": {
+      "include": true,
+      "deps": ["wasm", "node"],
+      "cmd": "python3 -c 'import os, pathlib, subprocess, sys, tempfile; root = pathlib.Path.cwd(); cli = [sys.executable, str(root / \"bin\" / \"geisha-starter\")]; td = tempfile.TemporaryDirectory(); tmp = pathlib.Path(td.name); [subprocess.run(cli + [\"--template-repo\", str(root), \"-t\", t, str(tmp / f\"demo_{t}\")], check=True) for t in (\"cli\", \"lib\", \"wasm\", \"web-js\")]; [subprocess.run([\"geisha\", \"check\"], cwd=tmp / f\"demo_{t}\", check=True) for t in (\"cli\", \"lib\", \"wasm\", \"web-js\")]; [subprocess.run([\"geisha\", \"test\"], cwd=tmp / f\"demo_{t}\", check=True) for t in (\"cli\", \"lib\", \"wasm\", \"web-js\")]; assert subprocess.check_output([\"geisha\", \"run\", \"--\", \"World\"], cwd=tmp / \"demo_cli\", text=True).strip() == \"Hello, World!\"; subprocess.run([\"geisha\", \"build\", \"--target\", \"wasm32\"], cwd=tmp / \"demo_wasm\", check=True); assert (tmp / \"demo_wasm\" / \"build\" / \"demo_wasm.wasm\").stat().st_size > 0; subprocess.run([\"geisha\", \"build\", \"--target\", \"js\"], cwd=tmp / \"demo_web-js\", check=True); assert (tmp / \"demo_web-js\" / \"build\" / \"demo_web_js.mjs\").stat().st_size > 0; td.cleanup()'"
+    },
+    "plot.gsa": {
+      "deps": ["wasm"],
+      "cmd": "clang -std=c99 -O2 -Wall -Wextra -Werror -c native/plot_png_software.c -o /tmp/plot_png_sw.o && rm -f /tmp/plot_png_sw.o && geisha check && geisha doc plot.plot >/dev/null && geisha test"
+    },
+    "crema": {
+      "targets": [
+        {
+          "label": "crema (linux-wasm)",
+          "os": "ubuntu-24.04",
+          "deps": ["wasm"],
+          "cmd": "geisha check && geisha doc crema.ui >/dev/null && geisha test && make wasm && test -s build/studio.wasm"
+        },
+        {
+          "label": "crema (macos-native)",
+          "os": "macos-15",
+          "deps": ["wasm"],
+          "cmd": "geisha check && geisha doc crema.ui >/dev/null && make test"
+        }
+      ]
+    },
+    "net.gsa": {
+      "deps": ["openssl"],
+      "cmd": "geisha doc net.stream >/dev/null && geisha doc net.tls >/dev/null && geisha doc net.ws >/dev/null && geisha doc net.wss >/dev/null && geisha doc net.http >/dev/null && geisha test"
+    },
+    "tensor.gsa": {
+      "deps": ["openblas"],
+      "cmd": "geisha check && geisha doc tensor.tensor >/dev/null && geisha doc tensor.ops >/dev/null && geisha test"
+    },
+    "duckdb.gsa": {
+      "deps": ["duckdb"],
+      "cmd": "geisha check && geisha doc duckdb.duckdb >/dev/null && geisha doc duckdb.dsl >/dev/null && geisha test"
+    },
+    "tabular.gsa": {
+      "deps": ["duckdb"],
+      "cmd": "geisha check && geisha doc tabular.tabular >/dev/null && geisha doc tabular.frame >/dev/null && geisha test"
+    },
+    "objc.gsa": {
+      "targets": [
+        {
+          "label": "objc.gsa (macos-ios-sim)",
+          "os": "macos-15",
+          "deps": [],
+          "cmd": "geisha check && geisha doc objc >/dev/null && geisha test && GEISHA_GC_HEAP_WORDS=4096 geisha test"
+        }
+      ]
+    }
+  }
+}
