@@ -1332,6 +1332,7 @@ structure Program where
   stackAllocs : List FnStackSpec := []
   gcMasks     : List AdtGcMaskSpec := []
   hasGcMasks  : Bool := false
+  vcgFormat   : Nat := 1
   deriving Repr
 
 def Program.allFuns (p : Program) : List FunDef :=

@@ -34,12 +34,13 @@ use ast.{
     FieldDecl, MkFieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
-    Def, MkDef, UseSpec, useSpecLocalName,
+    Def, MkDef, AttrExport, UseSpec, useSpecLocalName,
     UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
     ModuleItem, ModDef, ModUse, ModSub, ModDecl,
     listContainsStr, addUniqueStr
 }
 use parser.{parseFileModuleInFile, defContainsTry, desugarTryInDef}
+use infer.preludePrimSpecs
 use diag.diagRegisterFile
 use stdlib_bundle.builtinModuleSource
 
@@ -1553,7 +1554,26 @@ def rewriteDefInMod(ctx: ModRewriteCtx, d: Def): Def = {
             ItInstance(qcn, rewriteTypeListInMod(ctx, targs), rewriteConstraintsInMod(ctx, cs), cellGet(newImpls))
         },
     };
-    MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, attrs: d.attrs, item: newItem }
+    let outAttrs =
+        if (ctx.curPrefix == "" && qIdent != d.ident) {
+            let revA = cellNew(Nil);
+            let ca = cellNew(d.attrs);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(AttrExport(None), ra) -> {
+                        cellSet(revA, Cons(AttrExport(Some(d.ident)), cellGet(revA)));
+                        cellSet(ca, ra)
+                    },
+                    Cons(a, ra) -> {
+                        cellSet(revA, Cons(a, cellGet(revA)));
+                        cellSet(ca, ra)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(revA))
+        } else d.attrs;
+    MkDef { ident: qIdent, dpos: d.dpos, vis: d.vis, attrs: outAttrs, item: newItem }
 }
 
 def collectTyConsExpanded(
@@ -1726,6 +1746,18 @@ def compileLoadedCache(
     let typeOwners: StrMap String = strMapNew();
     let aliasBodies: StrMap Type = strMapNew();
 
+    let preludePrimSet: StrMap Bool = strMapNew();
+    let cpPrim = cellNew(preludePrimSpecs());
+    while (match cellGet(cpPrim) { Nil -> false, _ -> true }) {
+        match cellGet(cpPrim) {
+            Cons((pnm, _), rp) -> {
+                strMapInsert(preludePrimSet, pnm, true);
+                cellSet(cpPrim, rp)
+            },
+            Nil -> (),
+        }
+    };
+
     let curT = cellNew(topoKeys);
     while (match cellGet(curT) { Nil -> false, _ -> true }) {
         match cellGet(curT) {
@@ -1741,8 +1773,17 @@ def compileLoadedCache(
                             match cellGet(curD) {
                                 Cons((vis, d), rD) -> {
                                     let orig = d.ident;
-                                    let qname = joinKeyPrefix(pref, orig);
-                                    registerExport(avail, allExportKeys, qname, MkNameInfo {
+                                    let isRootValueShadow =
+                                        pref == ""
+                                        && (strMapContains(preludePrimSet, orig) || strStartsWith(orig, "__gs_"))
+                                        && match d.item {
+                                            ItForm(_) -> true,
+                                            ItExtern(_, _, _, _) -> true,
+                                            _ -> false,
+                                        };
+                                    let qname = if (isRootValueShadow) "$root." + orig else joinKeyPrefix(pref, orig);
+                                    let exportKey = if (isRootValueShadow) orig else qname;
+                                    registerExport(avail, allExportKeys, exportKey, MkNameInfo {
                                         qualifiedName: qname,
                                         isPublic: isPublicVis(vis),
                                         definedInMod: pref,
@@ -1761,6 +1802,8 @@ def compileLoadedCache(
                                             ItConcept(_, _, _, _) -> cellSet(ownTRev, Cons((orig, qname), cellGet(ownTRev))),
                                             _ -> (),
                                         }
+                                    } else if (isRootValueShadow) {
+                                        cellSet(ownVRev, Cons((orig, qname), cellGet(ownVRev)))
                                     } else ();
 
                                     match d.item {
@@ -1791,14 +1834,16 @@ def compileLoadedCache(
                                             while (match cellGet(curM) { Nil -> false, _ -> true }) {
                                                 match cellGet(curM) {
                                                     Cons(md, rM) -> {
-                                                        let qm = joinKeyPrefix(pref, md.mname);
-                                                        registerExport(avail, allExportKeys, qm, MkNameInfo {
+                                                        let isRootMethodShadow = pref == "" && (strMapContains(preludePrimSet, md.mname) || strStartsWith(md.mname, "__gs_"));
+                                                        let qm = if (isRootMethodShadow) "$root." + md.mname else joinKeyPrefix(pref, md.mname);
+                                                        let mExportKey = if (isRootMethodShadow) md.mname else qm;
+                                                        registerExport(avail, allExportKeys, mExportKey, MkNameInfo {
                                                             qualifiedName: qm,
                                                             isPublic: isPublicVis(vis),
                                                             definedInMod: pref,
                                                             viaExplicitAlias: false,
                                                         });
-                                                        if (pref != "") {
+                                                        if (pref != "" || isRootMethodShadow) {
                                                             cellSet(ownVRev, Cons((md.mname, qm), cellGet(ownVRev)))
                                                         } else ();
                                                         cellSet(curM, rM)

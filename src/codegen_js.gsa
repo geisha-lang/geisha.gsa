@@ -1245,15 +1245,19 @@ def emitJsExpr(ctx: JsEmitCtx, tm: TaggedTerm, locals: List (String, String)): S
             let avs = evalArgsJs(ctx, args, locals);
             "(" + cv + ")(" + strJoin(avs, ", ") + ")"
         },
-        TmApplyDir(vd, args) -> match tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals) {
-            Some(expr) -> expr,
-            None -> {
-                let avs = evalArgsJs(ctx, args, locals);
-                match strMapGet(ctx.jcProg.coreExterns, vd.vname) {
-                    Some(ext) -> emitExternCallJs(ext, avs),
-                    None -> jsFnIdent(vd.vname) + "(" + strJoin(avs, ", ") + ")",
-                }
-            },
+        TmApplyDir(vd, args) -> {
+            let isShadowed = !strStartsWith(vd.vname, "__gs_")
+                && (strMapContains(ctx.jcProg.coreExterns, vd.vname) || strMapContains(ctx.jcProg.coreFns, vd.vname));
+            match (if (isShadowed) None else tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals)) {
+                Some(expr) -> expr,
+                None -> {
+                    let avs = evalArgsJs(ctx, args, locals);
+                    match strMapGet(ctx.jcProg.coreExterns, vd.vname) {
+                        Some(ext) -> emitExternCallJs(ext, avs),
+                        None -> jsFnIdent(vd.vname) + "(" + strJoin(avs, ", ") + ")",
+                    }
+                },
+            }
         },
         TmBlock(_) -> {
             let tmp = jcFreshTmp(ctx);
@@ -1713,13 +1717,15 @@ pub def collectRootPubFnNames(rawDefs: List Def, prog: CoreProgram): List String
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(d, r) -> {
-                if (isPublicVis(d.vis) && !hasDotByte(d.ident) && d.ident != "main" && !strMapContains(seen, d.ident)) {
+                let isRoot = !hasDotByte(d.ident) || strStartsWith(d.ident, "$root.");
+                let expNm = if (strStartsWith(d.ident, "$root.")) strSlice(d.ident, 6, strLen(d.ident)) else d.ident;
+                if (isPublicVis(d.vis) && isRoot && expNm != "main" && !strMapContains(seen, expNm)) {
                     match d.item {
                         ItForm(f) -> match f.node {
                             ExAbs(_, _, _) ->
                                 if (strMapContains(prog.coreFns, d.ident)) {
-                                    strMapInsert(seen, d.ident, true);
-                                    cellSet(accRev, Cons(d.ident, cellGet(accRev)))
+                                    strMapInsert(seen, expNm, true);
+                                    cellSet(accRev, Cons(expNm, cellGet(accRev)))
                                 } else (),
                             _ -> (),
                         },
@@ -1771,9 +1777,14 @@ def collectExportPairs(prog: CoreProgram, cliExports: List String): List (String
     while (match cellGet(cx) { Nil -> false, _ -> true }) {
         match cellGet(cx) {
             Cons(nm, r) -> {
-                if (strMapContains(prog.coreFns, nm) && !strMapContains(seen, nm)) {
-                    strMapInsert(seen, nm, true);
-                    cellSet(accRev, Cons((nm, nm), cellGet(accRev)))
+                let (fnName, expName) =
+                    if (strStartsWith(nm, "$root.")) (nm, strSlice(nm, 6, strLen(nm)))
+                    else if (strMapContains(prog.coreFns, nm)) (nm, nm)
+                    else if (strMapContains(prog.coreFns, "$root." + nm)) ("$root." + nm, nm)
+                    else (nm, nm);
+                if (strMapContains(prog.coreFns, fnName) && !strMapContains(seen, expName)) {
+                    strMapInsert(seen, expName, true);
+                    cellSet(accRev, Cons((fnName, expName), cellGet(accRev)))
                 } else ();
                 cellSet(cx, r)
             },

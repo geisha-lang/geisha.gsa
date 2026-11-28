@@ -21,6 +21,7 @@ use std.json.{parse as jsonParse, stringify as jsonStringify}
 use sys.env.hostOs
 use sys.fs.{fileExists, isDir, readDir, readFile}
 use sys.io.eprintLn
+use verified_kernels.{clampOffset, hexDigitUpperByte, hexNibbleVal}
 use ast.{
     Span, MkSpan, isPublicVis,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
@@ -304,13 +305,10 @@ def objGetBool(v: Value, key: String): Option Bool = match objGet(v, key) {
 // ============================================================================
 
 def hexDigitVal(b: Int): Int =
-    if (b >= 48 && b <= 57) b - 48
-    else if (b >= 65 && b <= 70) b - 55
-    else if (b >= 97 && b <= 102) b - 87
-    else -1
+    hexNibbleVal(b)
 
 def hexUpperByte(n: Int): Int =
-    if (n < 10) 48 + n else 55 + n
+    hexDigitUpperByte(n & 15)
 
 def percentDecode(s: String): String = {
     let n = strLen(s);
@@ -432,9 +430,11 @@ def utf8StepAt(src: String, n: Int, idx: Int): (Int, Int) = {
     }
 }
 
-def offsetToLspPos(src: String, byteOff: Int): (Int, Int) = {
+def offsetToLspPos(src: String, byteOff: Int): (Int, Int)
+    ensures p -> match p { (l, c) -> l >= 0 && c >= 0 }
+= {
     let n = strLen(src);
-    let target = if (byteOff < 0) 0 else if (byteOff > n) n else byteOff;
+    let target = clampOffset(byteOff, n);
     let line = cellNew(0);
     let col = cellNew(0);
     let i = cellNew(0);
@@ -454,7 +454,9 @@ def offsetToLspPos(src: String, byteOff: Int): (Int, Int) = {
     (cellGet(line), cellGet(col))
 }
 
-def lspPosToOffset(src: String, targetLine: Int, targetChar: Int): Int = {
+def lspPosToOffset(src: String, targetLine: Int, targetChar: Int): Int
+    ensures off -> 0 <= off && off <= strLen(src)
+= {
     let n = strLen(src);
     let line = cellNew(0);
     let col = cellNew(0);

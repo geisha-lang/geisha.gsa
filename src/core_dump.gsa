@@ -9,7 +9,7 @@ use std.result.{Result, Ok, Err}
 use std.list.{listRev, listLen, listAppend}
 use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
-use std.str.{intToStr, i64ToStr}
+use std.str.{intToStr, i64ToStr, strStartsWith}
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, ScmSlot, schemeBody,
@@ -1955,6 +1955,8 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "__gs_contract_fail"
     || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
     || name == "assert" || name == "assume"
+    || name == "__gs_builtin_assert" || name == "__gs_builtin_assume"
+    || name == "__gs_builtin_intToI64" || name == "__gs_builtin_i64ToInt"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"
@@ -2453,7 +2455,9 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
         bufPushByte(b, 41)
     },
     TmApplyDir(vd, args) -> {
-        if (vd.vname == "cellNew") {
+        let isShadowedBuiltin = !strStartsWith(vd.vname, "__gs_")
+            && (strMapContains(ctx.dcProg.coreExterns, vd.vname) || strMapContains(ctx.dcProg.coreFns, vd.vname));
+        if (!isShadowedBuiltin && vd.vname == "cellNew") {
             match args {
                 Cons(a0, Nil) -> {
                     bufPushStr(b, "(cell-new ");
@@ -2465,7 +2469,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     bufPushStr(b, "(lit-unit)")
                 },
             }
-        } else if (vd.vname == "cellGet") {
+        } else if (!isShadowedBuiltin && vd.vname == "cellGet") {
             match args {
                 Cons(a0, Nil) -> {
                     bufPushStr(b, "(cell-get ");
@@ -2477,7 +2481,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     bufPushStr(b, "(lit-unit)")
                 },
             }
-        } else if (vd.vname == "cellSet") {
+        } else if (!isShadowedBuiltin && vd.vname == "cellSet") {
             match args {
                 Cons(a0, Cons(a1, Nil)) -> {
                     bufPushStr(b, "(cell-set ");
@@ -2698,7 +2702,13 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
             } else ();
             bufPushByte(b, 41)
         } else {
-            let extSym = getOrRegisterCoreExtern(ctx, vd.vname, args, schemeBody(tm.tscm));
+            let dumpRawName =
+                if (!strMapContains(ctx.dcProg.coreExterns, vd.vname)
+                    && !strMapContains(ctx.dcProg.coreFns, vd.vname)
+                    && (vd.vname == "assert" || vd.vname == "assume" || vd.vname == "intToI64" || vd.vname == "i64ToInt"))
+                    "__gs_builtin_" + vd.vname
+                else vd.vname;
+            let extSym = getOrRegisterCoreExtern(ctx, dumpRawName, args, schemeBody(tm.tscm));
             bufPushStr(b, "(apply-dir ");
             pushQuotedStr(b, extSym);
             let cur = cellNew(args);
@@ -3625,7 +3635,7 @@ pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String
         None -> {
             let extStr = bufToString(externsBuf);
             let out = bufNew();
-            bufPushStr(out, "(program\n  (adts\n");
+            bufPushStr(out, "(program\n  (vcg-format 2)\n  (adts\n");
             bufPushStr(out, bufToString(adtsBuf));
             if (strLen(extStr) > 0) {
                 bufPushStr(out, "  )\n  (externs\n");

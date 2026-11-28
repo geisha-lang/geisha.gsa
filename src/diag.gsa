@@ -11,6 +11,7 @@ use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr, vecSet}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.Span
+use verified_kernels.{clampOffset, clampSpanEnd}
 
 pub data SourceFile {
     MkSourceFile { sfPath: String, sfContent: String },
@@ -92,7 +93,7 @@ pub def diagSpanLineCol(sp: Span): (Int, Int) =
         Some(sf) -> {
             let src = sf.sfContent;
             let n = strLen(src);
-            let pos = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
+            let pos = clampOffset(sp.start, n);
             let starts = getOrBuildLineStarts(sp.fileId, src);
             let lo = cellNew(0);
             let hi = cellNew(vecLen(starts) - 1);
@@ -131,8 +132,8 @@ pub def diagSpanTerm(sp: Span): Option String =
         Some(sf) -> {
             let src = sf.sfContent;
             let n = strLen(src);
-            let s = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
-            let e = if (sp.end < s) s else if (sp.end > n) n else sp.end;
+            let s = clampOffset(sp.start, n);
+            let e = clampSpanEnd(s, sp.end, n);
             if (e <= s) None
             else {
                 let raw = trimWsSlice(src, s, e);
@@ -184,7 +185,7 @@ def formatDiagInternal(kind: String, fileId: Int, startByte: Int, endByte: Int, 
         Some(sf) -> {
             let src = sf.sfContent;
             let n = strLen(src);
-            let pos = if (startByte < 0) 0 else if (startByte > n) n else startByte;
+            let pos = clampOffset(startByte, n);
 
             // Compute 1-based line number and lineStart byte offset
             let line = cellNew(1);

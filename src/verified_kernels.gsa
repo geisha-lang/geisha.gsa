@@ -1,0 +1,172 @@
+// Mechanically verified pure arithmetic, encoding, span-clamping, alignment, and
+// GC-bitmap kernels used directly by the Geisha compiler passes (`codegen_wasmgc`,
+// `diag`, `doc`, `lsp`, `codegen`, `verify`).
+//
+// Every function in this module is restricted to the scalar/Cell fragment modeled
+// by BOTH `geisha verify` (Z3 QF_BV) and Lean 4 `CoreGeisha.VCG` (`geisha-check --verify-vcg`),
+// so 100% of obligations are cross-verified with 0 failed and 0 unknown.
+
+// ============================================================================
+// 1. WasmGC LEB128 Encoding Step & Byte-Length Kernels
+// ============================================================================
+
+pub def uleb32Next(cur: Int): Int
+    ensures r -> r == (cur >>> 7)
+= cur >>> 7
+
+pub def uleb32Byte(cur: Int): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((cur >>> 7) != 0 && (r & 128) == 128) || ((cur >>> 7) == 0 && (r & 128) == 0))
+= {
+    let low = cur & 127;
+    if ((cur >>> 7) != 0) low | 128 else low
+}
+
+pub def uleb32Len(n: Int): Int
+    ensures r -> 1 <= r && r <= 5
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 5)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 5
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 5 - cellGet(cnt)
+    {
+        let next = cellGet(v) >>> 7;
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (next != 0) cellSet(v, next) else cellSet(more, false)
+    };
+    cellGet(cnt)
+}
+
+pub def sleb32Done(cur: Int): Bool
+    ensures r -> r == (((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0))
+= {
+    let low = cur & 127;
+    let next = cur >> 7;
+    (next == 0 && (low & 64) == 0) || (next == -1 && (low & 64) != 0)
+}
+
+pub def sleb32Next(cur: Int): Int
+    ensures r -> r == (cur >> 7)
+= cur >> 7
+
+pub def sleb32Byte(cur: Int): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0)) && (r & 128) == 0)
+            || (!(((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0)) && (r & 128) == 128))
+= {
+    let low = cur & 127;
+    if (sleb32Done(cur)) low else low | 128
+}
+
+pub def sleb32Len(n: Int): Int
+    ensures r -> 1 <= r && r <= 5
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 5)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 5
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 5 - cellGet(cnt)
+    {
+        let cur = cellGet(v);
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (sleb32Done(cur)) cellSet(more, false) else cellSet(v, cur >> 7)
+    };
+    cellGet(cnt)
+}
+
+pub def sleb64Done(cur: Int64): Bool
+    ensures r -> r == (((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+        || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0))
+= {
+    let low = i64ToInt(cur & intToI64(127));
+    let next = cur >> 7;
+    (next == intToI64(0) && (low & 64) == 0) || (next == intToI64(-1) && (low & 64) != 0)
+}
+
+pub def sleb64Next(cur: Int64): Int64
+    ensures r -> r == (cur >> 7)
+= cur >> 7
+
+pub def sleb64Byte(cur: Int64): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+              || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0)) && (r & 128) == 0)
+            || (!(((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+                  || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0)) && (r & 128) == 128))
+= {
+    let low = i64ToInt(cur & intToI64(127));
+    if (sleb64Done(cur)) low else low | 128
+}
+
+pub def sleb64Len(n: Int64): Int
+    ensures r -> 1 <= r && r <= 10
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 10)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 10
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 10 - cellGet(cnt)
+    {
+        let cur = cellGet(v);
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (sleb64Done(cur)) cellSet(more, false) else cellSet(v, cur >> 7)
+    };
+    cellGet(cnt)
+}
+
+// ============================================================================
+// 2. Span Clamping & Interval Safety Kernels
+// ============================================================================
+
+pub def clampOffset(pos: Int, totalLen: Int): Int
+    requires totalLen >= 0
+    ensures r -> 0 <= r && r <= totalLen
+= if (pos < 0) 0 else if (pos > totalLen) totalLen else pos
+
+pub def clampSpanEnd(clampedStart: Int, endPos: Int, totalLen: Int): Int
+    requires 0 <= clampedStart && clampedStart <= totalLen
+    ensures r -> clampedStart <= r && r <= totalLen
+= if (endPos < clampedStart) clampedStart else if (endPos > totalLen) totalLen else endPos
+
+// ============================================================================
+// 3. Memory Alignment, GC Bitmap Index/Mask & Hex Encoding Kernels
+// ============================================================================
+
+pub def alignUp8(n: Int): Int
+    requires 0 <= n && n <= 2147483640
+    ensures r -> r >= n && (r & 7) == 0 && r - n < 8
+= (n + 7) & ~7
+
+pub def alignUp16(n: Int): Int
+    requires 0 <= n && n <= 2147483632
+    ensures r -> r >= n && (r & 15) == 0 && r - n < 16
+= (n + 15) & ~15
+
+pub def bitmapWordIdx(byteOff: Int): Int
+    requires 0 <= byteOff && byteOff < 320 && (byteOff & 7) == 0
+    ensures r -> 0 <= r && r < 40 && r * 8 == byteOff
+= byteOff >> 3
+
+pub def bitmapBitMask(wordIdx: Int): Int64
+    requires 0 <= wordIdx && wordIdx < 40
+    ensures r -> r != intToI64(0) && (r & (r - intToI64(1))) == intToI64(0)
+= intToI64(1) << wordIdx
+
+pub def hexDigitUpperByte(nib: Int): Int
+    requires 0 <= nib && nib < 16
+    ensures r -> (48 <= r && r <= 57) || (65 <= r && r <= 70)
+= if (nib < 10) 48 + nib else 55 + nib
+
+pub def hexNibbleVal(b: Int): Int
+    ensures r -> r == -1 || (0 <= r && r < 16)
+= if (b >= 48 && b <= 57) b - 48
+  else if (b >= 65 && b <= 70) b - 55
+  else if (b >= 97 && b <= 102) b - 87
+  else -1

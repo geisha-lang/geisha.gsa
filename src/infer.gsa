@@ -196,13 +196,19 @@ def joinMangledTypes(ts: List Type, sep: String): String = match ts {
     Cons(h, t) -> mangleType(h) + sep + joinMangledTypes(t, sep),
 }
 
-def freshVar(ctx: InferCtx): Type = {
+def freshVar(ctx: InferCtx): Type
+    requires cellGet(ctx.unique) >= 0
+    ensures r -> cellGet(ctx.unique) > 0 && match r { TyVar(nm) -> strLen(nm) > 1, _ -> false }
+= {
     let n = cellGet(ctx.unique) + 1;
     cellSet(ctx.unique, n);
     TyVar("." + intToStr(n))
 }
 
-def freshModeVar(ctx: InferCtx): Type = {
+def freshModeVar(ctx: InferCtx): Type
+    requires cellGet(ctx.unique) >= 0
+    ensures r -> cellGet(ctx.unique) > 0 && match r { TyVar(nm) -> strLen(nm) > 3, _ -> false }
+= {
     let n = cellGet(ctx.unique) + 1;
     cellSet(ctx.unique, n);
     TyVar(".$m" + intToStr(n))
@@ -403,7 +409,9 @@ def bindTypeVar(subst: StrMap Type, v: String, ty: Type, sp: Span): Result Void 
     }
 }
 
-def unifyTypeLists(subst: StrMap Type, xs: List Type, ys: List Type, sp: Span): Result Void String = match (xs, ys) {
+def unifyTypeLists(subst: StrMap Type, xs: List Type, ys: List Type, sp: Span): Result Void String
+    ensures res -> match res { Ok(_) -> listLen(xs) == listLen(ys), Err(_) -> true }
+= match (xs, ys) {
     (Nil, Nil) -> Ok(()),
     (Cons(x, xr), Cons(y, yr)) -> {
         unifyTypes(subst, x, y, sp)?;

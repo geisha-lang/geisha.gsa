@@ -662,4 +662,138 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_missing.gscore" 2>/dev/null;
     echo "FAIL [vcg_cross_mutrec_missing_lean]: Lean geisha-check --verify-vcg accepted mutual recursion missing decreases!" >&2
     exit 1
 fi
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases)"
+
+# Z6b: Shadowed user `assume` MUST NOT act as built-in path assumption in geisha verify OR Lean geisha-check --verify-vcg
+cat > "$TMP_DIR/vcg_shadow_assume.gsa" << 'EOF'
+def assume(b: Bool): Void = ()
+def observe(x: Int): Int
+    ensures r -> r == 1
+= { assume(x == 1); x }
+def main(): Void = { let _ = observe(7); () }
+EOF
+if "$GEISHA_BIN" verify --dump-core "$TMP_DIR/vcg_shadow_assume.gscore" "$TMP_DIR/vcg_shadow_assume.gsa" >/dev/null 2>&1; then
+    echo "FAIL [vcg_shadow_assume_compiler]: geisha verify accepted bogus ensures via shadowed def assume!" >&2
+    exit 1
+fi
+test -s "$TMP_DIR/vcg_shadow_assume.gscore"
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_shadow_assume.gscore" 2>/dev/null; then
+    echo "FAIL [vcg_shadow_assume_lean]: Lean geisha-check --verify-vcg accepted bogus ensures via shadowed def assume!" >&2
+    exit 1
+fi
+
+# Z6b/Z8 direct `.gscore` regressions (must fail in VCG, NEVER in Parser!):
+# 1. Versioned `(vcg-format 2)` with bare `(fun "assume" ...)` -> deflected to `$bare$assume`, refuted by Z3
+cat > "$TMP_DIR/vcg_bare_shadow_assume.gscore" << 'EOF'
+(program
+  (vcg-format 2)
+  (adts)
+  (externs)
+  (funs
+    (fun "assume" (("b" bool)) void (lit-unit))
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_shadow_assume.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_shadow_assume_lean]: Lean geisha-check --verify-vcg accepted bare shadowed (fun \"assume\" ...)!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG " "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_shadow_assume_err]: expected VCG diagnostic (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# 2. Versioned `(vcg-format 2)` with bare `(extern "assume" (("p0" bool)) void)` -> VCG ERROR (fail-closed)
+cat > "$TMP_DIR/vcg_bare_extern_assume_v2.gscore" << 'EOF'
+(program
+  (vcg-format 2)
+  (adts)
+  (externs (extern "assume" (("p0" bool)) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_extern_assume_v2.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_extern_assume_v2_lean]: Lean geisha-check --verify-vcg accepted bare (extern \"assume\" ...)!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_extern_assume_v2_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# 3. Unversioned legacy `.gscore` with `(extern "__gs_builtin_assume" ...)` (base2-ordinary-extern) -> VCG ERROR
+cat > "$TMP_DIR/vcg_legacy_builtin_extern.gscore" << 'EOF'
+(program
+  (adts)
+  (externs (extern "__gs_builtin_assume" (("p0" bool)) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "__gs_builtin_assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_legacy_builtin_extern.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_builtin_extern_lean]: Lean geisha-check --verify-vcg accepted unversioned legacy __gs_builtin_assume!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_builtin_extern_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# 4. Unversioned legacy `.gscore` with `(extern "assume" ...)` -> VCG ERROR
+cat > "$TMP_DIR/vcg_legacy_bare_extern.gscore" << 'EOF'
+(program
+  (adts)
+  (externs (extern "assume" (("p0" bool)) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_legacy_bare_extern.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_bare_extern_lean]: Lean geisha-check --verify-vcg accepted unversioned legacy extern assume!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_bare_extern_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# D1: Production compiler verified kernels (`src/verified_kernels.gsa`) 100% cross-verified by Z3 and Lean 4 VCG
+"$GEISHA_BIN" verify --src-root . --dump-core "$TMP_DIR/verified_kernels.gscore" src/verified_kernels.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/verified_kernels.gscore"
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + Z6b shadowed assume + D1 src/verified_kernels.gsa)"

@@ -442,8 +442,11 @@ private def parseProgramSections (sects : List SExpr) : Except String Program :=
   let mut stackAllocs : List FnStackSpec := []
   let mut gcMasks : List AdtGcMaskSpec := []
   let mut hasGcMasks : Bool := false
+  let mut vcgFormat : Nat := 1
   for s in sects do
     match s with
+    | .list [.atom "vcg-format", n] =>
+      vcgFormat := ← expectNat n
     | .list (.atom "adts" :: xs) =>
       adts := some (← xs.mapM parseAdt)
     | .list (.atom "externs" :: xs) =>
@@ -466,6 +469,7 @@ private def parseProgramSections (sects : List SExpr) : Except String Program :=
       stackAllocs := stackAllocs
       gcMasks := gcMasks
       hasGcMasks := hasGcMasks
+      vcgFormat := vcgFormat
     }
   | _, _ =>
     throw "program requires both (adts ...) and (funs ...) sections"
