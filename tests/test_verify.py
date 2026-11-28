@@ -2720,7 +2720,124 @@ def main() -> int:
         assert r_e10_pir.returncode == 0 and r_e10_pir.stdout.strip() == "ok", (
             f"E10 poly Bool & ImmArray(Cell Int) run failed:\n{r_e10_pir.stdout}\n{r_e10_pir.stderr}"
         )
-        print("PASS [e9_astra_round1_and_round2_regressions]")
+
+        # ------------------------------------------------------------------
+        # E11: Astra Round 3 regressions (capture-free bound unfolding,
+        # mid-conjunction independent guard after dependent guard,
+        # conditional `if` bound preceded by dependent guard + negative controls — Native + JS!)
+        # ------------------------------------------------------------------
+        e11_r3 = tmp / "e11_round3.gsa"
+        e11_r3.write_text(
+            "verified def positive(n: Int): Int\n"
+            "    requires n > 0\n"
+            "    ensures r -> r == n && r > 0\n"
+            "= n\n"
+            "\n"
+            "// 11.1 Local bindings (`let n`, `let i`, renamed `padding`) MUST NOT capture caller/quantifier vars!\n"
+            "def withinSameCaller(i: Int, limit: Int): Bool =\n"
+            "    i < { let n = 2; limit + n }\n"
+            "def withinSameQuant(i: Int, limit: Int): Bool =\n"
+            "    i < { let i = 2; limit + i }\n"
+            "def withinRenamed(i: Int, limit: Int): Bool =\n"
+            "    i < { let padding = 2; limit + padding }\n"
+            "verified def hasLastExplicitCap(n: Int): Void\n"
+            "    requires n == 4\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameCaller(i, n) && i < 8 && i == 5\n"
+            "= ()\n"
+            "verified def hasLastNoCap(n: Int): Void\n"
+            "    requires n == 4\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameCaller(i, n) && i == 5\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameQuant(i, n) && i == 5\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinRenamed(i, n) && i == 5\n"
+            "= ()\n"
+            "\n"
+            "// 11.2 Mid-conjunction `positive(mask) > 0` after `(i & mask) != 0` MUST NOT hoist before loop!\n"
+            "verified def checkMidGuard(mask: Int): Void\n"
+            "    requires mask >= 0\n"
+            "    ensures forall (i: Int) -> (0 <= i && (i & mask) != 0 && positive(mask) > 0 && i < 4) ==> i < 4\n"
+            "= ()\n"
+            "\n"
+            "// 11.3 Conditional `if (mask < 2) positive(mask) else 2` upper bound after `(i & mask) != 0`!\n"
+            "verified def checkCondBound(mask: Int): Void\n"
+            "    requires mask >= 0\n"
+            "    ensures forall (i: Int) -> (0 <= i && (i & mask) != 0 && i < (if (mask < 2) positive(mask) else 2)) ==> i >= 0\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    hasLastExplicitCap(4);\n"
+            "    hasLastNoCap(4);\n"
+            "    checkMidGuard(1);\n"
+            "    checkMidGuard(0);\n"
+            "    checkCondBound(2);\n"
+            "    checkCondBound(1);\n"
+            "    checkCondBound(0);\n"
+            "    printLn(\"ok\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e11_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e11_r3)])
+        assert r_e11_v.returncode == 0 and json.loads(r_e11_v.stdout)["ok"] is True, (
+            f"E11 Round 3 static verify failed:\n{r_e11_v.stdout}\n{r_e11_v.stderr}"
+        )
+        e11_bin = tmp / ("e11_r3.exe" if sys.platform == "win32" else "e11_r3")
+        r_e11_b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e11_bin), str(e11_r3)])
+        assert r_e11_b.returncode == 0, f"E11 Round 3 native build failed:\n{r_e11_b.stdout}\n{r_e11_b.stderr}"
+        r_e11_n = run([str(e11_bin)])
+        assert r_e11_n.returncode == 0 and r_e11_n.stdout.strip() == "ok", (
+            f"E11 Round 3 native run failed:\n{r_e11_n.stdout}\n{r_e11_n.stderr}"
+        )
+        if shutil.which("node"):
+            e11_js = tmp / "e11_r3.mjs"
+            r_e11_jb = run([geisha, "--contracts=check", "--target", "js", "-o", str(e11_js), str(e11_r3)])
+            assert r_e11_jb.returncode == 0, f"E11 Round 3 JS build failed:\n{r_e11_jb.stdout}\n{r_e11_jb.stderr}"
+            r_e11_jr = run(["node", str(e11_js)])
+            assert r_e11_jr.returncode == 0 and r_e11_jr.stdout.strip() == "ok", (
+                f"E11 Round 3 JS run failed:\n{r_e11_jr.stdout}\n{r_e11_jr.stderr}"
+            )
+
+        # 11.4 Adversarial negative controls:
+        #   (a) out-of-range witness `i == 6` (`withinSameCaller(6, 4)` is false) MUST fail ensures!
+        #   (b) non-vacuous `(i >= 5000)` before `i < (if (mask < 2) positive(mask) else 2)` with `mask = 0`
+        #       MUST reach `i = 5000` (beyond 4096!) and abort with `requires violated` in Native AND JS!
+        for neg_nm, neg_src_txt, exp_msg in [
+            (
+                "e11_neg_cap",
+                "def within(i: Int, limit: Int): Bool = i < { let n = 2; limit + n }\n"
+                "def badLast(n: Int): Void\n"
+                "    ensures exists (i: Int) -> 0 <= i && within(i, n) && i < 8 && i == 6\n"
+                "= ()\n"
+                "def main(): Void = badLast(4)\n",
+                "ensures violated",
+            ),
+            (
+                "e11_neg_high_witness",
+                "def positive(n: Int): Int\n"
+                "    requires n > 0\n"
+                "= n\n"
+                "def badCond(mask: Int): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && i >= 5000 && i < (if (mask < 2) positive(mask) else 2)) ==> i >= 0\n"
+                "= ()\n"
+                "def main(): Void = badCond(0)\n",
+                "requires violated",
+            ),
+        ]:
+            neg_f = tmp / f"{neg_nm}.gsa"
+            neg_f.write_text(neg_src_txt, encoding="utf-8", newline="\n")
+            neg_b = tmp / (f"{neg_nm}.exe" if sys.platform == "win32" else neg_nm)
+            assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(neg_b), str(neg_f)]).returncode == 0
+            r_nb = run([str(neg_b)])
+            assert r_nb.returncode != 0 and exp_msg in (r_nb.stdout + r_nb.stderr), (
+                f"E11 {neg_nm} native expected {exp_msg!r}, got rc={r_nb.returncode}: {r_nb.stdout}\n{r_nb.stderr}"
+            )
+            if shutil.which("node"):
+                neg_j = tmp / f"{neg_nm}.mjs"
+                assert run([geisha, "--contracts=check", "--target", "js", "-o", str(neg_j), str(neg_f)]).returncode == 0
+                r_nj = run(["node", str(neg_j)])
+                assert r_nj.returncode != 0 and exp_msg in (r_nj.stdout + r_nj.stderr), (
+                    f"E11 {neg_nm} JS expected {exp_msg!r}, got rc={r_nj.returncode}: {r_nj.stdout}\n{r_nj.stderr}"
+                )
+        print("PASS [e9_astra_round1_round2_round3_regressions]")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)

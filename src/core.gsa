@@ -6912,10 +6912,100 @@ def assocLookupTermPair(xs: List (String, TaggedTerm), key: String): Option Tagg
     Cons((k, v), r) -> if (k == key) Some(v) else assocLookupTermPair(r, key),
 }
 
-def stripFnEnsuresWrapper(body: TaggedTerm): (List TaggedTerm, TaggedTerm) =
+def termHasOldCallList(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(h, r) -> if (termHasOldCall(h)) true else termHasOldCallList(r),
+}
+
+def termHasOldCall(tm: TaggedTerm): Bool = match tm.tnode {
+    TmApplyDir(vd, args) -> if (vd.vname == "$gs$old") true else termHasOldCallList(args),
+    TmTuple(es) -> termHasOldCallList(es),
+    TmBlock(es) -> termHasOldCallList(es),
+    TmMakeData(_, _, fs, _, _) -> termHasOldCallList(fs),
+    TmBin(_, l, r) -> termHasOldCall(l) || termHasOldCall(r),
+    TmUn(_, e) -> termHasOldCall(e),
+    TmGetTag(e) -> termHasOldCall(e),
+    TmLet(_, v, b) -> termHasOldCall(v) || termHasOldCall(b),
+    TmIf(c, t, e) -> termHasOldCall(c) || termHasOldCall(t) || termHasOldCall(e),
+    TmWhile(c, b) -> termHasOldCall(c) || termHasOldCall(b),
+    TmMakeCls(_, _, b) -> termHasOldCall(b),
+    TmApplyCls(c, args) -> termHasOldCall(c) || termHasOldCallList(args),
+    TmMatch(s, arms) ->
+        if (termHasOldCall(s)) true
+        else {
+            let hit = cellNew(false);
+            let cur = cellNew(arms);
+            while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let gh = match a.caGuard { Some(g) -> termHasOldCall(g), None -> false };
+                        if (gh || termHasOldCall(a.caBody)) cellSet(hit, true) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        },
+    _ -> false,
+}
+
+def extractEnsuresCondsFromResAfter(ensAfter: TaggedTerm): Option (List TaggedTerm) = match ensAfter.tnode {
+    TmVar(v) -> if (v == "__gs_res") Some(Nil) else None,
+    TmBlock(stmts) -> {
+        let condsRev: Cell (List TaggedTerm) = cellNew(Nil);
+        let ok = cellNew(true);
+        let sawTail = cellNew(false);
+        let cur = cellNew(stmts);
+        while (cellGet(ok) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(st, Nil) -> {
+                    match st.tnode {
+                        TmVar(v) if (v == "__gs_res") -> cellSet(sawTail, true),
+                        _ -> cellSet(ok, false),
+                    };
+                    cellSet(cur, Nil)
+                },
+                Cons(st, r) -> {
+                    match st.tnode {
+                        TmApplyDir(vd, Cons(ec, _)) if (vd.vname == "__gs_ensures") ->
+                            if (termHasOldCall(ec)) cellSet(ok, false)
+                            else cellSet(condsRev, Cons(ec, cellGet(condsRev))),
+                        TmLet(bvd, v, innerSt) -> match (v.tnode, innerSt.tnode) {
+                            (TmVar(vnm), TmApplyDir(vd, Cons(ec, _))) if (vnm == "__gs_res" && vd.vname == "__gs_ensures") ->
+                                if (termHasOldCall(ec)) cellSet(ok, false)
+                                else {
+                                    let letCond = MkTerm { tspan: st.tspan, tscm: ec.tscm, tnode: TmLet(bvd, v, ec) };
+                                    cellSet(condsRev, Cons(letCond, cellGet(condsRev)))
+                                },
+                            _ -> cellSet(ok, false),
+                        },
+                        _ -> cellSet(ok, false),
+                    };
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        if (cellGet(ok) && cellGet(sawTail)) Some(listRev(cellGet(condsRev))) else None
+    },
+    _ -> None,
+}
+
+/// Decompose a Core function body into `(reqs, decs, coreValBody, Some((resDecl, ensConds)) | None)`.
+/// Returns `None` for the last element when `ensures` uses `$gs$old` or an unexpected wrapper shape.
+def stripFnContractParts(body: TaggedTerm): (List TaggedTerm, List TaggedTerm, TaggedTerm, Bool, List TaggedTerm) = {
+    let extractRes = (coreCandidate: TaggedTerm) -> match coreCandidate.tnode {
+        TmLet(vd, valT, ensAfter) if (vd.vname == "__gs_res") -> match extractEnsuresCondsFromResAfter(ensAfter) {
+            Some(ecs) -> (valT, true, ecs),
+            None -> (valT, false, Nil),
+        },
+        _ -> (coreCandidate, true, Nil),
+    };
     match body.tnode {
         TmBlock(stmts) -> {
             let reqsRev: Cell (List TaggedTerm) = cellNew(Nil);
+            let decsRev: Cell (List TaggedTerm) = cellNew(Nil);
             let restRev: Cell (List TaggedTerm) = cellNew(Nil);
             let inHdr = cellNew(true);
             let cur = cellNew(stmts);
@@ -6928,7 +7018,10 @@ def stripFnEnsuresWrapper(body: TaggedTerm): (List TaggedTerm, TaggedTerm) =
                                     match args { Cons(rc, _) -> cellSet(reqsRev, Cons(rc, cellGet(reqsRev))), Nil -> () };
                                     true
                                 },
-                                TmApplyDir(vd, _) if (vd.vname == "__gs_decreases") -> true,
+                                TmApplyDir(vd, args) if (vd.vname == "__gs_decreases") -> {
+                                    match args { Cons(dc, _) -> cellSet(decsRev, Cons(dc, cellGet(decsRev))), Nil -> () };
+                                    true
+                                },
                                 _ -> { cellSet(inHdr, false); false },
                             }
                         } else false;
@@ -6939,18 +7032,19 @@ def stripFnEnsuresWrapper(body: TaggedTerm): (List TaggedTerm, TaggedTerm) =
                 }
             };
             let rest = listRev(cellGet(restRev));
-            let coreB = match rest {
-                Cons(single, Nil) -> match single.tnode {
-                    TmLet(vd, valT, _) if (vd.vname == "__gs_res") -> valT,
-                    _ -> single,
-                },
+            let cand = match rest {
+                Cons(single, Nil) -> single,
                 _ -> MkTerm { tspan: body.tspan, tscm: body.tscm, tnode: TmBlock(rest) },
             };
-            (listRev(cellGet(reqsRev)), coreB)
+            let (valT, ensOk, ecs) = extractRes(cand);
+            (listRev(cellGet(reqsRev)), listRev(cellGet(decsRev)), valT, ensOk, ecs)
         },
-        TmLet(vd, valT, _) if (vd.vname == "__gs_res") -> (Nil, valT),
-        _ -> (Nil, body),
+        _ -> {
+            let (valT, ensOk, ecs) = extractRes(body);
+            (Nil, Nil, valT, ensOk, ecs)
+        },
     }
+}
 
 def isTotalIntrinsicForBound(nm: String): Bool =
     nm == "cellGet" || nm == "arrayLen" || nm == "immArrayLen" || nm == "strLen"
@@ -6992,61 +7086,177 @@ def isTriviallyTotalTerm(tm: TaggedTerm, rawFns: StrMap FunDef, depth: Int): Boo
             if (!isTriviallyTotalTermList(args, rawFns, depth)) false
             else if (isTotalIntrinsicForBound(vd.vname) && !strMapContains(rawFns, vd.vname)) true
             else match strMapGet(rawFns, vd.vname) {
-                Some(fd) -> {
-                    let (reqs, coreB) = stripFnEnsuresWrapper(fd.fnBody);
-                    match (fd.fnFvs, reqs) {
-                        (Nil, Nil) -> isTriviallyTotalTerm(coreB, rawFns, depth + 1),
-                        _ -> false,
-                    }
+                Some(fd) -> match fd.fnFvs {
+                    // Inspect `fd.fnBody` UNSTRIPPED so any `__gs_requires`, `__gs_decreases`,
+                    // `__gs_ensures`, or `assert` inside `fd` is treated as potentially aborting!
+                    Nil -> isTriviallyTotalTerm(fd.fnBody, rawFns, depth + 1),
+                    _ -> false,
                 },
                 None -> false,
             },
         _ -> false,
     }
 
-def substSimpleTermList(ts: List TaggedTerm, sub: List (String, TaggedTerm)): List TaggedTerm = {
+def alphaRenamePatList(
+    ctx: KCtx,
+    pats: List Pattern,
+    alphaSub: List (String, String)
+): (List Pattern, List (String, String)) = {
+    let rev: Cell (List Pattern) = cellNew(Nil);
+    let curSub = cellNew(alphaSub);
+    let cur = cellNew(pats);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                let (np, ns) = alphaRenamePat(ctx, p, cellGet(curSub));
+                cellSet(rev, Cons(np, cellGet(rev)));
+                cellSet(curSub, ns);
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    (listRev(cellGet(rev)), cellGet(curSub))
+}
+
+def alphaRenamePat(
+    ctx: KCtx,
+    pat: Pattern,
+    alphaSub: List (String, String)
+): (Pattern, List (String, String)) = match pat {
+    PatVar(vn, sp) -> {
+        let freshNm = "__gs_inl_" + intToStr(kUnique(ctx));
+        (PatVar(freshNm, sp), Cons((vn, freshNm), alphaSub))
+    },
+    PatTuple(ps) -> {
+        let (nps, ns) = alphaRenamePatList(ctx, ps, alphaSub);
+        (PatTuple(nps), ns)
+    },
+    PatCtor(cn, ps) -> {
+        let (nps, ns) = alphaRenamePatList(ctx, ps, alphaSub);
+        (PatCtor(cn, nps), ns)
+    },
+    PatStruct(cn, named) -> {
+        let rev: Cell (List (String, Pattern, Span, Bool)) = cellNew(Nil);
+        let curSub = cellNew(alphaSub);
+        let cur = cellNew(named);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((fnm, p, sp, pun), r) -> {
+                    let (np, ns) = alphaRenamePat(ctx, p, cellGet(curSub));
+                    cellSet(rev, Cons((fnm, np, sp, pun), cellGet(rev)));
+                    cellSet(curSub, ns);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (PatStruct(cn, listRev(cellGet(rev))), cellGet(curSub))
+    },
+    _ -> (pat, alphaSub),
+}
+
+def substCaptureFreeList(
+    ctx: KCtx,
+    ts: List TaggedTerm,
+    paramSub: List (String, TaggedTerm),
+    alphaSub: List (String, String)
+): List TaggedTerm = {
     let rev: Cell (List TaggedTerm) = cellNew(Nil);
     let cur = cellNew(ts);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
-            Cons(h, r) -> { cellSet(rev, Cons(substSimpleTerm(h, sub), cellGet(rev))); cellSet(cur, r) },
+            Cons(h, r) -> {
+                cellSet(rev, Cons(substCaptureFreeTerm(ctx, h, paramSub, alphaSub), cellGet(rev)));
+                cellSet(cur, r)
+            },
             Nil -> (),
         }
     };
     listRev(cellGet(rev))
 }
 
-def substFilterOutKey(sub: List (String, TaggedTerm), key: String): List (String, TaggedTerm) = match sub {
-    Nil -> Nil,
-    Cons((k, v), r) -> if (k == key) substFilterOutKey(r, key) else Cons((k, v), substFilterOutKey(r, key)),
-}
-
-def substSimpleTerm(tm: TaggedTerm, sub: List (String, TaggedTerm)): TaggedTerm = match tm.tnode {
-    TmVar(v) -> match assocLookupTermPair(sub, v) { Some(rep) -> rep, None -> tm },
-    TmTuple(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmTuple(substSimpleTermList(es, sub)) },
-    TmBlock(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBlock(substSimpleTermList(es, sub)) },
-    TmMakeData(a, tg, fs, ftys, targs) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmMakeData(a, tg, substSimpleTermList(fs, sub), ftys, targs) },
-    TmBin(op, l, r) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(op, substSimpleTerm(l, sub), substSimpleTerm(r, sub)) },
-    TmUn(op, e) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(op, substSimpleTerm(e, sub)) },
-    TmGetTag(e) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmGetTag(substSimpleTerm(e, sub)) },
-    TmApplyDir(vd, args) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(vd, substSimpleTermList(args, sub)) },
-    TmLet(vd, v, b) -> MkTerm {
-        tspan: tm.tspan, tscm: tm.tscm,
-        tnode: TmLet(vd, substSimpleTerm(v, sub), substSimpleTerm(b, substFilterOutKey(sub, vd.vname))),
+/// Capture-avoiding substitution: alpha-renames every internal `let` and `match` pattern binder
+/// to a globally fresh `__gs_inl_*` name so local bindings inside an inlined helper NEVER capture
+/// free variables of caller arguments (fixing Astra Round 3 P1 #1)!
+def substCaptureFreeTerm(
+    ctx: KCtx,
+    tm: TaggedTerm,
+    paramSub: List (String, TaggedTerm),
+    alphaSub: List (String, String)
+): TaggedTerm = match tm.tnode {
+    TmVar(v) -> match assocLookupStr(alphaSub, v) {
+        Some(freshNm) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmVar(freshNm) },
+        None -> match assocLookupTermPair(paramSub, v) {
+            Some(rep) -> rep,
+            None -> tm,
+        },
+    },
+    TmTuple(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmTuple(substCaptureFreeList(ctx, es, paramSub, alphaSub)) },
+    TmBlock(es) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBlock(substCaptureFreeList(ctx, es, paramSub, alphaSub)) },
+    TmMakeData(a, tg, fs, ftys, targs) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmMakeData(a, tg, substCaptureFreeList(ctx, fs, paramSub, alphaSub), ftys, targs) },
+    TmBin(op, l, r) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(op, substCaptureFreeTerm(ctx, l, paramSub, alphaSub), substCaptureFreeTerm(ctx, r, paramSub, alphaSub)) },
+    TmUn(op, e) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(op, substCaptureFreeTerm(ctx, e, paramSub, alphaSub)) },
+    TmGetTag(e) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmGetTag(substCaptureFreeTerm(ctx, e, paramSub, alphaSub)) },
+    TmApplyDir(vd, args) ->
+        if ((vd.vname == "$gs$forall" || vd.vname == "$gs$exists") && listLen(args) == 2) {
+            match args {
+                Cons(qv, Cons(qb, _)) -> match qv.tnode {
+                    TmVar(qn) -> {
+                        let freshQ = "__gs_inl_" + intToStr(kUnique(ctx));
+                        let nextAlpha = Cons((qn, freshQ), alphaSub);
+                        MkTerm {
+                            tspan: tm.tspan, tscm: tm.tscm,
+                            tnode: TmApplyDir(vd, [
+                                MkTerm { tspan: qv.tspan, tscm: qv.tscm, tnode: TmVar(freshQ) },
+                                substCaptureFreeTerm(ctx, qb, paramSub, nextAlpha),
+                            ]),
+                        }
+                    },
+                    _ -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(vd, substCaptureFreeList(ctx, args, paramSub, alphaSub)) },
+                },
+                _ -> tm,
+            }
+        } else MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(vd, substCaptureFreeList(ctx, args, paramSub, alphaSub)) },
+    TmLet(vd, v, b) -> {
+        let freshNm = "__gs_inl_" + intToStr(kUnique(ctx));
+        let nv = substCaptureFreeTerm(ctx, v, paramSub, alphaSub);
+        let nb = substCaptureFreeTerm(ctx, b, paramSub, Cons((vd.vname, freshNm), alphaSub));
+        MkTerm {
+            tspan: tm.tspan, tscm: tm.tscm,
+            tnode: TmLet(MkVarDecl { vname: freshNm, vscm: vd.vscm }, nv, nb),
+        }
     },
     TmIf(c, t, e) -> MkTerm {
         tspan: tm.tspan, tscm: tm.tscm,
-        tnode: TmIf(substSimpleTerm(c, sub), substSimpleTerm(t, sub), substSimpleTerm(e, sub)),
+        tnode: TmIf(
+            substCaptureFreeTerm(ctx, c, paramSub, alphaSub),
+            substCaptureFreeTerm(ctx, t, paramSub, alphaSub),
+            substCaptureFreeTerm(ctx, e, paramSub, alphaSub)
+        ),
+    },
+    TmMatch(s, arms) -> {
+        let ns = substCaptureFreeTerm(ctx, s, paramSub, alphaSub);
+        let rev: Cell (List CoreArm) = cellNew(Nil);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let (npat, armAlpha) = alphaRenamePat(ctx, a.caPat, alphaSub);
+                    let ng = match a.caGuard { Some(g) -> Some(substCaptureFreeTerm(ctx, g, paramSub, armAlpha)), None -> None };
+                    let nb = substCaptureFreeTerm(ctx, a.caBody, paramSub, armAlpha);
+                    cellSet(rev, Cons(MkCoreArm { caPat: npat, caGuard: ng, caBody: nb }, cellGet(rev)));
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmMatch(ns, listRev(cellGet(rev))) }
     },
     _ -> tm,
 }
 
-def termHasShadowConflict(tm: TaggedTerm, forbidVars: List String): Bool = match tm.tnode {
-    TmLet(vd, v, b) ->
-        listContainsStr(forbidVars, vd.vname)
-        || termHasShadowConflict(v, forbidVars)
-        || termHasShadowConflict(b, forbidVars),
-    TmMatch(_, _) -> true,
+def termHasLoopOrCls(tm: TaggedTerm): Bool = match tm.tnode {
     TmWhile(_, _) -> true,
     TmMakeCls(_, _, _) -> true,
     TmApplyCls(_, _) -> true,
@@ -7054,7 +7264,7 @@ def termHasShadowConflict(tm: TaggedTerm, forbidVars: List String): Bool = match
         let hit = cellNew(false);
         let cur = cellNew(es);
         while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(h, r) -> { if (termHasShadowConflict(h, forbidVars)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
+            match cellGet(cur) { Cons(h, r) -> { if (termHasLoopOrCls(h)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
         };
         cellGet(hit)
     },
@@ -7062,7 +7272,7 @@ def termHasShadowConflict(tm: TaggedTerm, forbidVars: List String): Bool = match
         let hit = cellNew(false);
         let cur = cellNew(es);
         while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(h, r) -> { if (termHasShadowConflict(h, forbidVars)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
+            match cellGet(cur) { Cons(h, r) -> { if (termHasLoopOrCls(h)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
         };
         cellGet(hit)
     },
@@ -7070,7 +7280,7 @@ def termHasShadowConflict(tm: TaggedTerm, forbidVars: List String): Bool = match
         let hit = cellNew(false);
         let cur = cellNew(fs);
         while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(h, r) -> { if (termHasShadowConflict(h, forbidVars)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
+            match cellGet(cur) { Cons(h, r) -> { if (termHasLoopOrCls(h)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
         };
         cellGet(hit)
     },
@@ -7078,14 +7288,32 @@ def termHasShadowConflict(tm: TaggedTerm, forbidVars: List String): Bool = match
         let hit = cellNew(false);
         let cur = cellNew(args);
         while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(h, r) -> { if (termHasShadowConflict(h, forbidVars)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
+            match cellGet(cur) { Cons(h, r) -> { if (termHasLoopOrCls(h)) cellSet(hit, true) else (); cellSet(cur, r) }, Nil -> () }
         };
         cellGet(hit)
     },
-    TmBin(_, l, r) -> termHasShadowConflict(l, forbidVars) || termHasShadowConflict(r, forbidVars),
-    TmUn(_, e) -> termHasShadowConflict(e, forbidVars),
-    TmIf(c, t, e) -> termHasShadowConflict(c, forbidVars) || termHasShadowConflict(t, forbidVars) || termHasShadowConflict(e, forbidVars),
-    TmGetTag(e) -> termHasShadowConflict(e, forbidVars),
+    TmBin(_, l, r) -> termHasLoopOrCls(l) || termHasLoopOrCls(r),
+    TmUn(_, e) -> termHasLoopOrCls(e),
+    TmLet(_, v, b) -> termHasLoopOrCls(v) || termHasLoopOrCls(b),
+    TmIf(c, t, e) -> termHasLoopOrCls(c) || termHasLoopOrCls(t) || termHasLoopOrCls(e),
+    TmGetTag(e) -> termHasLoopOrCls(e),
+    TmMatch(s, arms) ->
+        if (termHasLoopOrCls(s)) true
+        else {
+            let hit = cellNew(false);
+            let cur = cellNew(arms);
+            while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let gh = match a.caGuard { Some(g) -> termHasLoopOrCls(g), None -> false };
+                        if (gh || termHasLoopOrCls(a.caBody)) cellSet(hit, true) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        },
     _ -> false,
 }
 
@@ -7109,12 +7337,14 @@ def buildParamTermSubst(ps: List VarDecl, args: List TaggedTerm): Option (List (
     }
 }
 
-/// Synthesize a pure boolean guard sufficient to guarantee `tm` evaluates without aborting/trapping,
-/// so a bound expression preceded by a quantifier-dependent guard (e.g. `0 <= i && dep(i, n) && i < positive(n)`)
-/// is never evaluated eagerly when its preconditions fail!
-def extractSafeEvalGuardList(ts: List TaggedTerm, rawFns: StrMap FunDef, depth: Int): Option TaggedTerm = match ts {
+/// Synthesize an exact pure boolean guard necessary & sufficient to guarantee `tm` evaluates without
+/// aborting/trapping (covering `if`, `let`, `match`, short-circuit `&&`/`||`, division, array/string
+/// indexing, and callee `requires`), so a bound expression preceded by a quantifier-dependent guard
+/// (e.g. `0 <= i && (i & mask) != 0 && i < (if (mask < 2) positive(mask) else 2)`) is NEVER evaluated
+/// eagerly when its taken branch's preconditions fail!
+def extractSafeEvalGuardList(ctx: KCtx, ts: List TaggedTerm, rawFns: StrMap FunDef, depth: Int): Option TaggedTerm = match ts {
     Nil -> Some(MkTerm { tspan: emptySpan(), tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) }),
-    Cons(h, r) -> match (extractSafeEvalGuard(h, rawFns, depth), extractSafeEvalGuardList(r, rawFns, depth)) {
+    Cons(h, r) -> match (extractSafeEvalGuard(ctx, h, rawFns, depth), extractSafeEvalGuardList(ctx, r, rawFns, depth)) {
         (Some(gh), Some(gr)) -> match (gh.tnode, gr.tnode) {
             (TmLit(LitBool(true)), _) -> Some(gr),
             (_, TmLit(LitBool(true))) -> Some(gh),
@@ -7130,46 +7360,134 @@ def combineSafeGuards(sp: Span, g1: TaggedTerm, g2: TaggedTerm): TaggedTerm = ma
     _ -> MkTerm { tspan: sp, tscm: ScmMono(TyCon("Bool")), tnode: TmBin(OpAnd, g1, g2) },
 }
 
-def extractSafeEvalGuard(tm: TaggedTerm, rawFns: StrMap FunDef, depth: Int): Option TaggedTerm =
+def extractSafeEvalGuard(ctx: KCtx, tm: TaggedTerm, rawFns: StrMap FunDef, depth: Int): Option TaggedTerm =
     if (isTriviallyTotalTerm(tm, rawFns, depth)) {
         Some(MkTerm { tspan: tm.tspan, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) })
-    } else if (depth > 4) {
+    } else if (depth > 6) {
         None
     } else {
         let boolScm = ScmMono(TyCon("Bool"));
         let intScm = ScmMono(TyCon("Int"));
+        let trueLit = MkTerm { tspan: tm.tspan, tscm: boolScm, tnode: TmLit(LitBool(true)) };
         let sp = tm.tspan;
         match tm.tnode {
-            TmTuple(es) -> extractSafeEvalGuardList(es, rawFns, depth),
-            TmBlock(es) -> extractSafeEvalGuardList(es, rawFns, depth),
-            TmMakeData(_, _, fs, _, _) -> extractSafeEvalGuardList(fs, rawFns, depth),
-            TmUn(_, e) -> extractSafeEvalGuard(e, rawFns, depth),
-            TmGetTag(e) -> extractSafeEvalGuard(e, rawFns, depth),
-            TmBin(op, l, r) -> match (extractSafeEvalGuard(l, rawFns, depth), extractSafeEvalGuard(r, rawFns, depth)) {
-                (Some(gl), Some(gr)) -> {
-                    let gBase = combineSafeGuards(sp, gl, gr);
-                    let isDivRem = match op { OpDiv -> true, OpRem -> true, _ -> false };
-                    if (isDivRem) {
-                        if (typesEqual(schemeBody(r.tscm), TyCon("Int"))) {
-                            let nz = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpNe, r, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) }) };
-                            let notMinOv = MkTerm {
-                                tspan: sp, tscm: boolScm,
-                                tnode: TmUn(UnNot, MkTerm {
-                                    tspan: sp, tscm: boolScm,
-                                    tnode: TmBin(
-                                        OpAnd,
-                                        MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpEq, l, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(-2147483647 - 1)) }) },
-                                        MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpEq, r, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0 - 1)) }) }
-                                    ),
-                                }),
-                            };
-                            Some(combineSafeGuards(sp, gBase, combineSafeGuards(sp, nz, notMinOv)))
-                        } else None
-                    } else Some(gBase)
+            TmTuple(es) -> extractSafeEvalGuardList(ctx, es, rawFns, depth),
+            TmBlock(es) -> extractSafeEvalGuardList(ctx, es, rawFns, depth),
+            TmMakeData(_, _, fs, _, _) -> extractSafeEvalGuardList(ctx, fs, rawFns, depth),
+            TmUn(_, e) -> extractSafeEvalGuard(ctx, e, rawFns, depth),
+            TmGetTag(e) -> extractSafeEvalGuard(ctx, e, rawFns, depth),
+            TmIf(c, t, e) -> match (
+                extractSafeEvalGuard(ctx, c, rawFns, depth),
+                extractSafeEvalGuard(ctx, t, rawFns, depth),
+                extractSafeEvalGuard(ctx, e, rawFns, depth)
+            ) {
+                (Some(gc), Some(gt), Some(ge)) -> {
+                    let brSafe = match (gt.tnode, ge.tnode) {
+                        (TmLit(LitBool(true)), TmLit(LitBool(true))) -> trueLit,
+                        _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(c, gt, ge) },
+                    };
+                    Some(combineSafeGuards(sp, gc, brSafe))
                 },
                 _ -> None,
             },
-            TmApplyDir(vd, args) -> match extractSafeEvalGuardList(args, rawFns, depth) {
+            TmLet(vd, v, b) -> {
+                let freshNm = "__gs_sfg_" + intToStr(kUnique(ctx));
+                let bFresh = substCaptureFreeTerm(ctx, b, Nil, [(vd.vname, freshNm)]);
+                match (extractSafeEvalGuard(ctx, v, rawFns, depth), extractSafeEvalGuard(ctx, bFresh, rawFns, depth)) {
+                    (Some(gv), Some(gb)) -> {
+                        let letSafe = match gb.tnode {
+                            TmLit(LitBool(true)) -> trueLit,
+                            _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: freshNm, vscm: vd.vscm }, v, gb) },
+                        };
+                        Some(combineSafeGuards(sp, gv, letSafe))
+                    },
+                    _ -> None,
+                }
+            },
+            TmMatch(s, arms) -> match extractSafeEvalGuard(ctx, s, rawFns, depth) {
+                None -> None,
+                Some(gs) -> {
+                    let safeArmsRev: Cell (List CoreArm) = cellNew(Nil);
+                    let ok = cellNew(true);
+                    let cur = cellNew(arms);
+                    while (cellGet(ok) && match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(a, r) -> {
+                                let (npat, armAlpha) = alphaRenamePat(ctx, a.caPat, Nil);
+                                let bodyFresh = substCaptureFreeTerm(ctx, a.caBody, Nil, armAlpha);
+                                match a.caGuard {
+                                    None -> match extractSafeEvalGuard(ctx, bodyFresh, rawFns, depth) {
+                                        Some(gb) -> cellSet(safeArmsRev, Cons(MkCoreArm { caPat: npat, caGuard: None, caBody: gb }, cellGet(safeArmsRev))),
+                                        None -> cellSet(ok, false),
+                                    },
+                                    Some(g0) -> {
+                                        let gFresh = substCaptureFreeTerm(ctx, g0, Nil, armAlpha);
+                                        match (extractSafeEvalGuard(ctx, gFresh, rawFns, depth), extractSafeEvalGuard(ctx, bodyFresh, rawFns, depth)) {
+                                            (Some(gg), Some(gb)) -> match gg.tnode {
+                                                TmLit(LitBool(true)) ->
+                                                    cellSet(safeArmsRev, Cons(MkCoreArm { caPat: npat, caGuard: Some(gFresh), caBody: gb }, cellGet(safeArmsRev))),
+                                                _ -> cellSet(ok, false),
+                                            },
+                                            _ -> cellSet(ok, false),
+                                        }
+                                    },
+                                };
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    if (!cellGet(ok)) None
+                    else Some(combineSafeGuards(sp, gs, MkTerm { tspan: sp, tscm: boolScm, tnode: TmMatch(s, listRev(cellGet(safeArmsRev))) }))
+                },
+            },
+            TmBin(op, l, r) -> match op {
+                OpAnd -> match (extractSafeEvalGuard(ctx, l, rawFns, depth), extractSafeEvalGuard(ctx, r, rawFns, depth)) {
+                    (Some(gl), Some(gr)) -> {
+                        let rhsSafe = match gr.tnode {
+                            TmLit(LitBool(true)) -> trueLit,
+                            _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(l, gr, trueLit) },
+                        };
+                        Some(combineSafeGuards(sp, gl, rhsSafe))
+                    },
+                    _ -> None,
+                },
+                OpOr -> match (extractSafeEvalGuard(ctx, l, rawFns, depth), extractSafeEvalGuard(ctx, r, rawFns, depth)) {
+                    (Some(gl), Some(gr)) -> {
+                        let rhsSafe = match gr.tnode {
+                            TmLit(LitBool(true)) -> trueLit,
+                            _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(l, trueLit, gr) },
+                        };
+                        Some(combineSafeGuards(sp, gl, rhsSafe))
+                    },
+                    _ -> None,
+                },
+                _ -> match (extractSafeEvalGuard(ctx, l, rawFns, depth), extractSafeEvalGuard(ctx, r, rawFns, depth)) {
+                    (Some(gl), Some(gr)) -> {
+                        let gBase = combineSafeGuards(sp, gl, gr);
+                        let isDivRem = match op { OpDiv -> true, OpRem -> true, _ -> false };
+                        if (isDivRem) {
+                            if (typesEqual(schemeBody(r.tscm), TyCon("Int"))) {
+                                let nz = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpNe, r, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) }) };
+                                let notMinOv = MkTerm {
+                                    tspan: sp, tscm: boolScm,
+                                    tnode: TmUn(UnNot, MkTerm {
+                                        tspan: sp, tscm: boolScm,
+                                        tnode: TmBin(
+                                            OpAnd,
+                                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpEq, l, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(-2147483647 - 1)) }) },
+                                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpEq, r, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0 - 1)) }) }
+                                        ),
+                                    }),
+                                };
+                                Some(combineSafeGuards(sp, gBase, combineSafeGuards(sp, nz, notMinOv)))
+                            } else None
+                        } else Some(gBase)
+                    },
+                    _ -> None,
+                },
+            },
+            TmApplyDir(vd, args) -> match extractSafeEvalGuardList(ctx, args, rawFns, depth) {
                 None -> None,
                 Some(gArgs) ->
                     if ((vd.vname == "arrayGet" || vd.vname == "immArrayGet") && listLen(args) == 2 && !strMapContains(rawFns, vd.vname)) {
@@ -7186,33 +7504,125 @@ def extractSafeEvalGuard(tm: TaggedTerm, rawFns: StrMap FunDef, depth: Int): Opt
                             },
                             _ -> None,
                         }
+                    } else if (vd.vname == "strByteAt" && listLen(args) == 2 && !strMapContains(rawFns, vd.vname)) {
+                        match args {
+                            Cons(strT, Cons(idxT, _)) -> {
+                                let lenCall = MkTerm {
+                                    tspan: sp, tscm: intScm,
+                                    tnode: TmApplyDir(MkVarDecl { vname: "strLen", vscm: ScmMono(TyArr(TyVoid, [TyCon("String")], TyCon("Int"))) }, [strT]),
+                                };
+                                let nonNeg = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, idxT, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) }) };
+                                let inLen = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLt, idxT, lenCall) };
+                                Some(combineSafeGuards(sp, gArgs, combineSafeGuards(sp, nonNeg, inLen)))
+                            },
+                            _ -> None,
+                        }
+                    } else if (vd.vname == "strSlice" && listLen(args) == 3 && !strMapContains(rawFns, vd.vname)) {
+                        match args {
+                            Cons(strT, Cons(aT, Cons(bT, _))) -> {
+                                let lenCall = MkTerm {
+                                    tspan: sp, tscm: intScm,
+                                    tnode: TmApplyDir(MkVarDecl { vname: "strLen", vscm: ScmMono(TyArr(TyVoid, [TyCon("String")], TyCon("Int"))) }, [strT]),
+                                };
+                                let c1 = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, aT, MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) }) };
+                                let c2 = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLe, aT, bT) };
+                                let c3 = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLe, bT, lenCall) };
+                                Some(combineSafeGuards(sp, gArgs, combineSafeGuards(sp, c1, combineSafeGuards(sp, c2, c3))))
+                            },
+                            _ -> None,
+                        }
                     } else match strMapGet(rawFns, vd.vname) {
                         Some(fd) -> match fd.fnFvs {
                             Nil -> match buildParamTermSubst(fd.fnParams, args) {
                                 Some(sub) ->
-                                    if (termHasShadowConflict(fd.fnBody, Nil)) None
+                                    if (termHasLoopOrCls(fd.fnBody)) None
                                     else {
-                                        let (reqs, coreB) = stripFnEnsuresWrapper(fd.fnBody);
-                                        let reqGuardAcc: Cell (Option TaggedTerm) = cellNew(Some(gArgs));
-                                        let cr = cellNew(reqs);
-                                        while (match (cellGet(reqGuardAcc), cellGet(cr)) { (Some(_), Cons(_, _)) -> true, _ -> false }) {
-                                            match cellGet(cr) {
-                                                Cons(rcRaw, rcr) -> {
-                                                    let rcSub = substSimpleTerm(rcRaw, sub);
-                                                    cellSet(reqGuardAcc, match (cellGet(reqGuardAcc), extractSafeEvalGuard(rcSub, rawFns, depth + 1)) {
-                                                        (Some(prevG), Some(rcSafe)) ->
-                                                            Some(combineSafeGuards(sp, prevG, combineSafeGuards(sp, rcSafe, rcSub))),
-                                                        _ -> None,
-                                                    });
-                                                    cellSet(cr, rcr)
+                                        let (reqs, decs, coreB, ensOk, ensConds) = stripFnContractParts(fd.fnBody);
+                                        if (!ensOk) None
+                                        else {
+                                            let falseLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(false)) };
+                                            let zeroIntLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) };
+                                            let guardCond = (prevOpt: Option TaggedTerm, cSub: TaggedTerm) -> match (prevOpt, extractSafeEvalGuard(ctx, cSub, rawFns, depth + 1)) {
+                                                (Some(prevG), Some(cSafe)) -> {
+                                                    let gc = match cSafe.tnode {
+                                                        TmLit(LitBool(true)) -> cSub,
+                                                        _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(cSafe, cSub, falseLit) },
+                                                    };
+                                                    Some(combineSafeGuards(sp, prevG, gc))
                                                 },
-                                                Nil -> (),
+                                                _ -> None,
+                                            };
+                                            let hdrGuardAcc: Cell (Option TaggedTerm) = cellNew(Some(gArgs));
+                                            let cr = cellNew(reqs);
+                                            while (match (cellGet(hdrGuardAcc), cellGet(cr)) { (Some(_), Cons(_, _)) -> true, _ -> false }) {
+                                                match cellGet(cr) {
+                                                    Cons(rcRaw, rcr) -> {
+                                                        let rcSub = substCaptureFreeTerm(ctx, rcRaw, sub, Nil);
+                                                        cellSet(hdrGuardAcc, guardCond(cellGet(hdrGuardAcc), rcSub));
+                                                        cellSet(cr, rcr)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            let cd = cellNew(decs);
+                                            while (match (cellGet(hdrGuardAcc), cellGet(cd)) { (Some(_), Cons(_, _)) -> true, _ -> false }) {
+                                                match cellGet(cd) {
+                                                    Cons(dcRaw, rcd) -> {
+                                                        let dcSub = substCaptureFreeTerm(ctx, dcRaw, sub, Nil);
+                                                        let dcNonNeg = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, dcSub, zeroIntLit) };
+                                                        cellSet(hdrGuardAcc, guardCond(cellGet(hdrGuardAcc), dcNonNeg));
+                                                        cellSet(cd, rcd)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            let subBody = substCaptureFreeTerm(ctx, coreB, sub, Nil);
+                                            match (cellGet(hdrGuardAcc), extractSafeEvalGuard(ctx, subBody, rawFns, depth + 1)) {
+                                                (Some(gHdrAll), Some(gBody)) -> {
+                                                    let ensPartOpt: Option TaggedTerm = match ensConds {
+                                                        Nil -> Some(gBody),
+                                                        _ -> {
+                                                            let resFresh = "__gs_sfg_res_" + intToStr(kUnique(ctx));
+                                                            let resVarT = MkTerm { tspan: sp, tscm: subBody.tscm, tnode: TmVar(resFresh) };
+                                                            let ensSub = Cons(("__gs_res", resVarT), sub);
+                                                            let ensAcc: Cell (Option TaggedTerm) = cellNew(Some(trueLit));
+                                                            let ce = cellNew(ensConds);
+                                                            while (match (cellGet(ensAcc), cellGet(ce)) { (Some(_), Cons(_, _)) -> true, _ -> false }) {
+                                                                match cellGet(ce) {
+                                                                    Cons(ecRaw, rce) -> {
+                                                                        let ecSub = substCaptureFreeTerm(ctx, ecRaw, ensSub, Nil);
+                                                                        cellSet(ensAcc, guardCond(cellGet(ensAcc), ecSub));
+                                                                        cellSet(ce, rce)
+                                                                    },
+                                                                    Nil -> (),
+                                                                }
+                                                            };
+                                                            match cellGet(ensAcc) {
+                                                                None -> None,
+                                                                Some(ensG) -> {
+                                                                    let letEns = MkTerm {
+                                                                        tspan: sp, tscm: boolScm,
+                                                                        tnode: TmLet(MkVarDecl { vname: resFresh, vscm: subBody.tscm }, subBody, ensG),
+                                                                    };
+                                                                    Some(match gBody.tnode {
+                                                                        TmLit(LitBool(true)) -> letEns,
+                                                                        _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(gBody, letEns, falseLit) },
+                                                                    })
+                                                                },
+                                                            }
+                                                        },
+                                                    };
+                                                    match ensPartOpt {
+                                                        None -> None,
+                                                        Some(postHdrG) -> Some(match (gHdrAll.tnode, postHdrG.tnode) {
+                                                            (_, TmLit(LitBool(true))) -> gHdrAll,
+                                                            (TmLit(LitBool(true)), _) -> postHdrG,
+                                                            _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(gHdrAll, postHdrG, falseLit) },
+                                                        }),
+                                                    }
+                                                },
+                                                _ -> None,
                                             }
-                                        };
-                                        let subBody = substSimpleTerm(coreB, sub);
-                                        match (cellGet(reqGuardAcc), extractSafeEvalGuard(subBody, rawFns, depth + 1)) {
-                                            (Some(gReqAll), Some(gBody)) -> Some(combineSafeGuards(sp, gReqAll, gBody)),
-                                            _ -> None,
                                         }
                                     },
                                 None -> None,
@@ -7226,31 +7636,145 @@ def extractSafeEvalGuard(tm: TaggedTerm, rawFns: StrMap FunDef, depth: Int): Opt
         }
     }
 
+def extractBitAndOperands(t: TaggedTerm, rawFns: StrMap FunDef): Option (TaggedTerm, TaggedTerm) = match t.tnode {
+    TmBin(OpBitAnd, a, b) -> Some((a, b)),
+    TmApplyDir(vd, Cons(a, Cons(b, Nil))) ->
+        if (vd.vname == "bitAnd" && !strMapContains(rawFns, "bitAnd")) Some((a, b)) else None,
+    _ -> None,
+}
+
+def extractShiftLhs(t: TaggedTerm, rawFns: StrMap FunDef): Option TaggedTerm = match t.tnode {
+    TmBin(OpShl, a, _) -> Some(a),
+    TmBin(OpShr, a, _) -> Some(a),
+    TmBin(OpUshr, a, _) -> Some(a),
+    TmApplyDir(vd, Cons(a, Cons(_, Nil))) ->
+        if ((vd.vname == "bitShl" || vd.vname == "bitShr" || vd.vname == "bitUshr") && !strMapContains(rawFns, vd.vname)) Some(a)
+        else None,
+    _ -> None,
+}
+
+/// When all prior conjuncts AND `cond` itself are trivially total (cannot abort/trap), extract exact
+/// binder-free necessary conditions implied by bitwise/multiplicative non-zero or equality guards
+/// (e.g. `(i & mask) != 0` ==> `mask != 0`, `(i & mask) == c` ==> `(c & mask) == c`) so vacuous domains
+/// short-circuit in O(1) without ever skipping any candidate integer when non-vacuous!
+def pushImpliedTotalBitGuards(
+    cond: TaggedTerm,
+    forbidVars: List String,
+    rawFns: StrMap FunDef,
+    stepsRev: Cell (List QuantBoundStepTerm)
+): Void = {
+    let boolScm = ScmMono(TyCon("Bool"));
+    let intScm = ScmMono(TyCon("Int"));
+    let sp = cond.tspan;
+    let zeroLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) };
+    let isZeroLit = (e: TaggedTerm) -> match e.tnode { TmLit(LitInt(0)) -> true, _ -> false };
+    let emitNonZeroIfFree = (x: TaggedTerm) -> {
+        if (!termMentionsAnyBound(x, forbidVars, Nil) && typesEqual(schemeBody(x.tscm), TyCon("Int"))) {
+            let nz = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpNe, x, zeroLit) };
+            cellSet(stepsRev, Cons(QbtGuardIndep(nz), cellGet(stepsRev)))
+        } else ();
+        match extractShiftLhs(x, rawFns) {
+            Some(shLhs) ->
+                if (!termMentionsAnyBound(shLhs, forbidVars, Nil) && typesEqual(schemeBody(shLhs.tscm), TyCon("Int"))) {
+                    let nz = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpNe, shLhs, zeroLit) };
+                    cellSet(stepsRev, Cons(QbtGuardIndep(nz), cellGet(stepsRev)))
+                } else (),
+            None -> (),
+        }
+    };
+    let checkNonZeroExpr = (e: TaggedTerm) -> {
+        emitNonZeroIfFree(e);
+        match extractBitAndOperands(e, rawFns) {
+            Some((a, b)) -> { emitNonZeroIfFree(a); emitNonZeroIfFree(b) },
+            None -> match e.tnode {
+                TmBin(OpMul, a, b) -> { emitNonZeroIfFree(a); emitNonZeroIfFree(b) },
+                _ -> (),
+            },
+        }
+    };
+    match cond.tnode {
+        TmBin(OpNe, l, r) ->
+            if (isZeroLit(r)) checkNonZeroExpr(l)
+            else if (isZeroLit(l)) checkNonZeroExpr(r)
+            else (),
+        TmBin(OpGt, l, r) ->
+            if (isZeroLit(r)) checkNonZeroExpr(l) else (),
+        TmBin(OpLt, l, r) ->
+            if (isZeroLit(l)) checkNonZeroExpr(r) else (),
+        TmBin(OpEq, l, r) -> {
+            let checkAndEqConst = (andT: TaggedTerm, cT: TaggedTerm) ->
+                if (!termMentionsAnyBound(cT, forbidVars, Nil) && typesEqual(schemeBody(cT.tscm), TyCon("Int"))) {
+                    match extractBitAndOperands(andT, rawFns) {
+                        Some((a, b)) -> {
+                            if (!termMentionsAnyBound(b, forbidVars, Nil)) {
+                                let imp = MkTerm {
+                                    tspan: sp, tscm: boolScm,
+                                    tnode: TmBin(OpEq, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpBitAnd, cT, b) }, cT),
+                                };
+                                cellSet(stepsRev, Cons(QbtGuardIndep(imp), cellGet(stepsRev)))
+                            } else ();
+                            if (!termMentionsAnyBound(a, forbidVars, Nil)) {
+                                let imp = MkTerm {
+                                    tspan: sp, tscm: boolScm,
+                                    tnode: TmBin(OpEq, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpBitAnd, cT, a) }, cT),
+                                };
+                                cellSet(stepsRev, Cons(QbtGuardIndep(imp), cellGet(stepsRev)))
+                            } else ()
+                        },
+                        None -> (),
+                    }
+                } else ();
+            checkAndEqConst(l, r);
+            checkAndEqConst(r, l)
+        },
+        _ -> (),
+    }
+}
+
 def collectIntQuantStepsTerm(
+    ctx: KCtx,
     cond: TaggedTerm,
     qvar: String,
     innerQVars: List String,
     rawFns: StrMap FunDef,
     seenDep: Cell Bool,
+    seenPartial: Cell Bool,
     stepsRev: Cell (List QuantBoundStepTerm),
     unfoldDepth: Int
 ): Void = {
     let forbidVars = Cons(qvar, innerQVars);
+    let notePartial = (t: TaggedTerm) -> {
+        if (!isTriviallyTotalTerm(t, rawFns, 0)) cellSet(seenPartial, true) else ()
+    };
+    let pushIndepGuardIfSafe = (g: TaggedTerm) -> {
+        // Before any `qvar`-dependent condition (`!seenDep`), left-to-right evaluation always runs `g` first.
+        // After a `qvar`-dependent condition (`seenDep`), `g` may ONLY hoist if every prior conjunct AND `g`
+        // itself are trivially total (`!seenPartial && isTriviallyTotalTerm(g)`), fixing Astra Round 3 P1 #2!
+        if (!cellGet(seenDep)) {
+            cellSet(stepsRev, Cons(QbtGuardIndep(g), cellGet(stepsRev)));
+            notePartial(g)
+        } else if (!cellGet(seenPartial) && isTriviallyTotalTerm(g, rawFns, 0)) {
+            cellSet(stepsRev, Cons(QbtGuardIndep(g), cellGet(stepsRev)))
+        } else {
+            notePartial(g)
+        }
+    };
     match cond.tnode {
         TmBin(OpAnd, l, r) -> {
-            collectIntQuantStepsTerm(l, qvar, innerQVars, rawFns, seenDep, stepsRev, unfoldDepth);
-            collectIntQuantStepsTerm(r, qvar, innerQVars, rawFns, seenDep, stepsRev, unfoldDepth)
+            collectIntQuantStepsTerm(ctx, l, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, unfoldDepth);
+            collectIntQuantStepsTerm(ctx, r, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, unfoldDepth)
         },
         TmIf(c, t, el) -> match el.tnode {
             TmLit(LitBool(false)) -> {
-                collectIntQuantStepsTerm(c, qvar, innerQVars, rawFns, seenDep, stepsRev, unfoldDepth);
-                collectIntQuantStepsTerm(t, qvar, innerQVars, rawFns, seenDep, stepsRev, unfoldDepth)
+                collectIntQuantStepsTerm(ctx, c, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, unfoldDepth);
+                collectIntQuantStepsTerm(ctx, t, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, unfoldDepth)
             },
             _ ->
                 if (!termMentionsAnyBound(cond, forbidVars, Nil)) {
-                    cellSet(stepsRev, Cons(QbtGuardIndep(cond), cellGet(stepsRev)))
+                    pushIndepGuardIfSafe(cond)
                 } else {
-                    cellSet(seenDep, true)
+                    cellSet(seenDep, true);
+                    notePartial(cond)
                 },
         },
         TmBin(op, l, r) -> {
@@ -7259,65 +7783,71 @@ def collectIntQuantStepsTerm(
             let curDep = cellGet(seenDep);
             if (lIsVar && !termMentionsAnyBound(r, forbidVars, Nil)) {
                 match op {
-                    OpGe -> cellSet(stepsRev, Cons(QbtLo(r, false, curDep), cellGet(stepsRev))),
-                    OpGt -> cellSet(stepsRev, Cons(QbtLo(r, true, curDep), cellGet(stepsRev))),
-                    OpLt -> cellSet(stepsRev, Cons(QbtHi(r, false, curDep), cellGet(stepsRev))),
-                    OpLe -> cellSet(stepsRev, Cons(QbtHi(r, true, curDep), cellGet(stepsRev))),
-                    _ -> cellSet(seenDep, true),
+                    OpGe -> { cellSet(stepsRev, Cons(QbtLo(r, false, curDep), cellGet(stepsRev))); notePartial(r) },
+                    OpGt -> { cellSet(stepsRev, Cons(QbtLo(r, true, curDep), cellGet(stepsRev))); notePartial(r) },
+                    OpLt -> { cellSet(stepsRev, Cons(QbtHi(r, false, curDep), cellGet(stepsRev))); notePartial(r) },
+                    OpLe -> { cellSet(stepsRev, Cons(QbtHi(r, true, curDep), cellGet(stepsRev))); notePartial(r) },
+                    _ -> { cellSet(seenDep, true); notePartial(cond) },
                 }
             } else if (rIsVar && !termMentionsAnyBound(l, forbidVars, Nil)) {
                 match op {
-                    OpLe -> cellSet(stepsRev, Cons(QbtLo(l, false, curDep), cellGet(stepsRev))),
-                    OpLt -> cellSet(stepsRev, Cons(QbtLo(l, true, curDep), cellGet(stepsRev))),
-                    OpGt -> cellSet(stepsRev, Cons(QbtHi(l, false, curDep), cellGet(stepsRev))),
-                    OpGe -> cellSet(stepsRev, Cons(QbtHi(l, true, curDep), cellGet(stepsRev))),
-                    _ -> cellSet(seenDep, true),
+                    OpLe -> { cellSet(stepsRev, Cons(QbtLo(l, false, curDep), cellGet(stepsRev))); notePartial(l) },
+                    OpLt -> { cellSet(stepsRev, Cons(QbtLo(l, true, curDep), cellGet(stepsRev))); notePartial(l) },
+                    OpGt -> { cellSet(stepsRev, Cons(QbtHi(l, false, curDep), cellGet(stepsRev))); notePartial(l) },
+                    OpGe -> { cellSet(stepsRev, Cons(QbtHi(l, true, curDep), cellGet(stepsRev))); notePartial(l) },
+                    _ -> { cellSet(seenDep, true); notePartial(cond) },
                 }
             } else if (!termMentionsAnyBound(cond, forbidVars, Nil)) {
-                cellSet(stepsRev, Cons(QbtGuardIndep(cond), cellGet(stepsRev)))
+                pushIndepGuardIfSafe(cond)
             } else {
-                cellSet(seenDep, true)
+                if (!cellGet(seenPartial) && isTriviallyTotalTerm(cond, rawFns, 0)) {
+                    pushImpliedTotalBitGuards(cond, forbidVars, rawFns, stepsRev)
+                } else ();
+                cellSet(seenDep, true);
+                notePartial(cond)
             }
         },
         TmApplyDir(vd, args) ->
             if (!termMentionsAnyBound(cond, forbidVars, Nil)) {
-                cellSet(stepsRev, Cons(QbtGuardIndep(cond), cellGet(stepsRev)))
+                pushIndepGuardIfSafe(cond)
             } else if (unfoldDepth < 2) {
                 match strMapGet(rawFns, vd.vname) {
-                    Some(fd) -> {
-                        let (reqs, coreB) = stripFnEnsuresWrapper(fd.fnBody);
-                        match (fd.fnFvs, reqs, buildParamTermSubst(fd.fnParams, args)) {
-                            (Nil, Nil, Some(sub)) ->
-                                if (!termHasShadowConflict(coreB, forbidVars) && isTriviallyTotalTerm(coreB, rawFns, 0)) {
-                                    let inl = substSimpleTerm(coreB, sub);
-                                    collectIntQuantStepsTerm(inl, qvar, innerQVars, rawFns, seenDep, stepsRev, unfoldDepth + 1)
-                                } else {
-                                    cellSet(seenDep, true)
-                                },
-                            _ -> cellSet(seenDep, true),
-                        }
+                    Some(fd) -> match (fd.fnFvs, buildParamTermSubst(fd.fnParams, args)) {
+                        (Nil, Some(sub)) ->
+                            if (!termHasLoopOrCls(fd.fnBody) && isTriviallyTotalTerm(fd.fnBody, rawFns, 0) && isTriviallyTotalTermList(args, rawFns, 0)) {
+                                let inl = substCaptureFreeTerm(ctx, fd.fnBody, sub, Nil);
+                                collectIntQuantStepsTerm(ctx, inl, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, unfoldDepth + 1)
+                            } else {
+                                cellSet(seenDep, true);
+                                notePartial(cond)
+                            },
+                        _ -> { cellSet(seenDep, true); notePartial(cond) },
                     },
-                    None -> cellSet(seenDep, true),
+                    None -> { cellSet(seenDep, true); notePartial(cond) },
                 }
             } else {
-                cellSet(seenDep, true)
+                cellSet(seenDep, true);
+                notePartial(cond)
             },
         _ ->
             if (!termMentionsAnyBound(cond, forbidVars, Nil)) {
-                cellSet(stepsRev, Cons(QbtGuardIndep(cond), cellGet(stepsRev)))
+                pushIndepGuardIfSafe(cond)
             } else {
-                cellSet(seenDep, true)
+                cellSet(seenDep, true);
+                notePartial(cond)
             },
     }
 }
 
 def peelAndCollectIntQuantStepsTerm(
+    ctx: KCtx,
     isForall: Bool,
     body: TaggedTerm,
     qvar: String,
     innerQVars: List String,
     rawFns: StrMap FunDef,
     seenDep: Cell Bool,
+    seenPartial: Cell Bool,
     stepsRev: Cell (List QuantBoundStepTerm)
 ): Void = {
     let nestedOpt: Option (String, TaggedTerm) = match body.tnode {
@@ -7333,28 +7863,28 @@ def peelAndCollectIntQuantStepsTerm(
     match nestedOpt {
         Some((ivName, innerB)) ->
             if (ivName == qvar) ()
-            else peelAndCollectIntQuantStepsTerm(isForall, innerB, qvar, Cons(ivName, innerQVars), rawFns, seenDep, stepsRev),
+            else peelAndCollectIntQuantStepsTerm(ctx, isForall, innerB, qvar, Cons(ivName, innerQVars), rawFns, seenDep, seenPartial, stepsRev),
         None ->
             if (isForall) {
                 match body.tnode {
                     TmIf(guardT, thT, elT) -> match elT.tnode {
                         TmLit(LitBool(true)) -> {
-                            collectIntQuantStepsTerm(guardT, qvar, innerQVars, rawFns, seenDep, stepsRev, 0);
-                            peelAndCollectIntQuantStepsTerm(true, thT, qvar, innerQVars, rawFns, seenDep, stepsRev)
+                            collectIntQuantStepsTerm(ctx, guardT, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, 0);
+                            peelAndCollectIntQuantStepsTerm(ctx, true, thT, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev)
                         },
                         _ -> (),
                     },
                     TmBin(OpOr, negG, thT) -> match negG.tnode {
                         TmUn(UnNot, guardT) -> {
-                            collectIntQuantStepsTerm(guardT, qvar, innerQVars, rawFns, seenDep, stepsRev, 0);
-                            peelAndCollectIntQuantStepsTerm(true, thT, qvar, innerQVars, rawFns, seenDep, stepsRev)
+                            collectIntQuantStepsTerm(ctx, guardT, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, 0);
+                            peelAndCollectIntQuantStepsTerm(ctx, true, thT, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev)
                         },
                         _ -> (),
                     },
                     _ -> (),
                 }
             } else {
-                collectIntQuantStepsTerm(body, qvar, innerQVars, rawFns, seenDep, stepsRev, 0)
+                collectIntQuantStepsTerm(ctx, body, qvar, innerQVars, rawFns, seenDep, seenPartial, stepsRev, 0)
             },
     }
 }
@@ -7368,6 +7898,20 @@ def recordUnboundedQuantCheckErr(ctx: KCtx, sp: Span, isForall: Bool, vd: VarDec
             sp,
             "cannot execute unbounded `" + qkw + "` quantifier over `" + typeToString(bty) + "` in `--contracts=check` mode",
             "provide finite `Int` lower and upper bounds (e.g. `0 <= " + vd.vname + " && " + vd.vname + " < n`), use `geisha verify`, or compile with `--contracts=erase`"
+        ))),
+        Some(_) -> (),
+    };
+    MkTerm { tspan: sp, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) }
+}
+
+def recordUnsafeDepBoundCheckErr(ctx: KCtx, sp: Span, isForall: Bool, vd: VarDecl): TaggedTerm = {
+    let qkw = if (isForall) "forall" else "exists";
+    match cellGet(ctx.kErr) {
+        None -> cellSet(ctx.kErr, Some(formatSpanDiagHint(
+            "contract",
+            sp,
+            "cannot safely hoist `" + qkw + "` bound in `--contracts=check` mode when preceded by a `" + vd.vname + "`-dependent guard",
+            "place `" + vd.vname + "` range bounds before `" + vd.vname + "`-dependent predicates, add a total outer cap (e.g. `&& " + vd.vname + " < cap`), or compile with `--contracts=erase`"
         ))),
         Some(_) -> (),
     };
@@ -7463,10 +8007,13 @@ def lowerQuantifierTermForCheck(
         TyCon("Int") -> {
             let stepsRev: Cell (List QuantBoundStepTerm) = cellNew(Nil);
             let seenDep = cellNew(false);
-            peelAndCollectIntQuantStepsTerm(isForall, qbodyRaw, vd.vname, Nil, cctx.clRawFns, seenDep, stepsRev);
+            let seenPartial = cellNew(false);
+            peelAndCollectIntQuantStepsTerm(ctx, isForall, qbodyRaw, vd.vname, Nil, cctx.clRawFns, seenDep, seenPartial, stepsRev);
             let steps = listRev(cellGet(stepsRev));
-            let loPick: Cell (Option (Int, TaggedTerm, Bool, Bool)) = cellNew(None);
-            let hiPick: Cell (Option (Int, TaggedTerm, Bool, Bool)) = cellNew(None);
+            let loPick: Cell (Option (Int, TaggedTerm, Bool, Bool, Option TaggedTerm)) = cellNew(None);
+            let hiPick: Cell (Option (Int, TaggedTerm, Bool, Bool, Option TaggedTerm)) = cellNew(None);
+            let sawAnyLo = cellNew(false);
+            let sawAnyHi = cellNew(false);
             let sIdx = cellNew(0);
             let cs = cellNew(steps);
             while (match cellGet(cs) { Nil -> false, _ -> true }) {
@@ -7474,13 +8021,35 @@ def lowerQuantifierTermForCheck(
                     Cons(stp, rs) -> {
                         let k = cellGet(sIdx);
                         match stp {
-                            QbtLo(lf, ls, depB) -> match cellGet(loPick) {
-                                None -> cellSet(loPick, Some((k, lf, ls, depB))),
-                                Some(_) -> (),
+                            QbtLo(lf, ls, depB) -> {
+                                cellSet(sawAnyLo, true);
+                                match cellGet(loPick) {
+                                    None ->
+                                        if (!depB || isTriviallyTotalTerm(lf, cctx.clRawFns, 0)) {
+                                            cellSet(loPick, Some((k, lf, ls, false, None)))
+                                        } else {
+                                            match extractSafeEvalGuard(ctx, lf, cctx.clRawFns, 0) {
+                                                Some(sg) -> cellSet(loPick, Some((k, lf, ls, true, Some(sg)))),
+                                                None -> (),
+                                            }
+                                        },
+                                    Some(_) -> (),
+                                }
                             },
-                            QbtHi(hf, hi, depB) -> match cellGet(hiPick) {
-                                None -> cellSet(hiPick, Some((k, hf, hi, depB))),
-                                Some(_) -> (),
+                            QbtHi(hf, hi, depB) -> {
+                                cellSet(sawAnyHi, true);
+                                match cellGet(hiPick) {
+                                    None ->
+                                        if (!depB || isTriviallyTotalTerm(hf, cctx.clRawFns, 0)) {
+                                            cellSet(hiPick, Some((k, hf, hi, false, None)))
+                                        } else {
+                                            match extractSafeEvalGuard(ctx, hf, cctx.clRawFns, 0) {
+                                                Some(sg) -> cellSet(hiPick, Some((k, hf, hi, true, Some(sg)))),
+                                                None -> (),
+                                            }
+                                        },
+                                    Some(_) -> (),
+                                }
                             },
                             QbtGuardIndep(_) -> (),
                         };
@@ -7491,7 +8060,7 @@ def lowerQuantifierTermForCheck(
                 }
             };
             match (cellGet(loPick), cellGet(hiPick)) {
-                (Some((loIdx, loRaw, loStrict0, loDep)), Some((hiIdx, hiRaw, hiIncl0, hiDep))) -> {
+                (Some((loIdx, loRaw, loStrict0, loGuarded, loSafeGOpt)), Some((hiIdx, hiRaw, hiIncl0, hiGuarded, hiSafeGOpt))) -> {
                     let cellIntScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Int")));
                     let cellBoolScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Bool")));
                     let tbody = lowerContractsInTerm(cctx, qbodyRaw);
@@ -7500,6 +8069,8 @@ def lowerQuantifierTermForCheck(
                     let hiName = "__gs_qhi_" + intToStr(kUnique(ctx));
                     let loStrName = "__gs_qls_" + intToStr(kUnique(ctx));
                     let hiIncName = "__gs_qhi_inc_" + intToStr(kUnique(ctx));
+                    let loOkName = "__gs_qlo_ok_" + intToStr(kUnique(ctx));
+                    let hiOkName = "__gs_qhi_ok_" + intToStr(kUnique(ctx));
                     let idxName = "__gs_qi_" + intToStr(kUnique(ctx));
                     let resName = "__gs_qr_" + intToStr(kUnique(ctx));
                     let doneName = "__gs_qdone_" + intToStr(kUnique(ctx));
@@ -7508,6 +8079,8 @@ def lowerQuantifierTermForCheck(
                     let hiVar = MkTerm { tspan: sp, tscm: intScm, tnode: TmVar(hiName) };
                     let loStrVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(loStrName) };
                     let hiIncVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(hiIncName) };
+                    let loOkVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(loOkName) };
+                    let hiOkVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(hiOkName) };
                     let idxVar = MkTerm { tspan: sp, tscm: cellIntScm, tnode: TmVar(idxName) };
                     let resVar = MkTerm { tspan: sp, tscm: cellBoolScm, tnode: TmVar(resName) };
                     let doneVar = MkTerm { tspan: sp, tscm: cellBoolScm, tnode: TmVar(doneName) };
@@ -7515,9 +8088,13 @@ def lowerQuantifierTermForCheck(
                     let oneLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(1)) };
                     let maxIntLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(2147483647)) };
                     let minIntLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(-2147483647 - 1)) };
+                    let canIncLo = MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmBin(OpAnd, loStrVar, MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLt, loVar, maxIntLit) }),
+                    };
                     let startVal = MkTerm {
                         tspan: sp, tscm: intScm,
-                        tnode: TmIf(loStrVar, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, loVar, oneLit) }, loVar),
+                        tnode: TmIf(canIncLo, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, loVar, oneLit) }, loVar),
                     };
                     let emptyStrictExcl = MkTerm {
                         tspan: sp, tscm: boolScm,
@@ -7569,13 +8146,14 @@ def lowerQuantifierTermForCheck(
                     let onHit = MkTerm { tspan: sp, tscm: voidScm, tnode: TmBlock([setResFlip, setDoneTrue]) };
                     let stepChk = MkTerm { tspan: sp, tscm: voidScm, tnode: TmIf(chkCond, onHit, mkUnitTerm(sp)) };
 
-                    let incI = MkTerm {
+                    let setI = (valT: TaggedTerm) -> MkTerm {
                         tspan: sp, tscm: voidScm,
                         tnode: TmApplyDir(
                             MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int")), TyCon("Int")], TyVoid)) },
-                            [idxVar, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, getI(), oneLit) }]
+                            [idxVar, valT]
                         ),
                     };
+                    let incI = setI(MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, getI(), oneLit) });
                     let stopAtEnd = MkTerm {
                         tspan: sp, tscm: boolScm,
                         tnode: TmIf(
@@ -7585,6 +8163,7 @@ def lowerQuantifierTermForCheck(
                         ),
                     };
                     let advTerm = MkTerm { tspan: sp, tscm: voidScm, tnode: TmIf(stopAtEnd, setDoneTrue, incI) };
+
                     let inBound = MkTerm {
                         tspan: sp, tscm: boolScm,
                         tnode: TmIf(
@@ -7644,9 +8223,9 @@ def lowerQuantifierTermForCheck(
                             Cons(stItem, rSteps) -> {
                                 let k = cellGet(pIdx);
                                 if (k == loIdx) {
-                                    cellSet(selectedRev, Cons(QbtLo(loRaw, loStrict0, loDep), cellGet(selectedRev)))
+                                    cellSet(selectedRev, Cons(QbtLo(loRaw, loStrict0, loGuarded), cellGet(selectedRev)))
                                 } else if (k == hiIdx) {
-                                    cellSet(selectedRev, Cons(QbtHi(hiRaw, hiIncl0, hiDep), cellGet(selectedRev)))
+                                    cellSet(selectedRev, Cons(QbtHi(hiRaw, hiIncl0, hiGuarded), cellGet(selectedRev)))
                                 } else {
                                     match stItem {
                                         QbtGuardIndep(gf) -> cellSet(selectedRev, Cons(QbtGuardIndep(gf), cellGet(selectedRev))),
@@ -7659,126 +8238,110 @@ def lowerQuantifierTermForCheck(
                             Nil -> (),
                         }
                     };
+                    let trueTerm = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) };
+                    let falseTerm = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(false)) };
                     let wrapped = cellNew(loopInner);
                     let cWrap = cellNew(cellGet(selectedRev));
                     while (match cellGet(cWrap) { Nil -> false, _ -> true }) {
                         match cellGet(cWrap) {
                             Cons(wStep, rWrap) -> {
                                 match wStep {
-                                    QbtLo(lf, lStrict, lDep) -> {
+                                    QbtLo(lf, lStrict, lGuarded) -> {
                                         let lt = lowerContractsInTerm(cctx, lf);
                                         let lStrLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(lStrict)) };
-                                        if (lDep && !isTriviallyTotalTerm(lf, cctx.clRawFns, 0)) {
-                                            match extractSafeEvalGuard(lf, cctx.clRawFns, 0) {
-                                                Some(safeG0) -> {
-                                                    let safeG = lowerContractsInTerm(cctx, safeG0);
-                                                    let okNm = "__gs_qlo_ok_" + intToStr(kUnique(ctx));
-                                                    let okVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(okNm) };
-                                                    let safeLo = MkTerm { tspan: sp, tscm: intScm, tnode: TmIf(okVar, lt, minIntLit) };
-                                                    let safeStr = MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(okVar, lStrLit, MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(false)) }) };
-                                                    cellSet(wrapped, MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(
-                                                            MkVarDecl { vname: okNm, vscm: boolScm },
-                                                            safeG,
-                                                            MkTerm {
-                                                                tspan: sp, tscm: boolScm,
-                                                                tnode: TmLet(
-                                                                    MkVarDecl { vname: loName, vscm: intScm },
-                                                                    safeLo,
-                                                                    MkTerm {
-                                                                        tspan: sp, tscm: boolScm,
-                                                                        tnode: TmLet(MkVarDecl { vname: loStrName, vscm: boolScm }, safeStr, cellGet(wrapped)),
-                                                                    }
-                                                                ),
-                                                            }
-                                                        ),
-                                                    })
-                                                },
-                                                None -> {
-                                                    cellSet(wrapped, MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(
-                                                            MkVarDecl { vname: loName, vscm: intScm },
-                                                            lt,
-                                                            MkTerm {
-                                                                tspan: sp, tscm: boolScm,
-                                                                tnode: TmLet(MkVarDecl { vname: loStrName, vscm: boolScm }, lStrLit, cellGet(wrapped)),
-                                                            }
-                                                        ),
-                                                    })
-                                                },
-                                            }
-                                        } else {
-                                            cellSet(wrapped, MkTerm {
-                                                tspan: sp, tscm: boolScm,
-                                                tnode: TmLet(
-                                                    MkVarDecl { vname: loName, vscm: intScm },
-                                                    lt,
-                                                    MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(MkVarDecl { vname: loStrName, vscm: boolScm }, lStrLit, cellGet(wrapped)),
-                                                    }
-                                                ),
-                                            })
+                                        match (lGuarded, loSafeGOpt) {
+                                            (true, Some(safeG0)) -> {
+                                                let safeG = lowerContractsInTerm(cctx, safeG0);
+                                                let safeLo = MkTerm { tspan: sp, tscm: intScm, tnode: TmIf(loOkVar, lt, minIntLit) };
+                                                let safeStr = MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(loOkVar, lStrLit, falseTerm) };
+                                                cellSet(wrapped, MkTerm {
+                                                    tspan: sp, tscm: boolScm,
+                                                    tnode: TmLet(
+                                                        MkVarDecl { vname: loOkName, vscm: boolScm },
+                                                        safeG,
+                                                        MkTerm {
+                                                            tspan: sp, tscm: boolScm,
+                                                            tnode: TmLet(
+                                                                MkVarDecl { vname: loName, vscm: intScm },
+                                                                safeLo,
+                                                                MkTerm {
+                                                                    tspan: sp, tscm: boolScm,
+                                                                    tnode: TmLet(MkVarDecl { vname: loStrName, vscm: boolScm }, safeStr, cellGet(wrapped)),
+                                                                }
+                                                            ),
+                                                        }
+                                                    ),
+                                                })
+                                            },
+                                            _ -> {
+                                                cellSet(wrapped, MkTerm {
+                                                    tspan: sp, tscm: boolScm,
+                                                    tnode: TmLet(
+                                                        MkVarDecl { vname: loOkName, vscm: boolScm },
+                                                        trueTerm,
+                                                        MkTerm {
+                                                            tspan: sp, tscm: boolScm,
+                                                            tnode: TmLet(
+                                                                MkVarDecl { vname: loName, vscm: intScm },
+                                                                lt,
+                                                                MkTerm {
+                                                                    tspan: sp, tscm: boolScm,
+                                                                    tnode: TmLet(MkVarDecl { vname: loStrName, vscm: boolScm }, lStrLit, cellGet(wrapped)),
+                                                                }
+                                                            ),
+                                                        }
+                                                    ),
+                                                })
+                                            },
                                         }
                                     },
-                                    QbtHi(hf, hIncl, hDep) -> {
+                                    QbtHi(hf, hIncl, hGuarded) -> {
                                         let ht = lowerContractsInTerm(cctx, hf);
                                         let hIncLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(hIncl)) };
-                                        if (hDep && !isTriviallyTotalTerm(hf, cctx.clRawFns, 0)) {
-                                            match extractSafeEvalGuard(hf, cctx.clRawFns, 0) {
-                                                Some(safeG0) -> {
-                                                    let safeG = lowerContractsInTerm(cctx, safeG0);
-                                                    let okNm = "__gs_qhi_ok_" + intToStr(kUnique(ctx));
-                                                    let okVar = MkTerm { tspan: sp, tscm: boolScm, tnode: TmVar(okNm) };
-                                                    let safeHi = MkTerm { tspan: sp, tscm: intScm, tnode: TmIf(okVar, ht, maxIntLit) };
-                                                    let safeInc = MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(okVar, hIncLit, MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) }) };
-                                                    cellSet(wrapped, MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(
-                                                            MkVarDecl { vname: okNm, vscm: boolScm },
-                                                            safeG,
-                                                            MkTerm {
-                                                                tspan: sp, tscm: boolScm,
-                                                                tnode: TmLet(
-                                                                    MkVarDecl { vname: hiName, vscm: intScm },
-                                                                    safeHi,
-                                                                    MkTerm {
-                                                                        tspan: sp, tscm: boolScm,
-                                                                        tnode: TmLet(MkVarDecl { vname: hiIncName, vscm: boolScm }, safeInc, cellGet(wrapped)),
-                                                                    }
-                                                                ),
-                                                            }
-                                                        ),
-                                                    })
-                                                },
-                                                None -> {
-                                                    cellSet(wrapped, MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(
-                                                            MkVarDecl { vname: hiName, vscm: intScm },
-                                                            ht,
-                                                            MkTerm {
-                                                                tspan: sp, tscm: boolScm,
-                                                                tnode: TmLet(MkVarDecl { vname: hiIncName, vscm: boolScm }, hIncLit, cellGet(wrapped)),
-                                                            }
-                                                        ),
-                                                    })
-                                                },
-                                            }
-                                        } else {
-                                            cellSet(wrapped, MkTerm {
-                                                tspan: sp, tscm: boolScm,
-                                                tnode: TmLet(
-                                                    MkVarDecl { vname: hiName, vscm: intScm },
-                                                    ht,
-                                                    MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(MkVarDecl { vname: hiIncName, vscm: boolScm }, hIncLit, cellGet(wrapped)),
-                                                    }
-                                                ),
-                                            })
+                                        match (hGuarded, hiSafeGOpt) {
+                                            (true, Some(safeG0)) -> {
+                                                let safeG = lowerContractsInTerm(cctx, safeG0);
+                                                let safeHi = MkTerm { tspan: sp, tscm: intScm, tnode: TmIf(hiOkVar, ht, maxIntLit) };
+                                                let safeInc = MkTerm { tspan: sp, tscm: boolScm, tnode: TmIf(hiOkVar, hIncLit, trueTerm) };
+                                                cellSet(wrapped, MkTerm {
+                                                    tspan: sp, tscm: boolScm,
+                                                    tnode: TmLet(
+                                                        MkVarDecl { vname: hiOkName, vscm: boolScm },
+                                                        safeG,
+                                                        MkTerm {
+                                                            tspan: sp, tscm: boolScm,
+                                                            tnode: TmLet(
+                                                                MkVarDecl { vname: hiName, vscm: intScm },
+                                                                safeHi,
+                                                                MkTerm {
+                                                                    tspan: sp, tscm: boolScm,
+                                                                    tnode: TmLet(MkVarDecl { vname: hiIncName, vscm: boolScm }, safeInc, cellGet(wrapped)),
+                                                                }
+                                                            ),
+                                                        }
+                                                    ),
+                                                })
+                                            },
+                                            _ -> {
+                                                cellSet(wrapped, MkTerm {
+                                                    tspan: sp, tscm: boolScm,
+                                                    tnode: TmLet(
+                                                        MkVarDecl { vname: hiOkName, vscm: boolScm },
+                                                        trueTerm,
+                                                        MkTerm {
+                                                            tspan: sp, tscm: boolScm,
+                                                            tnode: TmLet(
+                                                                MkVarDecl { vname: hiName, vscm: intScm },
+                                                                ht,
+                                                                MkTerm {
+                                                                    tspan: sp, tscm: boolScm,
+                                                                    tnode: TmLet(MkVarDecl { vname: hiIncName, vscm: boolScm }, hIncLit, cellGet(wrapped)),
+                                                                }
+                                                            ),
+                                                        }
+                                                    ),
+                                                })
+                                            },
                                         }
                                     },
                                     QbtGuardIndep(gf) -> {
@@ -7797,7 +8360,9 @@ def lowerQuantifierTermForCheck(
                     };
                     cellGet(wrapped)
                 },
-                _ -> recordUnboundedQuantCheckErr(ctx, sp, isForall, vd),
+                _ ->
+                    if (cellGet(sawAnyLo) && cellGet(sawAnyHi)) recordUnsafeDepBoundCheckErr(ctx, sp, isForall, vd)
+                    else recordUnboundedQuantCheckErr(ctx, sp, isForall, vd),
             }
         },
         _ -> {
