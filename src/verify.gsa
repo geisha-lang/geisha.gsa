@@ -4409,7 +4409,7 @@ def evalUserOrUnknownCallDir(
                                 stArrLens: stBase.stArrLens, stArrMems: stBase.stArrMems,
                                 stDataTags: stGEnd.stDataTags, stDataCtorTags: stGEnd.stDataCtorTags,
                                 stDataFields: stGEnd.stDataFields,
-                                stPath: stBase.stPath, stUserVars: stGEnd.stUserVars,
+                                stPath: stGEnd.stPath, stUserVars: stGEnd.stUserVars,
                             };
                             (stGRestored, cellGet(conjOpt))
                         },
@@ -4424,6 +4424,7 @@ def evalUserOrUnknownCallDir(
                         Some(rsort) -> {
                             if (allowPureReflect && !listHasStr(ctx.vcUnfoldStack, nm) && (isPureSmtIteType(ctx, retTy) || isStringType(retTy))) {
                                 let (stDom, domOpt) = evalCalleeDomainGuard(stAfterMut);
+                                let qBaseLen = listLen(stDom.stPath);
                                 let qUnfoldIn = MkSymState {
                                     stDecls: stDom.stDecls,
                                     stVars: cellGet(calleeVars),
@@ -4431,13 +4432,33 @@ def evalUserOrUnknownCallDir(
                                     stArrLens: st1.stArrLens, stArrMems: st1.stArrMems,
                                     stDataTags: stDom.stDataTags, stDataCtorTags: stDom.stDataCtorTags,
                                     stDataFields: stDom.stDataFields,
-                                    stPath: stDom.stPath, stUserVars: stDom.stUserVars,
+                                    stPath: match domOpt {
+                                        Some("true") -> stDom.stPath,
+                                        Some(dg) -> Cons(dg, stDom.stPath),
+                                        None -> stDom.stPath,
+                                    },
+                                    stUserVars: stDom.stUserVars,
                                 };
                                 let (stUnfOut, unfOpt) = evalTerm(ctxPushUnfold(ctx, nm), qUnfoldIn, callee.fsBody, false);
                                 match (domOpt, unfOpt) {
                                     (Some("true"), Some(bodyExpr)) ->
                                         (stRestoreVars(stUnfOut, stAfterMut.stVars), Some(bodyExpr)),
                                     (Some(domG), Some(bodyExpr)) -> {
+                                        let qStartLen = qBaseLen + 1;
+                                        let qExtraCnt = listLen(stUnfOut.stPath) - qStartLen;
+                                        let qPathOut = cellNew(stDom.stPath);
+                                        let qk = cellNew(0);
+                                        let qp = cellNew(stUnfOut.stPath);
+                                        while (cellGet(qk) < qExtraCnt) {
+                                            match cellGet(qp) {
+                                                Cons(pItem, rp) -> {
+                                                    cellSet(qPathOut, Cons(guardImplies(domG, pItem), cellGet(qPathOut)));
+                                                    cellSet(qp, rp);
+                                                    cellSet(qk, cellGet(qk) + 1)
+                                                },
+                                                Nil -> cellSet(qk, qExtraCnt),
+                                            }
+                                        };
                                         let (declsUf, ufOpt) = pureUfExprOpt(stUnfOut.stDecls, rsort);
                                         let stUf = MkSymState {
                                             stDecls: declsUf, stVars: stAfterMut.stVars,
@@ -4445,7 +4466,7 @@ def evalUserOrUnknownCallDir(
                                             stArrLens: stAfterMut.stArrLens, stArrMems: stAfterMut.stArrMems,
                                             stDataTags: stUnfOut.stDataTags, stDataCtorTags: stUnfOut.stDataCtorTags,
                                             stDataFields: stUnfOut.stDataFields,
-                                            stPath: stAfterMut.stPath, stUserVars: stUnfOut.stUserVars,
+                                            stPath: cellGet(qPathOut), stUserVars: stUnfOut.stUserVars,
                                         };
                                         match ufOpt {
                                             Some(ufE) -> (stUf, Some("(ite " + domG + " " + bodyExpr + " " + ufE + ")")),
@@ -4460,7 +4481,7 @@ def evalUserOrUnknownCallDir(
                                             stArrLens: stAfterMut.stArrLens, stArrMems: stAfterMut.stArrMems,
                                             stDataTags: stUnfOut.stDataTags, stDataCtorTags: stUnfOut.stDataCtorTags,
                                             stDataFields: stUnfOut.stDataFields,
-                                            stPath: stAfterMut.stPath, stUserVars: stUnfOut.stUserVars,
+                                            stPath: stDom.stPath, stUserVars: stUnfOut.stUserVars,
                                         };
                                         (stUf, ufOpt)
                                     },

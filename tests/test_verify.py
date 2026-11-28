@@ -2619,7 +2619,108 @@ def main() -> int:
         assert "(fun \"main\"" not in emp_sexp and "\"sibling\"" not in emp_sexp, (
             f"E9 empty selected roots leaked `main` into `.gscore`:\n{emp_sexp}"
         )
-        print("PASS [e9_astra_round1_regressions]")
+
+        # ------------------------------------------------------------------
+        # E10: Astra Round 2 regressions (dependent guard before upper bound,
+        # global-Cell helper in `old(...)`, `requires` helper predicate facts,
+        # generic `Bool` quantifier specialization, `ImmArray (Cell Int)` in `old`)
+        # ------------------------------------------------------------------
+        # 10.1 Dependent guard `inRange(i, n)` + opaque dependent guard before `i < positive(n)` (Native + JS!)
+        e10_dep = tmp / "e10_dep_guard.gsa"
+        e10_dep.write_text(
+            "def positive(n: Int): Int\n"
+            "    requires n > 0\n"
+            "= n\n"
+            "def inRange(i: Int, n: Int): Bool = i < n\n"
+            "verified def checkRange(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (0 <= i && inRange(i, n) && i < positive(n)) ==> i < n\n"
+            "= ()\n"
+            "def main(): Void = { checkRange(3); checkRange(0); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e10_dv = run([geisha, "verify", "--json", "--solver", z3_bin, str(e10_dep)])
+        assert r_e10_dv.returncode == 0 and json.loads(r_e10_dv.stdout)["ok"] is True
+        e10_dbin = tmp / ("e10_dep.exe" if sys.platform == "win32" else "e10_dep")
+        assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_dbin), str(e10_dep)]).returncode == 0
+        r_e10_dn = run([str(e10_dbin)])
+        assert r_e10_dn.returncode == 0 and r_e10_dn.stdout.strip() == "ok"
+        if shutil.which("node"):
+            e10_djs = tmp / "e10_dep.mjs"
+            assert run([geisha, "--contracts=check", "--target", "js", "-o", str(e10_djs), str(e10_dep)]).returncode == 0
+            r_e10_dj = run(["node", str(e10_djs)])
+            assert r_e10_dj.returncode == 0 and r_e10_dj.stdout.strip() == "ok"
+
+        # 10.2 Read-only helper reading module-level `Cell` inside `old(current())` (Native + JS!)
+        e10_glob = tmp / "e10_global_old.gsa"
+        e10_glob.write_text(
+            "def counter: Cell Int = cellNew(10)\n"
+            "def current(): Int = cellGet(counter)\n"
+            "def increment(): Void\n"
+            "    ensures current() == old(current()) + 1\n"
+            "= cellSet(counter, current() + 1)\n"
+            "def main(): Void = { increment(); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e10_gbin = tmp / ("e10_glob.exe" if sys.platform == "win32" else "e10_glob")
+        r_e10_gb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_gbin), str(e10_glob)])
+        assert r_e10_gb.returncode == 0, f"E10 global old build failed:\n{r_e10_gb.stdout}\n{r_e10_gb.stderr}"
+        r_e10_gn = run([str(e10_gbin)])
+        assert r_e10_gn.returncode == 0 and r_e10_gn.stdout.strip() == "ok", (
+            f"E10 global old native run failed:\n{r_e10_gn.stdout}\n{r_e10_gn.stderr}"
+        )
+        if shutil.which("node"):
+            e10_gjs = tmp / "e10_glob.mjs"
+            assert run([geisha, "--contracts=check", "--target", "js", "-o", str(e10_gjs), str(e10_glob)]).returncode == 0
+            r_e10_gj = run(["node", str(e10_gjs)])
+            assert r_e10_gj.returncode == 0 and r_e10_gj.stdout.strip() == "ok"
+
+        # 10.3 `requires positive(x)` pure helper predicate facts preserved in domain-guarded unfolding!
+        e10_dom = tmp / "e10_domain_pred.gsa"
+        e10_dom.write_text(
+            "def positive(x: Int): Bool = x > 0\n"
+            "def identity(x: Int): Int\n"
+            "    requires positive(x)\n"
+            "= x\n"
+            "verified def client(x: Int): Int\n"
+            "    requires x > 0\n"
+            "    ensures r -> r == x\n"
+            "= identity(x)\n"
+            "def main(): Void = { let _ = client(1); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e10_dom = run([geisha, "verify", "--json", "--solver", z3_bin, str(e10_dom)])
+        assert r_e10_dom.returncode == 0 and json.loads(r_e10_dom.stdout)["ok"] is True, (
+            f"E10 requires helper predicate verify failed:\n{r_e10_dom.stdout}\n{r_e10_dom.stderr}"
+        )
+
+        # 10.4 Generic quantifier specialized to `Bool` + 10.5 `ImmArray (Cell Int)` in `old(...)`
+        e10_poly_imm = tmp / "e10_poly_and_imm.gsa"
+        e10_poly_imm.write_text(
+            "def identity(x: a): a\n"
+            "    ensures r -> forall (v: a) -> (v == x) ==> v == r\n"
+            "= x\n"
+            "def setFirst(items: ImmArray (Cell Int)): Void\n"
+            "    requires immArrayLen(items) > 0\n"
+            "    ensures cellGet(immArrayGet(items, 0)) == old(cellGet(immArrayGet(items, 0))) + 1\n"
+            "= { let c = immArrayGet(items, 0); cellSet(c, cellGet(c) + 1) }\n"
+            "def main(): Void = {\n"
+            "    setFirst(arrayFreeze(arrayNew(1, cellNew(10))));\n"
+            "    printLn(if (identity(true)) \"ok\" else \"unexpected\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e10_pibin = tmp / ("e10_pi.exe" if sys.platform == "win32" else "e10_pi")
+        r_e10_pib = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_pibin), str(e10_poly_imm)])
+        assert r_e10_pib.returncode == 0, f"E10 poly Bool & ImmArray(Cell Int) build failed:\n{r_e10_pib.stdout}\n{r_e10_pib.stderr}"
+        r_e10_pir = run([str(e10_pibin)])
+        assert r_e10_pir.returncode == 0 and r_e10_pir.stdout.strip() == "ok", (
+            f"E10 poly Bool & ImmArray(Cell Int) run failed:\n{r_e10_pir.stdout}\n{r_e10_pir.stderr}"
+        )
+        print("PASS [e9_astra_round1_and_round2_regressions]")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
