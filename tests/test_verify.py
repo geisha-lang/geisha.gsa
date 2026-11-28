@@ -2423,6 +2423,204 @@ def main() -> int:
             )
         print("PASS [e8_string_char_bits_intrinsics_and_stdlib]")
 
+        # ------------------------------------------------------------------
+        # E9: Astra Round 1 regressions (UF identity, multi-binder & guarded
+        # quantifiers/old() in `--contracts=check`, termination gate for pure
+        # reflection, nested same-ADT, exact popcount/ctz/clz, empty-root dump)
+        # ------------------------------------------------------------------
+        # 9.0 Lossless UF function identity (`m.f` vs `m_f` must NOT collide!)
+        e9_uf_dir = tmp / "e9_uf_pkg"
+        (e9_uf_dir / "m").mkdir(parents=True)
+        (e9_uf_dir / "m" / "mod.gsa").write_text(
+            "pub def f(x: Int): Int = x + 1\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e9_uf_main = e9_uf_dir / "main.gsa"
+        e9_uf_main.write_text(
+            "use m.f\n"
+            "// Recurse with `decreases` > 1 step so Z3 relies on UF congruence at depth 2!\n"
+            "def m_f(n: Int, x: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) x + 2 else m_f(n - 1, x)\n"
+            "def m2(n: Int, x: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) f(x) else m2(n - 1, x)\n"
+            "\n"
+            "verified def mustNotCollide(n: Int, x: Int): Void\n"
+            "    requires n >= 2\n"
+            "    ensures m_f(n, x) == m2(n, x)\n"
+            "= ()\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        # Also test direct module `a.b` vs `a_b` with depth-2 pure recursion so 1-step unfolding stops at UF!
+        (e9_uf_dir / "a").mkdir(parents=True)
+        (e9_uf_dir / "a" / "mod.gsa").write_text(
+            "pub def b(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) 1 else b(n - 1)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e9_uf_collide = e9_uf_dir / "collide.gsa"
+        e9_uf_collide.write_text(
+            "use a.{b}\n"
+            "def a_b(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) 2 else a_b(n - 1)\n"
+            "verified def checkDistinct(n: Int): Void\n"
+            "    requires n >= 2\n"
+            "    ensures b(n) == a_b(n)\n"
+            "= ()\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_uf_col = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(e9_uf_dir), str(e9_uf_collide)])
+        assert r_uf_col.returncode == 1 and json.loads(r_uf_col.stdout)["failed"] >= 1, (
+            f"E9 UF collision (`a.b` vs `a_b`) falsely proved equality:\n{r_uf_col.stdout}\n{r_uf_col.stderr}"
+        )
+
+        # 9.1–9.4 Four runtime `--contracts=check` + static `verify` parity reproducers from Astra Round 1
+        e9_parity = tmp / "e9_check_parity.gsa"
+        e9_parity.write_text(
+            "def positive(x: Int): Int\n"
+            "    requires x > 0\n"
+            "= x\n"
+            "\n"
+            "verified def pair(): Void\n"
+            "    ensures !(exists (i: Int, j: Int) -> 0 <= i && i <= 1 && 0 <= j && j <= 1 && i + j == 3)\n"
+            "= ()\n"
+            "\n"
+            "verified def advance(a: MutArray Int, pos: Cell Int): Void\n"
+            "    requires arrayLen(a) == 2 && cellGet(pos) == 0 && arrayGet(a, 0) == 10\n"
+            "    ensures forall (i: Int) -> (0 <= i && i < 1) ==> old(arrayGet(a, i + cellGet(pos))) == 10\n"
+            "= cellSet(pos, 1)\n"
+            "\n"
+            "verified def guardedOld(x: Int): Int\n"
+            "    ensures r -> (x > 0) ==> r == old(positive(x))\n"
+            "= x\n"
+            "\n"
+            "verified def guardedOldArr(a: MutArray Int, idx: Int): Void\n"
+            "    ensures (0 <= idx && idx < arrayLen(a)) ==> arrayGet(a, idx) == old(arrayGet(a, idx)) + 1\n"
+            "= if (0 <= idx && idx < arrayLen(a)) arraySet(a, idx, arrayGet(a, idx) + 1) else ()\n"
+            "\n"
+            "verified def boundedShortCircuit(x: Int): Void\n"
+            "    ensures forall (i: Int) -> (x > 0 && 0 <= i && i < positive(x)) ==> i < x\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    pair();\n"
+            "    let a = arrayNew(2, 20);\n"
+            "    arraySet(a, 0, 10);\n"
+            "    advance(a, cellNew(0));\n"
+            "    assert(guardedOld(0) == 0 && guardedOld(5) == 5);\n"
+            "    guardedOldArr(a, -1);\n"
+            "    guardedOldArr(a, 1);\n"
+            "    boundedShortCircuit(0);\n"
+            "    boundedShortCircuit(3)\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_pv = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_parity)])
+        assert r_e9_pv.returncode == 0 and json.loads(r_e9_pv.stdout)["ok"] is True, (
+            f"E9 parity static verify failed:\n{r_e9_pv.stdout}\n{r_e9_pv.stderr}"
+        )
+        e9_pbin = tmp / ("e9_parity.exe" if sys.platform == "win32" else "e9_parity")
+        r_e9_pb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e9_pbin), str(e9_parity)])
+        assert r_e9_pb.returncode == 0, f"E9 parity --contracts=check build failed:\n{r_e9_pb.stdout}\n{r_e9_pb.stderr}"
+        r_e9_pr = run([str(e9_pbin)])
+        assert r_e9_pr.returncode == 0, f"E9 parity --contracts=check execution failed:\n{r_e9_pr.stdout}\n{r_e9_pr.stderr}"
+
+        # Unbounded quantifier in `--contracts=check` must report a clean compile diagnostic instead of silently returning `true`!
+        e9_unb = tmp / "e9_unbounded_chk.gsa"
+        e9_unb.write_text(
+            "def badUnbounded(): Void\n"
+            "    ensures !(exists (x: Int) -> x == 42)\n"
+            "= ()\n"
+            "def main(): Void = badUnbounded()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_unb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(tmp / "e9_unb_bin"), str(e9_unb)])
+        assert r_e9_unb.returncode != 0 and "cannot execute unbounded" in (r_e9_unb.stdout + r_e9_unb.stderr), (
+            f"E9 unbounded quantifier in --contracts=check must emit diagnostic:\n{r_e9_unb.stdout}\n{r_e9_unb.stderr}"
+        )
+
+        # 9.5 Non-terminating recursive function without `decreases` MUST NOT get pure reflection (`uf(x) == uf(x) + 1` vacuity)!
+        e9_nonterm = tmp / "e9_nonterm_reflect.gsa"
+        e9_nonterm.write_text(
+            "def badRec(x: Int): Int = badRec(x) + 1\n"
+            "verified def exploit(): Void = {\n"
+            "    let _ = badRec(0);\n"
+            "    assert(false)\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_nt = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_nonterm)])
+        assert r_e9_nt.returncode == 1 and json.loads(r_e9_nt.stdout)["failed"] >= 1, (
+            f"E9 non-terminating pure recursion vacuously proved `assert(false)`:\n{r_e9_nt.stdout}\n{r_e9_nt.stderr}"
+        )
+
+        # 9.6 & 9.7 Nested same-ADT (`Option (Option Int)`) + exact `bitPopCount`/`bitCtz`/`bitClz` (32 & 64 bit)
+        e9_exact = tmp / "e9_nested_and_bits.gsa"
+        e9_exact.write_text(
+            "use std.option.{Option, Some, None}\n"
+            "\n"
+            "verified def wrapNested(flag: Bool): Option (Option Int)\n"
+            "    ensures r -> match r { Some(Some(x)) -> flag && x == 7, None -> !flag, _ -> false }\n"
+            "= if (flag) Some(Some(7)) else None\n"
+            "\n"
+            "verified def exactBits(x: Int): Int\n"
+            "    ensures r -> r == 1\n"
+            "= {\n"
+            "    assert(bitPopCount(1) == 1 && bitPopCount(7) == 3 && bitPopCount(-1) == 32);\n"
+            "    assert(bitCtz(8) == 3 && bitCtz(1) == 0 && bitCtz(0) == 32);\n"
+            "    assert(bitClz(1) == 31 && bitClz(4) == 29 && bitClz(-1) == 0);\n"
+            "    assert(bitPopCount64(intToI64(5)) == 2 && bitCtz64(intToI64(8)) == 3 && bitClz64(intToI64(1)) == 63);\n"
+            "    if (x != 0) {\n"
+            "        assert(bitPopCount(x & (x - 1)) == bitPopCount(x) - 1)\n"
+            "    } else ();\n"
+            "    bitPopCount(1)\n"
+            "}\n"
+            "def main(): Void = { let _ = wrapNested(true); let _ = exactBits(6); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_ex = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_exact)])
+        assert r_e9_ex.returncode == 0 and json.loads(r_e9_ex.stdout)["ok"] is True, (
+            f"E9 nested Option(Option Int) & exact bit-counts verify failed:\n{r_e9_ex.stdout}\n{r_e9_ex.stderr}"
+        )
+
+        # 9.8 Empty selected roots in `geisha verify --dump-core` must NOT leak unrelated `main`!
+        e9_empty = tmp / "e9_empty_roots.gsa"
+        e9_empty_dump = tmp / "e9_empty_roots.gscore"
+        e9_empty.write_text(
+            "concept Exotic a { rank: a -> Int }\n"
+            "verified def magnitude(x: a): Int\n"
+            "    ensures r -> r == rank(x)\n"
+            "= rank(x)\n"
+            "def main(): Void = printLn(\"sibling\")\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_emp = run([geisha, "verify", "--json", "--solver", z3_bin, "--dump-core", str(e9_empty_dump), str(e9_empty)])
+        assert r_e9_emp.returncode == 1 and json.loads(r_e9_emp.stdout)["unknown"] >= 1
+        emp_sexp = e9_empty_dump.read_text(encoding="utf-8")
+        assert "(fun \"main\"" not in emp_sexp and "\"sibling\"" not in emp_sexp, (
+            f"E9 empty selected roots leaked `main` into `.gscore`:\n{emp_sexp}"
+        )
+        print("PASS [e9_astra_round1_regressions]")
+
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
     # (Runs on all platforms, independent of Z3)

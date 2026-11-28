@@ -3014,50 +3014,51 @@ def collectReachableCoreFnsWithRoots(
     allReach: StrMap Bool,
     dirReach: StrMap Bool,
     reachGlobs: StrMap Bool,
-    extraRoots: List String
+    extraRootsOpt: Option (List String)
 ): List String = {
-    let hasExplicitRoots = match extraRoots { Cons(_, _) -> true, Nil -> false };
-    if (hasExplicitRoots) {
-        // Strict root-closure slicing (`geisha verify --dump-core`): ONLY trace `extraRoots`
-        // and the globals transitively referenced by them!
-        let wl: Cell (List String) = cellNew(Nil);
-        let cer = cellNew(extraRoots);
-        while (match cellGet(cer) { Nil -> false, _ -> true }) {
-            match cellGet(cer) {
-                Cons(rname, rr) -> {
-                    markReachFn(prog, allReach, dirReach, wl, rname, true);
-                    cellSet(cer, rr)
-                },
-                Nil -> (),
-            }
-        };
-        while (match cellGet(wl) { Nil -> false, _ -> true }) {
-            match cellGet(wl) {
-                Cons(fnName, rest) -> {
-                    cellSet(wl, rest);
-                    match strMapGet(prog.coreFns, fnName) {
-                        Some(fd) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, fd.fnBody),
-                        None -> (),
-                    }
-                },
-                Nil -> (),
-            }
-        };
-        let revAcc: Cell (List String) = cellNew(Nil);
-        let cf = cellNew(prog.coreFnNames);
-        while (match cellGet(cf) { Nil -> false, _ -> true }) {
-            match cellGet(cf) {
-                Cons(fnName, r) -> {
-                    if (strMapContains(allReach, fnName)) {
-                        cellSet(revAcc, Cons(fnName, cellGet(revAcc)))
-                    } else ();
-                    cellSet(cf, r)
-                },
-                Nil -> (),
-            }
-        };
-        listRev(cellGet(revAcc))
-    } else if (!strMapContains(prog.coreFns, "main")) {
+    match extraRootsOpt {
+        Some(extraRoots) -> {
+            // Strict root-closure slicing (`geisha verify --dump-core`): ONLY trace `extraRoots`
+            // and the globals transitively referenced by them (empty `extraRoots` -> empty slice, never falls back to `main`)!
+            let wl: Cell (List String) = cellNew(Nil);
+            let cer = cellNew(extraRoots);
+            while (match cellGet(cer) { Nil -> false, _ -> true }) {
+                match cellGet(cer) {
+                    Cons(rname, rr) -> {
+                        markReachFn(prog, allReach, dirReach, wl, rname, true);
+                        cellSet(cer, rr)
+                    },
+                    Nil -> (),
+                }
+            };
+            while (match cellGet(wl) { Nil -> false, _ -> true }) {
+                match cellGet(wl) {
+                    Cons(fnName, rest) -> {
+                        cellSet(wl, rest);
+                        match strMapGet(prog.coreFns, fnName) {
+                            Some(fd) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, fd.fnBody),
+                            None -> (),
+                        }
+                    },
+                    Nil -> (),
+                }
+            };
+            let revAcc: Cell (List String) = cellNew(Nil);
+            let cf = cellNew(prog.coreFnNames);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons(fnName, r) -> {
+                        if (strMapContains(allReach, fnName)) {
+                            cellSet(revAcc, Cons(fnName, cellGet(revAcc)))
+                        } else ();
+                        cellSet(cf, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            listRev(cellGet(revAcc))
+        },
+        None -> if (!strMapContains(prog.coreFns, "main")) {
         let cf = cellNew(prog.coreFnNames);
         while (match cellGet(cf) { Nil -> false, _ -> true }) {
             match cellGet(cf) {
@@ -3117,6 +3118,7 @@ def collectReachableCoreFnsWithRoots(
             }
         };
         listRev(cellGet(revAcc))
+    },
     }
 }
 
@@ -3424,13 +3426,16 @@ def emitMainBodyWithGlobals(ctx: DumpCtx, b: StringBuf, gs: List GlobalValDef, b
 }
 
 pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String =
-    dumpCoreProgramSExprWithRoots(prog, Nil)
+    dumpCoreProgramSExprWithRootsOpt(prog, None)
 
-pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String): Result String String = {
+pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String): Result String String =
+    dumpCoreProgramSExprWithRootsOpt(prog, Some(extraRoots))
+
+def dumpCoreProgramSExprWithRootsOpt(prog: CoreProgram, extraRootsOpt: Option (List String)): Result String String = {
     let allReach: StrMap Bool = strMapNew();
     let dirReach: StrMap Bool = strMapNew();
     let reachGlobs: StrMap Bool = strMapNew();
-    let activeFnNames = collectReachableCoreFnsWithRoots(prog, allReach, dirReach, reachGlobs, extraRoots);
+    let activeFnNames = collectReachableCoreFnsWithRoots(prog, allReach, dirReach, reachGlobs, extraRootsOpt);
     let activeGlobalsRev: Cell (List GlobalValDef) = cellNew(Nil);
 
     let globTypes: StrMap Type = strMapNew();

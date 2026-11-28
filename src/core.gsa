@@ -34,7 +34,7 @@ use infer.{
     VariantInfo, AdtInfo, ConceptInfo, InstanceInfo, InferOutput,
     mangleType, applyExplicitSubst, buildPairMap, matchInstancePatList, isConcreteTypeSend
 }
-use diag.{diagGetFile, diagSpanLineCol}
+use diag.{diagGetFile, diagSpanLineCol, formatSpanDiagHint}
 
 pub def coFreshNextId(curId: Int): Int
     requires 0 <= curId && curId < 2147483647
@@ -1056,7 +1056,99 @@ def formListMentionsAnyBound(es: List Form, targets: List String, shadowed: List
     Cons(h, t) -> if (formMentionsAnyBound(h, targets, shadowed)) true else formListMentionsAnyBound(t, targets, shadowed),
 }
 
-def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm): TaggedTerm = {
+def kAdtHeadAndArgs(ty: Type): (Option String, List Type) = match ty {
+    TyCon(n) -> (Some(n), Nil),
+    TyComp(b, a) -> {
+        let (h, args) = kAdtHeadAndArgs(b);
+        (h, listAppend(args, [a]))
+    },
+    _ -> (None, Nil),
+}
+
+def kTypeListHasMutContainer(ctx: KCtx, tys: List Type, visited: List String): Bool = match tys {
+    Nil -> false,
+    Cons(t, r) -> if (kTypeHasMutContainer(ctx, t, visited)) true else kTypeListHasMutContainer(ctx, r, visited),
+}
+
+def kTypeHasMutContainer(ctx: KCtx, ty: Type, visited: List String): Bool = match ty {
+    TyComp(TyCon("Cell"), _) -> true,
+    TyComp(TyCon("MutArray"), _) -> true,
+    TyTuple(ts) -> kTypeListHasMutContainer(ctx, ts, visited),
+    _ -> {
+        let (hOpt, targs) = kAdtHeadAndArgs(ty);
+        if (kTypeListHasMutContainer(ctx, targs, visited)) true
+        else match hOpt {
+            Some(adtNm) ->
+                if (listContainsStr(visited, adtNm)) false
+                else match strMapGet(ctx.kAdtReg, adtNm) {
+                    Some(ainfo) -> {
+                        let nextVis = Cons(adtNm, visited);
+                        let hit = cellNew(false);
+                        let cv = cellNew(ainfo.variants);
+                        while (!cellGet(hit) && match cellGet(cv) { Nil -> false, _ -> true }) {
+                            match cellGet(cv) {
+                                Cons(vi, rv) -> {
+                                    if (kTypeListHasMutContainer(ctx, vi.fieldTypes, nextVis)) cellSet(hit, true) else ();
+                                    cellSet(cv, rv)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellGet(hit)
+                    },
+                    None -> false,
+                },
+            None -> false,
+        }
+    },
+}
+
+def kTypeListCloneablePreState(ctx: KCtx, tys: List Type, depth: Int): Bool = match tys {
+    Nil -> true,
+    Cons(t, r) -> if (kTypeIsCloneablePreState(ctx, t, depth)) kTypeListCloneablePreState(ctx, r, depth) else false,
+}
+
+def kTypeIsCloneablePreState(ctx: KCtx, ty: Type, depth: Int): Bool =
+    if (!kTypeHasMutContainer(ctx, ty, Nil)) true
+    else if (depth > 6) false
+    else match ty {
+        TyComp(TyCon("Cell"), et) -> kTypeIsCloneablePreState(ctx, et, depth + 1),
+        TyComp(TyCon("MutArray"), et) -> kTypeIsCloneablePreState(ctx, et, depth + 1),
+        TyTuple(ts) -> kTypeListCloneablePreState(ctx, ts, depth + 1),
+        _ -> match kAdtHeadAndArgs(ty) {
+            (Some(adtNm), targs) -> match strMapGet(ctx.kAdtReg, adtNm) {
+                Some(ainfo) -> {
+                    let sub = buildPairMap(ainfo.typeParams, targs);
+                    let ok = cellNew(true);
+                    let cv = cellNew(ainfo.variants);
+                    while (cellGet(ok) && match cellGet(cv) { Nil -> false, _ -> true }) {
+                        match cellGet(cv) {
+                            Cons(vi, rv) -> {
+                                let cf = cellNew(vi.fieldTypes);
+                                while (cellGet(ok) && match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons(ft, rf) -> {
+                                            let instFt = applyExplicitSubst(ft, sub);
+                                            if (!kTypeIsCloneablePreState(ctx, instFt, depth + 1)) cellSet(ok, false) else ();
+                                            cellSet(cf, rf)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                cellSet(cv, rv)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellGet(ok)
+                },
+                None -> false,
+            },
+            _ -> false,
+        },
+    }
+
+def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm, depth: Int): TaggedTerm = {
     let arrTy = schemeBody(arrScm);
     let elemTy = match arrTy {
         TyComp(_, et) -> et,
@@ -1088,10 +1180,11 @@ def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm
         tspan: sp, tscm: arrScm,
         tnode: TmApplyDir(MkVarDecl { vname: "arrayNewZeroed", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], arrTy)) }, [zeroLit]),
     };
-    let elem0Call = MkTerm {
+    let elem0Raw = MkTerm {
         tspan: sp, tscm: ScmMono(elemTy),
         tnode: TmApplyDir(MkVarDecl { vname: "arrayGet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int")], elemTy)) }, [srcVar, zeroLit]),
     };
+    let elem0Call = mkDeepClonePreStateTerm(ctx, sp, ScmMono(elemTy), elem0Raw, depth + 1);
     let allocCall = MkTerm {
         tspan: sp, tscm: arrScm,
         tnode: TmApplyDir(MkVarDecl { vname: "arrayNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int"), elemTy], arrTy)) }, [lenVar, elem0Call]),
@@ -1104,10 +1197,11 @@ def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm
         tspan: sp, tscm: intScm,
         tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int"))], TyCon("Int"))) }, [idxVar]),
     };
-    let elemICall = MkTerm {
+    let elemIRaw = MkTerm {
         tspan: sp, tscm: ScmMono(elemTy),
         tnode: TmApplyDir(MkVarDecl { vname: "arrayGet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int")], elemTy)) }, [srcVar, idxGet()]),
     };
+    let elemICall = mkDeepClonePreStateTerm(ctx, sp, ScmMono(elemTy), elemIRaw, depth + 1);
     let setICall = MkTerm {
         tspan: sp, tscm: voidScm,
         tnode: TmApplyDir(MkVarDecl { vname: "arraySet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int"), elemTy], TyVoid)) }, [cpVar, idxGet(), elemICall]),
@@ -1152,14 +1246,139 @@ def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm
     }
 }
 
-def rewriteOldInFormForCheck(
+def mkDeepClonePreStateTerm(ctx: KCtx, sp: Span, scm: Scheme, srcTerm: TaggedTerm, depth: Int): TaggedTerm = {
+    let ty = schemeBody(scm);
+    if (!kTypeHasMutContainer(ctx, ty, Nil) || depth > 6) srcTerm
+    else match ty {
+        TyComp(TyCon("Cell"), et) -> {
+            let getCall = MkTerm {
+                tspan: sp, tscm: ScmMono(et),
+                tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [ty], et)) }, [srcTerm]),
+            };
+            let clonedInner = mkDeepClonePreStateTerm(ctx, sp, ScmMono(et), getCall, depth + 1);
+            MkTerm {
+                tspan: sp, tscm: scm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [et], ty)) }, [clonedInner]),
+            }
+        },
+        TyComp(TyCon("MutArray"), _) -> mkCloneMutArrayTerm(ctx, sp, scm, srcTerm, depth),
+        TyTuple(ts) -> {
+            let patsRev: Cell (List Pattern) = cellNew(Nil);
+            let elemsRev: Cell (List TaggedTerm) = cellNew(Nil);
+            let ct = cellNew(ts);
+            while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                match cellGet(ct) {
+                    Cons(et, rt) -> {
+                        let pn = "__gs_old_tp_" + intToStr(kUnique(ctx));
+                        cellSet(patsRev, Cons(PatVar(pn, sp), cellGet(patsRev)));
+                        let pv = MkTerm { tspan: sp, tscm: ScmMono(et), tnode: TmVar(pn) };
+                        cellSet(elemsRev, Cons(mkDeepClonePreStateTerm(ctx, sp, ScmMono(et), pv, depth + 1), cellGet(elemsRev)));
+                        cellSet(ct, rt)
+                    },
+                    Nil -> (),
+                }
+            };
+            let arm = MkCoreArm {
+                caPat: PatTuple(listRev(cellGet(patsRev))),
+                caGuard: None,
+                caBody: MkTerm { tspan: sp, tscm: scm, tnode: TmTuple(listRev(cellGet(elemsRev))) },
+            };
+            MkTerm { tspan: sp, tscm: scm, tnode: TmMatch(srcTerm, [arm]) }
+        },
+        _ -> match kAdtHeadAndArgs(ty) {
+            (Some(adtNm), targs) -> match strMapGet(ctx.kAdtReg, adtNm) {
+                Some(ainfo) -> {
+                    let sub = buildPairMap(ainfo.typeParams, targs);
+                    let armsRev: Cell (List CoreArm) = cellNew(Nil);
+                    let cv = cellNew(ainfo.variants);
+                    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                        match cellGet(cv) {
+                            Cons(vi, rv) -> {
+                                let patsRev: Cell (List Pattern) = cellNew(Nil);
+                                let ftermsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                                let ftysRev: Cell (List Type) = cellNew(Nil);
+                                let cf = cellNew(vi.fieldTypes);
+                                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                    match cellGet(cf) {
+                                        Cons(ft, rf) -> {
+                                            let instFt = applyExplicitSubst(ft, sub);
+                                            let pn = "__gs_old_fd_" + intToStr(kUnique(ctx));
+                                            cellSet(patsRev, Cons(PatVar(pn, sp), cellGet(patsRev)));
+                                            let pv = MkTerm { tspan: sp, tscm: ScmMono(instFt), tnode: TmVar(pn) };
+                                            cellSet(ftermsRev, Cons(mkDeepClonePreStateTerm(ctx, sp, ScmMono(instFt), pv, depth + 1), cellGet(ftermsRev)));
+                                            cellSet(ftysRev, Cons(instFt, cellGet(ftysRev)));
+                                            cellSet(cf, rf)
+                                        },
+                                        Nil -> (),
+                                    }
+                                };
+                                let armBody = MkTerm {
+                                    tspan: sp, tscm: scm,
+                                    tnode: TmMakeData(adtNm, vi.tag, listRev(cellGet(ftermsRev)), listRev(cellGet(ftysRev)), targs),
+                                };
+                                cellSet(armsRev, Cons(MkCoreArm {
+                                    caPat: PatCtor(vi.vname, listRev(cellGet(patsRev))),
+                                    caGuard: None,
+                                    caBody: armBody,
+                                }, cellGet(armsRev)));
+                                cellSet(cv, rv)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    MkTerm { tspan: sp, tscm: scm, tnode: TmMatch(srcTerm, listRev(cellGet(armsRev))) }
+                },
+                None -> srcTerm,
+            },
+            _ -> srcTerm,
+        },
+    }
+}
+
+/// Inside `old(arg0)` in `--contracts=check`: snapshot ONLY pre-state mutable containers
+/// (`Cell`, `MutArray`, or tuples/ADTs holding them) infallibly at function entry, and evaluate
+/// `arg0` lazily in place inside `ensures` so short-circuit guards (`==>`, `&&`, `if`, `match`)
+/// and inner quantifier binders (`old(arrayGet(a, i + cellGet(pos)))`) behave identically to `verify`.
+def rewriteInsideOldForCheck(
     ctx: KCtx,
     f: Form,
     innerBound: List String,
+    varSnapMap: Cell (List (String, String)),
     snapsRev: Cell (List (String, Scheme, TaggedTerm))
 ): Form = {
     let mk = (nd: Expr) -> MkForm { pos: f.pos, ty: f.ty, annot: f.annot, node: nd };
     match f.node {
+        ExVar(vn) -> {
+            let isBoundHere = listContainsStr(innerBound, vn) || strStartsWith(vn, "__gs_old_");
+            let isOuterDataVar =
+                (match assocLookupScheme(cellGet(ctx.kLocalEnv), vn) { Some(_) -> true, None -> false })
+                || strMapContains(ctx.kGlobalValSet, vn);
+            let vty = schemeBody(f.ty);
+            if (!isBoundHere && isOuterDataVar && kTypeHasMutContainer(ctx, vty, Nil)) {
+                if (!kTypeIsCloneablePreState(ctx, vty, 0)) {
+                    match cellGet(ctx.kErr) {
+                        None -> cellSet(ctx.kErr, Some(formatSpanDiagHint(
+                            "contract",
+                            f.pos,
+                            "cannot snapshot recursive mutable container `" + vn + "` of type `" + typeToString(vty) + "` for `old(...)` in `--contracts=check` mode",
+                            "read the `Cell` or `MutArray` field directly inside `old(...)` or compile with `--contracts=erase`"
+                        ))),
+                        Some(_) -> (),
+                    };
+                    f
+                } else match assocLookupStr(cellGet(varSnapMap), vn) {
+                    Some(existingSnap) -> MkForm { pos: f.pos, ty: f.ty, annot: None, node: ExVar(existingSnap) },
+                    None -> {
+                        let snapName = "__gs_old_" + intToStr(kUnique(ctx));
+                        let rawVarTerm = transformForm(ctx, f);
+                        let cloneTerm = mkDeepClonePreStateTerm(ctx, f.pos, f.ty, rawVarTerm, 0);
+                        cellSet(snapsRev, Cons((snapName, f.ty, cloneTerm), cellGet(snapsRev)));
+                        cellSet(varSnapMap, Cons((vn, snapName), cellGet(varSnapMap)));
+                        MkForm { pos: f.pos, ty: f.ty, annot: None, node: ExVar(snapName) }
+                    },
+                }
+            } else f
+        },
         ExApply(callee, args) -> {
             let isOld = match callee.node {
                 ExVar(nm) -> nm == "old" && isUnshadowedOldInCore(ctx, innerBound),
@@ -1167,43 +1386,17 @@ def rewriteOldInFormForCheck(
             };
             if (isOld) {
                 match args {
-                    Cons(arg0, Nil) ->
-                        if (!formMentionsAnyBound(arg0, innerBound, Nil)) {
-                            let snapName = "__gs_old_" + intToStr(kUnique(ctx));
-                            let snapTerm = transformForm(ctx, arg0);
-                            cellSet(snapsRev, Cons((snapName, arg0.ty, snapTerm), cellGet(snapsRev)));
-                            MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExVar(snapName) }
-                        } else match arg0.node {
-                            ExApply(cF, Cons(arrF, Cons(idxF, Nil))) -> match cF.node {
-                                ExVar(anm) if (anm == "immArrayGet") -> {
-                                    let snapArr = "__gs_old_arr_" + intToStr(kUnique(ctx));
-                                    cellSet(snapsRev, Cons((snapArr, arrF.ty, transformForm(ctx, arrF)), cellGet(snapsRev)));
-                                    let rwIdx = rewriteOldInFormForCheck(ctx, idxF, innerBound, snapsRev);
-                                    let arrRef = MkForm { pos: arrF.pos, ty: arrF.ty, annot: None, node: ExVar(snapArr) };
-                                    MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExApply(cF, [arrRef, rwIdx]) }
-                                },
-                                ExVar(anm) if (anm == "arrayGet") -> {
-                                    let snapArr = "__gs_old_arr_" + intToStr(kUnique(ctx));
-                                    let cloneTerm = mkCloneMutArrayTerm(ctx, f.pos, arrF.ty, transformForm(ctx, arrF));
-                                    cellSet(snapsRev, Cons((snapArr, arrF.ty, cloneTerm), cellGet(snapsRev)));
-                                    let rwIdx = rewriteOldInFormForCheck(ctx, idxF, innerBound, snapsRev);
-                                    let arrRef = MkForm { pos: arrF.pos, ty: arrF.ty, annot: None, node: ExVar(snapArr) };
-                                    MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExApply(cF, [arrRef, rwIdx]) }
-                                },
-                                _ -> arg0,
-                            },
-                            _ -> arg0,
-                        },
+                    Cons(arg0, Nil) -> rewriteInsideOldForCheck(ctx, arg0, innerBound, varSnapMap, snapsRev),
                     _ -> f,
                 }
             } else {
-                let rc = rewriteOldInFormForCheck(ctx, callee, innerBound, snapsRev);
+                let rc = rewriteInsideOldForCheck(ctx, callee, innerBound, varSnapMap, snapsRev);
                 let raRev: Cell (List Form) = cellNew(Nil);
                 let ca = cellNew(args);
                 while (match cellGet(ca) { Nil -> false, _ -> true }) {
                     match cellGet(ca) {
                         Cons(a, r) -> {
-                            cellSet(raRev, Cons(rewriteOldInFormForCheck(ctx, a, innerBound, snapsRev), cellGet(raRev)));
+                            cellSet(raRev, Cons(rewriteInsideOldForCheck(ctx, a, innerBound, varSnapMap, snapsRev), cellGet(raRev)));
                             cellSet(ca, r)
                         },
                         Nil -> (),
@@ -1217,7 +1410,7 @@ def rewriteOldInFormForCheck(
             let cur = cellNew(es);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
                     Nil -> (),
                 }
             };
@@ -1228,7 +1421,7 @@ def rewriteOldInFormForCheck(
             let cur = cellNew(es);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
                     Nil -> (),
                 }
             };
@@ -1239,7 +1432,7 @@ def rewriteOldInFormForCheck(
             let cur = cellNew(es);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
                     Nil -> (),
                 }
             };
@@ -1250,7 +1443,7 @@ def rewriteOldInFormForCheck(
             let cur = cellNew(fs);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
-                    Cons((k, v), r) -> { cellSet(rev, Cons((k, rewriteOldInFormForCheck(ctx, v, innerBound, snapsRev)), cellGet(rev))); cellSet(cur, r) },
+                    Cons((k, v), r) -> { cellSet(rev, Cons((k, rewriteInsideOldForCheck(ctx, v, innerBound, varSnapMap, snapsRev)), cellGet(rev))); cellSet(cur, r) },
                     Nil -> (),
                 }
             };
@@ -1265,32 +1458,36 @@ def rewriteOldInFormForCheck(
                     Nil -> (),
                 }
             };
-            mk(ExAbs(ps, rt, rewriteOldInFormForCheck(ctx, b, cellGet(nb), snapsRev)))
+            mk(ExAbs(ps, rt, rewriteInsideOldForCheck(ctx, b, cellGet(nb), varSnapMap, snapsRev)))
         },
-        ExBin(op, l, r) -> mk(ExBin(op, rewriteOldInFormForCheck(ctx, l, innerBound, snapsRev), rewriteOldInFormForCheck(ctx, r, innerBound, snapsRev))),
-        ExUn(op, e) -> mk(ExUn(op, rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev))),
-        ExField(e, nm) -> mk(ExField(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), nm)),
-        ExTry(e) -> mk(ExTry(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev))),
+        ExBin(op, l, r) -> mk(ExBin(
+            op,
+            rewriteInsideOldForCheck(ctx, l, innerBound, varSnapMap, snapsRev),
+            rewriteInsideOldForCheck(ctx, r, innerBound, varSnapMap, snapsRev)
+        )),
+        ExUn(op, e) -> mk(ExUn(op, rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev))),
+        ExField(e, nm) -> mk(ExField(rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev), nm)),
+        ExTry(e) -> mk(ExTry(rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev))),
         ExLet(vd, v, b) -> mk(ExLet(
             vd,
-            rewriteOldInFormForCheck(ctx, v, innerBound, snapsRev),
-            rewriteOldInFormForCheck(ctx, b, Cons(vd.vname, innerBound), snapsRev)
+            rewriteInsideOldForCheck(ctx, v, innerBound, varSnapMap, snapsRev),
+            rewriteInsideOldForCheck(ctx, b, Cons(vd.vname, innerBound), varSnapMap, snapsRev)
         )),
         ExIf(c, t, e) -> mk(ExIf(
-            rewriteOldInFormForCheck(ctx, c, innerBound, snapsRev),
-            rewriteOldInFormForCheck(ctx, t, innerBound, snapsRev),
-            rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev)
+            rewriteInsideOldForCheck(ctx, c, innerBound, varSnapMap, snapsRev),
+            rewriteInsideOldForCheck(ctx, t, innerBound, varSnapMap, snapsRev),
+            rewriteInsideOldForCheck(ctx, e, innerBound, varSnapMap, snapsRev)
         )),
         ExMatch(s, arms) -> {
-            let rs = rewriteOldInFormForCheck(ctx, s, innerBound, snapsRev);
+            let rs = rewriteInsideOldForCheck(ctx, s, innerBound, varSnapMap, snapsRev);
             let narmsRev: Cell (List MatchArm) = cellNew(Nil);
             let cur = cellNew(arms);
             while (match cellGet(cur) { Nil -> false, _ -> true }) {
                 match cellGet(cur) {
                     Cons(a, r) -> {
                         let ab = collectPatVarsList(a.pat, innerBound);
-                        let ng = match a.guard { Some(g) -> Some(rewriteOldInFormForCheck(ctx, g, ab, snapsRev)), None -> None };
-                        let nb = rewriteOldInFormForCheck(ctx, a.body, ab, snapsRev);
+                        let ng = match a.guard { Some(g) -> Some(rewriteInsideOldForCheck(ctx, g, ab, varSnapMap, snapsRev)), None -> None };
+                        let nb = rewriteInsideOldForCheck(ctx, a.body, ab, varSnapMap, snapsRev);
                         cellSet(narmsRev, Cons(MkMatchArm { pat: a.pat, guard: ng, body: nb }, cellGet(narmsRev)));
                         cellSet(cur, r)
                     },
@@ -1303,45 +1500,254 @@ def rewriteOldInFormForCheck(
     }
 }
 
-def scanIntQuantBounds(
+def rewriteOldInFormForCheck(
+    ctx: KCtx,
+    f: Form,
+    innerBound: List String,
+    varSnapMap: Cell (List (String, String)),
+    snapsRev: Cell (List (String, Scheme, TaggedTerm))
+): Form = {
+    let mk = (nd: Expr) -> MkForm { pos: f.pos, ty: f.ty, annot: f.annot, node: nd };
+    match f.node {
+        ExApply(callee, args) -> {
+            let isOld = match callee.node {
+                ExVar(nm) -> nm == "old" && isUnshadowedOldInCore(ctx, innerBound),
+                _ -> false,
+            };
+            if (isOld) {
+                match args {
+                    Cons(arg0, Nil) -> rewriteInsideOldForCheck(ctx, arg0, innerBound, varSnapMap, snapsRev),
+                    _ -> f,
+                }
+            } else {
+                let rc = rewriteOldInFormForCheck(ctx, callee, innerBound, varSnapMap, snapsRev);
+                let raRev: Cell (List Form) = cellNew(Nil);
+                let ca = cellNew(args);
+                while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                    match cellGet(ca) {
+                        Cons(a, r) -> {
+                            cellSet(raRev, Cons(rewriteOldInFormForCheck(ctx, a, innerBound, varSnapMap, snapsRev), cellGet(raRev)));
+                            cellSet(ca, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                mk(ExApply(rc, listRev(cellGet(raRev))))
+            }
+        },
+        ExTuple(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExTuple(listRev(cellGet(rev))))
+        },
+        ExList(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExList(listRev(cellGet(rev))))
+        },
+        ExBlock(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExBlock(listRev(cellGet(rev))))
+        },
+        ExStructInit(cn, fs) -> {
+            let rev: Cell (List (String, Form)) = cellNew(Nil);
+            let cur = cellNew(fs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons((k, v), r) -> { cellSet(rev, Cons((k, rewriteOldInFormForCheck(ctx, v, innerBound, varSnapMap, snapsRev)), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExStructInit(cn, listRev(cellGet(rev))))
+        },
+        ExAbs(ps, rt, b) -> {
+            let nb = cellNew(innerBound);
+            let cp = cellNew(ps);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(vd, r) -> { cellSet(nb, Cons(vd.vname, cellGet(nb))); cellSet(cp, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExAbs(ps, rt, rewriteOldInFormForCheck(ctx, b, cellGet(nb), varSnapMap, snapsRev)))
+        },
+        ExBin(op, l, r) -> mk(ExBin(
+            op,
+            rewriteOldInFormForCheck(ctx, l, innerBound, varSnapMap, snapsRev),
+            rewriteOldInFormForCheck(ctx, r, innerBound, varSnapMap, snapsRev)
+        )),
+        ExUn(op, e) -> mk(ExUn(op, rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev))),
+        ExField(e, nm) -> mk(ExField(rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev), nm)),
+        ExTry(e) -> mk(ExTry(rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev))),
+        ExLet(vd, v, b) -> mk(ExLet(
+            vd,
+            rewriteOldInFormForCheck(ctx, v, innerBound, varSnapMap, snapsRev),
+            rewriteOldInFormForCheck(ctx, b, Cons(vd.vname, innerBound), varSnapMap, snapsRev)
+        )),
+        ExIf(c, t, e) -> mk(ExIf(
+            rewriteOldInFormForCheck(ctx, c, innerBound, varSnapMap, snapsRev),
+            rewriteOldInFormForCheck(ctx, t, innerBound, varSnapMap, snapsRev),
+            rewriteOldInFormForCheck(ctx, e, innerBound, varSnapMap, snapsRev)
+        )),
+        ExMatch(s, arms) -> {
+            let rs = rewriteOldInFormForCheck(ctx, s, innerBound, varSnapMap, snapsRev);
+            let narmsRev: Cell (List MatchArm) = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ab = collectPatVarsList(a.pat, innerBound);
+                        let ng = match a.guard { Some(g) -> Some(rewriteOldInFormForCheck(ctx, g, ab, varSnapMap, snapsRev)), None -> None };
+                        let nb = rewriteOldInFormForCheck(ctx, a.body, ab, varSnapMap, snapsRev);
+                        cellSet(narmsRev, Cons(MkMatchArm { pat: a.pat, guard: ng, body: nb }, cellGet(narmsRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            mk(ExMatch(rs, listRev(cellGet(narmsRev))))
+        },
+        _ -> f,
+    }
+}
+
+data QuantBoundStep {
+    QbGuard(Form),
+    QbLo(Form, Bool),
+    QbHi(Form, Bool),
+}
+
+def collectIntQuantSteps(
     cond: Form,
     qvar: String,
-    loOut: Cell (Option (Form, Bool)),
-    hiOut: Cell (Option (Form, Bool))
-): Void = match cond.node {
-    ExBin(OpAnd, l, r) -> {
-        scanIntQuantBounds(l, qvar, loOut, hiOut);
-        scanIntQuantBounds(r, qvar, loOut, hiOut)
-    },
-    ExIf(c, t, el) -> match el.node {
-        ExLit(LitBool(false)) -> {
-            scanIntQuantBounds(c, qvar, loOut, hiOut);
-            scanIntQuantBounds(t, qvar, loOut, hiOut)
+    innerQVars: List String,
+    stepsRev: Cell (List QuantBoundStep)
+): Void = {
+    let forbidVars = Cons(qvar, innerQVars);
+    match cond.node {
+        ExBin(OpAnd, l, r) -> {
+            collectIntQuantSteps(l, qvar, innerQVars, stepsRev);
+            collectIntQuantSteps(r, qvar, innerQVars, stepsRev)
         },
-        _ -> (),
-    },
-    ExBin(op, l, r) -> {
-        let lIsVar = match l.node { ExVar(v) -> v == qvar, _ -> false };
-        let rIsVar = match r.node { ExVar(v) -> v == qvar, _ -> false };
-        if (lIsVar && !formMentionsAnyBound(r, [qvar], Nil)) {
-            match op {
-                OpGe -> cellSet(loOut, Some((r, false))),
-                OpGt -> cellSet(loOut, Some((r, true))),
-                OpLt -> cellSet(hiOut, Some((r, false))),
-                OpLe -> cellSet(hiOut, Some((r, true))),
-                _ -> (),
-            }
-        } else if (rIsVar && !formMentionsAnyBound(l, [qvar], Nil)) {
-            match op {
-                OpLe -> cellSet(loOut, Some((l, false))),
-                OpLt -> cellSet(loOut, Some((l, true))),
-                OpGt -> cellSet(hiOut, Some((l, false))),
-                OpGe -> cellSet(hiOut, Some((l, true))),
-                _ -> (),
-            }
-        } else ()
-    },
-    _ -> (),
+        ExIf(c, t, el) -> match el.node {
+            ExLit(LitBool(false)) -> {
+                collectIntQuantSteps(c, qvar, innerQVars, stepsRev);
+                collectIntQuantSteps(t, qvar, innerQVars, stepsRev)
+            },
+            _ ->
+                if (!formMentionsAnyBound(cond, forbidVars, Nil)) {
+                    cellSet(stepsRev, Cons(QbGuard(cond), cellGet(stepsRev)))
+                } else (),
+        },
+        ExBin(op, l, r) -> {
+            let lIsVar = match l.node { ExVar(v) -> v == qvar && !listContainsStr(innerQVars, v), _ -> false };
+            let rIsVar = match r.node { ExVar(v) -> v == qvar && !listContainsStr(innerQVars, v), _ -> false };
+            if (lIsVar && !formMentionsAnyBound(r, forbidVars, Nil)) {
+                match op {
+                    OpGe -> cellSet(stepsRev, Cons(QbLo(r, false), cellGet(stepsRev))),
+                    OpGt -> cellSet(stepsRev, Cons(QbLo(r, true), cellGet(stepsRev))),
+                    OpLt -> cellSet(stepsRev, Cons(QbHi(r, false), cellGet(stepsRev))),
+                    OpLe -> cellSet(stepsRev, Cons(QbHi(r, true), cellGet(stepsRev))),
+                    _ -> (),
+                }
+            } else if (rIsVar && !formMentionsAnyBound(l, forbidVars, Nil)) {
+                match op {
+                    OpLe -> cellSet(stepsRev, Cons(QbLo(l, false), cellGet(stepsRev))),
+                    OpLt -> cellSet(stepsRev, Cons(QbLo(l, true), cellGet(stepsRev))),
+                    OpGt -> cellSet(stepsRev, Cons(QbHi(l, false), cellGet(stepsRev))),
+                    OpGe -> cellSet(stepsRev, Cons(QbHi(l, true), cellGet(stepsRev))),
+                    _ -> (),
+                }
+            } else if (!formMentionsAnyBound(cond, forbidVars, Nil)) {
+                cellSet(stepsRev, Cons(QbGuard(cond), cellGet(stepsRev)))
+            } else ()
+        },
+        _ ->
+            if (!formMentionsAnyBound(cond, forbidVars, Nil)) {
+                cellSet(stepsRev, Cons(QbGuard(cond), cellGet(stepsRev)))
+            } else (),
+    }
+}
+
+def peelAndCollectIntQuantSteps(
+    ctx: KCtx,
+    isForall: Bool,
+    body: Form,
+    qvar: String,
+    innerQVars: List String,
+    stepsRev: Cell (List QuantBoundStep)
+): Void = {
+    let nestedOpt: Option (String, Form) = match body.node {
+        ExApply(cF, Cons(lamF, Nil)) -> match (resolveDirectCallee(ctx, cF.node), lamF.node) {
+            (Some(dn), ExAbs(Cons(ivd, Nil), _, innerB)) ->
+                if ((isForall && dn == "$gs$forall") || (!isForall && dn == "$gs$exists")) {
+                    Some((ivd.vname, innerB))
+                } else None,
+            _ -> None,
+        },
+        _ -> None,
+    };
+    match nestedOpt {
+        Some((ivName, innerB)) ->
+            if (ivName == qvar) ()
+            else peelAndCollectIntQuantSteps(ctx, isForall, innerB, qvar, Cons(ivName, innerQVars), stepsRev),
+        None ->
+            if (isForall) {
+                match body.node {
+                    ExIf(guardF, thF, elF) -> match elF.node {
+                        ExLit(LitBool(true)) -> {
+                            collectIntQuantSteps(guardF, qvar, innerQVars, stepsRev);
+                            peelAndCollectIntQuantSteps(ctx, true, thF, qvar, innerQVars, stepsRev)
+                        },
+                        _ -> (),
+                    },
+                    ExBin(OpOr, negG, thF) -> match negG.node {
+                        ExUn(UnNot, guardF) -> {
+                            collectIntQuantSteps(guardF, qvar, innerQVars, stepsRev);
+                            peelAndCollectIntQuantSteps(ctx, true, thF, qvar, innerQVars, stepsRev)
+                        },
+                        _ -> (),
+                    },
+                    _ -> (),
+                }
+            } else {
+                collectIntQuantSteps(body, qvar, innerQVars, stepsRev)
+            },
+    }
+}
+
+def recordUnboundedQuantCheckErr(ctx: KCtx, sp: Span, isForall: Bool, vd: VarDecl): TaggedTerm = {
+    let qkw = if (isForall) "forall" else "exists";
+    let bty = schemeBody(vd.vscm);
+    match cellGet(ctx.kErr) {
+        None -> cellSet(ctx.kErr, Some(formatSpanDiagHint(
+            "contract",
+            sp,
+            "cannot execute unbounded `" + qkw + "` quantifier over `" + typeToString(bty) + "` in `--contracts=check` mode",
+            "provide finite `Int` lower and upper bounds (e.g. `0 <= " + vd.vname + " && " + vd.vname + " < n`), use `geisha verify`, or compile with `--contracts=erase`"
+        ))),
+        Some(_) -> (),
+    };
+    MkTerm { tspan: sp, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) }
 }
 
 def lowerQuantifierForCheck(
@@ -1436,29 +1842,38 @@ def lowerQuantifierForCheck(
             }
         },
         TyCon("Int") -> {
-            let loOpt: Cell (Option (Form, Bool)) = cellNew(None);
-            let hiOpt: Cell (Option (Form, Bool)) = cellNew(None);
-            if (isForall) {
-                match qbody.node {
-                    ExIf(guardF, _, elF) -> match elF.node {
-                        ExLit(LitBool(true)) -> scanIntQuantBounds(guardF, vd.vname, loOpt, hiOpt),
-                        _ -> (),
+            let stepsRev: Cell (List QuantBoundStep) = cellNew(Nil);
+            peelAndCollectIntQuantSteps(ctx, isForall, qbody, vd.vname, Nil, stepsRev);
+            let steps = listRev(cellGet(stepsRev));
+            let loPick: Cell (Option (Int, Form, Bool)) = cellNew(None);
+            let hiPick: Cell (Option (Int, Form, Bool)) = cellNew(None);
+            let sIdx = cellNew(0);
+            let cs = cellNew(steps);
+            while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                match cellGet(cs) {
+                    Cons(stp, rs) -> {
+                        let k = cellGet(sIdx);
+                        match stp {
+                            QbLo(lf, ls) -> match cellGet(loPick) {
+                                None -> cellSet(loPick, Some((k, lf, ls))),
+                                Some(_) -> (),
+                            },
+                            QbHi(hf, hi) -> match cellGet(hiPick) {
+                                None -> cellSet(hiPick, Some((k, hf, hi))),
+                                Some(_) -> (),
+                            },
+                            QbGuard(_) -> (),
+                        };
+                        cellSet(sIdx, k + 1);
+                        cellSet(cs, rs)
                     },
-                    ExBin(OpOr, negG, _) -> match negG.node {
-                        ExUn(UnNot, guardF) -> scanIntQuantBounds(guardF, vd.vname, loOpt, hiOpt),
-                        _ -> (),
-                    },
-                    _ -> (),
+                    Nil -> (),
                 }
-            } else {
-                scanIntQuantBounds(qbody, vd.vname, loOpt, hiOpt)
             };
-            match (cellGet(loOpt), cellGet(hiOpt)) {
-                (Some((loF, loStrict)), Some((hiF, hiIncl))) -> {
+            match (cellGet(loPick), cellGet(hiPick)) {
+                (Some((loIdx, loF, loStrict)), Some((hiIdx, hiF, hiIncl))) -> {
                     let cellIntScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Int")));
                     let cellBoolScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Bool")));
-                    let loTerm0 = transformForm(ctx, loF);
-                    let hiTerm0 = transformForm(ctx, hiF);
                     let savedEnv = cellGet(ctx.kLocalEnv);
                     cellSet(ctx.kLocalEnv, Cons((vd.vname, intScm), savedEnv));
                     let tbody = transformForm(ctx, qbody);
@@ -1481,7 +1896,6 @@ def lowerQuantifierForCheck(
                     let startVal = if (loStrict) MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, loVar, oneLit) } else loVar;
                     let emptyRange =
                         if (loStrict && !hiIncl) {
-                            // `lo < i && i < hi` is empty when `lo >= hi` OR `lo == 2147483647`
                             MkTerm {
                                 tspan: sp, tscm: boolScm,
                                 tnode: TmBin(
@@ -1560,47 +1974,151 @@ def lowerQuantifierForCheck(
                         tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyComp(TyCon("Cell"), TyCon("Bool")))) }, [emptyRange]),
                     };
 
-                    MkTerm {
+                    let loopInner = MkTerm {
                         tspan: sp, tscm: boolScm,
                         tnode: TmLet(
-                            MkVarDecl { vname: loName, vscm: intScm },
-                            loTerm0,
+                            MkVarDecl { vname: idxName, vscm: cellIntScm },
+                            initI,
                             MkTerm {
                                 tspan: sp, tscm: boolScm,
                                 tnode: TmLet(
-                                    MkVarDecl { vname: hiName, vscm: intScm },
-                                    hiTerm0,
+                                    MkVarDecl { vname: resName, vscm: cellBoolScm },
+                                    initR,
                                     MkTerm {
                                         tspan: sp, tscm: boolScm,
                                         tnode: TmLet(
-                                            MkVarDecl { vname: idxName, vscm: cellIntScm },
-                                            initI,
-                                            MkTerm {
-                                                tspan: sp, tscm: boolScm,
-                                                tnode: TmLet(
-                                                    MkVarDecl { vname: resName, vscm: cellBoolScm },
-                                                    initR,
-                                                    MkTerm {
-                                                        tspan: sp, tscm: boolScm,
-                                                        tnode: TmLet(
-                                                            MkVarDecl { vname: doneName, vscm: cellBoolScm },
-                                                            initDone,
-                                                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBlock([wLoop, getR()]) }
-                                                        ),
-                                                    }
-                                                ),
-                                            }
+                                            MkVarDecl { vname: doneName, vscm: cellBoolScm },
+                                            initDone,
+                                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBlock([wLoop, getR()]) }
                                         ),
                                     }
                                 ),
                             }
                         ),
-                    }
+                    };
+
+                    // Wrap `loopInner` right-to-left over `steps[0 .. max(loIdx, hiIdx)]` so independent
+                    // short-circuit guards (e.g. `x > 0 && 0 <= i && i < positive(x)`) run BEFORE bound expressions!
+                    let maxBIdx = if (loIdx > hiIdx) loIdx else hiIdx;
+                    let selectedRev: Cell (List QuantBoundStep) = cellNew(Nil);
+                    let pIdx = cellNew(0);
+                    let cpSteps = cellNew(steps);
+                    while (cellGet(pIdx) <= maxBIdx && match cellGet(cpSteps) { Nil -> false, _ -> true }) {
+                        match cellGet(cpSteps) {
+                            Cons(stItem, rSteps) -> {
+                                let k = cellGet(pIdx);
+                                if (k == loIdx) {
+                                    cellSet(selectedRev, Cons(QbLo(loF, loStrict), cellGet(selectedRev)))
+                                } else if (k == hiIdx) {
+                                    cellSet(selectedRev, Cons(QbHi(hiF, hiIncl), cellGet(selectedRev)))
+                                } else {
+                                    match stItem {
+                                        QbGuard(gf) -> cellSet(selectedRev, Cons(QbGuard(gf), cellGet(selectedRev))),
+                                        _ -> (),
+                                    }
+                                };
+                                cellSet(pIdx, k + 1);
+                                cellSet(cpSteps, rSteps)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let wrapped = cellNew(loopInner);
+                    let cWrap = cellNew(cellGet(selectedRev));
+                    while (match cellGet(cWrap) { Nil -> false, _ -> true }) {
+                        match cellGet(cWrap) {
+                            Cons(wStep, rWrap) -> {
+                                match wStep {
+                                    QbLo(lf, _) -> {
+                                        let lt = transformForm(ctx, lf);
+                                        cellSet(wrapped, MkTerm {
+                                            tspan: sp, tscm: boolScm,
+                                            tnode: TmLet(MkVarDecl { vname: loName, vscm: intScm }, lt, cellGet(wrapped)),
+                                        })
+                                    },
+                                    QbHi(hf, _) -> {
+                                        let ht = transformForm(ctx, hf);
+                                        cellSet(wrapped, MkTerm {
+                                            tspan: sp, tscm: boolScm,
+                                            tnode: TmLet(MkVarDecl { vname: hiName, vscm: intScm }, ht, cellGet(wrapped)),
+                                        })
+                                    },
+                                    QbGuard(gf) -> {
+                                        let gt = transformForm(ctx, gf);
+                                        let vacuousLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(isForall)) };
+                                        cellSet(wrapped, MkTerm {
+                                            tspan: sp, tscm: boolScm,
+                                            tnode: TmIf(gt, cellGet(wrapped), vacuousLit),
+                                        })
+                                    },
+                                };
+                                cellSet(cWrap, rWrap)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellGet(wrapped)
                 },
-                _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) },
+                _ -> recordUnboundedQuantCheckErr(ctx, sp, isForall, vd),
             }
         },
-        _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) },
+        _ -> {
+            // Support finite fieldless enum ADTs (`data Color { Red, Green, Blue }`) in `--contracts=check` too!
+            let (hOpt, targs) = kAdtHeadAndArgs(bty);
+            let enumVariantsOpt: Option (String, List VariantInfo) = match hOpt {
+                Some(adtNm) -> match strMapGet(ctx.kAdtReg, adtNm) {
+                    Some(ainfo) -> match ainfo.variants {
+                        Nil -> None,
+                        vs -> {
+                            let allNullary = cellNew(true);
+                            let cv = cellNew(vs);
+                            while (cellGet(allNullary) && match cellGet(cv) { Nil -> false, _ -> true }) {
+                                match cellGet(cv) {
+                                    Cons(vi, rv) -> {
+                                        match vi.fieldTypes { Nil -> (), _ -> cellSet(allNullary, false) };
+                                        cellSet(cv, rv)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            if (cellGet(allNullary)) Some((adtNm, vs)) else None
+                        },
+                    },
+                    None -> None,
+                },
+                None -> None,
+            };
+            match enumVariantsOpt {
+                Some((adtNm, vs)) -> {
+                    let enumScm = ScmMono(bty);
+                    let accOpt: Cell (Option TaggedTerm) = cellNew(None);
+                    let cv = cellNew(vs);
+                    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                        match cellGet(cv) {
+                            Cons(vi, rv) -> {
+                                let savedEnv = cellGet(ctx.kLocalEnv);
+                                cellSet(ctx.kLocalEnv, Cons((vd.vname, enumScm), savedEnv));
+                                let tb = transformForm(ctx, qbody);
+                                cellSet(ctx.kLocalEnv, savedEnv);
+                                let ctorVal = MkTerm { tspan: sp, tscm: enumScm, tnode: TmMakeData(adtNm, vi.tag, Nil, Nil, targs) };
+                                let armTerm = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: vd.vname, vscm: enumScm }, ctorVal, tb) };
+                                cellSet(accOpt, match cellGet(accOpt) {
+                                    None -> Some(armTerm),
+                                    Some(prev) -> Some(MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(if (isForall) OpAnd else OpOr, prev, armTerm) }),
+                                });
+                                cellSet(cv, rv)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    match cellGet(accOpt) {
+                        Some(resT) -> resT,
+                        None -> recordUnboundedQuantCheckErr(ctx, sp, isForall, vd),
+                    }
+                },
+                None -> recordUnboundedQuantCheckErr(ctx, sp, isForall, vd),
+            }
+        },
     }
 }
 
@@ -1714,15 +2232,16 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         Nil -> (),
                     }
                 };
-                // Snapshot any `old(expr)` subexpressions in `fc.fcEnsures` BEFORE executing `innerBody`!
+                // Snapshot any pre-state mutable containers referenced inside `old(...)` BEFORE executing `innerBody`!
                 let oldSnapsRev: Cell (List (String, Scheme, TaggedTerm)) = cellNew(Nil);
+                let oldVarSnapMap: Cell (List (String, String)) = cellNew(Nil);
                 let rewrittenEnsRev: Cell (List EnsuresClause) = cellNew(Nil);
                 let ce0 = cellNew(fc.fcEnsures);
                 while (match cellGet(ce0) { Nil -> false, _ -> true }) {
                     match cellGet(ce0) {
                         Cons(ec, r) -> {
                             let initInner = match ec.ecBind { Some(bn) -> [bn], None -> Nil };
-                            let rwE = rewriteOldInFormForCheck(ctx, ec.ecExpr, initInner, oldSnapsRev);
+                            let rwE = rewriteOldInFormForCheck(ctx, ec.ecExpr, initInner, oldVarSnapMap, oldSnapsRev);
                             cellSet(rewrittenEnsRev, Cons(MkEnsuresClause { ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: rwE }, cellGet(rewrittenEnsRev)));
                             cellSet(ce0, r)
                         },
@@ -9225,51 +9744,56 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
         Some(emsg) -> Err(emsg),
         None -> {
             let (concreteFns0, concreteNames0, concreteGlobals0) = runMonomorphizationWorklist(ctx);
-            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames0, concreteGlobals0, ctx.kExterns, contractMode);
-            verifyConcurrentClosures(concreteFns, concreteNames0, concreteGlobals1, inf.adtReg)?;
-            let cExportList = listRev(cellGet(cExportsRev));
-            let (concreteNames, concreteGlobals) =
-                if (runInline && contractMode != "keep") {
-                    let nextBinderId = cellNew(0);
-                    let emptySkip: StrMap Bool = strMapNew();
-                    let g2 = inlineTinyLeafFns(concreteFns, concreteNames0, concreteGlobals1, ctx.kExterns, nextBinderId);
-                    let (ns3, g3) = optimizeCoreCombinators(
-                        concreteFns, concreteNames0, g2, ctx.kExterns, ctorMap, cExportList, emptySkip, nextBinderId
-                    );
-                    let g4 = inlineTinyLeafFns(concreteFns, ns3, g3, ctx.kExterns, nextBinderId);
-                    (ns3, g4)
-                } else (concreteNames0, concreteGlobals1);
-            verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
-            let escapeInfo =
-                if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, ctx.kExterns, inf.adtReg, inf.adtNames)
-                else MkEscapeInfo {
-                    escRecAdts: strMapNew(),
-                    escFnStackVars: strMapNew(),
-                    escFnHasStack: strMapNew(),
-                };
+            match cellGet(ctx.kErr) {
+                Some(emsg2) -> Err(emsg2),
+                None -> {
+                    let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames0, concreteGlobals0, ctx.kExterns, contractMode);
+                    verifyConcurrentClosures(concreteFns, concreteNames0, concreteGlobals1, inf.adtReg)?;
+                    let cExportList = listRev(cellGet(cExportsRev));
+                    let (concreteNames, concreteGlobals) =
+                        if (runInline && contractMode != "keep") {
+                            let nextBinderId = cellNew(0);
+                            let emptySkip: StrMap Bool = strMapNew();
+                            let g2 = inlineTinyLeafFns(concreteFns, concreteNames0, concreteGlobals1, ctx.kExterns, nextBinderId);
+                            let (ns3, g3) = optimizeCoreCombinators(
+                                concreteFns, concreteNames0, g2, ctx.kExterns, ctorMap, cExportList, emptySkip, nextBinderId
+                            );
+                            let g4 = inlineTinyLeafFns(concreteFns, ns3, g3, ctx.kExterns, nextBinderId);
+                            (ns3, g4)
+                        } else (concreteNames0, concreteGlobals1);
+                    verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
+                    let escapeInfo =
+                        if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, ctx.kExterns, inf.adtReg, inf.adtNames)
+                        else MkEscapeInfo {
+                            escRecAdts: strMapNew(),
+                            escFnStackVars: strMapNew(),
+                            escFnHasStack: strMapNew(),
+                        };
 
-            let adtNamesListRev: Cell (List String) = cellNew(Nil);
-            let anIdx = cellNew(0);
-            while (cellGet(anIdx) < vecLen(inf.adtNames)) {
-                cellSet(adtNamesListRev, Cons(vecGetOr(inf.adtNames, cellGet(anIdx), ""), cellGet(adtNamesListRev)));
-                cellSet(anIdx, cellGet(anIdx) + 1)
-            };
+                    let adtNamesListRev: Cell (List String) = cellNew(Nil);
+                    let anIdx = cellNew(0);
+                    while (cellGet(anIdx) < vecLen(inf.adtNames)) {
+                        cellSet(adtNamesListRev, Cons(vecGetOr(inf.adtNames, cellGet(anIdx), ""), cellGet(adtNamesListRev)));
+                        cellSet(anIdx, cellGet(anIdx) + 1)
+                    };
 
-            Ok(MkCoreProgram {
-                coreFns: concreteFns,
-                coreFnNames: concreteNames,
-                coreGlobals: concreteGlobals,
-                coreExterns: ctx.kExterns,
-                coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
-                coreCExports: cExportList,
-                coreCtors: listRev(cellGet(ctorsRev)),
-                coreAdtReg: inf.adtReg,
-                coreAdtNames: listRev(cellGet(adtNamesListRev)),
-                coreEscape: escapeInfo,
-                coreVerifiedFns: ctx.kVerifiedFns,
-                coreOrigFnNames: ctx.kOrigFnNames,
-                coreUnseededPolyFns: listRev(cellGet(ctx.kUnseededPolyRev)),
-            })
+                    Ok(MkCoreProgram {
+                        coreFns: concreteFns,
+                        coreFnNames: concreteNames,
+                        coreGlobals: concreteGlobals,
+                        coreExterns: ctx.kExterns,
+                        coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
+                        coreCExports: cExportList,
+                        coreCtors: listRev(cellGet(ctorsRev)),
+                        coreAdtReg: inf.adtReg,
+                        coreAdtNames: listRev(cellGet(adtNamesListRev)),
+                        coreEscape: escapeInfo,
+                        coreVerifiedFns: ctx.kVerifiedFns,
+                        coreOrigFnNames: ctx.kOrigFnNames,
+                        coreUnseededPolyFns: listRev(cellGet(ctx.kUnseededPolyRev)),
+                    })
+                },
+            }
         },
     }
 }
