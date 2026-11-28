@@ -12,8 +12,12 @@ import tempfile
 from pathlib import Path
 
 
-def run(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, env=env)
+def run(
+    cmd: list[str],
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
 
 
 def main() -> int:
@@ -1888,16 +1892,15 @@ def main() -> int:
         tmp2 = Path(td2)
         checked_bin = tmp2 / ("geisha_checked.exe" if sys.platform == "win32" else "geisha_checked")
         r_chk_build = run([
-            geisha, "--contracts=check", "--src-root", str(repo_root),
+            geisha, "build", "--contracts=check",
             "--runtime", runtime, "-O2", "-o", str(checked_bin),
-            str(repo_root / "src" / "geisha.gsa"),
-        ])
+        ], cwd=repo_root)
         assert r_chk_build.returncode == 0, f"D2 geisha_checked build failed:\n{r_chk_build.stdout}\n{r_chk_build.stderr}"
         # Verify contracts are genuinely live (not erased) in geisha_checked
         bin_bytes = checked_bin.read_bytes()
         assert b"Contract error:" in bin_bytes, "D2 geisha_checked binary missing live 'Contract error:' strings!"
         # Self-check the entire compiler under live runtime contracts
-        r_self = run([str(checked_bin), "check", "--src-root", str(repo_root), str(repo_root / "src" / "geisha.gsa")])
+        r_self = run([str(checked_bin), "check"], cwd=repo_root)
         assert r_self.returncode == 0, f"D2 geisha_checked self-check failed:\n{r_self.stdout}\n{r_self.stderr}"
         # Multi-backend codegen under live runtime contracts (native IR, wasm-gc, js),
         # exercising HOF combinator opt, `$spec$`, `$flat$`, and known-match reduction live!

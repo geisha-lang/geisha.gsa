@@ -47,6 +47,24 @@ if [ "$IS_WIN" = "1" ] && command -v cygpath >/dev/null 2>&1; then
 fi
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# Materialize compiler's locked `parsec` source dir for whitebox compiler-`src/` tests
+"$GEISHA_BIN" fetch >/dev/null
+PARSEC_LOCK_HASH12="$(grep '^sha256 = ' geisha.lock | head -n 1 | cut -d'"' -f2 | cut -c1-12)"
+PARSEC_PKG_SRC=""
+for cand in "${GEISHA_HOME:-$HOME/.geisha}"/cache/p/parsec-*"$PARSEC_LOCK_HASH12"/src; do
+    if [ -d "$cand" ]; then
+        PARSEC_PKG_SRC="$cand"
+        break
+    fi
+done
+if [ -z "$PARSEC_PKG_SRC" ]; then
+    echo "FAIL [parsec_pkg_src_resolve]: could not locate cached parsec-$PARSEC_LOCK_HASH12/src" >&2
+    exit 1
+fi
+if [ "$IS_WIN" = "1" ] && command -v cygpath >/dev/null 2>&1; then
+    PARSEC_PKG_SRC="$(cygpath -m "$PARSEC_PKG_SRC")"
+fi
+
 PASS=0
 
 assert_eq() {
@@ -4564,7 +4582,7 @@ def main(): Void = {
     printLn((if (uncOk) "1" else "0") + "|" + (if (lhOk) "1" else "0") + "|" + (if (pctRtOk) "1" else "0"))
 }
 EOF
-"$GEISHA_BIN" --src-root src -o "$TMP_DIR/t39_uri_norm$EXE_EXT" "$TMP_DIR/t39_uri_norm.gsa"
+"$GEISHA_BIN" --src-root src --pkg "parsec=$PARSEC_PKG_SRC" -o "$TMP_DIR/t39_uri_norm$EXE_EXT" "$TMP_DIR/t39_uri_norm.gsa"
 assert_eq "pkg_file_uri_pct_decode_and_unc" "1|1|1" "$("$TMP_DIR/t39_uri_norm$EXE_EXT")"
 
 # Two-repo fixture (`dep%20one` vs `dep one`): verify `geisha add file:///.../dep%2520one`
@@ -5537,7 +5555,7 @@ def main(): Void = {
     }
 }
 EOF
-"$GEISHA_BIN" --src-root src -o "$TMP_DIR/t39_win64_abi" "$TMP_DIR/t39_win64_abi.gsa"
+"$GEISHA_BIN" --src-root src --pkg "parsec=$PARSEC_PKG_SRC" -o "$TMP_DIR/t39_win64_abi" "$TMP_DIR/t39_win64_abi.gsa"
 assert_eq "win64_c_abi_and_blocking_capture" "1|1|1|1|1|1" "$("$TMP_DIR/t39_win64_abi")"
 
 # Verify `gc_enter_blocking_capture()` preserves callee-saved register GC roots under `-O2` across a blocking FFI call + major GC
@@ -8128,6 +8146,122 @@ SPEC_CALL_HITS="$(grep -o "apply-dir \"$FIRST_SPEC_FN\"" "$TMP_DIR/t50_spec_cap.
 if [ "$SPEC_CALL_HITS" -lt 3 ]; then
     echo "FAIL [hof_spec_cap_reuse_ir]: expected $FIRST_SPEC_FN to be reused after 64-spec cap, got $SPEC_CALL_HITS apply-dir hits" >&2
     exit 1
+fi
+PASS=$((PASS + 1))
+
+# 51. Parser Parsec Migration Regressions (CLI sibling isolation, diagnostic spans/hints, Parser compat API, & autocrlf fetch)
+mkdir -p "$TMP_DIR/t51_anc/dep/src" "$TMP_DIR/t51_anc/src" "$TMP_DIR/t51_anc/scratch"
+cat > "$TMP_DIR/t51_anc/geisha.toml" << 'EOF'
+[package]
+name = "anc_root"
+version = "0.1.0"
+
+[deps]
+foo = { path = "./dep" }
+EOF
+cat > "$TMP_DIR/t51_anc/dep/geisha.toml" << 'EOF'
+[package]
+name = "foo"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/t51_anc/dep/src/foo.gsa" << 'EOF'
+pub def label(): String = "dependency"
+EOF
+cat > "$TMP_DIR/t51_anc/src/main.gsa" << 'EOF'
+def main(): Void = ()
+EOF
+cat > "$TMP_DIR/t51_anc/scratch/foo.gsa" << 'EOF'
+pub def label(): String = "sibling"
+EOF
+cat > "$TMP_DIR/t51_anc/scratch/main.gsa" << 'EOF'
+use foo.label
+def main(): Void = printLn(label())
+EOF
+ABS_GEISHA_T51="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_T51="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+(cd "$TMP_DIR/t51_anc/scratch" && "$ABS_GEISHA_T51" --src-root . --runtime "$ABS_RT_T51" -o "$TMP_DIR/t51_sib$EXE_EXT" main.gsa)
+assert_eq "cli_src_root_sibling_beats_ancestor_dep_native" "sibling" "$("$TMP_DIR/t51_sib$EXE_EXT")"
+if command -v node >/dev/null 2>&1; then
+    (cd "$TMP_DIR/t51_anc/scratch" && "$ABS_GEISHA_T51" --target js --src-root . -o "$TMP_DIR/t51_sib.mjs" main.gsa)
+    assert_eq "cli_src_root_sibling_beats_ancestor_dep_js" "sibling" "$(node "$TMP_DIR/t51_sib.mjs")"
+fi
+
+# Diagnostic spans & overflow hints: `-2147483649` full span, `[1,2147483648]` overflow hint, `open m.` EOF ident
+cat > "$TMP_DIR/t51_neg_ovf.gsa" << 'EOF'
+pub def x = -2147483649
+EOF
+T51_NEG_DIAG="$("$GEISHA_BIN" check "$TMP_DIR/t51_neg_ovf.gsa" 2>&1 || true)"
+case "$T51_NEG_DIAG" in
+    *"near: -2147483649"*) ;;
+    *) echo "FAIL [neg_int_overflow_span]: expected 'near: -2147483649', got: $T51_NEG_DIAG" >&2; exit 1 ;;
+esac
+cat > "$TMP_DIR/t51_list_ovf.gsa" << 'EOF'
+pub def x = [1, 2147483648]
+EOF
+T51_LIST_DIAG="$("$GEISHA_BIN" check "$TMP_DIR/t51_list_ovf.gsa" 2>&1 || true)"
+case "$T51_LIST_DIAG" in
+    *"out of 32-bit Int range"*"parseInt64"*) ;;
+    *) echo "FAIL [list_int_overflow_hint]: expected overflow + parseInt64 hint, got: $T51_LIST_DIAG" >&2; exit 1 ;;
+esac
+cat > "$TMP_DIR/t51_open_dot.gsa" << 'EOF'
+open m.
+EOF
+T51_OPEN_DIAG="$("$GEISHA_BIN" check "$TMP_DIR/t51_open_dot.gsa" 2>&1 || true)"
+case "$T51_OPEN_DIAG" in
+    *"expected identifier"*) ;;
+    *) echo "FAIL [open_trailing_dot_diag]: expected identifier diagnostic, got: $T51_OPEN_DIAG" >&2; exit 1 ;;
+esac
+
+# Public `parser.{Parser, newParser, parseExpr}` source-module compatibility + deeply nested parenthesized types
+cat > "$TMP_DIR/t51_api_compat.gsa" << 'EOF'
+use std.result.{Ok, Err}
+use lexer.tokenizeInFile
+use parser.{Parser, newParser, parseExpr}
+
+type Deep = ((((((((((((((((Int))))))))))))))))
+
+def checkOne(p: Parser): Bool = match parseExpr(p) {
+    Ok(_) -> true,
+    Err(_) -> false,
+}
+
+def main(): Void = match tokenizeInFile("40 + 2", 0) {
+    Ok(toks) -> printLn(if (checkOne(newParser(toks))) "compat-ok" else "compat-bad"),
+    Err(e) -> printLn(e),
+}
+EOF
+if [ -n "$PARSEC_PKG_SRC" ]; then
+    "$GEISHA_BIN" --src-root src --pkg "parsec=$PARSEC_PKG_SRC" -o "$TMP_DIR/t51_api_compat$EXE_EXT" "$TMP_DIR/t51_api_compat.gsa"
+    assert_eq "parser_public_api_and_deep_paren_type" "compat-ok" "$("$TMP_DIR/t51_api_compat$EXE_EXT")"
+fi
+
+# Cold `GEISHA_HOME` single-file check must NOT fetch ancestor `[deps]`, while project `check` reports corrupted `geisha.lock`
+mkdir -p "$TMP_DIR/t51_cold_home" "$TMP_DIR/t51_lock_proj/src" "$TMP_DIR/t51_lock_proj/sub"
+cp geisha.toml geisha.lock "$TMP_DIR/t51_lock_proj/"
+cat > "$TMP_DIR/t51_lock_proj/src/geisha.gsa" << 'EOF'
+def main(): Void = ()
+EOF
+cat > "$TMP_DIR/t51_lock_proj/sub/standalone.gsa" << 'EOF'
+def main(): Void = ()
+EOF
+(cd "$TMP_DIR/t51_lock_proj/sub" && GEISHA_HOME="$TMP_DIR/t51_cold_home" "$ABS_GEISHA_T51" check standalone.gsa >/dev/null)
+if [ -d "$TMP_DIR/t51_cold_home/cache/p" ] && [ -n "$(ls -A "$TMP_DIR/t51_cold_home/cache/p" 2>/dev/null)" ]; then
+    echo "FAIL [cold_single_file_no_dep_fetch]: standalone check populated $TMP_DIR/t51_cold_home/cache/p!" >&2
+    exit 1
+fi
+printf 'version = [\n' > "$TMP_DIR/t51_lock_proj/geisha.lock"
+T51_BADLOCK_OUT="$(cd "$TMP_DIR/t51_lock_proj" && "$ABS_GEISHA_T51" check 2>&1 || true)"
+case "$T51_BADLOCK_OUT" in
+    *"TOML error"*) ;;
+    *) echo "FAIL [project_corrupt_lock_error]: expected TOML error on corrupt geisha.lock, got: $T51_BADLOCK_OUT" >&2; exit 1 ;;
+esac
+
+# Bootstrap IR target-independence: zero target-specific SIMD intrinsic declarations/calls in `./build/stage2.ll`
+if [ -f "./build/stage2.ll" ]; then
+    if grep -q '^declare .*@llvm\.aarch64\.\|^declare .*@llvm\.x86\.' ./build/stage2.ll; then
+        echo "FAIL [stage2_portable_ir_no_arch_intrinsics]: found target-specific SIMD intrinsic declaration in build/stage2.ll!" >&2
+        exit 1
+    fi
 fi
 PASS=$((PASS + 1))
 

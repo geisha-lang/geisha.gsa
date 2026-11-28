@@ -42,12 +42,12 @@ use lexer.{
     Token, MkToken, tokenizeInFile
 }
 use diag.{formatSpanDiag, formatSpanDiagHint}
-use parsec.{
-    Span as PSpan, ParseFail, ParseError, TokEntry, TokCursor, TokParser, InfixInfo,
+use parsec.core.{
+    Span as PSpan, ParseFail, ParseError, TokEntry, TokCursor, InfixInfo,
     curAtEnd, curOffset, newTokCursor, parseTokensFile, finishErrorFor,
-    fail, failHint, failAt, map, value, between,
-    commit, (<|>), backtrack, opt, optOr, peek, hadNewline, mark, spanFrom,
-    many, many1, skipMany, sepBy1, sepEndBy, sepEndBy1,
+    fail, failHint, failSpan, between,
+    commit, (<|>), backtrack, opt, optOr, peek, hadNewline, spanFrom,
+    many1, skipMany, sepBy1, sepEndBy, sepEndBy1, sepEndByUntil,
     prattInfix, prattPostfix,
     peekTok, atTok, atTokIf, peekNthTok, pushToken, bumpTok,
     eatTok, expectTok, matchTok, tok, skipTok
@@ -55,6 +55,12 @@ use parsec.{
 
 type GsCursor = TokCursor TokKind
 type GsResult a = Result a ParseFail
+
+pub data Parser {
+    MkParser {
+        cursor: GsCursor,
+    },
+}
 
 def toAstSpan(sp: PSpan): Span =
     MkSpan { fileId: sp.fileId, start: sp.start, end: sp.end }
@@ -163,11 +169,28 @@ def failMsg(s: GsCursor, msg: String): GsResult a =
 def failMsgHint(s: GsCursor, msg: String, hint: String): GsResult a =
     failHint("!" + msg, hint)(s)
 
-def failSpanMsg(s: GsCursor, sp: Span, msg: String): GsResult a =
-    failAt(s, sp.start, "!" + msg, "")
+def failSpanMsg(s: GsCursor, sp: Span, msg: String): GsResult a = {
+    commit(s);
+    failSpan(s, toPSpan(sp), "!" + msg, "")
+}
 
-def failSpanMsgHint(s: GsCursor, sp: Span, msg: String, hint: String): GsResult a =
-    failAt(s, sp.start, "!" + msg, hint)
+def failSpanMsgHint(s: GsCursor, sp: Span, msg: String, hint: String): GsResult a = {
+    commit(s);
+    failSpan(s, toPSpan(sp), "!" + msg, hint)
+}
+
+pub def newParser(toks: Vec Token): Parser = {
+    let dummy = MkToken { kind: TkEof, span: emptySpan(), hadNewline: true };
+    let fileId = if (vecLen(toks) > 0) vecGetOr(toks, 0, dummy).span.fileId else 0;
+    let frozen = freezeLexTokens(toks);
+    MkParser { cursor: newTokCursor("", frozen, "<parser>", fileId, describeGsTok) }
+}
+
+def runCompatParser(p: Parser, f: GsCursor -> GsResult a): Result a String =
+    match f(p.cursor) {
+        Ok(v) -> Ok(v),
+        Err(_) -> Err(formatParseErrorDiag(finishErrorFor(p.cursor))),
+    }
 
 // ============================================================================
 // Lexical Helpers & Strict 32-Bit Numeric Literals
@@ -299,9 +322,9 @@ def parseUpperIdent(s: GsCursor): GsResult String = {
 
 def parseParenOpName(s: GsCursor): GsResult String = {
     let _ = eatTok(s, TkLParen)?;
-    let (_, sym) = matchTok(s, (tk) -> match tk { TkSym(op) -> Some(op), _ -> None }, "operator")?;
+    let (opSp, sym) = matchTok(s, (tk) -> match tk { TkSym(op) -> Some(op), _ -> None }, "operator")?;
     if (!isDefinableOp(sym)) {
-        failMsg(s, "reserved symbol '" + sym + "' cannot be defined as an operator")
+        failSpanMsg(s, toAstSpan(opSp), "reserved symbol '" + sym + "' cannot be defined as an operator")
     } else {
         let _ = eatTok(s, TkRParen)?;
         Ok(encodeOpName(sym))
@@ -309,7 +332,7 @@ def parseParenOpName(s: GsCursor): GsResult String = {
 }
 
 def parseCallableIdent(s: GsCursor): GsResult String =
-    if (atTok(s, TkLParen)) backtrack(parseParenOpName)(s)
+    if (atTok(s, TkLParen)) parseParenOpName(s)
     else parseIdent(s)
 
 // ============================================================================
@@ -431,10 +454,9 @@ def parseTypeAtom(s: GsCursor): GsResult Type =
         commit(s);
         if (tryEatTok(s, TkRParen)) Ok(TyVoid)
         else {
-            let first = parseTypeExpr(s)?;
+            let first = parseTypeExprCur(s)?;
             if (tryEatTok(s, TkComma)) {
-                let rest = sepEndBy(parseTypeExpr, skipTok(TkComma))(s)?;
-                let _ = eatTok(s, TkRParen)?;
+                let (rest, _) = sepEndByUntil(parseTypeExprCur, skipTok(TkComma), tok(TkRParen))(s)?;
                 Ok(TyTuple(Cons(first, rest)))
             } else {
                 let _ = eatTok(s, TkRParen)?;
@@ -452,25 +474,15 @@ def parseTypeAtom(s: GsCursor): GsResult Type =
         } else failMsg(s, "invalid type identifier '" + id + "'")
     } else fail("type")(s)
 
-def parseBType(s: GsCursor): GsResult Type = {
-    let first = parseTypeAtom(s)?;
-    let all = parseInlineTypeAtoms(s, [first])?;
-    Ok(composeTypes(all))
-}
-
-def parseParenArrowType(s: GsCursor): GsResult Type = {
-    let params = between(tok(TkLParen), tok(TkRParen), sepEndBy(parseTypeExpr, skipTok(TkComma)))(s)?;
-    let _ = eatSym(s, "->")?;
-    commit(s);
-    let rhs = parseTypeExpr(s)?;
-    Ok(TyArr(TyVoid, params, rhs))
-}
-
-def parseSingleOrBType(s: GsCursor): GsResult Type = {
-    let lhs = parseBType(s)?;
+def finishTypeTailFromHead(s: GsCursor, head: Type): GsResult Type = {
+    let lhs =
+        if (canStartTypeAtomInline(s)) {
+            let all = parseInlineTypeAtoms(s, [head])?;
+            composeTypes(all)
+        } else head;
     if (tryEatSym(s, "->")) {
         commit(s);
-        let rhs = parseTypeExpr(s)?;
+        let rhs = parseTypeExprCur(s)?;
         let params = match lhs {
             TyVoid -> Nil,
             _ -> [lhs],
@@ -479,24 +491,59 @@ def parseSingleOrBType(s: GsCursor): GsResult Type = {
     } else Ok(lhs)
 }
 
-def parseTypeExpr(s: GsCursor): GsResult Type =
-    if (atTok(s, TkLParen)) (backtrack(parseParenArrowType) <|> parseSingleOrBType)(s)
-    else parseSingleOrBType(s)
+def parseSingleOrBType(s: GsCursor): GsResult Type = {
+    let first = parseTypeAtom(s)?;
+    finishTypeTailFromHead(s, first)
+}
 
-def parseTypeScheme(s: GsCursor): GsResult Scheme =
+// Single-pass `O(n)` parenthesized & arrow type parser (parses `(` ... `)` contents once
+// and inspects trailing `->` without exponential backtracking on nested `((((Int))))`).
+def parseTypeExprCur(s: GsCursor): GsResult Type =
+    if (!atTok(s, TkLParen)) parseSingleOrBType(s)
+    else {
+        let _ = eatTok(s, TkLParen)?;
+        commit(s);
+        if (tryEatTok(s, TkRParen)) {
+            if (tryEatSym(s, "->")) {
+                commit(s);
+                let rhs = parseTypeExprCur(s)?;
+                Ok(TyArr(TyVoid, Nil, rhs))
+            } else finishTypeTailFromHead(s, TyVoid)
+        } else {
+            let first = parseTypeExprCur(s)?;
+            if (tryEatTok(s, TkComma)) {
+                let (rest, _) = sepEndByUntil(parseTypeExprCur, skipTok(TkComma), tok(TkRParen))(s)?;
+                let elems = Cons(first, rest);
+                if (tryEatSym(s, "->")) {
+                    commit(s);
+                    let rhs = parseTypeExprCur(s)?;
+                    Ok(TyArr(TyVoid, elems, rhs))
+                } else finishTypeTailFromHead(s, TyTuple(elems))
+            } else {
+                let _ = eatTok(s, TkRParen)?;
+                if (tryEatSym(s, "->")) {
+                    commit(s);
+                    let rhs = parseTypeExprCur(s)?;
+                    Ok(TyArr(TyVoid, [first], rhs))
+                } else finishTypeTailFromHead(s, first)
+            }
+        }
+    }
+
+def parseTypeSchemeCur(s: GsCursor): GsResult Scheme =
     if (tryEatTok(s, TkForall)) {
         commit(s);
         if (atTok(s, TkLParen)) {
             let cs = between(tok(TkLParen), tok(TkRParen), sepEndBy1(parseTypeConstraint, skipTok(TkComma)))(s)?;
             let _ = eatTok(s, TkDot)?;
-            let body = parseTypeExpr(s)?;
+            let body = parseTypeExprCur(s)?;
             Ok(buildConstrainedScheme(Nil, cs, body))
         } else {
             let rawVars = many1(parseTypeVarIdent)(s)?;
             let vs = addStringsUnique(rawVars, Nil);
             let _ = eatTok(s, TkDot)?;
             let csOpt = opt(backtrack(parseConstraintPrefix))(s)?;
-            let body = parseTypeExpr(s)?;
+            let body = parseTypeExprCur(s)?;
             match csOpt {
                 Some(cs) -> Ok(buildConstrainedScheme(vs, cs, body)),
                 None -> Ok(ScmPoly(vs, body)),
@@ -504,7 +551,7 @@ def parseTypeScheme(s: GsCursor): GsResult Scheme =
         }
     } else {
         let csOpt = opt(backtrack(parseConstraintPrefix))(s)?;
-        let body = parseTypeExpr(s)?;
+        let body = parseTypeExprCur(s)?;
         match csOpt {
             Some(cs) -> Ok(buildConstrainedScheme(Nil, cs, body)),
             None -> Ok(ScmMono(body)),
@@ -516,7 +563,7 @@ pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 
     Ok(toks) -> {
         let frozen = freezeLexTokens(toks);
         let cur = newTokCursor(src, frozen, "<scheme>", 0, describeGsTok);
-        match parseTypeScheme(cur) {
+        match parseTypeSchemeCur(cur) {
             Ok(scm) -> scm,
             Err(_) -> ScmMono(TyVoid),
         }
@@ -532,12 +579,12 @@ def parseStructPatField(s: GsCursor): GsResult (String, Pattern, Span, Bool) = {
     let fname = parseLowerIdent(s)?;
     if (tryEatSym(s, ":")) {
         commit(s);
-        let sub = parsePattern(s)?;
+        let sub = parsePatternCur(s)?;
         Ok((fname, sub, fSp, false))
     } else Ok((fname, PatVar(fname, fSp), fSp, true))
 }
 
-def parsePattern(s: GsCursor): GsResult Pattern = match peekTok(s) {
+def parsePatternCur(s: GsCursor): GsResult Pattern = match peekTok(s) {
     None -> fail("pattern")(s),
     Some(e) -> match e.kind {
         TkIdent(name) -> {
@@ -547,14 +594,12 @@ def parsePattern(s: GsCursor): GsResult Pattern = match peekTok(s) {
                 if (atTok(s, TkLBrace)) {
                     let _ = eatTok(s, TkLBrace)?;
                     commit(s);
-                    let fs = sepEndBy(parseStructPatField, skipTok(TkComma))(s)?;
-                    let _ = eatTok(s, TkRBrace)?;
+                    let (fs, _) = sepEndByUntil(parseStructPatField, skipTok(TkComma), tok(TkRBrace))(s)?;
                     Ok(PatStruct(name, fs))
                 } else if (atTok(s, TkLParen)) {
                     let _ = eatTok(s, TkLParen)?;
                     commit(s);
-                    let args = sepEndBy(parsePattern, skipTok(TkComma))(s)?;
-                    let _ = eatTok(s, TkRParen)?;
+                    let (args, _) = sepEndByUntil(parsePatternCur, skipTok(TkComma), tok(TkRParen))(s)?;
                     Ok(PatCtor(name, args))
                 } else Ok(PatCtor(name, Nil))
             } else Ok(PatVar(name, toAstSpan(e.span)))
@@ -564,10 +609,9 @@ def parsePattern(s: GsCursor): GsResult Pattern = match peekTok(s) {
             commit(s);
             if (tryEatTok(s, TkRParen)) Ok(PatLit(LitUnit))
             else {
-                let first = parsePattern(s)?;
+                let first = parsePatternCur(s)?;
                 if (tryEatTok(s, TkComma)) {
-                    let rest = sepEndBy(parsePattern, skipTok(TkComma))(s)?;
-                    let _ = eatTok(s, TkRParen)?;
+                    let (rest, _) = sepEndByUntil(parsePatternCur, skipTok(TkComma), tok(TkRParen))(s)?;
                     Ok(PatTuple(Cons(first, rest)))
                 } else {
                     let _ = eatTok(s, TkRParen)?;
@@ -662,7 +706,7 @@ def parseVarDecl(s: GsCursor): GsResult VarDecl = {
     let name = parseIdent(s)?;
     if (tryEatSym(s, ":")) {
         commit(s);
-        let ty = parseTypeExpr(s)?;
+        let ty = parseTypeExprCur(s)?;
         Ok(MkVarDecl { vname: name, vscm: ScmMono(ty) })
     } else Ok(MkVarDecl { vname: name, vscm: ScmSlot })
 }
@@ -675,7 +719,7 @@ def parseLambdaHeader(s: GsCursor): GsResult (Span, List VarDecl, Option Type) =
     let ps = parseParamSeq(s)?;
     let _ = eatTok(s, TkRParen)?;
     let retOpt =
-        if (tryEatSym(s, ":")) Some(parseTypeExpr(s)?)
+        if (tryEatSym(s, ":")) Some(parseTypeExprCur(s)?)
         else None;
     let _ = eatSym(s, "->")?;
     Ok((openSp, ps, retOpt))
@@ -692,7 +736,7 @@ def parseLetBindingHead(s: GsCursor): GsResult (Bool, VarDecl, Pattern) = {
     match vdOpt {
         Some(vd) -> Ok((true, vd, PatWild)),
         None -> {
-            let pat = parsePattern(s)?;
+            let pat = parsePatternCur(s)?;
             Ok((false, MkVarDecl { vname: "", vscm: ScmSlot }, pat))
         },
     }
@@ -700,16 +744,16 @@ def parseLetBindingHead(s: GsCursor): GsResult (Bool, VarDecl, Pattern) = {
 
 def parseBlockItemsLoop(s: GsCursor, accRev: List BlockStmtItem): GsResult (List BlockStmtItem) = {
     skipSemis(s)?;
-    if (atTok(s, TkRBrace)) Ok(listRev(accRev))
+    if (atTok(s, TkRBrace) || curAtEnd(s)) Ok(listRev(accRev))
     else {
         let item =
             if (atTok(s, TkLet)) {
                 let letSp = toAstSpan(bumpTok(s)?.span);
                 let (isVar, vd, pat) = parseLetBindingHead(s)?;
                 let _ = eatSym(s, "=")?;
-                let val: Form = parseExpr(s)?;
+                let val: Form = parseExprCur(s)?;
                 if (tryEatTok(s, TkIn)) {
-                    let body: Form = parseExpr(s)?;
+                    let body: Form = parseExprCur(s)?;
                     let fullSp = unionSpan(letSp, body.pos);
                     let eForm =
                         if (isVar) mkForm(fullSp, ExLet(vd, val, body))
@@ -720,10 +764,10 @@ def parseBlockItemsLoop(s: GsCursor, accRev: List BlockStmtItem): GsResult (List
                     if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val)
                 }
             } else {
-                let e = parseExpr(s)?;
+                let e = parseExprCur(s)?;
                 BsExpr(e)
             };
-        if (atTok(s, TkRBrace)) {
+        if (atTok(s, TkRBrace) || curAtEnd(s)) {
             Ok(listRev(Cons(item, accRev)))
         } else {
             if (tryEatTok(s, TkSemi) || hadNewline(s)) {
@@ -775,11 +819,11 @@ def parseWhileSpecsLoop(
 ): GsResult (List (Span, Form), List (Span, Form)) =
     if (atTok(s, TkIdent("invariant"))) {
         let kwSp = toAstSpan(bumpTok(s)?.span);
-        let invE: Form = parseExpr(s)?;
+        let invE: Form = parseExprCur(s)?;
         parseWhileSpecsLoop(s, Cons((unionSpan(kwSp, invE.pos), invE), invsRev), decsRev)
     } else if (atTok(s, TkIdent("decreases"))) {
         let kwSp = toAstSpan(bumpTok(s)?.span);
-        let decE: Form = parseExpr(s)?;
+        let decE: Form = parseExprCur(s)?;
         let callSp = unionSpan(kwSp, decE.pos);
         match decsRev {
             Cons(_, _) -> failSpanMsgHint(
@@ -793,18 +837,18 @@ def parseWhileSpecsLoop(
     } else Ok((listRev(invsRev), listRev(decsRev)))
 
 def parseMatchArm(s: GsCursor): GsResult MatchArm = {
-    let pat = parsePattern(s)?;
+    let pat = parsePatternCur(s)?;
     commit(s);
     let guardOpt =
         if (tryEatTok(s, TkIf)) {
-            let g = between(tok(TkLParen), tok(TkRParen), parseExpr)(s)?;
+            let g = between(tok(TkLParen), tok(TkRParen), parseExprCur)(s)?;
             Some(g)
         } else None;
     if (atTok(s, TkSym("=>"))) {
         failMsgHint(s, "expected `->` in match arm, found `=>`", "Geisha uses `->` (not `=>`) in match arms")
     } else {
         let _ = eatSym(s, "->")?;
-        let body = parseExpr(s)?;
+        let body = parseExprCur(s)?;
         Ok(MkMatchArm { pat: pat, guard: guardOpt, body: body })
     }
 }
@@ -813,7 +857,7 @@ def parseStructInitField(s: GsCursor): GsResult (String, Form) = {
     let fnm = parseLowerIdent(s)?;
     commit(s);
     let _ = eatSym(s, ":")?;
-    let fval = parseExpr(s)?;
+    let fval = parseExprCur(s)?;
     Ok((fnm, fval))
 }
 
@@ -835,11 +879,11 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                 let _ = bumpTok(s)?;
                 commit(s);
                 let _ = expectTok(s, TkLParen, "conditions require parentheses, e.g. `if (cond) ... else ...`")?;
-                let cond = parseExpr(s)?;
+                let cond = parseExprCur(s)?;
                 let _ = eatTok(s, TkRParen)?;
-                let thenE = parseExpr(s)?;
+                let thenE = parseExprCur(s)?;
                 if (tryEatTok(s, TkElse)) {
-                    let elseE: Form = parseExpr(s)?;
+                    let elseE: Form = parseExprCur(s)?;
                     Ok(mkForm(unionSpan(tSp, elseE.pos), ExIf(cond, thenE, elseE)))
                 } else {
                     failMsgHint(s, "missing `else` branch in `if` expression", "add `else ()` if no value is needed")
@@ -849,10 +893,10 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                 let _ = bumpTok(s)?;
                 commit(s);
                 let _ = expectTok(s, TkLParen, "conditions require parentheses, e.g. `while (cond) { ... }`")?;
-                let cond = parseExpr(s)?;
+                let cond = parseExprCur(s)?;
                 let _ = eatTok(s, TkRParen)?;
                 let (invs, decs) = parseWhileSpecsLoop(s, Nil, Nil)?;
-                let rawBody: Form = parseExpr(s)?;
+                let rawBody: Form = parseExprCur(s)?;
                 let body = match (invs, decs) {
                     (Nil, Nil) -> rawBody,
                     _ -> mkForm(rawBody.pos, ExLoopContract(invs, decs, rawBody)),
@@ -864,9 +908,9 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                 commit(s);
                 let (isVar, vd, pat) = parseLetBindingHead(s)?;
                 let _ = eatSym(s, "=")?;
-                let val = parseExpr(s)?;
+                let val = parseExprCur(s)?;
                 let _ = expectTok(s, TkIn, "in expression context write `let x = v in body`, or wrap statements in `{ ... }`")?;
-                let body: Form = parseExpr(s)?;
+                let body: Form = parseExprCur(s)?;
                 let sp = unionSpan(tSp, body.pos);
                 if (isVar) Ok(mkForm(sp, ExLet(vd, val, body)))
                 else Ok(mkForm(sp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }])))
@@ -874,18 +918,18 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
             TkMatch -> {
                 let _ = bumpTok(s)?;
                 commit(s);
-                let scrut = parseExpr(s)?;
+                let scrut = parseExprCur(s)?;
                 let _ = eatTok(s, TkLBrace)?;
-                let arms = sepEndBy(parseMatchArm, skipTok(TkComma))(s)?;
-                let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                let (arms, rawClose) = sepEndByUntil(parseMatchArm, skipTok(TkComma), tok(TkRBrace))(s)?;
+                let closeSp = toAstSpan(rawClose);
                 Ok(mkForm(unionSpan(tSp, closeSp), ExMatch(scrut, arms)))
             },
             TkLBrace -> parseBlockExpr(s),
             TkLBracket -> {
                 let _ = bumpTok(s)?;
                 commit(s);
-                let elems = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
-                let closeSp = toAstSpan(eatTok(s, TkRBracket)?);
+                let (elems, rawClose) = sepEndByUntil(parseExprCur, skipTok(TkComma), tok(TkRBracket))(s)?;
+                let closeSp = toAstSpan(rawClose);
                 Ok(mkForm(unionSpan(tSp, closeSp), ExList(elems)))
             },
             TkLParen -> {
@@ -893,7 +937,7 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                 match lamHdrOpt {
                     Some((openSp, ps, retOpt)) -> {
                         commit(s);
-                        let body: Form = parseExpr(s)?;
+                        let body: Form = parseExprCur(s)?;
                         Ok(mkForm(unionSpan(openSp, body.pos), ExAbs(ps, retOpt, body)))
                     },
                     None -> {
@@ -907,10 +951,10 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                             match secOpt {
                                 Some(secForm) -> Ok(secForm),
                                 None -> {
-                                    let first: Form = parseExpr(s)?;
+                                    let first: Form = parseExprCur(s)?;
                                     if (tryEatTok(s, TkComma)) {
-                                        let rest = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
-                                        let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+                                        let (rest, rawClose) = sepEndByUntil(parseExprCur, skipTok(TkComma), tok(TkRParen))(s)?;
+                                        let closeSp = toAstSpan(rawClose);
                                         Ok(mkForm(unionSpan(openSp, closeSp), ExTuple(Cons(first, rest))))
                                     } else {
                                         let closeSp = toAstSpan(eatTok(s, TkRParen)?);
@@ -953,8 +997,8 @@ def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
                 if (isUpperByte(strByteAt(name, 0)) && atTok(s, TkLBrace) && looksLikeStructInitAfterBrace(s)) {
                     let _ = eatTok(s, TkLBrace)?;
                     commit(s);
-                    let fields = sepEndBy(parseStructInitField, skipTok(TkComma))(s)?;
-                    let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                    let (fields, rawClose) = sepEndByUntil(parseStructInitField, skipTok(TkComma), tok(TkRBrace))(s)?;
+                    let closeSp = toAstSpan(rawClose);
                     Ok(mkForm(unionSpan(tSp, closeSp), ExStructInit(name, fields)))
                 } else Ok(mkForm(tSp, ExVar(name)))
             },
@@ -967,8 +1011,8 @@ def parsePostfixStep(s: GsCursor, prev: Form): GsResult (Option Form) =
     if (!hadNewline(s) && atTok(s, TkLParen)) {
         let _ = eatTok(s, TkLParen)?;
         commit(s);
-        let args = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
-        let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+        let (args, rawClose) = sepEndByUntil(parseExprCur, skipTok(TkComma), tok(TkRParen))(s)?;
+        let closeSp = toAstSpan(rawClose);
         Ok(Some(mkForm(unionSpan(prev.pos, closeSp), ExApply(prev, args))))
     } else if (atTok(s, TkDot)) {
         let _ = eatTok(s, TkDot)?;
@@ -1068,7 +1112,7 @@ def combineGeishaInfix(lhs: Form, opInfo: (String, Span), rhs: Form): Form = {
     }
 }
 
-def parseExpr(s: GsCursor): GsResult Form =
+def parseExprCur(s: GsCursor): GsResult Form =
     prattInfix(parseUnaryExpr, parseGeishaInfixOp, combineGeishaInfix)(s)
 
 // ============================================================================
@@ -1082,12 +1126,12 @@ def parseNamedFieldDecl(s: GsCursor): GsResult FieldDecl = {
     let fnm = parseIdent(s)?;
     commit(s);
     let _ = eatSym(s, ":")?;
-    let ft = parseTypeExpr(s)?;
+    let ft = parseTypeExprCur(s)?;
     Ok(MkFieldDecl { fname: Some(fnm), fty: ft })
 }
 
 def parseTupleFieldDecl(s: GsCursor): GsResult FieldDecl = {
-    let ft = parseTypeExpr(s)?;
+    let ft = parseTypeExprCur(s)?;
     Ok(MkFieldDecl { fname: None, fty: ft })
 }
 
@@ -1110,11 +1154,11 @@ def parseExternParamNamed(s: GsCursor): GsResult Type = {
     let _ = parseIdent(s)?;
     let _ = eatSym(s, ":")?;
     commit(s);
-    parseTypeExpr(s)
+    parseTypeExprCur(s)
 }
 
 def parseExternParam(s: GsCursor): GsResult Type =
-    (backtrack(parseExternParamNamed) <|> parseTypeExpr)(s)
+    (backtrack(parseExternParamNamed) <|> parseTypeExprCur)(s)
 
 def parseEnsuresBindArrow(s: GsCursor): GsResult String = {
     let rname = parseIdent(s)?;
@@ -1131,7 +1175,7 @@ def parseFnContractLoop(
     if (atTok(s, TkIdent("requires"))) {
         let kwSp = toAstSpan(bumpTok(s)?.span);
         commit(s);
-        let reqE = parseExpr(s)?;
+        let reqE = parseExprCur(s)?;
         parseFnContractLoop(s, Cons((unionSpan(kwSp, reqE.pos), reqE), reqRev), ensRev, decRev)
     } else if (atTok(s, TkIdent("ensures"))) {
         let kwSp = toAstSpan(bumpTok(s)?.span);
@@ -1142,13 +1186,13 @@ def parseFnContractLoop(
                 let _ = eatSym(s, "|")?;
                 Some(rname)
             } else opt(backtrack(parseEnsuresBindArrow))(s)?;
-        let ensE = parseExpr(s)?;
+        let ensE = parseExprCur(s)?;
         let clause = MkEnsuresClause { ecBind: bindOpt, ecSpan: unionSpan(kwSp, ensE.pos), ecExpr: ensE };
         parseFnContractLoop(s, reqRev, Cons(clause, ensRev), decRev)
     } else if (atTok(s, TkIdent("decreases"))) {
         let kwSp = toAstSpan(bumpTok(s)?.span);
         commit(s);
-        let decE = parseExpr(s)?;
+        let decE = parseExprCur(s)?;
         let callSp = unionSpan(kwSp, decE.pos);
         match decRev {
             Cons(_, _) -> failSpanMsgHint(
@@ -1175,10 +1219,10 @@ def parseFormDefBody(s: GsCursor, vis: Visibility, startSp: Span): GsResult Def 
     let name = parseCallableIdent(s)?;
     if (atTok(s, TkLParen)) {
         let ps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
-        let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+        let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeSchemeCur(s)?) else None;
         let fc = parseFnContractLoop(s, Nil, Nil, Nil)?;
         let _ = eatSym(s, "=")?;
-        let rawBody = parseExpr(s)?;
+        let rawBody = parseExprCur(s)?;
         let body = wrapFnContractBody(fc, rawBody);
         let (retTy, fnScmAnn) = match retScmOpt {
             Some(ScmMono(t)) -> (Some(t), None),
@@ -1188,9 +1232,9 @@ def parseFormDefBody(s: GsCursor, vis: Visibility, startSp: Span): GsResult Def 
         let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
         Ok(MkDef { ident: name, dpos: unionSpan(startSp, rawBody.pos), vis: vis, attrs: Nil, item: ItForm(form) })
     } else {
-        let valAnn = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+        let valAnn = if (tryEatSym(s, ":")) Some(parseTypeSchemeCur(s)?) else None;
         let _ = eatSym(s, "=")?;
-        let val = parseExpr(s)?;
+        let val = parseExprCur(s)?;
         let annotatedVal = MkForm { pos: val.pos, ty: val.ty, annot: valAnn, node: val.node };
         Ok(MkDef { ident: name, dpos: unionSpan(startSp, val.pos), vis: vis, attrs: Nil, item: ItForm(annotatedVal) })
     }
@@ -1296,7 +1340,7 @@ def parseExternExportHeader(s: GsCursor): GsResult (String, List VarDecl, Option
     let _ = eatTok(s, TkDef)?;
     let name = parseCallableIdent(s)?;
     let ps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
-    let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+    let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeSchemeCur(s)?) else None;
     let fc = parseFnContractLoop(s, Nil, Nil, Nil)?;
     let _ = eatSym(s, "=")?;
     Ok((name, ps, retScmOpt, fc))
@@ -1310,7 +1354,7 @@ def parseExternModsLoop(s: GsCursor, isNoAlloc: Bool, isFnPtr: Bool): GsResult (
 def parseForwardDecl(s: GsCursor): GsResult (String, Scheme) = {
     let fname = parseCallableIdent(s)?;
     let _ = eatSym(s, ":")?;
-    let scm = parseTypeScheme(s)?;
+    let scm = parseTypeSchemeCur(s)?;
     Ok((fname, scm))
 }
 
@@ -1321,7 +1365,7 @@ def parseConceptMethodsLoop(s: GsCursor, accRev: List MethodDecl): GsResult (Lis
         commit(s);
         let mname = parseCallableIdent(s)?;
         let ptys = between(tok(TkLParen), tok(TkRParen), sepEndBy(parseExternParam, skipTok(TkComma)))(s)?;
-        let retTy = if (tryEatSym(s, ":")) parseTypeExpr(s)? else TyVoid;
+        let retTy = if (tryEatSym(s, ":")) parseTypeExprCur(s)? else TyVoid;
         let mscm = ScmMono(TyArr(TyVoid, ptys, retTy));
         let _ = tryEatTok(s, TkComma);
         skipSemis(s)?;
@@ -1330,7 +1374,7 @@ def parseConceptMethodsLoop(s: GsCursor, accRev: List MethodDecl): GsResult (Lis
         let mname = parseCallableIdent(s)?;
         commit(s);
         let _ = eatSym(s, ":")?;
-        let mscm = parseTypeScheme(s)?;
+        let mscm = parseTypeSchemeCur(s)?;
         let _ = tryEatTok(s, TkComma);
         skipSemis(s)?;
         parseConceptMethodsLoop(s, Cons(MkMethodDecl { mname: mname, mty: mscm }, accRev))
@@ -1345,10 +1389,10 @@ def parseInstanceImplsLoop(s: GsCursor, accRev: List MethodImpl): GsResult (List
         commit(s);
         let mname = parseCallableIdent(s)?;
         let mps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
-        let mret = if (tryEatSym(s, ":")) Some(parseTypeExpr(s)?) else None;
+        let mret = if (tryEatSym(s, ":")) Some(parseTypeExprCur(s)?) else None;
         let mfc = parseFnContractLoop(s, Nil, Nil, Nil)?;
         let _ = eatSym(s, "=")?;
-        let rawMBody = parseExpr(s)?;
+        let rawMBody = parseExprCur(s)?;
         let mbody = wrapFnContractBody(mfc, rawMBody);
         let lam = mkForm(unionSpan(mSp, rawMBody.pos), ExAbs(mps, mret, mbody));
         let _ = tryEatTok(s, TkComma);
@@ -1357,7 +1401,7 @@ def parseInstanceImplsLoop(s: GsCursor, accRev: List MethodImpl): GsResult (List
     } else failMsg(s, "expected 'def' or '}' inside instance block")
 }
 
-def parseDefinition(s: GsCursor, knownVis: Option Visibility): GsResult (Def, List ModuleItem) = {
+def parseDefinitionCur(s: GsCursor, knownVis: Option Visibility): GsResult (Def, List ModuleItem) = {
     let fwdOpt: Option (String, Scheme) = match knownVis {
         Some(_) -> None,
         None ->
@@ -1422,7 +1466,7 @@ def parseDefinition(s: GsCursor, knownVis: Option Visibility): GsResult (Def, Li
                         else None;
                     match exportHdrOpt {
                         Some((name, ps, retScmOpt, fc)) -> {
-                            let rawBody = parseExpr(s)?;
+                            let rawBody = parseExprCur(s)?;
                             let body = wrapFnContractBody(fc, rawBody);
                             let (retTy, fnScmAnn) = match retScmOpt {
                                 Some(ScmMono(t)) -> (Some(t), None),
@@ -1439,7 +1483,7 @@ def parseDefinition(s: GsCursor, knownVis: Option Visibility): GsResult (Def, Li
                             let _ = eatTok(s, TkLParen)?;
                             let ps = sepEndBy(parseExternParam, skipTok(TkComma))(s)?;
                             let closeSp = toAstSpan(eatTok(s, TkRParen)?);
-                            let retTy = if (tryEatSym(s, ":")) parseTypeExpr(s)? else TyVoid;
+                            let retTy = if (tryEatSym(s, ":")) parseTypeExprCur(s)? else TyVoid;
                             let linkSym = match linkOpt {
                                 Some(st) -> st,
                                 None -> if (isFnPtr) "" else fnName,
@@ -1461,7 +1505,7 @@ def parseDefinition(s: GsCursor, knownVis: Option Visibility): GsResult (Def, Li
                 let tname = parseUpperIdent(s)?;
                 let tparams = parseInlineTypeParams(s)?;
                 let _ = eatSym(s, "=")?;
-                let target = parseTypeScheme(s)?;
+                let target = parseTypeSchemeCur(s)?;
                 Ok((MkDef { ident: tname, dpos: startSp, vis: vis, attrs: Nil, item: ItAlias(tparams, target) }, Nil))
             } else if (atTok(s, TkData)) {
                 parseDataDefBody(s, vis, startSp, Nil)
@@ -1533,8 +1577,18 @@ def parseUseStatement(s: GsCursor): GsResult UseItem = {
     parseUseTailLoop(s, [seg0], firstSp)
 }
 
-def parseModPath(s: GsCursor): GsResult (List String) =
-    sepBy1(parseIdent, skipTok(TkDot))(s)
+def parseModPathTail(s: GsCursor, accRev: List String): GsResult (List String) =
+    if (!tryEatTok(s, TkDot)) Ok(listRev(accRev))
+    else {
+        commit(s);
+        let seg = parseIdent(s)?;
+        parseModPathTail(s, Cons(seg, accRev))
+    }
+
+def parseModPath(s: GsCursor): GsResult (List String) = {
+    let first = parseIdent(s)?;
+    parseModPathTail(s, [first])
+}
 
 def prependRev(xs: List a, accRev: List a): List a = match xs {
     Nil -> accRev,
@@ -1579,7 +1633,7 @@ def parseModuleItem(s: GsCursor): GsResult (List ModuleItem) = {
             Ok([ModSub(vis, mname, subItems, unionSpan(startSp, closeSp))])
         } else Ok([ModDecl(vis, mname)])
     } else {
-        let (d, derivedItems) = parseDefinition(s, visOpt)?;
+        let (d, derivedItems) = parseDefinitionCur(s, visOpt)?;
         Ok(Cons(ModDef(d.vis, d), derivedItems))
     }
 }
@@ -1617,10 +1671,10 @@ def parseTopLevelScriptStmt(s: GsCursor): GsResult BlockStmtItem =
         commit(s);
         let (isVar, vd, pat) = parseLetBindingHead(s)?;
         let _ = eatSym(s, "=")?;
-        let val = parseExpr(s)?;
+        let val = parseExprCur(s)?;
         let res =
             if (tryEatTok(s, TkIn)) {
-                let body = parseExpr(s)?;
+                let body = parseExprCur(s)?;
                 let fullSp = unionSpan(letSp, body.pos);
                 let eForm =
                     if (isVar) mkForm(fullSp, ExLet(vd, val, body))
@@ -1633,7 +1687,7 @@ def parseTopLevelScriptStmt(s: GsCursor): GsResult BlockStmtItem =
         eatScriptStmtSep(s)?;
         Ok(res)
     } else {
-        let e = parseExpr(s)?;
+        let e = parseExprCur(s)?;
         eatScriptStmtSep(s)?;
         Ok(BsExpr(e))
     }
@@ -1708,6 +1762,24 @@ def parseFileModuleBody(s: GsCursor, modPath: List String): GsResult FileModule 
         },
     }
 }
+
+pub def parseTypeExpr(p: Parser): Result Type String =
+    runCompatParser(p, parseTypeExprCur)
+
+pub def parseTypeScheme(p: Parser): Result Scheme String =
+    runCompatParser(p, parseTypeSchemeCur)
+
+pub def parsePattern(p: Parser): Result Pattern String =
+    runCompatParser(p, parsePatternCur)
+
+pub def parseExpr(p: Parser): Result Form String =
+    runCompatParser(p, parseExprCur)
+
+pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def String =
+    match parseDefinitionCur(p.cursor, knownVis) {
+        Ok((d, _)) -> Ok(d),
+        Err(_) -> Err(formatParseErrorDiag(finishErrorFor(p.cursor))),
+    }
 
 pub def parseFileModule(src: String, modPath: List String): Result FileModule String =
     parseFileModuleInFile(src, modPath, 0)

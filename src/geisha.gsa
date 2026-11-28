@@ -1034,57 +1034,13 @@ def buildCliPkgGraph(
         }
     };
 
-    match (pkgFlags, depFlags) {
-        (Nil, Nil) -> {
-            let probeDir = match srcRootOpt {
-                Some(sr) -> if (sr == "") "." else sr,
-                None -> {
-                    let ed = pathDirname(entryFile);
-                    if (ed == "") "." else ed
-                },
-            };
-            match findProjectRoot(probeDir) {
-                None -> {
-                    let rootSpec = MkPkgSpec {
-                        pkgId: "",
-                        pkgName: "",
-                        srcRoots: rootDirs,
-                        deps: autoRootDeps,
-                    };
-                    (rootSpec, cellGet(extSpecs))
-                },
-                Some(projDir) -> match resolveProjectGraph(projDir, false, None, false) {
-                    Err(_) -> {
-                        let rootSpec = MkPkgSpec {
-                            pkgId: "",
-                            pkgName: "",
-                            srcRoots: rootDirs,
-                            deps: autoRootDeps,
-                        };
-                        (rootSpec, cellGet(extSpecs))
-                    },
-                    Ok((_, projRootSpec, resolvedPkgs)) -> {
-                        let rootSpec = MkPkgSpec {
-                            pkgId: "",
-                            pkgName: "",
-                            srcRoots: rootDirs,
-                            deps: projRootSpec.deps,
-                        };
-                        (rootSpec, toLoaderPkgSpecs(resolvedPkgs))
-                    },
-                },
-            }
-        },
-        _ -> {
-            let rootSpec = MkPkgSpec {
-                pkgId: "",
-                pkgName: "",
-                srcRoots: rootDirs,
-                deps: autoRootDeps,
-            };
-            (rootSpec, cellGet(extSpecs))
-        },
-    }
+    let rootSpec = MkPkgSpec {
+        pkgId: "",
+        pkgName: "",
+        srcRoots: rootDirs,
+        deps: autoRootDeps,
+    };
+    (rootSpec, cellGet(extSpecs))
 }
 
 def compileWithPkgSpecsToIrForArchDebug(
