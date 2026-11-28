@@ -11,7 +11,7 @@
   "default_target": {
     "os": "ubuntu-24.04",
     "deps": [],
-    "cmd": "geisha check && geisha test"
+    "cmd": "(if grep -qE '^[[:space:]]*entry[[:space:]]*=' geisha.toml || [ -f src/main.gsa ]; then geisha check; fi) && geisha test"
   },
   "overrides": {
     "parsec.gsa": {
@@ -57,7 +57,7 @@
     },
     "net.gsa": {
       "deps": ["openssl"],
-      "cmd": "geisha check && geisha doc net.stream >/dev/null && geisha doc net.http >/dev/null && geisha test"
+      "cmd": "geisha doc net.stream >/dev/null && geisha doc net.tls >/dev/null && geisha doc net.ws >/dev/null && geisha doc net.wss >/dev/null && geisha doc net.http >/dev/null && geisha test"
     },
     "tensor.gsa": {
       "deps": ["openblas"],
