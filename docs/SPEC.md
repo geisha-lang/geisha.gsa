@@ -69,7 +69,7 @@ use      mod      open     as       true     false    Void
 ### 2.5 Symbolic Operators
 Operator characters: `! # $ % & * + - / : < = > ? @ \ ^ | ~`.
 - Standalone `?` (not followed by `?`, `>`, `=`, `:`) is lexed as `TkQuestion` (Result early-return operator).
-- Reserved non-definable tokens: `=`, `:`, `->`, `=>`, `&&`, `||`, `!`, `?`.
+- Reserved non-definable tokens: `=`, `:`, `->`, `=>`, `==>`, `<==>`, `&&`, `||`, `!`, `?`.
 - All other operator sequences can be defined as custom functions using parenthesized names: `def (|>)(x, f) = f(x)`.
 
 ---
@@ -115,25 +115,40 @@ A block `{ s1; s2; expr }` evaluates statements separated by `;` and yields the 
 - Static field projection: `p.x` (resolved statically by record type; Geisha does **not** use `obj.method()` syntax).
 
 ### 3.5 Operator Precedence & Associativity
-Infix operators have 13 precedence levels (1 = lowest, 13 = highest). Operators ending in `:` are **right-associative**; all others are **left-associative**.
+Infix operators have 15 precedence levels (1 = lowest, 15 = highest). `==>` and operators ending in `:` are **right-associative**; all others are **left-associative**.
 
 | Level | Operators / Leading Character |
 | :---: | --- |
 | 1 | Multi-char `\|`-leading pipelines (except `\|\|`) |
-| 2 | `\|\|` (short-circuit logical OR) |
-| 3 | `&&` (short-circuit logical AND) |
-| 4 | `=`, `!`-leading equality (`==`, `!=`, `===`, ...) |
-| 5 | `<`, `>`-leading comparisons & combinators (except shifts) |
-| 6 | `:`-leading (e.g., `::`, right-associative) |
-| 7 | `\|` (bitwise OR) |
-| 8 | `^`-leading (bitwise XOR) |
-| 9 | `&`-leading (bitwise AND, except `&&`) |
-| 10 | Shifts: `<<`, `>>`, `>>>` |
-| 11 | `+`, `-`-leading additive |
-| 12 | `*`, `/`, `%`-leading multiplicative |
-| 13 | `@`, `#`, `$`, multi-char `?`, multi-char `~`, `\` |
+| 2 | `<==>` (logical equivalence) |
+| 3 | `==>` (short-circuit logical implication, right-associative) |
+| 4 | `\|\|` (short-circuit logical OR) |
+| 5 | `&&` (short-circuit logical AND) |
+| 6 | `=`, `!`-leading equality (`==`, `!=`, `===`, ...) |
+| 7 | `<`, `>`-leading comparisons & combinators (except shifts, `==>`, `<==>`) |
+| 8 | `:`-leading (e.g., `::`, right-associative) |
+| 9 | `\|` (bitwise OR) |
+| 10 | `^`-leading (bitwise XOR) |
+| 11 | `&`-leading (bitwise AND, except `&&`) |
+| 12 | Shifts: `<<`, `>>`, `>>>` |
+| 13 | `+`, `-`-leading additive |
+| 14 | `*`, `/`, `%`-leading multiplicative |
+| 15 | `@`, `#`, `$`, multi-char `?`, multi-char `~`, `\` |
 
 Unary prefix operators: `!` (logical NOT), `-` (negation), `~` (bitwise NOT).
+
+### 3.6 Contracts, Specifications & In-Place Static Verification
+- **Function modifier**: `[pub] verified def` marks a function for selective static verification by `geisha verify` within mixed pure/impure modules (`geisha verify --all` verifies all functions in scope).
+- **Contract clauses**:
+  - Functions: `requires <Bool>`, `ensures <Bool>` / `ensures r -> <Bool>` / `ensures |r| <Bool>`, `decreases <Int>`.
+  - `while` loops: `invariant <Bool>`, `decreases <Int>`.
+- **Pre-state & Quantifiers**:
+  - `old(expr)` in `ensures` evaluates `expr` in the function's entry heap state (post-`requires`, pre-body), supporting both scalar cells (`old(cellGet(c))`) and element-wise array reads (`old(arrayGet(arr, i))`).
+  - `forall (x: T, ...) -> body` and contextual `exists (x: T, ...) -> body` are allowed inside `requires`, `ensures`, `invariant`, `assert`, and `assume`.
+- **Execution Modes**:
+  - `build` / `run` / `bench`: `--contracts=erase` by default (zero runtime cost).
+  - `geisha test` / `geisha test --doc`: `--contracts=check` by default (executes `requires`, `ensures`, `invariant`, `decreases`, `assert`, `old(...)` snapshots, and `Bool`/`Char`/bounded-`Int` quantifiers).
+  - `geisha verify`: translates monomorphized Core IR (including seeded Concept-constrained generics, composite ADTs/tuples, 1-step pure helper unfoldings, UF congruence, and BitVec/Array/String/Bitwise intrinsics) to batched SMT-LIB2 obligations.
 
 ---
 

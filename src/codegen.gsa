@@ -6,8 +6,7 @@ use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
 use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strIndexOfByte, strStartsWith}
-use diag.{diagGetFile, diagSpanLineCol}
-use verified_kernels.{alignUp8, alignUp16, bitmapWordIdx, bitmapBitMask, hexDigitUpperByte}
+use diag.{diagGetFile, diagSpanLineCol, hexDigitUpperByte}
 use ast.{
     Span, emptySpan, typeToString,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
@@ -30,6 +29,26 @@ use core.{
     FunDef, GlobalValDef, ExternDef, EscapeInfo, CoreProgram,
     extractTypeArgs, isStackAlloc, fnHasStackAlloc, isRecursiveAdt
 }
+
+pub def alignUp8(n: Int): Int
+    requires 0 <= n && n <= 2147483640
+    ensures r -> r >= n && (r & 7) == 0 && r - n < 8
+= (n + 7) & ~7
+
+pub def alignUp16(n: Int): Int
+    requires 0 <= n && n <= 2147483632
+    ensures r -> r >= n && (r & 15) == 0 && r - n < 16
+= (n + 15) & ~15
+
+pub def bitmapWordIdx(byteOff: Int): Int
+    requires 0 <= byteOff && byteOff < 320 && (byteOff & 7) == 0
+    ensures r -> 0 <= r && r < 40 && r * 8 == byteOff
+= byteOff >> 3
+
+pub def bitmapBitMask(wordIdx: Int): Int64
+    requires 0 <= wordIdx && wordIdx < 40
+    ensures r -> r != intToI64(0) && (r & (r - intToI64(1))) == intToI64(0)
+= intToI64(1) << wordIdx
 
 // ============================================================================
 // LLVM Identifier Formatting & String Escaping
@@ -5055,16 +5074,17 @@ def genExpr(
     } else ();
 
     let exprRes = match tm.tnode {
+        TmLit(LitUnit) -> llvmZeroValue(getValLlvmType(schemeBody(tm.tscm))),
         TmLit(lit) -> genLit(mctx, lit),
 
         TmVar(vn) -> match lookupVarSlot(locals, mctx, vn) {
             Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
-            None -> "0",
+            None -> llvmZeroValue(getValLlvmType(schemeBody(tm.tscm))),
         },
 
         TmGlobalVar(vn) -> match lookupGlobalSlot(mctx, vn) {
             Some(slot) -> emitLoad(fctx, slot.vsLlvmTy, slot.vsPtr),
-            None -> "0",
+            None -> llvmZeroValue(getValLlvmType(schemeBody(tm.tscm))),
         },
 
         TmTuple(elems) -> {

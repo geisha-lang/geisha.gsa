@@ -857,32 +857,59 @@ def main() -> int:
         print("PASS [smt_verify_a1_a6_polish]: A1 runtime 3-path, A5 duplicate decreases, A6 loc_count/doc/fmt verified")
 
         # ------------------------------------------------------------------
-        # D1: Production verified kernels (`src/verified_kernels.gsa`) + `--fn` filter
+        # D1: Production verified kernels in-place inside host compiler modules + `--fn` filter
         # ------------------------------------------------------------------
-        vk_path = repo_root / "src" / "verified_kernels.gsa"
-        r_vk = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root), str(vk_path)])
-        assert r_vk.returncode == 0, f"D1 verified_kernels.gsa verify failed:\n{r_vk.stdout}\n{r_vk.stderr}"
-        vk_json = json.loads(r_vk.stdout)
-        assert vk_json["ok"] is True and vk_json["failed"] == 0 and vk_json["unknown"] == 0 and vk_json["proved"] >= 40, (
-            f"D1 unexpected verified_kernels summary: {vk_json}"
-        )
-        r_vk_fn = run([
+        host_kernel_specs = [
+            (
+                repo_root / "src" / "diag.gsa",
+                ["clampOffset", "clampSpanEnd", "hexDigitUpperByte", "hexNibbleVal"],
+            ),
+            (
+                repo_root / "src" / "codegen.gsa",
+                ["alignUp8", "alignUp16", "bitmapWordIdx", "bitmapBitMask"],
+            ),
+            (
+                repo_root / "src" / "codegen_wasmgc.gsa",
+                [
+                    "uleb32Next", "uleb32Byte", "uleb32Len",
+                    "sleb32Done", "sleb32Next", "sleb32Byte", "sleb32Len",
+                    "sleb64Done", "sleb64Next", "sleb64Byte", "sleb64Len",
+                ],
+            ),
+            (
+                repo_root / "src" / "core.gsa",
+                [
+                    "coFreshNextId", "coFreshBatchEnd", "coFlatTotalArity",
+                    "coSpecSlotStepArity", "coAnfInFloatPrefix", "coPatSeqStatus", "coInlineBudgetAllows",
+                ],
+            ),
+        ]
+        total_vk_proved = 0
+        for host_path, fn_names in host_kernel_specs:
+            fn_args: list[str] = []
+            for fn_nm in fn_names:
+                fn_args.extend(["--fn", fn_nm])
+            r_vk = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root), *fn_args, str(host_path)])
+            assert r_vk.returncode == 0, f"D1 {host_path.name} verify failed:\n{r_vk.stdout}\n{r_vk.stderr}"
+            vk_json = json.loads(r_vk.stdout)
+            assert vk_json["ok"] is True and vk_json["failed"] == 0 and vk_json["unknown"] == 0 and vk_json["proved"] >= len(fn_names), (
+                f"D1 unexpected {host_path.name} summary: {vk_json}"
+            )
+            total_vk_proved += vk_json["proved"]
+        assert total_vk_proved >= 40, f"D1 expected >= 40 proved kernel obligations across host modules, got {total_vk_proved}"
+        r_vk_sub = run([
             geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root),
-            "--fn", "uleb32Byte", "--fn", "clampOffset",
-            "--fn", "coPatSeqStatus", "--fn", "coFreshBatchEnd", "--fn", "coFlatTotalArity",
-            str(vk_path),
+            "--fn", "clampOffset", str(repo_root / "src" / "diag.gsa"),
         ])
-        assert r_vk_fn.returncode == 0, f"D1 --fn filter failed:\n{r_vk_fn.stdout}\n{r_vk_fn.stderr}"
-        vk_fn_json = json.loads(r_vk_fn.stdout)
-        assert vk_fn_json["ok"] is True and 0 < vk_fn_json["proved"] < vk_json["proved"], (
-            f"D1 --fn filter did not restrict obligations: {vk_fn_json} vs {vk_json}"
-        )
+        assert r_vk_sub.returncode == 0
+        vk_sub_json = json.loads(r_vk_sub.stdout)
+        assert vk_sub_json["ok"] is True and vk_sub_json["functions"] == 1 and vk_sub_json["proved"] >= 1
         r_vk_miss = run([
             geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root),
-            "--fn", "definitely_not_a_real_fn_xyz", str(vk_path),
+            "--fn", "definitely_not_a_real_fn_xyz", str(repo_root / "src" / "diag.gsa"),
         ])
         assert r_vk_miss.returncode != 0, f"D1 --fn nonexistent should fail, got 0:\n{r_vk_miss.stdout}"
-        print(f"PASS [d1_verified_kernels]: {vk_json['proved']} obligations proved, --fn filter verified")
+        print(f"PASS [d1_verified_kernels]: {total_vk_proved} obligations proved in-place across 4 compiler host modules, --fn filter verified")
 
         # ------------------------------------------------------------------
         # D3: Verification-Driven Optimization (`--verified-opt`) + 3 Soundness Iron Laws
@@ -1879,6 +1906,1036 @@ def main() -> int:
             f"D4b safeFns tiny leaf plusOne was inlined into unverified caller!\n{d4b_caller_blk}"
         )
         print("PASS [d4_hof_opt_verification]: --verified-opt safeScale elision + safeFns boundary + $spec$ & $flat$ HOF specialization verified")
+
+        # ------------------------------------------------------------------
+        # E1: `geisha test` & `geisha test --doc` enable `--contracts=check` by default
+        # ------------------------------------------------------------------
+        e1_proj = tmp / "e1_test_contracts"
+        (e1_proj / "src").mkdir(parents=True)
+        (e1_proj / "tests").mkdir(parents=True)
+        (e1_proj / "geisha.toml").write_text('name = "e1_test_contracts"\nversion = "0.1.0"\n', encoding="utf-8")
+        (e1_proj / "src" / "main.gsa").write_text(
+            "/// ```geisha\n"
+            "/// assert(1 + 1 == 3)\n"
+            "/// ```\n"
+            "pub def brokenDocFn(x: Int): Int\n"
+            "    requires x > 0\n"
+            "= x + 1\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (e1_proj / "tests" / "test_contracts_live.gsa").write_text(
+            "def posOnly(x: Int): Int\n"
+            "    requires x > 0\n"
+            "= x\n"
+            "def main(): Void = { let _ = posOnly(-3); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e1_t = subprocess.run([geisha_abs, "test", "--runtime", runtime_abs], cwd=e1_proj, capture_output=True, text=True)
+        assert r_e1_t.returncode != 0 and "Contract error:" in (r_e1_t.stdout + r_e1_t.stderr), (
+            f"E1 `geisha test` must enforce contracts by default:\nrc={r_e1_t.returncode}\nout={r_e1_t.stdout}\nerr={r_e1_t.stderr}"
+        )
+        r_e1_te = subprocess.run([geisha_abs, "test", "--contracts=erase", "--runtime", runtime_abs], cwd=e1_proj, capture_output=True, text=True)
+        assert r_e1_te.returncode == 0, f"E1 `geisha test --contracts=erase` should elide contracts:\n{r_e1_te.stdout}\n{r_e1_te.stderr}"
+        r_e1_doc = subprocess.run([geisha_abs, "test", "--doc", "--runtime", runtime_abs], cwd=e1_proj, capture_output=True, text=True)
+        assert r_e1_doc.returncode != 0, f"E1 `geisha test --doc` must enforce assert/contracts by default:\n{r_e1_doc.stdout}\n{r_e1_doc.stderr}"
+        r_e1_doce = subprocess.run([geisha_abs, "test", "--doc", "--contracts=erase", "--runtime", runtime_abs], cwd=e1_proj, capture_output=True, text=True)
+        assert r_e1_doce.returncode == 0, f"E1 `geisha test --doc --contracts=erase` should pass:\n{r_e1_doce.stdout}\n{r_e1_doce.stderr}"
+        print("PASS [e1_test_and_doctest_default_contracts]")
+
+        # ------------------------------------------------------------------
+        # E2: In-place `[pub] verified def`, `--all`, `geisha fmt`, `geisha doc`, and non-fn rejection
+        # ------------------------------------------------------------------
+        e2_mixed = tmp / "e2_mixed_verified.gsa"
+        e2_mixed.write_text(
+            "pub verified def clampUnit(x: Int): Int\n"
+            "    ensures r -> 0 <= r && r <= 100\n"
+            "= if (x < 0) 0 else if (x > 100) 100 else x\n"
+            "\n"
+            "verified def doubleBounded(x: Int): Int\n"
+            "    requires 0 <= x && x <= 50\n"
+            "    ensures r -> 0 <= r && r <= 100 && r == x * 2\n"
+            "= x * 2\n"
+            "\n"
+            "pub def unverifiedCrash(x: Int): Int = 100 / x\n"
+            "\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e2_def = run([geisha, "verify", "--json", "--solver", z3_bin, str(e2_mixed)])
+        assert r_e2_def.returncode == 0, f"E2 selective `verified def` failed:\n{r_e2_def.stdout}\n{r_e2_def.stderr}"
+        e2_j = json.loads(r_e2_def.stdout)
+        assert e2_j["ok"] is True and e2_j["functions"] == 2 and e2_j["proved"] == 2, f"E2 unexpected selective summary: {e2_j}"
+        r_e2_all = run([geisha, "verify", "--all", "--json", "--solver", z3_bin, str(e2_mixed)])
+        assert r_e2_all.returncode == 1, f"E2 `--all` must also check unverifiedCrash and catch div_by_zero:\n{r_e2_all.stdout}"
+        r_e2_doc = run([geisha, "doc", str(e2_mixed)])
+        assert r_e2_doc.returncode == 0 and "pub verified def clampUnit" in r_e2_doc.stdout, (
+            f"E2 `geisha doc` missing `pub verified def`:\n{r_e2_doc.stdout}"
+        )
+        r_e2_fmt = run([geisha, "fmt", "--stdout", str(e2_mixed)])
+        assert r_e2_fmt.returncode == 0 and "pub verified def clampUnit" in r_e2_fmt.stdout and "\nverified def doubleBounded" in r_e2_fmt.stdout, (
+            f"E2 `geisha fmt` mangled `verified def`:\n{r_e2_fmt.stdout}"
+        )
+        e2_bad_const = tmp / "e2_bad_const.gsa"
+        e2_bad_const.write_text("verified def NOT_A_FN: Int = 42\ndef main() = ()\n", encoding="utf-8")
+        r_e2_bad = run([geisha, "check", str(e2_bad_const)])
+        assert r_e2_bad.returncode != 0 and "at byte " not in (r_e2_bad.stdout + r_e2_bad.stderr), (
+            f"E2 non-function `verified def` must be rejected cleanly:\n{r_e2_bad.stdout}\n{r_e2_bad.stderr}"
+        )
+        print("PASS [e2_inplace_verified_def_all_doc_fmt]")
+
+        # ------------------------------------------------------------------
+        # E3: Concept-constrained generic seeding (`Ord`/`Eq`/`Add` + fundep) & unseedable `unknown`
+        # ------------------------------------------------------------------
+        e3_pos = tmp / "e3_generic_pos.gsa"
+        e3_pos.write_text(
+            "pub def genericMax(a: t, b: t): t\n"
+            "    ensures r -> r >= a && r >= b && (r == a || r == b)\n"
+            "= if (a >= b) a else b\n"
+            "\n"
+            "pub def genericDouble(x: t): t\n"
+            "    ensures r -> r == x + x\n"
+            "= x + x\n"
+            "\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e3p = run([geisha, "verify", "--json", "--solver", z3_bin, str(e3_pos)])
+        assert r_e3p.returncode == 0, f"E3 constrained generic positive failed:\n{r_e3p.stdout}\n{r_e3p.stderr}"
+        e3p_j = json.loads(r_e3p.stdout)
+        assert e3p_j["ok"] is True and e3p_j["proved"] >= 2, f"E3 expected seeded obligations, got {e3p_j}"
+        r_e3_fn = run([geisha, "verify", "--json", "--solver", z3_bin, "--fn", "genericMax", str(e3_pos)])
+        assert r_e3_fn.returncode == 0 and json.loads(r_e3_fn.stdout)["proved"] == 1
+
+        e3_bug = tmp / "e3_generic_bug.gsa"
+        e3_bug.write_text(
+            "pub def badGenericClamp(x: t, lo: t, hi: t): t\n"
+            "    requires lo <= hi\n"
+            "    ensures r -> lo <= r && r <= hi\n"
+            "= if (x < lo) lo else if (x > hi) lo - hi else x\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e3b = run([geisha, "verify", "--json", "--solver", z3_bin, str(e3_bug)])
+        assert r_e3b.returncode == 1 and json.loads(r_e3b.stdout)["failed"] >= 1, (
+            f"E3 broken constrained generic MUST be caught (not silently skipped!):\n{r_e3b.stdout}"
+        )
+
+        e3_unseed = tmp / "e3_unseedable_poly.gsa"
+        e3_unseed.write_text(
+            "concept Exotic a { exoticVal: a -> Int }\n"
+            "pub def uncalledExotic(x: a): Int\n"
+            "    ensures r -> r > 0\n"
+            "= exoticVal(x)\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e3u = run([geisha, "verify", "--json", "--solver", z3_bin, str(e3_unseed)])
+        assert r_e3u.returncode == 1 and json.loads(r_e3u.stdout)["unknown"] >= 1, (
+            f"E3 unseedable generic MUST report unknown instead of vacuous VERIFIED:\n{r_e3u.stdout}"
+        )
+        print("PASS [e3_constrained_generic_seeding_and_unseedable_guard]")
+
+        # ------------------------------------------------------------------
+        # E4: Composite types (`Option`/`Result`/`Tuple`/`Struct`/Sum) & zero fake counterexamples
+        # ------------------------------------------------------------------
+        e4_comp = tmp / "e4_composites.gsa"
+        e4_comp.write_text(
+            "use std.option.{Option, Some, None}\n"
+            "use std.result.{Result, Ok, Err}\n"
+            "\n"
+            "data RangeSpan { RangeSpan { lo: Int, hi: Int } }\n"
+            "data Either { Left(Int), Right(Bool) }\n"
+            "\n"
+            "def safeHead(arr: ImmArray Int): Option Int\n"
+            "    ensures r -> match r {\n"
+            "        Some(v) -> immArrayLen(arr) > 0 && v == immArrayGet(arr, 0),\n"
+            "        None -> immArrayLen(arr) == 0,\n"
+            "    }\n"
+            "= if (immArrayLen(arr) > 0) Some(immArrayGet(arr, 0)) else None\n"
+            "\n"
+            "def minMax(a: Int, b: Int): (Int, Int)\n"
+            "    ensures p -> match p {\n"
+            "        (lo, hi) -> lo <= hi && ((lo == a && hi == b) || (lo == b && hi == a)),\n"
+            "    }\n"
+            "= if (a <= b) (a, b) else (b, a)\n"
+            "\n"
+            "def orderedSpan(a: Int, b: Int): RangeSpan\n"
+            "    ensures s -> s.lo <= s.hi\n"
+            "= if (a <= b) RangeSpan { lo: a, hi: b } else RangeSpan { lo: b, hi: a }\n"
+            "\n"
+            "def checkNonNeg(x: Int): Result Int String\n"
+            "    ensures r -> match r {\n"
+            "        Ok(v) -> x >= 0 && v == x,\n"
+            "        Err(msg) -> x < 0 && strLen(msg) > 0,\n"
+            "    }\n"
+            "= if (x >= 0) Ok(x) else Err(\"negative\")\n"
+            "\n"
+            "def bumpIfNonNeg(x: Int): Result Int String\n"
+            "    requires x < 1000\n"
+            "    ensures r -> match r {\n"
+            "        Ok(v) -> x >= 0 && v == x + 1,\n"
+            "        Err(_) -> x < 0,\n"
+            "    }\n"
+            "= {\n"
+            "    let base = checkNonNeg(x)?;\n"
+            "    Ok(base + 1)\n"
+            "}\n"
+            "\n"
+            "def evalEither(flag: Bool): Int\n"
+            "    ensures r -> r == 7\n"
+            "= {\n"
+            "    let e = if (flag) Left(7) else Right(true);\n"
+            "    match e {\n"
+            "        Left(n) -> n,\n"
+            "        Right(b) -> if (b) 7 else 0,\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e4 = run([geisha, "verify", "--json", "--solver", z3_bin, str(e4_comp)])
+        assert r_e4.returncode == 0, f"E4 composite verification failed:\n{r_e4.stdout}\n{r_e4.stderr}"
+        e4_j = json.loads(r_e4.stdout)
+        assert e4_j["ok"] is True and e4_j["failed"] == 0 and e4_j["unknown"] == 0 and e4_j["proved"] >= 7, f"E4 unexpected: {e4_j}"
+
+        # Unmodeled Float return MUST report `unknown` without a fabricated counterexample, and failed counterexamples hide `.tmp*`/`.iff_*`
+        e4_unmod = tmp / "e4_unmod_no_fake_ce.gsa"
+        e4_unmod.write_text(
+            "def halfFloat(x: Float): Float\n"
+            "    ensures r -> r == x\n"
+            "= x\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e4u = run([geisha, "verify", "--json", "--solver", z3_bin, str(e4_unmod)])
+        assert r_e4u.returncode == 1
+        e4u_j = json.loads(r_e4u.stdout)
+        assert e4u_j["failed"] == 0 and e4u_j["unknown"] == 1 and "counterexample" not in e4u_j["obligations"][0], (
+            f"E4 unmodeled return emitted fake failed counterexample: {e4u_j}"
+        )
+
+        e4_ce_clean = tmp / "e4_ce_clean.gsa"
+        e4_ce_clean.write_text(
+            "def badIff(a: Bool, b: Bool): Bool\n"
+            "    ensures r -> r\n"
+            "= { let _ = (a <==> b); a && b }\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e4c = run([geisha, "verify", "--json", "--solver", z3_bin, str(e4_ce_clean)])
+        assert r_e4c.returncode == 1
+        e4c_ce = json.loads(r_e4c.stdout)["obligations"][0].get("counterexample", {})
+        assert all(not k.startswith((".", "__", "$")) for k in e4c_ce), f"E4 internal var leaked into counterexample: {e4c_ce}"
+        print("PASS [e4_composite_types_and_no_fake_counterexamples]")
+
+        # ------------------------------------------------------------------
+        # E5: Pure helper 1-step unfolding + UF congruence + `--verified-opt` & heap-read soundness
+        # ------------------------------------------------------------------
+        e5_pure = tmp / "e5_pure_helpers.gsa"
+        e5_pure.write_text(
+            "use std.option.{Option, Some, None}\n"
+            "\n"
+            "def inByteRange(x: Int): Bool = 0 <= x && x < 256\n"
+            "def sq(x: Int): Int = x * x\n"
+            "def maybePos(x: Int): Option Int = if (x > 0) Some(x) else None\n"
+            "\n"
+            "def fib(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n <= 1) n else fib(n - 1) + fib(n - 2)\n"
+            "\n"
+            "def usePureHelpers(a: Int, b: Int, n: Int): Int\n"
+            "    requires inByteRange(a) && a == b && n >= 0\n"
+            "    ensures r -> 0 <= r && r < 256\n"
+            "= {\n"
+            "    assert(sq(a) == sq(b));\n"
+            "    assert(fib(n) == fib(n));\n"
+            "    assert(fib(0) == 0 && fib(1) == 1);\n"
+            "    match maybePos(5) {\n"
+            "        Some(v) -> assert(v == 5),\n"
+            "        None -> assert(false),\n"
+            "    };\n"
+            "    a\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e5 = run([geisha, "verify", "--json", "--solver", z3_bin, str(e5_pure)])
+        assert r_e5.returncode == 0, f"E5 pure helper unfolding & congruence failed:\n{r_e5.stdout}\n{r_e5.stderr}"
+        assert json.loads(r_e5.stdout)["ok"] is True
+
+        # Adversarial: heap-reading helper MUST NOT get pure mathematical UF across cellSet!
+        e5_heap_uf = tmp / "e5_heap_reader.gsa"
+        e5_heap_uf.write_text(
+            "def readIt(c: Cell Int): Int = cellGet(c)\n"
+            "def badCaller(): Void = {\n"
+            "    let c = cellNew(1);\n"
+            "    let v1 = readIt(c);\n"
+            "    cellSet(c, 2);\n"
+            "    let v2 = readIt(c);\n"
+            "    assert(v1 == v2)\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e5h = run([geisha, "verify", "--json", "--solver", z3_bin, str(e5_heap_uf)])
+        assert r_e5h.returncode == 1 and json.loads(r_e5h.stdout)["failed"] >= 1, (
+            f"E5 heap-reading helper unsoundly treated as state-independent UF:\n{r_e5h.stdout}"
+        )
+
+        # Adversarial `--verified-opt`: unproved trapping/diverging helper MUST NOT unlock `@llvm.assume` in caller
+        e5_vopt_adv = tmp / "e5_vopt_unproved_helper.gsa"
+        e5_vopt_adv.write_text(
+            "def unprovedPure(x: Int): Int = 100 / x\n"
+            "def victimCaller(): Int = {\n"
+            "    let v = unprovedPure(0);\n"
+            "    assert(v == unprovedPure(0));\n"
+            "    v\n"
+            "}\n"
+            "def main(): Void = { let _ = victimCaller(); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e5_vopt_ll = tmp / "e5_vopt.ll"
+        r_e5_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(e5_vopt_ll), str(e5_vopt_adv)])
+        assert r_e5_ir.returncode == 0
+        e5_vic_blk = fn_ir_block(e5_vopt_ll.read_text(encoding="utf-8"), "victimCaller")
+        assert "call void @llvm.assume" not in e5_vic_blk, f"E5 unproved pure helper leaked @llvm.assume!\n{e5_vic_blk}"
+        print("PASS [e5_pure_helper_unfolding_uf_and_vopt_guard]")
+
+        # ------------------------------------------------------------------
+        # E6: `old(expr)` pre-state snapshots & `==>` / `<==>` in `verify` and `--contracts=check`
+        # ------------------------------------------------------------------
+        e6_old = tmp / "e6_old_and_implies.gsa"
+        e6_old.write_text(
+            "def addInPlace(c: Cell Int, delta: Int): Void\n"
+            "    requires cellGet(c) >= 0 && cellGet(c) <= 1000 && delta >= 0 && delta <= 1000\n"
+            "    ensures cellGet(c) == old(cellGet(c)) + delta\n"
+            "= cellSet(c, cellGet(c) + delta)\n"
+            "\n"
+            "def bumpSlot(arr: MutArray Int, idx: Int): Void\n"
+            "    requires 0 <= idx && idx < arrayLen(arr) && arrayGet(arr, idx) < 10000\n"
+            "    ensures arrayGet(arr, idx) == old(arrayGet(arr, idx)) + 1\n"
+            "= arraySet(arr, idx, arrayGet(arr, idx) + 1)\n"
+            "\n"
+            "def shortCircuitImplies(x: Int): Bool\n"
+            "    ensures r -> r\n"
+            "= (x != 0 && x != -2147483648 ==> (x / x == 1)) && ((false ==> false ==> true) <==> true)\n"
+            "\n"
+            "def modularOldCaller(): Void = {\n"
+            "    let c = cellNew(10);\n"
+            "    addInPlace(c, 5);\n"
+            "    assert(cellGet(c) == 15);\n"
+            "    let a = arrayNew(2, 20);\n"
+            "    bumpSlot(a, 1);\n"
+            "    assert(arrayGet(a, 1) == 21)\n"
+            "}\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    modularOldCaller();\n"
+            "    assert(shortCircuitImplies(0));\n"
+            "    assert(shortCircuitImplies(7))\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e6v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e6_old)])
+        assert r_e6v.returncode == 0, f"E6 old() + ==> verify failed:\n{r_e6v.stdout}\n{r_e6v.stderr}"
+        assert json.loads(r_e6v.stdout)["ok"] is True
+        e6_bin = tmp / ("e6_old_chk.exe" if sys.platform == "win32" else "e6_old_chk")
+        r_e6b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e6_bin), str(e6_old)])
+        assert r_e6b.returncode == 0, f"E6 --contracts=check build failed:\n{r_e6b.stdout}\n{r_e6b.stderr}"
+        r_e6r = run([str(e6_bin)])
+        assert r_e6r.returncode == 0, f"E6 --contracts=check execution failed:\n{r_e6r.stdout}\n{r_e6r.stderr}"
+
+        # Runtime `--contracts=check` MUST catch violated `old(arrayGet(arr, idx))` postcondition!
+        e6_bad_rt = tmp / "e6_bad_old_rt.gsa"
+        e6_bad_rt.write_text(
+            "def wrongBump(arr: MutArray Int, idx: Int): Void\n"
+            "    requires 0 <= idx && idx < arrayLen(arr)\n"
+            "    ensures arrayGet(arr, idx) == old(arrayGet(arr, idx)) + 1\n"
+            "= arraySet(arr, idx, arrayGet(arr, idx) + 2)\n"
+            "def main(): Void = { let a = arrayNew(2, 10); wrongBump(a, 0) }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e6_bad_bin = tmp / ("e6_bad_old.exe" if sys.platform == "win32" else "e6_bad_old")
+        assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e6_bad_bin), str(e6_bad_rt)]).returncode == 0
+        r_e6_bad_run = run([str(e6_bad_bin)])
+        assert r_e6_bad_run.returncode != 0 and "Contract error: ensures violated" in (r_e6_bad_run.stdout + r_e6_bad_run.stderr)
+
+        # Negative static checks for invalid `old(...)`
+        for bad_old_lbl, bad_old_code in [
+            ("old_in_body", "def f(x: Int): Int = old(x)\ndef main() = ()\n"),
+            ("nested_old", "def f(c: Cell Int): Void\n    ensures cellGet(c) == old(old(cellGet(c)))\n= ()\ndef main() = ()\n"),
+            ("old_ret_bind", "def f(x: Int): Int\n    ensures r -> r == old(r)\n= x\ndef main() = ()\n"),
+        ]:
+            bo_path = tmp / f"e6_{bad_old_lbl}.gsa"
+            bo_path.write_text(bad_old_code, encoding="utf-8")
+            assert run([geisha, "check", str(bo_path)]).returncode != 0, f"E6 {bad_old_lbl} must fail typecheck"
+        print("PASS [e6_old_snapshots_and_implication]")
+
+        # ------------------------------------------------------------------
+        # E7: First-order quantifiers (`forall` / `exists`) in `verify`, `--contracts=check`, and `fmt`
+        # ------------------------------------------------------------------
+        e7_quant = tmp / "e7_quantifiers.gsa"
+        e7_quant.write_text(
+            "def zeroFill(arr: MutArray Int): Void\n"
+            "    ensures forall (k: Int) -> (0 <= k && k < arrayLen(arr)) ==> arrayGet(arr, k) == 0\n"
+            "= {\n"
+            "    let n = arrayLen(arr);\n"
+            "    let i = cellNew(0);\n"
+            "    while (cellGet(i) < n)\n"
+            "        invariant 0 <= cellGet(i) && cellGet(i) <= n\n"
+            "        invariant forall (k: Int) -> (0 <= k && k < cellGet(i)) ==> arrayGet(arr, k) == 0\n"
+            "        decreases n - cellGet(i)\n"
+            "    {\n"
+            "        arraySet(arr, cellGet(i), 0);\n"
+            "        cellSet(i, cellGet(i) + 1)\n"
+            "    }\n"
+            "}\n"
+            "\n"
+            "def witnessExists(): Int\n"
+            "    ensures r -> r == 7\n"
+            "= {\n"
+            "    let exists = 7;\n"
+            "    let a = arrayNew(3, 0);\n"
+            "    arraySet(a, 1, 42);\n"
+            "    assert(exists (k: Int) -> 0 <= k && k < arrayLen(a) && arrayGet(a, k) == 42);\n"
+            "    exists\n"
+            "}\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    let a = arrayNew(4, 9);\n"
+            "    zeroFill(a);\n"
+            "    let _ = witnessExists();\n"
+            "    ()\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e7v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e7_quant)])
+        assert r_e7v.returncode == 0, f"E7 quantifier verify failed:\n{r_e7v.stdout}\n{r_e7v.stderr}"
+        assert json.loads(r_e7v.stdout)["ok"] is True
+
+        # Format idempotence on `forall` / `exists` / `==>`
+        r_e7_fmt1 = run([geisha, "fmt", "--stdout", str(e7_quant)])
+        assert r_e7_fmt1.returncode == 0
+        e7_fmt_copy = tmp / "e7_quant_fmt.gsa"
+        e7_fmt_copy.write_text(r_e7_fmt1.stdout, encoding="utf-8", newline="\n")
+        r_e7_fmt2 = run([geisha, "fmt", "--stdout", str(e7_fmt_copy)])
+        assert r_e7_fmt2.returncode == 0 and r_e7_fmt2.stdout == r_e7_fmt1.stdout, "E7 fmt not idempotent on quantifiers!"
+
+        # Runtime `--contracts=check` on bounded `forall` / `exists` (positive + violated trap)
+        e7_bin = tmp / ("e7_quant_chk.exe" if sys.platform == "win32" else "e7_quant_chk")
+        assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e7_bin), str(e7_quant)]).returncode == 0
+        assert run([str(e7_bin)]).returncode == 0
+
+        e7_bad_rt = tmp / "e7_bad_quant_rt.gsa"
+        e7_bad_rt.write_text(
+            "def checkAllPos(arr: ImmArray Int): Void\n"
+            "    requires forall (i: Int) -> (0 <= i && i < immArrayLen(arr)) ==> immArrayGet(arr, i) > 0\n"
+            "= ()\n"
+            "def main(): Void = {\n"
+            "    let a = arrayNew(3, 5);\n"
+            "    arraySet(a, 2, -1);\n"
+            "    checkAllPos(arrayFreeze(a))\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e7_bad_bin = tmp / ("e7_bad_quant.exe" if sys.platform == "win32" else "e7_bad_quant")
+        assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e7_bad_bin), str(e7_bad_rt)]).returncode == 0
+        r_e7_br = run([str(e7_bad_bin)])
+        assert r_e7_br.returncode != 0 and "Contract error: requires violated" in (r_e7_br.stdout + r_e7_br.stderr)
+
+        # Negative: unguarded arrayGet inside `forall` MUST fail implicit bounds check!
+        e7_oob_q = tmp / "e7_oob_quant.gsa"
+        e7_oob_q.write_text(
+            "def badQuantBounds(arr: ImmArray Int): Void\n"
+            "    requires forall (i: Int) -> immArrayGet(arr, i) == 0\n"
+            "= ()\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e7_oob = run([geisha, "verify", "--json", "--solver", z3_bin, str(e7_oob_q)])
+        assert r_e7_oob.returncode == 1 and json.loads(r_e7_oob.stdout)["failed"] >= 1
+        print("PASS [e7_quantifiers_static_runtime_and_fmt]")
+
+        # ------------------------------------------------------------------
+        # E8: `String` / `Char` / Bitwise intrinsics & `stdlib` (`std.char`, `std.bits`) verification
+        # ------------------------------------------------------------------
+        e8_intr = tmp / "e8_intrinsics.gsa"
+        e8_intr.write_text(
+            "use std.char.{isDigitByte, isAlpha}\n"
+            "use std.bits.{popCount, trailingZeros, leadingZeros, setFlag, clearFlag}\n"
+            "\n"
+            "def firstAsciiByte(s: String): Int\n"
+            "    requires strLen(s) > 0\n"
+            "    ensures r -> 0 <= r && r < 256\n"
+            "= strByteAt(s, 0)\n"
+            "\n"
+            "def checkIntrinsics(x: Int, ch: Char): Void = {\n"
+            "    assert(strLen(\"geisha\") == 6 && strByteAt(\"geisha\", 0) == 103);\n"
+            "    let sub = strSlice(\"geisha\", 1, 4);\n"
+            "    assert(strLen(sub) == 3);\n"
+            "    assert(0 <= charToInt(ch) && charToInt(ch) < 256);\n"
+            "    assert(isDigitByte(53) && !isDigitByte(65) && isAlpha('Z'));\n"
+            "    let pc = popCount(x);\n"
+            "    let tz = trailingZeros(x);\n"
+            "    let lz = leadingZeros(x);\n"
+            "    assert(0 <= pc && pc <= 32 && 0 <= tz && tz <= 32 && 0 <= lz && lz <= 32);\n"
+            "    assert(popCount(0) == 0 && trailingZeros(0) == 32 && leadingZeros(0) == 32);\n"
+            "    assert((setFlag(x, 4) & 4) == 4 && (clearFlag(x, 4) & 4) == 0)\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e8 = run([geisha, "verify", "--json", "--solver", z3_bin, str(e8_intr)])
+        assert r_e8.returncode == 0, f"E8 intrinsics & stdlib contracts verify failed:\n{r_e8.stdout}\n{r_e8.stderr}"
+        assert json.loads(r_e8.stdout)["ok"] is True
+
+        # Unguarded `strByteAt(s, 0)` without `strLen(s) > 0` MUST fail bounds check
+        e8_oob = tmp / "e8_str_oob.gsa"
+        e8_oob.write_text("def badFirst(s: String): Int = strByteAt(s, 0)\ndef main() = ()\n", encoding="utf-8")
+        assert run([geisha, "verify", "--json", "--solver", z3_bin, str(e8_oob)]).returncode == 1
+
+        # Verify `stdlib/std/char.gsa` and `stdlib/std/bits.gsa` directly!
+        for std_rel in ["stdlib/std/char.gsa", "stdlib/std/bits.gsa"]:
+            r_std = run([geisha, "verify", "--json", "--solver", z3_bin, str(repo_root / std_rel)])
+            assert r_std.returncode == 0 and json.loads(r_std.stdout)["ok"] is True, (
+                f"E8 stdlib `{std_rel}` verify failed:\n{r_std.stdout}\n{r_std.stderr}"
+            )
+        print("PASS [e8_string_char_bits_intrinsics_and_stdlib]")
+
+        # ------------------------------------------------------------------
+        # E9: Astra Round 1 regressions (UF identity, multi-binder & guarded
+        # quantifiers/old() in `--contracts=check`, termination gate for pure
+        # reflection, nested same-ADT, exact popcount/ctz/clz, empty-root dump)
+        # ------------------------------------------------------------------
+        # 9.0 Lossless UF function identity (`m.f` vs `m_f` must NOT collide!)
+        e9_uf_dir = tmp / "e9_uf_pkg"
+        (e9_uf_dir / "m").mkdir(parents=True)
+        (e9_uf_dir / "m" / "mod.gsa").write_text(
+            "pub def f(x: Int): Int = x + 1\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e9_uf_main = e9_uf_dir / "main.gsa"
+        e9_uf_main.write_text(
+            "use m.f\n"
+            "// Recurse with `decreases` > 1 step so Z3 relies on UF congruence at depth 2!\n"
+            "def m_f(n: Int, x: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) x + 2 else m_f(n - 1, x)\n"
+            "def m2(n: Int, x: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) f(x) else m2(n - 1, x)\n"
+            "\n"
+            "verified def mustNotCollide(n: Int, x: Int): Void\n"
+            "    requires n >= 2\n"
+            "    ensures m_f(n, x) == m2(n, x)\n"
+            "= ()\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        # Also test direct module `a.b` vs `a_b` with depth-2 pure recursion so 1-step unfolding stops at UF!
+        (e9_uf_dir / "a").mkdir(parents=True)
+        (e9_uf_dir / "a" / "mod.gsa").write_text(
+            "pub def b(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) 1 else b(n - 1)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e9_uf_collide = e9_uf_dir / "collide.gsa"
+        e9_uf_collide.write_text(
+            "use a.{b}\n"
+            "def a_b(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    decreases n\n"
+            "= if (n == 0) 2 else a_b(n - 1)\n"
+            "verified def checkDistinct(n: Int): Void\n"
+            "    requires n >= 2\n"
+            "    ensures b(n) == a_b(n)\n"
+            "= ()\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_uf_col = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(e9_uf_dir), str(e9_uf_collide)])
+        assert r_uf_col.returncode == 1 and json.loads(r_uf_col.stdout)["failed"] >= 1, (
+            f"E9 UF collision (`a.b` vs `a_b`) falsely proved equality:\n{r_uf_col.stdout}\n{r_uf_col.stderr}"
+        )
+
+        # 9.1–9.4 Four runtime `--contracts=check` + static `verify` parity reproducers from Astra Round 1
+        e9_parity = tmp / "e9_check_parity.gsa"
+        e9_parity.write_text(
+            "def positive(x: Int): Int\n"
+            "    requires x > 0\n"
+            "= x\n"
+            "\n"
+            "verified def pair(): Void\n"
+            "    ensures !(exists (i: Int, j: Int) -> 0 <= i && i <= 1 && 0 <= j && j <= 1 && i + j == 3)\n"
+            "= ()\n"
+            "\n"
+            "verified def advance(a: MutArray Int, pos: Cell Int): Void\n"
+            "    requires arrayLen(a) == 2 && cellGet(pos) == 0 && arrayGet(a, 0) == 10\n"
+            "    ensures forall (i: Int) -> (0 <= i && i < 1) ==> old(arrayGet(a, i + cellGet(pos))) == 10\n"
+            "= cellSet(pos, 1)\n"
+            "\n"
+            "verified def guardedOld(x: Int): Int\n"
+            "    ensures r -> (x > 0) ==> r == old(positive(x))\n"
+            "= x\n"
+            "\n"
+            "verified def guardedOldArr(a: MutArray Int, idx: Int): Void\n"
+            "    ensures (0 <= idx && idx < arrayLen(a)) ==> arrayGet(a, idx) == old(arrayGet(a, idx)) + 1\n"
+            "= if (0 <= idx && idx < arrayLen(a)) arraySet(a, idx, arrayGet(a, idx) + 1) else ()\n"
+            "\n"
+            "verified def boundedShortCircuit(x: Int): Void\n"
+            "    ensures forall (i: Int) -> (x > 0 && 0 <= i && i < positive(x)) ==> i < x\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    pair();\n"
+            "    let a = arrayNew(2, 20);\n"
+            "    arraySet(a, 0, 10);\n"
+            "    advance(a, cellNew(0));\n"
+            "    assert(guardedOld(0) == 0 && guardedOld(5) == 5);\n"
+            "    guardedOldArr(a, -1);\n"
+            "    guardedOldArr(a, 1);\n"
+            "    boundedShortCircuit(0);\n"
+            "    boundedShortCircuit(3)\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_pv = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_parity)])
+        assert r_e9_pv.returncode == 0 and json.loads(r_e9_pv.stdout)["ok"] is True, (
+            f"E9 parity static verify failed:\n{r_e9_pv.stdout}\n{r_e9_pv.stderr}"
+        )
+        e9_pbin = tmp / ("e9_parity.exe" if sys.platform == "win32" else "e9_parity")
+        r_e9_pb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e9_pbin), str(e9_parity)])
+        assert r_e9_pb.returncode == 0, f"E9 parity --contracts=check build failed:\n{r_e9_pb.stdout}\n{r_e9_pb.stderr}"
+        r_e9_pr = run([str(e9_pbin)])
+        assert r_e9_pr.returncode == 0, f"E9 parity --contracts=check execution failed:\n{r_e9_pr.stdout}\n{r_e9_pr.stderr}"
+
+        # Unbounded quantifier in `--contracts=check` must report a clean compile diagnostic instead of silently returning `true`!
+        e9_unb = tmp / "e9_unbounded_chk.gsa"
+        e9_unb.write_text(
+            "def badUnbounded(): Void\n"
+            "    ensures !(exists (x: Int) -> x == 42)\n"
+            "= ()\n"
+            "def main(): Void = badUnbounded()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_unb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(tmp / "e9_unb_bin"), str(e9_unb)])
+        assert r_e9_unb.returncode != 0 and "cannot execute unbounded" in (r_e9_unb.stdout + r_e9_unb.stderr), (
+            f"E9 unbounded quantifier in --contracts=check must emit diagnostic:\n{r_e9_unb.stdout}\n{r_e9_unb.stderr}"
+        )
+
+        # 9.5 Non-terminating recursive function without `decreases` MUST NOT get pure reflection (`uf(x) == uf(x) + 1` vacuity)!
+        e9_nonterm = tmp / "e9_nonterm_reflect.gsa"
+        e9_nonterm.write_text(
+            "def badRec(x: Int): Int = badRec(x) + 1\n"
+            "verified def exploit(): Void = {\n"
+            "    let _ = badRec(0);\n"
+            "    assert(false)\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_nt = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_nonterm)])
+        assert r_e9_nt.returncode == 1 and json.loads(r_e9_nt.stdout)["failed"] >= 1, (
+            f"E9 non-terminating pure recursion vacuously proved `assert(false)`:\n{r_e9_nt.stdout}\n{r_e9_nt.stderr}"
+        )
+
+        # 9.6 & 9.7 Nested same-ADT (`Option (Option Int)`) + exact `bitPopCount`/`bitCtz`/`bitClz` (32 & 64 bit)
+        e9_exact = tmp / "e9_nested_and_bits.gsa"
+        e9_exact.write_text(
+            "use std.option.{Option, Some, None}\n"
+            "\n"
+            "verified def wrapNested(flag: Bool): Option (Option Int)\n"
+            "    ensures r -> match r { Some(Some(x)) -> flag && x == 7, None -> !flag, _ -> false }\n"
+            "= if (flag) Some(Some(7)) else None\n"
+            "\n"
+            "verified def exactBits(x: Int): Int\n"
+            "    ensures r -> r == 1\n"
+            "= {\n"
+            "    assert(bitPopCount(1) == 1 && bitPopCount(7) == 3 && bitPopCount(-1) == 32);\n"
+            "    assert(bitCtz(8) == 3 && bitCtz(1) == 0 && bitCtz(0) == 32);\n"
+            "    assert(bitClz(1) == 31 && bitClz(4) == 29 && bitClz(-1) == 0);\n"
+            "    assert(bitPopCount64(intToI64(5)) == 2 && bitCtz64(intToI64(8)) == 3 && bitClz64(intToI64(1)) == 63);\n"
+            "    if (x != 0) {\n"
+            "        assert(bitPopCount(x & (x - 1)) == bitPopCount(x) - 1)\n"
+            "    } else ();\n"
+            "    bitPopCount(1)\n"
+            "}\n"
+            "def main(): Void = { let _ = wrapNested(true); let _ = exactBits(6); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_ex = run([geisha, "verify", "--json", "--solver", z3_bin, str(e9_exact)])
+        assert r_e9_ex.returncode == 0 and json.loads(r_e9_ex.stdout)["ok"] is True, (
+            f"E9 nested Option(Option Int) & exact bit-counts verify failed:\n{r_e9_ex.stdout}\n{r_e9_ex.stderr}"
+        )
+
+        # 9.8 Empty selected roots in `geisha verify --dump-core` must NOT leak unrelated `main`!
+        e9_empty = tmp / "e9_empty_roots.gsa"
+        e9_empty_dump = tmp / "e9_empty_roots.gscore"
+        e9_empty.write_text(
+            "concept Exotic a { rank: a -> Int }\n"
+            "verified def magnitude(x: a): Int\n"
+            "    ensures r -> r == rank(x)\n"
+            "= rank(x)\n"
+            "def main(): Void = printLn(\"sibling\")\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e9_emp = run([geisha, "verify", "--json", "--solver", z3_bin, "--dump-core", str(e9_empty_dump), str(e9_empty)])
+        assert r_e9_emp.returncode == 1 and json.loads(r_e9_emp.stdout)["unknown"] >= 1
+        emp_sexp = e9_empty_dump.read_text(encoding="utf-8")
+        assert "(fun \"main\"" not in emp_sexp and "\"sibling\"" not in emp_sexp, (
+            f"E9 empty selected roots leaked `main` into `.gscore`:\n{emp_sexp}"
+        )
+
+        # ------------------------------------------------------------------
+        # E10: Astra Round 2 regressions (dependent guard before upper bound,
+        # global-Cell helper in `old(...)`, `requires` helper predicate facts,
+        # generic `Bool` quantifier specialization, `ImmArray (Cell Int)` in `old`)
+        # ------------------------------------------------------------------
+        # 10.1 Dependent guard `inRange(i, n)` + opaque dependent guard before `i < positive(n)` (Native + JS!)
+        e10_dep = tmp / "e10_dep_guard.gsa"
+        e10_dep.write_text(
+            "def positive(n: Int): Int\n"
+            "    requires n > 0\n"
+            "= n\n"
+            "def inRange(i: Int, n: Int): Bool = i < n\n"
+            "verified def checkRange(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (0 <= i && inRange(i, n) && i < positive(n)) ==> i < n\n"
+            "= ()\n"
+            "def main(): Void = { checkRange(3); checkRange(0); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e10_dv = run([geisha, "verify", "--json", "--solver", z3_bin, str(e10_dep)])
+        assert r_e10_dv.returncode == 0 and json.loads(r_e10_dv.stdout)["ok"] is True
+        e10_dbin = tmp / ("e10_dep.exe" if sys.platform == "win32" else "e10_dep")
+        assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_dbin), str(e10_dep)]).returncode == 0
+        r_e10_dn = run([str(e10_dbin)])
+        assert r_e10_dn.returncode == 0 and r_e10_dn.stdout.strip() == "ok"
+        if shutil.which("node"):
+            e10_djs = tmp / "e10_dep.mjs"
+            assert run([geisha, "--contracts=check", "--target", "js", "-o", str(e10_djs), str(e10_dep)]).returncode == 0
+            r_e10_dj = run(["node", str(e10_djs)])
+            assert r_e10_dj.returncode == 0 and r_e10_dj.stdout.strip() == "ok"
+
+        # 10.2 Read-only helper reading module-level `Cell` inside `old(current())` (Native + JS!)
+        e10_glob = tmp / "e10_global_old.gsa"
+        e10_glob.write_text(
+            "def counter: Cell Int = cellNew(10)\n"
+            "def current(): Int = cellGet(counter)\n"
+            "def increment(): Void\n"
+            "    ensures current() == old(current()) + 1\n"
+            "= cellSet(counter, current() + 1)\n"
+            "def main(): Void = { increment(); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e10_gbin = tmp / ("e10_glob.exe" if sys.platform == "win32" else "e10_glob")
+        r_e10_gb = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_gbin), str(e10_glob)])
+        assert r_e10_gb.returncode == 0, f"E10 global old build failed:\n{r_e10_gb.stdout}\n{r_e10_gb.stderr}"
+        r_e10_gn = run([str(e10_gbin)])
+        assert r_e10_gn.returncode == 0 and r_e10_gn.stdout.strip() == "ok", (
+            f"E10 global old native run failed:\n{r_e10_gn.stdout}\n{r_e10_gn.stderr}"
+        )
+        if shutil.which("node"):
+            e10_gjs = tmp / "e10_glob.mjs"
+            assert run([geisha, "--contracts=check", "--target", "js", "-o", str(e10_gjs), str(e10_glob)]).returncode == 0
+            r_e10_gj = run(["node", str(e10_gjs)])
+            assert r_e10_gj.returncode == 0 and r_e10_gj.stdout.strip() == "ok"
+
+        # 10.3 `requires positive(x)` pure helper predicate facts preserved in domain-guarded unfolding!
+        e10_dom = tmp / "e10_domain_pred.gsa"
+        e10_dom.write_text(
+            "def positive(x: Int): Bool = x > 0\n"
+            "def identity(x: Int): Int\n"
+            "    requires positive(x)\n"
+            "= x\n"
+            "verified def client(x: Int): Int\n"
+            "    requires x > 0\n"
+            "    ensures r -> r == x\n"
+            "= identity(x)\n"
+            "def main(): Void = { let _ = client(1); printLn(\"ok\") }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e10_dom = run([geisha, "verify", "--json", "--solver", z3_bin, str(e10_dom)])
+        assert r_e10_dom.returncode == 0 and json.loads(r_e10_dom.stdout)["ok"] is True, (
+            f"E10 requires helper predicate verify failed:\n{r_e10_dom.stdout}\n{r_e10_dom.stderr}"
+        )
+
+        # 10.4 Generic quantifier specialized to `Bool` + 10.5 `ImmArray (Cell Int)` in `old(...)`
+        e10_poly_imm = tmp / "e10_poly_and_imm.gsa"
+        e10_poly_imm.write_text(
+            "def identity(x: a): a\n"
+            "    ensures r -> forall (v: a) -> (v == x) ==> v == r\n"
+            "= x\n"
+            "def setFirst(items: ImmArray (Cell Int)): Void\n"
+            "    requires immArrayLen(items) > 0\n"
+            "    ensures cellGet(immArrayGet(items, 0)) == old(cellGet(immArrayGet(items, 0))) + 1\n"
+            "= { let c = immArrayGet(items, 0); cellSet(c, cellGet(c) + 1) }\n"
+            "def main(): Void = {\n"
+            "    setFirst(arrayFreeze(arrayNew(1, cellNew(10))));\n"
+            "    printLn(if (identity(true)) \"ok\" else \"unexpected\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        e10_pibin = tmp / ("e10_pi.exe" if sys.platform == "win32" else "e10_pi")
+        r_e10_pib = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e10_pibin), str(e10_poly_imm)])
+        assert r_e10_pib.returncode == 0, f"E10 poly Bool & ImmArray(Cell Int) build failed:\n{r_e10_pib.stdout}\n{r_e10_pib.stderr}"
+        r_e10_pir = run([str(e10_pibin)])
+        assert r_e10_pir.returncode == 0 and r_e10_pir.stdout.strip() == "ok", (
+            f"E10 poly Bool & ImmArray(Cell Int) run failed:\n{r_e10_pir.stdout}\n{r_e10_pir.stderr}"
+        )
+
+        # ------------------------------------------------------------------
+        # E11: Astra Round 3 regressions (capture-free bound unfolding,
+        # mid-conjunction independent guard after dependent guard,
+        # conditional `if` bound preceded by dependent guard + negative controls — Native + JS!)
+        # ------------------------------------------------------------------
+        e11_r3 = tmp / "e11_round3.gsa"
+        e11_r3.write_text(
+            "verified def positive(n: Int): Int\n"
+            "    requires n > 0\n"
+            "    ensures r -> r == n && r > 0\n"
+            "= n\n"
+            "\n"
+            "// 11.1 Local bindings (`let n`, `let i`, renamed `padding`) MUST NOT capture caller/quantifier vars!\n"
+            "def withinSameCaller(i: Int, limit: Int): Bool =\n"
+            "    i < { let n = 2; limit + n }\n"
+            "def withinSameQuant(i: Int, limit: Int): Bool =\n"
+            "    i < { let i = 2; limit + i }\n"
+            "def withinRenamed(i: Int, limit: Int): Bool =\n"
+            "    i < { let padding = 2; limit + padding }\n"
+            "verified def hasLastExplicitCap(n: Int): Void\n"
+            "    requires n == 4\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameCaller(i, n) && i < 8 && i == 5\n"
+            "= ()\n"
+            "verified def hasLastNoCap(n: Int): Void\n"
+            "    requires n == 4\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameCaller(i, n) && i == 5\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinSameQuant(i, n) && i == 5\n"
+            "    ensures exists (i: Int) -> 0 <= i && withinRenamed(i, n) && i == 5\n"
+            "= ()\n"
+            "\n"
+            "// 11.2 Mid-conjunction `positive(mask) > 0` after `(i & mask) != 0` MUST NOT hoist before loop!\n"
+            "verified def checkMidGuard(mask: Int): Void\n"
+            "    requires mask >= 0\n"
+            "    ensures forall (i: Int) -> (0 <= i && (i & mask) != 0 && positive(mask) > 0 && i < 4) ==> i < 4\n"
+            "= ()\n"
+            "\n"
+            "// 11.3 Conditional `if (mask < 2) positive(mask) else 2` upper bound after `(i & mask) != 0`!\n"
+            "verified def checkCondBound(mask: Int): Void\n"
+            "    requires mask >= 0\n"
+            "    ensures forall (i: Int) -> (0 <= i && (i & mask) != 0 && i < (if (mask < 2) positive(mask) else 2)) ==> i >= 0\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    hasLastExplicitCap(4);\n"
+            "    hasLastNoCap(4);\n"
+            "    checkMidGuard(1);\n"
+            "    checkMidGuard(0);\n"
+            "    checkCondBound(2);\n"
+            "    checkCondBound(1);\n"
+            "    checkCondBound(0);\n"
+            "    printLn(\"ok\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e11_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e11_r3)])
+        assert r_e11_v.returncode == 0 and json.loads(r_e11_v.stdout)["ok"] is True, (
+            f"E11 Round 3 static verify failed:\n{r_e11_v.stdout}\n{r_e11_v.stderr}"
+        )
+        e11_bin = tmp / ("e11_r3.exe" if sys.platform == "win32" else "e11_r3")
+        r_e11_b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e11_bin), str(e11_r3)])
+        assert r_e11_b.returncode == 0, f"E11 Round 3 native build failed:\n{r_e11_b.stdout}\n{r_e11_b.stderr}"
+        r_e11_n = run([str(e11_bin)])
+        assert r_e11_n.returncode == 0 and r_e11_n.stdout.strip() == "ok", (
+            f"E11 Round 3 native run failed:\n{r_e11_n.stdout}\n{r_e11_n.stderr}"
+        )
+        if shutil.which("node"):
+            e11_js = tmp / "e11_r3.mjs"
+            r_e11_jb = run([geisha, "--contracts=check", "--target", "js", "-o", str(e11_js), str(e11_r3)])
+            assert r_e11_jb.returncode == 0, f"E11 Round 3 JS build failed:\n{r_e11_jb.stdout}\n{r_e11_jb.stderr}"
+            r_e11_jr = run(["node", str(e11_js)])
+            assert r_e11_jr.returncode == 0 and r_e11_jr.stdout.strip() == "ok", (
+                f"E11 Round 3 JS run failed:\n{r_e11_jr.stdout}\n{r_e11_jr.stderr}"
+            )
+
+        # 11.4 Adversarial negative controls:
+        #   (a) out-of-range witness `i == 6` (`withinSameCaller(6, 4)` is false) MUST fail ensures!
+        #   (b) non-vacuous `(i >= 5000)` before `i < (if (mask < 2) positive(mask) else 2)` with `mask = 0`
+        #       MUST reach `i = 5000` (beyond 4096!) and abort with `requires violated` in Native AND JS!
+        for neg_nm, neg_src_txt, exp_msg in [
+            (
+                "e11_neg_cap",
+                "def within(i: Int, limit: Int): Bool = i < { let n = 2; limit + n }\n"
+                "def badLast(n: Int): Void\n"
+                "    ensures exists (i: Int) -> 0 <= i && within(i, n) && i < 8 && i == 6\n"
+                "= ()\n"
+                "def main(): Void = badLast(4)\n",
+                "ensures violated",
+            ),
+            (
+                "e11_neg_high_witness",
+                "def positive(n: Int): Int\n"
+                "    requires n > 0\n"
+                "= n\n"
+                "def badCond(mask: Int): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && i >= 5000 && i < (if (mask < 2) positive(mask) else 2)) ==> i >= 0\n"
+                "= ()\n"
+                "def main(): Void = badCond(0)\n",
+                "requires violated",
+            ),
+        ]:
+            neg_f = tmp / f"{neg_nm}.gsa"
+            neg_f.write_text(neg_src_txt, encoding="utf-8", newline="\n")
+            neg_b = tmp / (f"{neg_nm}.exe" if sys.platform == "win32" else neg_nm)
+            assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(neg_b), str(neg_f)]).returncode == 0
+            r_nb = run([str(neg_b)])
+            assert r_nb.returncode != 0 and exp_msg in (r_nb.stdout + r_nb.stderr), (
+                f"E11 {neg_nm} native expected {exp_msg!r}, got rc={r_nb.returncode}: {r_nb.stdout}\n{r_nb.stderr}"
+            )
+            if shutil.which("node"):
+                neg_j = tmp / f"{neg_nm}.mjs"
+                assert run([geisha, "--contracts=check", "--target", "js", "-o", str(neg_j), str(neg_f)]).returncode == 0
+                r_nj = run(["node", str(neg_j)])
+                assert r_nj.returncode != 0 and exp_msg in (r_nj.stdout + r_nj.stderr), (
+                    f"E11 {neg_nm} JS expected {exp_msg!r}, got rc={r_nj.returncode}: {r_nj.stdout}\n{r_nj.stderr}"
+                )
+        # ------------------------------------------------------------------
+        # E12: Astra Round 4 regressions (strict INT_MAX/INT_MIN empty-endpoint
+        # short-circuiting + contracted range predicates preserving live contract checks!)
+        # ------------------------------------------------------------------
+        e12_r4 = tmp / "e12_round4.gsa"
+        e12_r4.write_text(
+            "def successor(n: Int): Int\n"
+            "    requires n < 2147483647\n"
+            "= n + 1\n"
+            "verified def checkNext(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (i > n && i <= successor(n)) ==> i > n\n"
+            "= ()\n"
+            "\n"
+            "def prev(n: Int): Int\n"
+            "    requires n > -2147483648\n"
+            "= n - 1\n"
+            "verified def checkPrev(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (i < n && i >= prev(n)) ==> i < n\n"
+            "= ()\n"
+            "\n"
+            "def below(i: Int, cap: Int): Bool\n"
+            "    ensures r -> r == (i < cap)\n"
+            "= i < cap\n"
+            "verified def four(): Void\n"
+            "    ensures exists (i: Int) -> 0 <= i && below(i, 4) && i == 3\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    checkNext(4);\n"
+            "    checkNext(2147483647);\n"
+            "    checkPrev(4);\n"
+            "    checkPrev(-2147483648);\n"
+            "    four();\n"
+            "    printLn(\"ok\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e12_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e12_r4)])
+        assert r_e12_v.returncode == 0 and json.loads(r_e12_v.stdout)["ok"] is True, (
+            f"E12 Round 4 static verify failed:\n{r_e12_v.stdout}\n{r_e12_v.stderr}"
+        )
+        e12_bin = tmp / ("e12_r4.exe" if sys.platform == "win32" else "e12_r4")
+        r_e12_b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e12_bin), str(e12_r4)])
+        assert r_e12_b.returncode == 0, f"E12 Round 4 native build failed:\n{r_e12_b.stdout}\n{r_e12_b.stderr}"
+        r_e12_n = run([str(e12_bin)])
+        assert r_e12_n.returncode == 0 and r_e12_n.stdout.strip() == "ok", (
+            f"E12 Round 4 native run failed:\n{r_e12_n.stdout}\n{r_e12_n.stderr}"
+        )
+        if shutil.which("node"):
+            e12_js = tmp / "e12_r4.mjs"
+            r_e12_jb = run([geisha, "--contracts=check", "--target", "js", "-o", str(e12_js), str(e12_r4)])
+            assert r_e12_jb.returncode == 0, f"E12 Round 4 JS build failed:\n{r_e12_jb.stdout}\n{r_e12_jb.stderr}"
+            r_e12_jr = run(["node", str(e12_js)])
+            assert r_e12_jr.returncode == 0 and r_e12_jr.stdout.strip() == "ok", (
+                f"E12 Round 4 JS run failed:\n{r_e12_jr.stdout}\n{r_e12_jr.stderr}"
+            )
+
+        # 12.2 Contracted predicate helpers MUST still execute their own contracts on boundary/empty calls!
+        for neg_nm, neg_src_txt, exp_msg in [
+            (
+                "e12_pred_ens_boundary",
+                "def badBelow(i: Int, cap: Int): Bool\n"
+                "    ensures r -> i < 4\n"
+                "= i < cap\n"
+                "def caller(): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && badBelow(i, 4)) ==> i < 4\n"
+                "= ()\n"
+                "def main(): Void = caller()\n",
+                "ensures violated",
+            ),
+            (
+                "e12_pred_ens_empty",
+                "def badBelow0(i: Int, cap: Int): Bool\n"
+                "    ensures r -> cap > 0\n"
+                "= i < cap\n"
+                "def caller0(): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && badBelow0(i, 0)) ==> false\n"
+                "= ()\n"
+                "def main(): Void = caller0()\n",
+                "ensures violated",
+            ),
+        ]:
+            neg_f = tmp / f"{neg_nm}.gsa"
+            neg_f.write_text(neg_src_txt, encoding="utf-8", newline="\n")
+            neg_b = tmp / (f"{neg_nm}.exe" if sys.platform == "win32" else neg_nm)
+            assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(neg_b), str(neg_f)]).returncode == 0
+            r_nb = run([str(neg_b)])
+            assert r_nb.returncode != 0 and exp_msg in (r_nb.stdout + r_nb.stderr), (
+                f"E12 {neg_nm} native expected {exp_msg!r}, got rc={r_nb.returncode}: {r_nb.stdout}\n{r_nb.stderr}"
+            )
+            if shutil.which("node"):
+                neg_j = tmp / f"{neg_nm}.mjs"
+                assert run([geisha, "--contracts=check", "--target", "js", "-o", str(neg_j), str(neg_f)]).returncode == 0
+                r_nj = run(["node", str(neg_j)])
+                assert r_nj.returncode != 0 and exp_msg in (r_nj.stdout + r_nj.stderr), (
+                    f"E12 {neg_nm} JS expected {exp_msg!r}, got rc={r_nj.returncode}: {r_nj.stdout}\n{r_nj.stderr}"
+                )
+        print("PASS [e9_astra_round1_round2_round3_round4_regressions]")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)

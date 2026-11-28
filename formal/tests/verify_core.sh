@@ -793,7 +793,42 @@ if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
     exit 1
 fi
 
-# D1: Production compiler verified kernels (`src/verified_kernels.gsa`) 100% cross-verified by Z3 and Lean 4 VCG
-"$GEISHA_BIN" verify --src-root . --dump-core "$TMP_DIR/verified_kernels.gscore" src/verified_kernels.gsa
-"$CHECKER_BIN" --verify-vcg "$TMP_DIR/verified_kernels.gscore"
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + Z6b shadowed assume + D1 src/verified_kernels.gsa)"
+# D1: Production compiler verified kernels in-place inside host modules (`diag.gsa`, `codegen.gsa`, `codegen_wasmgc.gsa`, `core.gsa`)
+#     AND mixed-module `verified def` root-sliced `.gscore`, 100% cross-verified by Z3 and Lean 4 VCG!
+"$GEISHA_BIN" verify --src-root . \
+    --fn clampOffset --fn clampSpanEnd --fn hexDigitUpperByte --fn hexNibbleVal \
+    --dump-core "$TMP_DIR/vk_diag.gscore" src/diag.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vk_diag.gscore"
+
+"$GEISHA_BIN" verify --src-root . \
+    --fn alignUp8 --fn alignUp16 --fn bitmapWordIdx --fn bitmapBitMask \
+    --dump-core "$TMP_DIR/vk_codegen.gscore" src/codegen.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vk_codegen.gscore"
+
+"$GEISHA_BIN" verify --src-root . \
+    --fn uleb32Next --fn uleb32Byte --fn uleb32Len \
+    --fn sleb32Done --fn sleb32Next --fn sleb32Byte --fn sleb32Len \
+    --fn sleb64Done --fn sleb64Next --fn sleb64Byte --fn sleb64Len \
+    --dump-core "$TMP_DIR/vk_wasmgc.gscore" src/codegen_wasmgc.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vk_wasmgc.gscore"
+
+"$GEISHA_BIN" verify --src-root . \
+    --fn coFreshNextId --fn coFreshBatchEnd --fn coFlatTotalArity \
+    --fn coSpecSlotStepArity --fn coAnfInFloatPrefix --fn coPatSeqStatus --fn coInlineBudgetAllows \
+    --dump-core "$TMP_DIR/vk_core.gscore" src/core.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/vk_core.gscore"
+
+cat > "$TMP_DIR/mixed_verified_def.gsa" << 'EOF'
+use std.str.intToStr
+
+pub verified def clampUnit(x: Int): Int
+    ensures r -> 0 <= r && r <= 100
+= if (x < 0) 0 else if (x > 100) 100 else x
+
+pub def unverifiedLogger(x: Int): String = "val=" + intToStr(clampUnit(x))
+
+def main(): Void = printLn(unverifiedLogger(42))
+EOF
+"$GEISHA_BIN" verify --dump-core "$TMP_DIR/mixed_verified_def.gscore" "$TMP_DIR/mixed_verified_def.gsa"
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/mixed_verified_def.gscore"
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + Z6b shadowed assume + in-place compiler kernels + mixed verified def)"

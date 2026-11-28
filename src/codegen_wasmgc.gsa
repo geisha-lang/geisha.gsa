@@ -31,11 +31,7 @@ use ast.{
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
     Span, emptySpan
 }
-use diag.formatSpanDiag
-use verified_kernels.{
-    uleb32Byte, uleb32Next, sleb32Done, sleb32Byte, sleb32Next,
-    sleb64Done, sleb64Byte, sleb64Next, hexDigitUpperByte
-}
+use diag.{formatSpanDiag, hexDigitUpperByte}
 use infer.{
     VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
 }
@@ -45,6 +41,117 @@ use core.{
     TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
     FunDef, GlobalValDef, ExternDef, CoreProgram,
     extractTypeArgs
+}
+
+pub def uleb32Next(cur: Int): Int
+    ensures r -> r == (cur >>> 7)
+= cur >>> 7
+
+pub def uleb32Byte(cur: Int): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((cur >>> 7) != 0 && (r & 128) == 128) || ((cur >>> 7) == 0 && (r & 128) == 0))
+= {
+    let low = cur & 127;
+    if ((cur >>> 7) != 0) low | 128 else low
+}
+
+pub def uleb32Len(n: Int): Int
+    ensures r -> 1 <= r && r <= 5
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 5)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 5
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 5 - cellGet(cnt)
+    {
+        let next = cellGet(v) >>> 7;
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (next != 0) cellSet(v, next) else cellSet(more, false)
+    };
+    cellGet(cnt)
+}
+
+pub def sleb32Done(cur: Int): Bool
+    ensures r -> r == (((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0))
+= {
+    let low = cur & 127;
+    let next = cur >> 7;
+    (next == 0 && (low & 64) == 0) || (next == -1 && (low & 64) != 0)
+}
+
+pub def sleb32Next(cur: Int): Int
+    ensures r -> r == (cur >> 7)
+= cur >> 7
+
+pub def sleb32Byte(cur: Int): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0)) && (r & 128) == 0)
+            || (!(((cur >> 7) == 0 && ((cur & 127) & 64) == 0) || ((cur >> 7) == -1 && ((cur & 127) & 64) != 0)) && (r & 128) == 128))
+= {
+    let low = cur & 127;
+    if (sleb32Done(cur)) low else low | 128
+}
+
+pub def sleb32Len(n: Int): Int
+    ensures r -> 1 <= r && r <= 5
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 5)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 5
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 5 - cellGet(cnt)
+    {
+        let cur = cellGet(v);
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (sleb32Done(cur)) cellSet(more, false) else cellSet(v, cur >> 7)
+    };
+    cellGet(cnt)
+}
+
+pub def sleb64Done(cur: Int64): Bool
+    ensures r -> r == (((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+        || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0))
+= {
+    let low = i64ToInt(cur & intToI64(127));
+    let next = cur >> 7;
+    (next == intToI64(0) && (low & 64) == 0) || (next == intToI64(-1) && (low & 64) != 0)
+}
+
+pub def sleb64Next(cur: Int64): Int64
+    ensures r -> r == (cur >> 7)
+= cur >> 7
+
+pub def sleb64Byte(cur: Int64): Int
+    ensures r -> 0 <= r && r <= 255
+        && (((((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+              || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0)) && (r & 128) == 0)
+            || (!(((cur >> 7) == intToI64(0) && (i64ToInt(cur & intToI64(127)) & 64) == 0)
+                  || ((cur >> 7) == intToI64(-1) && (i64ToInt(cur & intToI64(127)) & 64) != 0)) && (r & 128) == 128))
+= {
+    let low = i64ToInt(cur & intToI64(127));
+    if (sleb64Done(cur)) low else low | 128
+}
+
+pub def sleb64Len(n: Int64): Int
+    ensures r -> 1 <= r && r <= 10
+= {
+    let v = cellNew(n);
+    let cnt = cellNew(0);
+    let more = cellNew(true);
+    while (cellGet(more) && cellGet(cnt) < 10)
+        invariant 0 <= cellGet(cnt) && cellGet(cnt) <= 10
+        invariant cellGet(more) || cellGet(cnt) >= 1
+        decreases 10 - cellGet(cnt)
+    {
+        let cur = cellGet(v);
+        cellSet(cnt, cellGet(cnt) + 1);
+        if (sleb64Done(cur)) cellSet(more, false) else cellSet(v, cur >> 7)
+    };
+    cellGet(cnt)
 }
 
 // ============================================================================

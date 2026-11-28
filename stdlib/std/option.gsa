@@ -5,12 +5,16 @@ pub data Option a {
     Some(a),
 }
 
-pub def isSome(opt: Option a): Bool = match opt {
+pub def isSome(opt: Option a): Bool
+    ensures r -> r <==> match opt { Some(_) -> true, None -> false }
+= match opt {
     Some(_) -> true,
     None -> false,
 }
 
-pub def isNone(opt: Option a): Bool = match opt {
+pub def isNone(opt: Option a): Bool
+    ensures r -> r <==> match opt { None -> true, Some(_) -> false }
+= match opt {
     None -> true,
     Some(_) -> false,
 }

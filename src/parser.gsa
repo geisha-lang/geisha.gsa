@@ -13,7 +13,7 @@ use ast.{
     ConstraintSpec, MkConstraint,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
-    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr, OpLt, OpGe,
+    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr, OpEq, OpLt, OpGe,
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl, MkVarDecl,
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
@@ -26,7 +26,7 @@ use ast.{
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
     FunDep, MkFunDep,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
-    DefAttr, AttrExport, AttrCtor, AttrCStruct,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct, AttrVerified,
     Def, MkDef, UseSpec, MkUseSpec, UseItem, UseSingle, UseMulti, UseGlob, UseAlias,
     ModuleItem, ModDef, ModUse, ModSub, ModDecl, FileModule, MkFileModule,
     encodeOpName, isDefinableOp, builtinBinOpFromStr, infixPrecedence, isRightAssocOp
@@ -49,6 +49,7 @@ pub data Parser {
         pushedSym: Cell (Option Token),
         eofTok: Token,
         pendingItems: Cell (List ModuleItem),
+        freshId: Cell Int,
     },
 }
 
@@ -126,6 +127,7 @@ def newParser(toks: Vec Token): Parser =
         pushedSym: cellNew(None),
         eofTok: eofToken(),
         pendingItems: cellNew(Nil),
+        freshId: cellNew(0),
     }
 
 def savePos(p: Parser): (Int, Option Token) =
@@ -1246,10 +1248,16 @@ def parseAtomExpr(p: Parser): Result Form String = {
             let _ = bumpTok(p);
             Ok(mkForm(t.span, ExLit(LitBool(false))))
         },
+        TkForall -> parseForallExpr(p, t.span),
         TkIdent(name) -> {
             let _ = bumpTok(p);
-            // Check struct construction `Ctor { f1: v1, ... }` when `name` is uppercase!
-            if (isUpperByte(strByteAt(name, 0)) && match peekTok(p).kind { TkLBrace -> true, _ -> false }) {
+            if (name == "exists") {
+                match tryParseExistsExpr(p, t.span) {
+                    Some(qres) -> qres,
+                    None -> Ok(mkForm(t.span, ExVar(name))),
+                }
+            } else if (isUpperByte(strByteAt(name, 0)) && match peekTok(p).kind { TkLBrace -> true, _ -> false }) {
+                // Check struct construction `Ctor { f1: v1, ... }` when `name` is uppercase!
                 let snapSt = savePos(p);
                 let _ = bumpTok(p);
                 // Verify `{ ident : ... }` so `match Ctor { ... }` scruts don't misparse as `Ctor { ... }`!
@@ -1281,6 +1289,112 @@ def parseAtomExpr(p: Parser): Result Form String = {
             } else Ok(mkForm(t.span, ExVar(name)))
         },
         _ -> Err(parseErr(p, "expected expression")),
+    }
+}
+
+def buildQuantifierForm(kwSp: Span, qPrim: String, ps: List VarDecl, body: Form): Form = {
+    let rev = listRev(ps);
+    let acc = cellNew(body);
+    let cur = cellNew(rev);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(vd, r) -> {
+                let curBody = cellGet(acc);
+                let sp = unionSpan(kwSp, curBody.pos);
+                let lam = mkForm(sp, ExAbs([vd], None, curBody));
+                cellSet(acc, mkForm(sp, ExApply(mkForm(kwSp, ExVar(qPrim)), [lam])));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(acc)
+}
+
+def parseForallExpr(p: Parser, kwSp: Span): Result Form String = {
+    let _ = bumpTok(p);
+    let ps: List VarDecl = match peekTok(p).kind {
+        TkLParen -> {
+            let _ = bumpTok(p);
+            let params = parseParamSeq(p)?;
+            let _ = expectRParen(p)?;
+            params
+        },
+        _ -> {
+            let vname = parseLowerIdent(p)?;
+            let vscm = if (eatSym(p, ":")) ScmMono(parseBType(p)?) else ScmSlot;
+            [MkVarDecl { vname: vname, vscm: vscm }]
+        },
+    };
+    match ps {
+        Nil -> Err(formatSpanDiagHint(
+            "Parse error", kwSp,
+            "`forall` quantifier requires at least one bound variable",
+            "write `forall (i: Int) -> ...`"
+        ))?,
+        _ -> (),
+    };
+    if (eatSym(p, "->")) ()
+    else match peekTok(p).kind {
+        TkDot -> { let _ = bumpTok(p); () },
+        _ -> { let _ = expectSym(p, "->")?; () },
+    };
+    let body = parseExpr(p)?;
+    Ok(buildQuantifierForm(kwSp, "$gs$forall", ps, body))
+}
+
+def tryParseExistsExpr(p: Parser, kwSp: Span): Option (Result Form String) = {
+    let snap = savePos(p);
+    let nextT = peekTok(p);
+    if (nextT.hadNewline) None
+    else match nextT.kind {
+        TkLParen -> {
+            let _ = bumpTok(p);
+            match parseParamSeq(p) {
+                Err(_) -> { restorePos(p, snap); None },
+                Ok(Nil) -> { restorePos(p, snap); None },
+                Ok(ps) -> match peekTok(p).kind {
+                    TkRParen -> {
+                        let _ = bumpTok(p);
+                        if (eatSym(p, "->")) {
+                            Some(match parseExpr(p) {
+                                Ok(body) -> Ok(buildQuantifierForm(kwSp, "$gs$exists", ps, body)),
+                                Err(e) -> Err(e),
+                            })
+                        } else {
+                            restorePos(p, snap);
+                            None
+                        }
+                    },
+                    _ -> { restorePos(p, snap); None },
+                },
+            }
+        },
+        TkIdent(vname) if (strLen(vname) > 0 && isLowerByte(strByteAt(vname, 0))) -> {
+            let _ = bumpTok(p);
+            let tyRes: Result Scheme String =
+                if (eatSym(p, ":")) {
+                    match parseBType(p) {
+                        Ok(bt) -> Ok(ScmMono(bt)),
+                        Err(e) -> Err(e),
+                    }
+                } else Ok(ScmSlot);
+            match tyRes {
+                Err(_) -> { restorePos(p, snap); None },
+                Ok(vscm) ->
+                    if (eatSym(p, "->")) {
+                        let vd = MkVarDecl { vname: vname, vscm: vscm };
+                        Some(match parseExpr(p) {
+                            Ok(body) -> Ok(buildQuantifierForm(kwSp, "$gs$exists", [vd], body)),
+                            Err(e) -> Err(e),
+                        })
+                    } else {
+                        restorePos(p, snap);
+                        None
+                    },
+            }
+        },
+        _ -> None,
     }
 }
 
@@ -1387,9 +1501,20 @@ def parseUnaryExpr(p: Parser): Result Form String = {
     }
 }
 
-def makeInfixForm(op: String, opSp: Span, lhs: Form, rhs: Form): Form = {
+def makeInfixForm(p: Parser, op: String, opSp: Span, lhs: Form, rhs: Form): Form = {
     let sp = unionSpan(lhs.pos, rhs.pos);
-    if (op == "||") mkForm(sp, ExBin(OpOr, lhs, rhs))
+    if (op == "==>") {
+        mkForm(sp, ExIf(lhs, rhs, mkForm(rhs.pos, ExLit(LitBool(true)))))
+    } else if (op == "<==>") {
+        let id = cellGet(p.freshId);
+        cellSet(p.freshId, id + 1);
+        let lnm = ".iff_l_" + intToStr(id);
+        let rnm = ".iff_r_" + intToStr(id);
+        let boolScm = ScmMono(TyCon("Bool"));
+        let eqForm = mkForm(sp, ExBin(OpEq, mkForm(lhs.pos, ExVar(lnm)), mkForm(rhs.pos, ExVar(rnm))));
+        let innerLet = mkForm(sp, ExLet(MkVarDecl { vname: rnm, vscm: boolScm }, rhs, eqForm));
+        mkForm(sp, ExLet(MkVarDecl { vname: lnm, vscm: boolScm }, lhs, innerLet))
+    } else if (op == "||") mkForm(sp, ExBin(OpOr, lhs, rhs))
     else if (op == "&&") mkForm(sp, ExBin(OpAnd, lhs, rhs))
     else match builtinBinOpFromStr(op) {
         Some(bop) -> mkForm(sp, ExBin(bop, lhs, rhs)),
@@ -1412,7 +1537,7 @@ def parseInfixPrec(p: Parser, minPrec: Int): Result Form String = {
                     let _ = bumpTok(p);
                     let nextMin = if (isRightAssocOp(op)) prec else prec + 1;
                     let rhs = parseInfixPrec(p, nextMin)?;
-                    cellSet(lhs, makeInfixForm(op, t.span, cellGet(lhs), rhs))
+                    cellSet(lhs, makeInfixForm(p, op, t.span, cellGet(lhs), rhs))
                 }
             },
             _ -> cellSet(looping, false),
@@ -1787,6 +1912,14 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
             skipSemis(p);
             let startSp = peekTok(p).span;
             let vis = parseVisibility(p);
+            let isVer = match peekTok(p).kind {
+                TkIdent(w) if (w == "verified") -> match peekAt(p, 1).kind {
+                    TkDef -> { let _ = bumpTok(p); true },
+                    _ -> false,
+                },
+                _ -> false,
+            };
+            let vAttrs = if (isVer) [AttrVerified] else Nil;
             match peekTok(p).kind {
                 TkDef -> {
                     let d = parseFormDefBody(p, vis, startSp)?;
@@ -1794,8 +1927,19 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                         Err(parseErr(p, "Forward declaration for '" + fwdName + "' must be followed by its definition"))
                     } else match d.item {
                         ItForm(f) -> {
-                            let f2 = MkForm { pos: f.pos, ty: f.ty, annot: Some(fwdScm), node: f.node };
-                            Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: Nil, item: ItForm(f2) })
+                            let isBadVer = if (isVer) {
+                                match f.node { ExAbs(_, _, _) -> false, _ -> true }
+                            } else false;
+                            if (isBadVer) {
+                                Err(formatSpanDiagHint(
+                                    "Parse error", startSp,
+                                    "`verified` modifier is only valid on function definitions (`verified def f(...) = ...`)",
+                                    "remove `verified` from constant value bindings"
+                                ))
+                            } else {
+                                let f2 = MkForm { pos: f.pos, ty: f.ty, annot: Some(fwdScm), node: f.node };
+                                Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: vAttrs, item: ItForm(f2) })
+                            }
                         },
                         _ -> Ok(d),
                     }
@@ -1810,6 +1954,23 @@ pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def Stri
                 None -> parseVisibility(p),
             };
             match peekTok(p).kind {
+                TkIdent(w) if (w == "verified" && match peekAt(p, 1).kind { TkDef -> true, _ -> false }) -> {
+                    let vSp = bumpTok(p).span;
+                    let d = parseFormDefBody(p, vis, unionSpan(startSp, vSp))?;
+                    let isFnForm = match d.item {
+                        ItForm(f) -> match f.node { ExAbs(_, _, _) -> true, _ -> false },
+                        _ -> false,
+                    };
+                    if (!isFnForm) {
+                        Err(formatSpanDiagHint(
+                            "Parse error", vSp,
+                            "`verified` modifier is only valid on function definitions (`verified def f(...) = ...`)",
+                            "remove `verified` from constant value bindings"
+                        ))
+                    } else {
+                        Ok(MkDef { ident: d.ident, dpos: unionSpan(startSp, d.dpos), vis: d.vis, attrs: [AttrVerified], item: d.item })
+                    }
+                },
                 TkDef -> parseFormDefBody(p, vis, startSp),
                 TkExtern -> {
                     let _ = bumpTok(p);
@@ -2162,15 +2323,17 @@ def isTopLevelModuleItemStart(p: Parser): Bool = match peekTok(p).kind {
     TkType -> true,
     TkConcept -> true,
     TkInstance -> true,
-    TkIdent(_) -> {
-        let snap = savePos(p);
-        let hit = match tryParseForwardDecl(p) {
-            Some(_) -> true,
-            None -> false,
-        };
-        restorePos(p, snap);
-        hit
-    },
+    TkIdent(w) ->
+        if (w == "verified" && match peekAt(p, 1).kind { TkDef -> true, _ -> false }) true
+        else {
+            let snap = savePos(p);
+            let hit = match tryParseForwardDecl(p) {
+                Some(_) -> true,
+                None -> false,
+            };
+            restorePos(p, snap);
+            hit
+        },
     TkLParen -> {
         let snap = savePos(p);
         let hit = match tryParseForwardDecl(p) {
