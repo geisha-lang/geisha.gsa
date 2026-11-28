@@ -4,4 +4,4 @@ version = "0.2.0"
 entry = "src/geisha.gsa"
 
 [deps]
-parsec = { git = "github.com/geisha-lang/parsec.gsa", version = "0.2.5" }
+parsec = { git = "github.com/geisha-lang/parsec.gsa", version = "0.2.6" }
