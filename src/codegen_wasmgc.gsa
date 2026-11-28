@@ -742,6 +742,10 @@ def scanTermImports(wm: WgcModule, tm: TaggedTerm): Void = match tm.tnode {
             cellSet(wm.wmNeedsStrInterop, true);
             let _ = addHostImport(wm, "geisha", "print_str", [WTAny], Nil);
             ()
+        } else if (nm == "$gs$contract_fail") {
+            cellSet(wm.wmNeedsStrInterop, true);
+            let _ = addHostImport(wm, "geisha", "contract_fail", [WTAny], Nil);
+            ()
         } else if (nm == "putChar") {
             let _ = addHostImport(wm, "geisha", "put_char", [WTI32], Nil);
             ()
@@ -1920,14 +1924,7 @@ def tryEmitBuiltinWgc(
 ): Bool = {
     let c = fctx.fcCode;
     let wm = fctx.fcMod;
-    if (name == "__gs_contract_fail") {
-        let cur = cellNew(args);
-        while (match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) { Cons(a, r) -> { emitTermDiscard(fctx, a, locals); cellSet(cur, r) }, Nil -> () }
-        };
-        bufPushByte(c, 0x00); // unreachable
-        true
-    } else if (name == "cellNew") {
+    if (name == "cellNew") {
         let a0 = nthArgTerm(args, 0);
         let elemWt = geishaTypeToWgc(wm, schemeBody(a0.tscm));
         let cellTy = internCellType(wm, elemWt);
@@ -2503,6 +2500,11 @@ def tryEmitBuiltinWgc(
         bufPushByte(c, 0x41); bufPushByte(c, 0x00);
         bufPushByte(c, 0xFB); bufPushByte(c, 0x07); emitUleb(c, 0);
         true
+    } else if (name == "$gs$contract_fail") {
+        emitTermAsVal(fctx, nthArgTerm(args, 0), locals);
+        emitHostImportCall(fctx, "geisha.contract_fail");
+        bufPushByte(c, 0x00);
+        true
     } else {
         false
     }
@@ -2752,6 +2754,7 @@ def emitWgcExpr(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcVa
         },
         TmApplyDir(vd, args) -> {
             let isShadowed = !strStartsWith(vd.vname, "__gs_")
+                && !strStartsWith(vd.vname, "$gs$")
                 && (strMapContains(wm.wmProg.coreExterns, vd.vname) || strMapContains(wm.wmProg.coreFns, vd.vname));
             if (!isShadowed && tryEmitBuiltinWgc(fctx, vd.vname, args, resTy, locals)) {
                 ()
@@ -3582,6 +3585,7 @@ pub def emitProgramWasmGcGlue(prog: CoreProgram, wasmBasename: String, exports: 
     bufPushStr(out, "      rand_seed() { _gs_seed = BigInt.asIntN(64, _gs_seed + 0x9e3779b97f4a7c15n); return _gs_seed; },\n");
     bufPushStr(out, "      fd_write(fd, r, n) { const u = _gs_fromWasmBytes(r); const len = Math.max(0, Math.min(u.length, Number(n))); const slice = u.subarray(0, len); if (fd === 2) { if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(slice); else console.error(_gs_dec.decode(slice)); } else { if (typeof globalThis.__geisha_write === \"function\") globalThis.__geisha_write(_gs_dec.decode(slice)); else if (typeof globalThis.__geisha_print === \"function\") globalThis.__geisha_print(_gs_dec.decode(slice)); else if (typeof process !== \"undefined\" && process.stdout) process.stdout.write(slice); else console.log(_gs_dec.decode(slice)); } return BigInt(len); },\n");
     bufPushStr(out, "      exit(c) { if (typeof process !== \"undefined\" && typeof process.exit === \"function\") process.exit(c | 0); throw new Error(\"Geisha exit(\" + (c | 0) + \")\"); },\n");
+    bufPushStr(out, "      contract_fail(r) { const msg = \"Contract error: \" + _gs_fromWasmStr(r); if (typeof globalThis.__geisha_err === \"function\") globalThis.__geisha_err(msg + \"\\n\"); else if (typeof process !== \"undefined\" && process.stderr) process.stderr.write(msg + \"\\n\"); throw new Error(msg); },\n");
     bufPushStr(out, "    },\n");
     bufPushStr(out, "    ...(extra || {}),\n");
     bufPushStr(out, "  };\n");

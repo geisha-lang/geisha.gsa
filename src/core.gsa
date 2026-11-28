@@ -13,8 +13,8 @@ use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     ConstraintSpec, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
-    listContainsStr, sortUniqueStrings, typeToString, typesEqual,
-    Lit, LitInt, LitStr, LitUnit,
+    listContainsStr, addUniqueStr, sortUniqueStrings, typeToString, typesEqual,
+    Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
     OpBitAnd, OpBitOr, OpBitXor, OpShl, OpShr, OpUshr,
     OpEq, OpNe, OpLt, OpLe, OpGt, OpGe,
@@ -35,6 +35,10 @@ use infer.{
     mangleType, applyExplicitSubst, buildPairMap, matchInstancePatList, isConcreteTypeSend
 }
 use diag.{diagGetFile, diagSpanLineCol}
+use verified_kernels.{
+    coFreshNextId, coFreshBatchEnd, coFlatTotalArity,
+    coSpecSlotStepArity, coAnfInFloatPrefix, coPatSeqStatus, coInlineBudgetAllows
+}
 
 // ============================================================================
 // Core IR Data Types (Distinct single-variant field names across project)
@@ -3396,7 +3400,7 @@ def insertOrMergeAlloc(
 }
 
 def isShadowedBuiltin(nm: String, fns: StrMap FunDef, externs: StrMap ExternDef): Bool =
-    !strStartsWith(nm, "__gs_") && (strMapContains(externs, nm) || strMapContains(fns, nm))
+    !strStartsWith(nm, "__gs_") && !strStartsWith(nm, "$gs$") && (strMapContains(externs, nm) || strMapContains(fns, nm))
 
 def collectNonAllocBindings(tm: TaggedTerm, nonAlloc: StrMap Bool, allowCellOps: Bool): Void = match tm.tnode {
     TmMakeCls(_, _, body) -> collectNonAllocBindings(body, nonAlloc, allowCellOps),
@@ -4628,19 +4632,42 @@ def lookupInlineEnv(env: List (String, String), name: String): String = match en
     Cons((k, v), r) -> if (k == name) v else lookupInlineEnv(r, name),
 }
 
-def alphaClonePat(pat: Pattern, pref: String, env: List (String, String)): (Pattern, List (String, String)) = match pat {
+def cleanCoreBinderHint(hint: String): String = {
+    let n = strLen(hint);
+    if (n > 0 && strByteAt(hint, 0) == 36) {
+        let lastDollar = cellNew(-1);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            if (strByteAt(hint, cellGet(i)) == 36) cellSet(lastDollar, cellGet(i)) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        let d = cellGet(lastDollar);
+        if (d >= 0 && d + 1 < n) strSlice(hint, d + 1, n) else hint
+    } else hint
+}
+
+def allocFreshCoreBinder(nextId: Cell Int, tag: String, hint: String): String
+    requires cellGet(nextId) >= 0 && cellGet(nextId) < 2147483647 && strLen(tag) > 0
+    ensures r -> cellGet(nextId) > 0 && strLen(r) >= 4
+= {
+    let id = cellGet(nextId);
+    cellSet(nextId, coFreshNextId(id));
+    "$" + tag + "$" + intToStr(id) + "$" + cleanCoreBinderHint(hint)
+}
+
+def alphaClonePat(pat: Pattern, nextId: Cell Int, env: List (String, String)): (Pattern, List (String, String)) = match pat {
     PatWild -> (PatWild, env),
     PatLit(l) -> (PatLit(l), env),
     PatVar(v, sp) -> {
-        let fv = pref + v;
+        let fv = allocFreshCoreBinder(nextId, "inl", v);
         (PatVar(fv, sp), Cons((v, fv), env))
     },
     PatTuple(ps) -> {
-        let (ps2, env2) = alphaClonePatList(ps, pref, env);
+        let (ps2, env2) = alphaClonePatList(ps, nextId, env);
         (PatTuple(ps2), env2)
     },
     PatCtor(cn, ps) -> {
-        let (ps2, env2) = alphaClonePatList(ps, pref, env);
+        let (ps2, env2) = alphaClonePatList(ps, nextId, env);
         (PatCtor(cn, ps2), env2)
     },
     PatStruct(cn, fs) -> (PatStruct(cn, fs), env),
@@ -4648,71 +4675,71 @@ def alphaClonePat(pat: Pattern, pref: String, env: List (String, String)): (Patt
 
 def alphaClonePatList(
     ps: List Pattern,
-    pref: String,
+    nextId: Cell Int,
     env: List (String, String)
 ): (List Pattern, List (String, String)) = match ps {
     Nil -> (Nil, env),
     Cons(p, r) -> {
-        let (p2, env1) = alphaClonePat(p, pref, env);
-        let (r2, env2) = alphaClonePatList(r, pref, env1);
+        let (p2, env1) = alphaClonePat(p, nextId, env);
+        let (r2, env2) = alphaClonePatList(r, nextId, env1);
         (Cons(p2, r2), env2)
     },
 }
 
-def alphaCloneTerm(tm: TaggedTerm, pref: String, env: List (String, String), sp: Span): TaggedTerm = {
+def alphaCloneTerm(tm: TaggedTerm, nextId: Cell Int, env: List (String, String), sp: Span): TaggedTerm = {
     let nd = match tm.tnode {
         TmLit(l) -> TmLit(l),
         TmVar(v) -> TmVar(lookupInlineEnv(env, v)),
         TmGlobalVar(g) -> TmGlobalVar(g),
-        TmTuple(es) -> TmTuple(alphaCloneTermList(es, pref, env, sp)),
-        TmBlock(es) -> TmBlock(alphaCloneTermList(es, pref, env, sp)),
-        TmMakeCls(vd, cls, body) -> TmMakeCls(vd, cls, alphaCloneTerm(body, pref, env, sp)),
-        TmApplyCls(c, args) -> TmApplyCls(alphaCloneTerm(c, pref, env, sp), alphaCloneTermList(args, pref, env, sp)),
-        TmApplyDir(vd, args) -> TmApplyDir(vd, alphaCloneTermList(args, pref, env, sp)),
-        TmBin(op, l, r) -> TmBin(op, alphaCloneTerm(l, pref, env, sp), alphaCloneTerm(r, pref, env, sp)),
-        TmUn(op, e1) -> TmUn(op, alphaCloneTerm(e1, pref, env, sp)),
+        TmTuple(es) -> TmTuple(alphaCloneTermList(es, nextId, env, sp)),
+        TmBlock(es) -> TmBlock(alphaCloneTermList(es, nextId, env, sp)),
+        TmMakeCls(vd, cls, body) -> TmMakeCls(vd, cls, alphaCloneTerm(body, nextId, env, sp)),
+        TmApplyCls(c, args) -> TmApplyCls(alphaCloneTerm(c, nextId, env, sp), alphaCloneTermList(args, nextId, env, sp)),
+        TmApplyDir(vd, args) -> TmApplyDir(vd, alphaCloneTermList(args, nextId, env, sp)),
+        TmBin(op, l, r) -> TmBin(op, alphaCloneTerm(l, nextId, env, sp), alphaCloneTerm(r, nextId, env, sp)),
+        TmUn(op, e1) -> TmUn(op, alphaCloneTerm(e1, nextId, env, sp)),
         TmLet(vd, e1, e2) -> {
-            let e1c = alphaCloneTerm(e1, pref, env, sp);
-            let fv = pref + vd.vname;
+            let e1c = alphaCloneTerm(e1, nextId, env, sp);
+            let fv = allocFreshCoreBinder(nextId, "inl", vd.vname);
             let vd2 = MkVarDecl { vname: fv, vscm: vd.vscm };
-            let e2c = alphaCloneTerm(e2, pref, Cons((vd.vname, fv), env), sp);
+            let e2c = alphaCloneTerm(e2, nextId, Cons((vd.vname, fv), env), sp);
             TmLet(vd2, e1c, e2c)
         },
-        TmIf(c, t, e) -> TmIf(alphaCloneTerm(c, pref, env, sp), alphaCloneTerm(t, pref, env, sp), alphaCloneTerm(e, pref, env, sp)),
-        TmWhile(c, b) -> TmWhile(alphaCloneTerm(c, pref, env, sp), alphaCloneTerm(b, pref, env, sp)),
-        TmMatch(s, arms) -> TmMatch(alphaCloneTerm(s, pref, env, sp), alphaCloneArmList(arms, pref, env, sp)),
+        TmIf(c, t, e) -> TmIf(alphaCloneTerm(c, nextId, env, sp), alphaCloneTerm(t, nextId, env, sp), alphaCloneTerm(e, nextId, env, sp)),
+        TmWhile(c, b) -> TmWhile(alphaCloneTerm(c, nextId, env, sp), alphaCloneTerm(b, nextId, env, sp)),
+        TmMatch(s, arms) -> TmMatch(alphaCloneTerm(s, nextId, env, sp), alphaCloneArmList(arms, nextId, env, sp)),
         TmMakeData(cn, tag, args, fTys, tArgs) ->
-            TmMakeData(cn, tag, alphaCloneTermList(args, pref, env, sp), fTys, tArgs),
-        TmGetTag(e1) -> TmGetTag(alphaCloneTerm(e1, pref, env, sp)),
+            TmMakeData(cn, tag, alphaCloneTermList(args, nextId, env, sp), fTys, tArgs),
+        TmGetTag(e1) -> TmGetTag(alphaCloneTerm(e1, nextId, env, sp)),
     };
     MkTerm { tspan: sp, tscm: tm.tscm, tnode: nd }
 }
 
 def alphaCloneTermList(
     es: List TaggedTerm,
-    pref: String,
+    nextId: Cell Int,
     env: List (String, String),
     sp: Span
 ): List TaggedTerm = match es {
     Nil -> Nil,
-    Cons(h, t) -> Cons(alphaCloneTerm(h, pref, env, sp), alphaCloneTermList(t, pref, env, sp)),
+    Cons(h, t) -> Cons(alphaCloneTerm(h, nextId, env, sp), alphaCloneTermList(t, nextId, env, sp)),
 }
 
 def alphaCloneArmList(
     arms: List CoreArm,
-    pref: String,
+    nextId: Cell Int,
     env: List (String, String),
     sp: Span
 ): List CoreArm = match arms {
     Nil -> Nil,
     Cons(a, r) -> {
-        let (pat2, envArm) = alphaClonePat(a.caPat, pref, env);
+        let (pat2, envArm) = alphaClonePat(a.caPat, nextId, env);
         let g2 = match a.caGuard {
-            Some(g) -> Some(alphaCloneTerm(g, pref, envArm, sp)),
+            Some(g) -> Some(alphaCloneTerm(g, nextId, envArm, sp)),
             None -> None,
         };
-        let b2 = alphaCloneTerm(a.caBody, pref, envArm, sp);
-        Cons(MkCoreArm { caPat: pat2, caGuard: g2, caBody: b2 }, alphaCloneArmList(r, pref, env, sp))
+        let b2 = alphaCloneTerm(a.caBody, nextId, envArm, sp);
+        Cons(MkCoreArm { caPat: pat2, caGuard: g2, caBody: b2 }, alphaCloneArmList(r, nextId, env, sp))
     },
 }
 
@@ -4723,25 +4750,45 @@ def inlineParamsMatchArgs(ps: List VarDecl, args: List TaggedTerm): Bool = match
     _ -> false,
 }
 
-def buildParamInlineEnv(ps: List VarDecl, pref: String): List (String, String)
-    requires strLen(pref) > 0
-    ensures out -> listLen(out) == listLen(ps)
-= match ps {
-    Nil -> Nil,
-    Cons(p, r) -> Cons((p.vname, pref + p.vname), buildParamInlineEnv(r, pref)),
+def allocParamInlineBinders(
+    ps: List VarDecl,
+    nextId: Cell Int
+): (List String, List (String, String))
+    requires cellGet(nextId) >= 0
+    ensures r -> match r { (nms, env) -> listLen(nms) == listLen(ps) && listLen(env) == listLen(ps) }
+= {
+    let startId = cellGet(nextId);
+    let namesRev: Cell (List String) = cellNew(Nil);
+    let envCell: Cell (List (String, String)) = cellNew(Nil);
+    let cur = cellNew(ps);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(p, r) -> {
+                let fnm = allocFreshCoreBinder(nextId, "inl", p.vname);
+                cellSet(namesRev, Cons(fnm, cellGet(namesRev)));
+                cellSet(envCell, Cons((p.vname, fnm), cellGet(envCell)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    let pCnt = listLen(ps);
+    if (startId <= 1073741824 && pCnt <= 1048576) {
+        assert(cellGet(nextId) == coFreshBatchEnd(startId, pCnt))
+    } else ();
+    (listRev(cellGet(namesRev)), cellGet(envCell))
 }
 
 def wrapInlinedParamLets(
-    ps: List VarDecl,
+    pNames: List String,
     args: List TaggedTerm,
-    pref: String,
     body: TaggedTerm,
     sp: Span,
     resScm: Scheme
-): TaggedTerm = match (ps, args) {
-    (Cons(p, pr), Cons(a, ar)) -> {
-        let inner = wrapInlinedParamLets(pr, ar, pref, body, sp, resScm);
-        let vd = MkVarDecl { vname: pref + p.vname, vscm: ScmMono(schemeBody(a.tscm)) };
+): TaggedTerm = match (pNames, args) {
+    (Cons(pnm, pr), Cons(a, ar)) -> {
+        let inner = wrapInlinedParamLets(pr, ar, body, sp, resScm);
+        let vd = MkVarDecl { vname: pnm, vscm: ScmMono(schemeBody(a.tscm)) };
         MkTerm { tspan: sp, tscm: resScm, tnode: TmLet(vd, a, inner) }
     },
     _ -> body,
@@ -4751,7 +4798,7 @@ def rewriteTermInlineLeaves(
     callerName: String,
     tm: TaggedTerm,
     leaves: StrMap FunDef,
-    counter: Cell Int
+    nextId: Cell Int
 ): TaggedTerm = {
     let sp = tm.tspan;
     let sc = tm.tscm;
@@ -4762,28 +4809,28 @@ def rewriteTermInlineLeaves(
         TmTuple(es) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmTuple(rewriteTermListInlineLeaves(callerName, es, leaves, counter)),
+            tnode: TmTuple(rewriteTermListInlineLeaves(callerName, es, leaves, nextId)),
         },
         TmBlock(es) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmBlock(rewriteTermListInlineLeaves(callerName, es, leaves, counter)),
+            tnode: TmBlock(rewriteTermListInlineLeaves(callerName, es, leaves, nextId)),
         },
         TmMakeCls(vd, cls, body) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmMakeCls(vd, cls, rewriteTermInlineLeaves(callerName, body, leaves, counter)),
+            tnode: TmMakeCls(vd, cls, rewriteTermInlineLeaves(callerName, body, leaves, nextId)),
         },
         TmApplyCls(c, args) -> MkTerm {
             tspan: sp,
             tscm: sc,
             tnode: TmApplyCls(
-                rewriteTermInlineLeaves(callerName, c, leaves, counter),
-                rewriteTermListInlineLeaves(callerName, args, leaves, counter)
+                rewriteTermInlineLeaves(callerName, c, leaves, nextId),
+                rewriteTermListInlineLeaves(callerName, args, leaves, nextId)
             ),
         },
         TmApplyDir(vd, args) -> {
-            let args2 = rewriteTermListInlineLeaves(callerName, args, leaves, counter);
+            let args2 = rewriteTermListInlineLeaves(callerName, args, leaves, nextId);
             match strMapGet(leaves, vd.vname) {
                 Some(callee) ->
                     if (
@@ -4792,12 +4839,9 @@ def rewriteTermInlineLeaves(
                         && typesEqual(schemeBody(sc), schemeBody(callee.fnBody.tscm))
                         && inlineParamsMatchArgs(callee.fnParams, args2)
                     ) {
-                        let id = cellGet(counter);
-                        cellSet(counter, id + 1);
-                        let pref = "$inl$" + intToStr(id) + "$";
-                        let pEnv = buildParamInlineEnv(callee.fnParams, pref);
-                        let cloned = alphaCloneTerm(callee.fnBody, pref, pEnv, sp);
-                        wrapInlinedParamLets(callee.fnParams, args2, pref, cloned, sp, sc)
+                        let (pNames, pEnv) = allocParamInlineBinders(callee.fnParams, nextId);
+                        let cloned = alphaCloneTerm(callee.fnBody, nextId, pEnv, sp);
+                        wrapInlinedParamLets(pNames, args2, cloned, sp, sc)
                     } else MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args2) },
                 None -> MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args2) },
             }
@@ -4807,58 +4851,58 @@ def rewriteTermInlineLeaves(
             tscm: sc,
             tnode: TmBin(
                 op,
-                rewriteTermInlineLeaves(callerName, l, leaves, counter),
-                rewriteTermInlineLeaves(callerName, r, leaves, counter)
+                rewriteTermInlineLeaves(callerName, l, leaves, nextId),
+                rewriteTermInlineLeaves(callerName, r, leaves, nextId)
             ),
         },
         TmUn(op, e1) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmUn(op, rewriteTermInlineLeaves(callerName, e1, leaves, counter)),
+            tnode: TmUn(op, rewriteTermInlineLeaves(callerName, e1, leaves, nextId)),
         },
         TmLet(vd, e1, e2) -> MkTerm {
             tspan: sp,
             tscm: sc,
             tnode: TmLet(
                 vd,
-                rewriteTermInlineLeaves(callerName, e1, leaves, counter),
-                rewriteTermInlineLeaves(callerName, e2, leaves, counter)
+                rewriteTermInlineLeaves(callerName, e1, leaves, nextId),
+                rewriteTermInlineLeaves(callerName, e2, leaves, nextId)
             ),
         },
         TmIf(c, t, e) -> MkTerm {
             tspan: sp,
             tscm: sc,
             tnode: TmIf(
-                rewriteTermInlineLeaves(callerName, c, leaves, counter),
-                rewriteTermInlineLeaves(callerName, t, leaves, counter),
-                rewriteTermInlineLeaves(callerName, e, leaves, counter)
+                rewriteTermInlineLeaves(callerName, c, leaves, nextId),
+                rewriteTermInlineLeaves(callerName, t, leaves, nextId),
+                rewriteTermInlineLeaves(callerName, e, leaves, nextId)
             ),
         },
         TmWhile(c, b) -> MkTerm {
             tspan: sp,
             tscm: sc,
             tnode: TmWhile(
-                rewriteTermInlineLeaves(callerName, c, leaves, counter),
-                rewriteTermInlineLeaves(callerName, b, leaves, counter)
+                rewriteTermInlineLeaves(callerName, c, leaves, nextId),
+                rewriteTermInlineLeaves(callerName, b, leaves, nextId)
             ),
         },
         TmMatch(s, arms) -> MkTerm {
             tspan: sp,
             tscm: sc,
             tnode: TmMatch(
-                rewriteTermInlineLeaves(callerName, s, leaves, counter),
-                rewriteArmListInlineLeaves(callerName, arms, leaves, counter)
+                rewriteTermInlineLeaves(callerName, s, leaves, nextId),
+                rewriteArmListInlineLeaves(callerName, arms, leaves, nextId)
             ),
         },
         TmMakeData(cn, tag, args, fTys, tArgs) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmMakeData(cn, tag, rewriteTermListInlineLeaves(callerName, args, leaves, counter), fTys, tArgs),
+            tnode: TmMakeData(cn, tag, rewriteTermListInlineLeaves(callerName, args, leaves, nextId), fTys, tArgs),
         },
         TmGetTag(e1) -> MkTerm {
             tspan: sp,
             tscm: sc,
-            tnode: TmGetTag(rewriteTermInlineLeaves(callerName, e1, leaves, counter)),
+            tnode: TmGetTag(rewriteTermInlineLeaves(callerName, e1, leaves, nextId)),
         },
     }
 }
@@ -4867,12 +4911,12 @@ def rewriteTermListInlineLeaves(
     callerName: String,
     es: List TaggedTerm,
     leaves: StrMap FunDef,
-    counter: Cell Int
+    nextId: Cell Int
 ): List TaggedTerm = match es {
     Nil -> Nil,
     Cons(h, t) -> Cons(
-        rewriteTermInlineLeaves(callerName, h, leaves, counter),
-        rewriteTermListInlineLeaves(callerName, t, leaves, counter)
+        rewriteTermInlineLeaves(callerName, h, leaves, nextId),
+        rewriteTermListInlineLeaves(callerName, t, leaves, nextId)
     ),
 }
 
@@ -4880,18 +4924,18 @@ def rewriteArmListInlineLeaves(
     callerName: String,
     arms: List CoreArm,
     leaves: StrMap FunDef,
-    counter: Cell Int
+    nextId: Cell Int
 ): List CoreArm = match arms {
     Nil -> Nil,
     Cons(a, r) -> {
         let g2 = match a.caGuard {
-            Some(g) -> Some(rewriteTermInlineLeaves(callerName, g, leaves, counter)),
+            Some(g) -> Some(rewriteTermInlineLeaves(callerName, g, leaves, nextId)),
             None -> None,
         };
-        let b2 = rewriteTermInlineLeaves(callerName, a.caBody, leaves, counter);
+        let b2 = rewriteTermInlineLeaves(callerName, a.caBody, leaves, nextId);
         Cons(
             MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: b2 },
-            rewriteArmListInlineLeaves(callerName, r, leaves, counter)
+            rewriteArmListInlineLeaves(callerName, r, leaves, nextId)
         )
     },
 }
@@ -5128,15 +5172,15 @@ pub def prepareVerifiedOptCore(
         }
     };
     let globs2 = listRev(cellGet(globsRev));
-    let finalGlobs =
+    let (finalNames, finalGlobs, finalEscape) =
         if (enableInline) {
             // Restrict leaf inlining into `safeFns` callers: only inline leaves that are also
             // in `safeFns` or contain no checked div/rem/array operations.
-            let fnCounters: StrMap (Cell Int) = strMapNew();
+            let nextBinderId = cellNew(0);
             let curGlobals = cellNew(globs2);
             let pass = cellNew(0);
             while (cellGet(pass) < 2) {
-                let allLeaves: StrMap FunDef = strMapNew();
+                let unverifiedLeaves: StrMap FunDef = strMapNew();
                 let safeLeaves: StrMap FunDef = strMapNew();
                 let leafCount = cellNew(0);
                 let cf0 = cellNew(prog.coreFnNames);
@@ -5146,7 +5190,9 @@ pub def prepareVerifiedOptCore(
                             match strMapGet(fns2, fnm) {
                                 Some(fd) ->
                                     if (isEligibleTinyLeafFn(fd, fns2, prog.coreExterns)) {
-                                        strMapInsert(allLeaves, fnm, fd);
+                                        if (!strMapContains(safeFns, fnm)) {
+                                            strMapInsert(unverifiedLeaves, fnm, fd)
+                                        } else ();
                                         if (strMapContains(safeFns, fnm) || !termHasCheckedOp(fd.fnBody, fns2, prog.coreExterns)) {
                                             strMapInsert(safeLeaves, fnm, fd)
                                         } else ();
@@ -5166,12 +5212,8 @@ pub def prepareVerifiedOptCore(
                             Cons(fnm, r) -> {
                                 match strMapGet(fns2, fnm) {
                                     Some(fd) -> {
-                                        let cnt = match strMapGet(fnCounters, fnm) {
-                                            Some(c) -> c,
-                                            None -> { let c = cellNew(0); strMapInsert(fnCounters, fnm, c); c },
-                                        };
-                                        let allowedLeaves = if (strMapContains(safeFns, fnm)) safeLeaves else allLeaves;
-                                        let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, allowedLeaves, cnt);
+                                        let allowedLeaves = if (strMapContains(safeFns, fnm)) safeLeaves else unverifiedLeaves;
+                                        let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, allowedLeaves, nextBinderId);
                                         strMapInsert(fns2, fnm, MkFunDef {
                                             fnName: fd.fnName,
                                             fnSpan: fd.fnSpan,
@@ -5188,16 +5230,12 @@ pub def prepareVerifiedOptCore(
                             Nil -> (),
                         }
                     };
-                    let globCnt = match strMapGet(fnCounters, "$globals") {
-                        Some(c) -> c,
-                        None -> { let c = cellNew(0); strMapInsert(fnCounters, "$globals", c); c },
-                    };
                     let newGlobsRev = cellNew(Nil);
                     let cg2 = cellNew(cellGet(curGlobals));
                     while (match cellGet(cg2) { Nil -> false, _ -> true }) {
                         match cellGet(cg2) {
                             Cons(gv, r) -> {
-                                let newInit = rewriteTermInlineLeaves("", gv.gvInit, allLeaves, globCnt);
+                                let newInit = rewriteTermInlineLeaves("", gv.gvInit, unverifiedLeaves, nextBinderId);
                                 cellSet(newGlobsRev, Cons(MkGlobalValDef {
                                     gvName: gv.gvName,
                                     gvSpan: gv.gvSpan,
@@ -5213,11 +5251,45 @@ pub def prepareVerifiedOptCore(
                 } else ();
                 cellSet(pass, cellGet(pass) + 1)
             };
-            cellGet(curGlobals)
-        } else globs2;
+            // Run HOF combinator/closure/loop optimization on non-`safeFns` functions while
+            // keeping `safeFns` bodies & boundaries intact (`coSkipFns = safeFns`).
+            let voptCtorMap: StrMap (String, VariantInfo) = strMapNew();
+            let adtVec: Vec String = vecNew();
+            let ca = cellNew(prog.coreAdtNames);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(adtName, ra) -> {
+                        vecPush(adtVec, adtName);
+                        match strMapGet(prog.coreAdtReg, adtName) {
+                            Some(ainfo) -> {
+                                let cv = cellNew(ainfo.variants);
+                                while (match cellGet(cv) { Nil -> false, _ -> true }) {
+                                    match cellGet(cv) {
+                                        Cons(vi, rv) -> {
+                                            strMapInsert(voptCtorMap, vi.vname, (adtName, vi));
+                                            cellSet(cv, rv)
+                                        },
+                                        Nil -> (),
+                                    }
+                                }
+                            },
+                            None -> (),
+                        };
+                        cellSet(ca, ra)
+                    },
+                    Nil -> (),
+                }
+            };
+            let (nsOpt, gsOpt) = optimizeCoreCombinators(
+                fns2, prog.coreFnNames, cellGet(curGlobals), prog.coreExterns,
+                voptCtorMap, prog.coreCExports, safeFns, nextBinderId
+            );
+            let escOpt = runEscapeAnalysis(fns2, nsOpt, prog.coreExterns, prog.coreAdtReg, adtVec);
+            (nsOpt, gsOpt, escOpt)
+        } else (prog.coreFnNames, globs2, prog.coreEscape);
     MkCoreProgram {
         coreFns: fns2,
-        coreFnNames: prog.coreFnNames,
+        coreFnNames: finalNames,
         coreGlobals: finalGlobs,
         coreExterns: prog.coreExterns,
         coreExternNames: prog.coreExternNames,
@@ -5225,7 +5297,7 @@ pub def prepareVerifiedOptCore(
         coreCtors: prog.coreCtors,
         coreAdtReg: prog.coreAdtReg,
         coreAdtNames: prog.coreAdtNames,
-        coreEscape: prog.coreEscape,
+        coreEscape: finalEscape,
     }
 }
 
@@ -5233,11 +5305,12 @@ def inlineTinyLeafFns(
     fns: StrMap FunDef,
     fnNames: List String,
     globals: List GlobalValDef,
-    externs: StrMap ExternDef
+    externs: StrMap ExternDef,
+    nextBinderId: Cell Int
 ): List GlobalValDef
+    requires cellGet(nextBinderId) >= 0
     ensures out -> listLen(out) == listLen(globals)
 = {
-    let fnCounters: StrMap (Cell Int) = strMapNew();
     let pass = cellNew(0);
     let prevLeafCount = cellNew(-1);
     let curGlobals = cellNew(globals);
@@ -5271,15 +5344,7 @@ def inlineTinyLeafFns(
                     Cons(fnm, r) -> {
                         match strMapGet(fns, fnm) {
                             Some(fd) -> {
-                                let cnt = match strMapGet(fnCounters, fnm) {
-                                    Some(c) -> c,
-                                    None -> {
-                                        let c = cellNew(0);
-                                        strMapInsert(fnCounters, fnm, c);
-                                        c
-                                    },
-                                };
-                                let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, leaves, cnt);
+                                let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, leaves, nextBinderId);
                                 strMapInsert(fns, fnm, MkFunDef {
                                     fnName: fd.fnName,
                                     fnSpan: fd.fnSpan,
@@ -5296,20 +5361,12 @@ def inlineTinyLeafFns(
                     Nil -> (),
                 }
             };
-            let globCnt = match strMapGet(fnCounters, "$globals") {
-                Some(c) -> c,
-                None -> {
-                    let c = cellNew(0);
-                    strMapInsert(fnCounters, "$globals", c);
-                    c
-                },
-            };
             let newGlobsRev = cellNew(Nil);
             let cg = cellNew(cellGet(curGlobals));
             while (match cellGet(cg) { Nil -> false, _ -> true }) {
                 match cellGet(cg) {
                     Cons(gv, r) -> {
-                        let newInit = rewriteTermInlineLeaves("", gv.gvInit, leaves, globCnt);
+                        let newInit = rewriteTermInlineLeaves("", gv.gvInit, leaves, nextBinderId);
                         cellSet(newGlobsRev, Cons(MkGlobalValDef {
                             gvName: gv.gvName,
                             gvSpan: gv.gvSpan,
@@ -5347,7 +5404,7 @@ def formatContractLoc(sp: Span): String =
 def mkContractFailCall(sp: Span, kind: String): TaggedTerm = {
     let msg = kind + " violated at " + formatContractLoc(sp);
     let failDecl = MkVarDecl {
-        vname: "__gs_contract_fail",
+        vname: "$gs$contract_fail",
         vscm: ScmMono(TyArr(TyVoid, [TyCon("String")], TyVoid)),
     };
     let msgTerm = MkTerm { tspan: sp, tscm: ScmMono(TyCon("String")), tnode: TmLit(LitStr(msg)) };
@@ -5544,6 +5601,2426 @@ def lowerContractsInProgramFns(
     }
 
 // ============================================================================
+// General Higher-Order Simplifier, Case-of-Known-Constructor, Closure
+// Devirtualization & Self-Recursive Call-Pattern Specialization
+// ============================================================================
+
+data CoKnownVal {
+    CoValData(String, Int, List TaggedTerm, List Type, List Type),
+    CoValTuple(List TaggedTerm),
+    CoValLit(Lit),
+}
+
+data CoPatMatch {
+    CoPatYes(List (VarDecl, TaggedTerm)),
+    CoPatNo,
+    CoPatUnknown,
+}
+
+data CoEnv {
+    MkCoEnv {
+        ceAliases: List (String, String),
+        ceVarTys: List (String, Scheme),
+        ceKnownVals: List (String, CoKnownVal),
+        ceKnownCls: List (String, ClosureSpec),
+    },
+}
+
+data CombOptCtx {
+    MkCombOptCtx {
+        coFns: StrMap FunDef,
+        coCalleesCache: StrMap (List String),
+        coNewNamesRev: Cell (List String),
+        coExterns: StrMap ExternDef,
+        coCtorMap: StrMap (String, VariantInfo),
+        coSkipFns: StrMap Bool,
+        coFlatClsMap: StrMap String,
+        coSpecMap: StrMap String,
+        coSpecCount: Cell Int,
+        coFnInlines: Cell Int,
+        coIdCnt: Cell Int,
+    },
+}
+
+def coFreshId(cctx: CombOptCtx): Int
+    requires cellGet(cctx.coIdCnt) >= 0 && cellGet(cctx.coIdCnt) < 2147483647
+    ensures id -> id >= 0 && cellGet(cctx.coIdCnt) == id + 1
+= {
+    let id = cellGet(cctx.coIdCnt);
+    cellSet(cctx.coIdCnt, coFreshNextId(id));
+    id
+}
+
+def coFreshBinder(cctx: CombOptCtx, hint: String): String =
+    allocFreshCoreBinder(cctx.coIdCnt, "co", hint)
+
+def coComputeDirectCallees(tm: TaggedTerm): List String = {
+    let out: Cell (List String) = cellNew(Nil);
+    coCollectDirectCallees(tm, out);
+    cellGet(out)
+}
+
+def coStoreFn(cctx: CombOptCtx, fd: FunDef): Void = {
+    strMapInsert(cctx.coFns, fd.fnName, fd);
+    strMapInsert(cctx.coCalleesCache, fd.fnName, coComputeDirectCallees(fd.fnBody))
+}
+
+def coRegisterFn(cctx: CombOptCtx, fd: FunDef): Void = {
+    if (!strMapContains(cctx.coFns, fd.fnName)) {
+        cellSet(cctx.coNewNamesRev, Cons(fd.fnName, cellGet(cctx.coNewNamesRev)))
+    } else ();
+    coStoreFn(cctx, fd)
+}
+
+def coTypeBlocksOpt(ty: Type): Bool = match ty {
+    TyVar(_) -> true,
+    TyVoid -> false,
+    TyCon(n) -> n == "ScopedPtr" || n == "Arena" || n == "$Scoped" || n == "Task",
+    TyArr(_, ps, r) -> coTypeListBlocksOpt(ps) || coTypeBlocksOpt(r),
+    TyTuple(es) -> coTypeListBlocksOpt(es),
+    TyComp(b, a) -> {
+        let blockedHead = match b {
+            TyCon(bn) -> bn == "ScopedPtr" || bn == "Arena" || bn == "Task",
+            _ -> false,
+        };
+        blockedHead || coTypeBlocksOpt(b) || coTypeBlocksOpt(a)
+    },
+}
+
+def coTypeListBlocksOpt(ts: List Type): Bool = match ts {
+    Nil -> false,
+    Cons(h, t) -> coTypeBlocksOpt(h) || coTypeListBlocksOpt(t),
+}
+
+def coVarDeclListBlocksOpt(vds: List VarDecl): Bool = match vds {
+    Nil -> false,
+    Cons(vd, r) -> coTypeBlocksOpt(schemeBody(vd.vscm)) || coVarDeclListBlocksOpt(r),
+}
+
+def coLitsEqual(a: Lit, b: Lit): Bool = match (a, b) {
+    (LitInt(x), LitInt(y)) -> x == y,
+    (LitChar(x), LitChar(y)) -> x == y,
+    (LitStr(x), LitStr(y)) -> x == y,
+    (LitBool(x), LitBool(y)) -> x == y,
+    (LitUnit, LitUnit) -> true,
+    (LitFloat(_), LitFloat(_)) -> false,
+    _ -> false,
+}
+
+def coIsSimpleTerm(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(_) -> true,
+    TmGlobalVar(_) -> true,
+    _ -> false,
+}
+
+def coAllTermsSimple(es: List TaggedTerm): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> coIsSimpleTerm(h) && coAllTermsSimple(t),
+}
+
+def coTypesEqualModuloMode(a: Type, b: Type): Bool = match (a, b) {
+    (TyVoid, TyVoid) -> true,
+    (TyVar(x), TyVar(y)) -> x == y,
+    (TyCon(x), TyCon(y)) -> x == y,
+    (TyComp(b1, a1), TyComp(b2, a2)) -> coTypesEqualModuloMode(b1, b2) && coTypesEqualModuloMode(a1, a2),
+    (TyTuple(es1), TyTuple(es2)) -> coTypeListsEqualModuloMode(es1, es2),
+    (TyArr(_, ps1, r1), TyArr(_, ps2, r2)) -> coTypeListsEqualModuloMode(ps1, ps2) && coTypesEqualModuloMode(r1, r2),
+    _ -> false,
+}
+
+def coTypeListsEqualModuloMode(xs: List Type, ys: List Type): Bool = match (xs, ys) {
+    (Nil, Nil) -> true,
+    (Cons(x, xr), Cons(y, yr)) -> coTypesEqualModuloMode(x, y) && coTypeListsEqualModuloMode(xr, yr),
+    _ -> false,
+}
+
+def coInlineParamsMatchArgs(ps: List VarDecl, args: List TaggedTerm): Bool = match (ps, args) {
+    (Nil, Nil) -> true,
+    (Cons(p, pr), Cons(a, ar)) ->
+        coTypesEqualModuloMode(schemeBody(p.vscm), schemeBody(a.tscm)) && coInlineParamsMatchArgs(pr, ar),
+    _ -> false,
+}
+
+def coTermNeedsArgFloat(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLet(_, _, _) -> true,
+    TmMakeCls(_, _, _) -> true,
+    TmMakeData(_, _, fs, _, _) -> coAllTermsSimple(fs),
+    TmTuple(es) -> coAllTermsSimple(es),
+    _ -> false,
+}
+
+def coAnyTermNeedsArgFloat(es: List TaggedTerm): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> coTermNeedsArgFloat(h) || coAnyTermNeedsArgFloat(t),
+}
+
+def coTermIsPure(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(_) -> true,
+    TmGlobalVar(_) -> true,
+    TmMakeCls(_, _, body) -> coTermIsPure(body),
+    TmTuple(es) -> coTermListIsPure(es),
+    TmMakeData(_, _, es, _, _) -> coTermListIsPure(es),
+    _ -> false,
+}
+
+def coTermListIsPure(es: List TaggedTerm): Bool = match es {
+    Nil -> true,
+    Cons(h, t) -> coTermIsPure(h) && coTermListIsPure(t),
+}
+
+def coPatBindsVar(pat: Pattern, target: String): Bool = match pat {
+    PatWild -> false,
+    PatLit(_) -> false,
+    PatVar(v, _) -> v == target,
+    PatTuple(ps) -> coPatListBindsVar(ps, target),
+    PatCtor(_, ps) -> coPatListBindsVar(ps, target),
+    PatStruct(_, _) -> false,
+}
+
+def coPatListBindsVar(ps: List Pattern, target: String): Bool = match ps {
+    Nil -> false,
+    Cons(p, r) -> coPatBindsVar(p, target) || coPatListBindsVar(r, target),
+}
+
+def coTermMentionsVar(tm: TaggedTerm, target: String): Bool = match tm.tnode {
+    TmLit(_) -> false,
+    TmVar(v) -> v == target,
+    TmGlobalVar(_) -> false,
+    TmTuple(es) -> coTermListMentionsVar(es, target),
+    TmBlock(es) -> coTermListMentionsVar(es, target),
+    TmMakeCls(vd, cls, body) ->
+        listContainsStr(cls.clsFvs, target)
+        || (vd.vname != target && coTermMentionsVar(body, target)),
+    TmApplyCls(c, args) -> coTermMentionsVar(c, target) || coTermListMentionsVar(args, target),
+    TmApplyDir(_, args) -> coTermListMentionsVar(args, target),
+    TmBin(_, l, r) -> coTermMentionsVar(l, target) || coTermMentionsVar(r, target),
+    TmUn(_, e1) -> coTermMentionsVar(e1, target),
+    TmLet(vd, e1, e2) ->
+        coTermMentionsVar(e1, target)
+        || (vd.vname != target && coTermMentionsVar(e2, target)),
+    TmIf(c, t, e) -> coTermMentionsVar(c, target) || coTermMentionsVar(t, target) || coTermMentionsVar(e, target),
+    TmWhile(c, b) -> coTermMentionsVar(c, target) || coTermMentionsVar(b, target),
+    TmMatch(s, arms) -> coTermMentionsVar(s, target) || coArmListMentionsVar(arms, target),
+    TmMakeData(_, _, args, _, _) -> coTermListMentionsVar(args, target),
+    TmGetTag(e1) -> coTermMentionsVar(e1, target),
+}
+
+def coTermListMentionsVar(es: List TaggedTerm, target: String): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> coTermMentionsVar(h, target) || coTermListMentionsVar(t, target),
+}
+
+def coArmListMentionsVar(arms: List CoreArm, target: String): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let bound = coPatBindsVar(a.caPat, target);
+        let inArm =
+            if (bound) false
+            else {
+                let gHit = match a.caGuard { Some(g) -> coTermMentionsVar(g, target), None -> false };
+                gHit || coTermMentionsVar(a.caBody, target)
+            };
+        inArm || coArmListMentionsVar(r, target)
+    },
+}
+
+def coKnownValMentionsVar(kv: CoKnownVal, target: String): Bool = match kv {
+    CoValLit(_) -> false,
+    CoValTuple(es) -> coTermListMentionsVar(es, target),
+    CoValData(_, _, es, _, _) -> coTermListMentionsVar(es, target),
+}
+
+def coFilterAliases(xs: List (String, String), v: String): List (String, String) = match xs {
+    Nil -> Nil,
+    Cons((k, tgt), r) ->
+        if (k == v || tgt == v) coFilterAliases(r, v)
+        else Cons((k, tgt), coFilterAliases(r, v)),
+}
+
+def coFilterKnownVals(xs: List (String, CoKnownVal), v: String): List (String, CoKnownVal) = match xs {
+    Nil -> Nil,
+    Cons((k, kv), r) ->
+        if (k == v || coKnownValMentionsVar(kv, v)) coFilterKnownVals(r, v)
+        else Cons((k, kv), coFilterKnownVals(r, v)),
+}
+
+def coFilterKnownCls(xs: List (String, ClosureSpec), v: String): List (String, ClosureSpec) = match xs {
+    Nil -> Nil,
+    Cons((k, cls), r) ->
+        if (k == v || listContainsStr(cls.clsFvs, v)) coFilterKnownCls(r, v)
+        else Cons((k, cls), coFilterKnownCls(r, v)),
+}
+
+def coBindVarInEnv(cenv: CoEnv, v: String, scm: Scheme): CoEnv = MkCoEnv {
+    ceAliases: coFilterAliases(cenv.ceAliases, v),
+    ceVarTys: Cons((v, scm), cenv.ceVarTys),
+    ceKnownVals: coFilterKnownVals(cenv.ceKnownVals, v),
+    ceKnownCls: coFilterKnownCls(cenv.ceKnownCls, v),
+}
+
+def lookupInlineEnvOpt(env: List (String, a), key: String): Option a = match env {
+    Nil -> None,
+    Cons((k, v), r) -> if (k == key) Some(v) else lookupInlineEnvOpt(r, key),
+}
+
+def coResolveAlias(aliases: List (String, String), name: String, hops: Int): String =
+    if (hops > 24) name
+    else match lookupInlineEnvOpt(aliases, name) {
+        Some(nxt) -> if (nxt == name) name else coResolveAlias(aliases, nxt, hops + 1),
+        None -> name,
+    }
+
+def coCombinatorTermCost(tm: TaggedTerm, externs: StrMap ExternDef): Int = {
+    let ty = schemeBody(tm.tscm);
+    if (!isTypeConcrete(ty) || coTypeBlocksOpt(ty)) -1
+    else match tm.tnode {
+        TmLit(_) -> 1,
+        TmVar(_) -> 1,
+        TmGlobalVar(_) -> 1,
+        TmWhile(_, _) -> -1,
+        TmMakeCls(vd, cls, body) ->
+            if (listContainsStr(cls.clsFvs, vd.vname) || coTypeBlocksOpt(schemeBody(vd.vscm))) -1
+            else {
+                let cb = coCombinatorTermCost(body, externs);
+                if (cb < 0) -1 else 2 + cb
+            },
+        TmApplyCls(c, args) -> {
+            let cc = coCombinatorTermCost(c, externs);
+            let ca = coCombinatorTermListCost(args, externs);
+            if (cc < 0 || ca < 0) -1 else 2 + cc + ca
+        },
+        TmApplyDir(vd, args) ->
+            if (
+                vd.vname == "$gs$contract_fail"
+                || (match intrinsicSendClosureArg(vd.vname) { Some(_) -> true, None -> false })
+                || strMapContains(externs, vd.vname)
+            ) -1
+            else {
+                let ca = coCombinatorTermListCost(args, externs);
+                if (ca < 0) -1 else 2 + ca
+            },
+        TmTuple(es) -> {
+            let c = coCombinatorTermListCost(es, externs);
+            if (c < 0) -1 else 1 + c
+        },
+        TmBlock(es) -> {
+            let c = coCombinatorTermListCost(es, externs);
+            if (c < 0) -1 else 1 + c
+        },
+        TmBin(_, l, r) -> {
+            let cl = coCombinatorTermCost(l, externs);
+            let cr = coCombinatorTermCost(r, externs);
+            if (cl < 0 || cr < 0) -1 else 1 + cl + cr
+        },
+        TmUn(_, e1) -> {
+            let c1 = coCombinatorTermCost(e1, externs);
+            if (c1 < 0) -1 else 1 + c1
+        },
+        TmLet(vd, e1, e2) ->
+            if (coTypeBlocksOpt(schemeBody(vd.vscm))) -1
+            else {
+                let c1 = coCombinatorTermCost(e1, externs);
+                let c2 = coCombinatorTermCost(e2, externs);
+                if (c1 < 0 || c2 < 0) -1 else 1 + c1 + c2
+            },
+        TmIf(cnd, thn, els) -> {
+            let cc = coCombinatorTermCost(cnd, externs);
+            let ct = coCombinatorTermCost(thn, externs);
+            let ce = coCombinatorTermCost(els, externs);
+            if (cc < 0 || ct < 0 || ce < 0) -1 else 1 + cc + ct + ce
+        },
+        TmMatch(scrut, arms) ->
+            if (listLen(arms) > 6) -1
+            else {
+                let cs = coCombinatorTermCost(scrut, externs);
+                let ca = coCombinatorArmListCost(arms, externs);
+                if (cs < 0 || ca < 0) -1 else 1 + cs + ca
+            },
+        TmMakeData(_, _, args, fTys, tArgs) ->
+            if (coTypeListBlocksOpt(fTys) || coTypeListBlocksOpt(tArgs)) -1
+            else {
+                let c = coCombinatorTermListCost(args, externs);
+                if (c < 0) -1 else 1 + c
+            },
+        TmGetTag(e1) -> {
+            let c1 = coCombinatorTermCost(e1, externs);
+            if (c1 < 0) -1 else 1 + c1
+        },
+    }
+}
+
+def coCombinatorTermListCost(es: List TaggedTerm, externs: StrMap ExternDef): Int = match es {
+    Nil -> 0,
+    Cons(h, t) -> {
+        let ch = coCombinatorTermCost(h, externs);
+        if (ch < 0) -1
+        else {
+            let ct = coCombinatorTermListCost(t, externs);
+            if (ct < 0) -1 else ch + ct
+        }
+    },
+}
+
+def coCombinatorArmListCost(arms: List CoreArm, externs: StrMap ExternDef): Int = match arms {
+    Nil -> 0,
+    Cons(a, r) ->
+        if (!leafPatOk(a.caPat)) -1
+        else {
+            let cg = match a.caGuard {
+                Some(g) -> coCombinatorTermCost(g, externs),
+                None -> 0,
+            };
+            let cb = coCombinatorTermCost(a.caBody, externs);
+            if (cg < 0 || cb < 0) -1
+            else {
+                let cr = coCombinatorArmListCost(r, externs);
+                if (cr < 0) -1 else 1 + cg + cb + cr
+            }
+        },
+}
+
+def coTermCallsFn(tm: TaggedTerm, targetFn: String): Bool = match tm.tnode {
+    TmApplyDir(vd, args) -> vd.vname == targetFn || coTermListCallsFn(args, targetFn),
+    TmApplyCls(c, args) -> coTermCallsFn(c, targetFn) || coTermListCallsFn(args, targetFn),
+    TmMakeCls(_, cls, body) -> cls.clsEntry == targetFn || coTermCallsFn(body, targetFn),
+    TmTuple(es) -> coTermListCallsFn(es, targetFn),
+    TmBlock(es) -> coTermListCallsFn(es, targetFn),
+    TmBin(_, l, r) -> coTermCallsFn(l, targetFn) || coTermCallsFn(r, targetFn),
+    TmUn(_, e1) -> coTermCallsFn(e1, targetFn),
+    TmLet(_, e1, e2) -> coTermCallsFn(e1, targetFn) || coTermCallsFn(e2, targetFn),
+    TmIf(c, t, e) -> coTermCallsFn(c, targetFn) || coTermCallsFn(t, targetFn) || coTermCallsFn(e, targetFn),
+    TmWhile(c, b) -> coTermCallsFn(c, targetFn) || coTermCallsFn(b, targetFn),
+    TmMatch(s, arms) -> coTermCallsFn(s, targetFn) || coArmListCallsFn(arms, targetFn),
+    TmMakeData(_, _, es, _, _) -> coTermListCallsFn(es, targetFn),
+    TmGetTag(e1) -> coTermCallsFn(e1, targetFn),
+    _ -> false,
+}
+
+def coTermListCallsFn(es: List TaggedTerm, targetFn: String): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> coTermCallsFn(h, targetFn) || coTermListCallsFn(t, targetFn),
+}
+
+def coArmListCallsFn(arms: List CoreArm, targetFn: String): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gHit = match a.caGuard { Some(g) -> coTermCallsFn(g, targetFn), None -> false };
+        gHit || coTermCallsFn(a.caBody, targetFn) || coArmListCallsFn(r, targetFn)
+    },
+}
+
+def coCollectDirectCallees(tm: TaggedTerm, out: Cell (List String)): Void = match tm.tnode {
+    TmApplyDir(vd, args) -> {
+        cellSet(out, addUniqueStr(cellGet(out), vd.vname));
+        coCollectDirectCalleesList(args, out)
+    },
+    TmMakeCls(_, cls, body) -> {
+        cellSet(out, addUniqueStr(cellGet(out), cls.clsEntry));
+        coCollectDirectCallees(body, out)
+    },
+    TmApplyCls(c, args) -> {
+        coCollectDirectCallees(c, out);
+        coCollectDirectCalleesList(args, out)
+    },
+    TmTuple(es) -> coCollectDirectCalleesList(es, out),
+    TmBlock(es) -> coCollectDirectCalleesList(es, out),
+    TmBin(_, l, r) -> { coCollectDirectCallees(l, out); coCollectDirectCallees(r, out) },
+    TmUn(_, e1) -> coCollectDirectCallees(e1, out),
+    TmLet(_, e1, e2) -> { coCollectDirectCallees(e1, out); coCollectDirectCallees(e2, out) },
+    TmIf(c, t, e) -> { coCollectDirectCallees(c, out); coCollectDirectCallees(t, out); coCollectDirectCallees(e, out) },
+    TmWhile(c, b) -> { coCollectDirectCallees(c, out); coCollectDirectCallees(b, out) },
+    TmMatch(s, arms) -> {
+        coCollectDirectCallees(s, out);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    match a.caGuard { Some(g) -> coCollectDirectCallees(g, out), None -> () };
+                    coCollectDirectCallees(a.caBody, out);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        }
+    },
+    TmMakeData(_, _, es, _, _) -> coCollectDirectCalleesList(es, out),
+    TmGetTag(e1) -> coCollectDirectCallees(e1, out),
+    _ -> (),
+}
+
+def coCollectDirectCalleesList(es: List TaggedTerm, out: Cell (List String)): Void = match es {
+    Nil -> (),
+    Cons(h, t) -> { coCollectDirectCallees(h, out); coCollectDirectCalleesList(t, out) },
+}
+
+def coGetDirectCalleesCached(cctx: CombOptCtx, fnName: String): List String =
+    match strMapGet(cctx.coCalleesCache, fnName) {
+        Some(cs) -> cs,
+        None -> match strMapGet(cctx.coFns, fnName) {
+            None -> Nil,
+            Some(fd) -> {
+                let cs = coComputeDirectCallees(fd.fnBody);
+                strMapInsert(cctx.coCalleesCache, fnName, cs);
+                cs
+            },
+        },
+    }
+
+def coReachesTargetVisited(cctx: CombOptCtx, curFn: String, targetFn: String, visited: StrMap Bool): Bool =
+    if (curFn == targetFn) true
+    else if (strMapContains(visited, curFn)) false
+    else {
+        strMapInsert(visited, curFn, true);
+        let cur = cellNew(coGetDirectCalleesCached(cctx, curFn));
+        let hit = cellNew(false);
+        while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(cn, r) -> {
+                    if (coReachesTargetVisited(cctx, cn, targetFn, visited)) cellSet(hit, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(hit)
+    }
+
+def coReachesTargetFn(cctx: CombOptCtx, curFn: String, targetFn: String): Bool =
+    if (curFn == targetFn) true
+    else coCalleeReachesTargetFn(cctx, curFn, targetFn)
+
+def coCalleeReachesTargetFn(cctx: CombOptCtx, startFn: String, targetFn: String): Bool = {
+    let visited: StrMap Bool = strMapNew();
+    let cur = cellNew(coGetDirectCalleesCached(cctx, startFn));
+    let hit = cellNew(false);
+    while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(cn, r) -> {
+                if (coReachesTargetVisited(cctx, cn, targetFn, visited)) cellSet(hit, true) else ();
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(hit)
+}
+
+def coIsEligibleGeneralInlineFn(cctx: CombOptCtx, fd: FunDef, cExportSet: StrMap Bool): Bool =
+    if (
+        fd.fnName == "main"
+        || strStartsWith(fd.fnName, "__ctor_")
+        || strMapContains(cExportSet, fd.fnName)
+        || strMapContains(cctx.coSkipFns, fd.fnName)
+    ) false
+    else match fd.fnFvs {
+        Cons(_, _) -> false,
+        Nil -> {
+            let fnTy = schemeBody(fd.fnScm);
+            match fnTy {
+                TyArr(_, _, retTy) ->
+                    if (!isTypeConcrete(fnTy) || coTypeBlocksOpt(retTy) || coVarDeclListBlocksOpt(fd.fnParams)) false
+                    else {
+                        let cost = coCombinatorTermCost(fd.fnBody, cctx.coExterns);
+                        if (!coInlineBudgetAllows(cost, 28, 0, 1, 0, 1)) false
+                        else !coCalleeReachesTargetFn(cctx, fd.fnName, fd.fnName)
+                    },
+                _ -> false,
+            }
+        },
+    }
+
+def coAlphaClonePat(
+    cctx: CombOptCtx,
+    pat: Pattern,
+    env: List (String, String)
+): (Pattern, List (String, String)) = match pat {
+    PatWild -> (PatWild, env),
+    PatLit(l) -> (PatLit(l), env),
+    PatVar(v, sp) -> {
+        let fv = coFreshBinder(cctx, v);
+        (PatVar(fv, sp), Cons((v, fv), env))
+    },
+    PatTuple(ps) -> {
+        let (ps2, env2) = coAlphaClonePatList(cctx, ps, env);
+        (PatTuple(ps2), env2)
+    },
+    PatCtor(cn, ps) -> {
+        let (ps2, env2) = coAlphaClonePatList(cctx, ps, env);
+        (PatCtor(cn, ps2), env2)
+    },
+    PatStruct(cn, fs) -> (PatStruct(cn, fs), env),
+}
+
+def coAlphaClonePatList(
+    cctx: CombOptCtx,
+    ps: List Pattern,
+    env: List (String, String)
+): (List Pattern, List (String, String)) = match ps {
+    Nil -> (Nil, env),
+    Cons(p, r) -> {
+        let (p2, env1) = coAlphaClonePat(cctx, p, env);
+        let (r2, env2) = coAlphaClonePatList(cctx, r, env1);
+        (Cons(p2, r2), env2)
+    },
+}
+
+def coCloneClosureEntryForEnv(
+    cctx: CombOptCtx,
+    origEntry: String,
+    origCallFvs: List String,
+    env: List (String, String),
+    sp: Span
+): Option (String, List String) =
+    match strMapGet(cctx.coFns, origEntry) {
+        None -> None,
+        Some(origFd) ->
+            if (listLen(origFd.fnFvs) != listLen(origCallFvs)) None
+            else {
+                let cid = coFreshId(cctx);
+                let newEntry = origEntry + "$icls$" + intToStr(cid);
+                let newFnFvsRev: Cell (List VarDecl) = cellNew(Nil);
+                let newCallFvsRev: Cell (List String) = cellNew(Nil);
+                let seenCallerFvs: Cell (List String) = cellNew(Nil);
+                let clsEnv: Cell (List (String, String)) = cellNew(Nil);
+                let cf1 = cellNew(origFd.fnFvs);
+                let cf2 = cellNew(origCallFvs);
+                while (match (cellGet(cf1), cellGet(cf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                    match (cellGet(cf1), cellGet(cf2)) {
+                        (Cons(fvd, rf1), Cons(callerFv, rf2)) -> {
+                            let mappedFv = lookupInlineEnv(env, callerFv);
+                            cellSet(clsEnv, Cons((fvd.vname, mappedFv), cellGet(clsEnv)));
+                            if (!listContainsStr(cellGet(seenCallerFvs), mappedFv)) {
+                                cellSet(seenCallerFvs, Cons(mappedFv, cellGet(seenCallerFvs)));
+                                cellSet(newCallFvsRev, Cons(mappedFv, cellGet(newCallFvsRev)));
+                                cellSet(newFnFvsRev, Cons(MkVarDecl { vname: mappedFv, vscm: fvd.vscm }, cellGet(newFnFvsRev)))
+                            } else ();
+                            cellSet(cf1, rf1);
+                            cellSet(cf2, rf2)
+                        },
+                        _ -> (),
+                    }
+                };
+                let newParamsRev: Cell (List VarDecl) = cellNew(Nil);
+                let cp = cellNew(origFd.fnParams);
+                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                    match cellGet(cp) {
+                        Cons(pvd, rp) -> {
+                            let np = coFreshBinder(cctx, pvd.vname);
+                            cellSet(clsEnv, Cons((pvd.vname, np), cellGet(clsEnv)));
+                            cellSet(newParamsRev, Cons(MkVarDecl { vname: np, vscm: pvd.vscm }, cellGet(newParamsRev)));
+                            cellSet(cp, rp)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let clonedBody = coCloneTerm(cctx, origFd.fnBody, cellGet(clsEnv), sp);
+                let newFd = MkFunDef {
+                    fnName: newEntry,
+                    fnSpan: sp,
+                    fnScm: origFd.fnScm,
+                    fnParams: listRev(cellGet(newParamsRev)),
+                    fnFvs: listRev(cellGet(newFnFvsRev)),
+                    fnBody: clonedBody,
+                };
+                coRegisterFn(cctx, newFd);
+                Some((newEntry, listRev(cellGet(newCallFvsRev))))
+            },
+    }
+
+def coCloneTerm(
+    cctx: CombOptCtx,
+    tm: TaggedTerm,
+    env: List (String, String),
+    sp: Span
+): TaggedTerm = {
+    let nd = match tm.tnode {
+        TmLit(l) -> TmLit(l),
+        TmVar(v) -> TmVar(lookupInlineEnv(env, v)),
+        TmGlobalVar(g) -> TmGlobalVar(g),
+        TmTuple(es) -> TmTuple(coCloneTermList(cctx, es, env, sp)),
+        TmBlock(es) -> TmBlock(coCloneTermList(cctx, es, env, sp)),
+        TmMakeCls(vd, cls, body) -> {
+            let fv = coFreshBinder(cctx, vd.vname);
+            let vd2 = MkVarDecl { vname: fv, vscm: vd.vscm };
+            let envBody = Cons((vd.vname, fv), env);
+            match cls.clsFvs {
+                Nil -> TmMakeCls(vd2, cls, coCloneTerm(cctx, body, envBody, sp)),
+                _ -> match coCloneClosureEntryForEnv(cctx, cls.clsEntry, cls.clsFvs, envBody, sp) {
+                    Some((newEntry, newFvs)) ->
+                        TmMakeCls(
+                            vd2,
+                            MkClosureSpec { clsEntry: newEntry, clsFvs: newFvs },
+                            coCloneTerm(cctx, body, envBody, sp)
+                        ),
+                    None -> TmMakeCls(vd, cls, coCloneTerm(cctx, body, env, sp)),
+                },
+            }
+        },
+        TmApplyCls(c, args) ->
+            TmApplyCls(coCloneTerm(cctx, c, env, sp), coCloneTermList(cctx, args, env, sp)),
+        TmApplyDir(vd, args) ->
+            TmApplyDir(vd, coCloneTermList(cctx, args, env, sp)),
+        TmBin(op, l, r) ->
+            TmBin(op, coCloneTerm(cctx, l, env, sp), coCloneTerm(cctx, r, env, sp)),
+        TmUn(op, e1) ->
+            TmUn(op, coCloneTerm(cctx, e1, env, sp)),
+        TmLet(vd, e1, e2) -> {
+            let e1c = coCloneTerm(cctx, e1, env, sp);
+            let fv = coFreshBinder(cctx, vd.vname);
+            let vd2 = MkVarDecl { vname: fv, vscm: vd.vscm };
+            let e2c = coCloneTerm(cctx, e2, Cons((vd.vname, fv), env), sp);
+            TmLet(vd2, e1c, e2c)
+        },
+        TmIf(c, t, e) ->
+            TmIf(
+                coCloneTerm(cctx, c, env, sp),
+                coCloneTerm(cctx, t, env, sp),
+                coCloneTerm(cctx, e, env, sp)
+            ),
+        TmWhile(c, b) ->
+            TmWhile(coCloneTerm(cctx, c, env, sp), coCloneTerm(cctx, b, env, sp)),
+        TmMatch(s, arms) ->
+            TmMatch(coCloneTerm(cctx, s, env, sp), coCloneArmList(cctx, arms, env, sp)),
+        TmMakeData(cn, tag, args, fTys, tArgs) ->
+            TmMakeData(cn, tag, coCloneTermList(cctx, args, env, sp), fTys, tArgs),
+        TmGetTag(e1) ->
+            TmGetTag(coCloneTerm(cctx, e1, env, sp)),
+    };
+    MkTerm { tspan: sp, tscm: tm.tscm, tnode: nd }
+}
+
+def coCloneTermList(
+    cctx: CombOptCtx,
+    es: List TaggedTerm,
+    env: List (String, String),
+    sp: Span
+): List TaggedTerm
+    ensures out -> listLen(out) == listLen(es)
+= match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(coCloneTerm(cctx, h, env, sp), coCloneTermList(cctx, t, env, sp)),
+}
+
+def coCloneArmList(
+    cctx: CombOptCtx,
+    arms: List CoreArm,
+    env: List (String, String),
+    sp: Span
+): List CoreArm
+    ensures out -> listLen(out) == listLen(arms)
+= match arms {
+    Nil -> Nil,
+    Cons(a, r) -> {
+        let (pat2, envArm) = coAlphaClonePat(cctx, a.caPat, env);
+        let g2 = match a.caGuard {
+            Some(g) -> Some(coCloneTerm(cctx, g, envArm, sp)),
+            None -> None,
+        };
+        let b2 = coCloneTerm(cctx, a.caBody, envArm, sp);
+        Cons(MkCoreArm { caPat: pat2, caGuard: g2, caBody: b2 }, coCloneArmList(cctx, r, env, sp))
+    },
+}
+
+def coBuildCallArgsInline(
+    cctx: CombOptCtx,
+    ps: List VarDecl,
+    args: List TaggedTerm,
+    baseEnv: List (String, String),
+    sp: Span,
+    resScm: Scheme,
+    bodyToClone: TaggedTerm
+): TaggedTerm = {
+    let envCell: Cell (List (String, String)) = cellNew(baseEnv);
+    let letsRev: Cell (List (VarDecl, TaggedTerm)) = cellNew(Nil);
+    let cp = cellNew(ps);
+    let ca = cellNew(args);
+    while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+        match (cellGet(cp), cellGet(ca)) {
+            (Cons(p, rp), Cons(a, ra)) -> {
+                match a.tnode {
+                    TmVar(v) -> cellSet(envCell, Cons((p.vname, v), cellGet(envCell))),
+                    _ -> {
+                        let fv = coFreshBinder(cctx, p.vname);
+                        cellSet(envCell, Cons((p.vname, fv), cellGet(envCell)));
+                        cellSet(letsRev, Cons((MkVarDecl { vname: fv, vscm: ScmMono(schemeBody(a.tscm)) }, a), cellGet(letsRev)))
+                    },
+                };
+                cellSet(cp, rp);
+                cellSet(ca, ra)
+            },
+            _ -> (),
+        }
+    };
+    let cloned = coCloneTerm(cctx, bodyToClone, cellGet(envCell), sp);
+    let cur = cellNew(cellGet(letsRev));
+    let out = cellNew(cloned);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((vd, rhs), r) -> {
+                cellSet(out, MkTerm { tspan: sp, tscm: resScm, tnode: TmLet(vd, rhs, cellGet(out)) });
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(out)
+}
+
+def coMapVarDeclTypes(vds: List VarDecl): List Type = match vds {
+    Nil -> Nil,
+    Cons(vd, r) -> Cons(schemeBody(vd.vscm), coMapVarDeclTypes(r)),
+}
+
+def coGetOrCreateFlatClsFn(
+    cctx: CombOptCtx,
+    clsFd: FunDef,
+    cExportSet: StrMap Bool
+): String
+    ensures fnName -> strLen(fnName) >= 6
+=
+    match strMapGet(cctx.coFlatClsMap, clsFd.fnName) {
+        Some(existing) -> {
+            assert(strMapContains(cctx.coFns, existing));
+            existing
+        },
+        None -> {
+            let fid = coFreshId(cctx);
+            let flatName = clsFd.fnName + "$flat$" + intToStr(fid);
+            strMapInsert(cctx.coFlatClsMap, clsFd.fnName, flatName);
+            let envRev: Cell (List (String, String)) = cellNew(Nil);
+            let allParamsRev: Cell (List VarDecl) = cellNew(Nil);
+            let cf = cellNew(clsFd.fnFvs);
+            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                match cellGet(cf) {
+                    Cons(fvd, rf) -> {
+                        let nf = coFreshBinder(cctx, fvd.vname);
+                        cellSet(envRev, Cons((fvd.vname, nf), cellGet(envRev)));
+                        cellSet(allParamsRev, Cons(MkVarDecl { vname: nf, vscm: fvd.vscm }, cellGet(allParamsRev)));
+                        cellSet(cf, rf)
+                    },
+                    Nil -> (),
+                }
+            };
+            let cp = cellNew(clsFd.fnParams);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(pvd, rp) -> {
+                        let np = coFreshBinder(cctx, pvd.vname);
+                        cellSet(envRev, Cons((pvd.vname, np), cellGet(envRev)));
+                        cellSet(allParamsRev, Cons(MkVarDecl { vname: np, vscm: pvd.vscm }, cellGet(allParamsRev)));
+                        cellSet(cp, rp)
+                    },
+                    Nil -> (),
+                }
+            };
+            let allParams = listRev(cellGet(allParamsRev));
+            let fvCnt = listLen(clsFd.fnFvs);
+            let pCnt = listLen(clsFd.fnParams);
+            if (fvCnt <= 1048576 && pCnt <= 1048576) {
+                assert(listLen(allParams) == coFlatTotalArity(fvCnt, pCnt))
+            } else ();
+            let retTy = schemeBody(clsFd.fnBody.tscm);
+            let flatScm = ScmMono(TyArr(TyVoid, coMapVarDeclTypes(allParams), retTy));
+            let clonedBody = coCloneTerm(cctx, clsFd.fnBody, cellGet(envRev), clsFd.fnSpan);
+            let initEnv = coInitialEnvForFn(allParams, Nil);
+            let savedInl = cellGet(cctx.coFnInlines);
+            cellSet(cctx.coFnInlines, 0);
+            let optBody = coOptTerm(cctx, flatName, clonedBody, initEnv, cExportSet, 1);
+            cellSet(cctx.coFnInlines, savedInl);
+            let flatFd = MkFunDef {
+                fnName: flatName,
+                fnSpan: clsFd.fnSpan,
+                fnScm: flatScm,
+                fnParams: allParams,
+                fnFvs: Nil,
+                fnBody: optBody,
+            };
+            coRegisterFn(cctx, flatFd);
+            flatName
+        },
+    }
+
+def coResolveTermKnownVal(tm: TaggedTerm, cenv: CoEnv): Option CoKnownVal = match tm.tnode {
+    TmLit(l) -> Some(CoValLit(l)),
+    TmTuple(es) -> if (coAllTermsSimple(es)) Some(CoValTuple(es)) else None,
+    TmMakeData(adt, tag, fs, ftys, targs) ->
+        if (coAllTermsSimple(fs)) Some(CoValData(adt, tag, fs, ftys, targs)) else None,
+    TmVar(v) -> {
+        let rv = coResolveAlias(cenv.ceAliases, v, 0);
+        lookupInlineEnvOpt(cenv.ceKnownVals, rv)
+    },
+    _ -> None,
+}
+
+def coMatchPatKnown(
+    cctx: CombOptCtx,
+    pat: Pattern,
+    tm: TaggedTerm,
+    cenv: CoEnv
+): CoPatMatch = match pat {
+    PatWild ->
+        if (coIsSimpleTerm(tm)) CoPatYes(Nil)
+        else match tm.tnode {
+            TmTuple(es) -> if (coAllTermsSimple(es)) CoPatYes(Nil) else CoPatUnknown,
+            TmMakeData(_, _, fs, _, _) -> if (coAllTermsSimple(fs)) CoPatYes(Nil) else CoPatUnknown,
+            _ -> CoPatUnknown,
+        },
+    PatVar(v, _) ->
+        if (coIsSimpleTerm(tm)) {
+            CoPatYes([(MkVarDecl { vname: v, vscm: ScmMono(schemeBody(tm.tscm)) }, tm)])
+        } else match tm.tnode {
+            TmTuple(es) if (coAllTermsSimple(es)) ->
+                CoPatYes([(MkVarDecl { vname: v, vscm: ScmMono(schemeBody(tm.tscm)) }, tm)]),
+            TmMakeData(_, _, fs, _, _) if (coAllTermsSimple(fs)) ->
+                CoPatYes([(MkVarDecl { vname: v, vscm: ScmMono(schemeBody(tm.tscm)) }, tm)]),
+            _ -> CoPatUnknown,
+        },
+    PatLit(pLit) -> match pLit {
+        LitFloat(_) -> CoPatUnknown,
+        _ -> match coResolveTermKnownVal(tm, cenv) {
+            Some(CoValLit(LitFloat(_))) -> CoPatUnknown,
+            Some(CoValLit(tLit)) -> if (coLitsEqual(pLit, tLit)) CoPatYes(Nil) else CoPatNo,
+            _ -> CoPatUnknown,
+        },
+    },
+    PatTuple(subPats) -> match coResolveTermKnownVal(tm, cenv) {
+        Some(CoValTuple(elems)) ->
+            if (listLen(subPats) != listLen(elems)) CoPatUnknown
+            else coMatchPatListKnown(cctx, subPats, elems, cenv),
+        _ -> CoPatUnknown,
+    },
+    PatCtor(cname, subPats) -> match strMapGet(cctx.coCtorMap, cname) {
+        None -> CoPatUnknown,
+        Some((patAdt, vinfo)) -> match coResolveTermKnownVal(tm, cenv) {
+            Some(CoValData(dataAdt, dataTag, fields, _, _)) ->
+                if (patAdt != dataAdt) CoPatUnknown
+                else if (vinfo.tag != dataTag) CoPatNo
+                else if (listLen(subPats) != listLen(fields)) CoPatUnknown
+                else coMatchPatListKnown(cctx, subPats, fields, cenv),
+            _ -> CoPatUnknown,
+        },
+    },
+    PatStruct(_, _) -> CoPatUnknown,
+}
+
+def coPatMatchStatus(m: CoPatMatch): Int = match m {
+    CoPatYes(_) -> 0,
+    CoPatNo -> 1,
+    CoPatUnknown -> 2,
+}
+
+def coMatchPatListKnown(
+    cctx: CombOptCtx,
+    ps: List Pattern,
+    es: List TaggedTerm,
+    cenv: CoEnv
+): CoPatMatch = match (ps, es) {
+    (Nil, Nil) -> CoPatYes(Nil),
+    (Cons(p, rp), Cons(e, re)) -> {
+        let m1 = coMatchPatKnown(cctx, p, e, cenv);
+        match m1 {
+            CoPatNo -> CoPatNo,
+            _ -> {
+                let m2 = coMatchPatListKnown(cctx, rp, re, cenv);
+                let st = coPatSeqStatus(coPatMatchStatus(m1), coPatMatchStatus(m2));
+                if (st == 1) CoPatNo
+                else if (st == 0) match (m1, m2) {
+                    (CoPatYes(b1), CoPatYes(b2)) -> CoPatYes(listAppend(b1, b2)),
+                    _ -> CoPatUnknown,
+                }
+                else CoPatUnknown
+            },
+        }
+    },
+    _ -> CoPatUnknown,
+}
+
+def coWrapLetBindings(
+    binds: List (VarDecl, TaggedTerm),
+    body: TaggedTerm,
+    sp: Span,
+    resScm: Scheme
+): TaggedTerm = match binds {
+    Nil -> body,
+    Cons((vd, rhs), r) -> MkTerm {
+        tspan: sp,
+        tscm: resScm,
+        tnode: TmLet(vd, rhs, coWrapLetBindings(r, body, sp, resScm)),
+    },
+}
+
+def coTryReduceMatch(
+    cctx: CombOptCtx,
+    scrut: TaggedTerm,
+    arms: List CoreArm,
+    cenv: CoEnv,
+    sp: Span,
+    resScm: Scheme
+): Option TaggedTerm = match arms {
+    Nil -> None,
+    Cons(a, rest) -> match coMatchPatKnown(cctx, a.caPat, scrut, cenv) {
+        CoPatNo -> coTryReduceMatch(cctx, scrut, rest, cenv, sp, resScm),
+        CoPatUnknown -> None,
+        CoPatYes(binds) -> match a.caGuard {
+            None -> {
+                let envRev: Cell (List (String, String)) = cellNew(Nil);
+                let renamedBindsRev: Cell (List (VarDecl, TaggedTerm)) = cellNew(Nil);
+                let cb = cellNew(binds);
+                while (match cellGet(cb) { Nil -> false, _ -> true }) {
+                    match cellGet(cb) {
+                        Cons((vd, rhs), rb) -> {
+                            let fv = coFreshBinder(cctx, vd.vname);
+                            cellSet(envRev, Cons((vd.vname, fv), cellGet(envRev)));
+                            cellSet(renamedBindsRev, Cons((MkVarDecl { vname: fv, vscm: vd.vscm }, rhs), cellGet(renamedBindsRev)));
+                            cellSet(cb, rb)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let clonedBody = coCloneTerm(cctx, a.caBody, cellGet(envRev), sp);
+                Some(coWrapLetBindings(listRev(cellGet(renamedBindsRev)), clonedBody, sp, resScm))
+            },
+            Some(_) -> None,
+        },
+    },
+}
+
+def coAnfLiftTermList(
+    cctx: CombOptCtx,
+    es: List TaggedTerm,
+    sp: Span,
+    outerScm: Scheme,
+    buildInner: List TaggedTerm -> Term
+): TaggedTerm =
+    if (coAllTermsSimple(es)) {
+        MkTerm { tspan: sp, tscm: outerScm, tnode: buildInner(es) }
+    } else {
+        let letsRev: Cell (List (VarDecl, TaggedTerm)) = cellNew(Nil);
+        let simpleRev: Cell (List TaggedTerm) = cellNew(Nil);
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    if (coIsSimpleTerm(e)) {
+                        cellSet(simpleRev, Cons(e, cellGet(simpleRev)))
+                    } else {
+                        let nm = coFreshBinder(cctx, "anf");
+                        let sc = ScmMono(schemeBody(e.tscm));
+                        let vd = MkVarDecl { vname: nm, vscm: sc };
+                        cellSet(letsRev, Cons((vd, e), cellGet(letsRev)));
+                        cellSet(simpleRev, Cons(MkTerm { tspan: e.tspan, tscm: sc, tnode: TmVar(nm) }, cellGet(simpleRev)))
+                    };
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let coreTm = MkTerm { tspan: sp, tscm: outerScm, tnode: buildInner(listRev(cellGet(simpleRev))) };
+        coWrapLetBindings(listRev(cellGet(letsRev)), coreTm, sp, outerScm)
+    }
+
+def coLastFloatArgIndex(es: List TaggedTerm, idx: Int, lastHit: Int): Int = match es {
+    Nil -> lastHit,
+    Cons(h, t) -> {
+        let nextHit = if (coTermNeedsArgFloat(h)) idx else lastHit;
+        coLastFloatArgIndex(t, idx + 1, nextHit)
+    },
+}
+
+def coFloatSelectedArgs(
+    cctx: CombOptCtx,
+    es: List TaggedTerm,
+    sp: Span,
+    outerScm: Scheme,
+    buildInner: List TaggedTerm -> Term
+): TaggedTerm = {
+    let lastIdx = coLastFloatArgIndex(es, 0, -1);
+    if (lastIdx < 0) {
+        MkTerm { tspan: sp, tscm: outerScm, tnode: buildInner(es) }
+    } else {
+        let letsRev: Cell (List (VarDecl, TaggedTerm)) = cellNew(Nil);
+        let outArgsRev: Cell (List TaggedTerm) = cellNew(Nil);
+        let iCell = cellNew(0);
+        let cur = cellNew(es);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(e, r) -> {
+                    let idx = cellGet(iCell);
+                    if (!coAnfInFloatPrefix(idx, lastIdx) || coIsSimpleTerm(e)) {
+                        cellSet(outArgsRev, Cons(e, cellGet(outArgsRev)))
+                    } else {
+                        let nm = coFreshBinder(cctx, "arg");
+                        let sc = ScmMono(schemeBody(e.tscm));
+                        let vd = MkVarDecl { vname: nm, vscm: sc };
+                        cellSet(letsRev, Cons((vd, e), cellGet(letsRev)));
+                        cellSet(outArgsRev, Cons(MkTerm { tspan: e.tspan, tscm: sc, tnode: TmVar(nm) }, cellGet(outArgsRev)))
+                    };
+                    cellSet(iCell, idx + 1);
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        let coreTm = MkTerm { tspan: sp, tscm: outerScm, tnode: buildInner(listRev(cellGet(outArgsRev))) };
+        coWrapLetBindings(listRev(cellGet(letsRev)), coreTm, sp, outerScm)
+    }
+}
+
+// ---- Self-Recursive Higher-Order Call-Pattern Specialization (`SpecConstr`) ----
+
+def coParamInvariantAndOnlyCalledInTerm(
+    tm: TaggedTerm,
+    selfFnName: String,
+    paramName: String,
+    paramIdx: Int
+): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(v) -> v != paramName,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> coParamInvariantInList(es, selfFnName, paramName, paramIdx),
+    TmBlock(es) -> coParamInvariantInList(es, selfFnName, paramName, paramIdx),
+    TmMakeCls(vd, cls, body) ->
+        !listContainsStr(cls.clsFvs, paramName)
+        && (if (vd.vname == paramName) !coTermCallsFn(body, selfFnName) else coParamInvariantAndOnlyCalledInTerm(body, selfFnName, paramName, paramIdx)),
+    TmApplyCls(callee, args) -> {
+        let calleeOk = match callee.tnode {
+            TmVar(v) if (v == paramName) -> true,
+            _ -> coParamInvariantAndOnlyCalledInTerm(callee, selfFnName, paramName, paramIdx),
+        };
+        calleeOk && coParamInvariantInList(args, selfFnName, paramName, paramIdx)
+    },
+    TmApplyDir(vd, args) ->
+        if (vd.vname == selfFnName) {
+            let argAtIdxOk = match listNthTerm(args, paramIdx) {
+                Some(ith) -> match ith.tnode {
+                    TmVar(v) -> v == paramName,
+                    _ -> false,
+                },
+                None -> false,
+            };
+            argAtIdxOk && coSelfCallOtherArgsOk(args, 0, paramIdx, selfFnName, paramName)
+        } else coParamInvariantInList(args, selfFnName, paramName, paramIdx),
+    TmBin(_, l, r) ->
+        coParamInvariantAndOnlyCalledInTerm(l, selfFnName, paramName, paramIdx)
+        && coParamInvariantAndOnlyCalledInTerm(r, selfFnName, paramName, paramIdx),
+    TmUn(_, e1) -> coParamInvariantAndOnlyCalledInTerm(e1, selfFnName, paramName, paramIdx),
+    TmLet(vd, e1, e2) ->
+        coParamInvariantAndOnlyCalledInTerm(e1, selfFnName, paramName, paramIdx)
+        && (if (vd.vname == paramName) !coTermCallsFn(e2, selfFnName) else coParamInvariantAndOnlyCalledInTerm(e2, selfFnName, paramName, paramIdx)),
+    TmIf(c, t, e) ->
+        coParamInvariantAndOnlyCalledInTerm(c, selfFnName, paramName, paramIdx)
+        && coParamInvariantAndOnlyCalledInTerm(t, selfFnName, paramName, paramIdx)
+        && coParamInvariantAndOnlyCalledInTerm(e, selfFnName, paramName, paramIdx),
+    TmWhile(c, b) ->
+        coParamInvariantAndOnlyCalledInTerm(c, selfFnName, paramName, paramIdx)
+        && coParamInvariantAndOnlyCalledInTerm(b, selfFnName, paramName, paramIdx),
+    TmMatch(s, arms) ->
+        coParamInvariantAndOnlyCalledInTerm(s, selfFnName, paramName, paramIdx)
+        && coParamInvariantInArms(arms, selfFnName, paramName, paramIdx),
+    TmMakeData(_, _, es, _, _) -> coParamInvariantInList(es, selfFnName, paramName, paramIdx),
+    TmGetTag(e1) -> coParamInvariantAndOnlyCalledInTerm(e1, selfFnName, paramName, paramIdx),
+}
+
+def coSelfCallOtherArgsOk(
+    args: List TaggedTerm,
+    curIdx: Int,
+    skipIdx: Int,
+    selfFnName: String,
+    paramName: String
+): Bool = match args {
+    Nil -> true,
+    Cons(h, t) -> {
+        let hOk =
+            if (curIdx == skipIdx) true
+            else coParamInvariantAndOnlyCalledInTerm(h, selfFnName, paramName, skipIdx);
+        hOk && coSelfCallOtherArgsOk(t, curIdx + 1, skipIdx, selfFnName, paramName)
+    },
+}
+
+def coParamInvariantInList(
+    es: List TaggedTerm,
+    selfFnName: String,
+    paramName: String,
+    paramIdx: Int
+): Bool = match es {
+    Nil -> true,
+    Cons(h, t) ->
+        coParamInvariantAndOnlyCalledInTerm(h, selfFnName, paramName, paramIdx)
+        && coParamInvariantInList(t, selfFnName, paramName, paramIdx),
+}
+
+def coParamInvariantInArms(
+    arms: List CoreArm,
+    selfFnName: String,
+    paramName: String,
+    paramIdx: Int
+): Bool = match arms {
+    Nil -> true,
+    Cons(a, r) -> {
+        let aOk =
+            if (coPatBindsVar(a.caPat, paramName)) {
+                let gCalls = match a.caGuard { Some(g) -> coTermCallsFn(g, selfFnName), None -> false };
+                !gCalls && !coTermCallsFn(a.caBody, selfFnName)
+            } else {
+                let gOk = match a.caGuard {
+                    Some(g) -> coParamInvariantAndOnlyCalledInTerm(g, selfFnName, paramName, paramIdx),
+                    None -> true,
+                };
+                gOk && coParamInvariantAndOnlyCalledInTerm(a.caBody, selfFnName, paramName, paramIdx)
+            };
+        aOk && coParamInvariantInArms(r, selfFnName, paramName, paramIdx)
+    },
+}
+
+def coResolveKnownArgClosure(
+    argTm: TaggedTerm,
+    cenv: CoEnv,
+    cctx: CombOptCtx
+): Option (ClosureSpec, FunDef) = match argTm.tnode {
+    TmVar(v) -> {
+        let rv = coResolveAlias(cenv.ceAliases, v, 0);
+        match lookupInlineEnvOpt(cenv.ceKnownCls, rv) {
+            Some(cls) ->
+                if (listContainsStr(cls.clsFvs, rv)) None
+                else match strMapGet(cctx.coFns, cls.clsEntry) {
+                    Some(clsFd) ->
+                        if (
+                            listLen(clsFd.fnFvs) == listLen(cls.clsFvs)
+                            && !coVarDeclListBlocksOpt(clsFd.fnFvs)
+                            && !coVarDeclListBlocksOpt(clsFd.fnParams)
+                        ) Some((cls, clsFd))
+                        else None,
+                    None -> None,
+                },
+            None -> None,
+        }
+    },
+    _ -> None,
+}
+
+def coRewriteSelfCallsInSpecBody(
+    tm: TaggedTerm,
+    origFnName: String,
+    specFnName: String,
+    specScm: Scheme,
+    paramExpansions: List (Option (List TaggedTerm))
+): TaggedTerm = {
+    let sp = tm.tspan;
+    let sc = tm.tscm;
+    let nd = match tm.tnode {
+        TmLit(l) -> TmLit(l),
+        TmVar(v) -> TmVar(v),
+        TmGlobalVar(g) -> TmGlobalVar(g),
+        TmTuple(es) -> TmTuple(coRewriteSelfCallsInList(es, origFnName, specFnName, specScm, paramExpansions)),
+        TmBlock(es) -> TmBlock(coRewriteSelfCallsInList(es, origFnName, specFnName, specScm, paramExpansions)),
+        TmMakeCls(vd, cls, b) ->
+            TmMakeCls(vd, cls, coRewriteSelfCallsInSpecBody(b, origFnName, specFnName, specScm, paramExpansions)),
+        TmApplyCls(c, args) ->
+            TmApplyCls(
+                coRewriteSelfCallsInSpecBody(c, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInList(args, origFnName, specFnName, specScm, paramExpansions)
+            ),
+        TmApplyDir(vd, args) -> {
+            let args2 = coRewriteSelfCallsInList(args, origFnName, specFnName, specScm, paramExpansions);
+            if (vd.vname == origFnName && listLen(args2) == listLen(paramExpansions)) {
+                let newArgsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                let ca = cellNew(args2);
+                let ce = cellNew(paramExpansions);
+                while (match (cellGet(ca), cellGet(ce)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                    match (cellGet(ca), cellGet(ce)) {
+                        (Cons(a, ra), Cons(expOpt, re)) -> {
+                            match expOpt {
+                                None -> cellSet(newArgsRev, Cons(a, cellGet(newArgsRev))),
+                                Some(fvTerms) -> {
+                                    let cf = cellNew(fvTerms);
+                                    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                        match cellGet(cf) {
+                                            Cons(ft, rf) -> {
+                                                cellSet(newArgsRev, Cons(ft, cellGet(newArgsRev)));
+                                                cellSet(cf, rf)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                },
+                            };
+                            cellSet(ca, ra);
+                            cellSet(ce, re)
+                        },
+                        _ -> (),
+                    }
+                };
+                TmApplyDir(MkVarDecl { vname: specFnName, vscm: specScm }, listRev(cellGet(newArgsRev)))
+            } else TmApplyDir(vd, args2)
+        },
+        TmBin(op, l, r) ->
+            TmBin(
+                op,
+                coRewriteSelfCallsInSpecBody(l, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInSpecBody(r, origFnName, specFnName, specScm, paramExpansions)
+            ),
+        TmUn(op, e1) ->
+            TmUn(op, coRewriteSelfCallsInSpecBody(e1, origFnName, specFnName, specScm, paramExpansions)),
+        TmLet(vd, e1, e2) ->
+            TmLet(
+                vd,
+                coRewriteSelfCallsInSpecBody(e1, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInSpecBody(e2, origFnName, specFnName, specScm, paramExpansions)
+            ),
+        TmIf(c, t, e) ->
+            TmIf(
+                coRewriteSelfCallsInSpecBody(c, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInSpecBody(t, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInSpecBody(e, origFnName, specFnName, specScm, paramExpansions)
+            ),
+        TmWhile(c, b) ->
+            TmWhile(
+                coRewriteSelfCallsInSpecBody(c, origFnName, specFnName, specScm, paramExpansions),
+                coRewriteSelfCallsInSpecBody(b, origFnName, specFnName, specScm, paramExpansions)
+            ),
+        TmMatch(s, arms) -> {
+            let rev: Cell (List CoreArm) = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let g2 = match a.caGuard {
+                            Some(g) -> Some(coRewriteSelfCallsInSpecBody(g, origFnName, specFnName, specScm, paramExpansions)),
+                            None -> None,
+                        };
+                        let b2 = coRewriteSelfCallsInSpecBody(a.caBody, origFnName, specFnName, specScm, paramExpansions);
+                        cellSet(rev, Cons(MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: b2 }, cellGet(rev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            TmMatch(
+                coRewriteSelfCallsInSpecBody(s, origFnName, specFnName, specScm, paramExpansions),
+                listRev(cellGet(rev))
+            )
+        },
+        TmMakeData(cn, tag, es, ftys, targs) ->
+            TmMakeData(cn, tag, coRewriteSelfCallsInList(es, origFnName, specFnName, specScm, paramExpansions), ftys, targs),
+        TmGetTag(e1) ->
+            TmGetTag(coRewriteSelfCallsInSpecBody(e1, origFnName, specFnName, specScm, paramExpansions)),
+    };
+    MkTerm { tspan: sp, tscm: sc, tnode: nd }
+}
+
+def coRewriteSelfCallsInList(
+    es: List TaggedTerm,
+    origFnName: String,
+    specFnName: String,
+    specScm: Scheme,
+    paramExpansions: List (Option (List TaggedTerm))
+): List TaggedTerm = match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(
+        coRewriteSelfCallsInSpecBody(h, origFnName, specFnName, specScm, paramExpansions),
+        coRewriteSelfCallsInList(t, origFnName, specFnName, specScm, paramExpansions)
+    ),
+}
+
+def coTrySpecializeHofLoop(
+    cctx: CombOptCtx,
+    targetFd: FunDef,
+    callArgs: List TaggedTerm,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    sp: Span,
+    resScm: Scheme
+): Option TaggedTerm =
+    if (
+        strMapContains(cctx.coSkipFns, targetFd.fnName)
+        || listLen(targetFd.fnParams) != listLen(callArgs)
+        || coTypeBlocksOpt(schemeBody(targetFd.fnScm))
+        || !coInlineParamsMatchArgs(targetFd.fnParams, callArgs)
+    ) None
+    else {
+        let choicesRev: Cell (List (Option (ClosureSpec, FunDef))) = cellNew(Nil);
+        let keyPartsRev: Cell (List String) = cellNew(Nil);
+        let expectedSpecArity = cellNew(0);
+        let arityCheckOk = cellNew(true);
+        let anySpec = cellNew(false);
+        let idx = cellNew(0);
+        let cp = cellNew(targetFd.fnParams);
+        let ca = cellNew(callArgs);
+        while (match (cellGet(cp), cellGet(ca)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+            match (cellGet(cp), cellGet(ca)) {
+                (Cons(pvd, rp), Cons(argTm, ra)) -> {
+                    let i = cellGet(idx);
+                    let specHit: Option (ClosureSpec, FunDef) = match schemeBody(pvd.vscm) {
+                        TyArr(_, _, _) ->
+                            if (coParamInvariantAndOnlyCalledInTerm(targetFd.fnBody, targetFd.fnName, pvd.vname, i)) {
+                                coResolveKnownArgClosure(argTm, cenv, cctx)
+                            } else None,
+                        _ -> None,
+                    };
+                    match specHit {
+                        Some((cls, clsFd)) -> {
+                            cellSet(anySpec, true);
+                            cellSet(choicesRev, Cons(Some((cls, clsFd)), cellGet(choicesRev)));
+                            cellSet(keyPartsRev, Cons(intToStr(i) + ":" + cls.clsEntry, cellGet(keyPartsRev)));
+                            let fvCnt = listLen(clsFd.fnFvs);
+                            let curAr = cellGet(expectedSpecArity);
+                            if (cellGet(arityCheckOk) && curAr <= 1048576 && fvCnt <= 1024) {
+                                cellSet(expectedSpecArity, coSpecSlotStepArity(curAr, true, fvCnt))
+                            } else cellSet(arityCheckOk, false)
+                        },
+                        None -> {
+                            cellSet(choicesRev, Cons(None, cellGet(choicesRev)));
+                            cellSet(keyPartsRev, Cons("-", cellGet(keyPartsRev)));
+                            let curAr = cellGet(expectedSpecArity);
+                            if (cellGet(arityCheckOk) && curAr <= 1048576) {
+                                cellSet(expectedSpecArity, coSpecSlotStepArity(curAr, false, 0))
+                            } else cellSet(arityCheckOk, false)
+                        },
+                    };
+                    cellSet(idx, i + 1);
+                    cellSet(cp, rp);
+                    cellSet(ca, ra)
+                },
+                _ -> (),
+            }
+        };
+        if (!cellGet(anySpec)) None
+        else {
+            let choices = listRev(cellGet(choicesRev));
+            let specKey = targetFd.fnName + "|" + joinKeyListPipe(listRev(cellGet(keyPartsRev)));
+            // Build call-site arguments corresponding to `choices`
+            let siteArgsRev: Cell (List TaggedTerm) = cellNew(Nil);
+            let cc0 = cellNew(choices);
+            let ca0 = cellNew(callArgs);
+            while (match (cellGet(cc0), cellGet(ca0)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                match (cellGet(cc0), cellGet(ca0)) {
+                    (Cons(chOpt, rc), Cons(origArg, ra)) -> {
+                        match chOpt {
+                            None -> cellSet(siteArgsRev, Cons(origArg, cellGet(siteArgsRev))),
+                            Some((cls, clsFd)) -> {
+                                let cf1 = cellNew(clsFd.fnFvs);
+                                let cf2 = cellNew(cls.clsFvs);
+                                while (match (cellGet(cf1), cellGet(cf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                    match (cellGet(cf1), cellGet(cf2)) {
+                                        (Cons(fvd, rf1), Cons(callerFv, rf2)) -> {
+                                            let rv = coResolveAlias(cenv.ceAliases, callerFv, 0);
+                                            cellSet(siteArgsRev, Cons(MkTerm {
+                                                tspan: sp,
+                                                tscm: fvd.vscm,
+                                                tnode: TmVar(rv),
+                                            }, cellGet(siteArgsRev)));
+                                            cellSet(cf1, rf1);
+                                            cellSet(cf2, rf2)
+                                        },
+                                        _ -> (),
+                                    }
+                                }
+                            },
+                        };
+                        cellSet(cc0, rc);
+                        cellSet(ca0, ra)
+                    },
+                    _ -> (),
+                }
+            };
+            let siteArgs = listRev(cellGet(siteArgsRev));
+            match strMapGet(cctx.coSpecMap, specKey) {
+                Some(existingSpecFn) -> match strMapGet(cctx.coFns, existingSpecFn) {
+                    Some(sfd) -> Some(MkTerm {
+                        tspan: sp,
+                        tscm: resScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: existingSpecFn, vscm: sfd.fnScm }, siteArgs),
+                    }),
+                    None -> None,
+                },
+                None ->
+                    if (cellGet(cctx.coSpecCount) >= 64) None
+                    else {
+                        let sid = coFreshId(cctx);
+                        let specName = targetFd.fnName + "$spec$" + intToStr(sid);
+                        cellSet(cctx.coSpecCount, cellGet(cctx.coSpecCount) + 1);
+                        strMapInsert(cctx.coSpecMap, specKey, specName);
+
+                        let specParamsRev: Cell (List VarDecl) = cellNew(Nil);
+                        let cloneEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                        let recExpansionsRev: Cell (List (Option (List TaggedTerm))) = cellNew(Nil);
+                        let wrapperClsRev: Cell (List (VarDecl, ClosureSpec)) = cellNew(Nil);
+
+                        let cp1 = cellNew(targetFd.fnParams);
+                        let cc1 = cellNew(choices);
+                        while (match (cellGet(cp1), cellGet(cc1)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                            match (cellGet(cp1), cellGet(cc1)) {
+                                (Cons(pvd, rp), Cons(chOpt, rc)) -> {
+                                    match chOpt {
+                                        None -> {
+                                            let np = coFreshBinder(cctx, pvd.vname);
+                                            cellSet(cloneEnvRev, Cons((pvd.vname, np), cellGet(cloneEnvRev)));
+                                            cellSet(specParamsRev, Cons(MkVarDecl { vname: np, vscm: pvd.vscm }, cellGet(specParamsRev)));
+                                            cellSet(recExpansionsRev, Cons(None, cellGet(recExpansionsRev)))
+                                        },
+                                        Some((_, clsFd)) -> {
+                                            let clsVarName = coFreshBinder(cctx, pvd.vname);
+                                            cellSet(cloneEnvRev, Cons((pvd.vname, clsVarName), cellGet(cloneEnvRev)));
+                                            let fvTermsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                                            let fvNamesRev: Cell (List String) = cellNew(Nil);
+                                            let fvMapEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                                            let cf = cellNew(clsFd.fnFvs);
+                                            while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                                                match cellGet(cf) {
+                                                    Cons(fvd, rf) -> {
+                                                        let fpNm = coFreshBinder(cctx, fvd.vname);
+                                                        let fpDecl = MkVarDecl { vname: fpNm, vscm: fvd.vscm };
+                                                        cellSet(specParamsRev, Cons(fpDecl, cellGet(specParamsRev)));
+                                                        cellSet(fvNamesRev, Cons(fpNm, cellGet(fvNamesRev)));
+                                                        cellSet(fvMapEnvRev, Cons((fvd.vname, fpNm), cellGet(fvMapEnvRev)));
+                                                        cellSet(fvTermsRev, Cons(MkTerm {
+                                                            tspan: targetFd.fnSpan,
+                                                            tscm: fvd.vscm,
+                                                            tnode: TmVar(fpNm),
+                                                        }, cellGet(fvTermsRev)));
+                                                        cellSet(cf, rf)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            cellSet(recExpansionsRev, Cons(Some(listRev(cellGet(fvTermsRev))), cellGet(recExpansionsRev)));
+                                            let localSpec = match clsFd.fnFvs {
+                                                Nil -> MkClosureSpec { clsEntry: clsFd.fnName, clsFvs: Nil },
+                                                _ -> {
+                                                    let origFvsList = mapVarDeclNames(clsFd.fnFvs);
+                                                    match coCloneClosureEntryForEnv(cctx, clsFd.fnName, origFvsList, cellGet(fvMapEnvRev), targetFd.fnSpan) {
+                                                        Some((ne, nfvs)) -> MkClosureSpec { clsEntry: ne, clsFvs: nfvs },
+                                                        None -> MkClosureSpec { clsEntry: clsFd.fnName, clsFvs: listRev(cellGet(fvNamesRev)) },
+                                                    }
+                                                },
+                                            };
+                                            cellSet(wrapperClsRev, Cons((MkVarDecl { vname: clsVarName, vscm: pvd.vscm }, localSpec), cellGet(wrapperClsRev)))
+                                        },
+                                    };
+                                    cellSet(cp1, rp);
+                                    cellSet(cc1, rc)
+                                },
+                                _ -> (),
+                            }
+                        };
+
+                        let specParams = listRev(cellGet(specParamsRev));
+                        if (cellGet(arityCheckOk)) {
+                            assert(listLen(specParams) == cellGet(expectedSpecArity) && listLen(siteArgs) == cellGet(expectedSpecArity))
+                        } else ();
+                        let retTy = schemeBody(targetFd.fnBody.tscm);
+                        let specScm = ScmMono(TyArr(TyVoid, coMapVarDeclTypes(specParams), retTy));
+                        let clonedRaw = coCloneTerm(cctx, targetFd.fnBody, cellGet(cloneEnvRev), targetFd.fnSpan);
+                    let rewrittenSelf = coRewriteSelfCallsInSpecBody(
+                        clonedRaw,
+                        targetFd.fnName,
+                        specName,
+                        specScm,
+                        listRev(cellGet(recExpansionsRev))
+                    );
+                    let wrappedBody = cellNew(rewrittenSelf);
+                    let cw = cellNew(cellGet(wrapperClsRev));
+                    while (match cellGet(cw) { Nil -> false, _ -> true }) {
+                        match cellGet(cw) {
+                            Cons((wvd, wspec), rw) -> {
+                                cellSet(wrappedBody, MkTerm {
+                                    tspan: targetFd.fnSpan,
+                                    tscm: targetFd.fnBody.tscm,
+                                    tnode: TmMakeCls(wvd, wspec, cellGet(wrappedBody)),
+                                });
+                                cellSet(cw, rw)
+                            },
+                            Nil -> (),
+                        }
+                    };
+
+                    // Register placeholder first so nested specialization terminates cleanly
+                    let placeholderFd = MkFunDef {
+                        fnName: specName,
+                        fnSpan: targetFd.fnSpan,
+                        fnScm: specScm,
+                        fnParams: specParams,
+                        fnFvs: Nil,
+                        fnBody: cellGet(wrappedBody),
+                    };
+                    coRegisterFn(cctx, placeholderFd);
+
+                    let specInitEnv = coInitialEnvForFn(specParams, Nil);
+                    let savedInl = cellGet(cctx.coFnInlines);
+                    cellSet(cctx.coFnInlines, 0);
+                    let optSpecBody = coOptTerm(cctx, specName, cellGet(wrappedBody), specInitEnv, cExportSet, 1);
+                    cellSet(cctx.coFnInlines, savedInl);
+                    let finalSpecFd = MkFunDef {
+                        fnName: specName,
+                        fnSpan: targetFd.fnSpan,
+                        fnScm: specScm,
+                        fnParams: specParams,
+                        fnFvs: Nil,
+                        fnBody: optSpecBody,
+                    };
+                    coRegisterFn(cctx, finalSpecFd);
+                    Some(MkTerm {
+                        tspan: sp,
+                        tscm: resScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: specName, vscm: specScm }, siteArgs),
+                    })
+                },
+            }
+        }
+    }
+
+def joinKeyListPipe(xs: List String): String = match xs {
+    Nil -> "",
+    Cons(h, Nil) -> h,
+    Cons(h, t) -> h + "," + joinKeyListPipe(t),
+}
+
+def mapVarDeclNames(vds: List VarDecl): List String = match vds {
+    Nil -> Nil,
+    Cons(vd, r) -> Cons(vd.vname, mapVarDeclNames(r)),
+}
+
+// ---- Closure Capture Propagation (`coSpecializeClosureCaptures`) ----
+
+def coTryPropagateClosureCaptures(
+    cctx: CombOptCtx,
+    vd: VarDecl,
+    cls: ClosureSpec,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    sp: Span,
+    depth: Int
+): ClosureSpec =
+    if (depth >= 5 || listContainsStr(cls.clsFvs, vd.vname)) cls
+    else match strMapGet(cctx.coFns, cls.clsEntry) {
+        None -> cls,
+        Some(clsFd) ->
+            if (listLen(clsFd.fnFvs) != listLen(cls.clsFvs)) cls
+            else {
+                let anyKnown = cellNew(false);
+                let cf = cellNew(cls.clsFvs);
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(rawFv, rf) -> {
+                            let rv = coResolveAlias(cenv.ceAliases, rawFv, 0);
+                            if (rv != rawFv) cellSet(anyKnown, true) else ();
+                            match lookupInlineEnvOpt(cenv.ceKnownCls, rv) {
+                                Some(icls) if (!listContainsStr(icls.clsFvs, rv)) -> cellSet(anyKnown, true),
+                                _ -> match lookupInlineEnvOpt(cenv.ceKnownVals, rv) {
+                                    Some(CoValData(_, _, dFs, dFtys, dTargs))
+                                        if (listLen(dFs) <= 4 && !coTypeListBlocksOpt(dFtys) && !coTypeListBlocksOpt(dTargs)) ->
+                                        cellSet(anyKnown, true),
+                                    _ -> (),
+                                },
+                            };
+                            cellSet(cf, rf)
+                        },
+                        Nil -> (),
+                    }
+                };
+                if (!cellGet(anyKnown)) cls
+                else {
+                    let pid = coFreshId(cctx);
+                    let newClsEntry = cls.clsEntry + "$cprop$" + intToStr(pid);
+
+                    let newFnFvsRev: Cell (List VarDecl) = cellNew(Nil);
+                    let newCallFvsRev: Cell (List String) = cellNew(Nil);
+                    let seenCallerFvs: Cell (List String) = cellNew(Nil);
+                    let cloneEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                    // Wrap bindings reconstructed inside `newClsEntry`:
+                    // Left(vd, ClosureSpec) or Right(vd, TaggedTerm)
+                    let reconClsRev: Cell (List (VarDecl, ClosureSpec)) = cellNew(Nil);
+                    let reconLetRev: Cell (List (VarDecl, TaggedTerm)) = cellNew(Nil);
+
+                    let addCapturedCallerVar = (callerVar: String, varScm: Scheme) -> {
+                        let innerFvNm =
+                            if (!listContainsStr(cellGet(seenCallerFvs), callerVar)) {
+                                cellSet(seenCallerFvs, Cons(callerVar, cellGet(seenCallerFvs)));
+                                cellSet(newCallFvsRev, Cons(callerVar, cellGet(newCallFvsRev)));
+                                cellSet(newFnFvsRev, Cons(MkVarDecl { vname: callerVar, vscm: varScm }, cellGet(newFnFvsRev)));
+                                callerVar
+                            } else callerVar;
+                        innerFvNm
+                    };
+
+                    let cf1 = cellNew(clsFd.fnFvs);
+                    let cf2 = cellNew(cls.clsFvs);
+                    while (match (cellGet(cf1), cellGet(cf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(cf1), cellGet(cf2)) {
+                            (Cons(fvd, rf1), Cons(rawFv, rf2)) -> {
+                                let rv = coResolveAlias(cenv.ceAliases, rawFv, 0);
+                                let handled = match lookupInlineEnvOpt(cenv.ceKnownCls, rv) {
+                                    Some(icls) if (!listContainsStr(icls.clsFvs, rv)) ->
+                                        match strMapGet(cctx.coFns, icls.clsEntry) {
+                                            Some(ifd) if (listLen(ifd.fnFvs) == listLen(icls.clsFvs) && !coVarDeclListBlocksOpt(ifd.fnFvs)) -> {
+                                                let innerBoundNm = coFreshBinder(cctx, fvd.vname);
+                                                cellSet(cloneEnvRev, Cons((fvd.vname, innerBoundNm), cellGet(cloneEnvRev)));
+                                                let subEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                                                let ic1 = cellNew(ifd.fnFvs);
+                                                let ic2 = cellNew(icls.clsFvs);
+                                                while (match (cellGet(ic1), cellGet(ic2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                    match (cellGet(ic1), cellGet(ic2)) {
+                                                        (Cons(ifvd, ric1), Cons(icallerFv, ric2)) -> {
+                                                            let irv = coResolveAlias(cenv.ceAliases, icallerFv, 0);
+                                                            let _ = addCapturedCallerVar(irv, ifvd.vscm);
+                                                            cellSet(subEnvRev, Cons((ifvd.vname, irv), cellGet(subEnvRev)));
+                                                            cellSet(ic1, ric1);
+                                                            cellSet(ic2, ric2)
+                                                        },
+                                                        _ -> (),
+                                                    }
+                                                };
+                                                let innerSpec = match ifd.fnFvs {
+                                                    Nil -> MkClosureSpec { clsEntry: icls.clsEntry, clsFvs: Nil },
+                                                    _ -> match coCloneClosureEntryForEnv(cctx, icls.clsEntry, mapVarDeclNames(ifd.fnFvs), cellGet(subEnvRev), sp) {
+                                                        Some((ne, nfvs)) -> MkClosureSpec { clsEntry: ne, clsFvs: nfvs },
+                                                        None -> icls,
+                                                    },
+                                                };
+                                                cellSet(reconClsRev, Cons((MkVarDecl { vname: innerBoundNm, vscm: fvd.vscm }, innerSpec), cellGet(reconClsRev)));
+                                                true
+                                            },
+                                            _ -> false,
+                                        },
+                                    _ -> false,
+                                };
+                                if (!handled) {
+                                    let handledData = match lookupInlineEnvOpt(cenv.ceKnownVals, rv) {
+                                        Some(CoValData(dAdt, dTag, dFs, dFtys, dTargs))
+                                            if (listLen(dFs) <= 4 && !coTypeListBlocksOpt(dFtys) && !coTypeListBlocksOpt(dTargs)) -> {
+                                            let innerDataNm = coFreshBinder(cctx, fvd.vname);
+                                            cellSet(cloneEnvRev, Cons((fvd.vname, innerDataNm), cellGet(cloneEnvRev)));
+                                            let newFieldsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                                            let dfs = cellNew(dFs);
+                                            while (match cellGet(dfs) { Nil -> false, _ -> true }) {
+                                                match cellGet(dfs) {
+                                                    Cons(ftm, rdfs) -> {
+                                                        let mappedFieldTm = match ftm.tnode {
+                                                            TmVar(fvField) -> {
+                                                                let rvf = coResolveAlias(cenv.ceAliases, fvField, 0);
+                                                                let _ = addCapturedCallerVar(rvf, ftm.tscm);
+                                                                // Also propagate closure if `rvf` itself is a known closure!
+                                                                match lookupInlineEnvOpt(cenv.ceKnownCls, rvf) {
+                                                                    Some(fcls) if (!listContainsStr(fcls.clsFvs, rvf)) ->
+                                                                        match strMapGet(cctx.coFns, fcls.clsEntry) {
+                                                                            Some(ffd) if (listLen(ffd.fnFvs) == listLen(fcls.clsFvs) && !coVarDeclListBlocksOpt(ffd.fnFvs)) -> {
+                                                                                let subClsNm = coFreshBinder(cctx, rvf);
+                                                                                let fEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                                                                                let fc1 = cellNew(ffd.fnFvs);
+                                                                                let fc2 = cellNew(fcls.clsFvs);
+                                                                                while (match (cellGet(fc1), cellGet(fc2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                                                    match (cellGet(fc1), cellGet(fc2)) {
+                                                                                        (Cons(ffvd, rfc1), Cons(fcallerFv, rfc2)) -> {
+                                                                                            let frv = coResolveAlias(cenv.ceAliases, fcallerFv, 0);
+                                                                                            let _ = addCapturedCallerVar(frv, ffvd.vscm);
+                                                                                            cellSet(fEnvRev, Cons((ffvd.vname, frv), cellGet(fEnvRev)));
+                                                                                            cellSet(fc1, rfc1);
+                                                                                            cellSet(fc2, rfc2)
+                                                                                        },
+                                                                                        _ -> (),
+                                                                                    }
+                                                                                };
+                                                                                let fInnerSpec = match ffd.fnFvs {
+                                                                                    Nil -> MkClosureSpec { clsEntry: fcls.clsEntry, clsFvs: Nil },
+                                                                                    _ -> match coCloneClosureEntryForEnv(cctx, fcls.clsEntry, mapVarDeclNames(ffd.fnFvs), cellGet(fEnvRev), sp) {
+                                                                                        Some((ne, nfvs)) -> MkClosureSpec { clsEntry: ne, clsFvs: nfvs },
+                                                                                        None -> fcls,
+                                                                                    },
+                                                                                };
+                                                                                cellSet(reconClsRev, Cons((MkVarDecl { vname: subClsNm, vscm: ftm.tscm }, fInnerSpec), cellGet(reconClsRev)));
+                                                                                MkTerm { tspan: ftm.tspan, tscm: ftm.tscm, tnode: TmVar(subClsNm) }
+                                                                            },
+                                                                            _ -> MkTerm { tspan: ftm.tspan, tscm: ftm.tscm, tnode: TmVar(rvf) },
+                                                                        },
+                                                                    _ -> MkTerm { tspan: ftm.tspan, tscm: ftm.tscm, tnode: TmVar(rvf) },
+                                                                }
+                                                            },
+                                                            _ -> ftm,
+                                                        };
+                                                        cellSet(newFieldsRev, Cons(mappedFieldTm, cellGet(newFieldsRev)));
+                                                        cellSet(dfs, rdfs)
+                                                    },
+                                                    Nil -> (),
+                                                }
+                                            };
+                                            let dataRhs = MkTerm {
+                                                tspan: sp,
+                                                tscm: fvd.vscm,
+                                                tnode: TmMakeData(dAdt, dTag, listRev(cellGet(newFieldsRev)), dFtys, dTargs),
+                                            };
+                                            cellSet(reconLetRev, Cons((MkVarDecl { vname: innerDataNm, vscm: fvd.vscm }, dataRhs), cellGet(reconLetRev)));
+                                            true
+                                        },
+                                        _ -> false,
+                                    };
+                                    if (!handledData) {
+                                        let _ = addCapturedCallerVar(rv, fvd.vscm);
+                                        cellSet(cloneEnvRev, Cons((fvd.vname, rv), cellGet(cloneEnvRev)))
+                                    } else ()
+                                } else ();
+                                cellSet(cf1, rf1);
+                                cellSet(cf2, rf2)
+                            },
+                            _ -> (),
+                        }
+                    };
+
+                    let newParamsRev: Cell (List VarDecl) = cellNew(Nil);
+                    let cp = cellNew(clsFd.fnParams);
+                    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                        match cellGet(cp) {
+                            Cons(pvd, rp) -> {
+                                let np = coFreshBinder(cctx, pvd.vname);
+                                cellSet(cloneEnvRev, Cons((pvd.vname, np), cellGet(cloneEnvRev)));
+                                cellSet(newParamsRev, Cons(MkVarDecl { vname: np, vscm: pvd.vscm }, cellGet(newParamsRev)));
+                                cellSet(cp, rp)
+                            },
+                            Nil -> (),
+                        }
+                    };
+
+                    let clonedCore = coCloneTerm(cctx, clsFd.fnBody, cellGet(cloneEnvRev), sp);
+                    let bodyWithLets = coWrapLetBindings(listRev(cellGet(reconLetRev)), clonedCore, sp, clsFd.fnBody.tscm);
+                    let bodyWrapped = cellNew(bodyWithLets);
+                    let crc = cellNew(cellGet(reconClsRev));
+                    while (match cellGet(crc) { Nil -> false, _ -> true }) {
+                        match cellGet(crc) {
+                            Cons((rcVd, rcSpec), rrc) -> {
+                                cellSet(bodyWrapped, MkTerm {
+                                    tspan: sp,
+                                    tscm: clsFd.fnBody.tscm,
+                                    tnode: TmMakeCls(rcVd, rcSpec, cellGet(bodyWrapped)),
+                                });
+                                cellSet(crc, rrc)
+                            },
+                            Nil -> (),
+                        }
+                    };
+
+                    let newParams = listRev(cellGet(newParamsRev));
+                    let newFnFvs0 = listRev(cellGet(newFnFvsRev));
+                    let newCallFvs0 = listRev(cellGet(newCallFvsRev));
+                    let innerEnv = coInitialEnvForFn(newParams, newFnFvs0);
+                    let savedInl = cellGet(cctx.coFnInlines);
+                    cellSet(cctx.coFnInlines, 0);
+                    let optInnerBody = coOptTerm(cctx, newClsEntry, cellGet(bodyWrapped), innerEnv, cExportSet, depth + 1);
+                    cellSet(cctx.coFnInlines, savedInl);
+
+                    // Prune any captured free variables that became dead after simplifying `optInnerBody`!
+                    let liveFnFvsRev: Cell (List VarDecl) = cellNew(Nil);
+                    let liveCallFvsRev: Cell (List String) = cellNew(Nil);
+                    let lf1 = cellNew(newFnFvs0);
+                    let lf2 = cellNew(newCallFvs0);
+                    while (match (cellGet(lf1), cellGet(lf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                        match (cellGet(lf1), cellGet(lf2)) {
+                            (Cons(fvd, rlf1), Cons(cfv, rlf2)) -> {
+                                if (coTermMentionsVar(optInnerBody, fvd.vname)) {
+                                    cellSet(liveFnFvsRev, Cons(fvd, cellGet(liveFnFvsRev)));
+                                    cellSet(liveCallFvsRev, Cons(cfv, cellGet(liveCallFvsRev)))
+                                } else ();
+                                cellSet(lf1, rlf1);
+                                cellSet(lf2, rlf2)
+                            },
+                            _ -> (),
+                        }
+                    };
+
+                    let finalFnFvs = listRev(cellGet(liveFnFvsRev));
+                    let finalCallFvs = listRev(cellGet(liveCallFvsRev));
+                    let newFd = MkFunDef {
+                        fnName: newClsEntry,
+                        fnSpan: sp,
+                        fnScm: clsFd.fnScm,
+                        fnParams: newParams,
+                        fnFvs: finalFnFvs,
+                        fnBody: optInnerBody,
+                    };
+                    coRegisterFn(cctx, newFd);
+                    MkClosureSpec { clsEntry: newClsEntry, clsFvs: finalCallFvs }
+                }
+            },
+    }
+
+// ---- Main Recursive Term Optimizer (`coOptTerm`) ----
+
+def coInitialEnvForFn(params: List VarDecl, fvs: List VarDecl): CoEnv = {
+    let tysRev: Cell (List (String, Scheme)) = cellNew(Nil);
+    let cp = cellNew(params);
+    while (match cellGet(cp) { Nil -> false, _ -> true }) {
+        match cellGet(cp) {
+            Cons(vd, r) -> {
+                cellSet(tysRev, Cons((vd.vname, vd.vscm), cellGet(tysRev)));
+                cellSet(cp, r)
+            },
+            Nil -> (),
+        }
+    };
+    let cf = cellNew(fvs);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(vd, r) -> {
+                cellSet(tysRev, Cons((vd.vname, vd.vscm), cellGet(tysRev)));
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    MkCoEnv {
+        ceAliases: Nil,
+        ceVarTys: listRev(cellGet(tysRev)),
+        ceKnownVals: Nil,
+        ceKnownCls: Nil,
+    }
+}
+
+def coRecordLetBindingInEnv(cenv: CoEnv, vd: VarDecl, rhs: TaggedTerm): CoEnv = {
+    let base = coBindVarInEnv(cenv, vd.vname, vd.vscm);
+    match rhs.tnode {
+        TmVar(src) -> {
+            let rsrc = coResolveAlias(base.ceAliases, src, 0);
+            if (rsrc == vd.vname) base
+            else MkCoEnv {
+                ceAliases: Cons((vd.vname, rsrc), base.ceAliases),
+                ceVarTys: base.ceVarTys,
+                ceKnownVals: base.ceKnownVals,
+                ceKnownCls: base.ceKnownCls,
+            }
+        },
+        TmLit(l) -> MkCoEnv {
+            ceAliases: base.ceAliases,
+            ceVarTys: base.ceVarTys,
+            ceKnownVals: Cons((vd.vname, CoValLit(l)), base.ceKnownVals),
+            ceKnownCls: base.ceKnownCls,
+        },
+        TmTuple(es) if (coAllTermsSimple(es) && !coTermListMentionsVar(es, vd.vname)) -> MkCoEnv {
+            ceAliases: base.ceAliases,
+            ceVarTys: base.ceVarTys,
+            ceKnownVals: Cons((vd.vname, CoValTuple(es)), base.ceKnownVals),
+            ceKnownCls: base.ceKnownCls,
+        },
+        TmMakeData(adt, tag, fs, ftys, targs) if (coAllTermsSimple(fs) && !coTermListMentionsVar(fs, vd.vname)) -> MkCoEnv {
+            ceAliases: base.ceAliases,
+            ceVarTys: base.ceVarTys,
+            ceKnownVals: Cons((vd.vname, CoValData(adt, tag, fs, ftys, targs)), base.ceKnownVals),
+            ceKnownCls: base.ceKnownCls,
+        },
+        _ -> base,
+    }
+}
+
+def coFinishLetWithDeadElim(vd: VarDecl, rhs: TaggedTerm, body: TaggedTerm, sp: Span, sc: Scheme): TaggedTerm =
+    if (!coTermMentionsVar(body, vd.vname) && coTermIsPure(rhs)) body
+    else MkTerm { tspan: sp, tscm: sc, tnode: TmLet(vd, rhs, body) }
+
+def coFinishMakeClsWithDeadElim(vd: VarDecl, cls: ClosureSpec, body: TaggedTerm, sp: Span, sc: Scheme): TaggedTerm =
+    if (!coTermMentionsVar(body, vd.vname)) body
+    else MkTerm { tspan: sp, tscm: sc, tnode: TmMakeCls(vd, cls, body) }
+
+def coEvictPatVarsFromEnv(pat: Pattern, cenv: CoEnv): CoEnv = match pat {
+    PatWild -> cenv,
+    PatLit(_) -> cenv,
+    PatVar(v, _) -> coBindVarInEnv(cenv, v, ScmSlot),
+    PatTuple(ps) -> coEvictPatVarListFromEnv(ps, cenv),
+    PatCtor(_, ps) -> coEvictPatVarListFromEnv(ps, cenv),
+    PatStruct(_, _) -> cenv,
+}
+
+def coEvictPatVarListFromEnv(ps: List Pattern, cenv: CoEnv): CoEnv = match ps {
+    Nil -> cenv,
+    Cons(p, r) -> coEvictPatVarListFromEnv(r, coEvictPatVarsFromEnv(p, cenv)),
+}
+
+def coEnvHasVar(cenv: CoEnv, v: String): Bool = match lookupInlineEnvOpt(cenv.ceVarTys, v) {
+    Some(_) -> true,
+    None -> false,
+}
+
+def coBindFlatLetChain(
+    cctx: CombOptCtx,
+    callerName: String,
+    vd: VarDecl,
+    flatRhs: TaggedTerm,
+    body0: TaggedTerm,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    depth: Int,
+    sp: Span,
+    sc: Scheme
+): TaggedTerm = match flatRhs.tnode {
+    TmLet(innerVd, innerRhs, innerBody) if (innerVd.vname != vd.vname && !coEnvHasVar(cenv, innerVd.vname) && !coTermMentionsVar(body0, innerVd.vname)) -> {
+        let cenv1 = coRecordLetBindingInEnv(cenv, innerVd, innerRhs);
+        let restOpt = coBindFlatLetChain(cctx, callerName, vd, innerBody, body0, cenv1, cExportSet, depth, sp, sc);
+        coFinishLetWithDeadElim(innerVd, innerRhs, restOpt, sp, sc)
+    },
+    TmMakeCls(clsVd, clsSpec, innerBody) if (clsVd.vname != vd.vname && !coEnvHasVar(cenv, clsVd.vname) && !coTermMentionsVar(body0, clsVd.vname)) -> {
+        let base = coBindVarInEnv(cenv, clsVd.vname, clsVd.vscm);
+        let cenv1 =
+            if (listContainsStr(clsSpec.clsFvs, clsVd.vname)) base
+            else MkCoEnv {
+                ceAliases: base.ceAliases,
+                ceVarTys: base.ceVarTys,
+                ceKnownVals: base.ceKnownVals,
+                ceKnownCls: Cons((clsVd.vname, clsSpec), base.ceKnownCls),
+            };
+        let restOpt = coBindFlatLetChain(cctx, callerName, vd, innerBody, body0, cenv1, cExportSet, depth, sp, sc);
+        coFinishMakeClsWithDeadElim(clsVd, clsSpec, restOpt, sp, sc)
+    },
+    _ -> {
+        let cenvNext = coRecordLetBindingInEnv(cenv, vd, flatRhs);
+        let body1 = coOptTerm(cctx, callerName, body0, cenvNext, cExportSet, depth);
+        coFinishLetWithDeadElim(vd, flatRhs, body1, sp, sc)
+    },
+}
+
+def coOptMatchWithFloatedScrut(
+    cctx: CombOptCtx,
+    callerName: String,
+    scrut: TaggedTerm,
+    arms0: List CoreArm,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    depth: Int,
+    sp: Span,
+    sc: Scheme
+): TaggedTerm = match scrut.tnode {
+    TmLet(svd, srhs, sbody) if (!coEnvHasVar(cenv, svd.vname) && !coArmListMentionsVar(arms0, svd.vname)) -> {
+        let cenv1 = coRecordLetBindingInEnv(cenv, svd, srhs);
+        let inner = coOptMatchWithFloatedScrut(cctx, callerName, sbody, arms0, cenv1, cExportSet, depth, sp, sc);
+        coFinishLetWithDeadElim(svd, srhs, inner, sp, sc)
+    },
+    TmMakeCls(cvd, cspec, sbody) if (!coEnvHasVar(cenv, cvd.vname) && !coArmListMentionsVar(arms0, cvd.vname)) -> {
+        let base = coBindVarInEnv(cenv, cvd.vname, cvd.vscm);
+        let cenv1 =
+            if (listContainsStr(cspec.clsFvs, cvd.vname)) base
+            else MkCoEnv {
+                ceAliases: base.ceAliases,
+                ceVarTys: base.ceVarTys,
+                ceKnownVals: base.ceKnownVals,
+                ceKnownCls: Cons((cvd.vname, cspec), base.ceKnownCls),
+            };
+        let inner = coOptMatchWithFloatedScrut(cctx, callerName, sbody, arms0, cenv1, cExportSet, depth, sp, sc);
+        coFinishMakeClsWithDeadElim(cvd, cspec, inner, sp, sc)
+    },
+    _ -> match coTryReduceMatch(cctx, scrut, arms0, cenv, sp, sc) {
+        Some(reduced) -> coOptTerm(cctx, callerName, reduced, cenv, cExportSet, depth),
+        None -> {
+            let armsRev: Cell (List CoreArm) = cellNew(Nil);
+            let cur = cellNew(arms0);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let armEnv = coEvictPatVarsFromEnv(a.caPat, cenv);
+                        let g2 = match a.caGuard {
+                            Some(g) -> Some(coOptTerm(cctx, callerName, g, armEnv, cExportSet, depth)),
+                            None -> None,
+                        };
+                        let b2 = coOptTerm(cctx, callerName, a.caBody, armEnv, cExportSet, depth);
+                        cellSet(armsRev, Cons(MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: b2 }, cellGet(armsRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            MkTerm { tspan: sp, tscm: sc, tnode: TmMatch(scrut, listRev(cellGet(armsRev))) }
+        },
+    },
+}
+
+def coOptTerm(
+    cctx: CombOptCtx,
+    callerName: String,
+    tm: TaggedTerm,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    depth: Int
+): TaggedTerm = {
+    let sp = tm.tspan;
+    let sc = tm.tscm;
+    match tm.tnode {
+        TmLit(_) -> tm,
+        TmGlobalVar(_) -> tm,
+        TmVar(v) -> {
+            let rv = coResolveAlias(cenv.ceAliases, v, 0);
+            if (rv == v) tm else MkTerm { tspan: sp, tscm: sc, tnode: TmVar(rv) }
+        },
+        TmTuple(es0) -> {
+            let es1 = coOptTermList(cctx, callerName, es0, cenv, cExportSet, depth);
+            if (coAllTermsSimple(es1)) MkTerm { tspan: sp, tscm: sc, tnode: TmTuple(es1) }
+            else {
+                let lifted = coAnfLiftTermList(cctx, es1, sp, sc, (xs) -> TmTuple(xs));
+                coOptTerm(cctx, callerName, lifted, cenv, cExportSet, depth)
+            }
+        },
+        TmMakeData(adt, tag, fs0, ftys, targs) -> {
+            let fs1 = coOptTermList(cctx, callerName, fs0, cenv, cExportSet, depth);
+            if (coAllTermsSimple(fs1)) {
+                MkTerm { tspan: sp, tscm: sc, tnode: TmMakeData(adt, tag, fs1, ftys, targs) }
+            } else {
+                let lifted = coAnfLiftTermList(cctx, fs1, sp, sc, (xs) -> TmMakeData(adt, tag, xs, ftys, targs));
+                coOptTerm(cctx, callerName, lifted, cenv, cExportSet, depth)
+            }
+        },
+        TmBlock(es0) -> {
+            let es1 = coOptTermList(cctx, callerName, es0, cenv, cExportSet, depth);
+            match es1 {
+                Cons(only, Nil) -> only,
+                _ -> MkTerm { tspan: sp, tscm: sc, tnode: TmBlock(es1) },
+            }
+        },
+        TmBin(op, l, r) ->
+            MkTerm {
+                tspan: sp,
+                tscm: sc,
+                tnode: TmBin(
+                    op,
+                    coOptTerm(cctx, callerName, l, cenv, cExportSet, depth),
+                    coOptTerm(cctx, callerName, r, cenv, cExportSet, depth)
+                ),
+            },
+        TmUn(op, e1) ->
+            MkTerm { tspan: sp, tscm: sc, tnode: TmUn(op, coOptTerm(cctx, callerName, e1, cenv, cExportSet, depth)) },
+        TmGetTag(e1) ->
+            MkTerm { tspan: sp, tscm: sc, tnode: TmGetTag(coOptTerm(cctx, callerName, e1, cenv, cExportSet, depth)) },
+        TmIf(c, t, e) ->
+            MkTerm {
+                tspan: sp,
+                tscm: sc,
+                tnode: TmIf(
+                    coOptTerm(cctx, callerName, c, cenv, cExportSet, depth),
+                    coOptTerm(cctx, callerName, t, cenv, cExportSet, depth),
+                    coOptTerm(cctx, callerName, e, cenv, cExportSet, depth)
+                ),
+            },
+        TmWhile(c, b) ->
+            MkTerm {
+                tspan: sp,
+                tscm: sc,
+                tnode: TmWhile(
+                    coOptTerm(cctx, callerName, c, cenv, cExportSet, depth),
+                    coOptTerm(cctx, callerName, b, cenv, cExportSet, depth)
+                ),
+            },
+        TmLet(vd, rhs0, body0) -> {
+            let rhs1 = coOptTerm(cctx, callerName, rhs0, cenv, cExportSet, depth);
+            coBindFlatLetChain(cctx, callerName, vd, rhs1, body0, cenv, cExportSet, depth, sp, sc)
+        },
+        TmMakeCls(vd, cls0, body0) -> {
+            let cls1 = coTryPropagateClosureCaptures(cctx, vd, cls0, cenv, cExportSet, sp, depth);
+            let base = coBindVarInEnv(cenv, vd.vname, vd.vscm);
+            let cenvNext =
+                if (listContainsStr(cls1.clsFvs, vd.vname)) base
+                else MkCoEnv {
+                    ceAliases: base.ceAliases,
+                    ceVarTys: base.ceVarTys,
+                    ceKnownVals: base.ceKnownVals,
+                    ceKnownCls: Cons((vd.vname, cls1), base.ceKnownCls),
+                };
+            let body1 = coOptTerm(cctx, callerName, body0, cenvNext, cExportSet, depth);
+            coFinishMakeClsWithDeadElim(vd, cls1, body1, sp, sc)
+        },
+        TmMatch(scrut0, arms0) -> {
+            let scrut1 = coOptTerm(cctx, callerName, scrut0, cenv, cExportSet, depth);
+            coOptMatchWithFloatedScrut(cctx, callerName, scrut1, arms0, cenv, cExportSet, depth, sp, sc)
+        },
+        TmApplyCls(callee0, args0) -> {
+            let callee1 = coOptTerm(cctx, callerName, callee0, cenv, cExportSet, depth);
+            let args1 = coOptTermList(cctx, callerName, args0, cenv, cExportSet, depth);
+            if (coTermNeedsArgFloat(callee1) || coAnyTermNeedsArgFloat(args1)) {
+                let floatedList = Cons(callee1, args1);
+                let lifted = coFloatSelectedArgs(cctx, floatedList, sp, sc, (xs) -> match xs {
+                    Cons(nc, nargs) -> TmApplyCls(nc, nargs),
+                    Nil -> TmApplyCls(callee1, args1),
+                });
+                coOptTerm(cctx, callerName, lifted, cenv, cExportSet, depth)
+            } else {
+                let devirtOpt: Option TaggedTerm = match callee1.tnode {
+                    TmVar(cv) -> {
+                        let rcv = coResolveAlias(cenv.ceAliases, cv, 0);
+                        match lookupInlineEnvOpt(cenv.ceKnownCls, rcv) {
+                            None -> None,
+                            Some(cls) ->
+                                if (listContainsStr(cls.clsFvs, rcv)) None
+                                else match strMapGet(cctx.coFns, cls.clsEntry) {
+                                    None -> None,
+                                    Some(clsFd) ->
+                                        if (
+                                            listLen(clsFd.fnParams) != listLen(args1)
+                                            || listLen(clsFd.fnFvs) != listLen(cls.clsFvs)
+                                            || !coTypesEqualModuloMode(schemeBody(sc), schemeBody(clsFd.fnBody.tscm))
+                                            || !coInlineParamsMatchArgs(clsFd.fnParams, args1)
+                                            || coTypeBlocksOpt(schemeBody(sc))
+                                            || coVarDeclListBlocksOpt(clsFd.fnParams)
+                                            || coVarDeclListBlocksOpt(clsFd.fnFvs)
+                                        ) None
+                                        else {
+                                            let cost = coCombinatorTermCost(clsFd.fnBody, cctx.coExterns);
+                                            let inlCnt = cellGet(cctx.coFnInlines);
+                                            if (
+                                                coInlineBudgetAllows(cost, 52, inlCnt, 96, depth, 7)
+                                                && !coReachesTargetFn(cctx, cls.clsEntry, callerName)
+                                            ) {
+                                                cellSet(cctx.coFnInlines, inlCnt + 1);
+                                                let fvEnvRev: Cell (List (String, String)) = cellNew(Nil);
+                                                let cf1 = cellNew(clsFd.fnFvs);
+                                                let cf2 = cellNew(cls.clsFvs);
+                                                while (match (cellGet(cf1), cellGet(cf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                    match (cellGet(cf1), cellGet(cf2)) {
+                                                        (Cons(fvd, rf1), Cons(callerFv, rf2)) -> {
+                                                            let rv = coResolveAlias(cenv.ceAliases, callerFv, 0);
+                                                            cellSet(fvEnvRev, Cons((fvd.vname, rv), cellGet(fvEnvRev)));
+                                                            cellSet(cf1, rf1);
+                                                            cellSet(cf2, rf2)
+                                                        },
+                                                        _ -> (),
+                                                    }
+                                                };
+                                                let inlined = coBuildCallArgsInline(
+                                                    cctx, clsFd.fnParams, args1, cellGet(fvEnvRev), sp, sc, clsFd.fnBody
+                                                );
+                                                Some(coOptTerm(cctx, callerName, inlined, cenv, cExportSet, depth + 1))
+                                            } else {
+                                                match cls.clsFvs {
+                                                    Nil -> {
+                                                        let dirVd = MkVarDecl { vname: cls.clsEntry, vscm: ScmMono(schemeBody(callee1.tscm)) };
+                                                        Some(MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(dirVd, args1) })
+                                                    },
+                                                    _ -> {
+                                                        let flatName = coGetOrCreateFlatClsFn(cctx, clsFd, cExportSet);
+                                                        match strMapGet(cctx.coFns, flatName) {
+                                                            Some(flatFd) -> {
+                                                                let fvArgsRev: Cell (List TaggedTerm) = cellNew(Nil);
+                                                                let cf1 = cellNew(clsFd.fnFvs);
+                                                                let cf2 = cellNew(cls.clsFvs);
+                                                                while (match (cellGet(cf1), cellGet(cf2)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                                                    match (cellGet(cf1), cellGet(cf2)) {
+                                                                        (Cons(fvd, rf1), Cons(callerFv, rf2)) -> {
+                                                                            let rv = coResolveAlias(cenv.ceAliases, callerFv, 0);
+                                                                            cellSet(fvArgsRev, Cons(MkTerm {
+                                                                                tspan: sp,
+                                                                                tscm: fvd.vscm,
+                                                                                tnode: TmVar(rv),
+                                                                            }, cellGet(fvArgsRev)));
+                                                                            cellSet(cf1, rf1);
+                                                                            cellSet(cf2, rf2)
+                                                                        },
+                                                                        _ -> (),
+                                                                    }
+                                                                };
+                                                                let allArgs = listAppend(listRev(cellGet(fvArgsRev)), args1);
+                                                                Some(MkTerm {
+                                                                    tspan: sp,
+                                                                    tscm: sc,
+                                                                    tnode: TmApplyDir(MkVarDecl { vname: flatName, vscm: flatFd.fnScm }, allArgs),
+                                                                })
+                                                            },
+                                                            None -> None,
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        },
+                                },
+                        }
+                    },
+                    _ -> None,
+                };
+                match devirtOpt {
+                    Some(resTm) -> resTm,
+                    None -> MkTerm { tspan: sp, tscm: sc, tnode: TmApplyCls(callee1, args1) },
+                }
+            }
+        },
+        TmApplyDir(vd, args0) -> {
+            let args1 = coOptTermList(cctx, callerName, args0, cenv, cExportSet, depth);
+            let isCellIntrinsic = !isShadowedBuiltin(vd.vname, cctx.coFns, cctx.coExterns)
+                && (vd.vname == "cellNew" || vd.vname == "cellGet" || vd.vname == "cellSet");
+            if (!isCellIntrinsic && coAnyTermNeedsArgFloat(args1)) {
+                let lifted = coFloatSelectedArgs(cctx, args1, sp, sc, (xs) -> TmApplyDir(vd, xs));
+                coOptTerm(cctx, callerName, lifted, cenv, cExportSet, depth)
+            } else if (strMapContains(cctx.coExterns, vd.vname)) {
+                MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args1) }
+            } else match strMapGet(cctx.coFns, vd.vname) {
+                None -> MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args1) },
+                Some(calleeFd) ->
+                    if (callerName != calleeFd.fnName && match calleeFd.fnFvs { Nil -> true, _ -> false } && coTermCallsFn(calleeFd.fnBody, calleeFd.fnName)) {
+                        match coTrySpecializeHofLoop(cctx, calleeFd, args1, cenv, cExportSet, sp, sc) {
+                            Some(specCall) -> specCall,
+                            None -> MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args1) },
+                        }
+                    } else {
+                        let inlCnt = cellGet(cctx.coFnInlines);
+                        if (
+                            coInlineBudgetAllows(1, 28, inlCnt, 96, depth, 7)
+                            && callerName != calleeFd.fnName
+                            && coIsEligibleGeneralInlineFn(cctx, calleeFd, cExportSet)
+                            && !coReachesTargetFn(cctx, calleeFd.fnName, callerName)
+                            && coTypesEqualModuloMode(schemeBody(sc), schemeBody(calleeFd.fnBody.tscm))
+                            && coInlineParamsMatchArgs(calleeFd.fnParams, args1)
+                        ) {
+                            cellSet(cctx.coFnInlines, inlCnt + 1);
+                            let inlined = coBuildCallArgsInline(
+                                cctx, calleeFd.fnParams, args1, Nil, sp, sc, calleeFd.fnBody
+                            );
+                            coOptTerm(cctx, callerName, inlined, cenv, cExportSet, depth + 1)
+                        } else {
+                            MkTerm { tspan: sp, tscm: sc, tnode: TmApplyDir(vd, args1) }
+                        }
+                    },
+            }
+        },
+    }
+}
+
+def coOptTermList(
+    cctx: CombOptCtx,
+    callerName: String,
+    es: List TaggedTerm,
+    cenv: CoEnv,
+    cExportSet: StrMap Bool,
+    depth: Int
+): List TaggedTerm
+    ensures out -> listLen(out) == listLen(es)
+= match es {
+    Nil -> Nil,
+    Cons(h, t) -> Cons(
+        coOptTerm(cctx, callerName, h, cenv, cExportSet, depth),
+        coOptTermList(cctx, callerName, t, cenv, cExportSet, depth)
+    ),
+}
+
+def optimizeCoreCombinators(
+    fns: StrMap FunDef,
+    fnNames: List String,
+    globals: List GlobalValDef,
+    externs: StrMap ExternDef,
+    ctorMap: StrMap (String, VariantInfo),
+    cExports: List (String, String),
+    skipOptFns: StrMap Bool,
+    nextBinderId: Cell Int
+): (List String, List GlobalValDef)
+    requires cellGet(nextBinderId) >= 0
+    ensures r -> match r { (outNames, outGlobs) -> listLen(outNames) >= listLen(fnNames) && listLen(outGlobs) == listLen(globals) }
+= {
+    let cExportSet: StrMap Bool = strMapNew();
+    let ce = cellNew(cExports);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons((fnm, _), r) -> {
+                strMapInsert(cExportSet, fnm, true);
+                cellSet(ce, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let cctx = MkCombOptCtx {
+        coFns: fns,
+        coCalleesCache: strMapNew(),
+        coNewNamesRev: cellNew(Nil),
+        coExterns: externs,
+        coCtorMap: ctorMap,
+        coSkipFns: skipOptFns,
+        coFlatClsMap: strMapNew(),
+        coSpecMap: strMapNew(),
+        coSpecCount: cellNew(0),
+        coFnInlines: cellNew(0),
+        coIdCnt: nextBinderId,
+    };
+
+    // Optimize top-level & monomorphized functions (`fnFvs == Nil`)
+    let cf = cellNew(fnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(fnm, r) -> {
+                if (!strMapContains(skipOptFns, fnm)) {
+                    match strMapGet(fns, fnm) {
+                        Some(fd) -> match fd.fnFvs {
+                            Nil -> {
+                                cellSet(cctx.coFnInlines, 0);
+                                let initEnv = coInitialEnvForFn(fd.fnParams, Nil);
+                                let newBody = coOptTerm(cctx, fnm, fd.fnBody, initEnv, cExportSet, 0);
+                                coStoreFn(cctx, MkFunDef {
+                                    fnName: fd.fnName,
+                                    fnSpan: fd.fnSpan,
+                                    fnScm: fd.fnScm,
+                                    fnParams: fd.fnParams,
+                                    fnFvs: Nil,
+                                    fnBody: newBody,
+                                })
+                            },
+                            _ -> (),
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Also optimize any remaining lifted closure bodies (`fnFvs != Nil`)
+    let allNames1 = listAppend(fnNames, listRev(cellGet(cctx.coNewNamesRev)));
+    cellSet(cctx.coNewNamesRev, Nil);
+    let cf2 = cellNew(allNames1);
+    while (match cellGet(cf2) { Nil -> false, _ -> true }) {
+        match cellGet(cf2) {
+            Cons(fnm, r) -> {
+                if (!strMapContains(skipOptFns, fnm)) {
+                    match strMapGet(fns, fnm) {
+                        Some(fd) -> match fd.fnFvs {
+                            Cons(_, _) -> {
+                                cellSet(cctx.coFnInlines, 0);
+                                let initEnv = coInitialEnvForFn(fd.fnParams, fd.fnFvs);
+                                let newBody = coOptTerm(cctx, fnm, fd.fnBody, initEnv, cExportSet, 0);
+                                coStoreFn(cctx, MkFunDef {
+                                    fnName: fd.fnName,
+                                    fnSpan: fd.fnSpan,
+                                    fnScm: fd.fnScm,
+                                    fnParams: fd.fnParams,
+                                    fnFvs: fd.fnFvs,
+                                    fnBody: newBody,
+                                })
+                            },
+                            Nil -> (),
+                        },
+                        None -> (),
+                    }
+                } else ();
+                cellSet(cf2, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Optimize global initializers
+    let outGlobsRev: Cell (List GlobalValDef) = cellNew(Nil);
+    let emptyEnv = coInitialEnvForFn(Nil, Nil);
+    let cg = cellNew(globals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(gv, r) -> {
+                cellSet(cctx.coFnInlines, 0);
+                let newInit = coOptTerm(cctx, "$global$" + gv.gvName, gv.gvInit, emptyEnv, cExportSet, 0);
+                cellSet(outGlobsRev, Cons(MkGlobalValDef {
+                    gvName: gv.gvName,
+                    gvSpan: gv.gvSpan,
+                    gvTy: gv.gvTy,
+                    gvInit: newInit,
+                }, cellGet(outGlobsRev)));
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let finalNames = listAppend(allNames1, listRev(cellGet(cctx.coNewNamesRev)));
+    (finalNames, listRev(cellGet(outGlobsRev)))
+}
+
+// ============================================================================
 // Top-Level Entry Point (`lowerToCore`, `lowerToCoreOpt`, `lowerToCoreMode`, `lowerToCoreOptMode`, `lowerToCoreForCheck`)
 // ============================================================================
 
@@ -5697,11 +8174,21 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
     match cellGet(ctx.kErr) {
         Some(emsg) -> Err(emsg),
         None -> {
-            let (concreteFns0, concreteNames, concreteGlobals0) = runMonomorphizationWorklist(ctx);
-            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames, concreteGlobals0, ctx.kExterns, contractMode);
-            let concreteGlobals =
-                if (runInline && contractMode != "keep") inlineTinyLeafFns(concreteFns, concreteNames, concreteGlobals1, ctx.kExterns)
-                else concreteGlobals1;
+            let (concreteFns0, concreteNames0, concreteGlobals0) = runMonomorphizationWorklist(ctx);
+            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames0, concreteGlobals0, ctx.kExterns, contractMode);
+            verifyConcurrentClosures(concreteFns, concreteNames0, concreteGlobals1, inf.adtReg)?;
+            let cExportList = listRev(cellGet(cExportsRev));
+            let (concreteNames, concreteGlobals) =
+                if (runInline && contractMode != "keep") {
+                    let nextBinderId = cellNew(0);
+                    let emptySkip: StrMap Bool = strMapNew();
+                    let g2 = inlineTinyLeafFns(concreteFns, concreteNames0, concreteGlobals1, ctx.kExterns, nextBinderId);
+                    let (ns3, g3) = optimizeCoreCombinators(
+                        concreteFns, concreteNames0, g2, ctx.kExterns, ctorMap, cExportList, emptySkip, nextBinderId
+                    );
+                    let g4 = inlineTinyLeafFns(concreteFns, ns3, g3, ctx.kExterns, nextBinderId);
+                    (ns3, g4)
+                } else (concreteNames0, concreteGlobals1);
             verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
             let escapeInfo =
                 if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, ctx.kExterns, inf.adtReg, inf.adtNames)
@@ -5724,7 +8211,7 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
                 coreGlobals: concreteGlobals,
                 coreExterns: ctx.kExterns,
                 coreExternNames: sortUniqueStrings(cellGet(ctx.kExternNamesRev)),
-                coreCExports: listRev(cellGet(cExportsRev)),
+                coreCExports: cExportList,
                 coreCtors: listRev(cellGet(ctorsRev)),
                 coreAdtReg: inf.adtReg,
                 coreAdtNames: listRev(cellGet(adtNamesListRev)),

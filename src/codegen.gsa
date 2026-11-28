@@ -3298,7 +3298,7 @@ def tryEmitIntrinsic(
     locals: List (String, VarSlot),
     directLetVar: Option String
 ): Option String = {
-    if (name == "__gs_contract_fail") {
+    if (name == "$gs$contract_fail") {
         let a0 = nthArgTerm(args, 0);
         let msgVal = genExpr(mctx, fctx, a0, locals, false);
         emitLine(fctx, "call void @gs_contract_fail(ptr " + msgVal + ")");
@@ -5203,6 +5203,7 @@ def genExpr(
             let calleeName = funDecl.vname;
             let retGeishaTy = schemeBody(tm.tscm);
             let isShadowed = !strStartsWith(calleeName, "__gs_")
+                && !strStartsWith(calleeName, "$gs$")
                 && (strMapContains(mctx.mcExterns, calleeName) || strMapContains(mctx.mcFns, calleeName));
             let intrinRes = if (isShadowed) None else tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals, directLetVar);
             match intrinRes {

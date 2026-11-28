@@ -127,6 +127,7 @@ data CliOpts {
 }
 
 def gContractMode: Cell String = cellNew("erase")
+def gOptLevel: Cell String = cellNew("2")
 def gVerifiedOpt: Cell Bool = cellNew(false)
 def gCompileOnly: Cell Bool = cellNew(false)
 def gVerifySolver: Cell String = cellNew("z3")
@@ -913,16 +914,17 @@ def compileLoadedDefsToIrForArchDebug(
     debugInfo: Bool
 ): Result String String = {
     let inf = inferProgram(rawDefs)?;
+    let runOpt = !debugInfo && cellGet(gOptLevel) != "0";
     let coreProg =
         if (cellGet(gVerifiedOpt) && cellGet(gContractMode) != "check") {
             let keepProg = lowerToCoreOptMode(inf, true, false, "keep")?;
             let isOpenWorld = noMain || cellGet(gCompileOnly);
             let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, isWasm, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
             setVerifiedSafeFns(safeFns);
-            prepareVerifiedOptCore(keepProg, safeFns, !debugInfo)
+            prepareVerifiedOptCore(keepProg, safeFns, runOpt)
         } else {
             clearVerifiedSafeFns();
-            lowerToCoreOptMode(inf, true, !debugInfo, cellGet(gContractMode))?
+            lowerToCoreOptMode(inf, true, runOpt, cellGet(gContractMode))?
         };
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let ir = emitProgramLlvmIrForTargetDebug(
@@ -1506,7 +1508,9 @@ def compileWithPkgSpecsToJs(
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCoreMode(inf, cellGet(gContractMode))?;
+    let effOptJs = match tc.tcOptLevel { Some(lvl) -> lvl, None -> cellGet(gOptLevel) };
+    let cmJs = cellGet(gContractMode);
+    let coreProg = lowerToCoreOptMode(inf, true, effOptJs != "0" && cmJs != "keep", cmJs)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let effExports = match tc.tcExports {
         Nil -> collectRootPubFnNames(rawDefs, coreProg),
@@ -1545,7 +1549,9 @@ def compileWithPkgSpecsToWasmGc(
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
     let inf = inferProgram(rawDefs)?;
-    let coreProg = lowerToCoreMode(inf, cellGet(gContractMode))?;
+    let effOptWgc = match tc.tcOptLevel { Some(lvl) -> lvl, None -> cellGet(gOptLevel) };
+    let cmWgc = cellGet(gContractMode);
+    let coreProg = lowerToCoreOptMode(inf, true, effOptWgc != "0" && cmWgc != "keep", cmWgc)?;
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let effExports = match tc.tcExports {
         Nil -> collectRootPubFnNames(rawDefs, coreProg),
@@ -1918,19 +1924,21 @@ def compileLoadedDefsToCgusForArchDebug(
     noMain: Bool,
     bootSymOpt: Option String,
     debugInfo: Bool,
+    runOpt: Bool,
     singleCgu: Bool
 ): Result (List CguIr) String = {
     let inf = inferProgram(rawDefs)?;
+    let doOpt = !debugInfo && runOpt;
     let coreProg =
         if (cellGet(gVerifiedOpt) && cellGet(gContractMode) != "check") {
             let keepProg = lowerToCoreOptMode(inf, true, false, "keep")?;
             let isOpenWorld = noMain || cellGet(gCompileOnly);
             let safeFns = computeVerifiedSafeFns(keepProg, exports, isOpenWorld, isWasm, cellGet(gVerifySolver), cellGet(gVerifyTimeoutMs))?;
             setVerifiedSafeFns(safeFns);
-            prepareVerifiedOptCore(keepProg, safeFns, !debugInfo)
+            prepareVerifiedOptCore(keepProg, safeFns, doOpt)
         } else {
             clearVerifiedSafeFns();
-            lowerToCoreOptMode(inf, true, !debugInfo, cellGet(gContractMode))?
+            lowerToCoreOptMode(inf, true, doOpt, cellGet(gContractMode))?
         };
     maybeDumpCoreIr(coreProg, dumpCoreOpt)?;
     let targetOs = if (isWasm) "wasm" else currentHostOs();
@@ -1960,6 +1968,7 @@ def compileWithPkgSpecsToCgusForArchDebug(
     noMain: Bool,
     bootSymOpt: Option String,
     debugInfo: Bool,
+    runOpt: Bool,
     singleCgu: Bool
 ): Result (List CguIr) String = {
     let rawDefs =
@@ -1969,7 +1978,7 @@ def compileWithPkgSpecsToCgusForArchDebug(
             let src = readFile(entryFile)?;
             loadSingleSourceProgramWithPkgsNamed(entryFile, src, rootSpec, extSpecs, libPaths)?
         };
-    compileLoadedDefsToCgusForArchDebug(rawDefs, dumpCoreOpt, isWasm, targetArch, exports, noMain, bootSymOpt, debugInfo, singleCgu)
+    compileLoadedDefsToCgusForArchDebug(rawDefs, dumpCoreOpt, isWasm, targetArch, exports, noMain, bootSymOpt, debugInfo, runOpt, singleCgu)
 }
 
 def resolveMaxJobs(): Int =
@@ -2390,7 +2399,7 @@ def compileCgusToCachedObjs(
         if (target == "wasm32") resolveWasmCc()
         else resolveNativeCc() + "|" + currentHostOs() + "|" + currentHostArch();
     let voptTag = if (cellGet(gVerifiedOpt)) "1" else "0";
-    let keyPrefix = "cgu-v5|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|vopt:" + voptTag + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
+    let keyPrefix = "cgu-v6|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|vopt:" + voptTag + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
     let pidStr = intToStr(c_getpid());
 
     let objsRev = cellNew(Nil);
@@ -2956,7 +2965,7 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
             diagReset();
             let cgus = compileWithPkgSpecsToCgusForArchDebug(
                 entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
-                false, currentHostArch(), tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol, debugInfo, singleCgu
+                false, currentHostArch(), tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol, debugInfo, effOpt != "0", singleCgu
             )?;
             let (natCacheable, natDepPaths) = emitNativeExecutableFromCgus(cgus, outBin, tc, rtOpt, cacheDir, effOpt, debugInfo, noCache)?;
             if (!noCache && natCacheable && match dumpCoreOpt { None -> true, Some(_) -> false }) {
@@ -2981,27 +2990,35 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
         lowerToCoreForCheck(inf)
     },
     cbCompileNativeObj: (entryFile, rootSpec, extSpecs, tc, outOpt, dumpCoreOpt) -> {
-        let llText = compileWithPkgSpecsToIrDebug(
+        let effLvl = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
+        let prevLvl = cellGet(gOptLevel);
+        cellSet(gOptLevel, effLvl);
+        let llRes = compileWithPkgSpecsToIrDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             false, tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol, debugInfo
-        )?;
+        );
+        cellSet(gOptLevel, prevLvl);
+        let llText = llRes?;
         let outObj = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + ".o" };
-        let effOpt = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> " -O" + optLevel };
-        emitNativeObjFromIrOpt(llText, outObj, effOpt)
+        emitNativeObjFromIrOpt(llText, outObj, " -O" + effLvl)
     },
     cbCompileWasm: (entryFile, rootSpec, extSpecs, tc, compOnly, outOpt, dumpCoreOpt, rtOpt, cacheDirOpt) -> {
         let effOpt = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
         let outWasm = match outOpt { Some(p) -> p, None -> pathStem(entryFile) + (if (compOnly) ".o" else ".wasm") };
         if (compOnly) {
-            let llText = compileWithPkgSpecsToIrDebug(
+            let prevLvl = cellGet(gOptLevel);
+            cellSet(gOptLevel, effOpt);
+            let llRes = compileWithPkgSpecsToIrDebug(
                 entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
                 true, tc.tcExports, false, None, debugInfo
-            )?;
+            );
+            cellSet(gOptLevel, prevLvl);
+            let llText = llRes?;
             emitWasmFromIrOpt(llText, outWasm, true, tc, rtOpt, " -O" + effOpt)
         } else {
             let cgus = compileWithPkgSpecsToCgusForArchDebug(
                 entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
-                true, "wasm32", tc.tcExports, false, None, debugInfo, singleCgu
+                true, "wasm32", tc.tcExports, false, None, debugInfo, effOpt != "0", singleCgu
             )?;
             emitWasmFromCgus(cgus, outWasm, tc, rtOpt, effectiveCacheDir(cacheDirOpt), effOpt, debugInfo, noCache)
         }
@@ -3020,24 +3037,33 @@ def makeCompileCallbacks(debugInfo: Bool, optLevel: String, singleCgu: Bool, noC
         let effOpt = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
         let cgus = compileWithPkgSpecsToCgusForArchDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
-            false, arch, tc.tcExports, noMainFlag, tc.tcBootSymbol, debugInfo, singleCgu
+            false, arch, tc.tcExports, noMainFlag, tc.tcBootSymbol, debugInfo, effOpt != "0", singleCgu
         )?;
         emitAppleBundleFromCgus(target, cgus, tc, ab, pkgName, pkgVersion, outOpt, rtOpt, effectiveCacheDir(cacheDirOpt), effOpt, debugInfo, noCache)
     },
     cbCompileTargetArchive: (target, entryFile, rootSpec, extSpecs, tc, outArc, dumpCoreOpt, rtOpt) -> {
         let arch = if (target == "ios" || target == "ios-sim") "arm64" else currentHostArch();
-        let llText = compileWithPkgSpecsToIrForArchDebug(
+        let effLvl = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
+        let prevLvl = cellGet(gOptLevel);
+        cellSet(gOptLevel, effLvl);
+        let llRes = compileWithPkgSpecsToIrForArchDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             false, arch, tc.tcExports, true, tc.tcBootSymbol, debugInfo
-        )?;
-        let effOpt = match tc.tcOptLevel { Some(lvl) -> " -O" + lvl, None -> " -O" + optLevel };
-        emitStaticLibFromIrOpt(llText, outArc, target, rtOpt, effOpt)
+        );
+        cellSet(gOptLevel, prevLvl);
+        let llText = llRes?;
+        emitStaticLibFromIrOpt(llText, outArc, target, rtOpt, " -O" + effLvl)
     },
     cbEmitIr: (entryFile, rootSpec, extSpecs, tc, isWasm, outOpt, dumpCoreOpt) -> {
-        let llText = compileWithPkgSpecsToIrDebug(
+        let effLvl = match tc.tcOptLevel { Some(lvl) -> lvl, None -> optLevel };
+        let prevLvl = cellGet(gOptLevel);
+        cellSet(gOptLevel, effLvl);
+        let llRes = compileWithPkgSpecsToIrDebug(
             entryFile, true, rootSpec, extSpecs, Nil, dumpCoreOpt,
             isWasm, tc.tcExports, tc.tcOwnsMain, tc.tcBootSymbol, debugInfo
-        )?;
+        );
+        cellSet(gOptLevel, prevLvl);
+        let llText = llRes?;
         match outOpt {
             Some(outLl) -> writeFile(outLl, llText),
             None -> {
@@ -3721,6 +3747,7 @@ def runDriver(): Result Int String = {
             Some(lvl) -> lvl,
             None -> if (opts.optDebug || isTestSub) "0" else "2",
         };
+        cellSet(gOptLevel, effOptLevel);
         let optFlag = " -O" + effOptLevel;
         let cbs = makeCompileCallbacks(opts.optDebug, effOptLevel, opts.optSingleCgu, opts.optNoCache);
         match opts.optSubcmd {
@@ -3937,7 +3964,7 @@ def runDriver(): Result Int String = {
                     } else {
                         let cgus = compileWithPkgSpecsToCgusForArchDebug(
                             inputFile, useProjLoader, rootSpec, extSpecs, opts.optLibPaths,
-                            opts.optDumpCore, true, "wasm32", opts.optExports, opts.optNoMain, opts.optBootSym, opts.optDebug, opts.optSingleCgu
+                            opts.optDumpCore, true, "wasm32", opts.optExports, opts.optNoMain, opts.optBootSym, opts.optDebug, effOptLevel != "0", opts.optSingleCgu
                         )?;
                         emitWasmFromCgus(cgus, outP, plainTc, opts.optRuntime, defaultGlobalCacheDir(), effOptLevel, opts.optDebug, opts.optNoCache)?;
                         Ok(0)
@@ -3971,7 +3998,7 @@ def runDriver(): Result Int String = {
                     };
                     let cgus = compileWithPkgSpecsToCgusForArchDebug(
                         inputFile, useProjLoader, rootSpec, extSpecs, opts.optLibPaths,
-                        opts.optDumpCore, false, arch, opts.optExports, opts.optNoMain, opts.optBootSym, opts.optDebug, opts.optSingleCgu
+                        opts.optDumpCore, false, arch, opts.optExports, opts.optNoMain, opts.optBootSym, opts.optDebug, effOptLevel != "0", opts.optSingleCgu
                     )?;
                     let _ = emitNativeExecutableFromCgus(cgus, outBin, plainTc, opts.optRuntime, defaultGlobalCacheDir(), effOptLevel, opts.optDebug, opts.optNoCache)?;
                     Ok(0)

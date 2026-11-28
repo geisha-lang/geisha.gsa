@@ -7507,4 +7507,615 @@ if command -v node >/dev/null 2>&1; then
     assert_eq "unbox_option_result_js" "$EXPECTED_UNBOX49" "$(node "$TMP_DIR/t49_unbox.mjs")"
 fi
 
+# 50. General Higher-Order Combinator Simplification, Case-of-Known-Ctor, Devirt & Loop Specialization
+cat > "$TMP_DIR/t50_general_hof_combinator_opt.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.list.listFold
+use std.str.intToStr
+
+data Step s a {
+    MkStep(s -> Option (a, s)),
+}
+
+def runStep(p: Step s a, st: s): Option (a, s) = match p {
+    MkStep(f) -> f(st),
+}
+
+def stepPure(v: a): Step s a = MkStep((st) -> Some((v, st)))
+
+def stepMap(f: a -> b, p: Step s a): Step s b = match p {
+    MkStep(fp) -> MkStep((st) -> match fp(st) {
+        Some((v, st1)) -> Some((f(v), st1)),
+        None -> None,
+    }),
+}
+
+def stepSeqRight(p: Step s a, q: Step s b): Step s b = match (p, q) {
+    (MkStep(fp), MkStep(fq)) -> MkStep((st) -> match fp(st) {
+        Some((_, st1)) -> fq(st1),
+        None -> None,
+    }),
+}
+
+def stepSeqLeft(p: Step s a, q: Step s b): Step s a = match (p, q) {
+    (MkStep(fp), MkStep(fq)) -> MkStep((st) -> match fp(st) {
+        Some((v, st1)) -> match fq(st1) {
+            Some((_, st2)) -> Some((v, st2)),
+            None -> None,
+        },
+        None -> None,
+    }),
+}
+
+def stepBetween(openP: Step s o, closeP: Step s c, body: Step s a): Step s a =
+    stepSeqRight(openP, stepSeqLeft(body, closeP))
+
+def expectByte(src: String, want: Int): Step Int Int =
+    MkStep((pos) ->
+        if (pos < strLen(src) && strByteAt(src, pos) == want) Some((want, pos + 1))
+        else None
+    )
+
+def parseDigitVal(src: String, scale: Int, bias: Int): Step Int Int =
+    MkStep((pos) ->
+        if (pos < strLen(src)) {
+            let b = strByteAt(src, pos);
+            if (b >= 48 && b <= 57) Some(((b - 48) * scale + bias, pos + 1))
+            else None
+        } else None
+    )
+
+def foldSepLoop(
+    pos: Int,
+    itemFn: Int -> Option (Int, Int),
+    sepFn: Int -> Option (Int, Int),
+    acc: Int
+): Option (Int, Int) = match sepFn(pos) {
+    None -> Some((acc, pos)),
+    Some((_, pos1)) -> match itemFn(pos1) {
+        Some((v, pos2)) -> foldSepLoop(pos2, itemFn, sepFn, acc + v),
+        None -> None,
+    },
+}
+
+def foldSep1(item: Step Int Int, sep: Step Int Int): Step Int Int = match (item, sep) {
+    (MkStep(fi), MkStep(fs)) -> MkStep((pos) -> match fi(pos) {
+        None -> None,
+        Some((first, pos1)) -> foldSepLoop(pos1, fi, fs, first),
+    }),
+}
+
+pub def runCombinedPipeline(src: String, scale: Int, bias: Int): Int = {
+    let openP = expectByte(src, 91);
+    let closeP = expectByte(src, 93);
+    let comma = expectByte(src, 44);
+    let item = stepMap((x) -> x + 1, parseDigitVal(src, scale, bias));
+    let full = stepBetween(openP, closeP, foldSep1(item, comma));
+    match runStep(full, 0) {
+        Some((sum, endPos)) -> sum * 100 + endPos,
+        None -> -1,
+    }
+}
+
+// Shadowing + recursive local closure inside cloned higher-order helper
+def applyDynamic(dynFn: Int -> Int, v: Int): Int = {
+    let sh = 10;
+    let shInner = {
+        let sh = 20;
+        sh + 4
+    };
+    dynFn(v) + sh - shInner + 14
+}
+
+def withTryLoopWrapper(f: Int -> Int, xs: List Int): Result Int String = {
+    let runOne = (limit: Int) -> {
+        let acc = cellNew(0);
+        let cur = cellNew(xs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(h, t) -> {
+                    if (h < 0) {
+                        let _ = Err("neg")?;
+                        ()
+                    } else ();
+                    let mapped = f(h);
+                    let mapped = if (mapped > limit) limit else mapped;
+                    cellSet(acc, cellGet(acc) + mapped);
+                    cellSet(cur, t)
+                },
+                Nil -> (),
+            }
+        };
+        Ok(cellGet(acc))
+    };
+    runOne(1000)
+}
+
+def main(): Void = {
+    let r1 = runCombinedPipeline("[3,5,7]", 10, 2);
+    let r2 = runCombinedPipeline("[3,5,x]", 10, 2);
+    let factor = 3;
+    let folded = listFold([1, 2, 3, 4], 0, (acc, x) -> acc * factor + x);
+    let dynVal = applyDynamic((z) -> z * 4, 6);
+    let tryRes = match withTryLoopWrapper((n) -> n * 2 + 1, [2, 4, 6]) {
+        Ok(v) -> v,
+        Err(_) -> -1,
+    };
+    let tryErr = match withTryLoopWrapper((n) -> n * 2 + 1, [2, -1, 6]) {
+        Ok(v) -> v,
+        Err(msg) -> if (msg == "neg") 77 else -2,
+    };
+    printLn(
+        intToStr(r1) + "|" +
+        intToStr(r2) + "|" +
+        intToStr(folded) + "|" +
+        intToStr(dynVal) + "|" +
+        intToStr(tryRes) + "|" +
+        intToStr(tryErr)
+    )
+}
+EOF
+
+"$GEISHA_BIN" -e -o "$TMP_DIR/t50_hof.ll" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+T50_PIPE_IR="$(awk '/^define .*@runCombinedPipeline\(/,/^}/' "$TMP_DIR/t50_hof.ll")"
+if [ -z "$T50_PIPE_IR" ] || printf "%s\n" "$T50_PIPE_IR" | grep -q "gc_alloc\|__gs_tlab_alloc"; then
+    echo "FAIL [hof_combinator_zero_alloc_ir]: runCombinedPipeline should eliminate all MkStep and closure heap allocations" >&2
+    exit 1
+fi
+if ! grep -qE '^define .*@"?foldSepLoop\$spec\$' "$TMP_DIR/t50_hof.ll"; then
+    echo "FAIL [hof_loop_spec_ir]: expected specialized foldSepLoop\$spec\$ function in LLVM IR" >&2
+    exit 1
+fi
+T50_SPEC_IR="$(awk '/^define .*@"?foldSepLoop\$spec\$/,/^}/' "$TMP_DIR/t50_hof.ll")"
+if printf "%s\n" "$T50_SPEC_IR" | grep -q "gc_alloc\|__gs_tlab_alloc" || ! printf "%s\n" "$T50_SPEC_IR" | grep -qE 'tail call .*@"?foldSepLoop\$spec\$'; then
+    echo "FAIL [hof_loop_spec_tco_ir]: foldSepLoop\$spec\$ should be zero-alloc and self-tail-recursive" >&2
+    exit 1
+fi
+if ! grep -qE '^define .*@"?std\.list\.listFold_Int_Int\$spec\$' "$TMP_DIR/t50_hof.ll"; then
+    echo "FAIL [std_list_fold_spec_ir]: expected specialized std.list.listFold_Int_Int\$spec\$ in LLVM IR" >&2
+    exit 1
+fi
+echo "PASS [hof_combinator_and_loop_spec_ir]: zero-alloc combinator fusion & tail-recursive HOF specialization verified"
+PASS=$((PASS + 1))
+
+EXPECTED_HOF50="15907|-1|58|24|27|77"
+
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_hof$EXE_EXT" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+assert_eq "hof_combinator_opt_native" "$EXPECTED_HOF50" "$("$TMP_DIR/t50_hof$EXE_EXT")"
+
+"$GEISHA_BIN" -g --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_hof_dbg$EXE_EXT" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+assert_eq "hof_combinator_opt_debug" "$EXPECTED_HOF50" "$("$TMP_DIR/t50_hof_dbg$EXE_EXT")"
+
+if [ -f "./build/wasm_rt.o" ]; then
+    "$GEISHA_BIN" --target wasm32 --runtime "./build/wasm_rt.o" -o "$TMP_DIR/t50_hof.wasm" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+    PASS=$((PASS + 1))
+fi
+
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t50_hof.mjs" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+    assert_eq "hof_combinator_opt_js" "$EXPECTED_HOF50" "$(node "$TMP_DIR/t50_hof.mjs")"
+fi
+
+# 50b. Cross-package combinator inlining + HOF specialization in --release vs cgu_miss=1 isolation in --dev
+T50_PKG_DIR="$TMP_DIR/t50_cross_pkg"
+mkdir -p "$T50_PKG_DIR/comb_lib/src" "$T50_PKG_DIR/comb_app/src"
+cat > "$T50_PKG_DIR/comb_lib/geisha.toml" << 'EOF'
+name = "comb_lib"
+version = "0.1.0"
+EOF
+cat > "$T50_PKG_DIR/comb_lib/src/comb_lib.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+
+pub data Gen a {
+    MkGen(Int -> Option (a, Int)),
+}
+
+pub def runGen(g: Gen a, seed: Int): Option (a, Int) = match g {
+    MkGen(f) -> f(seed),
+}
+
+pub def mapGen(f: a -> b, g: Gen a): Gen b = match g {
+    MkGen(fg) -> MkGen((s) -> match fg(s) {
+        Some((v, s1)) -> Some((f(v), s1)),
+        None -> None,
+    }),
+}
+
+def sumNLoop(rem: Int, s: Int, step: Int -> Option (Int, Int), acc: Int): Option (Int, Int) =
+    if (rem <= 0) Some((acc, s))
+    else match step(s) {
+        Some((v, s1)) -> sumNLoop(rem - 1, s1, step, acc + v),
+        None -> None,
+    }
+
+pub def sumNGen(n: Int, g: Gen Int): Gen Int = match g {
+    MkGen(fg) -> MkGen((s) -> sumNLoop(n, s, fg, 0)),
+}
+EOF
+git -C "$T50_PKG_DIR/comb_lib" init -q
+git -C "$T50_PKG_DIR/comb_lib" config user.email "ci@geisha.test"
+git -C "$T50_PKG_DIR/comb_lib" config user.name "Geisha CI"
+git -C "$T50_PKG_DIR/comb_lib" add .
+git -C "$T50_PKG_DIR/comb_lib" commit -q -m "init comb_lib"
+git -C "$T50_PKG_DIR/comb_lib" tag v0.1.0
+
+cat > "$T50_PKG_DIR/comb_app/geisha.toml" << EOF
+name = "comb_app"
+version = "0.1.0"
+
+[deps]
+comb_lib = { git = "${FILE_URL_PREFIX}$T50_PKG_DIR/comb_lib", version = "0.1.0" }
+EOF
+cat > "$T50_PKG_DIR/comb_app/src/helper.gsa" << 'EOF'
+use std.option.Some
+use comb_lib.{Gen, MkGen, mapGen}
+
+pub def linearGen(mul: Int, add: Int): Gen Int =
+    mapGen((x) -> x + add, MkGen((s) -> Some((s * mul, s + 1))))
+EOF
+cat > "$T50_PKG_DIR/comb_app/src/main.gsa" << 'EOF'
+use std.option.{Some, None}
+use std.str.intToStr
+use comb_lib.{runGen, sumNGen}
+use helper.linearGen
+
+def main(): Void = {
+    let g = sumNGen(4, linearGen(3, 2));
+    let out = match runGen(g, 1) {
+        Some((tot, nextSeed)) -> tot * 10 + nextSeed,
+        None -> -1,
+    };
+    printLn(intToStr(out))
+}
+EOF
+
+ABS_GEISHA_50="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+ABS_RT_50="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+(cd "$T50_PKG_DIR/comb_app" && GEISHA_HOME="$T50_PKG_DIR/ghome" "$ABS_GEISHA_50" fetch >/dev/null)
+(cd "$T50_PKG_DIR/comb_app" && GEISHA_HOME="$T50_PKG_DIR/ghome" "$ABS_GEISHA_50" build --release --runtime "$ABS_RT_50" >/dev/null)
+assert_eq "cross_pkg_combinator_release" "385" "$("$T50_PKG_DIR/comb_app/build/comb_app$EXE_EXT")"
+
+(cd "$T50_PKG_DIR/comb_app" && GEISHA_HOME="$T50_PKG_DIR/ghome" "$ABS_GEISHA_50" build --dev --runtime "$ABS_RT_50" >/dev/null)
+assert_eq "cross_pkg_combinator_dev_cold" "385" "$("$T50_PKG_DIR/comb_app/build/comb_app$EXE_EXT")"
+cat > "$T50_PKG_DIR/comb_app/src/main.gsa" << 'EOF'
+use std.option.{Some, None}
+use std.str.intToStr
+use comb_lib.{runGen, sumNGen}
+use helper.linearGen
+
+def main(): Void = {
+    let g = sumNGen(5, linearGen(3, 2));
+    let out = match runGen(g, 1) {
+        Some((tot, nextSeed)) -> tot * 10 + nextSeed,
+        None -> -1,
+    };
+    printLn(intToStr(out))
+}
+EOF
+T50_DEV_EDIT_LOG="$(cd "$T50_PKG_DIR/comb_app" && GEISHA_HOME="$T50_PKG_DIR/ghome" GEISHA_CACHE_STATS=1 "$ABS_GEISHA_50" build --dev --runtime "$ABS_RT_50" 2>&1)"
+assert_eq "cross_pkg_combinator_dev_edit_output" "556" "$("$T50_PKG_DIR/comb_app/build/comb_app$EXE_EXT")"
+if ! echo "$T50_DEV_EDIT_LOG" | grep -q "cgu_miss=1 "; then
+    echo "FAIL [cross_pkg_combinator_dev_cgu_miss]: expected cgu_miss=1 on single-module --dev edit, got: $T50_DEV_EDIT_LOG" >&2
+    exit 1
+fi
+PASS=$((PASS + 1))
+
+# 50c. Adversarial HOF soundness: evaluation order, Float literal match, same-name shadowing,
+#      binder collision immunity ($spec$/$flat$/$cprop$), extern alias uniformity, & WasmGC/JS/--dev parity
+cat > "$TMP_DIR/t50_hof_adversarial.gsa" << 'EOF'
+use std.str.intToStr
+
+data Chain {
+    End,
+    Next(Chain),
+}
+
+data Box {
+    MkBox(Int),
+}
+
+def pairAdd(a: Int, b: Int): Int = a + b
+
+def pickFn(c: Cell Int): Int -> Int =
+    if (cellGet(c) == 10) (x) -> 10 + x
+    else (x) -> 20 + x
+
+def specLoopColl(n: Int, f: Int -> Int, fv0_0_q: Int): Int =
+    if (n <= 0) fv0_0_q
+    else specLoopColl(n - 1, f, fv0_0_q + f(2))
+
+def makeLargeFlatRes(q: Int): Int = {
+    let bigCls = (u: Int) -> {
+        let fv_q = 5;
+        let a1 = u + 1;
+        let a2 = a1 + 2;
+        let a3 = a2 + 3;
+        let a4 = a3 + 4;
+        let a5 = a4 + 5;
+        let a6 = a5 + 6;
+        let a7 = a6 + 7;
+        let a8 = a7 + 8;
+        let a9 = a8 + 9;
+        let a10 = a9 + 10;
+        let a11 = a10 + 11;
+        let a12 = a11 + 12;
+        if (a12 > 0) q * fv_q else 0
+    };
+    bigCls(1)
+}
+
+def makeCpropRes(raw: Int): Int = {
+    let q = MkBox(raw);
+    let run = (z: Int) -> {
+        let kdat_q = 12 + z;
+        match q {
+            MkBox(v) -> v + kdat_q,
+        }
+    };
+    run(0)
+}
+
+def main(): Void = {
+    // 1. Strict left-to-right arg & callee evaluation order
+    let c1 = cellNew(10);
+    let ordDir = pairAdd(cellGet(c1), {
+        let v = cellGet(c1);
+        cellSet(c1, 20);
+        let packed = (v, 1);
+        match packed { (_, d) -> d }
+    });
+    let c2 = cellNew(10);
+    let ordCls = (pickFn(c2))({
+        let prev = cellGet(c2);
+        cellSet(c2, 20);
+        let tup = (prev - 9, 0);
+        match tup { (d, _) -> d }
+    });
+
+    // 2. Float literal match: exact match, -0.0 == 0.0, NaN != 0.0
+    let f1 = match 1.25 { 1.25 -> "equal", _ -> "different" };
+    let negZ = -0.0;
+    let f2 = match negZ { 0.0 -> "zero", _ -> "other" };
+    let zCell = cellNew(0.0);
+    let nanV = 0.0 / cellGet(zCell);
+    let f3 = match nanV { 0.0 -> "zero", _ -> "other" };
+
+    // 3. Same-name let shadowing on ADT & Tuple known values
+    let x = End;
+    let x = Next(x);
+    let shAdt = match x {
+        Next(End) -> "one",
+        _ -> "other",
+    };
+    let t = 7;
+    let t = (t, 8);
+    let shTup = match t { (a, b) -> a * 10 + b };
+
+    // 4. Binder collision immunity across $spec$, $flat$, $cprop$
+    let q = 3;
+    let sColl = specLoopColl(2, (z) -> z * q, 9);
+    let flColl = makeLargeFlatRes(3);
+    let cpColl = makeCpropRes(3);
+
+    printLn(
+        intToStr(ordDir) + "|" +
+        intToStr(ordCls) + "|" +
+        f1 + "," + f2 + "," + f3 + "|" +
+        shAdt + "|" +
+        intToStr(shTup) + "|" +
+        intToStr(sColl) + "|" +
+        intToStr(flColl) + "|" +
+        intToStr(cpColl)
+    )
+}
+EOF
+
+EXPECTED_ADV50="11|11|equal,zero,other|one|78|21|15|15"
+
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_adv_rel$EXE_EXT" "$TMP_DIR/t50_hof_adversarial.gsa"
+assert_eq "hof_adversarial_release" "$EXPECTED_ADV50" "$("$TMP_DIR/t50_adv_rel$EXE_EXT")"
+
+"$GEISHA_BIN" --dev --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_adv_dev$EXE_EXT" "$TMP_DIR/t50_hof_adversarial.gsa"
+assert_eq "hof_adversarial_dev" "$EXPECTED_ADV50" "$("$TMP_DIR/t50_adv_dev$EXE_EXT")"
+
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t50_adv_rel.mjs" "$TMP_DIR/t50_hof_adversarial.gsa"
+    assert_eq "hof_adversarial_js_rel" "$EXPECTED_ADV50" "$(node "$TMP_DIR/t50_adv_rel.mjs")"
+    "$GEISHA_BIN" --dev --target js -o "$TMP_DIR/t50_adv_dev.mjs" "$TMP_DIR/t50_hof_adversarial.gsa"
+    assert_eq "hof_adversarial_js_dev" "$EXPECTED_ADV50" "$(node "$TMP_DIR/t50_adv_dev.mjs")"
+    "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t50_adv_wgc.wasm" "$TMP_DIR/t50_hof_adversarial.gsa"
+    assert_eq "hof_adversarial_wasmgc" "$EXPECTED_ADV50" "$(node "$TMP_DIR/t50_adv_wgc.mjs")"
+    "$GEISHA_BIN" --dev --target wasm-gc -o "$TMP_DIR/t50_adv_wgc_dev.wasm" "$TMP_DIR/t50_hof_adversarial.gsa"
+    assert_eq "hof_adversarial_wasmgc_dev" "$EXPECTED_ADV50" "$(node "$TMP_DIR/t50_adv_wgc_dev.mjs")"
+fi
+
+# Trap order: non-inlined callee with side-effecting right arg must trap on left arg div-by-zero BEFORE right arg prints "B"
+cat > "$TMP_DIR/t50_trap_order.gsa" << 'EOF'
+use std.str.intToStr
+def both(a: Int, b: Int): Int = { printLn("C"); a + b }
+def main(): Void = {
+    let z = cellNew(0);
+    let n = both(10 / cellGet(z), { let tmp = cellGet(z); printLn("B"); tmp });
+    printLn(intToStr(n))
+}
+EOF
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_trap_order$EXE_EXT" "$TMP_DIR/t50_trap_order.gsa"
+if "$TMP_DIR/t50_trap_order$EXE_EXT" >"$TMP_DIR/t50_trap.out" 2>"$TMP_DIR/t50_trap.err"; then
+    echo "FAIL [hof_trap_order]: expected non-zero exit on left-arg division by zero" >&2
+    exit 1
+fi
+if grep -Eq "^(B|C)$" "$TMP_DIR/t50_trap.out"; then
+    echo "FAIL [hof_trap_order_side_effect]: right arg or callee executed before left arg trap!" >&2
+    exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t50_trap_order.mjs" "$TMP_DIR/t50_trap_order.gsa"
+    if node "$TMP_DIR/t50_trap_order.mjs" >"$TMP_DIR/t50_trap_js.out" 2>"$TMP_DIR/t50_trap_js.err"; then
+        echo "FAIL [hof_trap_order_js]: expected non-zero exit on JS left-arg division by zero" >&2
+        exit 1
+    fi
+    if grep -Eq "^(B|C)$" "$TMP_DIR/t50_trap_js.out"; then
+        echo "FAIL [hof_trap_order_js_side_effect]: JS right arg executed before left arg trap!" >&2
+        exit 1
+    fi
+    "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t50_trap_order_wgc.wasm" "$TMP_DIR/t50_trap_order.gsa"
+    if node "$TMP_DIR/t50_trap_order_wgc.mjs" >"$TMP_DIR/t50_trap_wgc.out" 2>"$TMP_DIR/t50_trap_wgc.err"; then
+        echo "FAIL [hof_trap_order_wgc]: expected non-zero exit on WasmGC left-arg division by zero" >&2
+        exit 1
+    fi
+    if grep -Eq "^(B|C)$" "$TMP_DIR/t50_trap_wgc.out"; then
+        echo "FAIL [hof_trap_order_wgc_side_effect]: WasmGC right arg executed before left arg trap!" >&2
+        exit 1
+    fi
+fi
+PASS=$((PASS + 1))
+
+# Cross-pass binder allocator hygiene (two leaf-inline passes + HOF combinator pass) & mutual cycle + WasmGC contracts=check
+cat > "$TMP_DIR/t50_leaf_two_pass.gsa" << 'EOF'
+use std.str.intToStr
+def identity(x: Int): Int = x
+pub extern def late(x: Int, y: Int): Int = { let f = (v: Int) -> v * 10; f(x) + y }
+def zlate(x: Int, y: Int): Int = {
+    let unused = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
+    let f = (v: Int) -> v * 10;
+    f(x) + y
+}
+def ca(n: Int, f: Int -> Int): Int = if (n <= 0) f(0) else cb(n - 1, f)
+def cb(n: Int, f: Int -> Int): Int = cc(n, f)
+def cc(n: Int, f: Int -> Int): Int = cd(n, f)
+def cd(n: Int, f: Int -> Int): Int = ce(n, f)
+def ce(n: Int, f: Int -> Int): Int = ch(n, f)
+def ch(n: Int, f: Int -> Int): Int = ci(n, f)
+def ci(n: Int, f: Int -> Int): Int = cj(n, f)
+def cj(n: Int, f: Int -> Int): Int = ca(n, f)
+def main(): Void = {
+    let c = cellNew(7);
+    let saved = identity(cellGet(c));
+    let r1 = late(2, saved);
+    let saved2 = identity(cellGet(c));
+    let r2 = zlate(2, saved2);
+    let r3 = ca(10, (x) -> x + 4);
+    printLn(intToStr(r1) + "|" + intToStr(r2) + "|" + intToStr(r3))
+}
+EOF
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_leaf2_rel$EXE_EXT" "$TMP_DIR/t50_leaf_two_pass.gsa"
+assert_eq "hof_two_pass_leaf_hygiene_rel" "27|27|4" "$("$TMP_DIR/t50_leaf2_rel$EXE_EXT")"
+"$GEISHA_BIN" --dev --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_leaf2_dev$EXE_EXT" "$TMP_DIR/t50_leaf_two_pass.gsa"
+assert_eq "hof_two_pass_leaf_hygiene_dev" "27|27|4" "$("$TMP_DIR/t50_leaf2_dev$EXE_EXT")"
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t50_leaf2_rel.mjs" "$TMP_DIR/t50_leaf_two_pass.gsa"
+    assert_eq "hof_two_pass_leaf_hygiene_js_rel" "27|27|4" "$(node "$TMP_DIR/t50_leaf2_rel.mjs")"
+    "$GEISHA_BIN" --dev --target js -o "$TMP_DIR/t50_leaf2_dev.mjs" "$TMP_DIR/t50_leaf_two_pass.gsa"
+    assert_eq "hof_two_pass_leaf_hygiene_js_dev" "27|27|4" "$(node "$TMP_DIR/t50_leaf2_dev.mjs")"
+    "$GEISHA_BIN" --target wasm-gc -o "$TMP_DIR/t50_leaf2_wgc_rel.wasm" "$TMP_DIR/t50_leaf_two_pass.gsa"
+    assert_eq "hof_two_pass_leaf_hygiene_wgc_rel" "27|27|4" "$(node "$TMP_DIR/t50_leaf2_wgc_rel.mjs")"
+    "$GEISHA_BIN" --dev --target wasm-gc -o "$TMP_DIR/t50_leaf2_wgc_dev.wasm" "$TMP_DIR/t50_leaf_two_pass.gsa"
+    assert_eq "hof_two_pass_leaf_hygiene_wgc_dev" "27|27|4" "$(node "$TMP_DIR/t50_leaf2_wgc_dev.mjs")"
+
+    cat > "$TMP_DIR/t50_wgc_contract_bad.gsa" << 'EOF'
+def checkIt(n: Int): Void = { assert(n > 0); printLn("ok") }
+def main(): Void = checkIt(cellGet(cellNew(0)))
+EOF
+    cat > "$TMP_DIR/t50_wgc_contract_ok.gsa" << 'EOF'
+def checkIt(n: Int): Void = { assert(n > 0); printLn("ok") }
+def main(): Void = checkIt(cellGet(cellNew(1)))
+EOF
+    "$GEISHA_BIN" --contracts=check --target wasm-gc -o "$TMP_DIR/t50_wgc_cbad_rel.wasm" "$TMP_DIR/t50_wgc_contract_bad.gsa"
+    if node "$TMP_DIR/t50_wgc_cbad_rel.mjs" >"$TMP_DIR/t50_wgc_cbad_rel.out" 2>"$TMP_DIR/t50_wgc_cbad_rel.err"; then
+        echo "FAIL [wgc_contracts_check_rel]: expected non-zero exit on failed assert" >&2
+        exit 1
+    fi
+    if grep -q "ok" "$TMP_DIR/t50_wgc_cbad_rel.out" || ! grep -q "Contract error: assert violated" "$TMP_DIR/t50_wgc_cbad_rel.err"; then
+        echo "FAIL [wgc_contracts_check_rel_msg]: unexpected output/stderr on failed assert" >&2
+        exit 1
+    fi
+    "$GEISHA_BIN" --dev --contracts=check --target wasm-gc -o "$TMP_DIR/t50_wgc_cbad_dev.wasm" "$TMP_DIR/t50_wgc_contract_bad.gsa"
+    if node "$TMP_DIR/t50_wgc_cbad_dev.mjs" >"$TMP_DIR/t50_wgc_cbad_dev.out" 2>"$TMP_DIR/t50_wgc_cbad_dev.err"; then
+        echo "FAIL [wgc_contracts_check_dev]: expected non-zero exit on failed assert in --dev" >&2
+        exit 1
+    fi
+    if grep -q "ok" "$TMP_DIR/t50_wgc_cbad_dev.out" || ! grep -q "Contract error: assert violated" "$TMP_DIR/t50_wgc_cbad_dev.err"; then
+        echo "FAIL [wgc_contracts_check_dev_msg]: unexpected output/stderr on failed assert in --dev" >&2
+        exit 1
+    fi
+    "$GEISHA_BIN" --contracts=check --target wasm-gc -o "$TMP_DIR/t50_wgc_cok.wasm" "$TMP_DIR/t50_wgc_contract_ok.gsa"
+    assert_eq "wgc_contracts_check_ok" "ok" "$(node "$TMP_DIR/t50_wgc_cok.mjs")"
+
+    # User-declared `__gs_contract_fail` (both String->Void and Int->Int, non-inlinable via `while`)
+    # must NEVER collide with the compiler's internal `$gs$contract_fail` intrinsic on any backend/opt level.
+    cat > "$TMP_DIR/t50_user_cfail_str.gsa" << 'EOF'
+def __gs_contract_fail(s: String): Void = { while (false) (); printLn(s) }
+def guarded(n: Int): Void = { assert(n > 0); __gs_contract_fail("ordinary") }
+def main(): Void = guarded(cellGet(cellNew(1)))
+EOF
+    cat > "$TMP_DIR/t50_user_cfail_int.gsa" << 'EOF'
+use std.str.intToStr
+def __gs_contract_fail(x: Int): Int = { while (false) (); x + 1 }
+def main(): Void = printLn(intToStr(__gs_contract_fail(4)))
+EOF
+    "$GEISHA_BIN" --contracts=erase --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_ucf_str_rel$EXE_EXT" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_nat_rel" "ordinary" "$("$TMP_DIR/t50_ucf_str_rel$EXE_EXT")"
+    "$GEISHA_BIN" --dev --contracts=check --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_ucf_str_dev$EXE_EXT" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_nat_dev_chk" "ordinary" "$("$TMP_DIR/t50_ucf_str_dev$EXE_EXT")"
+    "$GEISHA_BIN" --dev --contracts=erase --target js -o "$TMP_DIR/t50_ucf_str_dev.mjs" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_js_dev" "ordinary" "$(node "$TMP_DIR/t50_ucf_str_dev.mjs")"
+    "$GEISHA_BIN" --contracts=erase --target wasm-gc -o "$TMP_DIR/t50_ucf_str_wgc_rel.wasm" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_wgc_rel" "ordinary" "$(node "$TMP_DIR/t50_ucf_str_wgc_rel.mjs")"
+    "$GEISHA_BIN" --dev --contracts=erase --target wasm-gc -o "$TMP_DIR/t50_ucf_str_wgc_dev.wasm" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_wgc_dev" "ordinary" "$(node "$TMP_DIR/t50_ucf_str_wgc_dev.mjs")"
+    "$GEISHA_BIN" --dev --contracts=check --target wasm-gc -o "$TMP_DIR/t50_ucf_str_wgc_chk.wasm" "$TMP_DIR/t50_user_cfail_str.gsa"
+    assert_eq "user_cfail_str_wgc_dev_chk" "ordinary" "$(node "$TMP_DIR/t50_ucf_str_wgc_chk.mjs")"
+    "$GEISHA_BIN" --dev --contracts=erase --target wasm-gc -o "$TMP_DIR/t50_ucf_int_wgc_dev.wasm" "$TMP_DIR/t50_user_cfail_int.gsa"
+    assert_eq "user_cfail_int_wgc_dev" "5" "$(node "$TMP_DIR/t50_ucf_int_wgc_dev.mjs")"
+fi
+PASS=$((PASS + 1))
+
+# Extern local alias uniformity (no name special-casing) + --dev -e dump parity
+cat > "$TMP_DIR/t50_ext_a.gsa" << 'EOF'
+extern "abs" def c_exit(x: Int): Int
+def wrapExt(x: Int): Int = c_exit(x)
+def main(): Void = { let _ = wrapExt(-5); printLn("ok") }
+EOF
+cat > "$TMP_DIR/t50_ext_b.gsa" << 'EOF'
+extern "abs" def c_abs(x: Int): Int
+def wrapExt(x: Int): Int = c_abs(x)
+def main(): Void = { let _ = wrapExt(-5); printLn("ok") }
+EOF
+"$GEISHA_BIN" --dump-core "$TMP_DIR/t50_ext_a.gscore" -e -o "$TMP_DIR/t50_ext_a.ll" "$TMP_DIR/t50_ext_a.gsa"
+"$GEISHA_BIN" --dump-core "$TMP_DIR/t50_ext_b.gscore" -e -o "$TMP_DIR/t50_ext_b.ll" "$TMP_DIR/t50_ext_b.gsa"
+if ! grep -q '(fun "wrapExt"' "$TMP_DIR/t50_ext_a.gscore" || ! grep -q '(fun "wrapExt"' "$TMP_DIR/t50_ext_b.gscore"; then
+    echo "FAIL [extern_alias_uniformity]: extern local alias changed inlining eligibility!" >&2
+    exit 1
+fi
+"$GEISHA_BIN" --dev --dump-core "$TMP_DIR/t50_dev_e.gscore" -e -o "$TMP_DIR/t50_dev_e.ll" "$TMP_DIR/t50_general_hof_combinator_opt.gsa"
+if grep -q '\$spec\$' "$TMP_DIR/t50_dev_e.gscore"; then
+    echo "FAIL [dev_emit_ir_no_opt]: --dev -e should disable Core HOF specialization consistently with --dev build" >&2
+    exit 1
+fi
+{
+    echo 'use std.str.intToStr'
+    echo 'def repLoop(n: Int, f: Int -> Int, acc: Int): Int = if (n <= 0) acc else repLoop(n - 1, f, acc + f(1))'
+    echo 'def main(): Void = {'
+    echo '    let f0 = (x: Int) -> x + 100;'
+    echo '    let s = cellNew(repLoop(1, f0, 0));'
+    i=1
+    while [ "$i" -le 64 ]; do
+        echo "    cellSet(s, cellGet(s) + repLoop(1, (x) -> x + $i, 0));"
+        i=$((i + 1))
+    done
+    echo '    let tailReuse = repLoop(2, f0, 0);'
+    echo '    printLn(intToStr(cellGet(s) + tailReuse))'
+    echo '}'
+} > "$TMP_DIR/t50_spec_cap.gsa"
+"$GEISHA_BIN" --dump-core "$TMP_DIR/t50_spec_cap.gscore" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t50_spec_cap$EXE_EXT" "$TMP_DIR/t50_spec_cap.gsa"
+assert_eq "hof_spec_cap_reuse_run" "2447" "$("$TMP_DIR/t50_spec_cap$EXE_EXT")"
+FIRST_SPEC_FN="$(grep -o 'repLoop\$spec\$[0-9]*' "$TMP_DIR/t50_spec_cap.gscore" | head -n 1)"
+SPEC_CALL_HITS="$(grep -o "apply-dir \"$FIRST_SPEC_FN\"" "$TMP_DIR/t50_spec_cap.gscore" | wc -l | tr -d ' ')"
+if [ "$SPEC_CALL_HITS" -lt 3 ]; then
+    echo "FAIL [hof_spec_cap_reuse_ir]: expected $FIRST_SPEC_FN to be reused after 64-spec cap, got $SPEC_CALL_HITS apply-dir hits" >&2
+    exit 1
+fi
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"
