@@ -1,0 +1,1433 @@
+// Portable Hardware-Accelerated SIMD Vectors & Masks (`std.simd`)
+//
+// Parameterized `Simd n e` vectors (128-bit & 256-bit) and first-class `Mask n e` masks
+// lowered directly to LLVM `<N x T>` vector SSA registers across ARM64 NEON, x86-64 SSE4.2/AVX2,
+// WebAssembly SIMD128, and ES Module JavaScript (`DataView`).
+
+use std.bits.{popCount, trailingZeros, leadingZeros}
+
+// ============================================================================
+// 1. Lane-Count & Element Marker Types + Concrete Aliases
+// ============================================================================
+
+/// Phantom marker for 2-lane SIMD vectors.
+pub data L2 {}
+
+/// Phantom marker for 4-lane SIMD vectors.
+pub data L4 {}
+
+/// Phantom marker for 8-lane SIMD vectors.
+pub data L8 {}
+
+/// Phantom marker for 16-lane SIMD vectors.
+pub data L16 {}
+
+/// Phantom marker for 32-lane SIMD vectors.
+pub data L32 {}
+
+/// Signed 8-bit integer lane marker (`-128..127`, scalar representation `Int`).
+pub data I8 {}
+
+/// Unsigned 8-bit integer lane marker (`0..255`, scalar representation `Int`).
+pub data U8 {}
+
+/// Signed 16-bit integer lane marker (`-32768..32767`, scalar representation `Int`).
+pub data I16 {}
+
+/// Unsigned 16-bit integer lane marker (`0..65535`, scalar representation `Int`).
+pub data U16 {}
+
+/// Signed 32-bit integer lane alias (`Int`).
+pub type I32 = Int
+
+/// Unsigned 32-bit integer lane marker (scalar representation `Int`).
+pub data U32 {}
+
+/// Signed 64-bit integer lane alias (`Int64`).
+pub type I64 = Int64
+
+/// Unsigned 64-bit integer lane marker (scalar representation `Int64`).
+pub data U64 {}
+
+/// 32-bit IEEE-754 floating-point lane alias (`Float32`).
+pub type F32 = Float32
+
+/// 64-bit IEEE-754 floating-point lane alias (`Float`).
+pub type F64 = Float
+
+/// 128-bit SIMD vector of 16 signed 8-bit integers (`<16 x i8>`).
+pub type I8x16 = Simd L16 I8
+
+/// 128-bit SIMD vector of 16 unsigned 8-bit integers (`<16 x i8>`).
+pub type U8x16 = Simd L16 U8
+
+/// 128-bit SIMD vector of 8 signed 16-bit integers (`<8 x i16>`).
+pub type I16x8 = Simd L8 I16
+
+/// 128-bit SIMD vector of 8 unsigned 16-bit integers (`<8 x i16>`).
+pub type U16x8 = Simd L8 U16
+
+/// 128-bit SIMD vector of 4 signed 32-bit integers (`<4 x i32>`).
+pub type I32x4 = Simd L4 Int
+
+/// 128-bit SIMD vector of 4 unsigned 32-bit integers (`<4 x i32>`).
+pub type U32x4 = Simd L4 U32
+
+/// 128-bit SIMD vector of 2 signed 64-bit integers (`<2 x i64>`).
+pub type I64x2 = Simd L2 Int64
+
+/// 128-bit SIMD vector of 2 unsigned 64-bit integers (`<2 x i64>`).
+pub type U64x2 = Simd L2 U64
+
+/// 128-bit SIMD vector of 4 single-precision floats (`<4 x float>`).
+pub type F32x4 = Simd L4 Float32
+
+/// 128-bit SIMD vector of 2 double-precision floats (`<2 x double>`).
+pub type F64x2 = Simd L2 Float
+
+/// 256-bit SIMD vector of 32 signed 8-bit integers (`<32 x i8>`).
+pub type I8x32 = Simd L32 I8
+
+/// 256-bit SIMD vector of 32 unsigned 8-bit integers (`<32 x i8>`).
+pub type U8x32 = Simd L32 U8
+
+/// 256-bit SIMD vector of 16 signed 16-bit integers (`<16 x i16>`).
+pub type I16x16 = Simd L16 I16
+
+/// 256-bit SIMD vector of 16 unsigned 16-bit integers (`<16 x i16>`).
+pub type U16x16 = Simd L16 U16
+
+/// 256-bit SIMD vector of 8 signed 32-bit integers (`<8 x i32>`).
+pub type I32x8 = Simd L8 Int
+
+/// 256-bit SIMD vector of 8 unsigned 32-bit integers (`<8 x i32>`).
+pub type U32x8 = Simd L8 U32
+
+/// 256-bit SIMD vector of 4 signed 64-bit integers (`<4 x i64>`).
+pub type I64x4 = Simd L4 Int64
+
+/// 256-bit SIMD vector of 4 unsigned 64-bit integers (`<4 x i64>`).
+pub type U64x4 = Simd L4 U64
+
+/// 256-bit SIMD vector of 8 single-precision floats (`<8 x float>`).
+pub type F32x8 = Simd L8 Float32
+
+/// 256-bit SIMD vector of 4 double-precision floats (`<4 x double>`).
+pub type F64x4 = Simd L4 Float
+
+/// Unboxed lane-wise boolean mask with all-ones (`-1`) for `true` lanes and `0` for `false` lanes.
+pub data Mask n e (Simd n e)
+
+/// 16-lane 8-bit mask alias (`Mask L16 U8`).
+pub type Mask8x16 = Mask L16 U8
+
+/// 32-lane 8-bit mask alias (`Mask L32 U8`).
+pub type Mask8x32 = Mask L32 U8
+
+/// 8-lane 16-bit mask alias (`Mask L8 U16`).
+pub type Mask16x8 = Mask L8 U16
+
+/// 16-lane 16-bit mask alias (`Mask L16 U16`).
+pub type Mask16x16 = Mask L16 U16
+
+/// 4-lane 32-bit mask alias (`Mask L4 Int`).
+pub type Mask32x4 = Mask L4 Int
+
+/// 8-lane 32-bit mask alias (`Mask L8 Int`).
+pub type Mask32x8 = Mask L8 Int
+
+/// 2-lane 64-bit mask alias (`Mask L2 Int64`).
+pub type Mask64x2 = Mask L2 Int64
+
+/// 4-lane 64-bit mask alias (`Mask L4 Int64`).
+pub type Mask64x4 = Mask L4 Int64
+
+// ============================================================================
+// 2. Core Vector Geometry & Element Concepts (`SimdLane`, `SimdVec`)
+// ============================================================================
+
+/// Valid hardware SIMD vector geometry `(n, e)` (128-bit or 256-bit).
+pub concept SimdLane n e {
+    def laneCount(v: Simd n e): Int,
+    def vectorBytes(v: Simd n e): Int
+}
+
+pub instance SimdLane L16 I8 {
+    def laneCount(_) = 16
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L16 U8 {
+    def laneCount(_) = 16
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L8 I16 {
+    def laneCount(_) = 8
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L8 U16 {
+    def laneCount(_) = 8
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L4 Int {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L4 U32 {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L2 Int64 {
+    def laneCount(_) = 2
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L2 U64 {
+    def laneCount(_) = 2
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L4 Float32 {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L2 Float {
+    def laneCount(_) = 2
+    def vectorBytes(_) = 16
+}
+pub instance SimdLane L32 I8 {
+    def laneCount(_) = 32
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L32 U8 {
+    def laneCount(_) = 32
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L16 I16 {
+    def laneCount(_) = 16
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L16 U16 {
+    def laneCount(_) = 16
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L8 Int {
+    def laneCount(_) = 8
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L8 U32 {
+    def laneCount(_) = 8
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L4 Int64 {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L4 U64 {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L8 Float32 {
+    def laneCount(_) = 8
+    def vectorBytes(_) = 32
+}
+pub instance SimdLane L4 Float {
+    def laneCount(_) = 4
+    def vectorBytes(_) = 32
+}
+
+/// Associates a SIMD vector `Simd n e` with its natural Geisha scalar type `s`.
+pub concept SimdVec n e s : SimdLane n e | e -> s {
+    def splat(val: s): Simd n e,
+    def zero(): Simd n e,
+    def iota(): Simd n e,
+    def extract(v: Simd n e, idx: Int): s,
+    def replace(v: Simd n e, idx: Int, val: s): Simd n e
+}
+
+pub instance SimdVec L16 I8 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L16 U8 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L8 I16 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L8 U16 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 Int Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 U32 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L2 Int64 Int64 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(intToI64(0))
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L2 U64 Int64 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(intToI64(0))
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 Float32 Float32 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0.0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L2 Float Float {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0.0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L32 I8 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L32 U8 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L16 I16 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L16 U16 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L8 Int Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L8 U32 Int {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 Int64 Int64 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(intToI64(0))
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 U64 Int64 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(intToI64(0))
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L8 Float32 Float32 {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0.0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+pub instance SimdVec L4 Float Float {
+    def splat(x) = __simdSplat(x)
+    def zero() = __simdSplat(0.0)
+    def iota() = __simdIota()
+    def extract(v, i) = __simdExtract(v, i)
+    def replace(v, i, x) = __simdReplace(v, i, x)
+}
+
+/// Number of lanes in `v`.
+lanes: forall n e. (SimdLane n e) => Simd n e -> Int
+pub def lanes(v) = laneCount(v)
+
+/// Byte width of `v` (`16` or `32`).
+byteWidth: forall n e. (SimdLane n e) => Simd n e -> Int
+pub def byteWidth(v) = vectorBytes(v)
+
+// ============================================================================
+// 3. Prelude Arithmetic, Bitwise & Equality Instances (with Scalar Broadcast)
+// ============================================================================
+
+pub instance (SimdLane n e) => Add (Simd n e)(Simd n e)(Simd n e) {
+    def (+)(a, b) = __simdBin(0, a, b)
+}
+pub instance (SimdLane n e) => Add (Simd n e) Int (Simd n e) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n e) => Add Int (Simd n e)(Simd n e) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+pub instance (SimdLane n Int64) => Add (Simd n Int64) Int64 (Simd n Int64) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n Int64) => Add Int64 (Simd n Int64)(Simd n Int64) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+pub instance (SimdLane n U64) => Add (Simd n U64) Int64 (Simd n U64) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n U64) => Add Int64 (Simd n U64)(Simd n U64) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Add (Simd n Float32) Float32 (Simd n Float32) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Add Float32 (Simd n Float32)(Simd n Float32) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Add (Simd n Float32) Float (Simd n Float32) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Add Float (Simd n Float32)(Simd n Float32) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float) => Add (Simd n Float) Float (Simd n Float) {
+    def (+)(a, s) = __simdBin(0, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float) => Add Float (Simd n Float)(Simd n Float) {
+    def (+)(s, b) = __simdBin(0, __simdSplat(s), b)
+}
+
+pub instance (SimdLane n e) => Sub (Simd n e)(Simd n e)(Simd n e) {
+    def (-)(a, b) = __simdBin(1, a, b)
+}
+pub instance (SimdLane n e) => Sub (Simd n e) Int (Simd n e) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n e) => Sub Int (Simd n e)(Simd n e) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+pub instance (SimdLane n Int64) => Sub (Simd n Int64) Int64 (Simd n Int64) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n Int64) => Sub Int64 (Simd n Int64)(Simd n Int64) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+pub instance (SimdLane n U64) => Sub (Simd n U64) Int64 (Simd n U64) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n U64) => Sub Int64 (Simd n U64)(Simd n U64) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Sub (Simd n Float32) Float32 (Simd n Float32) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Sub Float32 (Simd n Float32)(Simd n Float32) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Sub (Simd n Float32) Float (Simd n Float32) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Sub Float (Simd n Float32)(Simd n Float32) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float) => Sub (Simd n Float) Float (Simd n Float) {
+    def (-)(a, s) = __simdBin(1, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float) => Sub Float (Simd n Float)(Simd n Float) {
+    def (-)(s, b) = __simdBin(1, __simdSplat(s), b)
+}
+
+pub instance (SimdLane n e) => Mul (Simd n e)(Simd n e)(Simd n e) {
+    def (*)(a, b) = __simdBin(2, a, b)
+}
+pub instance (SimdLane n e) => Mul (Simd n e) Int (Simd n e) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n e) => Mul Int (Simd n e)(Simd n e) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+pub instance (SimdLane n Int64) => Mul (Simd n Int64) Int64 (Simd n Int64) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n Int64) => Mul Int64 (Simd n Int64)(Simd n Int64) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+pub instance (SimdLane n U64) => Mul (Simd n U64) Int64 (Simd n U64) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n U64) => Mul Int64 (Simd n U64)(Simd n U64) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Mul (Simd n Float32) Float32 (Simd n Float32) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Mul Float32 (Simd n Float32)(Simd n Float32) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Mul (Simd n Float32) Float (Simd n Float32) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Mul Float (Simd n Float32)(Simd n Float32) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float) => Mul (Simd n Float) Float (Simd n Float) {
+    def (*)(a, s) = __simdBin(2, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float) => Mul Float (Simd n Float)(Simd n Float) {
+    def (*)(s, b) = __simdBin(2, __simdSplat(s), b)
+}
+
+pub instance (SimdLane n e) => Div (Simd n e)(Simd n e)(Simd n e) {
+    def (/)(a, b) = __simdBin(3, a, b)
+}
+pub instance (SimdLane n e) => Div (Simd n e) Int (Simd n e) {
+    def (/)(a, s) = __simdBin(3, a, __simdSplat(s))
+}
+pub instance (SimdLane n e) => Div Int (Simd n e)(Simd n e) {
+    def (/)(s, b) = __simdBin(3, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Div (Simd n Float32) Float32 (Simd n Float32) {
+    def (/)(a, s) = __simdBin(3, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Div Float32 (Simd n Float32)(Simd n Float32) {
+    def (/)(s, b) = __simdBin(3, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float32) => Div (Simd n Float32) Float (Simd n Float32) {
+    def (/)(a, s) = __simdBin(3, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float32) => Div Float (Simd n Float32)(Simd n Float32) {
+    def (/)(s, b) = __simdBin(3, __simdSplat(s), b)
+}
+pub instance (SimdLane n Float) => Div (Simd n Float) Float (Simd n Float) {
+    def (/)(a, s) = __simdBin(3, a, __simdSplat(s))
+}
+pub instance (SimdLane n Float) => Div Float (Simd n Float)(Simd n Float) {
+    def (/)(s, b) = __simdBin(3, __simdSplat(s), b)
+}
+
+/// Integer SIMD lane trait carrying bit width and signedness (`SimdBits`).
+pub concept SimdBits n e : SimdLane n e {
+    def laneBits(_: Simd n e): Int,
+    def shrOpcode(_: Simd n e): Int
+}
+
+pub instance SimdBits L16 I8 { def laneBits(_) = 8; def shrOpcode(_) = 1 }
+pub instance SimdBits L16 U8 { def laneBits(_) = 8; def shrOpcode(_) = 2 }
+pub instance SimdBits L8 I16 { def laneBits(_) = 16; def shrOpcode(_) = 1 }
+pub instance SimdBits L8 U16 { def laneBits(_) = 16; def shrOpcode(_) = 2 }
+pub instance SimdBits L4 Int { def laneBits(_) = 32; def shrOpcode(_) = 1 }
+pub instance SimdBits L4 U32 { def laneBits(_) = 32; def shrOpcode(_) = 2 }
+pub instance SimdBits L2 Int64 { def laneBits(_) = 64; def shrOpcode(_) = 1 }
+pub instance SimdBits L2 U64 { def laneBits(_) = 64; def shrOpcode(_) = 2 }
+pub instance SimdBits L32 I8 { def laneBits(_) = 8; def shrOpcode(_) = 1 }
+pub instance SimdBits L32 U8 { def laneBits(_) = 8; def shrOpcode(_) = 2 }
+pub instance SimdBits L16 I16 { def laneBits(_) = 16; def shrOpcode(_) = 1 }
+pub instance SimdBits L16 U16 { def laneBits(_) = 16; def shrOpcode(_) = 2 }
+pub instance SimdBits L8 Int { def laneBits(_) = 32; def shrOpcode(_) = 1 }
+pub instance SimdBits L8 U32 { def laneBits(_) = 32; def shrOpcode(_) = 2 }
+pub instance SimdBits L4 Int64 { def laneBits(_) = 64; def shrOpcode(_) = 1 }
+pub instance SimdBits L4 U64 { def laneBits(_) = 64; def shrOpcode(_) = 2 }
+
+pub instance (SimdBits n e) => Rem (Simd n e) {
+    def (%)(a, b) = __simdBin(4, a, b)
+}
+
+pub instance (SimdLane n e) => Neg (Simd n e) {
+    def neg(a) = __simdUnary(0, a)
+}
+
+pub instance (SimdBits n e) => BitAnd (Simd n e) {
+    def (&)(a, b) = __simdBin(5, a, b)
+}
+
+pub instance (SimdBits n e) => BitOr (Simd n e) {
+    def (|)(a, b) = __simdBin(6, a, b)
+}
+
+pub instance (SimdBits n e) => BitXor (Simd n e) {
+    def (^)(a, b) = __simdBin(7, a, b)
+}
+
+pub instance (SimdBits n e) => BitNot (Simd n e) {
+    def (~)(a) = __simdUnary(1, a)
+}
+
+pub instance (SimdBits n e) => Shl (Simd n e) {
+    def (<<)(a, amt) = __simdShift(0, a, amt)
+}
+
+pub instance (SimdBits n e) => Shr (Simd n e) {
+    def (>>)(a, amt) =
+        if (shrOpcode(a) == 2) __simdShift(2, a, amt)
+        else __simdShift(1, a, amt)
+}
+
+pub instance (SimdBits n e) => Ushr (Simd n e) {
+    def (>>>)(a, amt) = __simdShift(2, a, amt)
+}
+
+/// Whole-vector structural equality (`true` iff all lanes are equal).
+pub instance (SimdLane n e) => Eq (Simd n e) {
+    def eq(a, b) = {
+        let l = laneCount(a);
+        let m = __simdReduce(5, __simdCmp(0, a, b));
+        if (l == 32) m == -1 else m == ((1 << l) - 1)
+    }
+}
+
+// ============================================================================
+// 4. First-Class `Mask n e` Operations & Blending (`select`)
+// ============================================================================
+
+/// Unwrap the underlying all-ones/all-zeros raw `Simd n e` vector of `m`.
+pub def maskRaw(m: Mask n e): Simd n e = match m {
+    Mask(raw) -> raw,
+}
+
+pub instance (SimdLane n e) => BitAnd (Mask n e) {
+    def (&)(a, b) = match (a, b) {
+        (Mask(x), Mask(y)) -> Mask(__simdBin(5, x, y)),
+    }
+}
+
+pub instance (SimdLane n e) => BitOr (Mask n e) {
+    def (|)(a, b) = match (a, b) {
+        (Mask(x), Mask(y)) -> Mask(__simdBin(6, x, y)),
+    }
+}
+
+pub instance (SimdLane n e) => BitXor (Mask n e) {
+    def (^)(a, b) = match (a, b) {
+        (Mask(x), Mask(y)) -> Mask(__simdBin(7, x, y)),
+    }
+}
+
+pub instance (SimdLane n e) => BitNot (Mask n e) {
+    def (~)(a) = match a {
+        Mask(x) -> Mask(__simdUnary(1, x)),
+    }
+}
+
+pub instance (SimdLane n e) => Eq (Mask n e) {
+    def eq(a, b) = match (a, b) {
+        (Mask(x), Mask(y)) -> {
+            let mx: Int = __simdReduce(5, x);
+            let my: Int = __simdReduce(5, y);
+            mx == my
+        },
+    }
+}
+
+/// Pack the truth value of each lane in `m` into an `N`-bit `Int` bitmask (`bit k = lane k`).
+/// Compiles to `pmovmskb` on x86-64, `i8x16.bitmask` on Wasm SIMD128, and NEON bit-reduction on ARM64.
+bitmask: forall n e. (SimdLane n e) => Mask n e -> Int
+pub def bitmask(m) = match m {
+    Mask(raw) -> __simdReduce(5, raw),
+}
+
+/// Return `true` if at least one lane in `m` is `true`.
+any: forall n e. (SimdLane n e) => Mask n e -> Bool
+pub def any(m) = bitmask(m) != 0
+
+/// Return `true` if every lane in `m` is `true`.
+all: forall n e. (SimdLane n e) => Mask n e -> Bool
+pub def all(m) = match m {
+    Mask(raw) -> {
+        let l = laneCount(raw);
+        let bm = __simdReduce(5, raw);
+        if (l == 32) bm == -1 else bm == ((1 << l) - 1)
+    },
+}
+
+/// Return `true` if every lane in `m` is `false`.
+none: forall n e. (SimdLane n e) => Mask n e -> Bool
+pub def none(m) = bitmask(m) == 0
+
+/// Count the number of `true` lanes in `m`.
+countTrue: forall n e. (SimdLane n e) => Mask n e -> Int
+pub def countTrue(m) = popCount(bitmask(m))
+
+/// Index (`0..lanes-1`) of the first `true` lane in `m`, or `lanes` if all lanes are `false`.
+firstTrue: forall n e. (SimdLane n e) => Mask n e -> Int
+pub def firstTrue(m) = match m {
+    Mask(raw) -> {
+        let l = laneCount(raw);
+        let tz = trailingZeros(__simdReduce(5, raw));
+        if (tz > l) l else tz
+    },
+}
+
+/// Index (`0..lanes-1`) of the last `true` lane in `m`, or `-1` if all lanes are `false`.
+lastTrue: forall n e. (SimdLane n e) => Mask n e -> Int
+pub def lastTrue(m) = {
+    let bm = bitmask(m);
+    if (bm == 0) -1 else 31 - leadingZeros(bm)
+}
+
+/// Branchless lane-wise blend: selects `onTrue[i]` where `m[i]` is `true` and `onFalse[i]` otherwise.
+/// Compiles to single-instruction `bsl.16b` (NEON), `vpblendvb` (SSE4.1/AVX2), or `v128.bitselect` (Wasm).
+select: forall n e. (SimdLane n e) => (Mask n e, Simd n e, Simd n e) -> Simd n e
+pub def select(m, onTrue, onFalse) = match m {
+    Mask(raw) -> __simdBin(6, __simdBin(5, onTrue, raw), __simdBin(5, onFalse, __simdUnary(1, raw))),
+}
+
+// ============================================================================
+// 5. Lane-Wise Comparisons (`==~`, `!=~`, `<~`, `<=~`, `>~`, `>=~`)
+// ============================================================================
+
+/// Lane-wise SIMD equality comparison producing a `Mask` (`==~`, `!=~`, precedence 4).
+pub concept SimdEq a b m | a b -> m {
+    def (==~)(x: a, y: b): m,
+    def (!=~)(x: a, y: b): m
+}
+
+pub instance (SimdLane n e) => SimdEq (Simd n e)(Simd n e)(Mask n e) {
+    def (==~)(a, b) = Mask(__simdCmp(0, a, b))
+    def (!=~)(a, b) = Mask(__simdCmp(1, a, b))
+}
+pub instance (SimdLane n e) => SimdEq (Simd n e) Int (Mask n e) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+pub instance (SimdLane n e) => SimdEq Int (Simd n e)(Mask n e) {
+    def (==~)(s, b) = Mask(__simdCmp(0, __simdSplat(s), b))
+    def (!=~)(s, b) = Mask(__simdCmp(1, __simdSplat(s), b))
+}
+pub instance (SimdLane n U8) => SimdEq (Simd n U8) Char (Mask n U8) {
+    def (==~)(a, c) = Mask(__simdCmp(0, a, __simdSplat(charToInt(c))))
+    def (!=~)(a, c) = Mask(__simdCmp(1, a, __simdSplat(charToInt(c))))
+}
+pub instance (SimdLane n U8) => SimdEq Char (Simd n U8)(Mask n U8) {
+    def (==~)(c, b) = Mask(__simdCmp(0, __simdSplat(charToInt(c)), b))
+    def (!=~)(c, b) = Mask(__simdCmp(1, __simdSplat(charToInt(c)), b))
+}
+pub instance (SimdLane n I8) => SimdEq (Simd n I8) Char (Mask n I8) {
+    def (==~)(a, c) = Mask(__simdCmp(0, a, __simdSplat(charToInt(c))))
+    def (!=~)(a, c) = Mask(__simdCmp(1, a, __simdSplat(charToInt(c))))
+}
+pub instance (SimdLane n I8) => SimdEq Char (Simd n I8)(Mask n I8) {
+    def (==~)(c, b) = Mask(__simdCmp(0, __simdSplat(charToInt(c)), b))
+    def (!=~)(c, b) = Mask(__simdCmp(1, __simdSplat(charToInt(c)), b))
+}
+pub instance (SimdLane n Int64) => SimdEq (Simd n Int64) Int64 (Mask n Int64) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+pub instance (SimdLane n U64) => SimdEq (Simd n U64) Int64 (Mask n U64) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float32) => SimdEq (Simd n Float32) Float32 (Mask n Float32) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float32) => SimdEq (Simd n Float32) Float (Mask n Float32) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float) => SimdEq (Simd n Float) Float (Mask n Float) {
+    def (==~)(a, s) = Mask(__simdCmp(0, a, __simdSplat(s)))
+    def (!=~)(a, s) = Mask(__simdCmp(1, a, __simdSplat(s)))
+}
+
+/// Lane-wise SIMD ordering comparison producing a `Mask` (`<~`, `<=~`, `>~`, `>=~`, precedence 5).
+pub concept SimdOrd a b m | a b -> m {
+    def (<~)(x: a, y: b): m,
+    def (<=~)(x: a, y: b): m,
+    def (>~)(x: a, y: b): m,
+    def (>=~)(x: a, y: b): m
+}
+
+pub instance (SimdLane n e) => SimdOrd (Simd n e)(Simd n e)(Mask n e) {
+    def (<~)(a, b) = Mask(__simdCmp(2, a, b))
+    def (<=~)(a, b) = Mask(__simdCmp(3, a, b))
+    def (>~)(a, b) = Mask(__simdCmp(4, a, b))
+    def (>=~)(a, b) = Mask(__simdCmp(5, a, b))
+}
+pub instance (SimdLane n e) => SimdOrd (Simd n e) Int (Mask n e) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+pub instance (SimdLane n e) => SimdOrd Int (Simd n e)(Mask n e) {
+    def (<~)(s, b) = Mask(__simdCmp(2, __simdSplat(s), b))
+    def (<=~)(s, b) = Mask(__simdCmp(3, __simdSplat(s), b))
+    def (>~)(s, b) = Mask(__simdCmp(4, __simdSplat(s), b))
+    def (>=~)(s, b) = Mask(__simdCmp(5, __simdSplat(s), b))
+}
+pub instance (SimdLane n U8) => SimdOrd (Simd n U8) Char (Mask n U8) {
+    def (<~)(a, c) = Mask(__simdCmp(2, a, __simdSplat(charToInt(c))))
+    def (<=~)(a, c) = Mask(__simdCmp(3, a, __simdSplat(charToInt(c))))
+    def (>~)(a, c) = Mask(__simdCmp(4, a, __simdSplat(charToInt(c))))
+    def (>=~)(a, c) = Mask(__simdCmp(5, a, __simdSplat(charToInt(c))))
+}
+pub instance (SimdLane n U8) => SimdOrd Char (Simd n U8)(Mask n U8) {
+    def (<~)(c, b) = Mask(__simdCmp(2, __simdSplat(charToInt(c)), b))
+    def (<=~)(c, b) = Mask(__simdCmp(3, __simdSplat(charToInt(c)), b))
+    def (>~)(c, b) = Mask(__simdCmp(4, __simdSplat(charToInt(c)), b))
+    def (>=~)(c, b) = Mask(__simdCmp(5, __simdSplat(charToInt(c)), b))
+}
+pub instance (SimdLane n I8) => SimdOrd (Simd n I8) Char (Mask n I8) {
+    def (<~)(a, c) = Mask(__simdCmp(2, a, __simdSplat(charToInt(c))))
+    def (<=~)(a, c) = Mask(__simdCmp(3, a, __simdSplat(charToInt(c))))
+    def (>~)(a, c) = Mask(__simdCmp(4, a, __simdSplat(charToInt(c))))
+    def (>=~)(a, c) = Mask(__simdCmp(5, a, __simdSplat(charToInt(c))))
+}
+pub instance (SimdLane n I8) => SimdOrd Char (Simd n I8)(Mask n I8) {
+    def (<~)(c, b) = Mask(__simdCmp(2, __simdSplat(charToInt(c)), b))
+    def (<=~)(c, b) = Mask(__simdCmp(3, __simdSplat(charToInt(c)), b))
+    def (>~)(c, b) = Mask(__simdCmp(4, __simdSplat(charToInt(c)), b))
+    def (>=~)(c, b) = Mask(__simdCmp(5, __simdSplat(charToInt(c)), b))
+}
+pub instance (SimdLane n Int64) => SimdOrd (Simd n Int64) Int64 (Mask n Int64) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+pub instance (SimdLane n U64) => SimdOrd (Simd n U64) Int64 (Mask n U64) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float32) => SimdOrd (Simd n Float32) Float32 (Mask n Float32) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float32) => SimdOrd (Simd n Float32) Float (Mask n Float32) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+pub instance (SimdLane n Float) => SimdOrd (Simd n Float) Float (Mask n Float) {
+    def (<~)(a, s) = Mask(__simdCmp(2, a, __simdSplat(s)))
+    def (<=~)(a, s) = Mask(__simdCmp(3, a, __simdSplat(s)))
+    def (>~)(a, s) = Mask(__simdCmp(4, a, __simdSplat(s)))
+    def (>=~)(a, s) = Mask(__simdCmp(5, a, __simdSplat(s)))
+}
+
+// ============================================================================
+// 6. Min / Max / Clamp, Reductions, Saturating Int & IEEE Float SIMD Ops
+// ============================================================================
+
+/// Lane-wise minimum (signed/unsigned/IEEE minnum).
+simdMin: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def simdMin(a, b) = __simdBin(8, a, b)
+
+/// Lane-wise maximum (signed/unsigned/IEEE maxnum).
+simdMax: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def simdMax(a, b) = __simdBin(9, a, b)
+
+/// Lane-wise clamp of `v` into `[lo, hi]`.
+simdClamp: forall n e. (SimdLane n e) => (Simd n e, Simd n e, Simd n e) -> Simd n e
+pub def simdClamp(v, lo, hi) = simdMin(simdMax(v, lo), hi)
+
+/// Lane-wise absolute value.
+simdAbs: forall n e. (SimdLane n e) => Simd n e -> Simd n e
+pub def simdAbs(v) = __simdUnary(2, v)
+
+/// Horizontal sum across all lanes (wrapping for integers, pairwise halving tree for floats).
+reduceAdd: forall n e s. (SimdVec n e s) => Simd n e -> s
+pub def reduceAdd(v) = __simdReduce(0, v)
+
+/// Horizontal minimum across all lanes.
+reduceMin: forall n e s. (SimdVec n e s) => Simd n e -> s
+pub def reduceMin(v) = __simdReduce(1, v)
+
+/// Horizontal maximum across all lanes.
+reduceMax: forall n e s. (SimdVec n e s) => Simd n e -> s
+pub def reduceMax(v) = __simdReduce(2, v)
+
+/// Horizontal bitwise OR across all integer lanes.
+reduceBitOr: forall n e s. (SimdVec n e s, SimdBits n e) => Simd n e -> s
+pub def reduceBitOr(v) = __simdReduce(3, v)
+
+/// Horizontal bitwise AND across all integer lanes.
+reduceBitAnd: forall n e s. (SimdVec n e s, SimdBits n e) => Simd n e -> s
+pub def reduceBitAnd(v) = __simdReduce(4, v)
+
+/// Saturating lane-wise addition (`sadd.sat` / `uadd.sat`).
+addSat: forall n e. (SimdBits n e) => (Simd n e, Simd n e) -> Simd n e
+pub def addSat(a, b) = __simdBin(10, a, b)
+
+/// Saturating lane-wise addition operator (`+|`, precedence 11).
+(+|): forall n e. (SimdBits n e) => (Simd n e, Simd n e) -> Simd n e
+pub def (+|)(a, b) = __simdBin(10, a, b)
+
+/// Saturating lane-wise subtraction (`ssub.sat` / `usub.sat`).
+subSat: forall n e. (SimdBits n e) => (Simd n e, Simd n e) -> Simd n e
+pub def subSat(a, b) = __simdBin(11, a, b)
+
+/// Saturating lane-wise subtraction operator (`-|`, precedence 11).
+(-|): forall n e. (SimdBits n e) => (Simd n e, Simd n e) -> Simd n e
+pub def (-|)(a, b) = __simdBin(11, a, b)
+
+/// Lane-wise bit rotate-left by `amt` bits.
+rotl: forall n e. (SimdBits n e) => (Simd n e, Int) -> Simd n e
+pub def rotl(v, amt) = {
+    let w = laneBits(v);
+    let k = amt & (w - 1);
+    if (k == 0) v else (v << k) | (v >>> (w - k))
+}
+
+/// Lane-wise bit rotate-right by `amt` bits.
+rotr: forall n e. (SimdBits n e) => (Simd n e, Int) -> Simd n e
+pub def rotr(v, amt) = {
+    let w = laneBits(v);
+    let k = amt & (w - 1);
+    if (k == 0) v else (v >>> k) | (v << (w - k))
+}
+
+/// IEEE-754 floating-point SIMD operations (`Float32`, `Float`).
+pub concept SimdFloat n e s : SimdVec n e s | e -> s {
+    def simdFma(a: Simd n e, b: Simd n e, c: Simd n e): Simd n e,
+    def simdSqrt(v: Simd n e): Simd n e,
+    def simdFloor(v: Simd n e): Simd n e,
+    def simdCeil(v: Simd n e): Simd n e,
+    def simdRound(v: Simd n e): Simd n e
+}
+
+pub instance SimdFloat L4 Float32 Float32 {
+    def simdFma(a, b, c) = __simdFma(a, b, c)
+    def simdSqrt(v) = __simdUnary(3, v)
+    def simdFloor(v) = __simdUnary(4, v)
+    def simdCeil(v) = __simdUnary(5, v)
+    def simdRound(v) = __simdUnary(6, v)
+}
+pub instance SimdFloat L8 Float32 Float32 {
+    def simdFma(a, b, c) = __simdFma(a, b, c)
+    def simdSqrt(v) = __simdUnary(3, v)
+    def simdFloor(v) = __simdUnary(4, v)
+    def simdCeil(v) = __simdUnary(5, v)
+    def simdRound(v) = __simdUnary(6, v)
+}
+pub instance SimdFloat L2 Float Float {
+    def simdFma(a, b, c) = __simdFma(a, b, c)
+    def simdSqrt(v) = __simdUnary(3, v)
+    def simdFloor(v) = __simdUnary(4, v)
+    def simdCeil(v) = __simdUnary(5, v)
+    def simdRound(v) = __simdUnary(6, v)
+}
+pub instance SimdFloat L4 Float Float {
+    def simdFma(a, b, c) = __simdFma(a, b, c)
+    def simdSqrt(v) = __simdUnary(3, v)
+    def simdFloor(v) = __simdUnary(4, v)
+    def simdCeil(v) = __simdUnary(5, v)
+    def simdRound(v) = __simdUnary(6, v)
+}
+
+/// Horizontal dot product `reduceAdd(a * b)`.
+simdDot: forall n e s. (SimdFloat n e s) => (Simd n e, Simd n e) -> s
+pub def simdDot(a, b) = {
+    let prod: Simd n e = __simdBin(2, a, b);
+    __simdReduce(0, prod)
+}
+
+// ============================================================================
+// 7. Permutations, Swizzles, Halves, Widening / Narrowing & Casts
+// ============================================================================
+
+/// Reverse all lanes of `v`.
+reverseLanes: forall n e. (SimdLane n e) => Simd n e -> Simd n e
+pub def reverseLanes(v) = __simdPermute(0, v, v, 0)
+
+/// Interleave low halves of `a` and `b` (`[a0, b0, a1, b1, ...]`).
+zipLo: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def zipLo(a, b) = __simdPermute(1, a, b, 0)
+
+/// Interleave high halves of `a` and `b`.
+zipHi: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def zipHi(a, b) = __simdPermute(2, a, b, 0)
+
+/// De-interleave even-indexed lanes across `a` followed by `b` (`[a0, a2, ..., b0, b2, ...]`).
+unzipEven: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def unzipEven(a, b) = __simdPermute(3, a, b, 0)
+
+/// De-interleave odd-indexed lanes across `a` followed by `b` (`[a1, a3, ..., b1, b3, ...]`).
+unzipOdd: forall n e. (SimdLane n e) => (Simd n e, Simd n e) -> Simd n e
+pub def unzipOdd(a, b) = __simdPermute(4, a, b, 0)
+
+/// Dynamic 16-byte lookup table (`tbl.16b` / `pshufb` / `i8x16.swizzle`):
+/// selects `table[idx[i]]` when `0 <= idx[i] < 16` and `0` when `idx[i] >= 16`.
+pub def swizzleZero(table: U8x16, idx: U8x16): U8x16 = __simdPermute(6, table, idx, 0)
+
+/// Parallel 32-byte lookup into a 16-byte table (`vpshufb` / dual `tbl.16b` / dual `i8x16.swizzle`):
+/// for each lane `i` in `0..31`, selects `table[idx[i]]` when `0 <= idx[i] < 16` and `0` otherwise.
+pub def swizzle32(table: U8x16, idx: U8x32): U8x32 = {
+    let tbl32: U8x32 = __simdCombine(0, table, table);
+    __simdPermute(6, tbl32, idx, 0)
+}
+
+/// Shift `curr` right by 1 byte, shifting in the last byte `prev[15]` into lane 0 (`ext.16b` / `palignr`).
+pub def prev1Byte16(curr: U8x16, prev: U8x16): U8x16 = __simdPermute(5, prev, curr, 15)
+
+/// Shift `curr` right by 1 byte across 32 lanes, shifting `prev[31]` into lane 0.
+pub def prev1Byte32(curr: U8x32, prev: U8x32): U8x32 = __simdPermute(5, prev, curr, 31)
+
+/// Shift bytes of `v` toward lane 0 by `k` (`0..16`), filling vacated upper lanes with `0`.
+pub def shiftBytesRightZero16(v: U8x16, k: Int): U8x16 =
+    if (k <= 0) v
+    else if (k >= 16) zero()
+    else {
+        let baseIdx: U8x16 = iota();
+        swizzleZero(v, baseIdx + k)
+    }
+
+/// Relates a 128-bit vector `Simd nHalf e` and its 256-bit counterpart `Simd nFull e`.
+pub concept SimdHalves nHalf nFull e | nHalf -> nFull, nFull -> nHalf {
+    def splitHalves(v: Simd nFull e): (Simd nHalf e, Simd nHalf e),
+    def concatHalves(lo: Simd nHalf e, hi: Simd nHalf e): Simd nFull e
+}
+
+pub instance SimdHalves L16 L32 I8 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L16 L32 U8 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L8 L16 I16 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L8 L16 U16 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L4 L8 Int {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L4 L8 U32 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L2 L4 Int64 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L2 L4 U64 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L4 L8 Float32 {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+pub instance SimdHalves L2 L4 Float {
+    def splitHalves(v) = (__simdConvert(4, v), __simdConvert(5, v))
+    def concatHalves(lo, hi) = __simdCombine(0, lo, hi)
+}
+
+/// Adjacent element-width widening & narrowing between `(nNarrow, eNarrow)` and `(nWide, eWide)`.
+pub concept SimdWide nNarrow eNarrow nWide eWide | nNarrow eNarrow -> nWide eWide, nWide eWide -> nNarrow eNarrow {
+    def widenLo(v: Simd nNarrow eNarrow): Simd nWide eWide,
+    def widenHi(v: Simd nNarrow eNarrow): Simd nWide eWide,
+    def narrow(lo: Simd nWide eWide, hi: Simd nWide eWide): Simd nNarrow eNarrow,
+    def narrowSat(lo: Simd nWide eWide, hi: Simd nWide eWide): Simd nNarrow eNarrow
+}
+
+pub instance SimdWide L16 I8 L8 I16 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L16 U8 L8 U16 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L32 I8 L16 I16 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L32 U8 L16 U16 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L8 I16 L4 Int {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L8 U16 L4 U32 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L16 I16 L8 Int {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L16 U16 L8 U32 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L4 Int L2 Int64 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L4 U32 L2 U64 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L8 Int L4 Int64 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L8 U32 L4 U64 {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(2, a, b)
+}
+pub instance SimdWide L4 Float32 L2 Float {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(1, a, b)
+}
+pub instance SimdWide L8 Float32 L4 Float {
+    def widenLo(v) = __simdConvert(2, v)
+    def widenHi(v) = __simdConvert(3, v)
+    def narrow(a, b) = __simdCombine(1, a, b)
+    def narrowSat(a, b) = __simdCombine(1, a, b)
+}
+
+/// Overflow-free widened horizontal sum (widens lanes to double width before summing).
+reduceAddWide: forall n1 e1 n2 e2 s2. (SimdWide n1 e1 n2 e2, SimdVec n2 e2 s2) => Simd n1 e1 -> s2
+pub def reduceAddWide(v) = {
+    let lo: Simd n2 e2 = widenLo(v);
+    let hi: Simd n2 e2 = widenHi(v);
+    let sum: Simd n2 e2 = __simdBin(0, lo, hi);
+    __simdReduce(0, sum)
+}
+
+/// Same-lane-count numeric conversion (`castSimd`: int <-> float, signed <-> unsigned).
+pub concept SimdCast n src dst {
+    def castSimd(v: Simd n src): Simd n dst
+}
+
+pub instance (SimdLane n a, SimdLane n b) => SimdCast n a b {
+    def castSimd(v) = __simdConvert(1, v)
+}
+
+/// Zero-cost bit reinterpretation between equal-width (128-bit or 256-bit) SIMD vectors.
+pub concept SimdWidth n e w | n e -> w {
+    def simdWidthBits(v: Simd n e): Int
+}
+pub data W128 {}
+pub data W256 {}
+pub instance SimdWidth L16 I8 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L16 U8 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L8 I16 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L8 U16 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L4 Int W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L4 U32 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L2 Int64 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L2 U64 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L4 Float32 W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L2 Float W128 { def simdWidthBits(_) = 128 }
+pub instance SimdWidth L32 I8 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L32 U8 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L16 I16 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L16 U16 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L8 Int W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L8 U32 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L4 Int64 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L4 U64 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L8 Float32 W256 { def simdWidthBits(_) = 256 }
+pub instance SimdWidth L4 Float W256 { def simdWidthBits(_) = 256 }
+
+/// Reinterpret bits of a 128-bit or 256-bit vector as another vector of the same total bit width.
+bitcastSimd: forall n1 e1 n2 e2 w. (SimdWidth n1 e1 w, SimdWidth n2 e2 w) => Simd n1 e1 -> Simd n2 e2
+pub def bitcastSimd(v) = __simdConvert(0, v)
+
+/// Reinterpret a `Mask n e1` as `Mask n e2` when both vectors have the same lane count and total width.
+maskCast: forall n e1 e2 w. (SimdWidth n e1 w, SimdWidth n e2 w) => Mask n e1 -> Mask n e2
+pub def maskCast(m) = match m {
+    Mask(raw) -> Mask(__simdConvert(0, raw)),
+}
+
+// ============================================================================
+// 8. Unaligned Memory & String Loads / Stores (with ASan-Safe Tail Loader)
+// ============================================================================
+
+/// Unaligned load of `Simd n e` from `ScopedPtr` at byte offset `byteOff`.
+simdLoadScoped: forall n e. (SimdLane n e) => (ScopedPtr, Int64) -> Simd n e
+pub def simdLoadScoped(p, byteOff) = __simdLoad(p, byteOff)
+
+/// Unaligned store of `Simd n e` to `ScopedPtr` at byte offset `byteOff`.
+simdStoreScoped: forall n e. (SimdLane n e) => (ScopedPtr, Int64, Simd n e) -> Void
+pub def simdStoreScoped(p, byteOff, v) = __simdStore(p, byteOff, v)
+
+/// Unaligned load of `Simd n e` from raw `Ptr` at byte offset `byteOff`.
+simdLoadPtr: forall n e. (SimdLane n e) => (Ptr, Int64) -> Simd n e
+pub def simdLoadPtr(p, byteOff) = __simdLoadRaw(p, byteOff)
+
+/// Unaligned store of `Simd n e` to raw `Ptr` at byte offset `byteOff`.
+simdStorePtr: forall n e. (SimdLane n e) => (Ptr, Int64, Simd n e) -> Void
+pub def simdStorePtr(p, byteOff, v) = __simdStoreRaw(p, byteOff, v)
+
+/// Zero-copy unaligned load of `Simd n e` from `s` at `byteOff`.
+/// Caller must ensure `0 <= byteOff` and `byteOff + byteWidth <= strLen(s)`.
+simdLoadStr: forall n e. (SimdLane n e) => (String, Int) -> Simd n e
+pub def simdLoadStr(s, byteOff) =
+    if (byteOff < 0) {
+        let _ = strByteAt(s, byteOff);
+        __simdSplat(0)
+    } else __simdLoadStr(s, intToI64(byteOff))
+
+/// Safe zero-padded partial load from `s[byteOff .. byteOff + remBytes)` when `remBytes < byteWidth`.
+/// Never reads past `byteOff + remBytes` (100% ASan and page-boundary safe), padding trailing bytes with `0`.
+simdLoadStrTail: forall n e. (SimdLane n e) => (String, Int, Int) -> Simd n e
+pub def simdLoadStrTail(s, byteOff, remBytes) = {
+    let z: Simd n e = __simdSplat(0);
+    let bw = vectorBytes(z);
+    if (remBytes <= 0) z
+    else if (remBytes >= bw) simdLoadStr(s, byteOff)
+    else if (byteOff < 0) {
+        let _ = strByteAt(s, byteOff);
+        z
+    } else withAlloca(32, (tmp) -> {
+        scopedPtrWriteI64Le(tmp, intToI64(0), intToI64(0));
+        scopedPtrWriteI64Le(tmp, intToI64(8), intToI64(0));
+        scopedPtrWriteI64Le(tmp, intToI64(16), intToI64(0));
+        scopedPtrWriteI64Le(tmp, intToI64(24), intToI64(0));
+        withStrPtr(s, (src) -> {
+            scopedPtrCopyBytes(tmp, intToI64(0), src, intToI64(byteOff), intToI64(remBytes))
+        });
+        __simdLoad(tmp, intToI64(0))
+    })
+}
+
+/// Load `Simd n e` from `MutArray s` starting at element index `off` (bounds-checked).
+fromArray: forall n e s. (SimdVec n e s) => (MutArray s, Int) -> Simd n e
+pub def fromArray(arr, off) = {
+    let z = zero();
+    let n = lanes(z);
+    let _ = arrayGet(arr, off);
+    let _ = arrayGet(arr, off + n - 1);
+    let acc = cellNew(z);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let k = cellGet(i);
+        cellSet(acc, replace(cellGet(acc), k, arrayGet(arr, off + k)));
+        cellSet(i, k + 1)
+    };
+    cellGet(acc)
+}
+
+/// Materialize all lanes of `v` into a fresh `MutArray s`.
+toArray: forall n e s. (SimdVec n e s) => Simd n e -> MutArray s
+pub def toArray(v) = {
+    let n = lanes(v);
+    let out = arrayNew(n, extract(v, 0));
+    let i = cellNew(1);
+    while (cellGet(i) < n) {
+        let k = cellGet(i);
+        arraySet(out, k, extract(v, k));
+        cellSet(i, k + 1)
+    };
+    out
+}
+
+// ============================================================================
+// 9. Exact 256-Byte Universal Nibble-LUT Classifier (`SimdByteSet`)
+// ============================================================================
+
+/// Exact SIMD byte-set lookup table supporting all \(2^{256}\) subsets of `0..255` with zero false positives.
+/// Pure-ASCII sets (`0..127`) execute a single 2-swizzle pass; sets with high bytes (`128..255`) add a 2nd pass.
+pub data SimdByteSet {
+    loLut: U8x16,
+    hiLut: U8x16,
+    hasHigh: Bool,
+}
+
+def bitTableLo16(): U8x16 = {
+    let z: U8x16 = zero();
+    let v0 = replace(z, 0, 1);
+    let v1 = replace(v0, 1, 2);
+    let v2 = replace(v1, 2, 4);
+    let v3 = replace(v2, 3, 8);
+    let v4 = replace(v3, 4, 16);
+    let v5 = replace(v4, 5, 32);
+    let v6 = replace(v5, 6, 64);
+    replace(v6, 7, 128)
+}
+
+def bitTableHi16(): U8x16 = {
+    let z: U8x16 = zero();
+    let v0 = replace(z, 8, 1);
+    let v1 = replace(v0, 9, 2);
+    let v2 = replace(v1, 10, 4);
+    let v3 = replace(v2, 11, 8);
+    let v4 = replace(v3, 12, 16);
+    let v5 = replace(v4, 13, 32);
+    let v6 = replace(v5, 14, 64);
+    replace(v6, 15, 128)
+}
+
+/// Empty `SimdByteSet` matching no bytes.
+pub def byteSetEmpty(): SimdByteSet = SimdByteSet {
+    loLut: zero(),
+    hiLut: zero(),
+    hasHigh: false,
+}
+
+/// Return a new `SimdByteSet` with byte `b & 255` added.
+pub def byteSetAdd(bs: SimdByteSet, b: Int): SimdByteSet = {
+    let u = b & 255;
+    let lo = u & 15;
+    let hi = u >>> 4;
+    if (hi < 8) {
+        let cur = extract(bs.loLut, lo);
+        SimdByteSet {
+            loLut: replace(bs.loLut, lo, cur | (1 << hi)),
+            hiLut: bs.hiLut,
+            hasHigh: bs.hasHigh,
+        }
+    } else {
+        let cur = extract(bs.hiLut, lo);
+        SimdByteSet {
+            loLut: bs.loLut,
+            hiLut: replace(bs.hiLut, lo, cur | (1 << (hi - 8))),
+            hasHigh: true,
+        }
+    }
+}
+
+/// Return a new `SimdByteSet` with inclusive byte range `[loByte .. hiByte]` added.
+pub def byteSetAddRange(bs: SimdByteSet, loByte: Int, hiByte: Int): SimdByteSet = {
+    let acc = cellNew(bs);
+    let b = cellNew(if (loByte < 0) 0 else loByte);
+    let lim = if (hiByte > 255) 255 else hiByte;
+    while (cellGet(b) <= lim) {
+        let cur = cellGet(b);
+        cellSet(acc, byteSetAdd(cellGet(acc), cur));
+        cellSet(b, cur + 1)
+    };
+    cellGet(acc)
+}
+
+/// Build a `SimdByteSet` matching every byte present in `chars`.
+pub def byteSetFromStr(chars: String): SimdByteSet = {
+    let n = strLen(chars);
+    let acc = cellNew(byteSetEmpty());
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let k = cellGet(i);
+        cellSet(acc, byteSetAdd(cellGet(acc), strByteAt(chars, k)));
+        cellSet(i, k + 1)
+    };
+    cellGet(acc)
+}
+
+/// Union of two `SimdByteSet` classifiers.
+pub def byteSetUnion(a: SimdByteSet, b: SimdByteSet): SimdByteSet = SimdByteSet {
+    loLut: a.loLut | b.loLut,
+    hiLut: a.hiLut | b.hiLut,
+    hasHigh: a.hasHigh || b.hasHigh,
+}
+
+/// Complement of `bs` over all 256 byte values `0..255`.
+pub def byteSetInvert(bs: SimdByteSet): SimdByteSet = SimdByteSet {
+    loLut: ~bs.loLut,
+    hiLut: ~bs.hiLut,
+    hasHigh: true,
+}
+
+/// Scalar membership query on `bs` (`true` iff `b & 255` is in `bs`, for scalar tail loops).
+pub def byteSetContains(bs: SimdByteSet, b: Int): Bool = {
+    let u = b & 255;
+    let lo = u & 15;
+    let hi = u >>> 4;
+    if (hi < 8) (extract(bs.loLut, lo) & (1 << hi)) != 0
+    else bs.hasHigh && ((extract(bs.hiLut, lo) & (1 << (hi - 8))) != 0)
+}
+
+/// Classify 16 bytes in parallel against `bs`, returning a `Mask8x16` of matching lanes.
+pub def matchByteSet16(bs: SimdByteSet, v: U8x16): Mask8x16 = {
+    let mask15: U8x16 = splat(15);
+    let loNib = v & mask15;
+    let hiNib = v >>> 4;
+    let mLo = (swizzleZero(bs.loLut, loNib) & swizzleZero(bitTableLo16(), hiNib)) !=~ 0;
+    if (bs.hasHigh) {
+        let mHi = (swizzleZero(bs.hiLut, loNib) & swizzleZero(bitTableHi16(), hiNib)) !=~ 0;
+        mLo | mHi
+    } else mLo
+}
+
+/// Classify 32 bytes in parallel against `bs`, returning a `Mask8x32` of matching lanes.
+pub def matchByteSet32(bs: SimdByteSet, v: U8x32): Mask8x32 = {
+    let mask15: U8x32 = splat(15);
+    let loNib = v & mask15;
+    let hiNib = v >>> 4;
+    let mLo = (swizzle32(bs.loLut, loNib) & swizzle32(bitTableLo16(), hiNib)) !=~ 0;
+    if (bs.hasHigh) {
+        let mHi = (swizzle32(bs.hiLut, loNib) & swizzle32(bitTableHi16(), hiNib)) !=~ 0;
+        mLo | mHi
+    } else mLo
+}

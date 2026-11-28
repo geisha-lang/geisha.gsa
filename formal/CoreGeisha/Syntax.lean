@@ -71,6 +71,8 @@ inductive Ty where
   | tuple : List Ty → Ty
   | fn : Mode → List Ty → Ty → Ty
   | adt : Ident → Ty
+  | simd128 : Ident → Ty
+  | simd256 : Ident → Ty
   | cell : Ty → Ty
   | mutArray : Ty → Ty
   | immArray : Ty → Ty

@@ -1547,7 +1547,7 @@ def emitWasmFromIrOpt(
     if (compileOnly) {
         let tmpLl = outPath + ".tmp.ll";
         writeFile(tmpLl, llText)?;
-        let args = ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib", "-x", "ir", "-c", tmpLl, "-o", outPath];
+        let args = ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-msimd128", "-Wno-override-module", "-nostdlib", "-x", "ir", "-c", tmpLl, "-o", outPath];
         let rc = runHostProc(wasmCc, args, Nil);
         let _ = removeFile(tmpLl);
         if (rc == 0) Ok(())
@@ -1572,7 +1572,7 @@ def emitWasmFromIrOpt(
                 "-Wl,--export=gs_wasm_heap_live"
             ];
         let args = concatArgLists([
-            ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib"],
+            ["--target=wasm32", effOptArg, "-mbulk-memory", "-mnontrapping-fptoint", "-msimd128", "-Wno-override-module", "-nostdlib"],
             ldArgs,
             tc.tcCFlags,
             ["-x", "ir", tmpLl, "-x", "none", wasmRt],
@@ -1592,7 +1592,7 @@ def emitWasmFromIrOpt(
             if (isSizeOpt && !isWasmOptDisabled()) {
                 match findExeInPath("wasm-opt") {
                     Some(wasmOptBin) -> {
-                        let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", outPath, "-o", outPath];
+                        let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd", outPath, "-o", outPath];
                         let optRc = runHostProc(wasmOptBin, optArgs, Nil);
                         if (optRc == 0) Ok(())
                         else Err("wasm-opt failed while optimizing '" + outPath + "'")
@@ -2154,7 +2154,7 @@ def makeCompileIrJob(
             pjTmpObj: tmpObjPath,
             pjDstObj: dstObjPath,
             pjProg: wasmCc,
-            pjArgs: listAppend(["--target=wasm32", optFlag], listAppend(dbgArgs, ["-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib", "-x", "ir", "-c", cguLlPath, "-o", tmpObjPath])),
+            pjArgs: listAppend(["--target=wasm32", optFlag], listAppend(dbgArgs, ["-mbulk-memory", "-mnontrapping-fptoint", "-msimd128", "-Wno-override-module", "-nostdlib", "-x", "ir", "-c", cguLlPath, "-o", tmpObjPath])),
             pjEnv: Nil,
         }
     } else if (target == "ios" || target == "ios-app") {
@@ -2313,7 +2313,7 @@ def compileCgusToCachedObjs(
     let ccFp =
         if (target == "wasm32") resolveWasmCc()
         else resolveNativeCc() + "|" + currentHostOs() + "|" + currentHostArch();
-    let keyPrefix = "cgu-v3|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
+    let keyPrefix = "cgu-v4|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
     let pidStr = intToStr(c_getpid());
 
     let objsRev = cellNew(Nil);
@@ -2612,7 +2612,7 @@ def emitWasmFromCgus(
             "-Wl,--export=gs_wasm_heap_live"
         ];
     let args = concatArgLists([
-        ["--target=wasm32", optFlag, "-mbulk-memory", "-mnontrapping-fptoint", "-Wno-override-module", "-nostdlib"],
+        ["--target=wasm32", optFlag, "-mbulk-memory", "-mnontrapping-fptoint", "-msimd128", "-Wno-override-module", "-nostdlib"],
         ldArgs,
         tc.tcCFlags,
         cguObjs,
@@ -2630,7 +2630,7 @@ def emitWasmFromCgus(
     } else if (isSizeOpt && !isWasmOptDisabled()) {
         match findExeInPath("wasm-opt") {
             Some(wasmOptBin) -> {
-                let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", outPath, "-o", outPath];
+                let optArgs = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd", outPath, "-o", outPath];
                 let optRc = runHostProc(wasmOptBin, optArgs, Nil);
                 if (optRc == 0) Ok(())
                 else Err("wasm-opt failed while optimizing '" + outPath + "'")

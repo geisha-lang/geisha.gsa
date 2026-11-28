@@ -59,6 +59,8 @@ def tyEq : Ty → Ty → Bool
   | .tuple ts1, .tuple ts2 => tyListEq ts1 ts2
   | .fn m1 ps1 r1, .fn m2 ps2 r2 => modeEq m1 m2 && tyListEq ps1 ps2 && tyEq r1 r2
   | .adt n1, .adt n2 => n1 == n2
+  | .simd128 s1, .simd128 s2 => s1 == s2
+  | .simd256 s1, .simd256 s2 => s1 == s2
   | .cell t1, .cell t2 => tyEq t1 t2
   | .mutArray t1, .mutArray t2 => tyEq t1 t2
   | .immArray t1, .immArray t2 => tyEq t1 t2
@@ -113,6 +115,8 @@ def tySub : Ty → Ty → Bool
   | .fn m1 ps1 r1, .fn m2 ps2 r2 =>
     modeSub m1 m2 && tyListSub ps2 ps1 && tySub r1 r2
   | .adt n1, .adt n2 => n1 == n2
+  | .simd128 s1, .simd128 s2 => s1 == s2
+  | .simd256 s1, .simd256 s2 => s1 == s2
   | .cell t1, .cell t2 => tyEq t1 t2
   | .mutArray t1, .mutArray t2 => tyEq t1 t2
   | .immArray t1, .immArray t2 => tySub t1 t2
@@ -150,6 +154,8 @@ theorem tySub_sound {t1 t2 : Ty} (h : tySub t1 t2 = true) : TySub t1 t2 := by
   · simp only [Bool.and_eq_true] at h
     exact .fn (modeSub_sound h.1.1) (tyListSub_sound h.1.2) (tySub_sound h.2)
   · simp only [beq_iff_eq] at h; subst h; exact .adt _
+  · simp only [beq_iff_eq] at h; subst h; exact .simd128 _
+  · simp only [beq_iff_eq] at h; subst h; exact .simd256 _
   · rw [tyEq_sound h]; exact .cell _
   · rw [tyEq_sound h]; exact .mutArray _
   · exact .immArray (tySub_sound h)
@@ -188,6 +194,8 @@ def tySendInList (sendAdts : List Ident) : Ty → Bool
   | .fn .shared _ _ => true
   | .fn .local _ _ => false
   | .adt n => sendAdts.contains n
+  | .simd128 _ => true
+  | .simd256 _ => true
   | .cell _ => false
   | .mutArray _ => false
   | .immArray t => tySendInList sendAdts t
@@ -246,6 +254,8 @@ theorem tySendInList_sound {sendAdts : List Ident} {τ : Ty}
   | adt n =>
     simp only [tySendInList] at h
     exact .adt (List.contains_iff_mem.mp h)
+  | simd128 s => exact .simd128 s
+  | simd256 s => exact .simd256 s
   | cell _ => simp [tySendInList] at h
   | mutArray _ => simp [tySendInList] at h
   | immArray t => exact .immArray (tySendInList_sound h)

@@ -1711,6 +1711,7 @@ def resolveConceptCall(
             let callSub: StrMap Type = strMapNew();
             let concreteFnTy = TyArr(TyVoid, argTys, retTy);
             unifyTypesInto(schemeBody(methodScm), concreteFnTy, callSub);
+            resolveFunDepsInSubst(ctx, schemeConstraints(methodScm), callSub);
             collectSubstArgs(cinfo.typeParams, callSub) >>= (concreteTargetTys) ->
             if (!isTypeListConcrete(concreteTargetTys)) None
             else {
@@ -1725,6 +1726,7 @@ def resolveConceptCall(
                                     let resolved = strMapGet(instInfo.methodImpls, methodName) >>= (baseImplName) ->
                                         strMapGet(ctx.kGlobalFns, baseImplName) >>= (baseDef) -> {
                                             unifyTypesInto(schemeBody(baseDef.fnScm), concreteFnTy, instSub);
+                                            resolveFunDepsInSubst(ctx, schemeConstraints(baseDef.fnScm), instSub);
                                             let tparams = schemeTypeParams(baseDef.fnScm);
                                             match tparams {
                                                 Nil -> Some((baseImplName, ScmMono(concreteFnTy), None)),
@@ -4433,6 +4435,13 @@ def isInlineSafeIntrinsic(name: String): Bool =
     || name == "bitShl" || name == "bitShr" || name == "bitUshr"
     || name == "bitShl64" || name == "bitShr64" || name == "bitUshr64"
     || name == "bitPopCount" || name == "bitPopCount64" || name == "bitCtz"
+    || name == "bitCtz64" || name == "bitClz" || name == "bitClz64"
+    || name == "__simdSplat" || name == "__simdIota" || name == "__simdExtract" || name == "__simdReplace"
+    || name == "__simdUnary" || name == "__simdBin" || name == "__simdShift" || name == "__simdFma"
+    || name == "__simdCmp" || name == "__simdReduce" || name == "__simdPermute"
+    || name == "__simdConvert" || name == "__simdCombine"
+    || name == "__simdLoad" || name == "__simdStore"
+    || name == "__simdLoadRaw" || name == "__simdStoreRaw" || name == "__simdLoadStr"
     || name == "charToInt" || name == "intToChar" || name == "intToI64" || name == "i64ToInt"
     || name == "floatToBits64" || name == "bits64ToFloat" || name == "floatToBits32" || name == "bits32ToFloat"
     || name == "intToFloat" || name == "floatToInt"
@@ -4566,7 +4575,10 @@ def isEligibleTinyLeafFn(fd: FunDef, fns: StrMap FunDef, externs: StrMap ExternD
                     if (!isTypeConcrete(fnTy) || typeBlocksInline(retTy) || varDeclListBlocksInline(fd.fnParams)) false
                     else {
                         let cost = leafTermCost(fd.fnBody, fns, externs);
-                        cost >= 1 && cost <= 14
+                        let maxCost =
+                            if (strStartsWith(fd.fnName, "std.simd.") || strStartsWith(fd.fnName, "__inst_")) 34
+                            else 14;
+                        cost >= 1 && cost <= maxCost
                     },
                 _ -> false,
             }
@@ -4872,8 +4884,9 @@ def inlineTinyLeafFns(
 ): List GlobalValDef = {
     let fnCounters: StrMap (Cell Int) = strMapNew();
     let pass = cellNew(0);
+    let prevLeafCount = cellNew(-1);
     let curGlobals = cellNew(globals);
-    while (cellGet(pass) < 2) {
+    while (cellGet(pass) < 3) {
         let leaves: StrMap FunDef = strMapNew();
         let leafCount = cellNew(0);
         let cf0 = cellNew(fnNames);
@@ -4893,7 +4906,10 @@ def inlineTinyLeafFns(
                 Nil -> (),
             }
         };
-        if (cellGet(leafCount) > 0) {
+        let curCnt = cellGet(leafCount);
+        let shouldRun = curCnt > 0 && (cellGet(pass) < 2 || curCnt > cellGet(prevLeafCount));
+        cellSet(prevLeafCount, curCnt);
+        if (shouldRun) {
             let cf1 = cellNew(fnNames);
             while (match cellGet(cf1) { Nil -> false, _ -> true }) {
                 match cellGet(cf1) {

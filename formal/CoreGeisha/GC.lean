@@ -107,6 +107,8 @@ def flattenTyWords : Ty → List Bool
   | .ptr => [false]
   | .scopedPtr => [false]
   | .arena => [false]
+  | .simd128 _ => [false, false]
+  | .simd256 _ => [false, false, false, false]
   | .tuple ts => flattenTyListWords ts
   | .str => [true]
   | .foreignPtr => [true]
@@ -1788,6 +1790,8 @@ def abiTypeSizeAlign (adts : List AdtDef) (unboxedSet : List Ident)
   | _, .float32 => (4, 4)
   | _, .int64 => (8, 8)
   | _, .float => (8, 8)
+  | _, .simd128 _ => (16, 8)
+  | _, .simd256 _ => (32, 8)
   | f, .tuple elems => abiStructSizeAlign adts unboxedSet f elems
   | 0, .adt _ => (8, 8)
   | fuel' + 1, .adt n =>
@@ -1821,7 +1825,8 @@ mutual
 /-- Exact counterpart of `isNoscanElemType` in `src/codegen.gsa`. -/
 def abiIsNoscan (adts : List AdtDef) (unboxedSet : List Ident) : Nat → Ty → Bool
   | _, .void | _, .int | _, .int64 | _, .float | _, .float32
-  | _, .char | _, .bool | _, .scopedPtr | _, .arena => true
+  | _, .char | _, .bool | _, .scopedPtr | _, .arena
+  | _, .simd128 _ | _, .simd256 _ => true
   | 0, _ => false
   | fuel + 1, .tuple es => abiIsNoscanList adts unboxedSet fuel es
   | fuel + 1, .adt n =>

@@ -65,6 +65,7 @@ EOF
 cat > "$TMP_DIR/san_heap_stress.gsa" << 'EOF'
 use std.option.{Option, Some, None}
 use std.str.intToStr
+use std.simd.{U8x16, U8x32, splat, iota, extract, concatHalves, simdLoadStrTail, (==~), firstTrue}
 
 extern "gc_collect_major" def gcCollectMajor(): Void
 extern "gc_trim" def gcTrim(): Void
@@ -127,6 +128,8 @@ def main(): Void = {
     let oldCell = cellNew(buildTree(3, 1));
     let stackTreeCell = cellNew(Leaf("stack-root"));
     let largeArr = arrayNew(1500, Some("init"));
+    let simdAdtArr: MutArray (Option (Int, U8x32, String)) = arrayNew(256, None);
+    let simdCell: Cell (U8x16, String) = cellNew((iota(), "init-simd"));
     gcCollectMajor();
 
     let acc = cellNew(0);
@@ -135,7 +138,13 @@ def main(): Void = {
         let k = cellGet(r);
         let v1 = mutateOldAndShadow(oldCell, k) + mutateOldAndShadow(stackTreeCell, k + 3);
         arraySet(largeArr, (k * 13) % 1500, Some("item-" + intToStr(k)));
-        let v2 = ffiAndArenaRound(k);
+        let base16: U8x16 = splat(k & 63);
+        let v32: U8x32 = concatHalves(base16, base16 + 1);
+        arraySet(simdAdtArr, k % 256, Some((k, v32, "simd-" + intToStr(k))));
+        cellSet(simdCell, (base16 + 2, "cell-" + intToStr(k)));
+        let shortS = "t" + intToStr(k);
+        let tailV: U8x16 = simdLoadStrTail(shortS, 0, strLen(shortS));
+        let v2 = ffiAndArenaRound(k) + firstTrue(tailV ==~ 't');
         cellSet(acc, cellGet(acc) + v1 + v2);
         if (k % 40 == 39) gcTrim() else ();
         cellSet(r, k + 1)
@@ -145,8 +154,14 @@ def main(): Void = {
         Some(s) -> s,
         None -> "none",
     };
+    let simdOk = match arrayGet(simdAdtArr, 119) {
+        Some((tag, v32, lbl)) -> tag == 119 && extract(v32, 0) == (119 & 63) && extract(v32, 31) == ((119 & 63) + 1) && lbl == "simd-119",
+        None -> false,
+    };
+    let (cVec, cLbl) = cellGet(simdCell);
     let ok = treeLen(cellGet(oldCell)) > 40 && treeLen(cellGet(gBootTree)) > 60
-             && tailStr == "item-119" && cellGet(acc) > 10000;
+             && tailStr == "item-119" && simdOk && extract(cVec, 7) == ((119 & 63) + 2) && cLbl == "cell-119"
+             && cellGet(acc) > 10000;
     printLn(if (ok) "ASAN_HEAP_OK" else "ASAN_HEAP_BAD")
 }
 EOF

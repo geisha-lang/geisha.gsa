@@ -15,6 +15,7 @@ MODULES = [
     ("std.list", "std/list.gsa"),
     ("std.control", "std/control.gsa"),
     ("std.bits", "std/bits.gsa"),
+    ("std.simd", "std/simd.gsa"),
     ("std.path", "std/path.gsa"),
     ("std.char", "std/char.gsa"),
     ("std.buf", "std/buf.gsa"),

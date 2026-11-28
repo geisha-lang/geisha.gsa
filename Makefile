@@ -61,7 +61,7 @@ WASM_CC ?= $(shell \
 	elif [ -x /usr/local/opt/llvm@20/bin/clang ]; then echo /usr/local/opt/llvm@20/bin/clang; \
 	elif command -v clang-20 >/dev/null 2>&1; then command -v clang-20; \
 	else echo clang; fi)
-WASM_FLAGS ?= --target=wasm32 -Oz -ffunction-sections -fdata-sections -mbulk-memory -mnontrapping-fptoint
+WASM_FLAGS ?= --target=wasm32 -Oz -ffunction-sections -fdata-sections -mbulk-memory -mnontrapping-fptoint -msimd128
 
 ifeq ($(origin STAGE0),undefined)
   STAGE0     := $(BUILD_DIR)/geisha0$(EXE_EXT)

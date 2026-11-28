@@ -94,6 +94,8 @@ inductive TySub : Ty → Ty → Prop where
       TySub r1 r2 →
       TySub (.fn m1 ps1 r1) (.fn m2 ps2 r2)
   | adt (n : Ident) : TySub (.adt n) (.adt n)
+  | simd128 (s : Ident) : TySub (.simd128 s) (.simd128 s)
+  | simd256 (s : Ident) : TySub (.simd256 s) (.simd256 s)
   | cell (t : Ty) : TySub (.cell t) (.cell t)
   | mutArray (t : Ty) : TySub (.mutArray t) (.mutArray t)
   | immArray {t1 t2 : Ty} : TySub t1 t2 → TySub (.immArray t1) (.immArray t2)
@@ -132,6 +134,8 @@ inductive TySendIn (S : Ident → Prop) : Ty → Prop where
   | tuple {ts : List Ty} : TyListSendIn S ts → TySendIn S (.tuple ts)
   | fnShared (ps : List Ty) (ret : Ty) : TySendIn S (.fn .shared ps ret)
   | adt {name : Ident} : S name → TySendIn S (.adt name)
+  | simd128 (s : Ident) : TySendIn S (.simd128 s)
+  | simd256 (s : Ident) : TySendIn S (.simd256 s)
   | immArray {t : Ty} : TySendIn S t → TySendIn S (.immArray t)
   | task {t : Ty} : TySendIn S t → TySendIn S (.task t)
   | mvar {t : Ty} : TySendIn S t → TySendIn S (.mvar t)
