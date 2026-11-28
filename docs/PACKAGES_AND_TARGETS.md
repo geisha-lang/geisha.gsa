@@ -134,8 +134,6 @@ geisha --target js -o app.mjs app.gsa      # emits app.mjs + app.d.ts
 geisha build --target js                   # emits build/<name>.mjs + build/<name>.d.ts
 ```
 
-For zero-server browser playgrounds, `make wasm-playground` compiles the self-hosted Geisha frontend, embedded `stdlib_bundle`, and `codegen_js` into `build/geisha-playground.wasm`, paired with `playground/geisha-playground.mjs` (`createGeishaPlayground`).
-
 ---
 
 ## 5. iOS, macOS `.app` & `.appex` Bundles (`ios`, `ios-sim`, `macos-app`, `ios-app`, `ios-sim-app`)

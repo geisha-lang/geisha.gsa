@@ -70,7 +70,7 @@ else
   STAGE0_DEP :=
 endif
 
-.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime wasm-playground stdlib-bundle check-docs stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test test-sanitizers verify-core clean
+.PHONY: all runtime runtime-ios runtime-ios-sim wasm-runtime stdlib-bundle check-docs stage0 stage1 stage2 stage3 bootstrap update-bootstrap dist install test test-sanitizers verify-core clean
 
 all: stage2
 
@@ -80,11 +80,6 @@ $(BUILD_DIR):
 runtime: $(RUNTIME_LIB)
 
 wasm-runtime: $(WASM_RT_OBJ)
-
-wasm-playground: $(BUILD_DIR)/geisha-playground.wasm
-
-$(BUILD_DIR)/geisha-playground.wasm: $(BUILD_DIR)/geisha2$(EXE_EXT) $(WASM_RT_OBJ) src/*.gsa | $(BUILD_DIR)
-	$(BUILD_DIR)/geisha2$(EXE_EXT) --src-root src --target wasm32 --opt z --strip --runtime $(WASM_RT_OBJ) -o $(BUILD_DIR)/geisha-playground.wasm src/playground.gsa
 
 $(WASM_RT_OBJ): runtime/wasm_rt.c | $(BUILD_DIR)
 	$(WASM_CC) $(WASM_FLAGS) -Wall -Wextra -nostdlib -ffreestanding -c runtime/wasm_rt.c -o $(WASM_RT_OBJ)
