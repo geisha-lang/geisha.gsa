@@ -1931,6 +1931,9 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "scopedPtrCopyBytes"
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
     || name == "__blackBox"
+    || name == "__gs_contract_fail"
+    || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
+    || name == "assert" || name == "assume"
     || name == "gcTrim" || name == "gcSetThresholds" || name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes"
     || name == "sysArgc" || name == "sysArgv"
     || name == "__concAtomicNew" || name == "__concAtomicLoad" || name == "__concAtomicStore"
@@ -2926,10 +2929,11 @@ def scanReachTerm(
     TmGetTag(e1) -> scanReachTerm(prog, allReach, dirReach, wl, e1),
 }
 
-def collectReachableCoreFns(
+def collectReachableCoreFnsWithRoots(
     prog: CoreProgram,
     allReach: StrMap Bool,
-    dirReach: StrMap Bool
+    dirReach: StrMap Bool,
+    extraRoots: List String
 ): List String =
     if (!strMapContains(prog.coreFns, "main")) {
         let cf = cellNew(prog.coreFnNames);
@@ -2947,6 +2951,16 @@ def collectReachableCoreFns(
     } else {
         let wl: Cell (List String) = cellNew(Nil);
         markReachFn(prog, allReach, dirReach, wl, "main", true);
+        let cer = cellNew(extraRoots);
+        while (match cellGet(cer) { Nil -> false, _ -> true }) {
+            match cellGet(cer) {
+                Cons(rname, rr) -> {
+                    markReachFn(prog, allReach, dirReach, wl, rname, true);
+                    cellSet(cer, rr)
+                },
+                Nil -> (),
+            }
+        };
         let cg = cellNew(prog.coreGlobals);
         while (match cellGet(cg) { Nil -> false, _ -> true }) {
             match cellGet(cg) {
@@ -3288,10 +3302,13 @@ def emitMainBodyWithGlobals(ctx: DumpCtx, b: StringBuf, gs: List GlobalValDef, b
     },
 }
 
-pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String = {
+pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String =
+    dumpCoreProgramSExprWithRoots(prog, Nil)
+
+pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String): Result String String = {
     let allReach: StrMap Bool = strMapNew();
     let dirReach: StrMap Bool = strMapNew();
-    let activeFnNames = collectReachableCoreFns(prog, allReach, dirReach);
+    let activeFnNames = collectReachableCoreFnsWithRoots(prog, allReach, dirReach, extraRoots);
 
     let globTypes: StrMap Type = strMapNew();
     let cg0 = cellNew(prog.coreGlobals);

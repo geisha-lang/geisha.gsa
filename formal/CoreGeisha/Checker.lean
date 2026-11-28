@@ -589,6 +589,8 @@ def unOpSig : UnOp → Ty × Ty
   | .bitNot64 => (.int64, .int64)
   | .negFloat => (.float, .float)
   | .negFloat32 => (.float32, .float32)
+  | .intToI64 => (.int, .int64)
+  | .i64ToInt => (.int64, .int)
 
 def checkUnOp (op : UnOp) (τ : Ty) : Except String Ty :=
   let (e1, τr) := unOpSig op

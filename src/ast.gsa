@@ -274,6 +274,27 @@ pub data MatchArm {
     MkMatchArm { pat: Pattern, guard: Option Form, body: Form },
 }
 
+pub data EnsuresClause {
+    MkEnsuresClause { ecBind: Option String, ecSpan: Span, ecExpr: Form },
+}
+
+pub data FnContract {
+    MkFnContract {
+        fcRequires: List (Span, Form),
+        fcEnsures: List EnsuresClause,
+        fcDecreases: List (Span, Form),
+    },
+}
+
+pub def emptyFnContract(): FnContract =
+    MkFnContract { fcRequires: Nil, fcEnsures: Nil, fcDecreases: Nil }
+
+pub def hasFnContract(fc: FnContract): Bool =
+    match (fc.fcRequires, fc.fcEnsures, fc.fcDecreases) {
+        (Nil, Nil, Nil) -> false,
+        _ -> true,
+    }
+
 pub data Form {
     MkForm { pos: Span, ty: Scheme, annot: Option Scheme, node: Expr },
 }
@@ -295,6 +316,8 @@ pub data Expr {
     ExMatch(Form, List MatchArm),
     ExField(Form, String),
     ExTry(Form),
+    ExContract(FnContract, Form),
+    ExLoopContract(List (Span, Form), List (Span, Form), Form),
 }
 
 pub def mkForm(pos: Span, node: Expr): Form =

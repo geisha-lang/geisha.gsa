@@ -123,3 +123,9 @@ void gs_div_zero_fail(void)
     fprintf(stderr, "Runtime error: integer division or remainder by zero\n");
     abort();
 }
+
+void gs_contract_fail(const char *msg)
+{
+    fprintf(stderr, "Contract error: %s\n", msg ? msg : "assertion failed");
+    abort();
+}

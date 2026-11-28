@@ -18,6 +18,7 @@ This directory contains the complete machine-checked formal semantics and safety
 | `CoreGeisha/Eval.lean` | Fuel-bounded deterministic small-step evaluator (`stepOnce`, `runSteps`) with zero-`sorry` soundness proof (`runSteps_sound`) for `geisha-check --eval` differential conformance testing against native LLVM binaries. |
 | `CoreGeisha/Checker.lean` | Unified verified executable checker (`checkProgram`) combining type/mode/concurrency checking, Maranget exhaustiveness, stack-escape checking, and live codegen GC mask verification, linked directly to end-to-end safety theorems. |
 | `CoreGeisha/Parser.lean` | `.gscore` S-expression parser for `--dump-core` translation validation (`adts`, `externs`, `funs`, `stack-allocs`, `gc-masks`), supporting full self-verification of `src/geisha.gsa`. |
+| `CoreGeisha/VCG.lean` | Executable fail-closed **Verification Condition Generator** (`vcgenPure`, `vcgen`, `verifyFn`, `runVcgSelfCheck`, `verifyGscoreProgram`) mirroring `src/verify.gsa`, zero-`sorry` proofs of **VCG Soundness** (`vcgen_sound`), **Function Contract Soundness** (`verifyFn_sound`), **Well-Founded Loop Termination** (`while_decreases_terminates`), and 4 non-vacuity counterexamples (`int32_overflow_counterexample`, `truncating_rem_and_masked_shift_counterexample`, `missing_loop_havoc_counterexample`, `mutable_alias_call_counterexample`). |
 
 ## 2. Key Machine-Checked Guarantees
 
@@ -31,6 +32,8 @@ This directory contains the complete machine-checked formal semantics and safety
    Stack-promoted `Cell` allocations freed eagerly upon function return (`popRegion`) never produce dangling stack dereferences (`¬ IsDanglingAccess`) and are simulated lockstep by heap semantics (`stack_alloc_simulates_heap`).
 5. **Exact 40-Bit Pointer Masks & Sticky Generational Write Barrier (`GC.lean`)**:
    Immutable young allocations require zero write barriers; mutating heap containers with `gcWriteBarrierStore` preserves `GenHeapInv`; `minorGcCollect` preserves all reachable objects (`minorGc_sound`, whereas omitting the write barrier sweeps a live object in `missing_write_barrier_unsound`); `majorGcCollect` reclaims unreachable cyclic old-generation islands (`majorGc_complete`).
+6. **Verification Condition Generator Soundness & Termination (`VCG.lean`)**:
+   Programs passing `vcgen` / `verifyFn` with valid obligations never trap with `Trap.divByZero` and satisfy their `ensures` postconditions under `requires` and pairwise distinct mutable `Cell` arguments (`vcgen_sound`, `verifyFn_sound`), while `while_` loops with strictly decreasing non-negative ranking functions terminate in finitely many `Steps` (`while_decreases_terminates`). Non-vacuity is witnessed by 4 concrete operational counterexamples (`Int32` wrapping overflow, truncating `%` & masked `<<`, missing loop havoc, and aliased mutable call arguments), and live compiler `.gscore` dumps are cross-verified end-to-end via `geisha verify --dump-core` + `geisha-check --verify-vcg`.
 
 ## 3. Verification
 
@@ -39,4 +42,4 @@ cd formal && lake build
 make verify-core
 ```
 
-All 11 modules compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`**, **zero custom axioms**, and **zero external library dependencies**.
+All 12 modules compile cleanly under Lean 4 (`v4.36.0`) with **zero `sorry`**, **zero custom axioms**, and **zero external library dependencies**.

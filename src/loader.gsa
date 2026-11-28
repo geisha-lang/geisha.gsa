@@ -30,6 +30,7 @@ use ast.{
     Form, MkForm, mkForm,
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, MkEnsuresClause, FnContract, MkFnContract,
     FieldDecl, MkFieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MkVariantDef, MethodDecl, MkMethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
@@ -417,6 +418,51 @@ def collectExprChainsInForm(f: Form, bound: List String, out: Cell (List (List S
     ExWhile(c, b) -> {
         collectExprChainsInForm(c, bound, out);
         collectExprChainsInForm(b, bound, out)
+    },
+    ExContract(fc, body) -> {
+        let cr = cellNew(fc.fcRequires);
+        while (match cellGet(cr) { Nil -> false, _ -> true }) {
+            match cellGet(cr) {
+                Cons((_, e), r) -> { collectExprChainsInForm(e, bound, out); cellSet(cr, r) },
+                Nil -> (),
+            }
+        };
+        let cd = cellNew(fc.fcDecreases);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) {
+                Cons((_, e), r) -> { collectExprChainsInForm(e, bound, out); cellSet(cd, r) },
+                Nil -> (),
+            }
+        };
+        let ce = cellNew(fc.fcEnsures);
+        while (match cellGet(ce) { Nil -> false, _ -> true }) {
+            match cellGet(ce) {
+                Cons(ec, r) -> {
+                    let eb = match ec.ecBind { Some(bn) -> addUniqueStr(bound, bn), None -> bound };
+                    collectExprChainsInForm(ec.ecExpr, eb, out);
+                    cellSet(ce, r)
+                },
+                Nil -> (),
+            }
+        };
+        collectExprChainsInForm(body, bound, out)
+    },
+    ExLoopContract(invs, decs, body) -> {
+        let ci = cellNew(invs);
+        while (match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) {
+                Cons((_, e), r) -> { collectExprChainsInForm(e, bound, out); cellSet(ci, r) },
+                Nil -> (),
+            }
+        };
+        let cd = cellNew(decs);
+        while (match cellGet(cd) { Nil -> false, _ -> true }) {
+            match cellGet(cd) {
+                Cons((_, e), r) -> { collectExprChainsInForm(e, bound, out); cellSet(cd, r) },
+                Nil -> (),
+            }
+        };
+        collectExprChainsInForm(body, bound, out)
     },
     ExAbs(ps, _, body) -> {
         let nb = cellNew(bound);
@@ -1320,6 +1366,58 @@ def rewriteFormInMod(ctx: ModRewriteCtx, f: Form, bound: List String): Form = {
         ExTry(e) -> ExTry(rewriteFormInMod(ctx, e, bound)),
         ExIf(c, t, e) -> ExIf(rewriteFormInMod(ctx, c, bound), rewriteFormInMod(ctx, t, bound), rewriteFormInMod(ctx, e, bound)),
         ExWhile(c, b) -> ExWhile(rewriteFormInMod(ctx, c, bound), rewriteFormInMod(ctx, b, bound)),
+        ExContract(fc, body) -> {
+            let nReq = cellNew(Nil);
+            let cr = cellNew(fc.fcRequires);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) {
+                    Cons((sp, e), r) -> { cellSet(nReq, listAppend(cellGet(nReq), [(sp, rewriteFormInMod(ctx, e, bound))])); cellSet(cr, r) },
+                    Nil -> (),
+                }
+            };
+            let nDec = cellNew(Nil);
+            let cd = cellNew(fc.fcDecreases);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons((sp, e), r) -> { cellSet(nDec, listAppend(cellGet(nDec), [(sp, rewriteFormInMod(ctx, e, bound))])); cellSet(cd, r) },
+                    Nil -> (),
+                }
+            };
+            let nEns = cellNew(Nil);
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> {
+                        let eb = match ec.ecBind { Some(bn) -> addUniqueStr(bound, bn), None -> bound };
+                        cellSet(nEns, listAppend(cellGet(nEns), [MkEnsuresClause {
+                            ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: rewriteFormInMod(ctx, ec.ecExpr, eb),
+                        }]));
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            ExContract(MkFnContract { fcRequires: cellGet(nReq), fcEnsures: cellGet(nEns), fcDecreases: cellGet(nDec) }, rewriteFormInMod(ctx, body, bound))
+        },
+        ExLoopContract(invs, decs, body) -> {
+            let nInv = cellNew(Nil);
+            let ci = cellNew(invs);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) {
+                    Cons((sp, e), r) -> { cellSet(nInv, listAppend(cellGet(nInv), [(sp, rewriteFormInMod(ctx, e, bound))])); cellSet(ci, r) },
+                    Nil -> (),
+                }
+            };
+            let nDec = cellNew(Nil);
+            let cd = cellNew(decs);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) {
+                    Cons((sp, e), r) -> { cellSet(nDec, listAppend(cellGet(nDec), [(sp, rewriteFormInMod(ctx, e, bound))])); cellSet(cd, r) },
+                    Nil -> (),
+                }
+            };
+            ExLoopContract(cellGet(nInv), cellGet(nDec), rewriteFormInMod(ctx, body, bound))
+        },
         ExAbs(ps, rt, body) -> {
             let innerBound = cellNew(bound);
             let newPs = cellNew(Nil);

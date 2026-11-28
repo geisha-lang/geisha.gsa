@@ -29,6 +29,7 @@ use ast.{
     MatchArm, Form,
     Expr, ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
+    ExContract, ExLoopContract, EnsuresClause, FnContract,
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct, VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     Def, UseSpec, useSpecLocalName,
@@ -48,12 +49,58 @@ use loader.{
 }
 use infer.{InferOutput, AdtInfo, VariantInfo, inferProgram, preludePrimSpecs}
 use core.lowerToCoreForCheck
-use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig}
+use doc.{formatScheme, formatVariant, extractDocComment, formatDefSig, formatContractLinesFromSrc}
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs, sanitizeIdentAlias}
 
 extern "gs_pipe_read" def gs_pipe_read(fd: Int, buf: Ptr, cap: Int): Int
 extern "gs_pipe_write" def gs_pipe_write(fd: Int, buf: String, len: Int): Int
+
+def contractNonEnsForms(fc: FnContract, b: Form): List Form = {
+    let outRev: Cell (List Form) = cellNew(Nil);
+    let cr = cellNew(fc.fcRequires);
+    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+        match cellGet(cr) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(cr, r) }, Nil -> () }
+    };
+    let cd = cellNew(fc.fcDecreases);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(cd, r) }, Nil -> () }
+    };
+    cellSet(outRev, Cons(b, cellGet(outRev)));
+    listRev(cellGet(outRev))
+}
+
+def contractFormsAll(fc: FnContract, b: Form): List Form = {
+    let outRev: Cell (List Form) = cellNew(Nil);
+    let cr = cellNew(fc.fcRequires);
+    while (match cellGet(cr) { Nil -> false, _ -> true }) {
+        match cellGet(cr) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(cr, r) }, Nil -> () }
+    };
+    let cd = cellNew(fc.fcDecreases);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(cd, r) }, Nil -> () }
+    };
+    let ce = cellNew(fc.fcEnsures);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) { Cons(ec, r) -> { cellSet(outRev, Cons(ec.ecExpr, cellGet(outRev))); cellSet(ce, r) }, Nil -> () }
+    };
+    cellSet(outRev, Cons(b, cellGet(outRev)));
+    listRev(cellGet(outRev))
+}
+
+def loopContractFormsAll(invs: List (Span, Form), decs: List (Span, Form), b: Form): List Form = {
+    let outRev: Cell (List Form) = cellNew(Nil);
+    let ci = cellNew(invs);
+    while (match cellGet(ci) { Nil -> false, _ -> true }) {
+        match cellGet(ci) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(ci, r) }, Nil -> () }
+    };
+    let cd = cellNew(decs);
+    while (match cellGet(cd) { Nil -> false, _ -> true }) {
+        match cellGet(cd) { Cons((_, e), r) -> { cellSet(outRev, Cons(e, cellGet(outRev))); cellSet(cd, r) }, Nil -> () }
+    };
+    cellSet(outRev, Cons(b, cellGet(outRev)));
+    listRev(cellGet(outRev))
+}
 
 // ============================================================================
 // Buffered stdio JSON-RPC 2.0 Framing (Content-Length)
@@ -1083,6 +1130,32 @@ def searchFormAt(src: String, f: Form, fileId: Int, off: Int, locals: List Local
             searchFormAt(src, c, fileId, off, locals, best);
             searchFormAt(src, b, fileId, off, locals, best)
         },
+        ExContract(fc, b) -> {
+            let cr = cellNew(fc.fcRequires);
+            while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                match cellGet(cr) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cr, r) }, Nil -> () }
+            };
+            let cd = cellNew(fc.fcDecreases);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cd, r) }, Nil -> () }
+            };
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) { Cons(ec, r) -> { searchFormAt(src, ec.ecExpr, fileId, off, locals, best); cellSet(ce, r) }, Nil -> () }
+            };
+            searchFormAt(src, b, fileId, off, locals, best)
+        },
+        ExLoopContract(invs, decs, b) -> {
+            let ci = cellNew(invs);
+            while (match cellGet(ci) { Nil -> false, _ -> true }) {
+                match cellGet(ci) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(ci, r) }, Nil -> () }
+            };
+            let cd = cellNew(decs);
+            while (match cellGet(cd) { Nil -> false, _ -> true }) {
+                match cellGet(cd) { Cons((_, e), r) -> { searchFormAt(src, e, fileId, off, locals, best); cellSet(cd, r) }, Nil -> () }
+            };
+            searchFormAt(src, b, fileId, off, locals, best)
+        },
         ExMatch(scrut, arms) -> {
             searchFormAt(src, scrut, fileId, off, locals, best);
             let prevArmEnd = cellNew(if (scrut.pos.end > f.pos.start) scrut.pos.end else f.pos.start);
@@ -1363,9 +1436,26 @@ def hoverForWordInScope(doc: DocState, inf: InferOutput, locals: List LocalBind,
         },
         None -> match lookupDefLoose(inf.defs, word) {
             Some(d) -> {
-                let sig = match d.item {
+                let baseSig = match d.item {
                     ItForm(f) -> shortSymName(d.ident) + ": " + formatScheme(f.ty),
                     _ -> formatDefSig(d),
+                };
+                let sig = match d.item {
+                    ItForm(f) -> match f.node {
+                        ExAbs(_, _, body) -> {
+                            let srcForDef =
+                                if (d.dpos.fileId > 0 && d.dpos.fileId <= vecLen(doc.dsFiles)) {
+                                    vecGetOr(doc.dsFiles, d.dpos.fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }).sfContent
+                                } else doc.dsText;
+                            let clines = formatContractLinesFromSrc(srcForDef, body);
+                            match clines {
+                                Nil -> baseSig,
+                                _ -> baseSig + "\n" + strJoin(clines, "\n"),
+                            }
+                        },
+                        _ -> baseSig,
+                    },
+                    _ -> baseSig,
                 };
                 let docStr = docForDef(doc.dsFiles, d);
                 Some(makeHoverResult(formatHoverBlock(sig, docStr), wrng))
@@ -1374,6 +1464,25 @@ def hoverForWordInScope(doc: DocState, inf: InferOutput, locals: List LocalBind,
         },
     }
 }
+
+def appendDefContractsToSig(doc: DocState, d: Def, baseSig: String): String =
+    match d.item {
+        ItForm(f) -> match f.node {
+            ExAbs(_, _, body) -> {
+                let srcForDef =
+                    if (d.dpos.fileId > 0 && d.dpos.fileId <= vecLen(doc.dsFiles)) {
+                        vecGetOr(doc.dsFiles, d.dpos.fileId - 1, MkSourceFile { sfPath: "", sfContent: "" }).sfContent
+                    } else doc.dsText;
+                let clines = formatContractLinesFromSrc(srcForDef, body);
+                match clines {
+                    Nil -> baseSig,
+                    _ -> baseSig + "\n" + strJoin(clines, "\n"),
+                }
+            },
+            _ -> baseSig,
+        },
+        _ -> baseSig,
+    }
 
 def handleHover(ss: ServerState, params: Value): Value = {
     let uriOpt = match objGet(params, "textDocument") {
@@ -1396,12 +1505,13 @@ def handleHover(ss: ServerState, params: Value): Value = {
                                 let rng = Some(makeLspRange(doc.dsText, f.pos.start, f.pos.end));
                                 match f.node {
                                     ExVar(qname) -> {
-                                        let docStr = match lookupDefExact(inf.defs, qname) {
-                                            Some(d) -> docForDef(doc.dsFiles, d),
-                                            None -> "",
-                                        };
                                         let label = shortSymName(qname);
-                                        Some(makeHoverResult(formatHoverBlock(label + ": " + tyStr, docStr), rng))
+                                        let baseSig = label + ": " + tyStr;
+                                        let (sig, docStr) = match lookupDefExact(inf.defs, qname) {
+                                            Some(d) -> (appendDefContractsToSig(doc, d, baseSig), docForDef(doc.dsFiles, d)),
+                                            None -> (baseSig, ""),
+                                        };
+                                        Some(makeHoverResult(formatHoverBlock(sig, docStr), rng))
                                     },
                                     ExStructInit(qname, _) -> {
                                         let docStr = match lookupDefExact(inf.defs, qname) {
@@ -1428,10 +1538,11 @@ def handleHover(ss: ServerState, params: Value): Value = {
                             },
                             None -> match lookupDefAtOffset(inf.defs, doc.dsFileId, off) {
                                 Some(d) -> {
-                                    let sig = match d.item {
+                                    let baseSig = match d.item {
                                         ItForm(f) -> d.ident + ": " + formatScheme(f.ty),
                                         _ -> formatDefSig(d),
                                     };
+                                    let sig = appendDefContractsToSig(doc, d, baseSig);
                                     let docStr = docForDef(doc.dsFiles, d);
                                     Some(makeHoverResult(formatHoverBlock(sig, docStr), Some(makeLspRange(doc.dsText, d.dpos.start, d.dpos.end))))
                                 },
@@ -2340,6 +2451,8 @@ def findLocalDeclInForm(src: String, f: Form, fileId: Int, off: Int, word: Strin
         },
         ExField(base, _) -> findLocalDeclInForm(src, base, fileId, off, word),
         ExTry(inner) -> findLocalDeclInForm(src, inner, fileId, off, word),
+        ExContract(fc, b) -> findLocalDeclInFormList(src, contractFormsAll(fc, b), fileId, off, word),
+        ExLoopContract(invs, decs, b) -> findLocalDeclInFormList(src, loopContractFormsAll(invs, decs, b), fileId, off, word),
         ExLit(_) -> None,
         ExVar(_) -> None,
     }
@@ -3162,6 +3275,24 @@ def collectLocalOccsInForm(
         },
         ExField(base, _) -> collectLocalOccsInForm(uri, src, base, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
         ExTry(inner) -> collectLocalOccsInForm(uri, src, inner, fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
+        ExContract(fc, b) -> {
+            collectLocalOccsInList(uri, src, contractNonEnsForms(fc, b), fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> {
+                        let elocals = match ec.ecBind {
+                            Some(bn) -> Cons(MkLocalBind { lbName: bn, lbSpan: ec.ecSpan, lbScheme: ScmSlot }, locals),
+                            None -> locals,
+                        };
+                        collectLocalOccsInForm(uri, src, ec.ecExpr, fileId, elocals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev);
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ExLoopContract(invs, decs, b) -> collectLocalOccsInList(uri, src, loopContractFormsAll(invs, decs, b), fileId, locals, targetDefSpan, includeDecl, newNameOpt, conflict, seen, outRev),
     }
 }
 
@@ -3884,6 +4015,24 @@ def collectTopDefOccsInForm(
             }
         },
         ExTry(inner) -> collectTopDefOccsInForm(uri, src, inf, inner, fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
+        ExContract(fc, b) -> {
+            collectTopDefOccsInList(uri, src, inf, contractNonEnsForms(fc, b), fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+            let ce = cellNew(fc.fcEnsures);
+            while (match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> {
+                        let elocals = match ec.ecBind {
+                            Some(bn) -> Cons(MkLocalBind { lbName: bn, lbSpan: ec.ecSpan, lbScheme: ScmSlot }, locals),
+                            None -> locals,
+                        };
+                        collectTopDefOccsInForm(uri, src, inf, ec.ecExpr, fileId, elocals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev);
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            }
+        },
+        ExLoopContract(invs, decs, b) -> collectTopDefOccsInList(uri, src, inf, loopContractFormsAll(invs, decs, b), fileId, locals, rscope, target, targetQn, newNameOpt, conflict, seen, outRev),
     }
 }
 
@@ -4244,6 +4393,8 @@ def collectTypeAnnotOccsInForm(
         },
         ExField(base, _) -> collectTypeAnnotOccsInForm(uri, src, base, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
         ExTry(inner) -> collectTypeAnnotOccsInForm(uri, src, inner, fileId, rscope, typeName, targetQn, forRename, seen, outRev),
+        ExContract(fc, b) -> collectTypeAnnotOccsInList(uri, src, contractFormsAll(fc, b), fileId, rscope, typeName, targetQn, forRename, seen, outRev),
+        ExLoopContract(invs, decs, b) -> collectTypeAnnotOccsInList(uri, src, loopContractFormsAll(invs, decs, b), fileId, rscope, typeName, targetQn, forRename, seen, outRev),
         ExLit(_) -> (),
         ExVar(_) -> (),
     }
@@ -4858,6 +5009,8 @@ def collectInlayHintsInForm(
         },
         ExField(base, _) -> collectInlayHintsInForm(src, inf, base, fileId, reqStart, reqEnd, outRev),
         ExTry(inner) -> collectInlayHintsInForm(src, inf, inner, fileId, reqStart, reqEnd, outRev),
+        ExContract(fc, b) -> collectInlayHintsInList(src, inf, contractFormsAll(fc, b), fileId, reqStart, reqEnd, outRev),
+        ExLoopContract(invs, decs, b) -> collectInlayHintsInList(src, inf, loopContractFormsAll(invs, decs, b), fileId, reqStart, reqEnd, outRev),
     }
 }
 
@@ -5036,6 +5189,24 @@ def formUsesLocalName(f: Form, targetName: String): Bool = match f.node {
         },
     ExField(base, _) -> formUsesLocalName(base, targetName),
     ExTry(inner) -> formUsesLocalName(inner, targetName),
+    ExContract(fc, b) ->
+        if (formListUsesLocalName(contractNonEnsForms(fc, b), targetName)) true
+        else {
+            let ce = cellNew(fc.fcEnsures);
+            let used = cellNew(false);
+            while (!cellGet(used) && match cellGet(ce) { Nil -> false, _ -> true }) {
+                match cellGet(ce) {
+                    Cons(ec, r) -> {
+                        let shadowed = match ec.ecBind { Some(bn) -> bn == targetName, None -> false };
+                        if (!shadowed && formUsesLocalName(ec.ecExpr, targetName)) cellSet(used, true) else ();
+                        cellSet(ce, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(used)
+        },
+    ExLoopContract(invs, decs, b) -> formListUsesLocalName(loopContractFormsAll(invs, decs, b), targetName),
 }
 
 def formListUsesLocalName(fs: List Form, targetName: String): Bool = {
@@ -5182,6 +5353,8 @@ def collectUnusedVarFixesInForm(
         },
         ExField(base, _) -> collectUnusedVarFixesInForm(uri, src, base, fileId, reqStart, reqEnd, seen, outRev),
         ExTry(inner) -> collectUnusedVarFixesInForm(uri, src, inner, fileId, reqStart, reqEnd, seen, outRev),
+        ExContract(fc, b) -> collectUnusedVarFixesInList(uri, src, contractFormsAll(fc, b), fileId, reqStart, reqEnd, seen, outRev),
+        ExLoopContract(invs, decs, b) -> collectUnusedVarFixesInList(uri, src, loopContractFormsAll(invs, decs, b), fileId, reqStart, reqEnd, seen, outRev),
         ExLit(_) -> (),
         ExVar(_) -> (),
     }

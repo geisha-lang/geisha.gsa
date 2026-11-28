@@ -935,6 +935,11 @@ def tryEmitBuiltinJs(
         Some("undefined")
     } else if (name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes") {
         Some("0n")
+    } else if (name == "__gs_contract_fail") {
+        let vs = evalArgsJs(ctx, args, locals);
+        Some("(() => { throw new Error(\"Contract error: \" + " + nthStr(vs, 0) + "); })()")
+    } else if (name == "assert" || name == "assume") {
+        Some("undefined")
     } else if (name == "__blackBox") {
         let vs = evalArgsJs(ctx, args, locals);
         Some(nthStr(vs, 0))

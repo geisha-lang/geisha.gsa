@@ -7172,4 +7172,8 @@ fi
 echo "PASS [geisha_doc_doctest_regressions]: compile_fail CC isolation, lexer doc scan, lstat symlink guard, scoped type links, DOM search, stale cleanup, module targets, //! & CRLF"
 PASS=$((PASS + 1))
 
+# 47. Contracts (M1) & SMT Static Verifier (`geisha verify`, M2)
+"$PYTHON" tests/test_verify.py "$GEISHA_BIN"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

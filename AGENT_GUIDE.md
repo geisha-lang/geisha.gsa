@@ -10,9 +10,10 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha doc std.str` — print public types, concepts, instances, and function signatures of `std.str`
    - `geisha doc path/to/file.gsa [--all]` — inspect any local file or dependency module
    - `geisha doc --html [--out <dir>] [--json] [--stdlib|--no-stdlib] [module|file.gsa]` — generate a static HTML + CSS + JS documentation site (default `build/doc`, with live search index, sidebar navigation, cross-module type links, and line-numbered source viewer); `geisha doc --json [module|file.gsa]` prints structured JSON metadata to stdout
-3. **Fast typecheck loop (no LLVM/clang link)**:
+3. **Fast typecheck & static verification loop (no LLVM/clang link)**:
    - `geisha check` — check current `geisha.toml` project
    - `geisha check file.gsa [--json]` — check a single file (optional `--json` output)
+   - `geisha verify [file.gsa] [--json] [--solver z3] [--timeout 5000] [--no-implicit]` — SMT-based static contract & safety verifier (proves `requires`/`ensures`/`invariant`/`decreases`/`assert`, division-by-zero freedom, and array bounds with concrete counterexamples)
 4. **Run, script, test, build**:
    - `geisha run [--watch | -w] [--dev | --release] [--no-cache] [file.gsa] [args...]` — build & run project, or run a standalone `.gsa` script (content-hashed cache in `~/.geisha/cache/scripts/`; tracks local imports automatically; `--` before args is optional; `--watch` clears the screen and re-runs incrementally when `.gsa` or `geisha.toml` changes)
    - `geisha eval '<code>' [args...]` — evaluate an inline Geisha snippet (cached)
@@ -52,7 +53,11 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
 
 ### Primitives & Built-ins
 - Types: `Int` (32-bit signed int `-2147483648..2147483647`, checked at parse time; literals support decimal `1_000_000`, hex `0xFF_00`, octal `0o600`, and binary `0b1010_0101`), `Int64`, `Float` (f64, supports `_` separators like `1_000.5`), `Float32`, `Bool`, `Char`, `String`, `Void` (`()`), `Ptr`, `ForeignPtr`, `ScopedPtr`, `Cell a`, `Array a`, `ImmArray a`, `List a` (`Nil`, `Cons(h, t)`).
-- Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`.
+- Built-in primitives (no import needed): `printLn`, `strLen`, `strByteAt`, `strSlice`, `strConcat`, `ptrSliceFromStr`, `ptrSliceToString`, `ptrIsNull`, `ptrNull`, `ptrToString`, `ptrAllocBytes`, `ptrByteAt`, `cellNew`, `cellGet`, `cellSet`, `arrayNew`, `arrayGet`, `arraySet`, `arrayLen`, `intToI64`, `i64ToInt`, `parTabulate`, `assert`, `assume`.
+- **Contracts & Static Verification**:
+  - Function contracts (contextual clauses between signature and `=`): `requires <Bool>`, `ensures <Bool>` / `ensures res -> <Bool>` / `ensures |res| <Bool>`, `decreases <Int>`.
+  - Loop contracts (between `while (cond)` and body): `invariant <Bool>`, `decreases <Int>`.
+  - Contracts are purity-checked (only pure expressions and read-only lookups such as `cellGet`/`arrayLen`/`arrayGet`/`immArrayLen`/`immArrayGet`), erased at zero cost by default (`--contracts=erase`), optionally compiled to runtime checks (`--contracts=check`), and statically proved via `geisha verify`. Note: `assert(cond)` is also completely erased under the default `--contracts=erase`, so never place required side effects inside `assert(...)`.
 - Operators: `+`, `-`, `*`, `/` (works on `Int`, `Float`, `Float32`, and `String` concatenation via `+`), `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, `>>>`, `~`. Custom symbolic operators can be defined with `def (<op>)(a, b) = ...`.
 
 ### Functions, Bindings & Control Flow
