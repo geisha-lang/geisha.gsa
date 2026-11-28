@@ -7,6 +7,7 @@ use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.buf.{StringBuf, bufNew, bufLen, bufPushStr, bufPushByte, bufPushBuf, bufToString}
 use std.str.{intToStr, i64ToStr, floatToHex16, strJoin, strIndexOfByte, strStartsWith}
 use diag.{diagGetFile, diagSpanLineCol}
+use verified_kernels.{alignUp8, alignUp16, bitmapWordIdx, bitmapBitMask, hexDigitUpperByte}
 use ast.{
     Span, emptySpan, typeToString,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
@@ -77,7 +78,7 @@ pub def llvmSym(name: String): String = {
 }
 
 def hexDigitUpper(nib: Int): Int =
-    if (nib < 10) 48 + nib else 55 + nib
+    hexDigitUpperByte(nib & 15)
 
 def pushHexByteUpper(b: StringBuf, byteVal: Int): Void = {
     let v = byteVal & 255;
@@ -516,6 +517,8 @@ def llvmZeroValue(llvmTy: String): String =
 
 def alignUp(offset: Int, align: Int): Int =
     if (align <= 1) offset
+    else if (align == 8 && offset >= 0 && offset <= 2147483640) alignUp8(offset)
+    else if (align == 16 && offset >= 0 && offset <= 2147483632) alignUp16(offset)
     else {
         let rem = offset % align;
         if (rem == 0) offset else offset + (align - rem)
@@ -569,9 +572,15 @@ def structSizeAndAlignRec(elems: List Type, ptrSize: Int, visiting: List String,
     },
 }
 
-pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int) = typeSizeAndAlignRec(ty, ptrSize, Nil, 0)
+pub def typeSizeAndAlignFor(ty: Type, ptrSize: Int): (Int, Int)
+    requires ptrSize == 4 || ptrSize == 8
+    ensures r -> match r { (sz, al) -> sz >= 0 && al >= 1 }
+= typeSizeAndAlignRec(ty, ptrSize, Nil, 0)
 
-pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int) = structSizeAndAlignRec(elems, ptrSize, Nil, 0)
+pub def structSizeAndAlignFor(elems: List Type, ptrSize: Int): (Int, Int)
+    requires ptrSize == 4 || ptrSize == 8
+    ensures r -> match r { (sz, al) -> sz >= 0 && al >= 1 }
+= structSizeAndAlignRec(elems, ptrSize, Nil, 0)
 
 pub def typeSizeAndAlign(ty: Type): (Int, Int) = typeSizeAndAlignFor(ty, 8)
 
@@ -588,9 +597,11 @@ def accumPtrMaskType(ty: Type, baseOff: Int, maskAcc: Int64): Option Int64 = mat
         None ->
             if (isNoscanElemType(ty)) Some(maskAcc)
             else {
-                let wordIdx = baseOff / 8;
-                if (baseOff % 8 != 0 || wordIdx < 0 || wordIdx >= 40) None
-                else Some(maskAcc | (intToI64(1) << wordIdx))
+                if (baseOff < 0 || baseOff >= 320 || (baseOff & 7) != 0) None
+                else {
+                    let wordIdx = bitmapWordIdx(baseOff);
+                    Some(maskAcc | bitmapBitMask(wordIdx))
+                }
             },
     },
 }
@@ -794,8 +805,17 @@ data FnEmitCtx {
         fcDefLine: Int,
         fcCurLocId: Cell Int,
         fcCurSpan: Cell Span,
+        fcVerifiedSafe: Bool,
     },
 }
+
+def gVerifiedSafeFns: Cell (StrMap Bool) = cellNew(strMapNew())
+
+pub def setVerifiedSafeFns(safeFns: StrMap Bool): Void =
+    cellSet(gVerifiedSafeFns, safeFns)
+
+pub def clearVerifiedSafeFns(): Void =
+    cellSet(gVerifiedSafeFns, strMapNew())
 
 data ModEmitCtx {
     MkModEmitCtx {
@@ -1770,6 +1790,7 @@ def newFnEmitCtx(fnName: String): FnEmitCtx = {
         fcDefLine: 1,
         fcCurLocId: cellNew(-1),
         fcCurSpan: cellNew(emptySpan()),
+        fcVerifiedSafe: strMapContains(cellGet(gVerifiedSafeFns), fnName),
     }
 }
 
@@ -1809,19 +1830,26 @@ def newFnEmitCtxDebug(mctx: ModEmitCtx, fnName: String, displayName: String, lin
             fcDefLine: defLine,
             fcCurLocId: cellNew(-1),
             fcCurSpan: cellNew(sp),
+            fcVerifiedSafe: strMapContains(cellGet(gVerifiedSafeFns), fnName),
         };
         let prologueLoc = dbgGetOrCreatePrologueLoc(mctx, spId);
         cellSet(fctx.fcCurLocId, prologueLoc);
         fctx
     }
 
-def freshReg(fctx: FnEmitCtx): String = {
+def freshReg(fctx: FnEmitCtx): String
+    requires cellGet(fctx.fcRegCnt) >= 0
+    ensures r -> cellGet(fctx.fcRegCnt) > 0 && strLen(r) >= 3
+= {
     let n = cellGet(fctx.fcRegCnt) + 1;
     cellSet(fctx.fcRegCnt, n);
     "%r" + intToStr(n)
 }
 
-def appendBlock(fctx: FnEmitCtx, prefix: String): Int = {
+def appendBlock(fctx: FnEmitCtx, prefix: String): Int
+    requires cellGet(fctx.fcBlkCnt) >= 0
+    ensures idx -> idx >= 0 && cellGet(fctx.fcBlkCnt) > 0
+= {
     let n = cellGet(fctx.fcBlkCnt) + 1;
     cellSet(fctx.fcBlkCnt, n);
     let lbl = prefix + "." + intToStr(n);
@@ -3100,19 +3128,21 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
             OpSub -> emitAssign(fctx, "sub " + ity + " " + lhs + ", " + rhs),
             OpMul -> emitAssign(fctx, "mul " + ity + " " + lhs + ", " + rhs),
             OpDiv -> {
-                let divZeroBlk = appendBlock(fctx, "div.zero");
-                let divNonZeroBlk = appendBlock(fctx, "div.nonzero");
+                if (!fctx.fcVerifiedSafe) {
+                    let divZeroBlk = appendBlock(fctx, "div.zero");
+                    let divNonZeroBlk = appendBlock(fctx, "div.nonzero");
+                    let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
+                    emitCondBr(fctx, isZero, divZeroBlk, divNonZeroBlk);
+
+                    setInsertBlock(fctx, divZeroBlk);
+                    emitLine(fctx, "call void @gs_div_zero_fail()");
+                    emitTermLine(fctx, "unreachable");
+
+                    setInsertBlock(fctx, divNonZeroBlk)
+                } else ();
                 let divOvBlk = appendBlock(fctx, "div.ov");
                 let divNormalBlk = appendBlock(fctx, "div.normal");
                 let divDoneBlk = appendBlock(fctx, "div.done");
-                let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
-                emitCondBr(fctx, isZero, divZeroBlk, divNonZeroBlk);
-
-                setInsertBlock(fctx, divZeroBlk);
-                emitLine(fctx, "call void @gs_div_zero_fail()");
-                emitTermLine(fctx, "unreachable");
-
-                setInsertBlock(fctx, divNonZeroBlk);
                 let minLit = if (tyName == "Int64") "-9223372036854775808" else "-2147483648";
                 let isMin = emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + minLit);
                 let isNeg1 = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", -1");
@@ -3130,19 +3160,21 @@ def emitBinOperator(mctx: ModEmitCtx, fctx: FnEmitCtx, op: BinOp, lhs: String, r
                 emitAssign(fctx, "phi " + ity + " [ " + minLit + ", %" + blockLabel(fctx, divOvBlk) + " ], [ " + q + ", %" + blockLabel(fctx, divNormalBlk) + " ]")
             },
             OpRem -> {
-                let remZeroBlk = appendBlock(fctx, "rem.zero");
-                let remNonZeroBlk = appendBlock(fctx, "rem.nonzero");
+                if (!fctx.fcVerifiedSafe) {
+                    let remZeroBlk = appendBlock(fctx, "rem.zero");
+                    let remNonZeroBlk = appendBlock(fctx, "rem.nonzero");
+                    let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
+                    emitCondBr(fctx, isZero, remZeroBlk, remNonZeroBlk);
+
+                    setInsertBlock(fctx, remZeroBlk);
+                    emitLine(fctx, "call void @gs_div_zero_fail()");
+                    emitTermLine(fctx, "unreachable");
+
+                    setInsertBlock(fctx, remNonZeroBlk)
+                } else ();
                 let remOvBlk = appendBlock(fctx, "rem.ov");
                 let remNormalBlk = appendBlock(fctx, "rem.normal");
                 let remDoneBlk = appendBlock(fctx, "rem.done");
-                let isZero = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", 0");
-                emitCondBr(fctx, isZero, remZeroBlk, remNonZeroBlk);
-
-                setInsertBlock(fctx, remZeroBlk);
-                emitLine(fctx, "call void @gs_div_zero_fail()");
-                emitTermLine(fctx, "unreachable");
-
-                setInsertBlock(fctx, remNonZeroBlk);
                 let minLit = if (tyName == "Int64") "-9223372036854775808" else "-2147483648";
                 let isMin = emitAssign(fctx, "icmp eq " + ity + " " + lhs + ", " + minLit);
                 let isNeg1 = emitAssign(fctx, "icmp eq " + ity + " " + rhs + ", -1");
@@ -3205,6 +3237,34 @@ def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
     Nil -> MkTerm { tspan: emptySpan(), tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
 }
 
+def isPureScalarAssumeTermList(ts: List TaggedTerm): Bool = match ts {
+    Nil -> true,
+    Cons(t, r) -> if (isPureScalarAssumeTerm(t)) isPureScalarAssumeTermList(r) else false,
+}
+
+def isFloatTypeForAssume(ty: Type): Bool = match ty {
+    TyCon("Float") -> true,
+    TyCon("Float32") -> true,
+    _ -> false,
+}
+
+def isPureScalarAssumeTerm(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(_) -> !isFloatTypeForAssume(schemeBody(tm.tscm)),
+    TmVar(_) -> !isFloatTypeForAssume(schemeBody(tm.tscm)),
+    TmBin(op, a, b) -> {
+        let isDiv = match op { OpDiv -> true, OpRem -> true, _ -> false };
+        let hasFloat = isFloatTypeForAssume(schemeBody(a.tscm)) || isFloatTypeForAssume(schemeBody(b.tscm));
+        !isDiv && !hasFloat && isPureScalarAssumeTerm(a) && isPureScalarAssumeTerm(b)
+    },
+    TmUn(_, a) -> !isFloatTypeForAssume(schemeBody(a.tscm)) && isPureScalarAssumeTerm(a),
+    TmIf(c, t, e) -> isPureScalarAssumeTerm(c) && isPureScalarAssumeTerm(t) && isPureScalarAssumeTerm(e),
+    TmGetTag(e) -> isPureScalarAssumeTerm(e),
+    TmApplyDir(vd, args) ->
+        (vd.vname == "cellGet" || vd.vname == "arrayLen" || vd.vname == "immArrayLen")
+        && isPureScalarAssumeTermList(args),
+    _ -> false,
+}
+
 def tryEmitIntrinsic(
     mctx: ModEmitCtx,
     fctx: FnEmitCtx,
@@ -3219,7 +3279,19 @@ def tryEmitIntrinsic(
         let msgVal = genExpr(mctx, fctx, a0, locals, false);
         emitLine(fctx, "call void @gs_contract_fail(ptr " + msgVal + ")");
         Some("0")
-    } else if (name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases" || name == "assert" || name == "assume") {
+    } else if (name == "__gs_requires" || name == "assert") {
+        if (fctx.fcVerifiedSafe) {
+            match args {
+                Cons(a0, _) ->
+                    if (isPureScalarAssumeTerm(a0)) {
+                        let condVal = genExpr(mctx, fctx, a0, locals, false);
+                        emitLine(fctx, "call void @llvm.assume(i1 " + condVal + ")");
+                        Some("0")
+                    } else Some("0"),
+                Nil -> Some("0"),
+            }
+        } else Some("0")
+    } else if (name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases" || name == "assume") {
         Some("0")
     } else if (name == "__blackBox") {
         let a0 = nthArgTerm(args, 0);
@@ -3292,16 +3364,18 @@ def tryEmitIntrinsic(
         let elemSz = if (rawSz < 1) 1 else rawSz;
 
         if (isNoscanElemType(elemTy) && isAllZeroBitsTerm(a1)) {
-            let badBlk = appendBlock(fctx, "arr.bad_len");
-            let allocBlk = appendBlock(fctx, "arr.alloc");
-            let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
-            emitCondBr(fctx, isNeg, badBlk, allocBlk);
+            if (!fctx.fcVerifiedSafe) {
+                let badBlk = appendBlock(fctx, "arr.bad_len");
+                let allocBlk = appendBlock(fctx, "arr.alloc");
+                let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+                emitCondBr(fctx, isNeg, badBlk, allocBlk);
 
-            setInsertBlock(fctx, badBlk);
-            emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
-            emitTermLine(fctx, "unreachable");
+                setInsertBlock(fctx, badBlk);
+                emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+                emitTermLine(fctx, "unreachable");
 
-            setInsertBlock(fctx, allocBlk);
+                setInsertBlock(fctx, allocBlk)
+            } else ();
             let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
             let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
             let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
@@ -3334,20 +3408,21 @@ def tryEmitIntrinsic(
                 Some(emitAssign(fctx, "phi ptr [ " + lgPtr + ", %" + blockLabel(fctx, lgBlk) + " ], [ " + smPtr + ", %" + blockLabel(fctx, smBlk) + " ]"))
             }
         } else {
-            let badBlk = appendBlock(fctx, "arr.bad_len");
-            let allocBlk = appendBlock(fctx, "arr.alloc");
+            if (!fctx.fcVerifiedSafe) {
+                let badBlk = appendBlock(fctx, "arr.bad_len");
+                let allocBlk = appendBlock(fctx, "arr.alloc");
+                let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+                emitCondBr(fctx, isNeg, badBlk, allocBlk);
+
+                setInsertBlock(fctx, badBlk);
+                emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+                emitTermLine(fctx, "unreachable");
+
+                setInsertBlock(fctx, allocBlk)
+            } else ();
             let condBlk = appendBlock(fctx, "arr.init.cond");
             let bodyBlk = appendBlock(fctx, "arr.init.body");
             let doneBlk = appendBlock(fctx, "arr.init.done");
-
-            let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
-            emitCondBr(fctx, isNeg, badBlk, allocBlk);
-
-            setInsertBlock(fctx, badBlk);
-            emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
-            emitTermLine(fctx, "unreachable");
-
-            setInsertBlock(fctx, allocBlk);
             let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
             let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
             let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
@@ -3383,16 +3458,18 @@ def tryEmitIntrinsic(
         let (rawSz, _) = typeSizeAndAlignFor(elemTy, mctx.mcPtrSize);
         let elemSz = if (rawSz < 1) 1 else rawSz;
 
-        let badBlk = appendBlock(fctx, "arr.bad_len");
-        let allocBlk = appendBlock(fctx, "arr.alloc");
-        let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
-        emitCondBr(fctx, isNeg, badBlk, allocBlk);
+        if (!fctx.fcVerifiedSafe) {
+            let badBlk = appendBlock(fctx, "arr.bad_len");
+            let allocBlk = appendBlock(fctx, "arr.alloc");
+            let isNeg = emitAssign(fctx, "icmp slt i32 " + len32 + ", 0");
+            emitCondBr(fctx, isNeg, badBlk, allocBlk);
 
-        setInsertBlock(fctx, badBlk);
-        emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
-        emitTermLine(fctx, "unreachable");
+            setInsertBlock(fctx, badBlk);
+            emitLine(fctx, "call void @gs_bounds_fail(i32 " + len32 + ", i32 0)");
+            emitTermLine(fctx, "unreachable");
 
-        setInsertBlock(fctx, allocBlk);
+            setInsertBlock(fctx, allocBlk)
+        } else ();
         let len64 = emitAssign(fctx, "sext i32 " + len32 + " to i64");
         let dataBytes = emitAssign(fctx, "mul i64 " + len64 + ", " + intToStr(elemSz));
         let totalBytes = emitAssign(fctx, "add i64 8, " + dataBytes);
@@ -3481,19 +3558,21 @@ def tryEmitIntrinsic(
         let arrPtr = genExpr(mctx, fctx, nthArgTerm(args, 0), locals, false);
         let idx32 = genExpr(mctx, fctx, nthArgTerm(args, 1), locals, false);
         let elemLlvm = getValLlvmType(retTy);
-        let len64 = emitLoad(fctx, "i64", arrPtr);
-        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
-        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
+        if (!fctx.fcVerifiedSafe) {
+            let len64 = emitLoad(fctx, "i64", arrPtr);
+            let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+            let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
 
-        let oobBlk = appendBlock(fctx, "arr.oob_trap");
-        let okBlk = appendBlock(fctx, "arr.get_ok");
-        emitCondBr(fctx, oob, oobBlk, okBlk);
+            let oobBlk = appendBlock(fctx, "arr.oob_trap");
+            let okBlk = appendBlock(fctx, "arr.get_ok");
+            emitCondBr(fctx, oob, oobBlk, okBlk);
 
-        setInsertBlock(fctx, oobBlk);
-        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
-        emitTermLine(fctx, "unreachable");
+            setInsertBlock(fctx, oobBlk);
+            emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
+            emitTermLine(fctx, "unreachable");
 
-        setInsertBlock(fctx, okBlk);
+            setInsertBlock(fctx, okBlk)
+        } else ();
         let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
         let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
         let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
@@ -3505,19 +3584,21 @@ def tryEmitIntrinsic(
         let newVal = genExpr(mctx, fctx, a2, locals, false);
         let valTy = schemeBody(a2.tscm);
         let elemLlvm = getValLlvmType(valTy);
-        let len64 = emitLoad(fctx, "i64", arrPtr);
-        let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
-        let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
+        if (!fctx.fcVerifiedSafe) {
+            let len64 = emitLoad(fctx, "i64", arrPtr);
+            let len32 = emitAssign(fctx, "trunc i64 " + len64 + " to i32");
+            let oob = emitAssign(fctx, "icmp uge i32 " + idx32 + ", " + len32);
 
-        let oobBlk = appendBlock(fctx, "arr.oob_trap");
-        let okBlk = appendBlock(fctx, "arr.set_ok");
-        emitCondBr(fctx, oob, oobBlk, okBlk);
+            let oobBlk = appendBlock(fctx, "arr.oob_trap");
+            let okBlk = appendBlock(fctx, "arr.set_ok");
+            emitCondBr(fctx, oob, oobBlk, okBlk);
 
-        setInsertBlock(fctx, oobBlk);
-        emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
-        emitTermLine(fctx, "unreachable");
+            setInsertBlock(fctx, oobBlk);
+            emitLine(fctx, "call void @gs_bounds_fail(i32 " + idx32 + ", i32 " + len32 + ")");
+            emitTermLine(fctx, "unreachable");
 
-        setInsertBlock(fctx, okBlk);
+            setInsertBlock(fctx, okBlk)
+        } else ();
         let idx64 = emitAssign(fctx, "sext i32 " + idx32 + " to i64");
         let elemsBase = emitGep(fctx, "i8", arrPtr, "8");
         let slotPtr = emitGep(fctx, elemLlvm, elemsBase, idx64);
@@ -6084,6 +6165,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("gs_strlen", "declare i64 @gs_strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
+        ("llvm.assume", "declare void @llvm.assume(i1) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
         ("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg) nounwind"),
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),
@@ -6157,6 +6239,7 @@ def emitRuntimeDeclares(out: StringBuf, declaredSyms: StrMap Bool, definedFns: S
         ("gs_bench_black_box_void", "declare void @gs_bench_black_box_void() nounwind"),
         ("strlen", "declare i64 @strlen(ptr) nounwind willreturn memory(argmem: read)"),
         ("llvm.memcpy.p0.p0.i64", "declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg) nounwind"),
+        ("llvm.assume", "declare void @llvm.assume(i1) nounwind"),
         ("llvm.memmove.p0.p0.i64", "declare void @llvm.memmove.p0.p0.i64(ptr writeonly, ptr readonly, i64, i1 immarg) nounwind"),
         ("llvm.memset.p0.i64", "declare void @llvm.memset.p0.i64(ptr writeonly, i8, i64, i1 immarg) nounwind"),
         ("llvm.ctpop.i32", "declare i32 @llvm.ctpop.i32(i32) nounwind willreturn memory(none)"),

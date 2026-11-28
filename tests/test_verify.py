@@ -22,6 +22,7 @@ def main() -> int:
         return 2
     geisha = sys.argv[1]
     runtime = os.environ.get("GEISHA_RUNTIME", "./build/libgeisha_runtime.a")
+    repo_root = Path(__file__).resolve().parent.parent
 
     with tempfile.TemporaryDirectory(prefix="geisha_verify_test_") as td:
         tmp = Path(td)
@@ -846,6 +847,424 @@ def main() -> int:
         r_fmt2 = run([geisha, "fmt", "--stdout", str(a6_fmt2)])
         assert r_fmt2.returncode == 0 and r_fmt2.stdout == r_fmt1.stdout, f"A6 fmt not idempotent:\n{r_fmt1.stdout}\n---\n{r_fmt2.stdout}"
         print("PASS [smt_verify_a1_a6_polish]: A1 runtime 3-path, A5 duplicate decreases, A6 loc_count/doc/fmt verified")
+
+        # ------------------------------------------------------------------
+        # D1: Production verified kernels (`src/verified_kernels.gsa`) + `--fn` filter
+        # ------------------------------------------------------------------
+        vk_path = repo_root / "src" / "verified_kernels.gsa"
+        r_vk = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root), str(vk_path)])
+        assert r_vk.returncode == 0, f"D1 verified_kernels.gsa verify failed:\n{r_vk.stdout}\n{r_vk.stderr}"
+        vk_json = json.loads(r_vk.stdout)
+        assert vk_json["ok"] is True and vk_json["failed"] == 0 and vk_json["unknown"] == 0 and vk_json["proved"] >= 30, (
+            f"D1 unexpected verified_kernels summary: {vk_json}"
+        )
+        r_vk_fn = run([
+            geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root),
+            "--fn", "uleb32Byte", "--fn", "clampOffset", str(vk_path),
+        ])
+        assert r_vk_fn.returncode == 0, f"D1 --fn filter failed:\n{r_vk_fn.stdout}\n{r_vk_fn.stderr}"
+        vk_fn_json = json.loads(r_vk_fn.stdout)
+        assert vk_fn_json["ok"] is True and 0 < vk_fn_json["proved"] < vk_json["proved"], (
+            f"D1 --fn filter did not restrict obligations: {vk_fn_json} vs {vk_json}"
+        )
+        r_vk_miss = run([
+            geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root),
+            "--fn", "definitely_not_a_real_fn_xyz", str(vk_path),
+        ])
+        assert r_vk_miss.returncode != 0, f"D1 --fn nonexistent should fail, got 0:\n{r_vk_miss.stdout}"
+        print(f"PASS [d1_verified_kernels]: {vk_json['proved']} obligations proved, --fn filter verified")
+
+        # ------------------------------------------------------------------
+        # D3: Verification-Driven Optimization (`--verified-opt`) + 3 Soundness Iron Laws
+        # ------------------------------------------------------------------
+        d3_pos = tmp / "d3_pos.gsa"
+        d3_pos.write_text(
+            "use std.str.{intToStr}\n"
+            "def safeDiv(a: Int, b: Int): Int\n"
+            "    requires b != 0\n"
+            "= a / b\n"
+            "def safeIdx(arr: MutArray Int, i: Int): Int\n"
+            "    requires i >= 0 && i < arrayLen(arr)\n"
+            "= arrayGet(arr, i)\n"
+            "def safeAlloc(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "= {\n"
+            "    let a = arrayNew(n, 7);\n"
+            "    arrayLen(a)\n"
+            "}\n"
+            "def runAll(a: Int, b: Int): Int = {\n"
+            "    let arr = arrayNew(4, 7);\n"
+            "    let v = safeIdx(arr, 2);\n"
+            "    let _ = safeAlloc(4);\n"
+            "    if (b != 0) v + safeDiv(a, b) else v\n"
+            "}\n"
+            "def main(): Void = {\n"
+            "    let r1 = runAll(100, 5);\n"
+            "    let r2 = runAll(-2147483648, -1);\n"
+            "    printLn(intToStr(r1) + \":\" + intToStr(r2))\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        d3_pos_ll = tmp / "d3_pos.ll"
+        r_d3_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(d3_pos_ll), str(d3_pos)])
+        assert r_d3_ir.returncode == 0, f"D3 positive IR compile failed:\n{r_d3_ir.stdout}\n{r_d3_ir.stderr}"
+        pos_ir = d3_pos_ll.read_text(encoding="utf-8")
+        def fn_ir_block(ir_text: str, fn_name: str) -> str:
+            marker = f"@{fn_name}("
+            pos = 0
+            start = -1
+            while True:
+                idx = ir_text.find(marker, pos)
+                if idx == -1:
+                    break
+                line_start = ir_text.rfind("\n", 0, idx) + 1
+                if ir_text[line_start:idx].startswith("define "):
+                    start = line_start
+                    break
+                pos = idx + 1
+            assert start != -1, f"definition of @{fn_name} not found in IR"
+            end = ir_text.find("\n}", start)
+            assert end != -1, f"end of @{fn_name} not found in IR"
+            return ir_text[start:end + 2]
+        safe_div_ir = fn_ir_block(pos_ir, "safeDiv")
+        assert "call void @llvm.assume(i1" in safe_div_ir, f"D3 safeDiv missing @llvm.assume:\n{safe_div_ir}"
+        assert "div.zero" not in safe_div_ir, f"D3 safeDiv did not elide div.zero:\n{safe_div_ir}"
+        assert "div.ov" in safe_div_ir, f"D3 safeDiv MUST preserve INT_MIN/-1 div.ov guard:\n{safe_div_ir}"
+        safe_idx_ir = fn_ir_block(pos_ir, "safeIdx")
+        assert "call void @llvm.assume(i1" in safe_idx_ir, f"D3 safeIdx missing @llvm.assume:\n{safe_idx_ir}"
+        assert "arr.oob_trap" not in safe_idx_ir, f"D3 safeIdx did not elide arr.oob_trap:\n{safe_idx_ir}"
+        safe_alloc_ir = fn_ir_block(pos_ir, "safeAlloc")
+        assert "call void @llvm.assume(i1" in safe_alloc_ir, f"D3 safeAlloc missing @llvm.assume:\n{safe_alloc_ir}"
+        assert "arr.bad_len" not in safe_alloc_ir, f"D3 safeAlloc did not elide arr.bad_len:\n{safe_alloc_ir}"
+
+        d3_pos_bin = tmp / ("d3_pos.exe" if sys.platform == "win32" else "d3_pos")
+        r_d3_bin = run([geisha, "--verified-opt", "--solver", z3_bin, "--runtime", runtime, "-O2", "-o", str(d3_pos_bin), str(d3_pos)])
+        assert r_d3_bin.returncode == 0, f"D3 positive -O2 build failed:\n{r_d3_bin.stdout}\n{r_d3_bin.stderr}"
+        r_d3_run = run([str(d3_pos_bin)])
+        assert r_d3_run.returncode == 0 and r_d3_run.stdout.strip() == "27:-2147483641", (
+            f"D3 positive -O2 run mismatch (expected 27:-2147483641):\nrc={r_d3_run.returncode}\nout={r_d3_run.stdout!r}\nerr={r_d3_run.stderr!r}"
+        )
+
+        # D3 Adversarial Negative 1 (Iron Law 1: unverified caller MUST exclude callee with `requires`)
+        d3_neg1 = tmp / "d3_neg_unverified_caller.gsa"
+        d3_neg1.write_text(
+            "def idxWithReq(arr: MutArray Int, i: Int): Int\n"
+            "    requires i >= 0 && i < arrayLen(arr)\n"
+            "= arrayGet(arr, i)\n"
+            "def main(): Void = {\n"
+            "    let arr = arrayNew(4, 1);\n"
+            "    let _ = idxWithReq(arr, 99);\n"
+            "    ()\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        d3_neg1_ll = tmp / "d3_neg1.ll"
+        r_n1_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(d3_neg1_ll), str(d3_neg1)])
+        assert r_n1_ir.returncode == 0, f"D3 neg1 IR compile failed:\n{r_n1_ir.stdout}\n{r_n1_ir.stderr}"
+        n1_ir = fn_ir_block(d3_neg1_ll.read_text(encoding="utf-8"), "idxWithReq")
+        assert "arr.oob_trap" in n1_ir, f"D3 Iron Law 1 violated: unverified caller elided arr.oob_trap!\n{n1_ir}"
+        assert "llvm.assume" not in n1_ir, f"D3 Iron Law 1 violated: unverified caller emitted @llvm.assume!\n{n1_ir}"
+        d3_neg1_bin = tmp / ("d3_neg1.exe" if sys.platform == "win32" else "d3_neg1")
+        r_n1_bin = run([geisha, "--verified-opt", "--solver", z3_bin, "--runtime", runtime, "-O2", "-o", str(d3_neg1_bin), str(d3_neg1)])
+        assert r_n1_bin.returncode == 0
+        r_n1_run = run([str(d3_neg1_bin)])
+        assert r_n1_run.returncode != 0, f"D3 Iron Law 1 violated: OOB access did NOT trap! rc={r_n1_run.returncode}"
+
+        # D3 Adversarial Negative 2 (Iron Law 2: function containing `assume(...)` MUST be excluded)
+        d3_neg2 = tmp / "d3_neg_assume.gsa"
+        d3_neg2.write_text(
+            "def idxWithAssume(arr: MutArray Int, i: Int): Int = {\n"
+            "    assume(i >= 0 && i < arrayLen(arr));\n"
+            "    arrayGet(arr, i)\n"
+            "}\n"
+            "def main(): Void = {\n"
+            "    let arr = arrayNew(4, 1);\n"
+            "    let _ = idxWithAssume(arr, 99);\n"
+            "    ()\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        d3_neg2_ll = tmp / "d3_neg2.ll"
+        r_n2_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(d3_neg2_ll), str(d3_neg2)])
+        assert r_n2_ir.returncode == 0, f"D3 neg2 IR compile failed:\n{r_n2_ir.stdout}\n{r_n2_ir.stderr}"
+        n2_ir = fn_ir_block(d3_neg2_ll.read_text(encoding="utf-8"), "idxWithAssume")
+        assert "arr.oob_trap" in n2_ir, f"D3 Iron Law 2 violated: assume() elided arr.oob_trap!\n{n2_ir}"
+        assert "llvm.assume" not in n2_ir, f"D3 Iron Law 2 violated: assume() emitted @llvm.assume!\n{n2_ir}"
+        d3_neg2_bin = tmp / ("d3_neg2.exe" if sys.platform == "win32" else "d3_neg2")
+        r_n2_bin = run([geisha, "--verified-opt", "--solver", z3_bin, "--runtime", runtime, "-O2", "-o", str(d3_neg2_bin), str(d3_neg2)])
+        assert r_n2_bin.returncode == 0
+        r_n2_run = run([str(d3_neg2_bin)])
+        assert r_n2_run.returncode != 0, f"D3 Iron Law 2 violated: assume() OOB access did NOT trap! rc={r_n2_run.returncode}"
+
+        # D3 Cache Isolation: `geisha run` vs `geisha run --verified-opt`
+        r_run_plain = run([geisha, "run", "--runtime", runtime, str(d3_pos)])
+        assert r_run_plain.returncode == 0 and r_run_plain.stdout.strip() == "27:-2147483641", (
+            f"D3 plain geisha run failed:\n{r_run_plain.stdout}\n{r_run_plain.stderr}"
+        )
+        r_run_vopt = run([geisha, "run", "--verified-opt", "--solver", z3_bin, "--runtime", runtime, str(d3_pos)])
+        assert r_run_vopt.returncode == 0 and r_run_vopt.stdout.strip() == "27:-2147483641", (
+            f"D3 --verified-opt geisha run failed:\n{r_run_vopt.stdout}\n{r_run_vopt.stderr}"
+        )
+
+        # V1 Adversarial: unverified callee & assume-tainted callee with false `ensures` MUST NOT poison caller
+        for v1_name, v1_code in [
+            (
+                "v1_unverified_callee_ensures",
+                "def lie(x: Int): Int\n"
+                "    ensures _ -> x == 0\n"
+                "= x\n"
+                "def victim(i: Int): Int = {\n"
+                "    let arr = arrayNew(4, 7);\n"
+                "    let _ = lie(i);\n"
+                "    arrayGet(arr, i)\n"
+                "}\n"
+                "def main(): Void = { let _ = victim(99); () }\n",
+            ),
+            (
+                "v1_assume_callee_ensures",
+                "def lieAssume(x: Int): Int\n"
+                "    ensures _ -> x == 0\n"
+                "= { assume(x == 0); x }\n"
+                "def victim(i: Int): Int = {\n"
+                "    let arr = arrayNew(4, 7);\n"
+                "    let _ = lieAssume(i);\n"
+                "    arrayGet(arr, i)\n"
+                "}\n"
+                "def main(): Void = { let _ = victim(99); () }\n",
+            ),
+        ]:
+            v1_src = tmp / f"{v1_name}.gsa"
+            v1_src.write_text(v1_code, encoding="utf-8", newline="\n")
+            v1_ll = tmp / f"{v1_name}.ll"
+            r_v1_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(v1_ll), str(v1_src)])
+            assert r_v1_ir.returncode == 0, f"V1 {v1_name} IR compile failed:\n{r_v1_ir.stdout}\n{r_v1_ir.stderr}"
+            vic_ir = fn_ir_block(v1_ll.read_text(encoding="utf-8"), "victim")
+            assert "arr.oob_trap" in vic_ir, f"V1 {v1_name}: false callee ensures elided arr.oob_trap in victim!\n{vic_ir}"
+            v1_bin = tmp / (f"{v1_name}.exe" if sys.platform == "win32" else v1_name)
+            r_v1_bin = run([geisha, "--verified-opt", "--solver", z3_bin, "--runtime", runtime, "-O2", "-o", str(v1_bin), str(v1_src)])
+            assert r_v1_bin.returncode == 0
+            r_v1_run = run([str(v1_bin)])
+            assert r_v1_run.returncode != 0, f"V1 {v1_name}: OOB access in victim did NOT trap! rc={r_v1_run.returncode}"
+
+        # V2 Adversarial: zero-caller `requires` & `--no-main` MUST NOT elide bounds checks
+        v2_src = tmp / "v2_nomain_req.gsa"
+        v2_src.write_text(
+            "pub def fastGet(arr: MutArray Int, i: Int): Int\n"
+            "    requires 0 <= i && i < arrayLen(arr)\n"
+            "= arrayGet(arr, i)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        v2_ll = tmp / "v2_nomain_req.ll"
+        r_v2_ir = run([geisha, "--verified-opt", "--no-main", "--solver", z3_bin, "-e", "-o", str(v2_ll), str(v2_src)])
+        assert r_v2_ir.returncode == 0, f"V2 --no-main IR compile failed:\n{r_v2_ir.stdout}\n{r_v2_ir.stderr}"
+        fg_ir = fn_ir_block(v2_ll.read_text(encoding="utf-8"), "fastGet")
+        assert "arr.oob_trap" in fg_ir and "llvm.assume" not in fg_ir, (
+            f"V2 violated: --no-main / zero-caller elided check or emitted @llvm.assume!\n{fg_ir}"
+        )
+
+        # V3 Regression: tail-recursive function with `ensures` MUST keep `tail call` TCO under `--verified-opt`
+        v3_src = tmp / "v3_tco.gsa"
+        v3_src.write_text(
+            "def countDown(n: Int): Int\n"
+            "    requires n >= 0\n"
+            "    ensures r -> r == 0\n"
+            "    decreases n\n"
+            "= if (n <= 0) 0 else countDown(n - 1)\n"
+            "def main(): Void = { let _ = countDown(10); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        v3_ll = tmp / "v3_tco.ll"
+        r_v3_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(v3_ll), str(v3_src)])
+        assert r_v3_ir.returncode == 0, f"V3 TCO IR compile failed:\n{r_v3_ir.stdout}\n{r_v3_ir.stderr}"
+        cd_ir = fn_ir_block(v3_ll.read_text(encoding="utf-8"), "countDown")
+        assert "tail call" in cd_ir, f"V3 violated: countDown lost tail call TCO under --verified-opt!\n{cd_ir}"
+
+        # W1 Adversarial: non-let `arrayNew` / `arrayNewZeroed` MUST emit length>=0 VC and preserve `arr.bad_len`
+        w1_src = tmp / "w1_nonlet_arraynew.gsa"
+        w1_src.write_text(
+            "def direct(n: Int): MutArray Int = arrayNew(n, 0)\n"
+            "def nested(n: Int): Int = arrayLen(arrayNew(n, 0))\n"
+            "def zeroed(n: Int): MutArray Int = arrayNewZeroed(n)\n"
+            "def main(): Void = {\n"
+            "    let _ = direct(2);\n"
+            "    let _ = nested(2);\n"
+            "    let _ = zeroed(2);\n"
+            "    ()\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_w1_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(w1_src)])
+        assert r_w1_v.returncode == 1, f"W1 verify MUST fail (exit 1), got {r_w1_v.returncode}:\n{r_w1_v.stdout}\n{r_w1_v.stderr}"
+        w1_j = json.loads(r_w1_v.stdout)
+        assert w1_j["failed"] >= 3, f"W1 expected >=3 failed bounds VCs (direct/nested/zeroed), got: {w1_j}"
+        w1_ll = tmp / "w1_nonlet_arraynew.ll"
+        r_w1_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(w1_ll), str(w1_src)])
+        assert r_w1_ir.returncode == 0, f"W1 IR compile failed:\n{r_w1_ir.stdout}\n{r_w1_ir.stderr}"
+        w1_ir_txt = w1_ll.read_text(encoding="utf-8")
+        for fn_nm in ("direct", "nested", "zeroed"):
+            blk = fn_ir_block(w1_ir_txt, fn_nm)
+            assert "arr.bad_len" in blk, f"W1 violated: {fn_nm} elided arr.bad_len without requires n >= 0!\n{blk}"
+
+        # W2 Adversarial: implicit non-aliasing precondition on mutable params MUST participate in upward call-graph fixed-point
+        w2_src = tmp / "w2_alias_precond.gsa"
+        w2_src.write_text(
+            "def readAfter(a: Cell Int, b: Cell Int): Int = {\n"
+            "    cellSet(a, 1);\n"
+            "    cellSet(b, 2);\n"
+            "    assert(cellGet(a) == 1);\n"
+            "    cellGet(a)\n"
+            "}\n"
+            "def main(): Void = { let c = cellNew(0); let _ = readAfter(c, c); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        w2_ll = tmp / "w2_alias_precond.ll"
+        r_w2_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(w2_ll), str(w2_src)])
+        assert r_w2_ir.returncode == 0, f"W2 IR compile failed:\n{r_w2_ir.stdout}\n{r_w2_ir.stderr}"
+        ra_ir = fn_ir_block(w2_ll.read_text(encoding="utf-8"), "readAfter")
+        assert "llvm.assume" not in ra_ir, f"W2 violated: aliased caller emitted false @llvm.assume in readAfter!\n{ra_ir}"
+        w2_exp_ll = tmp / "w2_alias_export.ll"
+        r_w2_exp = run([geisha, "--verified-opt", "--export", "readAfter", "--solver", z3_bin, "-e", "-o", str(w2_exp_ll), str(w2_src)])
+        assert r_w2_exp.returncode == 0
+        ra_exp_ir = fn_ir_block(w2_exp_ll.read_text(encoding="utf-8"), "readAfter")
+        assert "llvm.assume" not in ra_exp_ir, f"W2 violated: exported readAfter emitted @llvm.assume!\n{ra_exp_ir}"
+
+        # W3 Adversarial: side-effecting `assert(...)` MUST fail verification (unknown) and NOT poison caller with false `ensures`
+        w3_src = tmp / "w3_impure_assert.gsa"
+        w3_src.write_text(
+            "def readCell(): Int\n"
+            "    ensures r -> r == 7\n"
+            "= {\n"
+            "    let c = cellNew(2);\n"
+            "    assert({ cellSet(c, 7); true });\n"
+            "    cellGet(c)\n"
+            "}\n"
+            "def callerOfReadCell(): Int = {\n"
+            "    let v = readCell();\n"
+            "    assert(v == 7);\n"
+            "    v\n"
+            "}\n"
+            "def main(): Void = { let _ = callerOfReadCell(); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_w3_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(w3_src)])
+        assert r_w3_v.returncode == 1, f"W3 verify MUST fail (exit 1), got {r_w3_v.returncode}:\n{r_w3_v.stdout}\n{r_w3_v.stderr}"
+        w3_ll = tmp / "w3_impure_assert.ll"
+        r_w3_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(w3_ll), str(w3_src)])
+        assert r_w3_ir.returncode == 0, f"W3 IR compile failed:\n{r_w3_ir.stdout}\n{r_w3_ir.stderr}"
+        caller_ir = fn_ir_block(w3_ll.read_text(encoding="utf-8"), "callerOfReadCell")
+        assert "llvm.assume" not in caller_ir, f"W3 violated: side-effecting assert poisoned callerOfReadCell with @llvm.assume!\n{caller_ir}"
+
+        # W4 CLI: `geisha eval` and `geisha eval --verified-opt`
+        r_eval1 = run([geisha, "eval", "--runtime", runtime, 'printLn("eval-ok")'])
+        assert r_eval1.returncode == 0 and r_eval1.stdout.strip() == "eval-ok", (
+            f"W4 plain eval failed:\n{r_eval1.stdout}\n{r_eval1.stderr}"
+        )
+        r_eval2 = run([geisha, "eval", "--verified-opt", "--solver", z3_bin, "--runtime", runtime, 'printLn("eval-vopt-ok")'])
+        assert r_eval2.returncode == 0 and r_eval2.stdout.strip() == "eval-vopt-ok", (
+            f"W4 --verified-opt eval failed:\n{r_eval2.stdout}\n{r_eval2.stderr}"
+        )
+
+        # X1-X3 Adversarial: branch-merged Cell / Option(Cell) references & unknown-loc havoc/aliasing
+        for x_name, x_target_fn, x_code in [
+            (
+                "x1_single_fn_if_cell",
+                "singleFnIfCell",
+                "def singleFnIfCell(b: Bool): Int\n"
+                "    ensures r -> r == 1\n"
+                "= {\n"
+                "    let c = cellNew(1);\n"
+                "    let alias = if (b) c else cellNew(2);\n"
+                "    cellSet(alias, 99);\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = singleFnIfCell(true); () }\n",
+            ),
+            (
+                "x2_sneaky_alias_if",
+                "readAfter",
+                "def readAfter(a: Cell Int, b: Cell Int): Int = {\n"
+                "    cellSet(a, 1);\n"
+                "    cellSet(b, 2);\n"
+                "    assert(cellGet(a) == 1);\n"
+                "    cellGet(a)\n"
+                "}\n"
+                "def main(): Void = {\n"
+                "    let c = cellNew(0);\n"
+                "    let a = if (true) c else c;\n"
+                "    let _ = readAfter(a, c);\n"
+                "    ()\n"
+                "}\n",
+            ),
+            (
+                "x3_match_opt_cell_alias",
+                "matchOptCell",
+                "use std.option.{Option, Some, None}\n"
+                "def matchOptCell(b: Bool): Int = {\n"
+                "    let c = cellNew(1);\n"
+                "    match (if (b) Some(c) else None) {\n"
+                "        Some(alias) -> { cellSet(alias, 99); assert(cellGet(c) == 1); cellGet(c) },\n"
+                "        None -> cellGet(c),\n"
+                "    }\n"
+                "}\n"
+                "def main(): Void = { let _ = matchOptCell(true); () }\n",
+            ),
+        ]:
+            x_src = tmp / f"{x_name}.gsa"
+            x_src.write_text(x_code, encoding="utf-8", newline="\n")
+            r_xv = run([geisha, "verify", "--json", "--solver", z3_bin, str(x_src)])
+            assert r_xv.returncode == 1, f"X1-X3 {x_name} verify MUST fail (exit 1), got {r_xv.returncode}:\n{r_xv.stdout}\n{r_xv.stderr}"
+            x_ll = tmp / f"{x_name}.ll"
+            r_xir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(x_ll), str(x_src)])
+            assert r_xir.returncode == 0, f"X1-X3 {x_name} IR compile failed:\n{r_xir.stdout}\n{r_xir.stderr}"
+            x_blk = fn_ir_block(x_ll.read_text(encoding="utf-8"), x_target_fn)
+            assert "llvm.assume" not in x_blk, f"X1-X3 {x_name} emitted false @llvm.assume in {x_target_fn}!\n{x_blk}"
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 adversarial/TCO/eval + cache isolation verified")
+
+    # ------------------------------------------------------------------
+    # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
+    # (Runs on all platforms, independent of Z3)
+    # ------------------------------------------------------------------
+    with tempfile.TemporaryDirectory(prefix="geisha_d2_") as td2:
+        tmp2 = Path(td2)
+        checked_bin = tmp2 / ("geisha_checked.exe" if sys.platform == "win32" else "geisha_checked")
+        r_chk_build = run([
+            geisha, "--contracts=check", "--src-root", str(repo_root),
+            "--runtime", runtime, "-O2", "-o", str(checked_bin),
+            str(repo_root / "src" / "geisha.gsa"),
+        ])
+        assert r_chk_build.returncode == 0, f"D2 geisha_checked build failed:\n{r_chk_build.stdout}\n{r_chk_build.stderr}"
+        # Verify contracts are genuinely live (not erased) in geisha_checked
+        bin_bytes = checked_bin.read_bytes()
+        assert b"Contract error:" in bin_bytes, "D2 geisha_checked binary missing live 'Contract error:' strings!"
+        # Self-check the entire compiler under live runtime contracts
+        r_self = run([str(checked_bin), "check", "--src-root", str(repo_root), str(repo_root / "src" / "geisha.gsa")])
+        assert r_self.returncode == 0, f"D2 geisha_checked self-check failed:\n{r_self.stdout}\n{r_self.stderr}"
+        # Multi-backend codegen under live runtime contracts (native IR, wasm-gc, js)
+        mini = tmp2 / "d2_mini.gsa"
+        mini.write_text(
+            "use std.str.{intToStr}\n"
+            "def add(a: Int, b: Int): Int = a + b\n"
+            "def main(): Void = printLn(intToStr(add(20, 22)))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_nat = run([str(checked_bin), "-e", "-o", str(tmp2 / "mini.ll"), str(mini)])
+        assert r_nat.returncode == 0, f"D2 native codegen failed:\n{r_nat.stdout}\n{r_nat.stderr}"
+        r_wgc = run([str(checked_bin), "--target", "wasm-gc", "-o", str(tmp2 / "mini.wasm"), str(mini)])
+        assert r_wgc.returncode == 0, f"D2 wasm-gc codegen failed:\n{r_wgc.stdout}\n{r_wgc.stderr}"
+        r_js = run([str(checked_bin), "--target", "js", "-o", str(tmp2 / "mini.mjs"), str(mini)])
+        assert r_js.returncode == 0, f"D2 js codegen failed:\n{r_js.stdout}\n{r_js.stderr}"
+        print("PASS [d2_geisha_checked]: live contracts embedded, self-check + native/wasm-gc/js codegen passed")
 
     return 0
 

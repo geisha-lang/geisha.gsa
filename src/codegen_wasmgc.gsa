@@ -32,6 +32,10 @@ use ast.{
     Span, emptySpan
 }
 use diag.formatSpanDiag
+use verified_kernels.{
+    uleb32Byte, uleb32Next, sleb32Done, sleb32Byte, sleb32Next,
+    sleb64Done, sleb64Byte, sleb64Next, hexDigitUpperByte
+}
 use infer.{
     VariantInfo, AdtInfo, findVariantByName, applyExplicitSubst, buildPairMap
 }
@@ -52,15 +56,10 @@ def emitUleb(b: StringBuf, n: Int): Void = {
     let more = cellNew(true);
     while (cellGet(more)) {
         let cur = cellGet(v);
-        let byte = cur & 127;
-        let next = cur >>> 7;
-        if (next != 0) {
-            bufPushByte(b, byte | 128);
-            cellSet(v, next)
-        } else {
-            bufPushByte(b, byte);
-            cellSet(more, false)
-        }
+        let byte = uleb32Byte(cur);
+        let next = uleb32Next(cur);
+        bufPushByte(b, byte);
+        if (next != 0) cellSet(v, next) else cellSet(more, false)
     }
 }
 
@@ -69,35 +68,18 @@ def emitSleb(b: StringBuf, n: Int): Void = {
     let more = cellNew(true);
     while (cellGet(more)) {
         let cur = cellGet(v);
-        let byte = cur & 127;
-        let next = cur >> 7;
-        if ((next == 0 && (byte & 64) == 0) || (next == -1 && (byte & 64) != 0)) {
-            bufPushByte(b, byte);
-            cellSet(more, false)
-        } else {
-            bufPushByte(b, byte | 128);
-            cellSet(v, next)
-        }
+        bufPushByte(b, sleb32Byte(cur));
+        if (sleb32Done(cur)) cellSet(more, false) else cellSet(v, sleb32Next(cur))
     }
 }
 
 def emitSleb64(b: StringBuf, n: Int64): Void = {
     let v = cellNew(n);
     let more = cellNew(true);
-    let z64 = intToI64(0);
-    let m1_64 = intToI64(-1);
-    let mask7 = intToI64(127);
     while (cellGet(more)) {
         let cur = cellGet(v);
-        let byte = i64ToInt(bitAnd64(cur, mask7));
-        let next = bitShr64(cur, 7);
-        if ((next == z64 && (byte & 64) == 0) || (next == m1_64 && (byte & 64) != 0)) {
-            bufPushByte(b, byte);
-            cellSet(more, false)
-        } else {
-            bufPushByte(b, byte | 128);
-            cellSet(v, next)
-        }
+        bufPushByte(b, sleb64Byte(cur));
+        if (sleb64Done(cur)) cellSet(more, false) else cellSet(v, sleb64Next(cur))
     }
 }
 
@@ -127,7 +109,10 @@ def emitWasmName(b: StringBuf, s: String): Void = {
     bufPushStr(b, s)
 }
 
-def emitSection(out: StringBuf, secId: Int, body: StringBuf): Void = {
+def emitSection(out: StringBuf, secId: Int, body: StringBuf): Void
+    requires secId >= 0 && secId <= 12 && bufLen(body) >= 0
+    ensures _ -> bufLen(out) > 0
+= {
     bufPushByte(out, secId);
     emitUleb(out, bufLen(body));
     bufPushBuf(out, body)
@@ -1445,7 +1430,10 @@ data WgcFnCtx {
     },
 }
 
-def fcAllocLocal(fctx: WgcFnCtx, wt: WgcValType): Int = {
+def fcAllocLocal(fctx: WgcFnCtx, wt: WgcValType): Int
+    requires fctx.fcNumParams >= 0
+    ensures idx -> idx >= fctx.fcNumParams && fctx.fcNumParams + vecLen(fctx.fcExtraLocals) == idx + 1
+= {
     let idx = fctx.fcNumParams + vecLen(fctx.fcExtraLocals);
     vecPush(fctx.fcExtraLocals, wt);
     idx
@@ -3325,7 +3313,7 @@ def isReservedWgcExportName(nm: String): Bool =
     || nm == "wasmExports"
 
 def hexDigitUpper(nib: Int): Int =
-    if (nib < 10) 48 + nib else 55 + nib
+    hexDigitUpperByte(nib & 15)
 
 def isUrlPathSegmentUnreserved(b: Int): Bool =
     (b >= 65 && b <= 90)

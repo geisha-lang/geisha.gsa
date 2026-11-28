@@ -17,6 +17,7 @@ use std.json.stringify
 use sys.fs.{writeFile, removeFile, mkdirAll}
 use sys.proc.{command, runTimeout, ExitStatus, Exited}
 use pkg.geishaHomeDir
+use verified_kernels.hexNibbleVal
 use ast.{
     Span, emptySpan,
     Type, TyVoid, TyCon, TyArr, TyTuple, TyComp,
@@ -141,6 +142,13 @@ def assocGetFields(xs: List (String, List (Option String)), key: String): Option
 
 def assocSet(xs: List (String, String), key: String, val: String): List (String, String) =
     Cons((key, val), xs)
+
+def assocRemove(xs: List (String, String), key: String): List (String, String) = match xs {
+    Nil -> Nil,
+    Cons((k, v), r) ->
+        if (k == key) assocRemove(r, key)
+        else Cons((k, v), assocRemove(r, key)),
+}
 
 def listHasStr(xs: List String, s: String): Bool = match xs {
     Nil -> false,
@@ -566,7 +574,7 @@ def scanEffectsInTerm(
                 Nil -> (),
             }
         } else if (nm != "cellGet" && nm != "cellNew" && nm != "arrayLen" && nm != "immArrayLen"
-            && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew"
+            && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew" && nm != "arrayNewZeroed"
             && nm != "assert" && nm != "assume"
             && nm != "__gs_requires" && nm != "__gs_ensures" && nm != "__gs_invariant" && nm != "__gs_decreases") {
             // Any user/extern call inside a loop may mutate Cell/MutArray (directly or wrapped in Tuple/ADT)
@@ -713,10 +721,7 @@ def trimLine(s: String): String = {
 }
 
 def hexDigitVal(b: Int): Int =
-    if (b >= 48 && b <= 57) b - 48
-    else if (b >= 97 && b <= 102) 10 + (b - 97)
-    else if (b >= 65 && b <= 70) 10 + (b - 65)
-    else -1
+    hexNibbleVal(b)
 
 def decodeBvLiteral(s: String): String =
     if (strStartsWith(s, "#x")) {
@@ -1111,7 +1116,17 @@ def bindPatternInSym(
             };
             (st2, Some("true"))
         },
-        None -> (st, Some("true")),
+        None -> {
+            let st2 = MkSymState {
+                stDecls: st.stDecls,
+                stVars: assocRemove(st.stVars, vn),
+                stCells: st.stCells, stLocSorts: st.stLocSorts,
+                stArrLens: st.stArrLens, stArrMems: st.stArrMems,
+                stDataTags: st.stDataTags, stDataFields: st.stDataFields,
+                stPath: st.stPath, stUserVars: st.stUserVars,
+            };
+            (st2, Some("true"))
+        },
     },
     PatLit(LitInt(n)) -> match scrutOpt {
         Some(sv) -> (st, Some("(= " + sv + " " + bvLitForBits(n, typeBitWidth(scrutTy)) + ")")),
@@ -1317,11 +1332,11 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
         },
         TmBin(OpAnd, l, r) -> {
             let falseTerm = MkTerm { tspan: t.tspan, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(false)) };
-            evalIf(ctx, st, l, r, falseTerm, emitObs)
+            evalIf(ctx, st, TyCon("Bool"), l, r, falseTerm, emitObs)
         },
         TmBin(OpOr, l, r) -> {
             let trueTerm = MkTerm { tspan: t.tspan, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) };
-            evalIf(ctx, st, l, trueTerm, r, emitObs)
+            evalIf(ctx, st, TyCon("Bool"), l, trueTerm, r, emitObs)
         },
         TmBin(op, l, r) -> {
             let (st1, lv) = evalTerm(ctx, st, l, emitObs);
@@ -1600,7 +1615,14 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                                     stPath: st1.stPath, stUserVars: st1.stUserVars,
                                 },
                             },
-                        None -> st1,
+                        None -> MkSymState {
+                            stDecls: st1.stDecls,
+                            stVars: assocRemove(st1.stVars, vname),
+                            stCells: st1.stCells, stLocSorts: st1.stLocSorts,
+                            stArrLens: st1.stArrLens, stArrMems: st1.stArrMems,
+                            stDataTags: st1.stDataTags, stDataFields: st1.stDataFields,
+                            stPath: st1.stPath, stUserVars: st1.stUserVars,
+                        },
                     };
                     let (stOut, rv) = evalTerm(ctx, st2, bodyT, emitObs);
                     (stRestoreVars(stOut, st1.stVars), rv)
@@ -1608,15 +1630,47 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
             }
         },
         TmBlock(stmts) -> evalBlock(ctx, st, stmts, emitObs),
-        TmIf(c, th, el) -> evalIf(ctx, st, c, th, el, emitObs),
-        TmMatch(scrut, arms) -> evalMatch(ctx, st, scrut, arms, emitObs),
+        TmIf(c, th, el) -> evalIf(ctx, st, schemeBody(t.tscm), c, th, el, emitObs),
+        TmMatch(scrut, arms) -> evalMatch(ctx, st, schemeBody(t.tscm), scrut, arms, emitObs),
         TmWhile(cond, body) -> evalWhile(ctx, st, t.tspan, cond, body, emitObs),
         TmApplyDir(vd, args) -> evalApplyDir(ctx, st, t.tspan, schemeBody(t.tscm), vd.vname, args, emitObs),
+    }
+
+def isPureSmtIteType(ctx: VerifyCtx, ty: Type): Bool =
+    match typeToSmtSort(ty) {
+        Some(_) -> true,
+        None -> match adtHeadNameAndArgs(ty) {
+            (Some(nm), _) -> match strMapGet(ctx.vcAdtReg, nm) {
+                Some(info) -> match info.variants {
+                    Nil -> false,
+                    _ -> {
+                        let allFieldless = cellNew(true);
+                        let cv = cellNew(info.variants);
+                        while (cellGet(allFieldless) && match cellGet(cv) { Nil -> false, _ -> true }) {
+                            match cellGet(cv) {
+                                Cons(v, r) -> {
+                                    match v.fieldTypes {
+                                        Nil -> (),
+                                        _ -> cellSet(allFieldless, false),
+                                    };
+                                    cellSet(cv, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellGet(allFieldless)
+                    },
+                },
+                None -> false,
+            },
+            _ -> false,
+        },
     }
 
 def evalIf(
     ctx: VerifyCtx,
     st: SymState,
+    resTy: Type,
     c: TaggedTerm,
     th: TaggedTerm,
     el: TaggedTerm,
@@ -1710,7 +1764,10 @@ def evalIf(
                 stUserVars: stElseOut.stUserVars,
             };
             let resVal = match (tv, ev) {
-                (Some(ts), Some(es)) -> Some("(ite " + cs + " " + ts + " " + es + ")"),
+                (Some(ts), Some(es)) ->
+                    if (ts == es) Some(ts)
+                    else if (isPureSmtIteType(ctx, resTy)) Some("(ite " + cs + " " + ts + " " + es + ")")
+                    else None,
                 _ -> None,
             };
             (stMerged, resVal)
@@ -1740,6 +1797,7 @@ def evalIf(
 def evalMatch(
     ctx: VerifyCtx,
     st: SymState,
+    resTy: Type,
     scrut: TaggedTerm,
     arms: List CoreArm,
     emitObs: Bool
@@ -1878,7 +1936,8 @@ def evalMatch(
         }
     };
 
-    // Fold arm values into nested `(ite cond_i val_i ...)`
+    // Fold arm values into nested `(ite cond_i val_i ...)` ONLY for pure SMT scalar/enum types
+    let canIte = isPureSmtIteType(ctx, resTy);
     let resVal: Cell (Option String) = cellNew(None);
     let firstArm = cellNew(true);
     let cr = cellNew(cellGet(armResultsRev));
@@ -1891,7 +1950,10 @@ def evalMatch(
                 } else {
                     cellSet(resVal, match (condOpt, valOpt, cellGet(resVal)) {
                         (Some("true"), Some(v), _) -> Some(v),
-                        (Some(c), Some(v), Some(elseV)) -> Some("(ite " + c + " " + v + " " + elseV + ")"),
+                        (Some(c), Some(v), Some(elseV)) ->
+                            if (v == elseV) Some(v)
+                            else if (canIte) Some("(ite " + c + " " + v + " " + elseV + ")")
+                            else None,
                         _ -> None,
                     })
                 };
@@ -2048,6 +2110,59 @@ def collectMutLocsFromSym(
         },
     }
 
+def isSideEffectFreeVerifyList(specs: StrMap FnSpec, ts: List TaggedTerm, visited: List String): Bool = match ts {
+    Nil -> true,
+    Cons(t, r) -> if (isSideEffectFreeVerifyTerm(specs, t, visited)) isSideEffectFreeVerifyList(specs, r, visited) else false,
+}
+
+def isSideEffectFreeVerifyArms(specs: StrMap FnSpec, arms: List CoreArm, visited: List String): Bool = match arms {
+    Nil -> true,
+    Cons(a, r) -> {
+        let gOk = match a.caGuard { Some(g) -> isSideEffectFreeVerifyTerm(specs, g, visited), None -> true };
+        if (gOk && isSideEffectFreeVerifyTerm(specs, a.caBody, visited)) isSideEffectFreeVerifyArms(specs, r, visited)
+        else false
+    },
+}
+
+def isSideEffectFreeVerifyTerm(specs: StrMap FnSpec, tm: TaggedTerm, visited: List String): Bool = match tm.tnode {
+    TmLit(_) -> true,
+    TmVar(_) -> true,
+    TmGlobalVar(_) -> true,
+    TmTuple(es) -> isSideEffectFreeVerifyList(specs, es, visited),
+    TmBlock(es) -> isSideEffectFreeVerifyList(specs, es, visited),
+    TmMakeData(_, _, fs, _, _) -> isSideEffectFreeVerifyList(specs, fs, visited),
+    TmBin(_, a, b) -> isSideEffectFreeVerifyTerm(specs, a, visited) && isSideEffectFreeVerifyTerm(specs, b, visited),
+    TmUn(_, a) -> isSideEffectFreeVerifyTerm(specs, a, visited),
+    TmLet(_, v, b) -> isSideEffectFreeVerifyTerm(specs, v, visited) && isSideEffectFreeVerifyTerm(specs, b, visited),
+    TmIf(c, t, e) ->
+        isSideEffectFreeVerifyTerm(specs, c, visited)
+        && isSideEffectFreeVerifyTerm(specs, t, visited)
+        && isSideEffectFreeVerifyTerm(specs, e, visited),
+    TmMatch(s, arms) -> isSideEffectFreeVerifyTerm(specs, s, visited) && isSideEffectFreeVerifyArms(specs, arms, visited),
+    TmGetTag(e) -> isSideEffectFreeVerifyTerm(specs, e, visited),
+    TmApplyDir(vd, args) -> {
+        let nm = vd.vname;
+        if (!isSideEffectFreeVerifyList(specs, args, visited)) false
+        else if (
+            nm == "cellGet" || nm == "arrayLen" || nm == "immArrayLen"
+            || nm == "arrayGet" || nm == "immArrayGet"
+            || nm == "intToI64" || nm == "i64ToInt"
+            || nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases"
+        ) true
+        else if (
+            nm == "cellSet" || nm == "arraySet" || nm == "cellNew"
+            || nm == "arrayNew" || nm == "arrayNewZeroed" || nm == "parTabulate"
+            || nm == "assert" || nm == "assume"
+        ) false
+        else if (listHasStr(visited, nm)) false
+        else match strMapGet(specs, nm) {
+            Some(sp) -> isSideEffectFreeVerifyTerm(specs, sp.fsBody, Cons(nm, visited)),
+            None -> false,
+        }
+    },
+    _ -> false,
+}
+
 def evalApplyDir(
     ctx: VerifyCtx,
     st: SymState,
@@ -2057,7 +2172,114 @@ def evalApplyDir(
     args: List TaggedTerm,
     emitObs: Bool
 ): (SymState, Option String) =
-    if (nm == "cellGet") {
+    if (nm == "cellNew") {
+        match args {
+            Cons(initT, _) -> {
+                let (st1, initV) = evalTerm(ctx, st, initT, emitObs);
+                let loc = freshLoc(ctx, "cell");
+                let eSort = elemSortOf(retTy);
+                let (decls2, initSym) = match initV {
+                    Some(iv) -> (st1.stDecls, iv),
+                    None -> {
+                        let fs = freshSym(ctx, "cell_init");
+                        (Cons("(declare-const " + fs + " " + eSort + ")", st1.stDecls), fs)
+                    },
+                };
+                let st2 = MkSymState {
+                    stDecls: decls2,
+                    stVars: st1.stVars,
+                    stCells: assocSet(st1.stCells, loc, initSym),
+                    stLocSorts: assocSet(st1.stLocSorts, loc, eSort),
+                    stArrLens: st1.stArrLens, stArrMems: st1.stArrMems,
+                    stDataTags: st1.stDataTags, stDataFields: st1.stDataFields,
+                    stPath: st1.stPath, stUserVars: st1.stUserVars,
+                };
+                (st2, Some(loc))
+            },
+            Nil -> (st, None),
+        }
+    } else if (nm == "arrayNew" || nm == "arrayNewZeroed") {
+        match args {
+            Cons(lenT, restA) -> {
+                let (st1, lenV) = evalTerm(ctx, st, lenT, emitObs);
+                let (st2, initV) = match restA {
+                    Cons(initT, _) -> evalTerm(ctx, st1, initT, emitObs),
+                    Nil -> (st1, Some("#x00000000")),
+                };
+                let loc = freshLoc(ctx, "arr");
+                let eSort = elemSortOf(retTy);
+                let (decls2, lenSym) = match lenV {
+                    Some(ls) -> {
+                        if (emitObs && ctx.vcCheckImplicit) {
+                            dischargeObligation(
+                                ctx, st2, "bounds", sp,
+                                "array length may be negative in `" + ctx.vcCurFn + "`",
+                                "(bvsge " + ls + " #x00000000)", None
+                            )
+                        } else ();
+                        (st2.stDecls, ls)
+                    },
+                    None -> {
+                        if (emitObs && ctx.vcCheckImplicit) {
+                            recordUnknown(
+                                ctx, "bounds", sp,
+                                "array length non-negativity could not be verified in `" + ctx.vcCurFn + "`",
+                                "array length expression is not modeled in SMT"
+                            )
+                        } else ();
+                        let fl = freshSym(ctx, "arr_len");
+                        (Cons("(declare-const " + fl + " (_ BitVec 32))", st2.stDecls), fl)
+                    },
+                };
+                let (decls3, memExpr) = match initV {
+                    Some(iv) -> (decls2, "((as const (Array (_ BitVec 32) " + eSort + ")) " + iv + ")"),
+                    None -> {
+                        let ms = freshSym(ctx, "arr_mem");
+                        (Cons("(declare-const " + ms + " (Array (_ BitVec 32) " + eSort + "))", decls2), ms)
+                    },
+                };
+                let st3 = MkSymState {
+                    stDecls: decls3,
+                    stVars: st2.stVars,
+                    stCells: st2.stCells,
+                    stLocSorts: assocSet(st2.stLocSorts, loc, eSort),
+                    stArrLens: assocSet(st2.stArrLens, loc, lenSym),
+                    stArrMems: assocSet(st2.stArrMems, loc, memExpr),
+                    stDataTags: st2.stDataTags, stDataFields: st2.stDataFields,
+                    stPath: Cons("(bvsge " + lenSym + " #x00000000)", st2.stPath),
+                    stUserVars: st2.stUserVars,
+                };
+                (st3, Some(loc))
+            },
+            Nil -> (st, None),
+        }
+    } else if (nm == "parTabulate") {
+        match args {
+            Cons(lenT, _) -> {
+                let (st1, lenV) = evalTerm(ctx, st, lenT, emitObs);
+                match lenV {
+                    Some(ls) ->
+                        if (emitObs && ctx.vcCheckImplicit) {
+                            dischargeObligation(
+                                ctx, st1, "bounds", sp,
+                                "array length may be negative in `" + ctx.vcCurFn + "`",
+                                "(bvsge " + ls + " #x00000000)", None
+                            )
+                        } else (),
+                    None ->
+                        if (emitObs && ctx.vcCheckImplicit) {
+                            recordUnknown(
+                                ctx, "bounds", sp,
+                                "array length non-negativity could not be verified in `" + ctx.vcCurFn + "`",
+                                "array length expression is not modeled in SMT"
+                            )
+                        } else (),
+                };
+                (st1, None)
+            },
+            Nil -> (st, None),
+        }
+    } else if (nm == "cellGet") {
         match args {
             Cons(cArg, _) -> {
                 let (st1, cv) = evalTerm(ctx, st, cArg, emitObs);
@@ -2073,20 +2295,25 @@ def evalApplyDir(
             Cons(cArg, Cons(vArg, _)) -> {
                 let (st1, cv) = evalTerm(ctx, st, cArg, emitObs);
                 let (st2, vv) = evalTerm(ctx, st1, vArg, emitObs);
-                match (cv, vv) {
-                    (Some(loc), Some(vs)) -> {
-                        let st3 = MkSymState {
-                            stDecls: st2.stDecls, stVars: st2.stVars,
-                            stCells: assocSet(st2.stCells, loc, vs),
-                            stLocSorts: st2.stLocSorts,
-                            stArrLens: st2.stArrLens, stArrMems: st2.stArrMems,
-                            stDataTags: st2.stDataTags, stDataFields: st2.stDataFields,
-                            stPath: st2.stPath, stUserVars: st2.stUserVars,
-                        };
-                        (st3, Some("#x00000000"))
+                match cv {
+                    Some(loc) -> match assocGet(st2.stCells, loc) {
+                        Some(_) -> match vv {
+                            Some(vs) -> {
+                                let st3 = MkSymState {
+                                    stDecls: st2.stDecls, stVars: st2.stVars,
+                                    stCells: assocSet(st2.stCells, loc, vs),
+                                    stLocSorts: st2.stLocSorts,
+                                    stArrLens: st2.stArrLens, stArrMems: st2.stArrMems,
+                                    stDataTags: st2.stDataTags, stDataFields: st2.stDataFields,
+                                    stPath: st2.stPath, stUserVars: st2.stUserVars,
+                                };
+                                (st3, Some("#x00000000"))
+                            },
+                            None -> (havocLocs(ctx, st2, [loc], Nil, "cset"), Some("#x00000000")),
+                        },
+                        None -> (havocLocs(ctx, st2, assocKeysUnique(st2.stCells), Nil, "cset"), Some("#x00000000")),
                     },
-                    (Some(loc), None) -> (havocLocs(ctx, st2, [loc], Nil, "cset"), Some("#x00000000")),
-                    _ -> (st2, Some("#x00000000")),
+                    None -> (havocLocs(ctx, st2, assocKeysUnique(st2.stCells), Nil, "cset"), Some("#x00000000")),
                 }
             },
             _ -> (st, Some("#x00000000")),
@@ -2168,7 +2395,8 @@ def evalApplyDir(
                                 };
                                 (st4, Some("#x00000000"))
                             },
-                            _ -> (havocLocs(ctx, st3, Nil, [loc], "aset"), Some("#x00000000")),
+                            (Some(_), None) -> (havocLocs(ctx, st3, Nil, [loc], "aset"), Some("#x00000000")),
+                            (None, _) -> (havocLocs(ctx, st3, Nil, assocKeysUnique(st3.stArrMems), "aset"), Some("#x00000000")),
                         }
                     },
                 _ -> {
@@ -2183,31 +2411,51 @@ def evalApplyDir(
         }
     } else if (nm == "assert") {
         match args {
-            Cons(cArg, _) -> {
-                let (st1, cv) = evalTerm(ctx, st, cArg, emitObs);
-                if (emitObs) {
-                    dischargeOptGoal(
-                        ctx, st1, "assert", sp,
-                        "assertion may fail in `" + ctx.vcCurFn + "`",
-                        cv, None
-                    )
-                } else ();
-                match cv {
-                    Some(cs) -> (stWithPath(st1, cs), Some("#x00000000")),
-                    None -> (st1, Some("#x00000000")),
-                }
-            },
+            Cons(cArg, _) ->
+                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, cArg, Nil)) {
+                    if (emitObs) {
+                        recordUnknown(
+                            ctx, "assert", sp,
+                            "side-effecting expression inside `assert(...)` cannot be statically verified in `" + ctx.vcCurFn + "`",
+                            "move mutations (`cellSet`/`arraySet`/allocations) outside `assert(...)`; `--contracts=erase` elides `assert`"
+                        )
+                    } else ();
+                    (havocLocs(ctx, st, assocKeysUnique(st.stCells), assocKeysUnique(st.stArrMems), "impure_assert"), Some("#x00000000"))
+                } else {
+                    let (st1, cv) = evalTerm(ctx, st, cArg, emitObs);
+                    if (emitObs) {
+                        dischargeOptGoal(
+                            ctx, st1, "assert", sp,
+                            "assertion may fail in `" + ctx.vcCurFn + "`",
+                            cv, None
+                        )
+                    } else ();
+                    match cv {
+                        Some(cs) -> (stWithPath(st1, cs), Some("#x00000000")),
+                        None -> (st1, Some("#x00000000")),
+                    }
+                },
             Nil -> (st, Some("#x00000000")),
         }
     } else if (nm == "assume") {
         match args {
-            Cons(cArg, _) -> {
-                let (st1, cv) = evalTerm(ctx, st, cArg, false);
-                match cv {
-                    Some(cs) -> (stWithPath(st1, cs), Some("#x00000000")),
-                    None -> (st1, Some("#x00000000")),
-                }
-            },
+            Cons(cArg, _) ->
+                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, cArg, Nil)) {
+                    if (emitObs) {
+                        recordUnknown(
+                            ctx, "assume", sp,
+                            "side-effecting expression inside `assume(...)` cannot be statically verified in `" + ctx.vcCurFn + "`",
+                            "move mutations (`cellSet`/`arraySet`/allocations) outside `assume(...)`"
+                        )
+                    } else ();
+                    (havocLocs(ctx, st, assocKeysUnique(st.stCells), assocKeysUnique(st.stArrMems), "impure_assume"), Some("#x00000000"))
+                } else {
+                    let (st1, cv) = evalTerm(ctx, st, cArg, false);
+                    match cv {
+                        Some(cs) -> (stWithPath(st1, cs), Some("#x00000000")),
+                        None -> (st1, Some("#x00000000")),
+                    }
+                },
             Nil -> (st, Some("#x00000000")),
         }
     } else if (nm == "intToI64") {
@@ -2266,13 +2514,21 @@ def evalApplyDir(
                                 Some(asmt) -> {
                                     cellSet(calleeVars, assocSet(cellGet(calleeVars), pvd.vname, asmt));
                                     if (isMutParam) {
-                                        if (listHasStr(cellGet(seenMutLocs), asmt) || listHasStr(cellGet(seenImmLocs), asmt)) {
+                                        let knownLoc =
+                                            if (isCellType(pty)) match assocGet(st1.stCells, asmt) { Some(_) -> true, None -> false }
+                                            else match assocGet(st1.stArrMems, asmt) { Some(_) -> true, None -> false };
+                                        if (!knownLoc) {
+                                            cellSet(unknownMutContainer, true);
                                             cellSet(hasMutAlias, true)
                                         } else {
-                                            cellSet(seenMutLocs, Cons(asmt, cellGet(seenMutLocs)))
-                                        };
-                                        if (isCellType(pty)) cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), asmt))
-                                        else cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), asmt))
+                                            if (listHasStr(cellGet(seenMutLocs), asmt) || listHasStr(cellGet(seenImmLocs), asmt)) {
+                                                cellSet(hasMutAlias, true)
+                                            } else {
+                                                cellSet(seenMutLocs, Cons(asmt, cellGet(seenMutLocs)))
+                                            };
+                                            if (isCellType(pty)) cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), asmt))
+                                            else cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), asmt))
+                                        }
                                     } else if (hasNestedMut) {
                                         let embCells: Cell (List String) = cellNew(Nil);
                                         let embArrs: Cell (List String) = cellNew(Nil);
@@ -2308,8 +2564,12 @@ def evalApplyDir(
                                             }
                                         }
                                     } else if (isImmArrParam) {
-                                        if (listHasStr(cellGet(seenMutLocs), asmt)) cellSet(hasMutAlias, true)
-                                        else cellSet(seenImmLocs, Cons(asmt, cellGet(seenImmLocs)))
+                                        match assocGet(st1.stArrLens, asmt) {
+                                            Some(_) ->
+                                                if (listHasStr(cellGet(seenMutLocs), asmt)) cellSet(hasMutAlias, true)
+                                                else cellSet(seenImmLocs, Cons(asmt, cellGet(seenImmLocs))),
+                                            None -> cellSet(hasMutAlias, true),
+                                        }
                                     } else ()
                                 },
                                 None ->
@@ -2478,9 +2738,17 @@ def evalApplyDir(
                             let aty = schemeBody(a.tscm);
                             match avOpt {
                                 Some(loc) ->
-                                    if (isCellType(aty)) cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), loc))
-                                    else if (isMutArrayType(aty)) cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), loc))
-                                    else if (typeContainsMutableRec(ctx, aty, Nil)) {
+                                    if (isCellType(aty)) {
+                                        match assocGet(st1.stCells, loc) {
+                                            Some(_) -> cellSet(passedCellLocs, addUnique(cellGet(passedCellLocs), loc)),
+                                            None -> cellSet(unknownMutContainer, true),
+                                        }
+                                    } else if (isMutArrayType(aty)) {
+                                        match assocGet(st1.stArrMems, loc) {
+                                            Some(_) -> cellSet(passedMutArrLocs, addUnique(cellGet(passedMutArrLocs), loc)),
+                                            None -> cellSet(unknownMutContainer, true),
+                                        }
+                                    } else if (typeContainsMutableRec(ctx, aty, Nil)) {
                                         collectMutLocsFromSym(st1, loc, passedCellLocs, passedMutArrLocs, unknownMutContainer, Nil)
                                     } else (),
                                 None ->
@@ -3000,7 +3268,31 @@ def isUserFnToVerify(fd: FunDef, entryFile: String, scopeDir: String): Bool =
         None -> false,
     }
 
-pub def collectUserVerifyFnNames(prog: CoreProgram, entryFile: String, scopeDir: String): List String = {
+def fnMatchesFilters(name: String, filters: List String): Bool = match filters {
+    Nil -> true,
+    _ -> {
+        let found = cellNew(false);
+        let cf = cellNew(filters);
+        while (!cellGet(found) && match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(f, r) -> {
+                    if (name == f) cellSet(found, true)
+                    else {
+                        let suf = "." + f;
+                        let nl = strLen(name);
+                        let sl = strLen(suf);
+                        if (nl > sl && strSlice(name, nl - sl, nl) == suf) cellSet(found, true) else ()
+                    };
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(found)
+    },
+}
+
+pub def collectUserVerifyFnNames(prog: CoreProgram, entryFile: String, scopeDir: String, fnFilters: List String): List String = {
     let outRev: Cell (List String) = cellNew(Nil);
     let cf = cellNew(prog.coreFnNames);
     while (match cellGet(cf) { Nil -> false, _ -> true }) {
@@ -3008,7 +3300,7 @@ pub def collectUserVerifyFnNames(prog: CoreProgram, entryFile: String, scopeDir:
             Cons(nm, r) -> {
                 match strMapGet(prog.coreFns, nm) {
                     Some(fd) ->
-                        if (isUserFnToVerify(fd, entryFile, scopeDir)) {
+                        if (isUserFnToVerify(fd, entryFile, scopeDir) && fnMatchesFilters(nm, fnFilters)) {
                             cellSet(outRev, Cons(nm, cellGet(outRev)))
                         } else (),
                     None -> (),
@@ -3028,7 +3320,8 @@ pub def verifyCoreProgram(
     jsonOut: Bool,
     solverBin: String,
     timeoutMs: Int,
-    checkImplicit: Bool
+    checkImplicit: Bool,
+    fnFilters: List String
 ): Result Int String = {
     let specs: StrMap FnSpec = strMapNew();
     let callGraph: StrMap (List String) = strMapNew();
@@ -3043,7 +3336,7 @@ pub def verifyCoreProgram(
                         let sp = extractFnSpec(fd);
                         strMapInsert(specs, nm, sp);
                         strMapInsert(callGraph, nm, collectDirectCallees(sp.fsBody, Nil));
-                        if (isUserFnToVerify(fd, entryFile, scopeDir)) {
+                        if (isUserFnToVerify(fd, entryFile, scopeDir) && fnMatchesFilters(nm, fnFilters)) {
                             cellSet(userFnsRev, Cons(sp, cellGet(userFnsRev)))
                         } else ()
                     },
@@ -3077,6 +3370,10 @@ pub def verifyCoreProgram(
     };
 
     let userFns = listRev(cellGet(userFnsRev));
+    let hasFnFilter = match fnFilters { Nil -> false, _ -> true };
+    if (hasFnFilter && listLen(userFns) == 0) {
+        Err("no user functions matched --fn filter in " + entryFile)
+    } else {
     let uf = cellNew(userFns);
     while (match cellGet(uf) { Nil -> false, _ -> true } && match cellGet(ctx.vcSolverErr) { None -> true, Some(_) -> false }) {
         match cellGet(uf) {
@@ -3197,6 +3494,487 @@ pub def verifyCoreProgram(
                     Ok(1)
                 }
             }
+        },
+    }
+    }
+}
+
+// ============================================================================
+// Verification-Driven Optimization (`--verified-opt`) Closed Call-Graph Analysis
+// ============================================================================
+
+def termListContainsAssume(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(t, r) -> if (termContainsAssume(t)) true else termListContainsAssume(r),
+}
+
+def armListContainsAssume(arms: List CoreArm): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gHas = match a.caGuard { Some(g) -> termContainsAssume(g), None -> false };
+        if (gHas || termContainsAssume(a.caBody)) true else armListContainsAssume(r)
+    },
+}
+
+def termContainsAssume(tm: TaggedTerm): Bool = match tm.tnode {
+    TmApplyDir(vd, args) ->
+        if (vd.vname == "assume") true else termListContainsAssume(args),
+    TmApplyCls(f, args) -> if (termContainsAssume(f)) true else termListContainsAssume(args),
+    TmTuple(es) -> termListContainsAssume(es),
+    TmBlock(es) -> termListContainsAssume(es),
+    TmMakeCls(_, _, body) -> termContainsAssume(body),
+    TmMakeData(_, _, fs, _, _) -> termListContainsAssume(fs),
+    TmBin(_, a, b) -> if (termContainsAssume(a)) true else termContainsAssume(b),
+    TmUn(_, a) -> termContainsAssume(a),
+    TmLet(_, v, b) -> if (termContainsAssume(v)) true else termContainsAssume(b),
+    TmIf(c, t, e) -> if (termContainsAssume(c)) true else if (termContainsAssume(t)) true else termContainsAssume(e),
+    TmWhile(c, b) -> if (termContainsAssume(c)) true else termContainsAssume(b),
+    TmMatch(s, arms) -> if (termContainsAssume(s)) true else armListContainsAssume(arms),
+    TmGetTag(e) -> termContainsAssume(e),
+    _ -> false,
+}
+
+def collectCallsAndEscapesList(
+    ts: List TaggedTerm,
+    callerName: String,
+    callersOf: StrMap (List String),
+    calledFromGlobal: StrMap Bool,
+    escapedCls: StrMap Bool
+): Void = match ts {
+    Nil -> (),
+    Cons(t, r) -> {
+        collectCallsAndEscapes(t, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapesList(r, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+}
+
+def collectCallsAndEscapesArms(
+    arms: List CoreArm,
+    callerName: String,
+    callersOf: StrMap (List String),
+    calledFromGlobal: StrMap Bool,
+    escapedCls: StrMap Bool
+): Void = match arms {
+    Nil -> (),
+    Cons(a, r) -> {
+        match a.caGuard {
+            Some(g) -> collectCallsAndEscapes(g, callerName, callersOf, calledFromGlobal, escapedCls),
+            None -> (),
+        };
+        collectCallsAndEscapes(a.caBody, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapesArms(r, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+}
+
+def collectCallsAndEscapes(
+    tm: TaggedTerm,
+    callerName: String,
+    callersOf: StrMap (List String),
+    calledFromGlobal: StrMap Bool,
+    escapedCls: StrMap Bool
+): Void = match tm.tnode {
+    TmApplyDir(vd, args) -> {
+        let callee = vd.vname;
+        if (callerName == "") {
+            strMapInsert(calledFromGlobal, callee, true)
+        } else {
+            let prev = match strMapGet(callersOf, callee) { Some(xs) -> xs, None -> Nil };
+            strMapInsert(callersOf, callee, Cons(callerName, prev))
+        };
+        collectCallsAndEscapesList(args, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmApplyCls(f, args) -> {
+        collectCallsAndEscapes(f, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapesList(args, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmMakeCls(_, cs, body) -> {
+        strMapInsert(escapedCls, cs.clsEntry, true);
+        collectCallsAndEscapes(body, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmGlobalVar(nm) -> {
+        strMapInsert(escapedCls, nm, true)
+    },
+    TmTuple(es) -> collectCallsAndEscapesList(es, callerName, callersOf, calledFromGlobal, escapedCls),
+    TmBlock(es) -> collectCallsAndEscapesList(es, callerName, callersOf, calledFromGlobal, escapedCls),
+    TmMakeData(_, _, fs, _, _) -> collectCallsAndEscapesList(fs, callerName, callersOf, calledFromGlobal, escapedCls),
+    TmBin(_, a, b) -> {
+        collectCallsAndEscapes(a, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapes(b, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmUn(_, a) -> collectCallsAndEscapes(a, callerName, callersOf, calledFromGlobal, escapedCls),
+    TmLet(_, v, b) -> {
+        collectCallsAndEscapes(v, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapes(b, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmIf(c, t, e) -> {
+        collectCallsAndEscapes(c, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapes(t, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapes(e, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmWhile(c, b) -> {
+        collectCallsAndEscapes(c, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapes(b, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmMatch(s, arms) -> {
+        collectCallsAndEscapes(s, callerName, callersOf, calledFromGlobal, escapedCls);
+        collectCallsAndEscapesArms(arms, callerName, callersOf, calledFromGlobal, escapedCls)
+    },
+    TmGetTag(e) -> collectCallsAndEscapes(e, callerName, callersOf, calledFromGlobal, escapedCls),
+    _ -> (),
+}
+
+def isUserFnForVerifiedOpt(fd: FunDef): Bool =
+    if (fd.fnSpan.fileId <= 0) false
+    else match diagGetFile(fd.fnSpan.fileId) {
+        Some(sf) ->
+            !strStartsWith(sf.sfPath, "<builtin:")
+            && !strStartsWith(sf.sfPath, "std/")
+            && !strStartsWith(sf.sfPath, "sys/"),
+        None -> false,
+    }
+
+/// Compute the sound set of Verified-Safe functions for `--verified-opt`:
+///   1. Every implicit & explicit VC of `f` under `vcCheckImplicit = true` is `"proved"` (`0 failed, 0 unknown`);
+///   2. `f` contains NO `assume(...)` call (prevents `--contracts=erase` unsoundness / LLVM UB);
+///   3. Downward `CalleeSound` fixed-point: any unverified or `assume`-tainted callee has its
+///      `ensures` stripped and its callers re-verified until convergence;
+///   4. Upward closed call-graph fixed-point: if `f` has non-empty `requires`, then `isOpenWorld`
+///      is false, `f` has at least one direct caller, `f` is NOT `main`/exported/extern/ctor,
+///      NOT escaped as a closure/global, NOT called from a global initializer, and EVERY direct
+///      caller of `f` is also Verified-Safe.
+pub def computeVerifiedSafeFns(
+    prog: CoreProgram,
+    exportedFns: List String,
+    isOpenWorld: Bool,
+    solverBin: String,
+    timeoutMs: Int
+): Result (StrMap Bool) String = {
+    let specs: StrMap FnSpec = strMapNew();
+    let callGraph: StrMap (List String) = strMapNew();
+    let callersOf: StrMap (List String) = strMapNew();
+    let calledFromGlobal: StrMap Bool = strMapNew();
+    let escapedCls: StrMap Bool = strMapNew();
+    let hasAssume: StrMap Bool = strMapNew();
+    let extCallable: StrMap Bool = strMapNew();
+
+    strMapInsert(extCallable, "main", true);
+    let ce = cellNew(exportedFns);
+    while (match cellGet(ce) { Nil -> false, _ -> true }) {
+        match cellGet(ce) {
+            Cons(en, r) -> { strMapInsert(extCallable, en, true); cellSet(ce, r) },
+            Nil -> (),
+        }
+    };
+    let cex = cellNew(prog.coreExternNames);
+    while (match cellGet(cex) { Nil -> false, _ -> true }) {
+        match cellGet(cex) {
+            Cons(en, r) -> { strMapInsert(extCallable, en, true); cellSet(cex, r) },
+            Nil -> (),
+        }
+    };
+    let cce = cellNew(prog.coreCExports);
+    while (match cellGet(cce) { Nil -> false, _ -> true }) {
+        match cellGet(cce) {
+            Cons((fnNm, _), r) -> { strMapInsert(extCallable, fnNm, true); cellSet(cce, r) },
+            Nil -> (),
+        }
+    };
+    let cct = cellNew(prog.coreCtors);
+    while (match cellGet(cct) { Nil -> false, _ -> true }) {
+        match cellGet(cct) {
+            Cons((fnNm, _), r) -> { strMapInsert(extCallable, fnNm, true); cellSet(cct, r) },
+            Nil -> (),
+        }
+    };
+
+    let userFnsRev: Cell (List FnSpec) = cellNew(Nil);
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(nm, r) -> {
+                match strMapGet(prog.coreFns, nm) {
+                    Some(fd) -> {
+                        let spRaw = extractFnSpec(fd);
+                        let fnHasAssume = termContainsAssume(fd.fnBody);
+                        if (fnHasAssume) strMapInsert(hasAssume, nm, true) else ();
+                        let eligible = isUserFnForVerifiedOpt(fd) && !fnHasAssume;
+                        let sp =
+                            if (eligible) spRaw
+                            else MkFnSpec {
+                                fsName: spRaw.fsName,
+                                fsSpan: spRaw.fsSpan,
+                                fsParams: spRaw.fsParams,
+                                fsRetTy: spRaw.fsRetTy,
+                                fsRequires: spRaw.fsRequires,
+                                fsEnsures: Nil,
+                                fsDecreases: spRaw.fsDecreases,
+                                fsBody: spRaw.fsBody,
+                            };
+                        strMapInsert(specs, nm, sp);
+                        strMapInsert(callGraph, nm, collectDirectCallees(sp.fsBody, Nil));
+                        collectCallsAndEscapes(fd.fnBody, nm, callersOf, calledFromGlobal, escapedCls);
+                        if (eligible) {
+                            cellSet(userFnsRev, Cons(sp, cellGet(userFnsRev)))
+                        } else ()
+                    },
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let cg = cellNew(prog.coreGlobals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(gd, r) -> {
+                collectCallsAndEscapes(gd.gvInit, "", callersOf, calledFromGlobal, escapedCls);
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    let (ctorTags, ctorAdt, ctorFtys, adtCounts, adtTps) = buildAdtVerifyMaps(prog.coreAdtNames, prog.coreAdtReg);
+    let provedMap: StrMap Bool = strMapNew();
+    let solverErr: Cell (Option String) = cellNew(None);
+
+    let runVerifyOne = (sp: FnSpec) -> {
+        let ctx = MkVerifyCtx {
+            vcSpecs: specs,
+            vcCtorTags: ctorTags,
+            vcCtorAdt: ctorAdt,
+            vcCtorFieldTypes: ctorFtys,
+            vcAdtVariantCount: adtCounts,
+            vcAdtTypeParams: adtTps,
+            vcAdtReg: prog.coreAdtReg,
+            vcCallGraph: callGraph,
+            vcCurFn: "",
+            vcCurDecExpr: None,
+            vcCurDecVal: None,
+            vcSolver: solverBin,
+            vcTimeoutMs: if (timeoutMs < 100) 100 else timeoutMs,
+            vcCheckImplicit: true,
+            vcNextSym: cellNew(0),
+            vcResultsRev: cellNew(Nil),
+            vcSolverErr: cellNew(None),
+        };
+        verifySingleFn(ctx, sp);
+        match cellGet(ctx.vcSolverErr) {
+            Some(e) -> cellSet(solverErr, Some(e)),
+            None -> {
+                let allOk = cellNew(true);
+                let cr = cellNew(cellGet(ctx.vcResultsRev));
+                while (cellGet(allOk) && match cellGet(cr) { Nil -> false, _ -> true }) {
+                    match cellGet(cr) {
+                        Cons(ob, rr) -> {
+                            if (ob.obStatus != "proved") cellSet(allOk, false) else ();
+                            cellSet(cr, rr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                strMapInsert(provedMap, sp.fsName, cellGet(allOk))
+            },
+        }
+    };
+
+    let isProved = (nm: String) -> match strMapGet(provedMap, nm) { Some(true) -> true, _ -> false };
+
+    let uf = cellNew(listRev(cellGet(userFnsRev)));
+    while (match cellGet(uf) { Nil -> false, _ -> true } && match cellGet(solverErr) { None -> true, Some(_) -> false }) {
+        match cellGet(uf) {
+            Cons(sp, r) -> {
+                runVerifyOne(sp);
+                cellSet(uf, r)
+            },
+            Nil -> (),
+        }
+    };
+
+    // Downward `CalleeSound` fixed-point (V1): if any function with non-empty `fsEnsures`
+    // failed verification, strip its `fsEnsures` from `specs` and re-verify its proved callers.
+    let calleeChanged = cellNew(true);
+    while (cellGet(calleeChanged) && match cellGet(solverErr) { None -> true, Some(_) -> false }) {
+        cellSet(calleeChanged, false);
+        let toReverifyMap: StrMap Bool = strMapNew();
+        let toReverifyRev: Cell (List String) = cellNew(Nil);
+        let cfd = cellNew(prog.coreFnNames);
+        while (match cellGet(cfd) { Nil -> false, _ -> true }) {
+            match cellGet(cfd) {
+                Cons(nm, r) -> {
+                    if (!isProved(nm)) {
+                        match strMapGet(specs, nm) {
+                            Some(sp) -> {
+                                let hasEns = match sp.fsEnsures { Nil -> false, _ -> true };
+                                if (hasEns) {
+                                    strMapInsert(specs, nm, MkFnSpec {
+                                        fsName: sp.fsName,
+                                        fsSpan: sp.fsSpan,
+                                        fsParams: sp.fsParams,
+                                        fsRetTy: sp.fsRetTy,
+                                        fsRequires: sp.fsRequires,
+                                        fsEnsures: Nil,
+                                        fsDecreases: sp.fsDecreases,
+                                        fsBody: sp.fsBody,
+                                    });
+                                    cellSet(calleeChanged, true);
+                                    let callers = match strMapGet(callersOf, nm) { Some(xs) -> xs, None -> Nil };
+                                    let cc = cellNew(callers);
+                                    while (match cellGet(cc) { Nil -> false, _ -> true }) {
+                                        match cellGet(cc) {
+                                            Cons(callerNm, rc) -> {
+                                                if (isProved(callerNm) && !strMapContains(toReverifyMap, callerNm)) {
+                                                    strMapInsert(toReverifyMap, callerNm, true);
+                                                    cellSet(toReverifyRev, Cons(callerNm, cellGet(toReverifyRev)))
+                                                } else ();
+                                                cellSet(cc, rc)
+                                            },
+                                            Nil -> (),
+                                        }
+                                    }
+                                } else ()
+                            },
+                            None -> (),
+                        }
+                    } else ();
+                    cellSet(cfd, r)
+                },
+                Nil -> (),
+            }
+        };
+        let crv = cellNew(listRev(cellGet(toReverifyRev)));
+        while (match cellGet(crv) { Nil -> false, _ -> true } && match cellGet(solverErr) { None -> true, Some(_) -> false }) {
+            match cellGet(crv) {
+                Cons(callerNm, rr) -> {
+                    match strMapGet(specs, callerNm) {
+                        Some(sp) -> runVerifyOne(sp),
+                        None -> (),
+                    };
+                    cellSet(crv, rr)
+                },
+                Nil -> (),
+            }
+        }
+    };
+
+    match cellGet(solverErr) {
+        Some(e) -> Err(e),
+        None -> {
+            // Upward closed call-graph fixed-point for functions with non-empty `requires`
+            // OR implicit non-aliasing preconditions on mutable parameters (Iron Law 1 + V2 + W2)
+            let aliasCtx = MkVerifyCtx {
+                vcSpecs: specs,
+                vcCtorTags: ctorTags,
+                vcCtorAdt: ctorAdt,
+                vcCtorFieldTypes: ctorFtys,
+                vcAdtVariantCount: adtCounts,
+                vcAdtTypeParams: adtTps,
+                vcAdtReg: prog.coreAdtReg,
+                vcCallGraph: callGraph,
+                vcCurFn: "",
+                vcCurDecExpr: None,
+                vcCurDecVal: None,
+                vcSolver: solverBin,
+                vcTimeoutMs: 100,
+                vcCheckImplicit: true,
+                vcNextSym: cellNew(0),
+                vcResultsRev: cellNew(Nil),
+                vcSolverErr: cellNew(None),
+            };
+            let fnHasImplicitAliasPrecond = (params: List VarDecl) -> {
+                let mutCnt = cellNew(0);
+                let immArrCnt = cellNew(0);
+                let nestedMutCnt = cellNew(0);
+                let cp = cellNew(params);
+                while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                    match cellGet(cp) {
+                        Cons(pvd, r) -> {
+                            let pty = schemeBody(pvd.vscm);
+                            let isMut = isCellType(pty) || isMutArrayType(pty);
+                            let isImm = isArrayType(pty) && !isMutArrayType(pty);
+                            let hasNested = !isMut && typeContainsMutableRec(aliasCtx, pty, Nil);
+                            if (isMut) cellSet(mutCnt, cellGet(mutCnt) + 1)
+                            else if (hasNested) cellSet(nestedMutCnt, cellGet(nestedMutCnt) + 1)
+                            else if (isImm) cellSet(immArrCnt, cellGet(immArrCnt) + 1)
+                            else ();
+                            cellSet(cp, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellGet(mutCnt) >= 2
+                || (cellGet(mutCnt) >= 1 && cellGet(immArrCnt) >= 1)
+                || cellGet(nestedMutCnt) >= 1
+            };
+            let unsafeSet: StrMap Bool = strMapNew();
+            let changed = cellNew(true);
+            while (cellGet(changed)) {
+                cellSet(changed, false);
+                let cf2 = cellNew(prog.coreFnNames);
+                while (match cellGet(cf2) { Nil -> false, _ -> true }) {
+                    match cellGet(cf2) {
+                        Cons(nm, r) -> {
+                            if (isProved(nm) && !strMapContains(unsafeSet, nm)) {
+                                match strMapGet(specs, nm) {
+                                    Some(sp) -> {
+                                        let hasReq = match sp.fsRequires { Nil -> false, _ -> true };
+                                        let hasEntryPrecond = hasReq || fnHasImplicitAliasPrecond(sp.fsParams);
+                                        if (hasEntryPrecond) {
+                                            let callers = match strMapGet(callersOf, nm) { Some(xs) -> xs, None -> Nil };
+                                            let noCallers = match callers { Nil -> true, _ -> false };
+                                            let bad = cellNew(
+                                                isOpenWorld
+                                                || noCallers
+                                                || strMapContains(extCallable, nm)
+                                                || strMapContains(escapedCls, nm)
+                                                || strMapContains(calledFromGlobal, nm)
+                                            );
+                                            if (!cellGet(bad)) {
+                                                let cc = cellNew(callers);
+                                                while (!cellGet(bad) && match cellGet(cc) { Nil -> false, _ -> true }) {
+                                                    match cellGet(cc) {
+                                                        Cons(callerNm, rc) -> {
+                                                            if (!isProved(callerNm) || strMapContains(unsafeSet, callerNm)) {
+                                                                cellSet(bad, true)
+                                                            } else ();
+                                                            cellSet(cc, rc)
+                                                        },
+                                                        Nil -> (),
+                                                    }
+                                                }
+                                            } else ();
+                                            if (cellGet(bad)) {
+                                                strMapInsert(unsafeSet, nm, true);
+                                                cellSet(changed, true)
+                                            } else ()
+                                        } else ()
+                                    },
+                                    None -> (),
+                                }
+                            } else ();
+                            cellSet(cf2, r)
+                        },
+                        Nil -> (),
+                    }
+                }
+            };
+
+            let safeOut: StrMap Bool = strMapNew();
+            let cf3 = cellNew(prog.coreFnNames);
+            while (match cellGet(cf3) { Nil -> false, _ -> true }) {
+                match cellGet(cf3) {
+                    Cons(nm, r) -> {
+                        if (isProved(nm) && !strMapContains(unsafeSet, nm) && !strMapContains(hasAssume, nm)) {
+                            strMapInsert(safeOut, nm, true)
+                        } else ();
+                        cellSet(cf3, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            Ok(safeOut)
         },
     }
 }

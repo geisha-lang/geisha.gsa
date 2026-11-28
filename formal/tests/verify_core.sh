@@ -662,4 +662,8 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_mutrec_missing.gscore" 2>/dev/null;
     echo "FAIL [vcg_cross_mutrec_missing_lean]: Lean geisha-check --verify-vcg accepted mutual recursion missing decreases!" >&2
     exit 1
 fi
-echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases)"
+
+# D1: Production compiler verified kernels (`src/verified_kernels.gsa`) 100% cross-verified by Z3 and Lean 4 VCG
+"$GEISHA_BIN" verify --src-root . --dump-core "$TMP_DIR/verified_kernels.gscore" src/verified_kernels.gsa
+"$CHECKER_BIN" --verify-vcg "$TMP_DIR/verified_kernels.gscore"
+echo "PASS [vcg_live_cross_verification]: geisha verify --dump-core <-> Lean geisha-check --verify-vcg cross-checked (positive + fail-closed + violated ensures/divZero/entryInv + T1 local cell + T2 Int64 shift/casts + T3 mutual-rec decreases + D1 src/verified_kernels.gsa)"

@@ -4712,7 +4712,10 @@ def inlineParamsMatchArgs(ps: List VarDecl, args: List TaggedTerm): Bool = match
     _ -> false,
 }
 
-def buildParamInlineEnv(ps: List VarDecl, pref: String): List (String, String) = match ps {
+def buildParamInlineEnv(ps: List VarDecl, pref: String): List (String, String)
+    requires strLen(pref) > 0
+    ensures out -> listLen(out) == listLen(ps)
+= match ps {
     Nil -> Nil,
     Cons(p, r) -> Cons((p.vname, pref + p.vname), buildParamInlineEnv(r, pref)),
 }
@@ -4882,12 +4885,326 @@ def rewriteArmListInlineLeaves(
     },
 }
 
+def termListHasCheckedOp(ts: List TaggedTerm): Bool = match ts {
+    Nil -> false,
+    Cons(t, r) -> if (termHasCheckedOp(t)) true else termListHasCheckedOp(r),
+}
+
+def armListHasCheckedOp(arms: List CoreArm): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gHas = match a.caGuard { Some(g) -> termHasCheckedOp(g), None -> false };
+        if (gHas || termHasCheckedOp(a.caBody)) true else armListHasCheckedOp(r)
+    },
+}
+
+def termHasCheckedOp(tm: TaggedTerm): Bool = match tm.tnode {
+    TmBin(op, a, b) -> {
+        let isDiv = match op { OpDiv -> true, OpRem -> true, _ -> false };
+        isDiv || termHasCheckedOp(a) || termHasCheckedOp(b)
+    },
+    TmApplyDir(vd, args) -> {
+        let nm = vd.vname;
+        let isArr =
+            nm == "arrayGet" || nm == "immArrayGet" || nm == "arraySet"
+            || nm == "arrayNew" || nm == "arrayNewZeroed";
+        isArr || termListHasCheckedOp(args)
+    },
+    TmApplyCls(f, args) -> termHasCheckedOp(f) || termListHasCheckedOp(args),
+    TmTuple(es) -> termListHasCheckedOp(es),
+    TmBlock(es) -> termListHasCheckedOp(es),
+    TmMakeCls(_, _, body) -> termHasCheckedOp(body),
+    TmMakeData(_, _, fs, _, _) -> termListHasCheckedOp(fs),
+    TmUn(_, a) -> termHasCheckedOp(a),
+    TmLet(_, v, b) -> termHasCheckedOp(v) || termHasCheckedOp(b),
+    TmIf(c, t, e) -> termHasCheckedOp(c) || termHasCheckedOp(t) || termHasCheckedOp(e),
+    TmWhile(c, b) -> termHasCheckedOp(c) || termHasCheckedOp(b),
+    TmMatch(s, arms) -> termHasCheckedOp(s) || armListHasCheckedOp(arms),
+    TmGetTag(e) -> termHasCheckedOp(e),
+    _ -> false,
+}
+
+def isPureScalarAssumeTermCoreList(ts: List TaggedTerm): Bool = match ts {
+    Nil -> true,
+    Cons(t, r) -> if (isPureScalarAssumeTermCore(t)) isPureScalarAssumeTermCoreList(r) else false,
+}
+
+def isFloatTypeForAssumeCore(ty: Type): Bool = match ty {
+    TyCon("Float") -> true,
+    TyCon("Float32") -> true,
+    _ -> false,
+}
+
+def isPureScalarAssumeTermCore(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(_) -> !isFloatTypeForAssumeCore(schemeBody(tm.tscm)),
+    TmVar(_) -> !isFloatTypeForAssumeCore(schemeBody(tm.tscm)),
+    TmBin(op, a, b) -> {
+        let isDiv = match op { OpDiv -> true, OpRem -> true, _ -> false };
+        let hasFloat = isFloatTypeForAssumeCore(schemeBody(a.tscm)) || isFloatTypeForAssumeCore(schemeBody(b.tscm));
+        !isDiv && !hasFloat && isPureScalarAssumeTermCore(a) && isPureScalarAssumeTermCore(b)
+    },
+    TmUn(_, a) -> !isFloatTypeForAssumeCore(schemeBody(a.tscm)) && isPureScalarAssumeTermCore(a),
+    TmIf(c, t, e) -> isPureScalarAssumeTermCore(c) && isPureScalarAssumeTermCore(t) && isPureScalarAssumeTermCore(e),
+    TmGetTag(e) -> isPureScalarAssumeTermCore(e),
+    TmApplyDir(vd, args) ->
+        (vd.vname == "cellGet" || vd.vname == "arrayLen" || vd.vname == "immArrayLen")
+        && isPureScalarAssumeTermCoreList(args),
+    _ -> false,
+}
+
+def isEnsuresOnlyBlockEndingInVar(es: List TaggedTerm, resName: String): Bool = match es {
+    Nil -> false,
+    Cons(last, Nil) -> match last.tnode { TmVar(nm) -> nm == resName, _ -> false },
+    Cons(hd, rest) -> match hd.tnode {
+        TmApplyDir(vd, _) ->
+            if (vd.vname == "__gs_ensures") isEnsuresOnlyBlockEndingInVar(rest, resName)
+            else false,
+        _ -> false,
+    },
+}
+
+def isUnitLitTerm(tm: TaggedTerm): Bool = match tm.tnode {
+    TmLit(LitUnit) -> true,
+    _ -> false,
+}
+
+def pruneLeadingUnitStmts(es: List TaggedTerm): List TaggedTerm = match es {
+    Nil -> Nil,
+    Cons(last, Nil) -> Cons(last, Nil),
+    Cons(hd, rest) ->
+        if (isUnitLitTerm(hd)) pruneLeadingUnitStmts(rest)
+        else Cons(hd, pruneLeadingUnitStmts(rest)),
+}
+
+def eraseContractsTermList(ts: List TaggedTerm, keepReq: Bool): List TaggedTerm = match ts {
+    Nil -> Nil,
+    Cons(t, r) -> Cons(eraseContractsTerm(t, keepReq), eraseContractsTermList(r, keepReq)),
+}
+
+def eraseContractsArms(arms: List CoreArm, keepReq: Bool): List CoreArm = match arms {
+    Nil -> Nil,
+    Cons(a, r) -> {
+        let g2 = match a.caGuard { Some(g) -> Some(eraseContractsTerm(g, keepReq)), None -> None };
+        Cons(
+            MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: eraseContractsTerm(a.caBody, keepReq) },
+            eraseContractsArms(r, keepReq)
+        )
+    },
+}
+
+def eraseContractsTerm(tm: TaggedTerm, keepReq: Bool): TaggedTerm = {
+    let mk = (n: Term) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: n };
+    match tm.tnode {
+        TmApplyDir(vd, args) -> {
+            let nm = vd.vname;
+            if (nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases" || nm == "assume") {
+                MkTerm { tspan: tm.tspan, tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
+            } else if (nm == "__gs_requires" || nm == "assert") {
+                let keepThis = keepReq && match args {
+                    Cons(a0, _) -> isPureScalarAssumeTermCore(a0),
+                    Nil -> false,
+                };
+                if (keepThis) mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq)))
+                else MkTerm { tspan: tm.tspan, tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
+            } else {
+                mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq)))
+            }
+        },
+        TmLet(vd, v, b) -> {
+            // Erase `let r = __gs_res in ()` left behind after erasing `ensures r -> ...`,
+            // and unwrap `let __gs_res = body in __gs_res` to restore tail-call TCO!
+            let b2 = eraseContractsTerm(b, keepReq);
+            let isResVar = match v.tnode { TmVar(nm) -> nm == "__gs_res", _ -> false };
+            if (isUnitLitTerm(b2) && isResVar) {
+                b2
+            } else {
+                let isRetRes =
+                    vd.vname == "__gs_res"
+                    && match b2.tnode { TmVar(nm) -> nm == "__gs_res", _ -> false };
+                if (isRetRes) eraseContractsTerm(v, keepReq)
+                else mk(TmLet(vd, eraseContractsTerm(v, keepReq), b2))
+            }
+        },
+        TmBlock(es) -> {
+            let mapped = pruneLeadingUnitStmts(eraseContractsTermList(es, keepReq));
+            match mapped {
+                Cons(single, Nil) -> single,
+                _ -> mk(TmBlock(mapped)),
+            }
+        },
+        TmApplyCls(f, args) -> mk(TmApplyCls(eraseContractsTerm(f, keepReq), eraseContractsTermList(args, keepReq))),
+        TmTuple(es) -> mk(TmTuple(eraseContractsTermList(es, keepReq))),
+        TmMakeCls(vd, cs, body) -> mk(TmMakeCls(vd, cs, eraseContractsTerm(body, keepReq))),
+        TmMakeData(adt, tag, fs, t1, t2) -> mk(TmMakeData(adt, tag, eraseContractsTermList(fs, keepReq), t1, t2)),
+        TmBin(op, a, b) -> mk(TmBin(op, eraseContractsTerm(a, keepReq), eraseContractsTerm(b, keepReq))),
+        TmUn(op, a) -> mk(TmUn(op, eraseContractsTerm(a, keepReq))),
+        TmIf(c, t, e) -> mk(TmIf(eraseContractsTerm(c, keepReq), eraseContractsTerm(t, keepReq), eraseContractsTerm(e, keepReq))),
+        TmWhile(c, b) -> mk(TmWhile(eraseContractsTerm(c, keepReq), eraseContractsTerm(b, keepReq))),
+        TmMatch(s, arms) -> mk(TmMatch(eraseContractsTerm(s, keepReq), eraseContractsArms(arms, keepReq))),
+        TmGetTag(e) -> mk(TmGetTag(eraseContractsTerm(e, keepReq))),
+        _ -> tm,
+    }
+}
+
+/// Prepare a verified `"keep"` CoreProgram for `--verified-opt` LLVM codegen:
+/// 1. Unwraps `__gs_res` `ensures` wrappers so recursive calls stay in tail position (TCO preserved);
+/// 2. Erases all contracts/asserts except pure-scalar `__gs_requires`/`assert` inside `safeFns`;
+/// 3. Runs `inlineTinyLeafFns` while preventing unverified div/array ops from being inlined into `safeFns`.
+pub def prepareVerifiedOptCore(
+    prog: CoreProgram,
+    safeFns: StrMap Bool,
+    enableInline: Bool
+): CoreProgram = {
+    let fns2: StrMap FunDef = strMapNew();
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(nm, r) -> {
+                match strMapGet(prog.coreFns, nm) {
+                    Some(fd) -> {
+                        let keepReq = strMapContains(safeFns, nm);
+                        strMapInsert(fns2, nm, MkFunDef {
+                            fnName: fd.fnName,
+                            fnSpan: fd.fnSpan,
+                            fnScm: fd.fnScm,
+                            fnParams: fd.fnParams,
+                            fnFvs: fd.fnFvs,
+                            fnBody: eraseContractsTerm(fd.fnBody, keepReq),
+                        })
+                    },
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    let globsRev: Cell (List GlobalValDef) = cellNew(Nil);
+    let cg = cellNew(prog.coreGlobals);
+    while (match cellGet(cg) { Nil -> false, _ -> true }) {
+        match cellGet(cg) {
+            Cons(gv, r) -> {
+                cellSet(globsRev, Cons(MkGlobalValDef {
+                    gvName: gv.gvName,
+                    gvSpan: gv.gvSpan,
+                    gvTy: gv.gvTy,
+                    gvInit: eraseContractsTerm(gv.gvInit, false),
+                }, cellGet(globsRev)));
+                cellSet(cg, r)
+            },
+            Nil -> (),
+        }
+    };
+    let globs2 = listRev(cellGet(globsRev));
+    let finalGlobs =
+        if (enableInline) {
+            // Restrict leaf inlining into `safeFns` callers: only inline leaves that are also
+            // in `safeFns` or contain no checked div/rem/array operations.
+            let fnCounters: StrMap (Cell Int) = strMapNew();
+            let curGlobals = cellNew(globs2);
+            let pass = cellNew(0);
+            while (cellGet(pass) < 2) {
+                let allLeaves: StrMap FunDef = strMapNew();
+                let safeLeaves: StrMap FunDef = strMapNew();
+                let leafCount = cellNew(0);
+                let cf0 = cellNew(prog.coreFnNames);
+                while (match cellGet(cf0) { Nil -> false, _ -> true }) {
+                    match cellGet(cf0) {
+                        Cons(fnm, r) -> {
+                            match strMapGet(fns2, fnm) {
+                                Some(fd) ->
+                                    if (isEligibleTinyLeafFn(fd, fns2, prog.coreExterns)) {
+                                        strMapInsert(allLeaves, fnm, fd);
+                                        if (strMapContains(safeFns, fnm) || !termHasCheckedOp(fd.fnBody)) {
+                                            strMapInsert(safeLeaves, fnm, fd)
+                                        } else ();
+                                        cellSet(leafCount, cellGet(leafCount) + 1)
+                                    } else (),
+                                None -> (),
+                            };
+                            cellSet(cf0, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                if (cellGet(leafCount) > 0) {
+                    let cf1 = cellNew(prog.coreFnNames);
+                    while (match cellGet(cf1) { Nil -> false, _ -> true }) {
+                        match cellGet(cf1) {
+                            Cons(fnm, r) -> {
+                                match strMapGet(fns2, fnm) {
+                                    Some(fd) -> {
+                                        let cnt = match strMapGet(fnCounters, fnm) {
+                                            Some(c) -> c,
+                                            None -> { let c = cellNew(0); strMapInsert(fnCounters, fnm, c); c },
+                                        };
+                                        let allowedLeaves = if (strMapContains(safeFns, fnm)) safeLeaves else allLeaves;
+                                        let newBody = rewriteTermInlineLeaves(fnm, fd.fnBody, allowedLeaves, cnt);
+                                        strMapInsert(fns2, fnm, MkFunDef {
+                                            fnName: fd.fnName,
+                                            fnSpan: fd.fnSpan,
+                                            fnScm: fd.fnScm,
+                                            fnParams: fd.fnParams,
+                                            fnFvs: fd.fnFvs,
+                                            fnBody: newBody,
+                                        })
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(cf1, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let globCnt = match strMapGet(fnCounters, "$globals") {
+                        Some(c) -> c,
+                        None -> { let c = cellNew(0); strMapInsert(fnCounters, "$globals", c); c },
+                    };
+                    let newGlobsRev = cellNew(Nil);
+                    let cg2 = cellNew(cellGet(curGlobals));
+                    while (match cellGet(cg2) { Nil -> false, _ -> true }) {
+                        match cellGet(cg2) {
+                            Cons(gv, r) -> {
+                                let newInit = rewriteTermInlineLeaves("", gv.gvInit, allLeaves, globCnt);
+                                cellSet(newGlobsRev, Cons(MkGlobalValDef {
+                                    gvName: gv.gvName,
+                                    gvSpan: gv.gvSpan,
+                                    gvTy: gv.gvTy,
+                                    gvInit: newInit,
+                                }, cellGet(newGlobsRev)));
+                                cellSet(cg2, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellSet(curGlobals, listRev(cellGet(newGlobsRev)))
+                } else ();
+                cellSet(pass, cellGet(pass) + 1)
+            };
+            cellGet(curGlobals)
+        } else globs2;
+    MkCoreProgram {
+        coreFns: fns2,
+        coreFnNames: prog.coreFnNames,
+        coreGlobals: finalGlobs,
+        coreExterns: prog.coreExterns,
+        coreExternNames: prog.coreExternNames,
+        coreCExports: prog.coreCExports,
+        coreCtors: prog.coreCtors,
+        coreAdtReg: prog.coreAdtReg,
+        coreAdtNames: prog.coreAdtNames,
+        coreEscape: prog.coreEscape,
+    }
+}
+
 def inlineTinyLeafFns(
     fns: StrMap FunDef,
     fnNames: List String,
     globals: List GlobalValDef,
     externs: StrMap ExternDef
-): List GlobalValDef = {
+): List GlobalValDef
+    ensures out -> listLen(out) == listLen(globals)
+= {
     let fnCounters: StrMap (Cell Int) = strMapNew();
     let pass = cellNew(0);
     let prevLeafCount = cellNew(-1);

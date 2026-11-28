@@ -23,6 +23,7 @@ use ast.{
     typeToString, sortUniqueStrings
 }
 use diag.{diagRegisterFile, diagSpanLineCol}
+use verified_kernels.{clampOffset, clampSpanEnd}
 use parser.parseFileModuleInFile
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs}
@@ -256,8 +257,8 @@ pub def formatContractLinesFromSrc(src: String, body: ast.Form): List String =
         ExContract(fc, _) -> {
             let n = strLen(src);
             let sliceSpan = (sp: ast.Span) -> {
-                let s = if (sp.start < 0) 0 else if (sp.start > n) n else sp.start;
-                let e = if (sp.end < s) s else if (sp.end > n) n else sp.end;
+                let s = clampOffset(sp.start, n);
+                let e = clampSpanEnd(s, sp.end, n);
                 strSlice(src, s, e)
             };
             let outRev: Cell (List String) = cellNew(Nil);

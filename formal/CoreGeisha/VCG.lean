@@ -8365,4 +8365,1419 @@ def verifyGscoreProgram (funs : List FunDef) : Except String (Nat × List (Ident
         allObs := allObs ++ obs.map (fun ob => (fd.name, ob))
   return (verifiedFns, allObs)
 
+/-! ## Part 9: Verification-Driven Optimization Soundness (`verified_opt_sound`)
+
+Models `--verified-opt` check elision directly on `CoreGeisha`'s small-step operational
+semantics:
+1. `elideVerifiedAsserts Φ` replaces `"assert"`'s trapping failure branch `.trap .divByZero`
+   with `.lit .unit` (modeling elided runtime assertion / `requires` checks);
+2. `StepUnchecked` runs under `elideVerifiedAsserts Φ` and removes `.trap .divByZero`
+   transitions (modeling elided division/modulo-by-zero checks).
+
+Without verification, `StepUnchecked` is strictly unsound (`assert(false)` silently
+evaluates to `()`, and `1 / 0` silently evaluates to `0` instead of trapping). Theorem `verified_opt_sound`
+proves that for every function verified by `verifyFn` with `ValidObs obs` and satisfied
+precondition `fc.req`, `StepsUnchecked` is **bidirectionally observationally equivalent**
+to `Steps` (identical return value `v` and final heap `σ'`, no `.divByZero` trap, and
+postcondition `fc.ens` preserved). -/
+
+/-- Unchecked binary operator evaluation (`--verified-opt`):
+    agrees with `evalBinOp` on all non-trapping inputs, but elides the division/remainder-by-zero
+    trap check by returning a silent fallback literal (`0` / `0i64`) when dividing by `0`. -/
+def evalBinOpUnchecked (op : BinOp) (l1 l2 : Lit) : Option Lit :=
+  match evalBinOp op l1 l2 with
+  | some (.val l') => some l'
+  | some (.trap .divByZero) =>
+    match op with
+    | .div64 | .rem64 => some (.int64 0)
+    | _ => some (.int 0)
+  | _ => none
+
+private theorem evalBinOpUnchecked_of_val {op : BinOp} {l1 l2 l' : Lit}
+    (h : evalBinOp op l1 l2 = some (.val l')) : evalBinOpUnchecked op l1 l2 = some l' := by
+  simp [evalBinOpUnchecked, h]
+
+/-- Unchecked `assert` stub: elides the `.trap .divByZero` failure branch. -/
+def assertElidedFunDef : FunDef :=
+  { name := "assert", params := [("b", .bool)], retTy := .void,
+    body := .if_ (.var "b") (.lit .unit) (.lit .unit) }
+
+/-- Optimized function environment with runtime `assert` traps elided. -/
+def elideVerifiedAsserts (Φ : FunEnv) : FunEnv :=
+  fun nm => if nm == "assert" then some assertElidedFunDef else Φ nm
+
+/- One-step unchecked operational semantics (`--verified-opt`):
+   1. Evaluates direct calls under `elideVerifiedAsserts Φ` (runtime `assert` traps elided);
+   2. Evaluates binary operators with `evalBinOpUnchecked` (division/modulo-by-zero checks elided:
+      dividing by `0` silently yields `0` instead of trapping `.trap .divByZero`). -/
+mutual
+inductive StepUnchecked (Δ : AdtEnv) (Φ : FunEnv) : Expr → Store → Expr → Store → Prop where
+  | tupleStep {es es' : List Expr} {σ σ' : Store} :
+      StepListUnchecked Δ Φ es σ es' σ' → StepUnchecked Δ Φ (.tuple es) σ (.tuple es') σ'
+  | tupleTrap {es : List Expr} {t : Trap} {σ : Store} :
+      ListFirstTrap es t → StepUnchecked Δ Φ (.tuple es) σ (.trap t) σ
+  | blockEmpty {σ : Store} : StepUnchecked Δ Φ (.block []) σ (.lit .unit) σ
+  | blockSingle {e : Expr} {σ : Store} : StepUnchecked Δ Φ (.block [e]) σ e σ
+  | blockConsStep {e1 e1' e2 : Expr} {es : List Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e1 σ e1' σ' →
+      StepUnchecked Δ Φ (.block (e1 :: e2 :: es)) σ (.block (e1' :: e2 :: es)) σ'
+  | blockConsVal {v1 e2 : Expr} {es : List Expr} {σ : Store} :
+      IsValue v1 → StepUnchecked Δ Φ (.block (v1 :: e2 :: es)) σ (.block (e2 :: es)) σ
+  | blockConsTrap {t : Trap} {e2 : Expr} {es : List Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.block (.trap t :: e2 :: es)) σ (.trap t) σ
+  | applyFn {fn fn' : Expr} {args : List Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ fn σ fn' σ' → StepUnchecked Δ Φ (.apply fn args) σ (.apply fn' args) σ'
+  | applyFnTrap {t : Trap} {args : List Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.apply (.trap t) args) σ (.trap t) σ
+  | applyArgs {fn : Expr} {args args' : List Expr} {σ σ' : Store} :
+      IsValue fn → StepListUnchecked Δ Φ args σ args' σ' →
+      StepUnchecked Δ Φ (.apply fn args) σ (.apply fn args') σ'
+  | applyArgsTrap {fn : Expr} {args : List Expr} {t : Trap} {σ : Store} :
+      IsValue fn → ListFirstTrap args t → StepUnchecked Δ Φ (.apply fn args) σ (.trap t) σ
+  | applyBeta {m : Mode} {ps : List (Ident × Ty)} {ret : Ty} {body : Expr}
+      {args : List Expr} {σ : Store} :
+      (∀ a ∈ args, IsValue a) → args.length = ps.length →
+      StepUnchecked Δ Φ (.apply (.lam m ps ret body) args) σ (substMany (zipParams ps args) body) σ
+  | applyDirArgs {name : Ident} {args args' : List Expr} {σ σ' : Store} :
+      StepListUnchecked Δ Φ args σ args' σ' →
+      StepUnchecked Δ Φ (.applyDir name args) σ (.applyDir name args') σ'
+  | applyDirTrap {name : Ident} {args : List Expr} {t : Trap} {σ : Store} :
+      ListFirstTrap args t → StepUnchecked Δ Φ (.applyDir name args) σ (.trap t) σ
+  | applyDirBeta {name : Ident} {fd : FunDef} {args : List Expr} {σ : Store} :
+      elideVerifiedAsserts Φ name = some fd →
+      (∀ a ∈ args, IsValue a) → args.length = fd.params.length →
+      StepUnchecked Δ Φ (.applyDir name args) σ (substMany (zipParams fd.params args) fd.body) σ
+  | unStep {op : UnOp} {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.un op e) σ (.un op e') σ'
+  | unTrap {op : UnOp} {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.un op (.trap t)) σ (.trap t) σ
+  | unVal {op : UnOp} {l l' : Lit} {σ : Store} :
+      evalUnOp op l = some l' → StepUnchecked Δ Φ (.un op (.lit l)) σ (.lit l') σ
+  | binLeft {op : BinOp} {e1 e1' e2 : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e1 σ e1' σ' → StepUnchecked Δ Φ (.bin op e1 e2) σ (.bin op e1' e2) σ'
+  | binLeftTrap {op : BinOp} {t : Trap} {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.bin op (.trap t) e2) σ (.trap t) σ
+  | binAndFalse {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.bin .and (.lit (.bool false)) e2) σ (.lit (.bool false)) σ
+  | binAndTrue {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.bin .and (.lit (.bool true)) e2) σ e2 σ
+  | binOrTrue {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.bin .or (.lit (.bool true)) e2) σ (.lit (.bool true)) σ
+  | binOrFalse {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.bin .or (.lit (.bool false)) e2) σ e2 σ
+  | binRight {op : BinOp} {v1 e2 e2' : Expr} {σ σ' : Store} :
+      op ≠ .and → op ≠ .or → IsValue v1 → StepUnchecked Δ Φ e2 σ e2' σ' →
+      StepUnchecked Δ Φ (.bin op v1 e2) σ (.bin op v1 e2') σ'
+  | binRightTrap {op : BinOp} {v1 : Expr} {t : Trap} {σ : Store} :
+      op ≠ .and → op ≠ .or → IsValue v1 →
+      StepUnchecked Δ Φ (.bin op v1 (.trap t)) σ (.trap t) σ
+  | binVal {op : BinOp} {l1 l2 l' : Lit} {σ : Store} :
+      evalBinOpUnchecked op l1 l2 = some l' →
+      StepUnchecked Δ Φ (.bin op (.lit l1) (.lit l2)) σ (.lit l') σ
+  | binTrap {op : BinOp} {l1 l2 : Lit} {t : Trap} {σ : Store} :
+      evalBinOp op l1 l2 = some (.trap t) → t ≠ .divByZero →
+      StepUnchecked Δ Φ (.bin op (.lit l1) (.lit l2)) σ (.trap t) σ
+  | letStep {x : Ident} {e1 e1' e2 : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e1 σ e1' σ' → StepUnchecked Δ Φ (.let_ x e1 e2) σ (.let_ x e1' e2) σ'
+  | letTrap {x : Ident} {t : Trap} {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.let_ x (.trap t) e2) σ (.trap t) σ
+  | letVal {x : Ident} {v1 e2 : Expr} {σ : Store} :
+      IsValue v1 → StepUnchecked Δ Φ (.let_ x v1 e2) σ (subst x v1 e2) σ
+  | ifStep {c c' t e : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ c σ c' σ' → StepUnchecked Δ Φ (.if_ c t e) σ (.if_ c' t e) σ'
+  | ifTrap {tr : Trap} {t e : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.if_ (.trap tr) t e) σ (.trap tr) σ
+  | ifTrue {t e : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.if_ (.lit (.bool true)) t e) σ t σ
+  | ifFalse {t e : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.if_ (.lit (.bool false)) t e) σ e σ
+  | whileUnfold {c b : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.while_ c b) σ (.if_ c (.block [b, .while_ c b]) (.lit .unit)) σ
+  | matchScrut {s s' : Expr} {arms : List (Pat × Expr)} {σ σ' : Store} :
+      StepUnchecked Δ Φ s σ s' σ' → StepUnchecked Δ Φ (.match_ s arms) σ (.match_ s' arms) σ'
+  | matchScrutTrap {t : Trap} {arms : List (Pat × Expr)} {σ : Store} :
+      StepUnchecked Δ Φ (.match_ (.trap t) arms) σ (.trap t) σ
+  | matchEmpty {v : Expr} {σ : Store} :
+      IsValue v → StepUnchecked Δ Φ (.match_ v []) σ (.trap .matchFailure) σ
+  | matchHit {v : Expr} {p : Pat} {body : Expr} {rest : List (Pat × Expr)}
+      {env : List (Ident × Expr)} {σ : Store} :
+      IsValue v → matchPat p v = some env →
+      StepUnchecked Δ Φ (.match_ v ((p, body) :: rest)) σ (substMany env body) σ
+  | matchMiss {v : Expr} {p : Pat} {body : Expr} {rest : List (Pat × Expr)} {σ : Store} :
+      IsValue v → matchPat p v = none →
+      StepUnchecked Δ Φ (.match_ v ((p, body) :: rest)) σ (.match_ v rest) σ
+  | makeDataStep {adt : Ident} {tag : Nat} {es es' : List Expr} {σ σ' : Store} :
+      StepListUnchecked Δ Φ es σ es' σ' →
+      StepUnchecked Δ Φ (.makeData adt tag es) σ (.makeData adt tag es') σ'
+  | makeDataTrap {adt : Ident} {tag : Nat} {es : List Expr} {t : Trap} {σ : Store} :
+      ListFirstTrap es t → StepUnchecked Δ Φ (.makeData adt tag es) σ (.trap t) σ
+  | getTagStep {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.getTag e) σ (.getTag e') σ'
+  | getTagTrap {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.getTag (.trap t)) σ (.trap t) σ
+  | getTagVal {adt : Ident} {tag : Nat} {vs : List Expr} {σ : Store} :
+      (∀ v ∈ vs, IsValue v) →
+      StepUnchecked Δ Φ (.getTag (.makeData adt tag vs)) σ (.lit (.int (Int32.ofNat tag))) σ
+  | cellNewStep {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.cellNew e) σ (.cellNew e') σ'
+  | cellNewTrap {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.cellNew (.trap t)) σ (.trap t) σ
+  | cellNewVal {v : Expr} {σ : Store} :
+      IsValue v → StepUnchecked Δ Φ (.cellNew v) σ (.loc σ.length) (σ ++ [v])
+  | cellGetStep {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.cellGet e) σ (.cellGet e') σ'
+  | cellGetTrap {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.cellGet (.trap t)) σ (.trap t) σ
+  | cellGetVal {l : Loc} {v : Expr} {σ : Store} :
+      σ[l]? = some v → StepUnchecked Δ Φ (.cellGet (.loc l)) σ v σ
+  | cellSetLeft {e1 e1' e2 : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e1 σ e1' σ' → StepUnchecked Δ Φ (.cellSet e1 e2) σ (.cellSet e1' e2) σ'
+  | cellSetLeftTrap {t : Trap} {e2 : Expr} {σ : Store} :
+      StepUnchecked Δ Φ (.cellSet (.trap t) e2) σ (.trap t) σ
+  | cellSetRight {v1 e2 e2' : Expr} {σ σ' : Store} :
+      IsValue v1 → StepUnchecked Δ Φ e2 σ e2' σ' →
+      StepUnchecked Δ Φ (.cellSet v1 e2) σ (.cellSet v1 e2') σ'
+  | cellSetRightTrap {v1 : Expr} {t : Trap} {σ : Store} :
+      IsValue v1 → StepUnchecked Δ Φ (.cellSet v1 (.trap t)) σ (.trap t) σ
+  | cellSetVal {l : Loc} {v : Expr} {σ : Store} :
+      l < σ.length → IsValue v →
+      StepUnchecked Δ Φ (.cellSet (.loc l) v) σ (.lit .unit) (σ.set l v)
+  | spawnStep {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.spawn e) σ (.spawn e') σ'
+  | spawnTrap {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.spawn (.trap t)) σ (.trap t) σ
+  | awaitStep {e e' : Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' → StepUnchecked Δ Φ (.await e) σ (.await e') σ'
+  | awaitTrap {t : Trap} {σ : Store} :
+      StepUnchecked Δ Φ (.await (.trap t)) σ (.trap t) σ
+  | awaitVal {tid : TaskId} {v : Expr} {σ : Store} :
+      emptyPool.tasks[tid]? = some (.running v) → IsValue v →
+      StepUnchecked Δ Φ (.await (.taskRef tid)) σ v σ
+  | awaitTaskTrap {tid : TaskId} {t : Trap} {σ : Store} :
+      emptyPool.tasks[tid]? = some (.running (.trap t)) →
+      StepUnchecked Δ Φ (.await (.taskRef tid)) σ (.trap t) σ
+  | concPrimArgs {op : ConcPrim} {args args' : List Expr} {σ σ' : Store} :
+      StepListUnchecked Δ Φ args σ args' σ' →
+      StepUnchecked Δ Φ (.concPrim op args) σ (.concPrim op args') σ'
+  | concPrimTrap {op : ConcPrim} {args : List Expr} {t : Trap} {σ : Store} :
+      ListFirstTrap args t → StepUnchecked Δ Φ (.concPrim op args) σ (.trap t) σ
+  | concPrimVal {op : ConcPrim} {args : List Expr} {e' : Expr} {σ : Store} :
+      StepConcPrim emptyPool op args e' .none →
+      StepUnchecked Δ Φ (.concPrim op args) σ e' σ
+
+inductive StepListUnchecked (Δ : AdtEnv) (Φ : FunEnv) :
+    List Expr → Store → List Expr → Store → Prop where
+  | head {e e' : Expr} {es : List Expr} {σ σ' : Store} :
+      StepUnchecked Δ Φ e σ e' σ' →
+      StepListUnchecked Δ Φ (e :: es) σ (e' :: es) σ'
+  | tail {v : Expr} {es es' : List Expr} {σ σ' : Store} :
+      IsValue v → StepListUnchecked Δ Φ es σ es' σ' →
+      StepListUnchecked Δ Φ (v :: es) σ (v :: es') σ'
+end
+
+/-- Multi-step unchecked operational semantics. -/
+inductive StepsUnchecked (Δ : AdtEnv) (Φ : FunEnv) : Expr → Store → Expr → Store → Prop where
+  | refl (e : Expr) (σ : Store) : StepsUnchecked Δ Φ e σ e σ
+  | trans {e1 e2 e3 : Expr} {σ1 σ2 σ3 : Store} :
+      StepUnchecked Δ Φ e1 σ1 e2 σ2 →
+      StepsUnchecked Δ Φ e2 σ2 e3 σ3 →
+      StepsUnchecked Δ Φ e1 σ1 e3 σ3
+
+/-- Non-vacuity witness 1: without verification, `StepUnchecked` silently evaluates
+    `assert(false)` to `()`, whereas original `Steps` traps with `.trap .divByZero`. -/
+theorem unchecked_assert_false_diverges {Δ : AdtEnv} {Φ : FunEnv}
+    (hIntr : IntrinsicsOk Φ) (σ : Store) :
+    Steps Δ Φ (.applyDir "assert" [.lit (.bool false)]) σ (.trap .divByZero) σ ∧
+    StepsUnchecked Δ Φ (.applyDir "assert" [.lit (.bool false)]) σ (.lit .unit) σ := by
+  constructor
+  · exact .trans (.applyDirBeta hIntr.1 (fun _ h => by simp at h; subst h; exact .lit _) rfl)
+      (.trans .ifFalse (.refl _ _))
+  · exact .trans (.applyDirBeta (fd := assertElidedFunDef) (by simp [elideVerifiedAsserts])
+        (fun _ h => by simp at h; subst h; exact .lit _) rfl)
+      (.trans .ifFalse (.refl _ _))
+
+/-- Non-vacuity witness 2: without verification, `StepUnchecked` silently evaluates
+    `1 / 0` to `0` (elided zero check), whereas original `Steps` traps with `.trap .divByZero`. -/
+theorem unchecked_div_zero_diverges {Δ : AdtEnv} {Φ : FunEnv} (σ : Store) :
+    Steps Δ Φ (.bin .div (.lit (.int 1)) (.lit (.int 0))) σ (.trap .divByZero) σ ∧
+    StepsUnchecked Δ Φ (.bin .div (.lit (.int 1)) (.lit (.int 0))) σ (.lit (.int 0)) σ := by
+  constructor
+  · exact .trans (.binTrap (by simp [evalBinOp])) (.refl _ _)
+  · exact .trans (.binVal (by simp [evalBinOpUnchecked, evalBinOp])) (.refl _ _)
+
+mutual
+private theorem value_no_stepUnchecked {Δ : AdtEnv} {Φ : FunEnv} {v e' : Expr} {σ σ' : Store}
+    (hv : IsValue v) (hs : StepUnchecked Δ Φ v σ e' σ') : False := by
+  cases hs with
+  | tupleStep hsl =>
+    cases hv with | tuple hvs => exact valueList_no_stepListUnchecked hvs hsl
+  | tupleTrap hft =>
+    cases hv with | tuple hvs => exact valueList_no_firstTrap hvs hft
+  | makeDataStep hsl =>
+    cases hv with | makeData _ _ hvs => exact valueList_no_stepListUnchecked hvs hsl
+  | makeDataTrap hft =>
+    cases hv with | makeData _ _ hvs => exact valueList_no_firstTrap hvs hft
+  | _ => cases hv
+termination_by sizeOf v
+
+private theorem valueList_no_stepListUnchecked {Δ : AdtEnv} {Φ : FunEnv} {vs es' : List Expr}
+    {σ σ' : Store} (hvs : ∀ v ∈ vs, IsValue v) (hsl : StepListUnchecked Δ Φ vs σ es' σ') : False := by
+  cases hsl with
+  | head hs1 => exact value_no_stepUnchecked (hvs _ (List.mem_cons_self ..)) hs1
+  | tail _ hsl' => exact valueList_no_stepListUnchecked (fun x hx => hvs x (List.mem_cons_of_mem _ hx)) hsl'
+termination_by sizeOf vs
+end
+
+private def NoDivZero (Δ : AdtEnv) (Φ : FunEnv) (e : Expr) (σ : Store) : Prop :=
+  ∀ σ', ¬ Steps Δ Φ e σ (.trap .divByZero) σ'
+
+private theorem noDivZero_of_step {Δ : AdtEnv} {Φ : FunEnv} {e e' : Expr} {σ σ' : Store}
+    (hnd : NoDivZero Δ Φ e σ) (hs : Step Δ Φ emptyPool e σ e' σ' .none) :
+    NoDivZero Δ Φ e' σ' :=
+  fun σ'' hst => hnd σ'' (.trans hs hst)
+
+private theorem noDivZero_ne_trap {Δ : AdtEnv} {Φ : FunEnv} {e e' : Expr} {σ σ' : Store}
+    (hnd : NoDivZero Δ Φ e σ) (hs : Step Δ Φ emptyPool e σ e' σ' .none) :
+    e' ≠ .trap .divByZero := by
+  intro hEq; subst hEq
+  exact hnd σ' (.trans hs (.refl _ _))
+
+-- Trap-lifting lemmas for active evaluation contexts
+private theorem steps_lift_ctx {Δ : AdtEnv} {Φ : FunEnv} {e : Expr} {σ σ' : Store} {t : Trap}
+    (C : Expr → Expr)
+    (hStep : ∀ {x x' σ1 σ2}, Step Δ Φ emptyPool x σ1 x' σ2 .none →
+      Step Δ Φ emptyPool (C x) σ1 (C x') σ2 .none)
+    (hTrap : ∀ {σ1}, Step Δ Φ emptyPool (C (.trap t)) σ1 (.trap t) σ1 .none)
+    (h : Steps Δ Φ e σ (.trap t) σ') :
+    Steps Δ Φ (C e) σ (.trap t) σ' := by
+  generalize hres : Expr.trap t = res at h
+  induction h with
+  | refl => subst hres; exact .trans hTrap (.refl _ _)
+  | trans hs _ ih => exact .trans (hStep hs) (ih hres)
+
+/-- Helper: multi-step list reduction ending in a `ListFirstTrap` lifts into any list context `C`. -/
+private inductive StepsList (Δ : AdtEnv) (Φ : FunEnv) : List Expr → Store → List Expr → Store → Prop where
+  | refl (es : List Expr) (σ : Store) : StepsList Δ Φ es σ es σ
+  | trans {es1 es2 es3 : List Expr} {σ1 σ2 σ3 : Store} :
+      StepList Δ Φ emptyPool es1 σ1 es2 σ2 .none →
+      StepsList Δ Φ es2 σ2 es3 σ3 →
+      StepsList Δ Φ es1 σ1 es3 σ3
+
+private def NoDivZeroList (Δ : AdtEnv) (Φ : FunEnv) (es : List Expr) (σ : Store) : Prop :=
+  ∀ es' σ', StepsList Δ Φ es σ es' σ' → ¬ ListFirstTrap es' .divByZero
+
+private theorem noDivZeroList_of_ctx {Δ : AdtEnv} {Φ : FunEnv} {es : List Expr} {σ : Store}
+    (C : List Expr → Expr)
+    (hStep : ∀ {xs xs' σ1 σ2}, StepList Δ Φ emptyPool xs σ1 xs' σ2 .none →
+      Step Δ Φ emptyPool (C xs) σ1 (C xs') σ2 .none)
+    (hTrap : ∀ {xs σ1}, ListFirstTrap xs .divByZero →
+      Step Δ Φ emptyPool (C xs) σ1 (.trap .divByZero) σ1 .none)
+    (hnd : NoDivZero Δ Φ (C es) σ) :
+    NoDivZeroList Δ Φ es σ := by
+  intro es' σ' hsl hft
+  have hsteps : Steps Δ Φ (C es) σ (.trap .divByZero) σ' := by
+    clear hnd
+    induction hsl with
+    | refl => exact .trans (hTrap hft) (.refl _ _)
+    | trans hs _ ih => exact .trans (hStep hs) (ih hft)
+  exact hnd σ' hsteps
+
+private theorem noDivZeroList_head {Δ : AdtEnv} {Φ : FunEnv} {e : Expr} {es : List Expr} {σ : Store}
+    (hnd : NoDivZeroList Δ Φ (e :: es) σ) : NoDivZero Δ Φ e σ := by
+  intro σ' hst
+  have hsl : StepsList Δ Φ (e :: es) σ (.trap .divByZero :: es) σ' := by
+    clear hnd
+    generalize hres : Expr.trap .divByZero = res at hst
+    induction hst with
+    | refl => subst hres; exact .refl _ _
+    | trans hs _ ih => exact .trans (.head hs) (ih hres)
+  exact hnd _ _ hsl (.head _ _)
+
+private theorem noDivZeroList_tail {Δ : AdtEnv} {Φ : FunEnv} {v : Expr} {es : List Expr} {σ : Store}
+    (hv : IsValue v) (hnd : NoDivZeroList Δ Φ (v :: es) σ) : NoDivZeroList Δ Φ es σ := by
+  intro es' σ' hsl hft
+  have hsl' : StepsList Δ Φ (v :: es) σ (v :: es') σ' := by
+    clear hnd hft
+    induction hsl with
+    | refl => exact .refl _ _
+    | trans hs _ ih => exact .trans (.tail hv hs) ih
+  exact hnd _ _ hsl' (.tail hv hft)
+
+/- Bisimulation relation between an expression running under original `Φ` and under
+   `elideVerifiedAsserts Φ`: identical everywhere except an active `assert` body
+   `.if_ v (.lit .unit) (.trap .divByZero)` may correspond to `.if_ v (.lit .unit) (.lit .unit)`. -/
+mutual
+private inductive AssertEq : Expr → Expr → Prop where
+  | refl (e : Expr) : AssertEq e e
+  | assertIf {v : Expr} : IsValue v →
+      AssertEq (.if_ v (.lit .unit) (.trap .divByZero)) (.if_ v (.lit .unit) (.lit .unit))
+  | tuple {es1 es2 : List Expr} : AssertEqList es1 es2 → AssertEq (.tuple es1) (.tuple es2)
+  | blockCons {e1 e1' e2 : Expr} {es : List Expr} :
+      AssertEq e1 e1' → AssertEq (.block (e1 :: e2 :: es)) (.block (e1' :: e2 :: es))
+  | applyFn {f1 f2 : Expr} {args : List Expr} :
+      AssertEq f1 f2 → AssertEq (.apply f1 args) (.apply f2 args)
+  | applyArgs {fn : Expr} {a1 a2 : List Expr} :
+      IsValue fn → AssertEqList a1 a2 → AssertEq (.apply fn a1) (.apply fn a2)
+  | applyDirArgs {nm : Ident} {a1 a2 : List Expr} :
+      AssertEqList a1 a2 → AssertEq (.applyDir nm a1) (.applyDir nm a2)
+  | un {op : UnOp} {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.un op e1) (.un op e2)
+  | binLeft {op : BinOp} {e1 e1' e2 : Expr} :
+      AssertEq e1 e1' → AssertEq (.bin op e1 e2) (.bin op e1' e2)
+  | binRight {op : BinOp} {v1 e2 e2' : Expr} :
+      op ≠ .and → op ≠ .or → IsValue v1 →
+      AssertEq e2 e2' → AssertEq (.bin op v1 e2) (.bin op v1 e2')
+  | let_ {x : Ident} {e1 e1' e2 : Expr} :
+      AssertEq e1 e1' → AssertEq (.let_ x e1 e2) (.let_ x e1' e2)
+  | if_ {c1 c2 t e : Expr} :
+      AssertEq c1 c2 → AssertEq (.if_ c1 t e) (.if_ c2 t e)
+  | match_ {s1 s2 : Expr} {arms : List (Pat × Expr)} :
+      AssertEq s1 s2 → AssertEq (.match_ s1 arms) (.match_ s2 arms)
+  | makeData {adt : Ident} {tag : Nat} {es1 es2 : List Expr} :
+      AssertEqList es1 es2 → AssertEq (.makeData adt tag es1) (.makeData adt tag es2)
+  | getTag {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.getTag e1) (.getTag e2)
+  | cellNew {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.cellNew e1) (.cellNew e2)
+  | cellGet {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.cellGet e1) (.cellGet e2)
+  | cellSetLeft {e1 e1' e2 : Expr} :
+      AssertEq e1 e1' → AssertEq (.cellSet e1 e2) (.cellSet e1' e2)
+  | cellSetRight {v1 e2 e2' : Expr} :
+      IsValue v1 → AssertEq e2 e2' → AssertEq (.cellSet v1 e2) (.cellSet v1 e2')
+  | spawn {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.spawn e1) (.spawn e2)
+  | await {e1 e2 : Expr} : AssertEq e1 e2 → AssertEq (.await e1) (.await e2)
+  | concPrim {op : ConcPrim} {a1 a2 : List Expr} :
+      AssertEqList a1 a2 → AssertEq (.concPrim op a1) (.concPrim op a2)
+
+private inductive AssertEqList : List Expr → List Expr → Prop where
+  | refl (es : List Expr) : AssertEqList es es
+  | head {e1 e2 : Expr} {es : List Expr} :
+      AssertEq e1 e2 → AssertEqList (e1 :: es) (e2 :: es)
+  | tail {v : Expr} {es1 es2 : List Expr} :
+      IsValue v → AssertEqList es1 es2 → AssertEqList (v :: es1) (v :: es2)
+end
+
+mutual
+private theorem assertEq_eq_of_val_left {e1 e2 : Expr} (h : AssertEq e1 e2) (hv : IsValue e1) :
+    e1 = e2 := by
+  cases h with
+  | refl => rfl
+  | tuple hl => cases hv with | tuple hvs => rw [assertEqList_eq_of_vals_left hl hvs]
+  | makeData hl => cases hv with | makeData _ _ hvs => rw [assertEqList_eq_of_vals_left hl hvs]
+  | _ => cases hv
+
+private theorem assertEqList_eq_of_vals_left {es1 es2 : List Expr} (h : AssertEqList es1 es2)
+    (hvs : ∀ v ∈ es1, IsValue v) : es1 = es2 := by
+  cases h with
+  | refl => rfl
+  | head he =>
+    rw [assertEq_eq_of_val_left he (hvs _ (List.mem_cons_self ..))]
+  | tail hv hl =>
+    rw [assertEqList_eq_of_vals_left hl (fun v hmem => hvs v (List.mem_cons_of_mem _ hmem))]
+end
+
+mutual
+private theorem assertEq_eq_of_val_right {e1 e2 : Expr} (h : AssertEq e1 e2) (hv : IsValue e2) :
+    e1 = e2 := by
+  cases h with
+  | refl => rfl
+  | tuple hl => cases hv with | tuple hvs => rw [assertEqList_eq_of_vals_right hl hvs]
+  | makeData hl => cases hv with | makeData _ _ hvs => rw [assertEqList_eq_of_vals_right hl hvs]
+  | _ => cases hv
+
+private theorem assertEqList_eq_of_vals_right {es1 es2 : List Expr} (h : AssertEqList es1 es2)
+    (hvs : ∀ v ∈ es2, IsValue v) : es1 = es2 := by
+  cases h with
+  | refl => rfl
+  | head he =>
+    rw [assertEq_eq_of_val_right he (hvs _ (List.mem_cons_self ..))]
+  | tail hv hl =>
+    rw [assertEqList_eq_of_vals_right hl (fun v hmem => hvs v (List.mem_cons_of_mem _ hmem))]
+end
+
+private theorem assertEq_trap_left {e1 e2 : Expr} {t : Trap} (h : AssertEq e1 e2) (heq : e1 = .trap t) :
+    e2 = .trap t := by
+  cases h <;> cases heq; rfl
+
+private theorem assertEq_trap_right {e1 e2 : Expr} {t : Trap} (h : AssertEq e1 e2) (heq : e2 = .trap t) :
+    e1 = .trap t := by
+  cases h <;> cases heq; rfl
+
+private theorem assertEqList_firstTrap_left {es1 es2 : List Expr} {t : Trap}
+    (h : AssertEqList es1 es2) (hft : ListFirstTrap es1 t) : ListFirstTrap es2 t := by
+  cases h with
+  | refl => exact hft
+  | head he =>
+    cases hft with
+    | head => rw [assertEq_trap_left he rfl]; exact .head _ _
+    | tail hv hft' => rw [← assertEq_eq_of_val_left he hv]; exact .tail hv hft'
+  | tail hv hl =>
+    cases hft with
+    | head => cases hv
+    | tail _ hft' => exact .tail hv (assertEqList_firstTrap_left hl hft')
+
+private theorem assertEqList_firstTrap_right {es1 es2 : List Expr} {t : Trap}
+    (h : AssertEqList es1 es2) (hft : ListFirstTrap es2 t) : ListFirstTrap es1 t := by
+  cases h with
+  | refl => exact hft
+  | head he =>
+    cases hft with
+    | head => rw [assertEq_trap_right he rfl]; exact .head _ _
+    | tail hv hft' => rw [assertEq_eq_of_val_right he hv]; exact .tail hv hft'
+  | tail hv hl =>
+    cases hft with
+    | head => cases hv
+    | tail _ hft' => exact .tail hv (assertEqList_firstTrap_right hl hft')
+
+private theorem applyDirBeta_fwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {nm : Ident} {fd : FunDef} {args : List Expr} {σ : Store}
+    (hΦ : Φ nm = some fd) (hvs : ∀ a ∈ args, IsValue a) (hlen : args.length = fd.params.length) :
+    ∃ e2', StepUnchecked Δ Φ (.applyDir nm args) σ e2' σ ∧
+      AssertEq (substMany (zipParams fd.params args) fd.body) e2' := by
+  by_cases hnm : nm = "assert"
+  · subst hnm
+    rw [hIntr.1] at hΦ; cases hΦ
+    cases args with
+    | nil => simp [assertFunDef] at hlen
+    | cons v rest =>
+      cases rest with
+      | cons _ _ => simp [assertFunDef] at hlen
+      | nil =>
+        have hv : IsValue v := hvs v (List.mem_cons_self ..)
+        refine ⟨substMany (zipParams assertElidedFunDef.params [v]) assertElidedFunDef.body,
+          .applyDirBeta (fd := assertElidedFunDef) (by simp [elideVerifiedAsserts]) hvs rfl, ?_⟩
+        simp only [assertFunDef, assertElidedFunDef, zipParams]
+        exact .assertIf hv
+  · exact ⟨_, .applyDirBeta (by simp [elideVerifiedAsserts, hnm, hΦ]) hvs hlen, .refl _⟩
+
+private theorem binVal_fwd {Δ : AdtEnv} {Φ : FunEnv} {op : BinOp} {l1 l2 l' : Lit} {σ : Store}
+    (h : evalBinOp op l1 l2 = some (.val l')) :
+    ∃ e2', StepUnchecked Δ Φ (.bin op (.lit l1) (.lit l2)) σ e2' σ ∧ AssertEq (.lit l') e2' :=
+  ⟨.lit l', .binVal (evalBinOpUnchecked_of_val h), .refl _⟩
+
+private theorem binTrap_fwd {Δ : AdtEnv} {Φ : FunEnv} {op : BinOp} {l1 l2 : Lit} {t : Trap} {σ : Store}
+    (hnd : NoDivZero Δ Φ (.bin op (.lit l1) (.lit l2)) σ)
+    (h : evalBinOp op l1 l2 = some (.trap t)) :
+    ∃ e2', StepUnchecked Δ Φ (.bin op (.lit l1) (.lit l2)) σ e2' σ ∧ AssertEq (.trap t) e2' := by
+  have hne : t ≠ .divByZero := by
+    intro ht; subst ht
+    exact hnd σ (.trans (.binTrap h) (.refl _ _))
+  exact ⟨.trap t, .binTrap h hne, .refl _⟩
+
+private theorem binVal_bwd {Δ : AdtEnv} {Φ : FunEnv} {op : BinOp} {l1 l2 l' : Lit} {σ : Store}
+    (hnd : NoDivZero Δ Φ (.bin op (.lit l1) (.lit l2)) σ)
+    (h : evalBinOpUnchecked op l1 l2 = some l') :
+    ∃ e1', Step Δ Φ emptyPool (.bin op (.lit l1) (.lit l2)) σ e1' σ .none ∧ AssertEq e1' (.lit l') := by
+  cases h0 : evalBinOp op l1 l2 with
+  | none => simp [evalBinOpUnchecked, h0] at h
+  | some r =>
+    cases r with
+    | val l'' =>
+      simp [evalBinOpUnchecked, h0] at h; subst h
+      exact ⟨.lit l'', .binVal h0, .refl _⟩
+    | trap t =>
+      cases t with
+      | divByZero => exact False.elim (hnd σ (.trans (.binTrap h0) (.refl _ _)))
+      | matchFailure => simp [evalBinOpUnchecked, h0] at h
+      | hostTrap => simp [evalBinOpUnchecked, h0] at h
+
+private theorem applyDirBeta_bwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {nm : Ident} {fd : FunDef} {args : List Expr} {σ : Store}
+    (hΦ : elideVerifiedAsserts Φ nm = some fd) (hvs : ∀ a ∈ args, IsValue a) (hlen : args.length = fd.params.length) :
+    ∃ e1', Step Δ Φ emptyPool (.applyDir nm args) σ e1' σ .none ∧
+      AssertEq e1' (substMany (zipParams fd.params args) fd.body) := by
+  by_cases hnm : nm = "assert"
+  · subst hnm
+    simp [elideVerifiedAsserts] at hΦ; subst hΦ
+    cases args with
+    | nil => simp [assertElidedFunDef] at hlen
+    | cons v rest =>
+      cases rest with
+      | cons _ _ => simp [assertElidedFunDef] at hlen
+      | nil =>
+        have hv : IsValue v := hvs v (List.mem_cons_self ..)
+        refine ⟨substMany (zipParams assertFunDef.params [v]) assertFunDef.body,
+          .applyDirBeta hIntr.1 hvs rfl, ?_⟩
+        simp only [assertFunDef, assertElidedFunDef, zipParams]
+        exact .assertIf hv
+  · simp [elideVerifiedAsserts, hnm] at hΦ
+    exact ⟨_, .applyDirBeta hΦ hvs hlen, .refl _⟩
+
+/- Forward 1-step simulation: any step under `Φ` from a `NoDivZero` state is matched by
+   a step under `elideVerifiedAsserts Φ` preserving `AssertEq`. -/
+mutual
+private theorem assertEq_step_fwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {e1 e2 e1' : Expr} {σ σ' : Store}
+    (heq : AssertEq e1 e2) (hnd : NoDivZero Δ Φ e1 σ)
+    (hs : Step Δ Φ emptyPool e1 σ e1' σ' .none) :
+    ∃ e2', StepUnchecked Δ Φ e2 σ e2' σ' ∧ AssertEq e1' e2' := by
+  cases heq with
+  | refl =>
+    cases hs with
+    | tupleStep hsl =>
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx .tuple .tupleStep .tupleTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨.tuple es', .tupleStep hsl', .tuple heql⟩
+    | tupleTrap hft => exact ⟨_, .tupleTrap hft, .refl _⟩
+    | blockEmpty => exact ⟨_, .blockEmpty, .refl _⟩
+    | blockSingle => exact ⟨_, .blockSingle, .refl _⟩
+    | blockConsStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .block (x :: _ :: _)) .blockConsStep .blockConsTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .blockConsStep hs2, .blockCons heq'⟩
+    | blockConsVal hv => exact ⟨_, .blockConsVal hv, .refl _⟩
+    | blockConsTrap => exact ⟨_, .blockConsTrap, .refl _⟩
+    | applyFn hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .apply x _) .applyFn .applyFnTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨f2', hs2, heq'⟩
+      exact ⟨_, .applyFn hs2, .applyFn heq'⟩
+    | applyFnTrap => exact ⟨_, .applyFnTrap, .refl _⟩
+    | applyArgs hv hsl =>
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap hv hft => exact ⟨_, .applyArgsTrap hv hft, .refl _⟩
+    | applyBeta hvs hlen => exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+    | applyDirArgs hsl =>
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.applyDir _) .applyDirArgs .applyDirTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyDirArgs hsl', .applyDirArgs heql⟩
+    | applyDirTrap hft => exact ⟨_, .applyDirTrap hft, .refl _⟩
+    | @applyDirBeta nm fd args _ hΦ hvs hlen =>
+      by_cases hnm : nm = "assert"
+      · subst hnm
+        rw [hIntr.1] at hΦ; cases hΦ
+        cases args with
+        | nil => simp [assertFunDef] at hlen
+        | cons v rest =>
+          cases rest with
+          | cons _ _ => simp [assertFunDef] at hlen
+          | nil =>
+            have hv : IsValue v := hvs v (List.mem_cons_self ..)
+            refine ⟨substMany (zipParams assertElidedFunDef.params [v]) assertElidedFunDef.body,
+              .applyDirBeta (by simp [elideVerifiedAsserts]) hvs rfl, ?_⟩
+            simp only [assertFunDef, assertElidedFunDef, zipParams]
+            exact .assertIf hv
+      · exact ⟨_, .applyDirBeta (by simp [elideVerifiedAsserts, hnm, hΦ]) hvs hlen, .refl _⟩
+    | unStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.un _) .unStep .unTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .unStep hs2, .un heq'⟩
+    | unTrap => exact ⟨_, .unTrap, .refl _⟩
+    | unVal h => exact ⟨_, .unVal h, .refl _⟩
+    | binLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .bin _ x _) .binLeft .binLeftTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .binLeft hs2, .binLeft heq'⟩
+    | binLeftTrap => exact ⟨_, .binLeftTrap, .refl _⟩
+    | binAndFalse => exact ⟨_, .binAndFalse, .refl _⟩
+    | binAndTrue => exact ⟨_, .binAndTrue, .refl _⟩
+    | binOrTrue => exact ⟨_, .binOrTrue, .refl _⟩
+    | binOrFalse => exact ⟨_, .binOrFalse, .refl _⟩
+    | binRight h1 h2 hv hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs2', .binRight h1 h2 hv heq'⟩
+    | binRightTrap h1 h2 hv => exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => exact binVal_fwd h
+    | binTrap h => exact binTrap_fwd hnd h
+    | letStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .let_ _ x _) .letStep .letTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .letStep hs2, .let_ heq'⟩
+    | letTrap => exact ⟨_, .letTrap, .refl _⟩
+    | letVal hv => exact ⟨_, .letVal hv, .refl _⟩
+    | ifStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .if_ x _ _) .ifStep .ifTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨c2', hs2, heq'⟩
+      exact ⟨_, .ifStep hs2, .if_ heq'⟩
+    | ifTrap => exact ⟨_, .ifTrap, .refl _⟩
+    | ifTrue => exact ⟨_, .ifTrue, .refl _⟩
+    | ifFalse => exact ⟨_, .ifFalse, .refl _⟩
+    | whileUnfold => exact ⟨_, .whileUnfold, .refl _⟩
+    | matchScrut hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .match_ x _) .matchScrut .matchScrutTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨s2', hs2, heq'⟩
+      exact ⟨_, .matchScrut hs2, .match_ heq'⟩
+    | matchScrutTrap => exact ⟨_, .matchScrutTrap, .refl _⟩
+    | matchEmpty hv => exact ⟨_, .matchEmpty hv, .refl _⟩
+    | matchHit hv hm => exact ⟨_, .matchHit hv hm, .refl _⟩
+    | matchMiss hv hm => exact ⟨_, .matchMiss hv hm, .refl _⟩
+    | makeDataStep hsl =>
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.makeData _ _) .makeDataStep .makeDataTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .makeDataStep hsl', .makeData heql⟩
+    | makeDataTrap hft => exact ⟨_, .makeDataTrap hft, .refl _⟩
+    | getTagStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .getTag .getTagStep .getTagTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .getTagStep hs2, .getTag heq'⟩
+    | getTagTrap => exact ⟨_, .getTagTrap, .refl _⟩
+    | getTagVal hvs => exact ⟨_, .getTagVal hvs, .refl _⟩
+    | cellNewStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellNew .cellNewStep .cellNewTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellNewStep hs2, .cellNew heq'⟩
+    | cellNewTrap => exact ⟨_, .cellNewTrap, .refl _⟩
+    | cellNewVal hv => exact ⟨_, .cellNewVal hv, .refl _⟩
+    | cellGetStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellGet .cellGetStep .cellGetTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellGetStep hs2, .cellGet heq'⟩
+    | cellGetTrap => exact ⟨_, .cellGetTrap, .refl _⟩
+    | cellGetVal h => exact ⟨_, .cellGetVal h, .refl _⟩
+    | cellSetLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .cellSet x _) .cellSetLeft .cellSetLeftTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellSetLeft hs2, .cellSetLeft heq'⟩
+    | cellSetLeftTrap => exact ⟨_, .cellSetLeftTrap, .refl _⟩
+    | cellSetRight hv hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .cellSetRight hv hs2', .cellSetRight hv heq'⟩
+    | cellSetRightTrap hv => exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv => exact ⟨_, .cellSetVal hl hv, .refl _⟩
+    | spawnStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .spawn .spawnStep .spawnTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .spawnStep hs2, .spawn heq'⟩
+    | spawnTrap => exact ⟨_, .spawnTrap, .refl _⟩
+    | awaitStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .await .awaitStep .awaitTrap h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .awaitStep hs2, .await heq'⟩
+    | awaitTrap => exact ⟨_, .awaitTrap, .refl _⟩
+    | awaitVal h hv => exact ⟨_, .awaitVal h hv, .refl _⟩
+    | awaitTaskTrap h => exact ⟨_, .awaitTaskTrap h, .refl _⟩
+    | concPrimArgs hsl =>
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.concPrim _) .concPrimArgs .concPrimTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .concPrimArgs hsl', .concPrim heql⟩
+    | concPrimTrap hft => exact ⟨_, .concPrimTrap hft, .refl _⟩
+    | concPrimVal h => exact ⟨_, .concPrimVal h, .refl _⟩
+  | assertIf hv =>
+    cases hs with
+    | ifStep hs1 => exact False.elim (value_no_step hv hs1)
+    | ifTrap => cases hv
+    | ifTrue => exact ⟨.lit .unit, .ifTrue, .refl _⟩
+    | ifFalse => exact False.elim (hnd σ (.trans .ifFalse (.refl _ _)))
+  | tuple hl =>
+    cases hs with
+    | tupleStep hsl =>
+      rcases assertEqList_step_fwd hIntr hl
+        (noDivZeroList_of_ctx .tuple .tupleStep .tupleTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .tupleStep hsl', .tuple heql⟩
+    | tupleTrap hft => exact ⟨_, .tupleTrap (assertEqList_firstTrap_left hl hft), .refl _⟩
+  | blockCons he =>
+    cases hs with
+    | blockConsStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .block (x :: _ :: _)) .blockConsStep .blockConsTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .blockConsStep hs2, .blockCons heq'⟩
+    | blockConsVal hv => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .blockConsVal hv, .refl _⟩
+    | blockConsTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .blockConsTrap, .refl _⟩
+  | applyFn he =>
+    cases hs with
+    | applyFn hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .apply x _) .applyFn .applyFnTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨f2', hs2, heq'⟩
+      exact ⟨_, .applyFn hs2, .applyFn heq'⟩
+    | applyFnTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .applyFnTrap, .refl _⟩
+    | applyArgs hv hsl =>
+      rw [← assertEq_eq_of_val_left he hv]
+      rcases assertEqList_step_fwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap hv hft => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .applyArgsTrap hv hft, .refl _⟩
+    | applyBeta hvs hlen =>
+      rw [← assertEq_eq_of_val_left he (.lam _ _ _ _)]
+      exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+  | applyArgs hv hl =>
+    cases hs with
+    | applyFn hs1 => exact False.elim (value_no_step hv hs1)
+    | applyFnTrap => cases hv
+    | applyArgs _ hsl =>
+      rcases assertEqList_step_fwd hIntr hl
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap _ hft => exact ⟨_, .applyArgsTrap hv (assertEqList_firstTrap_left hl hft), .refl _⟩
+    | applyBeta hvs hlen =>
+      rw [← assertEqList_eq_of_vals_left hl hvs]
+      exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+  | applyDirArgs hl =>
+    cases hs with
+    | applyDirArgs hsl =>
+      rcases assertEqList_step_fwd hIntr hl
+        (noDivZeroList_of_ctx (.applyDir _) .applyDirArgs .applyDirTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyDirArgs hsl', .applyDirArgs heql⟩
+    | applyDirTrap hft => exact ⟨_, .applyDirTrap (assertEqList_firstTrap_left hl hft), .refl _⟩
+    | applyDirBeta hΦ hvs hlen =>
+      rw [← assertEqList_eq_of_vals_left hl hvs]
+      exact applyDirBeta_fwd hIntr hΦ hvs hlen
+  | un he =>
+    cases hs with
+    | unStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.un _) .unStep .unTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .unStep hs2, .un heq'⟩
+    | unTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .unTrap, .refl _⟩
+    | unVal h => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .unVal h, .refl _⟩
+  | binLeft he =>
+    cases hs with
+    | binLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .bin _ x _) .binLeft .binLeftTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .binLeft hs2, .binLeft heq'⟩
+    | binLeftTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .binLeftTrap, .refl _⟩
+    | binAndFalse => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .binAndFalse, .refl _⟩
+    | binAndTrue => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .binAndTrue, .refl _⟩
+    | binOrTrue => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .binOrTrue, .refl _⟩
+    | binOrFalse => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .binOrFalse, .refl _⟩
+    | binRight h1 h2 hv hs2 =>
+      rw [← assertEq_eq_of_val_left he hv]
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs2', .binRight h1 h2 hv heq'⟩
+    | binRightTrap h1 h2 hv =>
+      rw [← assertEq_eq_of_val_left he hv]
+      exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => rw [← assertEq_eq_of_val_left he (.lit _)]; exact binVal_fwd h
+    | binTrap h => rw [← assertEq_eq_of_val_left he (.lit _)]; exact binTrap_fwd hnd h
+  | binRight h1 h2 hv he =>
+    cases hs with
+    | binLeft hs1 => exact False.elim (value_no_step hv hs1)
+    | binLeftTrap => cases hv
+    | binAndFalse => exact False.elim (h1 rfl)
+    | binAndTrue => exact False.elim (h1 rfl)
+    | binOrTrue => exact False.elim (h2 rfl)
+    | binOrFalse => exact False.elim (h2 rfl)
+    | binRight _ _ _ hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_fwd hIntr he hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs2', .binRight h1 h2 hv heq'⟩
+    | binRightTrap _ _ _ => rw [assertEq_trap_left he rfl]; exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => rw [← assertEq_eq_of_val_left he (.lit _)]; exact binVal_fwd h
+    | binTrap h => rw [← assertEq_eq_of_val_left he (.lit _)]; exact binTrap_fwd hnd h
+  | let_ he =>
+    cases hs with
+    | letStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .let_ _ x _) .letStep .letTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .letStep hs2, .let_ heq'⟩
+    | letTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .letTrap, .refl _⟩
+    | letVal hv => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .letVal hv, .refl _⟩
+  | if_ he =>
+    cases hs with
+    | ifStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .if_ x _ _) .ifStep .ifTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨c2', hs2, heq'⟩
+      exact ⟨_, .ifStep hs2, .if_ heq'⟩
+    | ifTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .ifTrap, .refl _⟩
+    | ifTrue => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .ifTrue, .refl _⟩
+    | ifFalse => rw [← assertEq_eq_of_val_left he (.lit _)]; exact ⟨_, .ifFalse, .refl _⟩
+  | match_ he =>
+    cases hs with
+    | matchScrut hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .match_ x _) .matchScrut .matchScrutTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨s2', hs2, heq'⟩
+      exact ⟨_, .matchScrut hs2, .match_ heq'⟩
+    | matchScrutTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .matchScrutTrap, .refl _⟩
+    | matchEmpty hv => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .matchEmpty hv, .refl _⟩
+    | matchHit hv hm => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .matchHit hv hm, .refl _⟩
+    | matchMiss hv hm => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .matchMiss hv hm, .refl _⟩
+  | makeData hl =>
+    cases hs with
+    | makeDataStep hsl =>
+      rcases assertEqList_step_fwd hIntr hl
+        (noDivZeroList_of_ctx (.makeData _ _) .makeDataStep .makeDataTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .makeDataStep hsl', .makeData heql⟩
+    | makeDataTrap hft => exact ⟨_, .makeDataTrap (assertEqList_firstTrap_left hl hft), .refl _⟩
+  | getTag he =>
+    cases hs with
+    | getTagStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .getTag .getTagStep .getTagTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .getTagStep hs2, .getTag heq'⟩
+    | getTagTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .getTagTrap, .refl _⟩
+    | getTagVal hvs => rw [← assertEq_eq_of_val_left he (.makeData _ _ hvs)]; exact ⟨_, .getTagVal hvs, .refl _⟩
+  | cellNew he =>
+    cases hs with
+    | cellNewStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellNew .cellNewStep .cellNewTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellNewStep hs2, .cellNew heq'⟩
+    | cellNewTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .cellNewTrap, .refl _⟩
+    | cellNewVal hv => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .cellNewVal hv, .refl _⟩
+  | cellGet he =>
+    cases hs with
+    | cellGetStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellGet .cellGetStep .cellGetTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellGetStep hs2, .cellGet heq'⟩
+    | cellGetTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .cellGetTrap, .refl _⟩
+    | cellGetVal h => rw [← assertEq_eq_of_val_left he (.loc _)]; exact ⟨_, .cellGetVal h, .refl _⟩
+  | cellSetLeft he =>
+    cases hs with
+    | cellSetLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .cellSet x _) .cellSetLeft .cellSetLeftTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .cellSetLeft hs2, .cellSetLeft heq'⟩
+    | cellSetLeftTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .cellSetLeftTrap, .refl _⟩
+    | cellSetRight hv hs2 =>
+      rw [← assertEq_eq_of_val_left he hv]
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_fwd hIntr (.refl _) hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .cellSetRight hv hs2', .cellSetRight hv heq'⟩
+    | cellSetRightTrap hv => rw [← assertEq_eq_of_val_left he hv]; exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv => rw [← assertEq_eq_of_val_left he (.loc _)]; exact ⟨_, .cellSetVal hl hv, .refl _⟩
+  | cellSetRight hv he =>
+    cases hs with
+    | cellSetLeft hs1 => exact False.elim (value_no_step hv hs1)
+    | cellSetLeftTrap => cases hv
+    | cellSetRight _ hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_fwd hIntr he hnd2 hs2 with ⟨e2', hs2', heq'⟩
+      exact ⟨_, .cellSetRight hv hs2', .cellSetRight hv heq'⟩
+    | cellSetRightTrap _ => rw [assertEq_trap_left he rfl]; exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv2 => rw [← assertEq_eq_of_val_left he hv2]; exact ⟨_, .cellSetVal hl hv2, .refl _⟩
+  | spawn he =>
+    cases hs with
+    | spawnStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .spawn .spawnStep .spawnTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .spawnStep hs2, .spawn heq'⟩
+    | spawnTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .spawnTrap, .refl _⟩
+  | await he =>
+    cases hs with
+    | awaitStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .await .awaitStep .awaitTrap h)
+      rcases assertEq_step_fwd hIntr he hnd1 hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .awaitStep hs2, .await heq'⟩
+    | awaitTrap => rw [assertEq_trap_left he rfl]; exact ⟨_, .awaitTrap, .refl _⟩
+    | awaitVal h hv => rw [← assertEq_eq_of_val_left he (.taskRef _)]; exact ⟨_, .awaitVal h hv, .refl _⟩
+    | awaitTaskTrap h => rw [← assertEq_eq_of_val_left he (.taskRef _)]; exact ⟨_, .awaitTaskTrap h, .refl _⟩
+  | concPrim hl =>
+    cases hs with
+    | concPrimArgs hsl =>
+      rcases assertEqList_step_fwd hIntr hl
+        (noDivZeroList_of_ctx (.concPrim _) .concPrimArgs .concPrimTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .concPrimArgs hsl', .concPrim heql⟩
+    | concPrimTrap hft => exact ⟨_, .concPrimTrap (assertEqList_firstTrap_left hl hft), .refl _⟩
+    | concPrimVal h =>
+      cases h with
+      | chanSendClosed hch _ _ => simp [emptyPool] at hch
+      | chanRecvClosed hch _ _ => simp [emptyPool] at hch
+termination_by sizeOf e1
+
+private theorem assertEqList_step_fwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {es1 es2 es1' : List Expr} {σ σ' : Store}
+    (heql : AssertEqList es1 es2) (hnd : NoDivZeroList Δ Φ es1 σ)
+    (hsl : StepList Δ Φ emptyPool es1 σ es1' σ' .none) :
+    ∃ es2', StepListUnchecked Δ Φ es2 σ es2' σ' ∧ AssertEqList es1' es2' := by
+  cases heql with
+  | refl =>
+    cases hsl with
+    | head hs1 =>
+      rcases assertEq_step_fwd hIntr (.refl _) (noDivZeroList_head hnd) hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .head hs2, .head heq'⟩
+    | tail hv hsl1 =>
+      rcases assertEqList_step_fwd hIntr (.refl _) (noDivZeroList_tail hv hnd) hsl1 with ⟨es2', hsl2, heql'⟩
+      exact ⟨_, .tail hv hsl2, .tail hv heql'⟩
+  | head he =>
+    cases hsl with
+    | head hs1 =>
+      rcases assertEq_step_fwd hIntr he (noDivZeroList_head hnd) hs1 with ⟨e2', hs2, heq'⟩
+      exact ⟨_, .head hs2, .head heq'⟩
+    | tail hv hsl1 =>
+      rw [← assertEq_eq_of_val_left he hv]
+      rcases assertEqList_step_fwd hIntr (.refl _) (noDivZeroList_tail hv hnd) hsl1 with ⟨es2', hsl2, heql'⟩
+      exact ⟨_, .tail hv hsl2, .tail hv heql'⟩
+  | tail hv hl =>
+    cases hsl with
+    | head hs1 => exact False.elim (value_no_step hv hs1)
+    | tail _ hsl1 =>
+      rcases assertEqList_step_fwd hIntr hl (noDivZeroList_tail hv hnd) hsl1 with ⟨es2', hsl2, heql'⟩
+      exact ⟨_, .tail hv hsl2, .tail hv heql'⟩
+termination_by sizeOf es1
+end
+
+/- Backward 1-step simulation: any step under `elideVerifiedAsserts Φ` from a state `AssertEq`-related
+   to a `NoDivZero` original state `e1` is matched by a step under `Φ` preserving `AssertEq`. -/
+mutual
+private theorem assertEq_step_bwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {e1 e2 e2' : Expr} {σ σ' : Store}
+    (heq : AssertEq e1 e2) (hnd : NoDivZero Δ Φ e1 σ)
+    (hs : StepUnchecked Δ Φ e2 σ e2' σ') :
+    ∃ e1', Step Δ Φ emptyPool e1 σ e1' σ' .none ∧ AssertEq e1' e2' := by
+  cases heq with
+  | refl =>
+    cases hs with
+    | tupleStep hsl =>
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx .tuple .tupleStep .tupleTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨.tuple es', .tupleStep hsl', .tuple heql⟩
+    | tupleTrap hft => exact ⟨_, .tupleTrap hft, .refl _⟩
+    | blockEmpty => exact ⟨_, .blockEmpty, .refl _⟩
+    | blockSingle => exact ⟨_, .blockSingle, .refl _⟩
+    | blockConsStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .block (x :: _ :: _)) .blockConsStep .blockConsTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .blockConsStep hs1', .blockCons heq'⟩
+    | blockConsVal hv => exact ⟨_, .blockConsVal hv, .refl _⟩
+    | blockConsTrap => exact ⟨_, .blockConsTrap, .refl _⟩
+    | applyFn hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .apply x _) .applyFn .applyFnTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨f1', hs1', heq'⟩
+      exact ⟨_, .applyFn hs1', .applyFn heq'⟩
+    | applyFnTrap => exact ⟨_, .applyFnTrap, .refl _⟩
+    | applyArgs hv hsl =>
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap hv hft => exact ⟨_, .applyArgsTrap hv hft, .refl _⟩
+    | applyBeta hvs hlen => exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+    | applyDirArgs hsl =>
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.applyDir _) .applyDirArgs .applyDirTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyDirArgs hsl', .applyDirArgs heql⟩
+    | applyDirTrap hft => exact ⟨_, .applyDirTrap hft, .refl _⟩
+    | @applyDirBeta nm fd args _ hΦ hvs hlen =>
+      by_cases hnm : nm = "assert"
+      · subst hnm
+        simp [elideVerifiedAsserts] at hΦ; subst hΦ
+        cases args with
+        | nil => simp [assertElidedFunDef] at hlen
+        | cons v rest =>
+          cases rest with
+          | cons _ _ => simp [assertElidedFunDef] at hlen
+          | nil =>
+            have hv : IsValue v := hvs v (List.mem_cons_self ..)
+            refine ⟨substMany (zipParams assertFunDef.params [v]) assertFunDef.body,
+              .applyDirBeta hIntr.1 hvs rfl, ?_⟩
+            simp only [assertFunDef, assertElidedFunDef, zipParams]
+            exact .assertIf hv
+      · simp [elideVerifiedAsserts, hnm] at hΦ
+        exact ⟨_, .applyDirBeta hΦ hvs hlen, .refl _⟩
+    | unStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.un _) .unStep .unTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .unStep hs1', .un heq'⟩
+    | unTrap => exact ⟨_, .unTrap, .refl _⟩
+    | unVal h => exact ⟨_, .unVal h, .refl _⟩
+    | binLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .bin _ x _) .binLeft .binLeftTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .binLeft hs1', .binLeft heq'⟩
+    | binLeftTrap => exact ⟨_, .binLeftTrap, .refl _⟩
+    | binAndFalse => exact ⟨_, .binAndFalse, .refl _⟩
+    | binAndTrue => exact ⟨_, .binAndTrue, .refl _⟩
+    | binOrTrue => exact ⟨_, .binOrTrue, .refl _⟩
+    | binOrFalse => exact ⟨_, .binOrFalse, .refl _⟩
+    | binRight h1 h2 hv hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs1', .binRight h1 h2 hv heq'⟩
+    | binRightTrap h1 h2 hv => exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => exact binVal_bwd hnd h
+    | binTrap h _ => exact ⟨_, .binTrap h, .refl _⟩
+    | letStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .let_ _ x _) .letStep .letTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .letStep hs1', .let_ heq'⟩
+    | letTrap => exact ⟨_, .letTrap, .refl _⟩
+    | letVal hv => exact ⟨_, .letVal hv, .refl _⟩
+    | ifStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .if_ x _ _) .ifStep .ifTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨c1', hs1', heq'⟩
+      exact ⟨_, .ifStep hs1', .if_ heq'⟩
+    | ifTrap => exact ⟨_, .ifTrap, .refl _⟩
+    | ifTrue => exact ⟨_, .ifTrue, .refl _⟩
+    | ifFalse => exact ⟨_, .ifFalse, .refl _⟩
+    | whileUnfold => exact ⟨_, .whileUnfold, .refl _⟩
+    | matchScrut hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .match_ x _) .matchScrut .matchScrutTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨s1', hs1', heq'⟩
+      exact ⟨_, .matchScrut hs1', .match_ heq'⟩
+    | matchScrutTrap => exact ⟨_, .matchScrutTrap, .refl _⟩
+    | matchEmpty hv => exact ⟨_, .matchEmpty hv, .refl _⟩
+    | matchHit hv hm => exact ⟨_, .matchHit hv hm, .refl _⟩
+    | matchMiss hv hm => exact ⟨_, .matchMiss hv hm, .refl _⟩
+    | makeDataStep hsl =>
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.makeData _ _) .makeDataStep .makeDataTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .makeDataStep hsl', .makeData heql⟩
+    | makeDataTrap hft => exact ⟨_, .makeDataTrap hft, .refl _⟩
+    | getTagStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .getTag .getTagStep .getTagTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .getTagStep hs1', .getTag heq'⟩
+    | getTagTrap => exact ⟨_, .getTagTrap, .refl _⟩
+    | getTagVal hvs => exact ⟨_, .getTagVal hvs, .refl _⟩
+    | cellNewStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellNew .cellNewStep .cellNewTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellNewStep hs1', .cellNew heq'⟩
+    | cellNewTrap => exact ⟨_, .cellNewTrap, .refl _⟩
+    | cellNewVal hv => exact ⟨_, .cellNewVal hv, .refl _⟩
+    | cellGetStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellGet .cellGetStep .cellGetTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellGetStep hs1', .cellGet heq'⟩
+    | cellGetTrap => exact ⟨_, .cellGetTrap, .refl _⟩
+    | cellGetVal h => exact ⟨_, .cellGetVal h, .refl _⟩
+    | cellSetLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .cellSet x _) .cellSetLeft .cellSetLeftTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellSetLeft hs1', .cellSetLeft heq'⟩
+    | cellSetLeftTrap => exact ⟨_, .cellSetLeftTrap, .refl _⟩
+    | cellSetRight hv hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellSetRight hv hs1', .cellSetRight hv heq'⟩
+    | cellSetRightTrap hv => exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv => exact ⟨_, .cellSetVal hl hv, .refl _⟩
+    | spawnStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .spawn .spawnStep .spawnTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .spawnStep hs1', .spawn heq'⟩
+    | spawnTrap => exact ⟨_, .spawnTrap, .refl _⟩
+    | awaitStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .await .awaitStep .awaitTrap h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .awaitStep hs1', .await heq'⟩
+    | awaitTrap => exact ⟨_, .awaitTrap, .refl _⟩
+    | awaitVal h hv => exact ⟨_, .awaitVal h hv, .refl _⟩
+    | awaitTaskTrap h => exact ⟨_, .awaitTaskTrap h, .refl _⟩
+    | concPrimArgs hsl =>
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.concPrim _) .concPrimArgs .concPrimTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .concPrimArgs hsl', .concPrim heql⟩
+    | concPrimTrap hft => exact ⟨_, .concPrimTrap hft, .refl _⟩
+    | concPrimVal h => exact ⟨_, .concPrimVal h, .refl _⟩
+  | assertIf hv =>
+    cases hs with
+    | ifStep hs1 => exact False.elim (value_no_stepUnchecked hv hs1)
+    | ifTrap => cases hv
+    | ifTrue => exact ⟨.lit .unit, .ifTrue, .refl _⟩
+    | ifFalse => exact False.elim (hnd σ (.trans .ifFalse (.refl _ _)))
+  | tuple hl =>
+    cases hs with
+    | tupleStep hsl =>
+      rcases assertEqList_step_bwd hIntr hl
+        (noDivZeroList_of_ctx .tuple .tupleStep .tupleTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .tupleStep hsl', .tuple heql⟩
+    | tupleTrap hft => exact ⟨_, .tupleTrap (assertEqList_firstTrap_right hl hft), .refl _⟩
+  | blockCons he =>
+    cases hs with
+    | blockConsStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .block (x :: _ :: _)) .blockConsStep .blockConsTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .blockConsStep hs1', .blockCons heq'⟩
+    | blockConsVal hv => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .blockConsVal hv, .refl _⟩
+    | blockConsTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .blockConsTrap, .refl _⟩
+  | applyFn he =>
+    cases hs with
+    | applyFn hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .apply x _) .applyFn .applyFnTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨f1', hs1', heq'⟩
+      exact ⟨_, .applyFn hs1', .applyFn heq'⟩
+    | applyFnTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .applyFnTrap, .refl _⟩
+    | applyArgs hv hsl =>
+      have hEq := assertEq_eq_of_val_right he hv
+      rw [hEq]
+      rcases assertEqList_step_bwd hIntr (.refl _)
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) (hEq ▸ hnd)) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap hv hft => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .applyArgsTrap hv hft, .refl _⟩
+    | applyBeta hvs hlen =>
+      rw [assertEq_eq_of_val_right he (.lam _ _ _ _)]
+      exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+  | applyArgs hv hl =>
+    cases hs with
+    | applyFn hs1 => exact False.elim (value_no_stepUnchecked hv hs1)
+    | applyFnTrap => cases hv
+    | applyArgs _ hsl =>
+      rcases assertEqList_step_bwd hIntr hl
+        (noDivZeroList_of_ctx (.apply _) (.applyArgs hv) (.applyArgsTrap hv) hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyArgs hv hsl', .applyArgs hv heql⟩
+    | applyArgsTrap _ hft => exact ⟨_, .applyArgsTrap hv (assertEqList_firstTrap_right hl hft), .refl _⟩
+    | applyBeta hvs hlen =>
+      rw [assertEqList_eq_of_vals_right hl hvs]
+      exact ⟨_, .applyBeta hvs hlen, .refl _⟩
+  | applyDirArgs hl =>
+    cases hs with
+    | applyDirArgs hsl =>
+      rcases assertEqList_step_bwd hIntr hl
+        (noDivZeroList_of_ctx (.applyDir _) .applyDirArgs .applyDirTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .applyDirArgs hsl', .applyDirArgs heql⟩
+    | applyDirTrap hft => exact ⟨_, .applyDirTrap (assertEqList_firstTrap_right hl hft), .refl _⟩
+    | applyDirBeta hΦ hvs hlen =>
+      have hEq := assertEqList_eq_of_vals_right hl hvs
+      rw [hEq]
+      exact applyDirBeta_bwd hIntr hΦ hvs hlen
+  | un he =>
+    cases hs with
+    | unStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.un _) .unStep .unTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .unStep hs1', .un heq'⟩
+    | unTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .unTrap, .refl _⟩
+    | unVal h => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .unVal h, .refl _⟩
+  | binLeft he =>
+    cases hs with
+    | binLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .bin _ x _) .binLeft .binLeftTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .binLeft hs1', .binLeft heq'⟩
+    | binLeftTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .binLeftTrap, .refl _⟩
+    | binAndFalse => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binAndFalse, .refl _⟩
+    | binAndTrue => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binAndTrue, .refl _⟩
+    | binOrTrue => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binOrTrue, .refl _⟩
+    | binOrFalse => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binOrFalse, .refl _⟩
+    | binRight h1 h2 hv hs2 =>
+      have hEq := assertEq_eq_of_val_right he hv
+      rw [hEq]
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => (hEq ▸ hnd) σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs1', .binRight h1 h2 hv heq'⟩
+    | binRightTrap h1 h2 hv =>
+      rw [assertEq_eq_of_val_right he hv]
+      exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => have hEq := assertEq_eq_of_val_right he (.lit _); rw [hEq]; exact binVal_bwd (hEq ▸ hnd) h
+    | binTrap h _ => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binTrap h, .refl _⟩
+  | binRight h1 h2 hv he =>
+    cases hs with
+    | binLeft hs1 => exact False.elim (value_no_stepUnchecked hv hs1)
+    | binLeftTrap => cases hv
+    | binAndFalse => exact False.elim (h1 rfl)
+    | binAndTrue => exact False.elim (h1 rfl)
+    | binOrTrue => exact False.elim (h2 rfl)
+    | binOrFalse => exact False.elim (h2 rfl)
+    | binRight _ _ _ hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.bin _ _) (.binRight h1 h2 hv) (.binRightTrap h1 h2 hv) h)
+      rcases assertEq_step_bwd hIntr he hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .binRight h1 h2 hv hs1', .binRight h1 h2 hv heq'⟩
+    | binRightTrap _ _ _ => rw [assertEq_trap_right he rfl]; exact ⟨_, .binRightTrap h1 h2 hv, .refl _⟩
+    | binVal h => have hEq := assertEq_eq_of_val_right he (.lit _); rw [hEq]; exact binVal_bwd (hEq ▸ hnd) h
+    | binTrap h _ => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .binTrap h, .refl _⟩
+  | let_ he =>
+    cases hs with
+    | letStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .let_ _ x _) .letStep .letTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .letStep hs1', .let_ heq'⟩
+    | letTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .letTrap, .refl _⟩
+    | letVal hv => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .letVal hv, .refl _⟩
+  | if_ he =>
+    cases hs with
+    | ifStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .if_ x _ _) .ifStep .ifTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨c1', hs1', heq'⟩
+      exact ⟨_, .ifStep hs1', .if_ heq'⟩
+    | ifTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .ifTrap, .refl _⟩
+    | ifTrue => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .ifTrue, .refl _⟩
+    | ifFalse => rw [assertEq_eq_of_val_right he (.lit _)]; exact ⟨_, .ifFalse, .refl _⟩
+  | match_ he =>
+    cases hs with
+    | matchScrut hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .match_ x _) .matchScrut .matchScrutTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨s1', hs1', heq'⟩
+      exact ⟨_, .matchScrut hs1', .match_ heq'⟩
+    | matchScrutTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .matchScrutTrap, .refl _⟩
+    | matchEmpty hv => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .matchEmpty hv, .refl _⟩
+    | matchHit hv hm => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .matchHit hv hm, .refl _⟩
+    | matchMiss hv hm => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .matchMiss hv hm, .refl _⟩
+  | makeData hl =>
+    cases hs with
+    | makeDataStep hsl =>
+      rcases assertEqList_step_bwd hIntr hl
+        (noDivZeroList_of_ctx (.makeData _ _) .makeDataStep .makeDataTrap hnd) hsl with ⟨es', hsl', heql⟩
+      exact ⟨_, .makeDataStep hsl', .makeData heql⟩
+    | makeDataTrap hft => exact ⟨_, .makeDataTrap (assertEqList_firstTrap_right hl hft), .refl _⟩
+  | getTag he =>
+    cases hs with
+    | getTagStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .getTag .getTagStep .getTagTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .getTagStep hs1', .getTag heq'⟩
+    | getTagTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .getTagTrap, .refl _⟩
+    | getTagVal hvs => rw [assertEq_eq_of_val_right he (.makeData _ _ hvs)]; exact ⟨_, .getTagVal hvs, .refl _⟩
+  | cellNew he =>
+    cases hs with
+    | cellNewStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellNew .cellNewStep .cellNewTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellNewStep hs1', .cellNew heq'⟩
+    | cellNewTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .cellNewTrap, .refl _⟩
+    | cellNewVal hv => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .cellNewVal hv, .refl _⟩
+  | cellGet he =>
+    cases hs with
+    | cellGetStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .cellGet .cellGetStep .cellGetTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellGetStep hs1', .cellGet heq'⟩
+    | cellGetTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .cellGetTrap, .refl _⟩
+    | cellGetVal h => rw [assertEq_eq_of_val_right he (.loc _)]; exact ⟨_, .cellGetVal h, .refl _⟩
+  | cellSetLeft he =>
+    cases hs with
+    | cellSetLeft hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (fun x => .cellSet x _) .cellSetLeft .cellSetLeftTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellSetLeft hs1', .cellSetLeft heq'⟩
+    | cellSetLeftTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .cellSetLeftTrap, .refl _⟩
+    | cellSetRight hv hs2 =>
+      have hEq := assertEq_eq_of_val_right he hv
+      rw [hEq]
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => (hEq ▸ hnd) σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_bwd hIntr (.refl _) hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellSetRight hv hs1', .cellSetRight hv heq'⟩
+    | cellSetRightTrap hv => rw [assertEq_eq_of_val_right he hv]; exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv => rw [assertEq_eq_of_val_right he (.loc _)]; exact ⟨_, .cellSetVal hl hv, .refl _⟩
+  | cellSetRight hv he =>
+    cases hs with
+    | cellSetLeft hs1 => exact False.elim (value_no_stepUnchecked hv hs1)
+    | cellSetLeftTrap => cases hv
+    | cellSetRight _ hs2 =>
+      have hnd2 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx (.cellSet _) (.cellSetRight hv) (.cellSetRightTrap hv) h)
+      rcases assertEq_step_bwd hIntr he hnd2 hs2 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .cellSetRight hv hs1', .cellSetRight hv heq'⟩
+    | cellSetRightTrap _ => rw [assertEq_trap_right he rfl]; exact ⟨_, .cellSetRightTrap hv, .refl _⟩
+    | cellSetVal hl hv2 => rw [assertEq_eq_of_val_right he hv2]; exact ⟨_, .cellSetVal hl hv2, .refl _⟩
+  | spawn he =>
+    cases hs with
+    | spawnStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .spawn .spawnStep .spawnTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .spawnStep hs1', .spawn heq'⟩
+    | spawnTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .spawnTrap, .refl _⟩
+  | await he =>
+    cases hs with
+    | awaitStep hs1 =>
+      have hnd1 : NoDivZero Δ Φ _ σ := fun σ'' h => hnd σ'' (steps_lift_ctx .await .awaitStep .awaitTrap h)
+      rcases assertEq_step_bwd hIntr he hnd1 hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .awaitStep hs1', .await heq'⟩
+    | awaitTrap => rw [assertEq_trap_right he rfl]; exact ⟨_, .awaitTrap, .refl _⟩
+    | awaitVal h hv => rw [assertEq_eq_of_val_right he (.taskRef _)]; exact ⟨_, .awaitVal h hv, .refl _⟩
+    | awaitTaskTrap h => rw [assertEq_eq_of_val_right he (.taskRef _)]; exact ⟨_, .awaitTaskTrap h, .refl _⟩
+  | concPrim hl =>
+    cases hs with
+    | concPrimArgs hsl =>
+      rcases assertEqList_step_bwd hIntr hl
+        (noDivZeroList_of_ctx (.concPrim _) .concPrimArgs .concPrimTrap hnd) hsl with ⟨a', hsl', heql⟩
+      exact ⟨_, .concPrimArgs hsl', .concPrim heql⟩
+    | concPrimTrap hft => exact ⟨_, .concPrimTrap (assertEqList_firstTrap_right hl hft), .refl _⟩
+    | concPrimVal h =>
+      cases h with
+      | chanSendClosed hch _ _ => simp [emptyPool] at hch
+      | chanRecvClosed hch _ _ => simp [emptyPool] at hch
+termination_by sizeOf e2
+
+private theorem assertEqList_step_bwd {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {es1 es2 es2' : List Expr} {σ σ' : Store}
+    (heql : AssertEqList es1 es2) (hnd : NoDivZeroList Δ Φ es1 σ)
+    (hsl : StepListUnchecked Δ Φ es2 σ es2' σ') :
+    ∃ es1', StepList Δ Φ emptyPool es1 σ es1' σ' .none ∧ AssertEqList es1' es2' := by
+  cases heql with
+  | refl =>
+    cases hsl with
+    | head hs1 =>
+      rcases assertEq_step_bwd hIntr (.refl _) (noDivZeroList_head hnd) hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .head hs1', .head heq'⟩
+    | tail hv hsl1 =>
+      rcases assertEqList_step_bwd hIntr (.refl _) (noDivZeroList_tail hv hnd) hsl1 with ⟨es1', hsl1', heql'⟩
+      exact ⟨_, .tail hv hsl1', .tail hv heql'⟩
+  | head he =>
+    cases hsl with
+    | head hs1 =>
+      rcases assertEq_step_bwd hIntr he (noDivZeroList_head hnd) hs1 with ⟨e1', hs1', heq'⟩
+      exact ⟨_, .head hs1', .head heq'⟩
+    | tail hv hsl1 =>
+      have hEq := assertEq_eq_of_val_right he hv
+      rw [hEq]
+      rcases assertEqList_step_bwd hIntr (.refl _) (noDivZeroList_tail hv (hEq ▸ hnd)) hsl1 with ⟨es1', hsl1', heql'⟩
+      exact ⟨_, .tail hv hsl1', .tail hv heql'⟩
+  | tail hv hl =>
+    cases hsl with
+    | head hs1 => exact False.elim (value_no_stepUnchecked hv hs1)
+    | tail _ hsl1 =>
+      rcases assertEqList_step_bwd hIntr hl (noDivZeroList_tail hv hnd) hsl1 with ⟨es1', hsl1', heql'⟩
+      exact ⟨_, .tail hv hsl1', .tail hv heql'⟩
+termination_by sizeOf es2
+end
+
+private theorem steps_to_stepsUnchecked {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {e1 e2 v : Expr} {σ σ' : Store}
+    (heq : AssertEq e1 e2) (hnd : NoDivZero Δ Φ e1 σ) (hv : IsValue v)
+    (hst : Steps Δ Φ e1 σ v σ') :
+    StepsUnchecked Δ Φ e2 σ v σ' := by
+  induction hst generalizing e2 with
+  | refl =>
+    rw [← assertEq_eq_of_val_left heq hv]
+    exact .refl _ _
+  | trans hs hrest ih =>
+    rcases assertEq_step_fwd hIntr heq hnd hs with ⟨e2', hs2, heq'⟩
+    exact .trans hs2 (ih heq' (noDivZero_of_step hnd hs) hv)
+
+private theorem stepsUnchecked_to_steps {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {e1 e2 v : Expr} {σ σ' : Store}
+    (heq : AssertEq e1 e2) (hnd : NoDivZero Δ Φ e1 σ) (hv : IsValue v)
+    (hst : StepsUnchecked Δ Φ e2 σ v σ') :
+    Steps Δ Φ e1 σ v σ' := by
+  induction hst generalizing e1 with
+  | refl =>
+    rw [assertEq_eq_of_val_right heq hv]
+    exact .refl _ _
+  | trans hs hrest ih =>
+    rcases assertEq_step_bwd hIntr heq hnd hs with ⟨e1', hs1, heq'⟩
+    exact .trans hs1 (ih heq' (noDivZero_of_step hnd hs1) hv)
+
+private theorem stepsUnchecked_to_steps_trap {Δ : AdtEnv} {Φ : FunEnv} (hIntr : IntrinsicsOk Φ)
+    {e1 e2 : Expr} {t : Trap} {σ σ' : Store}
+    (heq : AssertEq e1 e2) (hnd : NoDivZero Δ Φ e1 σ)
+    (hst : StepsUnchecked Δ Φ e2 σ (.trap t) σ') :
+    Steps Δ Φ e1 σ (.trap t) σ' := by
+  generalize hres : Expr.trap t = res at hst
+  induction hst generalizing e1 with
+  | refl =>
+    subst hres
+    rw [assertEq_trap_right heq rfl]
+    exact .refl _ _
+  | trans hs _ ih =>
+    rcases assertEq_step_bwd hIntr heq hnd hs with ⟨e1', hs1, heq'⟩
+    exact .trans hs1 (ih heq' (noDivZero_of_step hnd hs1) hres)
+
+/-- **Theorem (`verified_opt_sound`)**:
+    Machine-checked soundness of `--verified-opt` check elision.
+    For any function `fd` verified by `verifyFn env fd fc = some obs` with `ValidObs obs`,
+    under any pre-existing heap `σ` and arguments `vs` satisfying `fc.req`:
+    1. Execution under `StepsUnchecked` (runtime `assert` checks and `.divByZero` guards elided
+       via `elideVerifiedAsserts` and `evalBinOpUnchecked`) never traps with `.trap .divByZero`;
+    2. `StepsUnchecked` is **bidirectionally observationally equivalent** to original `Steps`
+       (identical return value `v` and final heap `σ'`);
+    3. Every terminating unchecked execution satisfies the postcondition `fc.ens`. -/
+theorem verified_opt_sound {Δ : AdtEnv} {Φ : FunEnv} {env : VcgEnv}
+    (hIntr : IntrinsicsOk Φ) (hCallee : ∀ bound, CalleeSound Δ Φ env bound)
+    {fd : FunDef} {fc : FnContract} {obs : List SForm} {initSt : SymState}
+    (hΦ : Φ fd.name = some fd)
+    (hInit : initFnSymState fd.params = some initSt)
+    (hver : verifyFn env fd fc = some obs) (hObs : ValidObs obs)
+    {M : Model} {L : Loc → Loc} {vs : List Expr} {σ : Store}
+    (hM : ValidModel M) (hσ : StoreClosed σ)
+    (hvs : ∀ v ∈ vs, IsValue v) (hlen : vs.length = fd.params.length)
+    (hMatchInit : StateMatches M L initSt (zipParams fd.params vs) σ)
+    (hReq : Steps Δ Φ (substMany (zipParams fd.params vs) fc.req) σ (.lit (.bool true)) σ) :
+    (∀ σ', ¬ StepsUnchecked Δ Φ (.applyDir fd.name vs) σ (.trap .divByZero) σ') ∧
+    (∀ v σ', IsValue v →
+      (Steps Δ Φ (.applyDir fd.name vs) σ v σ' ↔ StepsUnchecked Δ Φ (.applyDir fd.name vs) σ v σ')) ∧
+    (∀ v σ', IsValue v →
+      StepsUnchecked Δ Φ (.applyDir fd.name vs) σ v σ' →
+      Steps Δ Φ (substMany ((fc.retVar, v) :: zipParams fd.params vs) fc.ens) σ' (.lit (.bool true)) σ') := by
+  have hSafe := verifyFn_sound hIntr hCallee hΦ hInit hver hObs hM hσ hvs hlen hMatchInit hReq
+  have hnd : NoDivZero Δ Φ (.applyDir fd.name vs) σ := hSafe.1
+  refine ⟨?_, ?_, ?_⟩
+  · intro σ' hstU
+    exact hnd σ' (stepsUnchecked_to_steps_trap hIntr (.refl _) hnd hstU)
+  · intro v σ' hv
+    exact ⟨steps_to_stepsUnchecked hIntr (.refl _) hnd hv,
+           stepsUnchecked_to_steps hIntr (.refl _) hnd hv⟩
+  · intro v σ' hv hstU
+    exact hSafe.2 v σ' hv (stepsUnchecked_to_steps hIntr (.refl _) hnd hv hstU)
+
 end CoreGeisha
