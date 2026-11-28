@@ -2837,7 +2837,105 @@ def main() -> int:
                 assert r_nj.returncode != 0 and exp_msg in (r_nj.stdout + r_nj.stderr), (
                     f"E11 {neg_nm} JS expected {exp_msg!r}, got rc={r_nj.returncode}: {r_nj.stdout}\n{r_nj.stderr}"
                 )
-        print("PASS [e9_astra_round1_round2_round3_regressions]")
+        # ------------------------------------------------------------------
+        # E12: Astra Round 4 regressions (strict INT_MAX/INT_MIN empty-endpoint
+        # short-circuiting + contracted range predicates preserving live contract checks!)
+        # ------------------------------------------------------------------
+        e12_r4 = tmp / "e12_round4.gsa"
+        e12_r4.write_text(
+            "def successor(n: Int): Int\n"
+            "    requires n < 2147483647\n"
+            "= n + 1\n"
+            "verified def checkNext(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (i > n && i <= successor(n)) ==> i > n\n"
+            "= ()\n"
+            "\n"
+            "def prev(n: Int): Int\n"
+            "    requires n > -2147483648\n"
+            "= n - 1\n"
+            "verified def checkPrev(n: Int): Void\n"
+            "    ensures forall (i: Int) -> (i < n && i >= prev(n)) ==> i < n\n"
+            "= ()\n"
+            "\n"
+            "def below(i: Int, cap: Int): Bool\n"
+            "    ensures r -> r == (i < cap)\n"
+            "= i < cap\n"
+            "verified def four(): Void\n"
+            "    ensures exists (i: Int) -> 0 <= i && below(i, 4) && i == 3\n"
+            "= ()\n"
+            "\n"
+            "def main(): Void = {\n"
+            "    checkNext(4);\n"
+            "    checkNext(2147483647);\n"
+            "    checkPrev(4);\n"
+            "    checkPrev(-2147483648);\n"
+            "    four();\n"
+            "    printLn(\"ok\")\n"
+            "}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_e12_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(e12_r4)])
+        assert r_e12_v.returncode == 0 and json.loads(r_e12_v.stdout)["ok"] is True, (
+            f"E12 Round 4 static verify failed:\n{r_e12_v.stdout}\n{r_e12_v.stderr}"
+        )
+        e12_bin = tmp / ("e12_r4.exe" if sys.platform == "win32" else "e12_r4")
+        r_e12_b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(e12_bin), str(e12_r4)])
+        assert r_e12_b.returncode == 0, f"E12 Round 4 native build failed:\n{r_e12_b.stdout}\n{r_e12_b.stderr}"
+        r_e12_n = run([str(e12_bin)])
+        assert r_e12_n.returncode == 0 and r_e12_n.stdout.strip() == "ok", (
+            f"E12 Round 4 native run failed:\n{r_e12_n.stdout}\n{r_e12_n.stderr}"
+        )
+        if shutil.which("node"):
+            e12_js = tmp / "e12_r4.mjs"
+            r_e12_jb = run([geisha, "--contracts=check", "--target", "js", "-o", str(e12_js), str(e12_r4)])
+            assert r_e12_jb.returncode == 0, f"E12 Round 4 JS build failed:\n{r_e12_jb.stdout}\n{r_e12_jb.stderr}"
+            r_e12_jr = run(["node", str(e12_js)])
+            assert r_e12_jr.returncode == 0 and r_e12_jr.stdout.strip() == "ok", (
+                f"E12 Round 4 JS run failed:\n{r_e12_jr.stdout}\n{r_e12_jr.stderr}"
+            )
+
+        # 12.2 Contracted predicate helpers MUST still execute their own contracts on boundary/empty calls!
+        for neg_nm, neg_src_txt, exp_msg in [
+            (
+                "e12_pred_ens_boundary",
+                "def badBelow(i: Int, cap: Int): Bool\n"
+                "    ensures r -> i < 4\n"
+                "= i < cap\n"
+                "def caller(): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && badBelow(i, 4)) ==> i < 4\n"
+                "= ()\n"
+                "def main(): Void = caller()\n",
+                "ensures violated",
+            ),
+            (
+                "e12_pred_ens_empty",
+                "def badBelow0(i: Int, cap: Int): Bool\n"
+                "    ensures r -> cap > 0\n"
+                "= i < cap\n"
+                "def caller0(): Void\n"
+                "    ensures forall (i: Int) -> (0 <= i && badBelow0(i, 0)) ==> false\n"
+                "= ()\n"
+                "def main(): Void = caller0()\n",
+                "ensures violated",
+            ),
+        ]:
+            neg_f = tmp / f"{neg_nm}.gsa"
+            neg_f.write_text(neg_src_txt, encoding="utf-8", newline="\n")
+            neg_b = tmp / (f"{neg_nm}.exe" if sys.platform == "win32" else neg_nm)
+            assert run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(neg_b), str(neg_f)]).returncode == 0
+            r_nb = run([str(neg_b)])
+            assert r_nb.returncode != 0 and exp_msg in (r_nb.stdout + r_nb.stderr), (
+                f"E12 {neg_nm} native expected {exp_msg!r}, got rc={r_nb.returncode}: {r_nb.stdout}\n{r_nb.stderr}"
+            )
+            if shutil.which("node"):
+                neg_j = tmp / f"{neg_nm}.mjs"
+                assert run([geisha, "--contracts=check", "--target", "js", "-o", str(neg_j), str(neg_f)]).returncode == 0
+                r_nj = run(["node", str(neg_j)])
+                assert r_nj.returncode != 0 and exp_msg in (r_nj.stdout + r_nj.stderr), (
+                    f"E12 {neg_nm} JS expected {exp_msg!r}, got rc={r_nj.returncode}: {r_nj.stdout}\n{r_nj.stderr}"
+                )
+        print("PASS [e9_astra_round1_round2_round3_round4_regressions]")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
