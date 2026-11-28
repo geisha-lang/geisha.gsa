@@ -35,7 +35,7 @@ use core.{
     TaggedTerm, MkTerm, Term, CoreArm,
     TmLit, TmVar, TmGlobalVar, TmTuple, TmBlock, TmMakeCls, TmApplyCls, TmApplyDir,
     TmBin, TmUn, TmLet, TmIf, TmWhile, TmMatch, TmMakeData, TmGetTag,
-    FunDef, CoreProgram
+    FunDef, ExternDef, CoreProgram
 }
 use diag.{
     diagGetFile, diagSpanLineCol, formatSpanDiag, formatSpanDiagHint
@@ -107,6 +107,7 @@ data SymState {
 data VerifyCtx {
     MkVerifyCtx {
         vcSpecs: StrMap FnSpec,
+        vcExterns: StrMap ExternDef,
         vcCtorTags: StrMap Int,
         vcCtorAdt: StrMap String,
         vcCtorFieldTypes: StrMap (List Type),
@@ -573,51 +574,70 @@ def bindPatEffectVarsList(pats: List Pattern, stVars: List (String, String)): Li
     Cons(p, r) -> bindPatEffectVarsList(r, bindPatEffectVars(p, stVars)),
 }
 
-def isKnownLocalOnlyIntrinsic(nm: String): Bool =
-    nm == "cellNew" || nm == "cellGet" || nm == "cellSet"
-    || nm == "arrayNew" || nm == "arrayNewZeroed"
-    || nm == "arrayLen" || nm == "immArrayLen"
-    || nm == "arrayGet" || nm == "immArrayGet"
-    || nm == "arraySet" || nm == "arrayClearSlot" || nm == "arrayFreeze"
-    || nm == "intToI64" || nm == "i64ToInt" || nm == "charToInt" || nm == "intToChar"
-    || nm == "strLen" || nm == "strByteAt" || nm == "strSlice" || nm == "strConcat"
-    || nm == "__blackBox" || nm == "assert" || nm == "assume"
-    || nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases"
-    || strStartsWith(nm, "bit") || strStartsWith(nm, "float") || strStartsWith(nm, "f32")
-    || strStartsWith(nm, "bits") || strStartsWith(nm, "intToF") || strStartsWith(nm, "math")
+def isKnownLocalOnlyIntrinsic(externs: StrMap ExternDef, nm: String): Bool =
+    if (strMapContains(externs, nm)) false
+    else
+        // Core mutable/pure container & string & verification intrinsics
+        nm == "cellNew" || nm == "cellGet" || nm == "cellSet"
+        || nm == "arrayNew" || nm == "arrayNewZeroed"
+        || nm == "arrayLen" || nm == "immArrayLen"
+        || nm == "arrayGet" || nm == "immArrayGet"
+        || nm == "arraySet" || nm == "arrayClearSlot" || nm == "arrayFreeze"
+        || nm == "strLen" || nm == "strByteAt" || nm == "strSlice" || nm == "strConcat"
+        || nm == "__blackBox" || nm == "assert" || nm == "assume"
+        || nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases"
+        // Exact bitwise intrinsics (matching codegen.gsa:tryEmitIntrinsic)
+        || nm == "bitAnd" || nm == "bitAnd64" || nm == "bitOr" || nm == "bitOr64"
+        || nm == "bitXor" || nm == "bitXor64" || nm == "bitNot" || nm == "bitNot64"
+        || nm == "bitShl" || nm == "bitShr" || nm == "bitUshr"
+        || nm == "bitShl64" || nm == "bitShr64" || nm == "bitUshr64"
+        || nm == "bitPopCount" || nm == "bitPopCount64"
+        || nm == "bitCtz" || nm == "bitCtz64" || nm == "bitClz" || nm == "bitClz64"
+        // Exact scalar conversion intrinsics (matching codegen.gsa:tryEmitIntrinsic)
+        || nm == "charToInt" || nm == "intToChar" || nm == "intToI64" || nm == "i64ToInt"
+        || nm == "floatToBits64" || nm == "bits64ToFloat" || nm == "floatToBits32" || nm == "bits32ToFloat"
+        || nm == "intToFloat" || nm == "floatToInt" || nm == "floatToF32" || nm == "f32ToFloat"
+        || nm == "intToF32" || nm == "f32ToInt" || nm == "f32ToBits32" || nm == "bits32ToF32"
+        // Exact math intrinsics (matching codegen.gsa:tryEmitIntrinsic)
+        || nm == "mathExp" || nm == "mathLog" || nm == "mathSqrt" || nm == "mathSin"
+        || nm == "mathCos" || nm == "mathTanh" || nm == "mathPow" || nm == "mathAbs"
+        || nm == "mathFloor" || nm == "mathCeil" || nm == "mathFma"
+        || nm == "mathExpF32" || nm == "mathLogF32" || nm == "mathSqrtF32" || nm == "mathSinF32"
+        || nm == "mathCosF32" || nm == "mathTanhF32" || nm == "mathPowF32" || nm == "mathAbsF32"
+        || nm == "mathFloorF32" || nm == "mathCeilF32" || nm == "mathFmaF32"
 
-def termListHasDirectAmbientEffect(ts: List TaggedTerm, specs: StrMap FnSpec): Bool = match ts {
+def termListHasDirectAmbientEffect(ts: List TaggedTerm, specs: StrMap FnSpec, externs: StrMap ExternDef): Bool = match ts {
     Nil -> false,
-    Cons(t, r) -> if (termHasDirectAmbientEffect(t, specs)) true else termListHasDirectAmbientEffect(r, specs),
+    Cons(t, r) -> if (termHasDirectAmbientEffect(t, specs, externs)) true else termListHasDirectAmbientEffect(r, specs, externs),
 }
 
-def armListHasDirectAmbientEffect(arms: List CoreArm, specs: StrMap FnSpec): Bool = match arms {
+def armListHasDirectAmbientEffect(arms: List CoreArm, specs: StrMap FnSpec, externs: StrMap ExternDef): Bool = match arms {
     Nil -> false,
     Cons(a, r) -> {
-        let gHas = match a.caGuard { Some(g) -> termHasDirectAmbientEffect(g, specs), None -> false };
-        if (gHas || termHasDirectAmbientEffect(a.caBody, specs)) true else armListHasDirectAmbientEffect(r, specs)
+        let gHas = match a.caGuard { Some(g) -> termHasDirectAmbientEffect(g, specs, externs), None -> false };
+        if (gHas || termHasDirectAmbientEffect(a.caBody, specs, externs)) true else armListHasDirectAmbientEffect(r, specs, externs)
     },
 }
 
-def termHasDirectAmbientEffect(t: TaggedTerm, specs: StrMap FnSpec): Bool = match t.tnode {
+def termHasDirectAmbientEffect(t: TaggedTerm, specs: StrMap FnSpec, externs: StrMap ExternDef): Bool = match t.tnode {
     TmGlobalVar(_) -> true,
     TmApplyCls(_, _) -> true,
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
-        if (!strMapContains(specs, nm) && !isKnownLocalOnlyIntrinsic(nm)) true
-        else termListHasDirectAmbientEffect(args, specs)
+        if (strMapContains(externs, nm) || (!strMapContains(specs, nm) && !isKnownLocalOnlyIntrinsic(externs, nm))) true
+        else termListHasDirectAmbientEffect(args, specs, externs)
     },
-    TmMakeCls(_, _, b) -> termHasDirectAmbientEffect(b, specs),
-    TmTuple(es) -> termListHasDirectAmbientEffect(es, specs),
-    TmBlock(es) -> termListHasDirectAmbientEffect(es, specs),
-    TmMakeData(_, _, fs, _, _) -> termListHasDirectAmbientEffect(fs, specs),
-    TmBin(_, l, r) -> termHasDirectAmbientEffect(l, specs) || termHasDirectAmbientEffect(r, specs),
-    TmUn(_, e) -> termHasDirectAmbientEffect(e, specs),
-    TmLet(_, v, b) -> termHasDirectAmbientEffect(v, specs) || termHasDirectAmbientEffect(b, specs),
-    TmIf(c, th, el) -> termHasDirectAmbientEffect(c, specs) || termHasDirectAmbientEffect(th, specs) || termHasDirectAmbientEffect(el, specs),
-    TmWhile(c, b) -> termHasDirectAmbientEffect(c, specs) || termHasDirectAmbientEffect(b, specs),
-    TmMatch(s, arms) -> termHasDirectAmbientEffect(s, specs) || armListHasDirectAmbientEffect(arms, specs),
-    TmGetTag(e) -> termHasDirectAmbientEffect(e, specs),
+    TmMakeCls(_, _, b) -> termHasDirectAmbientEffect(b, specs, externs),
+    TmTuple(es) -> termListHasDirectAmbientEffect(es, specs, externs),
+    TmBlock(es) -> termListHasDirectAmbientEffect(es, specs, externs),
+    TmMakeData(_, _, fs, _, _) -> termListHasDirectAmbientEffect(fs, specs, externs),
+    TmBin(_, l, r) -> termHasDirectAmbientEffect(l, specs, externs) || termHasDirectAmbientEffect(r, specs, externs),
+    TmUn(_, e) -> termHasDirectAmbientEffect(e, specs, externs),
+    TmLet(_, v, b) -> termHasDirectAmbientEffect(v, specs, externs) || termHasDirectAmbientEffect(b, specs, externs),
+    TmIf(c, th, el) -> termHasDirectAmbientEffect(c, specs, externs) || termHasDirectAmbientEffect(th, specs, externs) || termHasDirectAmbientEffect(el, specs, externs),
+    TmWhile(c, b) -> termHasDirectAmbientEffect(c, specs, externs) || termHasDirectAmbientEffect(b, specs, externs),
+    TmMatch(s, arms) -> termHasDirectAmbientEffect(s, specs, externs) || armListHasDirectAmbientEffect(arms, specs, externs),
+    TmGetTag(e) -> termHasDirectAmbientEffect(e, specs, externs),
     _ -> false,
 }
 
@@ -634,7 +654,7 @@ def computeAmbientHeapEffectFns(
                 match strMapGet(prog.coreFns, nm) {
                     Some(fd) -> {
                         let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
-                        if (hasFvs || termHasDirectAmbientEffect(fd.fnBody, specs)) {
+                        if (hasFvs || termHasDirectAmbientEffect(fd.fnBody, specs, prog.coreExterns)) {
                             strMapInsert(ambient, nm, true)
                         } else ()
                     },
@@ -690,7 +710,9 @@ def scanEffectsInTerm(
     TmGlobalVar(_) -> cellSet(hasOpaqueCall, true),
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
-        if (nm == "cellSet") {
+        if (strMapContains(ctx.vcExterns, nm)) {
+            cellSet(hasOpaqueCall, true)
+        } else if (nm == "cellSet") {
             match args {
                 Cons(cArg, _) -> match cArg.tnode {
                     TmVar(cn) -> match assocGet(stVars, cn) {
@@ -714,7 +736,7 @@ def scanEffectsInTerm(
                 },
                 Nil -> (),
             }
-        } else if (strMapContains(ctx.vcAmbientMutFns, nm) || (!strMapContains(ctx.vcSpecs, nm) && !isKnownLocalOnlyIntrinsic(nm))) {
+        } else if (strMapContains(ctx.vcAmbientMutFns, nm) || (!strMapContains(ctx.vcSpecs, nm) && !isKnownLocalOnlyIntrinsic(ctx.vcExterns, nm))) {
             cellSet(hasOpaqueCall, true)
         } else if (nm != "cellGet" && nm != "cellNew" && nm != "arrayLen" && nm != "immArrayLen"
             && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew" && nm != "arrayNewZeroed"
@@ -1703,7 +1725,7 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
             let vname = vd.vname;
             let vty = schemeBody(vd.vscm);
             match valT.tnode {
-                TmApplyDir(cvd, cargs) if (cvd.vname == "cellNew") -> match cargs {
+                TmApplyDir(cvd, cargs) if (cvd.vname == "cellNew" && !strMapContains(ctx.vcExterns, cvd.vname)) -> match cargs {
                     Cons(initT, _) -> {
                         let (st1, iv) = evalTerm(ctx, st, initT, emitObs);
                         let loc = freshLoc(ctx, vname);
@@ -1735,7 +1757,7 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                     },
                     Nil -> evalTerm(ctx, st, bodyT, emitObs),
                 },
-                TmApplyDir(avd, aargs) if (avd.vname == "arrayNew" || avd.vname == "arrayNewZeroed") -> match aargs {
+                TmApplyDir(avd, aargs) if ((avd.vname == "arrayNew" || avd.vname == "arrayNewZeroed") && !strMapContains(ctx.vcExterns, avd.vname)) -> match aargs {
                     Cons(lenT, restA) -> {
                         let (st1, lenV) = evalTerm(ctx, st, lenT, emitObs);
                         let (st2, initV) = match restA {
@@ -2422,7 +2444,12 @@ def evalApplyDir(
     args: List TaggedTerm,
     emitObs: Bool
 ): (SymState, Option String) =
-    if (nm == "cellNew") {
+    if (strMapContains(ctx.vcExterns, nm)) {
+        // Extern declaration: never match built-in intrinsic semantics; conservatively havoc all mutable heap
+        let (st1, _) = evalArgs(ctx, st, args, emitObs);
+        let stOut = havocLocs(ctx, st1, assocKeysUnique(st1.stCells), assocKeysUnique(st1.stArrMems), "ext");
+        (stOut, None)
+    } else if (nm == "cellNew") {
         match args {
             Cons(initT, _) -> {
                 let (st1, initV) = evalTerm(ctx, st, initT, emitObs);
@@ -3110,7 +3137,7 @@ def evalApplyDir(
                         _ -> (),
                     }
                 };
-                if (!isKnownLocalOnlyIntrinsic(nm)) {
+                if (!isKnownLocalOnlyIntrinsic(ctx.vcExterns, nm)) {
                     cellSet(unknownMutContainer, true)
                 } else ();
                 let havocCells = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
@@ -3453,6 +3480,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
 
     let fnCtxBase = MkVerifyCtx {
         vcSpecs: ctx.vcSpecs,
+        vcExterns: ctx.vcExterns,
         vcCtorTags: ctx.vcCtorTags,
         vcCtorAdt: ctx.vcCtorAdt,
         vcCtorFieldTypes: ctx.vcCtorFieldTypes,
@@ -3512,6 +3540,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
 
     let fnCtx = MkVerifyCtx {
         vcSpecs: ctx.vcSpecs,
+        vcExterns: ctx.vcExterns,
         vcCtorTags: ctx.vcCtorTags,
         vcCtorAdt: ctx.vcCtorAdt,
         vcCtorFieldTypes: ctx.vcCtorFieldTypes,
@@ -3717,6 +3746,7 @@ pub def verifyCoreProgram(
     let ambientMutFns = computeAmbientHeapEffectFns(prog, specs, callGraph);
     let ctx = MkVerifyCtx {
         vcSpecs: specs,
+        vcExterns: prog.coreExterns,
         vcCtorTags: ctorTags,
         vcCtorAdt: ctorAdt,
         vcCtorFieldTypes: ctorFtys,
@@ -4111,6 +4141,7 @@ pub def computeVerifiedSafeFns(
     let runVerifyOne = (sp: FnSpec) -> {
         let ctx = MkVerifyCtx {
             vcSpecs: specs,
+            vcExterns: prog.coreExterns,
             vcCtorTags: ctorTags,
             vcCtorAdt: ctorAdt,
             vcCtorFieldTypes: ctorFtys,
@@ -4235,6 +4266,7 @@ pub def computeVerifiedSafeFns(
             // OR implicit non-aliasing preconditions on mutable parameters (Iron Law 1 + V2 + W2)
             let aliasCtx = MkVerifyCtx {
                 vcSpecs: specs,
+                vcExterns: prog.coreExterns,
                 vcCtorTags: ctorTags,
                 vcCtorAdt: ctorAdt,
                 vcCtorFieldTypes: ctorFtys,

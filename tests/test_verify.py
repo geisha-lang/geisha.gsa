@@ -1454,7 +1454,61 @@ def main() -> int:
             z_blk = fn_ir_block(z_ll.read_text(encoding="utf-8"), z_target_fn)
             assert "call void @llvm.assume" not in z_blk, f"Z1 {z_name} emitted false @llvm.assume in {z_target_fn}!\n{z_blk}"
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z3 adversarial/TCO/eval/zerosorts + cache isolation verified")
+        # Z4 Adversarial: extern C functions whose names start with intrinsic prefixes
+        # (`math`, `bit`, `bits`, `float`, `f32`, `intToF`) MUST NEVER be treated as local-only intrinsics.
+        for ext_nm in ["mathNotify", "bitNotify", "bitsNotify", "floatNotify", "f32Notify", "intToFNotify"]:
+            z4_src = tmp / f"z4_{ext_nm}.gsa"
+            z4_src.write_text(
+                f'extern "review_notify" def {ext_nm}(): Void\n'
+                "def slot: Cell (Cell Int) = cellNew(cellNew(0))\n"
+                "def remember(c: Cell Int): Void = cellSet(slot, c)\n"
+                "def observe(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    remember(c);\n"
+                "    cellSet(c, 1);\n"
+                f"    {ext_nm}();\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(); () }\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            r_z4v = run([geisha, "verify", "--json", "--solver", z3_bin, str(z4_src)])
+            assert r_z4v.returncode == 1, f"Z4 {ext_nm} verify MUST fail (exit 1), got {r_z4v.returncode}:\n{r_z4v.stdout}\n{r_z4v.stderr}"
+            z4_ll = tmp / f"z4_{ext_nm}.ll"
+            r_z4ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z4_ll), str(z4_src)])
+            assert r_z4ir.returncode == 0, f"Z4 {ext_nm} IR compile failed:\n{r_z4ir.stdout}\n{r_z4ir.stderr}"
+            z4_blk = fn_ir_block(z4_ll.read_text(encoding="utf-8"), "observe")
+            assert "call void @llvm.assume" not in z4_blk, f"Z4 {ext_nm} emitted false @llvm.assume in observe!\n{z4_blk}"
+
+        # Z4 Positive control: genuine pure intrinsics (`bitAnd`, `mathAbs`) MUST NOT trigger spurious cell havoc
+        z4_pos_src = tmp / "z4_pure_intrinsics.gsa"
+        z4_pos_src.write_text(
+            "def observePure(): Int = {\n"
+            "    let c = cellNew(1);\n"
+            "    let _ = bitAnd(3, 1);\n"
+            "    let _ = mathAbs(1.0);\n"
+            "    assert(cellGet(c) == 1);\n"
+            "    cellGet(c)\n"
+            "}\n"
+            "def main(): Void = { let _ = observePure(); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_z4pv = run([geisha, "verify", "--json", "--solver", z3_bin, str(z4_pos_src)])
+        assert r_z4pv.returncode == 0, f"Z4 pure intrinsics verify failed:\n{r_z4pv.stdout}\n{r_z4pv.stderr}"
+        z4p_j = json.loads(r_z4pv.stdout)
+        assert z4p_j["ok"] is True and z4p_j["failed"] == 0 and z4p_j["unknown"] == 0 and z4p_j["proved"] >= 1, (
+            f"Z4 pure intrinsics unexpected summary: {z4p_j}"
+        )
+        z4p_ll = tmp / "z4_pure_intrinsics.ll"
+        r_z4pir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z4p_ll), str(z4_pos_src)])
+        assert r_z4pir.returncode == 0, f"Z4 pure intrinsics IR compile failed:\n{r_z4pir.stdout}\n{r_z4pir.stderr}"
+        z4p_blk = fn_ir_block(z4p_ll.read_text(encoding="utf-8"), "observePure")
+        assert "call void @llvm.assume" in z4p_blk, f"Z4 pure intrinsics should still emit @llvm.assume in observePure!\n{z4p_blk}"
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z4 adversarial/TCO/eval/zerosorts + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
