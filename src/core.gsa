@@ -10,9 +10,9 @@ use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
 use std.str.{intToStr, strStartsWith}
 use ast.{
-    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
+    Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp, isModeVarName,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
-    ConstraintSpec, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
+    ConstraintSpec, MkConstraint, schemeBody, schemeTypeParams, schemeConstraints, isFnScheme,
     listContainsStr, addUniqueStr, sortUniqueStrings, typeToString, typesEqual,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
     BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr,
@@ -21,13 +21,13 @@ use ast.{
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl, MkVarDecl,
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
-    MatchArm,
-    Form, Expr,
+    MatchArm, MkMatchArm,
+    Form, MkForm, Expr,
     ExLit, ExVar, ExTuple, ExStructInit, ExList, ExBlock, ExApply,
     ExAbs, ExBin, ExUn, ExLet, ExIf, ExWhile, ExMatch, ExField, ExTry,
-    ExContract, ExLoopContract, EnsuresClause, FnContract,
+    ExContract, ExLoopContract, EnsuresClause, MkEnsuresClause, FnContract,
     Item, ItForm, ItExtern,
-    DefAttr, AttrExport, AttrCtor, AttrCStruct,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct, AttrVerified,
     Def, Span, emptySpan
 }
 use infer.{
@@ -35,10 +35,69 @@ use infer.{
     mangleType, applyExplicitSubst, buildPairMap, matchInstancePatList, isConcreteTypeSend
 }
 use diag.{diagGetFile, diagSpanLineCol}
-use verified_kernels.{
-    coFreshNextId, coFreshBatchEnd, coFlatTotalArity,
-    coSpecSlotStepArity, coAnfInFloatPrefix, coPatSeqStatus, coInlineBudgetAllows
+
+pub def coFreshNextId(curId: Int): Int
+    requires 0 <= curId && curId < 2147483647
+    ensures r -> r == curId + 1 && r > curId && r > 0
+= curId + 1
+
+pub def coFreshBatchEnd(startId: Int, count: Int): Int
+    requires 0 <= startId && startId <= 1073741824 && 0 <= count && count <= 1048576
+    ensures r -> r == startId + count && r >= startId
+= {
+    let cur = cellNew(startId);
+    let rem = cellNew(count);
+    while (cellGet(rem) > 0)
+        invariant 0 <= cellGet(rem) && cellGet(rem) <= count
+        invariant 0 <= cellGet(cur) && cellGet(cur) == startId + (count - cellGet(rem))
+        decreases cellGet(rem)
+    {
+        cellSet(cur, cellGet(cur) + 1);
+        cellSet(rem, cellGet(rem) - 1)
+    };
+    cellGet(cur)
 }
+
+pub def coFlatTotalArity(fvCount: Int, paramCount: Int): Int
+    requires 0 <= fvCount && fvCount <= 1048576 && 0 <= paramCount && paramCount <= 1048576
+    ensures r -> r == fvCount + paramCount && r >= fvCount && r >= paramCount
+= fvCount + paramCount
+
+pub def coSpecSlotStepArity(curArity: Int, isSpecCb: Bool, fvCount: Int): Int
+    requires 0 <= curArity && curArity <= 1048576 && 0 <= fvCount && fvCount <= 1024
+    ensures r -> r >= curArity
+        && ((isSpecCb && r == curArity + fvCount) || (!isSpecCb && r == curArity + 1))
+= if (isSpecCb) curArity + fvCount else curArity + 1
+
+pub def coAnfInFloatPrefix(idx: Int, lastFloatIdx: Int): Bool
+    requires idx >= 0 && lastFloatIdx >= -1
+    ensures r -> (r == (idx <= lastFloatIdx)) && (!r || lastFloatIdx >= 0)
+= idx <= lastFloatIdx
+
+pub def coPatSeqStatus(s1: Int, s2: Int): Int
+    requires 0 <= s1 && s1 <= 2 && 0 <= s2 && s2 <= 2
+    ensures r -> 0 <= r && r <= 2
+        && ((r == 1) == (s1 == 1 || s2 == 1))
+        && ((r == 0) == (s1 == 0 && s2 == 0))
+= if (s1 == 1) 1 else if (s1 == 2) { if (s2 == 1) 1 else 2 } else s2
+
+pub def coInlineBudgetAllows(
+    cost: Int,
+    maxCost: Int,
+    inlCnt: Int,
+    maxInlines: Int,
+    depth: Int,
+    maxDepth: Int
+): Bool
+    requires maxCost >= 1 && maxInlines >= 0 && maxDepth >= 0
+    ensures r -> r == (
+        1 <= cost && cost <= maxCost
+        && 0 <= inlCnt && inlCnt < maxInlines
+        && 0 <= depth && depth < maxDepth
+    )
+= 1 <= cost && cost <= maxCost
+    && 0 <= inlCnt && inlCnt < maxInlines
+    && 0 <= depth && depth < maxDepth
 
 // ============================================================================
 // Core IR Data Types (Distinct single-variant field names across project)
@@ -114,6 +173,9 @@ pub data CoreProgram {
         coreAdtReg: StrMap AdtInfo,
         coreAdtNames: List String,
         coreEscape: EscapeInfo,
+        coreVerifiedFns: StrMap Bool,
+        coreOrigFnNames: StrMap String,
+        coreUnseededPolyFns: List (String, Span, Bool),
     },
 }
 
@@ -333,6 +395,10 @@ data KCtx {
         kInstanceReg: List InstanceInfo,
         kConceptMethods: StrMap (String, Int),
         kContractMode: String,
+        kVerifiedFns: StrMap Bool,
+        kOrigFnNames: StrMap String,
+        kInstantiatedPoly: StrMap Bool,
+        kUnseededPolyRev: Cell (List (String, Span, Bool)),
         kErr: Cell (Option String),
     },
 }
@@ -914,6 +980,630 @@ def collectAstFreeLocalsList(
     },
 }
 
+def isUnshadowedOldInCore(ctx: KCtx, innerBound: List String): Bool =
+    !listContainsStr(innerBound, "old")
+    && (match assocLookupScheme(cellGet(ctx.kLocalEnv), "old") { Some(_) -> false, None -> true })
+    && !strMapContains(ctx.kTopDirect, "old")
+
+def formMentionsAnyBound(f: Form, targets: List String, shadowed: List String): Bool = match f.node {
+    ExVar(v) -> !listContainsStr(shadowed, v) && listContainsStr(targets, v),
+    ExTuple(es) -> formListMentionsAnyBound(es, targets, shadowed),
+    ExList(es) -> formListMentionsAnyBound(es, targets, shadowed),
+    ExBlock(es) -> formListMentionsAnyBound(es, targets, shadowed),
+    ExStructInit(_, fs) -> {
+        let hit = cellNew(false);
+        let cur = cellNew(fs);
+        while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, vf), r) -> {
+                    if (formMentionsAnyBound(vf, targets, shadowed)) cellSet(hit, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(hit)
+    },
+    ExApply(c, args) -> formMentionsAnyBound(c, targets, shadowed) || formListMentionsAnyBound(args, targets, shadowed),
+    ExAbs(ps, _, b) -> {
+        let nextSh = cellNew(shadowed);
+        let cp = cellNew(ps);
+        while (match cellGet(cp) { Nil -> false, _ -> true }) {
+            match cellGet(cp) {
+                Cons(vd, r) -> { cellSet(nextSh, Cons(vd.vname, cellGet(nextSh))); cellSet(cp, r) },
+                Nil -> (),
+            }
+        };
+        formMentionsAnyBound(b, targets, cellGet(nextSh))
+    },
+    ExBin(_, l, r) -> formMentionsAnyBound(l, targets, shadowed) || formMentionsAnyBound(r, targets, shadowed),
+    ExUn(_, e) -> formMentionsAnyBound(e, targets, shadowed),
+    ExField(e, _) -> formMentionsAnyBound(e, targets, shadowed),
+    ExTry(e) -> formMentionsAnyBound(e, targets, shadowed),
+    ExLet(vd, v, b) ->
+        formMentionsAnyBound(v, targets, shadowed)
+        || formMentionsAnyBound(b, targets, Cons(vd.vname, shadowed)),
+    ExIf(c, t, e) ->
+        formMentionsAnyBound(c, targets, shadowed)
+        || formMentionsAnyBound(t, targets, shadowed)
+        || formMentionsAnyBound(e, targets, shadowed),
+    ExMatch(s, arms) ->
+        if (formMentionsAnyBound(s, targets, shadowed)) true
+        else {
+            let hit = cellNew(false);
+            let cur = cellNew(arms);
+            while (!cellGet(hit) && match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let sh2 = collectPatVarsList(a.pat, shadowed);
+                        let gHit = match a.guard {
+                            Some(g) -> formMentionsAnyBound(g, targets, sh2),
+                            None -> false,
+                        };
+                        if (gHit || formMentionsAnyBound(a.body, targets, sh2)) cellSet(hit, true) else ();
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            cellGet(hit)
+        },
+    _ -> false,
+}
+
+def formListMentionsAnyBound(es: List Form, targets: List String, shadowed: List String): Bool = match es {
+    Nil -> false,
+    Cons(h, t) -> if (formMentionsAnyBound(h, targets, shadowed)) true else formListMentionsAnyBound(t, targets, shadowed),
+}
+
+def mkCloneMutArrayTerm(ctx: KCtx, sp: Span, arrScm: Scheme, arrTerm: TaggedTerm): TaggedTerm = {
+    let arrTy = schemeBody(arrScm);
+    let elemTy = match arrTy {
+        TyComp(_, et) -> et,
+        _ -> TyCon("Int"),
+    };
+    let intScm = ScmMono(TyCon("Int"));
+    let boolScm = ScmMono(TyCon("Bool"));
+    let voidScm = ScmMono(TyVoid);
+    let cellIntScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Int")));
+
+    let srcName = "__gs_old_src_" + intToStr(kUnique(ctx));
+    let lenName = "__gs_old_len_" + intToStr(kUnique(ctx));
+    let cpName = "__gs_old_cp_" + intToStr(kUnique(ctx));
+    let idxName = "__gs_old_idx_" + intToStr(kUnique(ctx));
+
+    let srcVar = MkTerm { tspan: sp, tscm: arrScm, tnode: TmVar(srcName) };
+    let lenVar = MkTerm { tspan: sp, tscm: intScm, tnode: TmVar(lenName) };
+    let cpVar = MkTerm { tspan: sp, tscm: arrScm, tnode: TmVar(cpName) };
+    let idxVar = MkTerm { tspan: sp, tscm: cellIntScm, tnode: TmVar(idxName) };
+
+    let zeroLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) };
+    let oneLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(1)) };
+
+    let arrLenCall = MkTerm {
+        tspan: sp, tscm: intScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "arrayLen", vscm: ScmMono(TyArr(TyVoid, [arrTy], TyCon("Int"))) }, [srcVar]),
+    };
+    let emptyCall = MkTerm {
+        tspan: sp, tscm: arrScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "arrayNewZeroed", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], arrTy)) }, [zeroLit]),
+    };
+    let elem0Call = MkTerm {
+        tspan: sp, tscm: ScmMono(elemTy),
+        tnode: TmApplyDir(MkVarDecl { vname: "arrayGet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int")], elemTy)) }, [srcVar, zeroLit]),
+    };
+    let allocCall = MkTerm {
+        tspan: sp, tscm: arrScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "arrayNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int"), elemTy], arrTy)) }, [lenVar, elem0Call]),
+    };
+    let idxInit = MkTerm {
+        tspan: sp, tscm: cellIntScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyComp(TyCon("Cell"), TyCon("Int")))) }, [oneLit]),
+    };
+    let idxGet = () -> MkTerm {
+        tspan: sp, tscm: intScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int"))], TyCon("Int"))) }, [idxVar]),
+    };
+    let elemICall = MkTerm {
+        tspan: sp, tscm: ScmMono(elemTy),
+        tnode: TmApplyDir(MkVarDecl { vname: "arrayGet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int")], elemTy)) }, [srcVar, idxGet()]),
+    };
+    let setICall = MkTerm {
+        tspan: sp, tscm: voidScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "arraySet", vscm: ScmMono(TyArr(TyVoid, [arrTy, TyCon("Int"), elemTy], TyVoid)) }, [cpVar, idxGet(), elemICall]),
+    };
+    let incExpr = MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, idxGet(), oneLit) };
+    let idxIncCall = MkTerm {
+        tspan: sp, tscm: voidScm,
+        tnode: TmApplyDir(MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int")), TyCon("Int")], TyVoid)) }, [idxVar, incExpr]),
+    };
+    let loopCond = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLt, idxGet(), lenVar) };
+    let loopTerm = MkTerm {
+        tspan: sp, tscm: voidScm,
+        tnode: TmWhile(loopCond, MkTerm { tspan: sp, tscm: voidScm, tnode: TmBlock([setICall, idxIncCall]) }),
+    };
+    let nonEmptyBranch = MkTerm {
+        tspan: sp, tscm: arrScm,
+        tnode: TmLet(
+            MkVarDecl { vname: cpName, vscm: arrScm },
+            allocCall,
+            MkTerm {
+                tspan: sp, tscm: arrScm,
+                tnode: TmLet(
+                    MkVarDecl { vname: idxName, vscm: cellIntScm },
+                    idxInit,
+                    MkTerm { tspan: sp, tscm: arrScm, tnode: TmBlock([loopTerm, cpVar]) }
+                ),
+            }
+        ),
+    };
+    let condZero = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLe, lenVar, zeroLit) };
+    let branchTerm = MkTerm { tspan: sp, tscm: arrScm, tnode: TmIf(condZero, emptyCall, nonEmptyBranch) };
+    MkTerm {
+        tspan: sp, tscm: arrScm,
+        tnode: TmLet(
+            MkVarDecl { vname: srcName, vscm: arrScm },
+            arrTerm,
+            MkTerm {
+                tspan: sp, tscm: arrScm,
+                tnode: TmLet(MkVarDecl { vname: lenName, vscm: intScm }, arrLenCall, branchTerm),
+            }
+        ),
+    }
+}
+
+def rewriteOldInFormForCheck(
+    ctx: KCtx,
+    f: Form,
+    innerBound: List String,
+    snapsRev: Cell (List (String, Scheme, TaggedTerm))
+): Form = {
+    let mk = (nd: Expr) -> MkForm { pos: f.pos, ty: f.ty, annot: f.annot, node: nd };
+    match f.node {
+        ExApply(callee, args) -> {
+            let isOld = match callee.node {
+                ExVar(nm) -> nm == "old" && isUnshadowedOldInCore(ctx, innerBound),
+                _ -> false,
+            };
+            if (isOld) {
+                match args {
+                    Cons(arg0, Nil) ->
+                        if (!formMentionsAnyBound(arg0, innerBound, Nil)) {
+                            let snapName = "__gs_old_" + intToStr(kUnique(ctx));
+                            let snapTerm = transformForm(ctx, arg0);
+                            cellSet(snapsRev, Cons((snapName, arg0.ty, snapTerm), cellGet(snapsRev)));
+                            MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExVar(snapName) }
+                        } else match arg0.node {
+                            ExApply(cF, Cons(arrF, Cons(idxF, Nil))) -> match cF.node {
+                                ExVar(anm) if (anm == "immArrayGet") -> {
+                                    let snapArr = "__gs_old_arr_" + intToStr(kUnique(ctx));
+                                    cellSet(snapsRev, Cons((snapArr, arrF.ty, transformForm(ctx, arrF)), cellGet(snapsRev)));
+                                    let rwIdx = rewriteOldInFormForCheck(ctx, idxF, innerBound, snapsRev);
+                                    let arrRef = MkForm { pos: arrF.pos, ty: arrF.ty, annot: None, node: ExVar(snapArr) };
+                                    MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExApply(cF, [arrRef, rwIdx]) }
+                                },
+                                ExVar(anm) if (anm == "arrayGet") -> {
+                                    let snapArr = "__gs_old_arr_" + intToStr(kUnique(ctx));
+                                    let cloneTerm = mkCloneMutArrayTerm(ctx, f.pos, arrF.ty, transformForm(ctx, arrF));
+                                    cellSet(snapsRev, Cons((snapArr, arrF.ty, cloneTerm), cellGet(snapsRev)));
+                                    let rwIdx = rewriteOldInFormForCheck(ctx, idxF, innerBound, snapsRev);
+                                    let arrRef = MkForm { pos: arrF.pos, ty: arrF.ty, annot: None, node: ExVar(snapArr) };
+                                    MkForm { pos: f.pos, ty: arg0.ty, annot: None, node: ExApply(cF, [arrRef, rwIdx]) }
+                                },
+                                _ -> arg0,
+                            },
+                            _ -> arg0,
+                        },
+                    _ -> f,
+                }
+            } else {
+                let rc = rewriteOldInFormForCheck(ctx, callee, innerBound, snapsRev);
+                let raRev: Cell (List Form) = cellNew(Nil);
+                let ca = cellNew(args);
+                while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                    match cellGet(ca) {
+                        Cons(a, r) -> {
+                            cellSet(raRev, Cons(rewriteOldInFormForCheck(ctx, a, innerBound, snapsRev), cellGet(raRev)));
+                            cellSet(ca, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                mk(ExApply(rc, listRev(cellGet(raRev))))
+            }
+        },
+        ExTuple(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExTuple(listRev(cellGet(rev))))
+        },
+        ExList(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExList(listRev(cellGet(rev))))
+        },
+        ExBlock(es) -> {
+            let rev: Cell (List Form) = cellNew(Nil);
+            let cur = cellNew(es);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(e, r) -> { cellSet(rev, Cons(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExBlock(listRev(cellGet(rev))))
+        },
+        ExStructInit(cn, fs) -> {
+            let rev: Cell (List (String, Form)) = cellNew(Nil);
+            let cur = cellNew(fs);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons((k, v), r) -> { cellSet(rev, Cons((k, rewriteOldInFormForCheck(ctx, v, innerBound, snapsRev)), cellGet(rev))); cellSet(cur, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExStructInit(cn, listRev(cellGet(rev))))
+        },
+        ExAbs(ps, rt, b) -> {
+            let nb = cellNew(innerBound);
+            let cp = cellNew(ps);
+            while (match cellGet(cp) { Nil -> false, _ -> true }) {
+                match cellGet(cp) {
+                    Cons(vd, r) -> { cellSet(nb, Cons(vd.vname, cellGet(nb))); cellSet(cp, r) },
+                    Nil -> (),
+                }
+            };
+            mk(ExAbs(ps, rt, rewriteOldInFormForCheck(ctx, b, cellGet(nb), snapsRev)))
+        },
+        ExBin(op, l, r) -> mk(ExBin(op, rewriteOldInFormForCheck(ctx, l, innerBound, snapsRev), rewriteOldInFormForCheck(ctx, r, innerBound, snapsRev))),
+        ExUn(op, e) -> mk(ExUn(op, rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev))),
+        ExField(e, nm) -> mk(ExField(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev), nm)),
+        ExTry(e) -> mk(ExTry(rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev))),
+        ExLet(vd, v, b) -> mk(ExLet(
+            vd,
+            rewriteOldInFormForCheck(ctx, v, innerBound, snapsRev),
+            rewriteOldInFormForCheck(ctx, b, Cons(vd.vname, innerBound), snapsRev)
+        )),
+        ExIf(c, t, e) -> mk(ExIf(
+            rewriteOldInFormForCheck(ctx, c, innerBound, snapsRev),
+            rewriteOldInFormForCheck(ctx, t, innerBound, snapsRev),
+            rewriteOldInFormForCheck(ctx, e, innerBound, snapsRev)
+        )),
+        ExMatch(s, arms) -> {
+            let rs = rewriteOldInFormForCheck(ctx, s, innerBound, snapsRev);
+            let narmsRev: Cell (List MatchArm) = cellNew(Nil);
+            let cur = cellNew(arms);
+            while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                match cellGet(cur) {
+                    Cons(a, r) -> {
+                        let ab = collectPatVarsList(a.pat, innerBound);
+                        let ng = match a.guard { Some(g) -> Some(rewriteOldInFormForCheck(ctx, g, ab, snapsRev)), None -> None };
+                        let nb = rewriteOldInFormForCheck(ctx, a.body, ab, snapsRev);
+                        cellSet(narmsRev, Cons(MkMatchArm { pat: a.pat, guard: ng, body: nb }, cellGet(narmsRev)));
+                        cellSet(cur, r)
+                    },
+                    Nil -> (),
+                }
+            };
+            mk(ExMatch(rs, listRev(cellGet(narmsRev))))
+        },
+        _ -> f,
+    }
+}
+
+def scanIntQuantBounds(
+    cond: Form,
+    qvar: String,
+    loOut: Cell (Option (Form, Bool)),
+    hiOut: Cell (Option (Form, Bool))
+): Void = match cond.node {
+    ExBin(OpAnd, l, r) -> {
+        scanIntQuantBounds(l, qvar, loOut, hiOut);
+        scanIntQuantBounds(r, qvar, loOut, hiOut)
+    },
+    ExIf(c, t, el) -> match el.node {
+        ExLit(LitBool(false)) -> {
+            scanIntQuantBounds(c, qvar, loOut, hiOut);
+            scanIntQuantBounds(t, qvar, loOut, hiOut)
+        },
+        _ -> (),
+    },
+    ExBin(op, l, r) -> {
+        let lIsVar = match l.node { ExVar(v) -> v == qvar, _ -> false };
+        let rIsVar = match r.node { ExVar(v) -> v == qvar, _ -> false };
+        if (lIsVar && !formMentionsAnyBound(r, [qvar], Nil)) {
+            match op {
+                OpGe -> cellSet(loOut, Some((r, false))),
+                OpGt -> cellSet(loOut, Some((r, true))),
+                OpLt -> cellSet(hiOut, Some((r, false))),
+                OpLe -> cellSet(hiOut, Some((r, true))),
+                _ -> (),
+            }
+        } else if (rIsVar && !formMentionsAnyBound(l, [qvar], Nil)) {
+            match op {
+                OpLe -> cellSet(loOut, Some((l, false))),
+                OpLt -> cellSet(loOut, Some((l, true))),
+                OpGt -> cellSet(hiOut, Some((l, false))),
+                OpGe -> cellSet(hiOut, Some((l, true))),
+                _ -> (),
+            }
+        } else ()
+    },
+    _ -> (),
+}
+
+def lowerQuantifierForCheck(
+    ctx: KCtx,
+    sp: Span,
+    isForall: Bool,
+    vd: VarDecl,
+    qbody: Form
+): TaggedTerm = {
+    let boolScm = ScmMono(TyCon("Bool"));
+    let intScm = ScmMono(TyCon("Int"));
+    let charScm = ScmMono(TyCon("Char"));
+    let voidScm = ScmMono(TyVoid);
+    let bty = schemeBody(vd.vscm);
+    match bty {
+        TyCon("Bool") -> {
+            let savedEnv = cellGet(ctx.kLocalEnv);
+            cellSet(ctx.kLocalEnv, Cons((vd.vname, boolScm), savedEnv));
+            let tbFalse = transformForm(ctx, qbody);
+            let tbTrue = transformForm(ctx, qbody);
+            cellSet(ctx.kLocalEnv, savedEnv);
+            let fLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(false)) };
+            let tLit = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) };
+            let eFalse = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: vd.vname, vscm: boolScm }, fLit, tbFalse) };
+            let eTrue = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: vd.vname, vscm: boolScm }, tLit, tbTrue) };
+            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(if (isForall) OpAnd else OpOr, eFalse, eTrue) }
+        },
+        TyCon("Char") -> {
+            let cellIntScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Int")));
+            let cellBoolScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Bool")));
+            let idxName = "__gs_qi_" + intToStr(kUnique(ctx));
+            let resName = "__gs_qr_" + intToStr(kUnique(ctx));
+            let idxVar = MkTerm { tspan: sp, tscm: cellIntScm, tnode: TmVar(idxName) };
+            let resVar = MkTerm { tspan: sp, tscm: cellBoolScm, tnode: TmVar(resName) };
+            let savedEnv = cellGet(ctx.kLocalEnv);
+            cellSet(ctx.kLocalEnv, Cons((vd.vname, charScm), savedEnv));
+            let tbody = transformForm(ctx, qbody);
+            cellSet(ctx.kLocalEnv, savedEnv);
+            let getI = () -> MkTerm {
+                tspan: sp, tscm: intScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int"))], TyCon("Int"))) }, [idxVar]),
+            };
+            let getR = () -> MkTerm {
+                tspan: sp, tscm: boolScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool"))], TyCon("Bool"))) }, [resVar]),
+            };
+            let chVal = MkTerm {
+                tspan: sp, tscm: charScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "intToChar", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyCon("Char"))) }, [getI()]),
+            };
+            let bodyLet = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: vd.vname, vscm: charScm }, chVal, tbody) };
+            let flipVal = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(!isForall)) };
+            let setRes = MkTerm {
+                tspan: sp, tscm: voidScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool")), TyCon("Bool")], TyVoid)) }, [resVar, flipVal]),
+            };
+            let chkCond = if (isForall) MkTerm { tspan: sp, tscm: boolScm, tnode: TmUn(UnNot, bodyLet) } else bodyLet;
+            let stepChk = MkTerm { tspan: sp, tscm: voidScm, tnode: TmIf(chkCond, setRes, mkUnitTerm(sp)) };
+            let incI = MkTerm {
+                tspan: sp, tscm: voidScm,
+                tnode: TmApplyDir(
+                    MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int")), TyCon("Int")], TyVoid)) },
+                    [idxVar, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, getI(), MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(1)) }) }]
+                ),
+            };
+            let keepGoing = if (isForall) getR() else MkTerm { tspan: sp, tscm: boolScm, tnode: TmUn(UnNot, getR()) };
+            let inRange = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpLt, getI(), MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(256)) }) };
+            let wCond = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpAnd, keepGoing, inRange) };
+            let wLoop = MkTerm { tspan: sp, tscm: voidScm, tnode: TmWhile(wCond, MkTerm { tspan: sp, tscm: voidScm, tnode: TmBlock([stepChk, incI]) }) };
+            let initI = MkTerm {
+                tspan: sp, tscm: cellIntScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyComp(TyCon("Cell"), TyCon("Int")))) }, [MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(0)) }]),
+            };
+            let initR = MkTerm {
+                tspan: sp, tscm: cellBoolScm,
+                tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyComp(TyCon("Cell"), TyCon("Bool")))) }, [MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(isForall)) }]),
+            };
+            MkTerm {
+                tspan: sp, tscm: boolScm,
+                tnode: TmLet(
+                    MkVarDecl { vname: idxName, vscm: cellIntScm },
+                    initI,
+                    MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmLet(
+                            MkVarDecl { vname: resName, vscm: cellBoolScm },
+                            initR,
+                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBlock([wLoop, getR()]) }
+                        ),
+                    }
+                ),
+            }
+        },
+        TyCon("Int") -> {
+            let loOpt: Cell (Option (Form, Bool)) = cellNew(None);
+            let hiOpt: Cell (Option (Form, Bool)) = cellNew(None);
+            if (isForall) {
+                match qbody.node {
+                    ExIf(guardF, _, elF) -> match elF.node {
+                        ExLit(LitBool(true)) -> scanIntQuantBounds(guardF, vd.vname, loOpt, hiOpt),
+                        _ -> (),
+                    },
+                    ExBin(OpOr, negG, _) -> match negG.node {
+                        ExUn(UnNot, guardF) -> scanIntQuantBounds(guardF, vd.vname, loOpt, hiOpt),
+                        _ -> (),
+                    },
+                    _ -> (),
+                }
+            } else {
+                scanIntQuantBounds(qbody, vd.vname, loOpt, hiOpt)
+            };
+            match (cellGet(loOpt), cellGet(hiOpt)) {
+                (Some((loF, loStrict)), Some((hiF, hiIncl))) -> {
+                    let cellIntScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Int")));
+                    let cellBoolScm = ScmMono(TyComp(TyCon("Cell"), TyCon("Bool")));
+                    let loTerm0 = transformForm(ctx, loF);
+                    let hiTerm0 = transformForm(ctx, hiF);
+                    let savedEnv = cellGet(ctx.kLocalEnv);
+                    cellSet(ctx.kLocalEnv, Cons((vd.vname, intScm), savedEnv));
+                    let tbody = transformForm(ctx, qbody);
+                    cellSet(ctx.kLocalEnv, savedEnv);
+
+                    let loName = "__gs_qlo_" + intToStr(kUnique(ctx));
+                    let hiName = "__gs_qhi_" + intToStr(kUnique(ctx));
+                    let idxName = "__gs_qi_" + intToStr(kUnique(ctx));
+                    let resName = "__gs_qr_" + intToStr(kUnique(ctx));
+                    let doneName = "__gs_qdone_" + intToStr(kUnique(ctx));
+
+                    let loVar = MkTerm { tspan: sp, tscm: intScm, tnode: TmVar(loName) };
+                    let hiVar = MkTerm { tspan: sp, tscm: intScm, tnode: TmVar(hiName) };
+                    let idxVar = MkTerm { tspan: sp, tscm: cellIntScm, tnode: TmVar(idxName) };
+                    let resVar = MkTerm { tspan: sp, tscm: cellBoolScm, tnode: TmVar(resName) };
+                    let doneVar = MkTerm { tspan: sp, tscm: cellBoolScm, tnode: TmVar(doneName) };
+
+                    let oneLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(1)) };
+                    let maxIntLit = MkTerm { tspan: sp, tscm: intScm, tnode: TmLit(LitInt(2147483647)) };
+                    let startVal = if (loStrict) MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, loVar, oneLit) } else loVar;
+                    let emptyRange =
+                        if (loStrict && !hiIncl) {
+                            // `lo < i && i < hi` is empty when `lo >= hi` OR `lo == 2147483647`
+                            MkTerm {
+                                tspan: sp, tscm: boolScm,
+                                tnode: TmBin(
+                                    OpOr,
+                                    MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, loVar, hiVar) },
+                                    MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpEq, loVar, maxIntLit) }
+                                ),
+                            }
+                        } else if (loStrict && hiIncl) {
+                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, loVar, hiVar) }
+                        } else if (!loStrict && !hiIncl) {
+                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, loVar, hiVar) }
+                        } else {
+                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGt, loVar, hiVar) }
+                        };
+
+                    let getI = () -> MkTerm {
+                        tspan: sp, tscm: intScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int"))], TyCon("Int"))) }, [idxVar]),
+                    };
+                    let getR = () -> MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool"))], TyCon("Bool"))) }, [resVar]),
+                    };
+                    let getDone = () -> MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellGet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool"))], TyCon("Bool"))) }, [doneVar]),
+                    };
+                    let setDoneTrue = MkTerm {
+                        tspan: sp, tscm: voidScm,
+                        tnode: TmApplyDir(
+                            MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool")), TyCon("Bool")], TyVoid)) },
+                            [doneVar, MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) }]
+                        ),
+                    };
+                    let setResFlip = MkTerm {
+                        tspan: sp, tscm: voidScm,
+                        tnode: TmApplyDir(
+                            MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Bool")), TyCon("Bool")], TyVoid)) },
+                            [resVar, MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(!isForall)) }]
+                        ),
+                    };
+                    let bodyLet = MkTerm { tspan: sp, tscm: boolScm, tnode: TmLet(MkVarDecl { vname: vd.vname, vscm: intScm }, getI(), tbody) };
+                    let chkCond = if (isForall) MkTerm { tspan: sp, tscm: boolScm, tnode: TmUn(UnNot, bodyLet) } else bodyLet;
+                    let onHit = MkTerm { tspan: sp, tscm: voidScm, tnode: TmBlock([setResFlip, setDoneTrue]) };
+                    let stepChk = MkTerm { tspan: sp, tscm: voidScm, tnode: TmIf(chkCond, onHit, mkUnitTerm(sp)) };
+
+                    let incI = MkTerm {
+                        tspan: sp, tscm: voidScm,
+                        tnode: TmApplyDir(
+                            MkVarDecl { vname: "cellSet", vscm: ScmMono(TyArr(TyVoid, [TyComp(TyCon("Cell"), TyCon("Int")), TyCon("Int")], TyVoid)) },
+                            [idxVar, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, getI(), oneLit) }]
+                        ),
+                    };
+                    let stopAtEnd =
+                        if (hiIncl) MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, getI(), hiVar) }
+                        else MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(OpGe, MkTerm { tspan: sp, tscm: intScm, tnode: TmBin(OpAdd, getI(), oneLit) }, hiVar) };
+                    let advTerm = MkTerm { tspan: sp, tscm: voidScm, tnode: TmIf(stopAtEnd, setDoneTrue, incI) };
+                    let inBound = MkTerm { tspan: sp, tscm: boolScm, tnode: TmBin(if (hiIncl) OpLe else OpLt, getI(), hiVar) };
+                    let wCond = MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmBin(OpAnd, MkTerm { tspan: sp, tscm: boolScm, tnode: TmUn(UnNot, getDone()) }, inBound),
+                    };
+                    let wLoop = MkTerm { tspan: sp, tscm: voidScm, tnode: TmWhile(wCond, MkTerm { tspan: sp, tscm: voidScm, tnode: TmBlock([stepChk, advTerm]) }) };
+
+                    let initI = MkTerm {
+                        tspan: sp, tscm: cellIntScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Int")], TyComp(TyCon("Cell"), TyCon("Int")))) }, [startVal]),
+                    };
+                    let initR = MkTerm {
+                        tspan: sp, tscm: cellBoolScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyComp(TyCon("Cell"), TyCon("Bool")))) }, [MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(isForall)) }]),
+                    };
+                    let initDone = MkTerm {
+                        tspan: sp, tscm: cellBoolScm,
+                        tnode: TmApplyDir(MkVarDecl { vname: "cellNew", vscm: ScmMono(TyArr(TyVoid, [TyCon("Bool")], TyComp(TyCon("Cell"), TyCon("Bool")))) }, [emptyRange]),
+                    };
+
+                    MkTerm {
+                        tspan: sp, tscm: boolScm,
+                        tnode: TmLet(
+                            MkVarDecl { vname: loName, vscm: intScm },
+                            loTerm0,
+                            MkTerm {
+                                tspan: sp, tscm: boolScm,
+                                tnode: TmLet(
+                                    MkVarDecl { vname: hiName, vscm: intScm },
+                                    hiTerm0,
+                                    MkTerm {
+                                        tspan: sp, tscm: boolScm,
+                                        tnode: TmLet(
+                                            MkVarDecl { vname: idxName, vscm: cellIntScm },
+                                            initI,
+                                            MkTerm {
+                                                tspan: sp, tscm: boolScm,
+                                                tnode: TmLet(
+                                                    MkVarDecl { vname: resName, vscm: cellBoolScm },
+                                                    initR,
+                                                    MkTerm {
+                                                        tspan: sp, tscm: boolScm,
+                                                        tnode: TmLet(
+                                                            MkVarDecl { vname: doneName, vscm: cellBoolScm },
+                                                            initDone,
+                                                            MkTerm { tspan: sp, tscm: boolScm, tnode: TmBlock([wLoop, getR()]) }
+                                                        ),
+                                                    }
+                                                ),
+                                            }
+                                        ),
+                                    }
+                                ),
+                            }
+                        ),
+                    }
+                },
+                _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) },
+            }
+        },
+        _ -> MkTerm { tspan: sp, tscm: boolScm, tnode: TmLit(LitBool(true)) },
+    }
+}
+
 def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
     let tform = form.ty;
     match form.node {
@@ -1024,8 +1714,36 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         Nil -> (),
                     }
                 };
+                // Snapshot any `old(expr)` subexpressions in `fc.fcEnsures` BEFORE executing `innerBody`!
+                let oldSnapsRev: Cell (List (String, Scheme, TaggedTerm)) = cellNew(Nil);
+                let rewrittenEnsRev: Cell (List EnsuresClause) = cellNew(Nil);
+                let ce0 = cellNew(fc.fcEnsures);
+                while (match cellGet(ce0) { Nil -> false, _ -> true }) {
+                    match cellGet(ce0) {
+                        Cons(ec, r) -> {
+                            let initInner = match ec.ecBind { Some(bn) -> [bn], None -> Nil };
+                            let rwE = rewriteOldInFormForCheck(ctx, ec.ecExpr, initInner, oldSnapsRev);
+                            cellSet(rewrittenEnsRev, Cons(MkEnsuresClause { ecBind: ec.ecBind, ecSpan: ec.ecSpan, ecExpr: rwE }, cellGet(rewrittenEnsRev)));
+                            cellSet(ce0, r)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let oldSnaps = listRev(cellGet(oldSnapsRev));
+                let rewrittenEns = listRev(cellGet(rewrittenEnsRev));
                 let tBody = transformForm(ctx, innerBody);
-                let bodyWithEns = match fc.fcEnsures {
+                let savedOuterEnv = cellGet(ctx.kLocalEnv);
+                let csEnv = cellNew(oldSnaps);
+                while (match cellGet(csEnv) { Nil -> false, _ -> true }) {
+                    match cellGet(csEnv) {
+                        Cons((snm, sscm, _), rs) -> {
+                            cellSet(ctx.kLocalEnv, Cons((snm, sscm), cellGet(ctx.kLocalEnv)));
+                            cellSet(csEnv, rs)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let bodyWithEns0 = match rewrittenEns {
                     Nil -> tBody,
                     ensList -> {
                         let resVd = MkVarDecl { vname: "__gs_res", vscm: tBody.tscm };
@@ -1058,6 +1776,25 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                         };
                         MkTerm { tspan: innerBody.pos, tscm: tBody.tscm, tnode: TmLet(resVd, tBody, after) }
                     },
+                };
+                cellSet(ctx.kLocalEnv, savedOuterEnv);
+                let bodyWithEns = {
+                    let acc = cellNew(bodyWithEns0);
+                    let csRev = cellNew(listRev(oldSnaps));
+                    while (match cellGet(csRev) { Nil -> false, _ -> true }) {
+                        match cellGet(csRev) {
+                            Cons((snm, sscm, sterm), rs) -> {
+                                cellSet(acc, MkTerm {
+                                    tspan: form.pos,
+                                    tscm: tBody.tscm,
+                                    tnode: TmLet(MkVarDecl { vname: snm, vscm: sscm }, sterm, cellGet(acc)),
+                                });
+                                cellSet(csRev, rs)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellGet(acc)
                 };
                 match cellGet(prefixRev) {
                     Nil -> bodyWithEns,
@@ -1553,7 +2290,46 @@ def transformForm(ctx: KCtx, form: Form): TaggedTerm = {
                             // 3. Direct function / concept method / intrinsic call?
                             match resolveDirectCallee(ctx, callee.node) {
                                 Some(directName) ->
-                                    if (directName == "cFnPtr") {
+                                    if (directName == "$gs$forall" || directName == "$gs$exists") {
+                                        let isForall = directName == "$gs$forall";
+                                        match args {
+                                            Cons(lamF, Nil) -> match lamF.node {
+                                                ExAbs(Cons(vd, Nil), _, qbody) ->
+                                                    if (ctx.kContractMode == "erase") {
+                                                        MkTerm { tspan: form.pos, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) }
+                                                    } else if (ctx.kContractMode == "check") {
+                                                        lowerQuantifierForCheck(ctx, form.pos, isForall, vd, qbody)
+                                                    } else {
+                                                        let savedEnv = cellGet(ctx.kLocalEnv);
+                                                        cellSet(ctx.kLocalEnv, Cons((vd.vname, vd.vscm), savedEnv));
+                                                        let tqb = transformForm(ctx, qbody);
+                                                        cellSet(ctx.kLocalEnv, savedEnv);
+                                                        let qFnScm = ScmMono(TyArr(TyVoid, [schemeBody(vd.vscm), TyCon("Bool")], TyCon("Bool")));
+                                                        let qVarTerm = MkTerm { tspan: form.pos, tscm: vd.vscm, tnode: TmVar(vd.vname) };
+                                                        MkTerm {
+                                                            tspan: form.pos,
+                                                            tscm: ScmMono(TyCon("Bool")),
+                                                            tnode: TmApplyDir(MkVarDecl { vname: directName, vscm: qFnScm }, [qVarTerm, tqb]),
+                                                        }
+                                                    },
+                                                _ -> MkTerm { tspan: form.pos, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) },
+                                            },
+                                            _ -> MkTerm { tspan: form.pos, tscm: ScmMono(TyCon("Bool")), tnode: TmLit(LitBool(true)) },
+                                        }
+                                    } else if (directName == "old" && ctx.kContractMode == "keep" && isUnshadowedOldInCore(ctx, Nil)) {
+                                        match args {
+                                            Cons(arg0, Nil) -> {
+                                                let ta = transformForm(ctx, arg0);
+                                                let oldScm = ScmMono(TyArr(TyVoid, [schemeBody(ta.tscm)], schemeBody(tform)));
+                                                MkTerm {
+                                                    tspan: form.pos,
+                                                    tscm: tform,
+                                                    tnode: TmApplyDir(MkVarDecl { vname: "$gs$old", vscm: oldScm }, [ta]),
+                                                }
+                                            },
+                                            _ -> MkTerm { tspan: form.pos, tscm: tform, tnode: TmLit(LitUnit) },
+                                        }
+                                    } else if (directName == "cFnPtr") {
                                         match args {
                                             Cons(argF, Nil) -> match argF.node {
                                                 ExVar(fnNm) -> {
@@ -1955,6 +2731,14 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                             Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmApplyDir(MkVarDecl { vname: mangled, vscm: specScm }, args) })
                         },
                         None -> match args {
+                            Cons(a0, Nil) ->
+                                if (isBuiltinOpPrimitive(schemeBody(a0.tscm))) {
+                                    if (fnName == "neg") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(UnNeg, a0) })
+                                    } else if (fnName == "bitNot" || fnName == "$op$tilde") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmUn(UnBitNot, a0) })
+                                    } else None
+                                } else None,
                             Cons(a0, Cons(b0, Nil)) ->
                                 if (isBuiltinOpPrimitive(schemeBody(a0.tscm))) {
                                     if (fnName == "eq") {
@@ -1969,6 +2753,28 @@ def rewriteCallsInTerm(ctx: KCtx, tm: TaggedTerm, discovered: Cell (List Instant
                                         let posOne = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmLit(LitInt(1)) };
                                         let innerIf = MkTerm { tspan: tm.tspan, tscm: intScm, tnode: TmIf(eqCond, zero, posOne) };
                                         Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmIf(ltCond, negOne, innerIf) })
+                                    } else if (fnName == "add" || fnName == "$op$plus") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpAdd, a0, b0) })
+                                    } else if (fnName == "sub" || fnName == "$op$minus") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpSub, a0, b0) })
+                                    } else if (fnName == "mul" || fnName == "$op$star") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpMul, a0, b0) })
+                                    } else if (fnName == "div" || fnName == "$op$slash") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpDiv, a0, b0) })
+                                    } else if (fnName == "rem" || fnName == "$op$rem") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpRem, a0, b0) })
+                                    } else if (fnName == "bitAnd" || fnName == "$op$amp") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpBitAnd, a0, b0) })
+                                    } else if (fnName == "bitOr" || fnName == "$op$bar") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpBitOr, a0, b0) })
+                                    } else if (fnName == "bitXor" || fnName == "$op$caret") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpBitXor, a0, b0) })
+                                    } else if (fnName == "shl" || fnName == "$op$lt_lt") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpShl, a0, b0) })
+                                    } else if (fnName == "shr" || fnName == "$op$gt_gt") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpShr, a0, b0) })
+                                    } else if (fnName == "ushr" || fnName == "$op$gt_gt_gt") {
+                                        Some(MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: TmBin(OpUshr, a0, b0) })
                                     } else None
                                 } else None,
                             _ -> None,
@@ -2383,6 +3189,11 @@ def materializeSpecialization(ctx: KCtx, inst: Instantiation): List String =
                 };
 
                 let specFn = buildSpecializedFunDef(orig, inst.instMangled, sub, fnRename);
+                strMapInsert(ctx.kInstantiatedPoly, inst.instFn, true);
+                strMapInsert(ctx.kOrigFnNames, inst.instMangled, inst.instFn);
+                if (strMapContains(ctx.kVerifiedFns, inst.instFn)) {
+                    strMapInsert(ctx.kVerifiedFns, inst.instMangled, true)
+                } else ();
                 strMapInsert(ctx.kTopDirect, inst.instMangled, inst.instMangled);
                 strMapInsert(ctx.kGlobalFns, inst.instMangled, specFn);
                 vecPush(ctx.kAllFnNames, inst.instMangled);
@@ -2412,6 +3223,226 @@ def markTransitiveTemplateClosures(liftedMap: StrMap (List String), fnId: String
         },
     }
 
+def isAllIntTypeArgs(ts: List Type): Bool = match ts {
+    Nil -> true,
+    Cons(TyCon("Int"), r) -> isAllIntTypeArgs(r),
+    _ -> false,
+}
+
+def canSatisfyConcreteConstraintCore(ctx: KCtx, c: ConstraintSpec, depth: Int): Bool =
+    if (depth > 6) false
+    else if (!isTypeListConcrete(c.typeArgs)) false
+    else if (c.conceptName == "Send") {
+        match c.typeArgs {
+            Cons(ta, Nil) -> isConcreteTypeSend(ctx.kAdtReg, ta),
+            _ -> false,
+        }
+    } else if (c.conceptName == "SendIf") {
+        match c.typeArgs {
+            Cons(TyCon("$Local"), _) -> true,
+            Cons(TyCon("$Scoped"), _) -> true,
+            Cons(_, Cons(ta, Nil)) -> isConcreteTypeSend(ctx.kAdtReg, ta),
+            _ -> false,
+        }
+    } else if (
+        (c.conceptName == "Eq" || c.conceptName == "Ord"
+         || c.conceptName == "Add" || c.conceptName == "Sub" || c.conceptName == "Mul"
+         || c.conceptName == "Div" || c.conceptName == "Rem" || c.conceptName == "Neg"
+         || c.conceptName == "BitAnd" || c.conceptName == "BitOr" || c.conceptName == "BitXor"
+         || c.conceptName == "BitNot" || c.conceptName == "Shl" || c.conceptName == "Shr" || c.conceptName == "Ushr")
+        && isAllIntTypeArgs(c.typeArgs)
+    ) {
+        true
+    } else {
+        let hit = cellNew(false);
+        let ci = cellNew(ctx.kInstanceReg);
+        while (!cellGet(hit) && match cellGet(ci) { Nil -> false, _ -> true }) {
+            match cellGet(ci) {
+                Cons(inst, ri) -> {
+                    if (inst.conceptName == c.conceptName && listLen(inst.targetTypes) == listLen(c.typeArgs)) {
+                        let isub: StrMap Type = strMapNew();
+                        if (matchInstancePatList(inst.targetTypes, c.typeArgs, isub)) {
+                            let subOk = cellNew(true);
+                            let csub = cellNew(inst.constraints);
+                            while (cellGet(subOk) && match cellGet(csub) { Nil -> false, _ -> true }) {
+                                match cellGet(csub) {
+                                    Cons(sc, rsc) -> {
+                                        let instSc = MkConstraint {
+                                            conceptName: sc.conceptName,
+                                            typeArgs: applySubstToTypeList(sc.typeArgs, isub),
+                                        };
+                                        if (!canSatisfyConcreteConstraintCore(ctx, instSc, depth + 1)) {
+                                            cellSet(subOk, false)
+                                        } else ();
+                                        cellSet(csub, rsc)
+                                    },
+                                    Nil -> (),
+                                }
+                            };
+                            if (cellGet(subOk)) cellSet(hit, true) else ()
+                        } else ()
+                    } else ();
+                    cellSet(ci, ri)
+                },
+                Nil -> (),
+            }
+        };
+        cellGet(hit)
+    }
+
+def canSeedPolySchemeWithInt(ctx: KCtx, scm: Scheme): (Bool, List Type) = {
+    let tps = schemeTypeParams(scm);
+    match tps {
+        Nil -> (false, Nil),
+        _ -> {
+            let sub: StrMap Type = strMapNew();
+            let argsRev: Cell (List Type) = cellNew(Nil);
+            let ct = cellNew(tps);
+            while (match cellGet(ct) { Nil -> false, _ -> true }) {
+                match cellGet(ct) {
+                    Cons(tv, rt) -> {
+                        let conc = if (isModeVarName(tv)) TyCon("$Local") else TyCon("Int");
+                        strMapInsert(sub, tv, conc);
+                        cellSet(argsRev, Cons(conc, cellGet(argsRev)));
+                        cellSet(ct, rt)
+                    },
+                    Nil -> (),
+                }
+            };
+            // Allow fundeps to refine any dependent output type params from `Int` inputs!
+            let subFd: StrMap Type = strMapNew();
+            let ct2 = cellNew(tps);
+            let hasMultiParamConcept = match schemeConstraints(scm) {
+                Nil -> false,
+                cs -> {
+                    let found = cellNew(false);
+                    let cc0 = cellNew(cs);
+                    while (!cellGet(found) && match cellGet(cc0) { Nil -> false, _ -> true }) {
+                        match cellGet(cc0) {
+                            Cons(c0, rc0) -> {
+                                match strMapGet(ctx.kConceptReg, c0.conceptName) {
+                                    Some(ci0) -> match ci0.fundeps {
+                                        Cons(_, _) -> cellSet(found, true),
+                                        Nil -> (),
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(cc0, rc0)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    cellGet(found)
+                },
+            };
+            let finalSub =
+                if (!hasMultiParamConcept) sub
+                else {
+                    // Seed non-fundep-rhs vars to Int, run fundep solver, then default remaining vars to Int
+                    let rhsVars: StrMap Bool = strMapNew();
+                    let cc1 = cellNew(schemeConstraints(scm));
+                    while (match cellGet(cc1) { Nil -> false, _ -> true }) {
+                        match cellGet(cc1) {
+                            Cons(c1, rc1) -> {
+                                match strMapGet(ctx.kConceptReg, c1.conceptName) {
+                                    Some(ci1) -> {
+                                        let cfd = cellNew(ci1.fundeps);
+                                        while (match cellGet(cfd) { Nil -> false, _ -> true }) {
+                                            match cellGet(cfd) {
+                                                Cons(fd, rfd) -> {
+                                                    let sel = selectCoreTypesByNames(ci1.typeParams, fd.fdRhs, c1.typeArgs);
+                                                    let cs = cellNew(sel);
+                                                    while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                                                        match cellGet(cs) {
+                                                            Cons(TyVar(rv), rcs) -> { strMapInsert(rhsVars, rv, true); cellSet(cs, rcs) },
+                                                            Cons(_, rcs) -> cellSet(cs, rcs),
+                                                            Nil -> (),
+                                                        }
+                                                    };
+                                                    cellSet(cfd, rfd)
+                                                },
+                                                Nil -> (),
+                                            }
+                                        }
+                                    },
+                                    None -> (),
+                                };
+                                cellSet(cc1, rc1)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    while (match cellGet(ct2) { Nil -> false, _ -> true }) {
+                        match cellGet(ct2) {
+                            Cons(tv, rt) -> {
+                                if (isModeVarName(tv)) strMapInsert(subFd, tv, TyCon("$Local"))
+                                else if (!strMapContains(rhsVars, tv)) strMapInsert(subFd, tv, TyCon("Int"))
+                                else ();
+                                cellSet(ct2, rt)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    resolveFunDepsInSubst(ctx, schemeConstraints(scm), subFd);
+                    let ct3 = cellNew(tps);
+                    while (match cellGet(ct3) { Nil -> false, _ -> true }) {
+                        match cellGet(ct3) {
+                            Cons(tv, rt) -> {
+                                if (!strMapContains(subFd, tv)) {
+                                    strMapInsert(subFd, tv, if (isModeVarName(tv)) TyCon("$Local") else TyCon("Int"))
+                                } else ();
+                                cellSet(ct3, rt)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    subFd
+                };
+            let ok = cellNew(true);
+            let cc = cellNew(schemeConstraints(scm));
+            while (cellGet(ok) && match cellGet(cc) { Nil -> false, _ -> true }) {
+                match cellGet(cc) {
+                    Cons(c, rc) -> {
+                        let concC = MkConstraint {
+                            conceptName: c.conceptName,
+                            typeArgs: applySubstToTypeList(c.typeArgs, finalSub),
+                        };
+                        if (!canSatisfyConcreteConstraintCore(ctx, concC, 0)) cellSet(ok, false) else ();
+                        cellSet(cc, rc)
+                    },
+                    Nil -> (),
+                }
+            };
+            if (!cellGet(ok)) (false, Nil)
+            else {
+                let finalArgsRev: Cell (List Type) = cellNew(Nil);
+                let ct4 = cellNew(tps);
+                while (match cellGet(ct4) { Nil -> false, _ -> true }) {
+                    match cellGet(ct4) {
+                        Cons(tv, rt) -> {
+                            let ta = match strMapGet(finalSub, tv) { Some(t) -> t, None -> TyCon("Int") };
+                            cellSet(finalArgsRev, Cons(ta, cellGet(finalArgsRev)));
+                            cellSet(ct4, rt)
+                        },
+                        Nil -> (),
+                    }
+                };
+                (true, listRev(cellGet(finalArgsRev)))
+            }
+        },
+    }
+}
+
+def isUserSourceFileForSeed(fileId: Int): Bool =
+    if (fileId <= 0) false
+    else match diagGetFile(fileId) {
+        Some(sf) ->
+            !(strLen(sf.sfPath) >= 1 && strByteAt(sf.sfPath, 0) == 60)
+            && !strStartsWith(sf.sfPath, "std/")
+            && !strStartsWith(sf.sfPath, "sys/"),
+        None -> false,
+    }
+
 def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List GlobalValDef) = {
     let queue: Vec String = vecNew();
     let qHead = cellNew(0);
@@ -2434,7 +3465,7 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
         cellSet(t0, cellGet(t0) + 1)
     };
 
-    // Seed with concrete monomorphic top-level functions
+    // Seed with concrete monomorphic top-level functions (preserving polymorphic templates intact!)
     let i = cellNew(0);
     while (cellGet(i) < totalInitial) {
         let fnm = vecGetOr(ctx.kAllFnNames, cellGet(i), "");
@@ -2443,13 +3474,6 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                 Some(fd) -> {
                     let isMono = match schemeTypeParams(fd.fnScm) {
                         Nil -> isTypeConcrete(schemeBody(fd.fnScm)),
-                        _ -> false,
-                    };
-                    let isSeedPoly = ctx.kContractMode == "keep" && !isMono && match (schemeTypeParams(fd.fnScm), schemeConstraints(fd.fnScm)) {
-                        (Cons(_, _), Nil) -> match diagGetFile(fd.fnSpan.fileId) {
-                            Some(sf) -> !(strLen(sf.sfPath) >= 7 && strByteAt(sf.sfPath, 0) == 60),
-                            None -> false,
-                        },
                         _ -> false,
                     };
                     if (isMono) {
@@ -2462,27 +3486,6 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
                             fnBody: sanitizePhantomTerm(fd.fnBody),
                         };
                         strMapInsert(ctx.kGlobalFns, fnm, cleanFd);
-                        vecPush(queue, fnm)
-                    } else if (isSeedPoly) {
-                        let tps = schemeTypeParams(fd.fnScm);
-                        let tsub: StrMap Type = strMapNew();
-                        let ct = cellNew(tps);
-                        while (match cellGet(ct) { Nil -> false, _ -> true }) {
-                            match cellGet(ct) {
-                                Cons(tv, rt) -> { strMapInsert(tsub, tv, TyCon("Int")); cellSet(ct, rt) },
-                                Nil -> (),
-                            }
-                        };
-                        let emptyRen: StrMap String = strMapNew();
-                        let specFn = MkFunDef {
-                            fnName: fd.fnName,
-                            fnSpan: fd.fnSpan,
-                            fnScm: ScmMono(defaultPhantomType(applyExplicitSubst(schemeBody(fd.fnScm), tsub))),
-                            fnParams: sanitizeVarDecls(specializeVarDecls(fd.fnParams, tsub)),
-                            fnFvs: sanitizeVarDecls(specializeVarDecls(fd.fnFvs, tsub)),
-                            fnBody: sanitizePhantomTerm(specializeTerm(fd.fnBody, tsub, emptyRen)),
-                        };
-                        strMapInsert(ctx.kGlobalFns, fnm, specFn);
                         vecPush(queue, fnm)
                     } else ()
                 },
@@ -2511,31 +3514,67 @@ def runMonomorphizationWorklist(ctx: KCtx): (StrMap FunDef, List String, List Gl
 
     enqueueDiscoveredSpecs(ctx, listRev(cellGet(initDiscovered)), createdSpecs, queue);
 
-    // Drain worklist to transitive fixed point
-    while (cellGet(qHead) < vecLen(queue)) {
-        let h = cellGet(qHead);
-        cellSet(qHead, h + 1);
-        let fnId = vecGetOr(queue, h, "");
-        if (!strMapContains(processed, fnId)) {
-            strMapInsert(processed, fnId, true);
-            match strMapGet(ctx.kGlobalFns, fnId) {
-                Some(fd) -> {
-                    let disc: Cell (List Instantiation) = cellNew(Nil);
-                    let rwBody = rewriteCallsInTerm(ctx, fd.fnBody, disc);
-                    strMapInsert(ctx.kGlobalFns, fnId, MkFunDef {
-                        fnName: fd.fnName,
-                        fnSpan: fd.fnSpan,
-                        fnScm: fd.fnScm,
-                        fnParams: fd.fnParams,
-                        fnFvs: fd.fnFvs,
-                        fnBody: rwBody,
-                    });
-                    enqueueDiscoveredSpecs(ctx, listRev(cellGet(disc)), createdSpecs, queue)
-                },
-                None -> (),
-            }
-        } else ()
+    let drainWorklist = () -> {
+        while (cellGet(qHead) < vecLen(queue)) {
+            let h = cellGet(qHead);
+            cellSet(qHead, h + 1);
+            let fnId = vecGetOr(queue, h, "");
+            if (!strMapContains(processed, fnId)) {
+                strMapInsert(processed, fnId, true);
+                match strMapGet(ctx.kGlobalFns, fnId) {
+                    Some(fd) -> {
+                        let disc: Cell (List Instantiation) = cellNew(Nil);
+                        let rwBody = rewriteCallsInTerm(ctx, fd.fnBody, disc);
+                        strMapInsert(ctx.kGlobalFns, fnId, MkFunDef {
+                            fnName: fd.fnName,
+                            fnSpan: fd.fnSpan,
+                            fnScm: fd.fnScm,
+                            fnParams: fd.fnParams,
+                            fnFvs: fd.fnFvs,
+                            fnBody: rwBody,
+                        });
+                        enqueueDiscoveredSpecs(ctx, listRev(cellGet(disc)), createdSpecs, queue)
+                    },
+                    None -> (),
+                }
+            } else ()
+        }
     };
+
+    drainWorklist();
+
+    // In `"keep"` mode (`geisha verify`), seed any uninstantiated user polymorphic functions
+    // (including Concept-constrained generics satisfied by `Int`!) via non-destructive specialization,
+    // and record any unseedable user polymorphic functions so `verify` fails closed with `unknown`.
+    if (ctx.kContractMode == "keep") {
+        let seedSpecsRev: Cell (List Instantiation) = cellNew(Nil);
+        let pIdx = cellNew(0);
+        while (cellGet(pIdx) < totalInitial) {
+            let fnm = vecGetOr(ctx.kAllFnNames, cellGet(pIdx), "");
+            if (!strMapContains(templateClosures, fnm)
+                && !strStartsWith(fnm, "__inst_")
+                && !strStartsWith(fnm, "$derive")
+                && !strMapContains(ctx.kInstantiatedPoly, fnm)) {
+                match strMapGet(ctx.kGlobalFns, fnm) {
+                    Some(fd) -> match schemeTypeParams(fd.fnScm) {
+                        Cons(_, _) if (isUserSourceFileForSeed(fd.fnSpan.fileId)) -> {
+                            let (canSeed, seedArgs) = canSeedPolySchemeWithInt(ctx, fd.fnScm);
+                            if (canSeed) {
+                                cellSet(seedSpecsRev, Cons(mkInst(fnm, seedArgs), cellGet(seedSpecsRev)))
+                            } else {
+                                cellSet(ctx.kUnseededPolyRev, Cons((fnm, fd.fnSpan, strMapContains(ctx.kVerifiedFns, fnm)), cellGet(ctx.kUnseededPolyRev)))
+                            }
+                        },
+                        _ -> (),
+                    },
+                    None -> (),
+                }
+            } else ();
+            cellSet(pIdx, cellGet(pIdx) + 1)
+        };
+        enqueueDiscoveredSpecs(ctx, listRev(cellGet(seedSpecsRev)), createdSpecs, queue);
+        drainWorklist()
+    } else ();
 
     // Keep only concrete monomorphic functions, sorted deterministically by name!
     let concreteFns: StrMap FunDef = strMapNew();
@@ -5298,6 +6337,9 @@ pub def prepareVerifiedOptCore(
         coreAdtReg: prog.coreAdtReg,
         coreAdtNames: prog.coreAdtNames,
         coreEscape: finalEscape,
+        coreVerifiedFns: prog.coreVerifiedFns,
+        coreOrigFnNames: prog.coreOrigFnNames,
+        coreUnseededPolyFns: prog.coreUnseededPolyFns,
     }
 }
 
@@ -8086,6 +9128,10 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
         kInstanceReg: inf.instanceReg,
         kConceptMethods: inf.conceptMethods,
         kContractMode: contractMode,
+        kVerifiedFns: strMapNew(),
+        kOrigFnNames: strMapNew(),
+        kInstantiatedPoly: strMapNew(),
+        kUnseededPolyRev: cellNew(Nil),
         kErr: cellNew(None),
     };
 
@@ -8111,6 +9157,10 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
                                     },
                                     Cons(AttrCtor(prio), ra) -> {
                                         cellSet(ctorsRev, Cons((d.ident, prio), cellGet(ctorsRev)));
+                                        cellSet(ca, ra)
+                                    },
+                                    Cons(AttrVerified, ra) -> {
+                                        strMapInsert(ctx.kVerifiedFns, d.ident, true);
                                         cellSet(ca, ra)
                                     },
                                     Cons(_, ra) -> cellSet(ca, ra),
@@ -8216,6 +9266,9 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
                 coreAdtReg: inf.adtReg,
                 coreAdtNames: listRev(cellGet(adtNamesListRev)),
                 coreEscape: escapeInfo,
+                coreVerifiedFns: ctx.kVerifiedFns,
+                coreOrigFnNames: ctx.kOrigFnNames,
+                coreUnseededPolyFns: listRev(cellGet(ctx.kUnseededPolyRev)),
             })
         },
     }

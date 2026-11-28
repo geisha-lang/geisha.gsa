@@ -11,7 +11,28 @@ use std.vec.{Vec, vecNew, vecPush, vecLen, vecGetOr, vecSet}
 use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
 use std.str.intToStr
 use ast.Span
-use verified_kernels.{clampOffset, clampSpanEnd}
+
+pub def clampOffset(pos: Int, totalLen: Int): Int
+    requires totalLen >= 0
+    ensures r -> 0 <= r && r <= totalLen
+= if (pos < 0) 0 else if (pos > totalLen) totalLen else pos
+
+pub def clampSpanEnd(clampedStart: Int, endPos: Int, totalLen: Int): Int
+    requires 0 <= clampedStart && clampedStart <= totalLen
+    ensures r -> clampedStart <= r && r <= totalLen
+= if (endPos < clampedStart) clampedStart else if (endPos > totalLen) totalLen else endPos
+
+pub def hexDigitUpperByte(nib: Int): Int
+    requires 0 <= nib && nib < 16
+    ensures r -> (48 <= r && r <= 57) || (65 <= r && r <= 70)
+= if (nib < 10) 48 + nib else 55 + nib
+
+pub def hexNibbleVal(b: Int): Int
+    ensures r -> r == -1 || (0 <= r && r < 16)
+= if (b >= 48 && b <= 57) b - 48
+  else if (b >= 65 && b <= 70) b - 55
+  else if (b >= 97 && b <= 102) b - 87
+  else -1
 
 pub data SourceFile {
     MkSourceFile { sfPath: String, sfContent: String },

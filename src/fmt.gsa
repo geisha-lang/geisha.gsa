@@ -468,6 +468,53 @@ def isDeclOrStmtKeyword(raw: String): Bool =
     || raw == "open"
     || raw == "mod"
 
+def isDeclStartOnLine(line: Vec FTok, firstIdx: Int): Bool = {
+    let firstRaw = vecGetOr(line, firstIdx, emptyFTok()).raw;
+    if (isDeclOrStmtKeyword(firstRaw)) true
+    else if (firstRaw == "verified") {
+        let n = vecLen(line);
+        let j = cellNew(firstIdx + 1);
+        while (cellGet(j) < n && isTriviaTok(vecGetOr(line, cellGet(j), emptyFTok()))) {
+            cellSet(j, cellGet(j) + 1)
+        };
+        cellGet(j) < n && vecGetOr(line, cellGet(j), emptyFTok()).raw == "def"
+    } else false
+}
+
+def isExistsQuantifierAt(line: Vec FTok, existsIdx: Int): Bool =
+    if (existsIdx < 0 || existsIdx >= vecLen(line)) false
+    else if (vecGetOr(line, existsIdx, emptyFTok()).raw != "exists") false
+    else {
+        let n = vecLen(line);
+        let j = cellNew(existsIdx + 1);
+        while (cellGet(j) < n && isTriviaTok(vecGetOr(line, cellGet(j), emptyFTok()))) {
+            cellSet(j, cellGet(j) + 1)
+        };
+        if (cellGet(j) >= n) false
+        else match vecGetOr(line, cellGet(j), emptyFTok()).kind {
+            FtLParen -> {
+                let depth = cellNew(1);
+                cellSet(j, cellGet(j) + 1);
+                while (cellGet(j) < n && cellGet(depth) > 0) {
+                    match vecGetOr(line, cellGet(j), emptyFTok()).kind {
+                        FtLParen -> cellSet(depth, cellGet(depth) + 1),
+                        FtRParen -> cellSet(depth, cellGet(depth) - 1),
+                        _ -> (),
+                    };
+                    cellSet(j, cellGet(j) + 1)
+                };
+                if (cellGet(depth) != 0) false
+                else {
+                    while (cellGet(j) < n && isTriviaTok(vecGetOr(line, cellGet(j), emptyFTok()))) {
+                        cellSet(j, cellGet(j) + 1)
+                    };
+                    cellGet(j) < n && vecGetOr(line, cellGet(j), emptyFTok()).raw == "->"
+                }
+            },
+            _ -> false,
+        }
+    }
+
 def isCloserTok(t: FTok): Bool = match t.kind {
     FtRBrace -> true,
     FtRParen -> true,
@@ -512,7 +559,7 @@ def lineStartsWithHeaderKw(line: Vec FTok, target: String): Bool = {
         let t = vecGetOr(line, cellGet(i), emptyFTok());
         if (isTriviaTok(t)) {
             cellSet(i, cellGet(i) + 1)
-        } else if (t.raw == "pub" || t.raw == "extern") {
+        } else if (t.raw == "pub" || t.raw == "extern" || t.raw == "verified") {
             cellSet(i, cellGet(i) + 1)
         } else {
             if (t.raw == target) cellSet(matched, true) else ();
@@ -673,6 +720,7 @@ def formatLineTokens(
         && !isDefLine
     );
     let seenForall = cellNew(false);
+    let inContract = cellNew(false);
     let seenEq = cellNew(false);
     let seenRetColon = cellNew(false);
     let braceDepth = cellNew(0);
@@ -771,7 +819,9 @@ def formatLineTokens(
                         FtSym -> true,
                         FtKeyword -> true,
                         FtIdent ->
-                            if (isDataLine && cellGet(braceDepth) == 0) {
+                            if (isExistsQuantifierAt(line, idx - 1)) {
+                                true
+                            } else if (isDataLine && cellGet(braceDepth) == 0) {
                                 // `data Pipe(Int)` has no space; `data Wrapper a (a)` has space after lowercase type param
                                 isLowerStart(prev.raw)
                             } else if (cellGet(inType)) {
@@ -836,6 +886,12 @@ def formatLineTokens(
 
         let justClosedCond = cellNew(false);
         match cur.kind {
+            FtIdent ->
+                if (isContractClauseWord(cur.raw) && cellGet(parenDepth) == 0) {
+                    cellSet(inContract, true);
+                    cellSet(inType, false);
+                    cellSet(seenRetColon, false)
+                } else (),
             FtKeyword ->
                 if (cur.raw == "forall") {
                     cellSet(seenForall, true);
@@ -865,7 +921,7 @@ def formatLineTokens(
                     cellSet(justClosedCond, true);
                     cellSet(condParenTarget, -1)
                 } else ();
-                if (cellGet(parenDepth) == 0 && isDefLine && !cellGet(seenRetColon)) cellSet(inType, false) else ()
+                if (cellGet(parenDepth) == 0 && ((isDefLine && !cellGet(seenRetColon)) || cellGet(inContract))) cellSet(inType, false) else ()
             },
             FtComma -> {
                 if (cellGet(parenDepth) == 1 && isDefLine && !cellGet(seenRetColon) && !isTypeLine && !isInstanceLine && !isConceptLine) {
@@ -878,7 +934,7 @@ def formatLineTokens(
                         Some(p) -> match p.kind { FtRParen -> true, _ -> false },
                         None -> false,
                     };
-                    if ((prevWasRParen || (isDefLine && cellGet(parenDepth) == 0)) && cellGet(braceDepth) == 0 && !cellGet(seenEq)) {
+                    if ((prevWasRParen || (isDefLine && cellGet(parenDepth) == 0)) && cellGet(braceDepth) == 0 && !cellGet(seenEq) && !cellGet(inContract)) {
                         cellSet(seenRetColon, true);
                         cellSet(inType, true)
                     } else if ((isDefLine || isLetLine || topFrame.isDefParamParen) && !cellGet(seenEq) && cellGet(braceDepth) == 0) {
@@ -893,12 +949,17 @@ def formatLineTokens(
                     } else ()
                 } else if (cur.raw == "=") {
                     cellSet(seenEq, true);
+                    cellSet(inContract, false);
                     if (isTypeLine) cellSet(inType, true)
                     else cellSet(inType, false)
                 } else if (cur.raw == "->") {
-                    if (!cellGet(inType)) ()
+                    if (cellGet(seenForall) && cellGet(parenDepth) == 0) {
+                        cellSet(seenForall, false);
+                        cellSet(inType, false)
+                    } else if (!cellGet(inType)) ()
                     else if (
-                        (isDefLine && cellGet(seenEq))
+                        cellGet(inContract)
+                        || (isDefLine && cellGet(seenEq))
                         || (!isDefLine && !topFrame.isDefParamParen && !topFrame.isDataParen && !isTypeLine && !isConceptLine && !topFrame.isConceptBrace && !topFrame.isDataBrace && !cellGet(topFrame.typeHanging))
                     ) {
                         cellSet(inType, false)
@@ -1031,7 +1092,7 @@ pub def formatSource(src: String): String = {
                             clearHanging(top);
                             top.bodyIndent + 1
                         } else {
-                            if (isDeclOrStmtKeyword(firstCode.raw)) {
+                            if (isDeclStartOnLine(ln, fc)) {
                                 clearHanging(top)
                             } else if (firstCode.raw == "else") {
                                 cellSet(top.ifHanging, false);

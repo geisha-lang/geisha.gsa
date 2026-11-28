@@ -17,13 +17,12 @@ use ast.{
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
-    DefAttr, AttrExport, AttrCtor, AttrCStruct,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct, AttrVerified,
     Def, ModuleItem, ModDef, ModUse, ModSub,
     UseItem, UseSingle, UseMulti, UseGlob, UseAlias, UseSpec, useSpecLocalName,
     typeToString, sortUniqueStrings
 }
-use diag.{diagRegisterFile, diagSpanLineCol}
-use verified_kernels.{clampOffset, clampSpanEnd}
+use diag.{diagRegisterFile, diagSpanLineCol, clampOffset, clampSpanEnd}
 use parser.parseFileModuleInFile
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs}
@@ -246,10 +245,11 @@ def extractModuleDocComment(src: String): List String = {
 
 def formatDefExternPrefix(attrs: List DefAttr): String = match attrs {
     Nil -> "",
-    Cons(AttrCStruct, _) -> "extern ",
-    Cons(AttrExport(Some(sym)), _) -> "extern \"" + sym + "\" ",
-    Cons(AttrExport(None), _) -> "extern ",
-    Cons(AttrCtor(_), _) -> "extern init ",
+    Cons(AttrCStruct, r) -> "extern " + formatDefExternPrefix(r),
+    Cons(AttrExport(Some(sym)), r) -> "extern \"" + sym + "\" " + formatDefExternPrefix(r),
+    Cons(AttrExport(None), r) -> "extern " + formatDefExternPrefix(r),
+    Cons(AttrCtor(_), r) -> "extern init " + formatDefExternPrefix(r),
+    Cons(AttrVerified, r) -> "verified " + formatDefExternPrefix(r),
 }
 
 pub def formatContractLinesFromSrc(src: String, body: ast.Form): List String =

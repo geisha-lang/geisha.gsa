@@ -21,7 +21,6 @@ use std.json.{parse as jsonParse, stringify as jsonStringify}
 use sys.env.hostOs
 use sys.fs.{fileExists, isDir, readDir, readFile}
 use sys.io.eprintLn
-use verified_kernels.{clampOffset, hexDigitUpperByte, hexNibbleVal}
 use ast.{
     Span, MkSpan, isPublicVis,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
@@ -40,7 +39,8 @@ use ast.{
 }
 use diag.{
     SourceFile, MkSourceFile,
-    diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError
+    diagReset, diagRegisterFile, diagRegisteredFiles, diagLastError,
+    clampOffset, hexDigitUpperByte, hexNibbleVal
 }
 use lexer.{Token, MkToken, TokKind, TkIdent, TkDot, TkLBrace, TkRBrace, TkLParen, TkRParen, TkComma, TkDef, TkSym, TkEof, tokenizeInFile}
 use parser.parseFileModuleInFile

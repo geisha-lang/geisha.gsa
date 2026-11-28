@@ -352,6 +352,13 @@ pub data DefAttr {
     AttrExport(Option String),
     AttrCtor(Int),
     AttrCStruct,
+    AttrVerified,
+}
+
+pub def hasAttrVerified(attrs: List DefAttr): Bool = match attrs {
+    Nil -> false,
+    Cons(AttrVerified, _) -> true,
+    Cons(_, r) -> hasAttrVerified(r),
 }
 
 pub data Item {
@@ -435,10 +442,12 @@ pub def encodeOpName(op: String): String = {
 }
 
 pub def isReservedNonOp(s: String): Bool =
-    s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||" || s == "!" || s == "~" || s == "?"
+    s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||"
+    || s == "==>" || s == "<==>" || s == "!" || s == "~" || s == "?"
 
 pub def isDefinableOp(s: String): Bool =
-    !(s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||" || s == "!" || s == "?")
+    !(s == "=" || s == ":" || s == "->" || s == "=>" || s == "&&" || s == "||"
+      || s == "==>" || s == "<==>" || s == "!" || s == "?")
 
 pub def builtinBinOpFromStr(s: String): Option BinOp =
     if (s == "+") Some(OpAdd)
@@ -460,39 +469,43 @@ pub def builtinBinOpFromStr(s: String): Option BinOp =
     else if (s == ">=") Some(OpGe)
     else None
 
-/// Infix precedence levels (1 = lowest, 13 = highest):
+/// Infix precedence levels (1 = lowest, 15 = highest):
 ///   1: multi-char `|`-leading pipelines (except `||`)
-///   2: `||` (short-circuit logical OR)
-///   3: `&&` (short-circuit logical AND)
-///   4: `=` / `!`-leading equality (`==`, `!=`, `===`, ...)
-///   5: `<` / `>`-leading comparisons & combinators except shifts
-///   6: `:`-leading (`::` right-assoc)
-///   7: single `|` bitwise OR
-///   8: `^`-leading bitwise XOR
-///   9: `&`-leading bitwise AND (except `&&`)
-///  10: shifts `<<`, `>>`, `>>>`
-///  11: `+` / `-`-leading additive
-///  12: `*` / `/` / `%`-leading multiplicative
-///  13: `@`, `#`, `$`, multi-char `?`, multi-char `~`, `\`
+///   2: `<==>` (logical equivalence)
+///   3: `==>` (right-associative short-circuit logical implication)
+///   4: `||` (short-circuit logical OR)
+///   5: `&&` (short-circuit logical AND)
+///   6: `=` / `!`-leading equality (`==`, `!=`, `===`, ...)
+///   7: `<` / `>`-leading comparisons & combinators except shifts & `<==>`
+///   8: `:`-leading (`::` right-assoc)
+///   9: single `|` bitwise OR
+///  10: `^`-leading bitwise XOR
+///  11: `&`-leading bitwise AND (except `&&`)
+///  12: shifts `<<`, `>>`, `>>>`
+///  13: `+` / `-`-leading additive
+///  14: `*` / `/` / `%`-leading multiplicative
+///  15: `@`, `#`, `$`, multi-char `?`, multi-char `~`, `\`
 pub def infixPrecedence(op: String): Int =
-    if (op == "||") 2
-    else if (op == "&&") 3
+    if (op == "<==>") 2
+    else if (op == "==>") 3
+    else if (op == "||") 4
+    else if (op == "&&") 5
     else if (isReservedNonOp(op) || strLen(op) == 0) 0
-    else if (op == "|") 7
-    else if (op == "<<" || op == ">>" || op == ">>>") 10
+    else if (op == "|") 9
+    else if (op == "<<" || op == ">>" || op == ">>>") 12
     else {
         let c = strByteAt(op, 0);
         if (c == 124) 1
-        else if (c == 61 || c == 33) 4
-        else if (c == 60 || c == 62) 5
-        else if (c == 58) 6
-        else if (c == 94) 8
-        else if (c == 38) 9
-        else if (c == 43 || c == 45) 11
-        else if (c == 42 || c == 47 || c == 37) 12
-        else if (c == 64 || c == 35 || c == 36 || c == 63 || c == 126 || c == 92) 13
+        else if (c == 61 || c == 33) 6
+        else if (c == 60 || c == 62) 7
+        else if (c == 58) 8
+        else if (c == 94) 10
+        else if (c == 38) 11
+        else if (c == 43 || c == 45) 13
+        else if (c == 42 || c == 47 || c == 37) 14
+        else if (c == 64 || c == 35 || c == 36 || c == 63 || c == 126 || c == 92) 15
         else 0
     }
 
 pub def isRightAssocOp(op: String): Bool =
-    strLen(op) > 0 && strByteAt(op, strLen(op) - 1) == 58
+    op == "==>" || (strLen(op) > 0 && strByteAt(op, strLen(op) - 1) == 58)

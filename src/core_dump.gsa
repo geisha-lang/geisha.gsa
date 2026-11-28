@@ -1953,6 +1953,7 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
     || name == "__blackBox"
     || name == "$gs$contract_fail"
+    || name == "$gs$old" || name == "$gs$forall" || name == "$gs$exists"
     || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
     || name == "assert" || name == "assume"
     || name == "__gs_builtin_assert" || name == "__gs_builtin_assume"
@@ -2869,6 +2870,29 @@ def markReachFn(
         } else ()
     } else ()
 
+def scanReachGlobal(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    reachGlobs: StrMap Bool,
+    wl: Cell (List String),
+    gname: String
+): Void =
+    if (!strMapContains(reachGlobs, gname)) {
+        strMapInsert(reachGlobs, gname, true);
+        let cg = cellNew(prog.coreGlobals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, r) -> {
+                    if (g.gvName == gname) scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, g.gvInit)
+                    else ();
+                    cellSet(cg, r)
+                },
+                Nil -> (),
+            }
+        }
+    } else ()
+
 def scanReachTermList(
     prog: CoreProgram,
     allReach: StrMap Bool,
@@ -2876,11 +2900,23 @@ def scanReachTermList(
     wl: Cell (List String),
     es: List TaggedTerm
 ): Void = {
+    let dummyG: StrMap Bool = strMapNew();
+    scanReachTermListWithGlobs(prog, allReach, dirReach, dummyG, wl, es)
+}
+
+def scanReachTermListWithGlobs(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    reachGlobs: StrMap Bool,
+    wl: Cell (List String),
+    es: List TaggedTerm
+): Void = {
     let cur = cellNew(es);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(e, r) -> {
-                scanReachTerm(prog, allReach, dirReach, wl, e);
+                scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e);
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -2894,19 +2930,31 @@ def scanReachTerm(
     dirReach: StrMap Bool,
     wl: Cell (List String),
     tm: TaggedTerm
+): Void = {
+    let dummyG: StrMap Bool = strMapNew();
+    scanReachTermWithGlobs(prog, allReach, dirReach, dummyG, wl, tm)
+}
+
+def scanReachTermWithGlobs(
+    prog: CoreProgram,
+    allReach: StrMap Bool,
+    dirReach: StrMap Bool,
+    reachGlobs: StrMap Bool,
+    wl: Cell (List String),
+    tm: TaggedTerm
 ): Void = match tm.tnode {
     TmLit(_) -> (),
     TmVar(_) -> (),
-    TmGlobalVar(_) -> (),
-    TmTuple(es) -> scanReachTermList(prog, allReach, dirReach, wl, es),
-    TmBlock(es) -> scanReachTermList(prog, allReach, dirReach, wl, es),
+    TmGlobalVar(gnm) -> scanReachGlobal(prog, allReach, dirReach, reachGlobs, wl, gnm),
+    TmTuple(es) -> scanReachTermListWithGlobs(prog, allReach, dirReach, reachGlobs, wl, es),
+    TmBlock(es) -> scanReachTermListWithGlobs(prog, allReach, dirReach, reachGlobs, wl, es),
     TmMakeCls(_, cls, body) -> {
         markReachFn(prog, allReach, dirReach, wl, cls.clsEntry, false);
-        scanReachTerm(prog, allReach, dirReach, wl, body)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, body)
     },
     TmApplyCls(fnTm, args) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, fnTm);
-        scanReachTermList(prog, allReach, dirReach, wl, args)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, fnTm);
+        scanReachTermListWithGlobs(prog, allReach, dirReach, reachGlobs, wl, args)
     },
     TmApplyDir(vd, args) -> {
         if (vd.vname == "cFnPtr") {
@@ -2920,54 +2968,96 @@ def scanReachTerm(
         } else if (!isChanRecvWrapper(prog, vd.vname)) {
             markReachFn(prog, allReach, dirReach, wl, vd.vname, true)
         } else ();
-        scanReachTermList(prog, allReach, dirReach, wl, args)
+        scanReachTermListWithGlobs(prog, allReach, dirReach, reachGlobs, wl, args)
     },
     TmBin(_, e1, e2) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, e1);
-        scanReachTerm(prog, allReach, dirReach, wl, e2)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e1);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e2)
     },
-    TmUn(_, e1) -> scanReachTerm(prog, allReach, dirReach, wl, e1),
+    TmUn(_, e1) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e1),
     TmLet(_, e1, e2) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, e1);
-        scanReachTerm(prog, allReach, dirReach, wl, e2)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e1);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e2)
     },
     TmIf(c, t, e) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, c);
-        scanReachTerm(prog, allReach, dirReach, wl, t);
-        scanReachTerm(prog, allReach, dirReach, wl, e)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, c);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, t);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e)
     },
     TmWhile(c, body) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, c);
-        scanReachTerm(prog, allReach, dirReach, wl, body)
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, c);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, body)
     },
     TmMatch(scrut, arms) -> {
-        scanReachTerm(prog, allReach, dirReach, wl, scrut);
+        scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, scrut);
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(arm, r) -> {
                     match arm.caGuard {
-                        Some(g) -> scanReachTerm(prog, allReach, dirReach, wl, g),
+                        Some(g) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, g),
                         None -> (),
                     };
-                    scanReachTerm(prog, allReach, dirReach, wl, arm.caBody);
+                    scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, arm.caBody);
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
         }
     },
-    TmMakeData(_, _, args, _, _) -> scanReachTermList(prog, allReach, dirReach, wl, args),
-    TmGetTag(e1) -> scanReachTerm(prog, allReach, dirReach, wl, e1),
+    TmMakeData(_, _, args, _, _) -> scanReachTermListWithGlobs(prog, allReach, dirReach, reachGlobs, wl, args),
+    TmGetTag(e1) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, e1),
 }
 
 def collectReachableCoreFnsWithRoots(
     prog: CoreProgram,
     allReach: StrMap Bool,
     dirReach: StrMap Bool,
+    reachGlobs: StrMap Bool,
     extraRoots: List String
-): List String =
-    if (!strMapContains(prog.coreFns, "main")) {
+): List String = {
+    let hasExplicitRoots = match extraRoots { Cons(_, _) -> true, Nil -> false };
+    if (hasExplicitRoots) {
+        // Strict root-closure slicing (`geisha verify --dump-core`): ONLY trace `extraRoots`
+        // and the globals transitively referenced by them!
+        let wl: Cell (List String) = cellNew(Nil);
+        let cer = cellNew(extraRoots);
+        while (match cellGet(cer) { Nil -> false, _ -> true }) {
+            match cellGet(cer) {
+                Cons(rname, rr) -> {
+                    markReachFn(prog, allReach, dirReach, wl, rname, true);
+                    cellSet(cer, rr)
+                },
+                Nil -> (),
+            }
+        };
+        while (match cellGet(wl) { Nil -> false, _ -> true }) {
+            match cellGet(wl) {
+                Cons(fnName, rest) -> {
+                    cellSet(wl, rest);
+                    match strMapGet(prog.coreFns, fnName) {
+                        Some(fd) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, fd.fnBody),
+                        None -> (),
+                    }
+                },
+                Nil -> (),
+            }
+        };
+        let revAcc: Cell (List String) = cellNew(Nil);
+        let cf = cellNew(prog.coreFnNames);
+        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+            match cellGet(cf) {
+                Cons(fnName, r) -> {
+                    if (strMapContains(allReach, fnName)) {
+                        cellSet(revAcc, Cons(fnName, cellGet(revAcc)))
+                    } else ();
+                    cellSet(cf, r)
+                },
+                Nil -> (),
+            }
+        };
+        listRev(cellGet(revAcc))
+    } else if (!strMapContains(prog.coreFns, "main")) {
         let cf = cellNew(prog.coreFnNames);
         while (match cellGet(cf) { Nil -> false, _ -> true }) {
             match cellGet(cf) {
@@ -2979,25 +3069,23 @@ def collectReachableCoreFnsWithRoots(
                 Nil -> (),
             }
         };
+        let cg = cellNew(prog.coreGlobals);
+        while (match cellGet(cg) { Nil -> false, _ -> true }) {
+            match cellGet(cg) {
+                Cons(g, gr) -> { strMapInsert(reachGlobs, g.gvName, true); cellSet(cg, gr) },
+                Nil -> (),
+            }
+        };
         prog.coreFnNames
     } else {
         let wl: Cell (List String) = cellNew(Nil);
         markReachFn(prog, allReach, dirReach, wl, "main", true);
-        let cer = cellNew(extraRoots);
-        while (match cellGet(cer) { Nil -> false, _ -> true }) {
-            match cellGet(cer) {
-                Cons(rname, rr) -> {
-                    markReachFn(prog, allReach, dirReach, wl, rname, true);
-                    cellSet(cer, rr)
-                },
-                Nil -> (),
-            }
-        };
         let cg = cellNew(prog.coreGlobals);
         while (match cellGet(cg) { Nil -> false, _ -> true }) {
             match cellGet(cg) {
                 Cons(g, gr) -> {
-                    scanReachTerm(prog, allReach, dirReach, wl, g.gvInit);
+                    strMapInsert(reachGlobs, g.gvName, true);
+                    scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, g.gvInit);
                     cellSet(cg, gr)
                 },
                 Nil -> (),
@@ -3008,7 +3096,7 @@ def collectReachableCoreFnsWithRoots(
                 Cons(fnName, rest) -> {
                     cellSet(wl, rest);
                     match strMapGet(prog.coreFns, fnName) {
-                        Some(fd) -> scanReachTerm(prog, allReach, dirReach, wl, fd.fnBody),
+                        Some(fd) -> scanReachTermWithGlobs(prog, allReach, dirReach, reachGlobs, wl, fd.fnBody),
                         None -> (),
                     }
                 },
@@ -3030,6 +3118,7 @@ def collectReachableCoreFnsWithRoots(
         };
         listRev(cellGet(revAcc))
     }
+}
 
 def listContainsStrDump(xs: List String, target: String): Bool = match xs {
     Nil -> false,
@@ -3340,19 +3429,25 @@ pub def dumpCoreProgramSExpr(prog: CoreProgram): Result String String =
 pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String): Result String String = {
     let allReach: StrMap Bool = strMapNew();
     let dirReach: StrMap Bool = strMapNew();
-    let activeFnNames = collectReachableCoreFnsWithRoots(prog, allReach, dirReach, extraRoots);
+    let reachGlobs: StrMap Bool = strMapNew();
+    let activeFnNames = collectReachableCoreFnsWithRoots(prog, allReach, dirReach, reachGlobs, extraRoots);
+    let activeGlobalsRev: Cell (List GlobalValDef) = cellNew(Nil);
 
     let globTypes: StrMap Type = strMapNew();
     let cg0 = cellNew(prog.coreGlobals);
     while (match cellGet(cg0) { Nil -> false, _ -> true }) {
         match cellGet(cg0) {
             Cons(g, gr) -> {
-                strMapInsert(globTypes, g.gvName, g.gvTy);
+                if (strMapContains(reachGlobs, g.gvName)) {
+                    strMapInsert(globTypes, g.gvName, g.gvTy);
+                    cellSet(activeGlobalsRev, Cons(g, cellGet(activeGlobalsRev)))
+                } else ();
                 cellSet(cg0, gr)
             },
             Nil -> (),
         }
     };
+    let activeGlobals = listRev(cellGet(activeGlobalsRev));
 
     let fnGlobs = computeFnGlobals(prog, activeFnNames);
 
@@ -3450,7 +3545,7 @@ pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String
                                 emitCoreTyWithMode(ctx, funsBuf, retTy, rMode);
                                 bufPushByte(funsBuf, 32);
                                 if (fd.fnName == "main") {
-                                    emitMainBodyWithGlobals(ctx, funsBuf, prog.coreGlobals, fd.fnBody)
+                                    emitMainBodyWithGlobals(ctx, funsBuf, activeGlobals, fd.fnBody)
                                 } else {
                                     emitCoreTerm(ctx, funsBuf, fd.fnBody)
                                 };

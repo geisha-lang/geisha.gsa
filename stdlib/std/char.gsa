@@ -1,24 +1,46 @@
 // ASCII / UTF-8 byte & character classification (`std.char`)
 
-pub def isDigitByte(b: Int): Bool = b >= 48 && b <= 57
+pub def isDigitByte(b: Int): Bool
+    ensures r -> r <==> (b >= 48 && b <= 57)
+= b >= 48 && b <= 57
 
-pub def isUpperByte(b: Int): Bool = b >= 65 && b <= 90
+pub def isUpperByte(b: Int): Bool
+    ensures r -> r <==> (b >= 65 && b <= 90)
+= b >= 65 && b <= 90
 
-pub def isLowerByte(b: Int): Bool = b >= 97 && b <= 122
+pub def isLowerByte(b: Int): Bool
+    ensures r -> r <==> (b >= 97 && b <= 122)
+= b >= 97 && b <= 122
 
-pub def isAlphaByte(b: Int): Bool = isUpperByte(b) || isLowerByte(b)
+pub def isAlphaByte(b: Int): Bool
+    ensures r -> r <==> ((b >= 65 && b <= 90) || (b >= 97 && b <= 122))
+= isUpperByte(b) || isLowerByte(b)
 
-pub def isAlphaNumByte(b: Int): Bool = isAlphaByte(b) || isDigitByte(b)
+pub def isAlphaNumByte(b: Int): Bool
+    ensures r -> r <==> ((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57))
+= isAlphaByte(b) || isDigitByte(b)
 
-pub def isIdentStartByte(b: Int): Bool = isAlphaByte(b) || b == 95
+pub def isIdentStartByte(b: Int): Bool
+    ensures r -> r <==> ((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95)
+= isAlphaByte(b) || b == 95
 
-pub def isIdentContByte(b: Int): Bool = isAlphaNumByte(b) || b == 95
+pub def isIdentContByte(b: Int): Bool
+    ensures r -> r <==> ((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95)
+= isAlphaNumByte(b) || b == 95
 
-pub def isSpaceByte(b: Int): Bool =
+pub def isSpaceByte(b: Int): Bool
+    ensures r -> r <==> (b == 32 || b == 9 || b == 10 || b == 13)
+=
     b == 32 || b == 9 || b == 10 || b == 13
 
-pub def isDigit(c: Char): Bool = isDigitByte(charToInt(c))
+pub def isDigit(c: Char): Bool
+    ensures r -> r <==> (charToInt(c) >= 48 && charToInt(c) <= 57)
+= isDigitByte(charToInt(c))
 
-pub def isAlpha(c: Char): Bool = isAlphaByte(charToInt(c))
+pub def isAlpha(c: Char): Bool
+    ensures r -> r <==> ((charToInt(c) >= 65 && charToInt(c) <= 90) || (charToInt(c) >= 97 && charToInt(c) <= 122))
+= isAlphaByte(charToInt(c))
 
-pub def isSpace(c: Char): Bool = isSpaceByte(charToInt(c))
+pub def isSpace(c: Char): Bool
+    ensures r -> r <==> (charToInt(c) == 32 || charToInt(c) == 9 || charToInt(c) == 10 || charToInt(c) == 13)
+= isSpaceByte(charToInt(c))

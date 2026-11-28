@@ -31,7 +31,7 @@ use ast.{
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl, MethodImpl, MkMethodImpl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
-    DefAttr, AttrExport, AttrCtor, AttrCStruct,
+    DefAttr, AttrExport, AttrCtor, AttrCStruct, AttrVerified, hasAttrVerified,
     Def, MkDef
 }
 use parser.parseTypeSchemeFromStr
@@ -1338,6 +1338,9 @@ pub def preludePrimSpecs(): List (String, String) = [
         ("__blackBox", "forall a. a -> a"),
         ("assert", "Bool -> Void"),
         ("assume", "Bool -> Void"),
+        ("old", "forall a. a -> a"),
+        ("$gs$forall", "forall a. (a -> Bool) -> Bool"),
+        ("$gs$exists", "forall a. (a -> Bool) -> Bool"),
         ("gcHandleFree", "Int64 -> Void"),
         ("gcTrim", "() -> Void"),
         ("gcSetThresholds", "(Int64, Int64) -> Void"),
@@ -4068,23 +4071,39 @@ def collectDirectImpurityAndCalls(
 ): Void = match f.node {
     ExWhile(_, _) -> cellSet(isImpure, true),
     ExApply(callee, args) -> {
-        match callee.node {
-            ExVar(nm) ->
-                if (isImpureContractPrim(nm)) cellSet(isImpure, true)
-                else if (listContainsStr(bound, nm)) cellSet(isImpure, true)
-                else cellSet(callees, addUniqueStr(cellGet(callees), nm)),
-            _ -> {
-                cellSet(isImpure, true);
-                collectDirectImpurityAndCalls(callee, bound, isImpure, callees)
+        let handledQuant = match callee.node {
+            ExVar(qnm) if (qnm == "$gs$forall" || qnm == "$gs$exists") -> match args {
+                Cons(lamF, Nil) -> match lamF.node {
+                    ExAbs(ps, _, qb) -> {
+                        collectDirectImpurityAndCalls(qb, extendBoundWithVarDecls(ps, bound), isImpure, callees);
+                        true
+                    },
+                    _ -> false,
+                },
+                _ -> false,
             },
+            _ -> false,
         };
-        let ca = cellNew(args);
-        while (match cellGet(ca) { Nil -> false, _ -> true }) {
-            match cellGet(ca) {
-                Cons(a, r) -> { collectDirectImpurityAndCalls(a, bound, isImpure, callees); cellSet(ca, r) },
-                Nil -> (),
+        if (!handledQuant) {
+            match callee.node {
+                ExVar(nm) ->
+                    if (isImpureContractPrim(nm)) cellSet(isImpure, true)
+                    else if (listContainsStr(bound, nm)) cellSet(isImpure, true)
+                    else if (nm == "old") ()
+                    else cellSet(callees, addUniqueStr(cellGet(callees), nm)),
+                _ -> {
+                    cellSet(isImpure, true);
+                    collectDirectImpurityAndCalls(callee, bound, isImpure, callees)
+                },
+            };
+            let ca = cellNew(args);
+            while (match cellGet(ca) { Nil -> false, _ -> true }) {
+                match cellGet(ca) {
+                    Cons(a, r) -> { collectDirectImpurityAndCalls(a, bound, isImpure, callees); cellSet(ca, r) },
+                    Nil -> (),
+                }
             }
-        }
+        } else ()
     },
     ExTuple(es) -> collectDirectList(es, bound, isImpure, callees),
     ExList(es) -> collectDirectList(es, bound, isImpure, callees),
@@ -4243,44 +4262,343 @@ def buildImpureFnSet(ctx: InferCtx, defs: List Def): StrMap Bool = {
     impure
 }
 
-def checkPureExpr(impure: StrMap Bool, bound: List String, f: Form): Result Void String = match f.node {
-    ExWhile(_, _) ->
-        Err(formatSpanDiagHint("Purity error", f.pos, "`while` loop is not allowed inside a contract specification", "contracts (`requires`, `ensures`, `invariant`, `decreases`) must be pure and terminating")),
-    ExApply(callee, args) -> {
-        let calleeChk: Result Void String = match callee.node {
-            ExVar(nm) ->
-                if (isImpureContractPrim(nm)) {
-                    Err(formatSpanDiagHint("Purity error", f.pos, "side-effecting primitive `" + nm + "` is not allowed inside a contract specification", "only pure expressions and read-only lookups (`cellGet`, `arrayLen`, `arrayGet`, `immArrayLen`, `immArrayGet`) are permitted in contracts"))
-                } else if (listContainsStr(bound, nm)) {
-                    Err(formatSpanDiagHint("Purity error", f.pos, "calling higher-order local function `" + nm + "` is not allowed inside a contract specification", "contract specifications cannot invoke arbitrary closures with unknown side effects"))
-                } else if (strMapContains(impure, nm)) {
-                    Err(formatSpanDiagHint("Purity error", f.pos, "impure function `" + nm + "` is not allowed inside a contract specification", "`" + nm + "` directly or transitively performs mutation, I/O, extern FFI, or looping"))
-                } else Ok(()),
-            _ -> Err(formatSpanDiagHint("Purity error", f.pos, "indirect function call is not allowed inside a contract specification", "only calls to statically known pure functions are permitted in contracts")),
-        };
-        calleeChk?;
-        checkPureExprList(impure, bound, args)
+data PurityCtx {
+    MkPurityCtx {
+        pcImpure: StrMap Bool,
+        pcUserDefs: StrMap Bool,
+        pcFnTypeParams: List String,
+        pcEntryVars: List String,
+        pcEnsBind: Option String,
+        pcInSpec: Bool,
+        pcAllowQuant: Bool,
+        pcInEnsures: Bool,
+        pcInOld: Bool,
     },
-    ExTuple(es) -> checkPureExprList(impure, bound, es),
-    ExList(es) -> checkPureExprList(impure, bound, es),
-    ExBlock(es) -> checkPureExprList(impure, bound, es),
-    ExStructInit(_, fs) -> checkPureExprNamed(impure, bound, fs),
-    ExAbs(ps, _, b) -> checkPureExpr(impure, extendBoundWithVarDecls(ps, bound), b),
-    ExBin(_, l, r) -> { checkPureExpr(impure, bound, l)?; checkPureExpr(impure, bound, r) },
-    ExUn(_, e) -> checkPureExpr(impure, bound, e),
-    ExField(e, _) -> checkPureExpr(impure, bound, e),
-    ExTry(e) -> checkPureExpr(impure, bound, e),
-    ExLet(vd, v, b) -> { checkPureExpr(impure, bound, v)?; checkPureExpr(impure, Cons(vd.vname, bound), b) },
-    ExIf(c, t, e) -> { checkPureExpr(impure, bound, c)?; checkPureExpr(impure, bound, t)?; checkPureExpr(impure, bound, e) },
+}
+
+def isUnshadowedSpecPrim(pctx: PurityCtx, bound: List String, nm: String): Bool =
+    !listContainsStr(bound, nm) && !strMapContains(pctx.pcUserDefs, nm)
+
+def exprRefsNonEntryVar(
+    f: Form,
+    entryVars: List String,
+    outerBound: List String,
+    innerBound: List String,
+    ensBindOpt: Option String
+): (Bool, Bool) = match f.node {
+    ExVar(v) ->
+        if (listContainsStr(innerBound, v)) (false, false)
+        else {
+            let hitEnsBind = match ensBindOpt {
+                Some(eb) -> v == eb,
+                None -> false,
+            };
+            let hitLocal = listContainsStr(outerBound, v) && !listContainsStr(entryVars, v);
+            (hitEnsBind, hitLocal)
+        },
+    ExTuple(es) -> exprListRefsNonEntryVar(es, entryVars, outerBound, innerBound, ensBindOpt),
+    ExList(es) -> exprListRefsNonEntryVar(es, entryVars, outerBound, innerBound, ensBindOpt),
+    ExBlock(es) -> exprListRefsNonEntryVar(es, entryVars, outerBound, innerBound, ensBindOpt),
+    ExStructInit(_, fs) -> {
+        let eb = cellNew(false);
+        let loc = cellNew(false);
+        let cur = cellNew(fs);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons((_, vf), r) -> {
+                    let (b1, b2) = exprRefsNonEntryVar(vf, entryVars, outerBound, innerBound, ensBindOpt);
+                    if (b1) cellSet(eb, true) else ();
+                    if (b2) cellSet(loc, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (cellGet(eb), cellGet(loc))
+    },
+    ExApply(c, args) -> {
+        let (c1, c2) = exprRefsNonEntryVar(c, entryVars, outerBound, innerBound, ensBindOpt);
+        let (a1, a2) = exprListRefsNonEntryVar(args, entryVars, outerBound, innerBound, ensBindOpt);
+        (c1 || a1, c2 || a2)
+    },
+    ExAbs(ps, _, b) ->
+        exprRefsNonEntryVar(b, entryVars, outerBound, extendBoundWithVarDecls(ps, innerBound), ensBindOpt),
+    ExBin(_, l, r) -> {
+        let (l1, l2) = exprRefsNonEntryVar(l, entryVars, outerBound, innerBound, ensBindOpt);
+        let (r1, r2) = exprRefsNonEntryVar(r, entryVars, outerBound, innerBound, ensBindOpt);
+        (l1 || r1, l2 || r2)
+    },
+    ExUn(_, e) -> exprRefsNonEntryVar(e, entryVars, outerBound, innerBound, ensBindOpt),
+    ExField(e, _) -> exprRefsNonEntryVar(e, entryVars, outerBound, innerBound, ensBindOpt),
+    ExTry(e) -> exprRefsNonEntryVar(e, entryVars, outerBound, innerBound, ensBindOpt),
+    ExLet(vd, v, b) -> {
+        let (v1, v2) = exprRefsNonEntryVar(v, entryVars, outerBound, innerBound, ensBindOpt);
+        let (b1, b2) = exprRefsNonEntryVar(b, entryVars, outerBound, Cons(vd.vname, innerBound), ensBindOpt);
+        (v1 || b1, v2 || b2)
+    },
+    ExIf(c, t, e) -> {
+        let (c1, c2) = exprRefsNonEntryVar(c, entryVars, outerBound, innerBound, ensBindOpt);
+        let (t1, t2) = exprRefsNonEntryVar(t, entryVars, outerBound, innerBound, ensBindOpt);
+        let (e1, e2) = exprRefsNonEntryVar(e, entryVars, outerBound, innerBound, ensBindOpt);
+        (c1 || t1 || e1, c2 || t2 || e2)
+    },
+    ExMatch(s, arms) -> {
+        let (s1, s2) = exprRefsNonEntryVar(s, entryVars, outerBound, innerBound, ensBindOpt);
+        let eb = cellNew(s1);
+        let loc = cellNew(s2);
+        let cur = cellNew(arms);
+        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+            match cellGet(cur) {
+                Cons(a, r) -> {
+                    let nextInner = extendBoundWithPattern(a.pat, innerBound);
+                    match a.guard {
+                        Some(g) -> {
+                            let (g1, g2) = exprRefsNonEntryVar(g, entryVars, outerBound, nextInner, ensBindOpt);
+                            if (g1) cellSet(eb, true) else ();
+                            if (g2) cellSet(loc, true) else ()
+                        },
+                        None -> (),
+                    };
+                    let (b1, b2) = exprRefsNonEntryVar(a.body, entryVars, outerBound, nextInner, ensBindOpt);
+                    if (b1) cellSet(eb, true) else ();
+                    if (b2) cellSet(loc, true) else ();
+                    cellSet(cur, r)
+                },
+                Nil -> (),
+            }
+        };
+        (cellGet(eb), cellGet(loc))
+    },
+    _ -> (false, false),
+}
+
+def exprListRefsNonEntryVar(
+    es: List Form,
+    entryVars: List String,
+    outerBound: List String,
+    innerBound: List String,
+    ensBindOpt: Option String
+): (Bool, Bool) = match es {
+    Nil -> (false, false),
+    Cons(h, t) -> {
+        let (h1, h2) = exprRefsNonEntryVar(h, entryVars, outerBound, innerBound, ensBindOpt);
+        let (t1, t2) = exprListRefsNonEntryVar(t, entryVars, outerBound, innerBound, ensBindOpt);
+        (h1 || t1, h2 || t2)
+    },
+}
+
+def checkOldArgScope(pctx: PurityCtx, bound: List String, callSp: Span, arg0: Form): Result Void String = {
+    let (usesEnsBind, usesEnsLocal) = exprRefsNonEntryVar(arg0, pctx.pcEntryVars, bound, Nil, pctx.pcEnsBind);
+    if (usesEnsBind) {
+        let rname = match pctx.pcEnsBind { Some(rn) -> rn, None -> "result" };
+        Err(formatSpanDiagHint(
+            "Contract error", callSp,
+            "`old(...)` evaluates in the pre-state before the function body runs and cannot reference the `ensures` return binding `" + rname + "`",
+            "use `" + rname + "` outside `old(...)` to compare post-state results against `old(...)` pre-state values"
+        ))
+    } else if (!usesEnsLocal) {
+        Ok(())
+    } else {
+        // Allow `old(arrayGet(arrExpr, idxExpr))` when `arrExpr` depends only on entry-scope variables!
+        let okArrIdx = match arg0.node {
+            ExApply(cF, Cons(arrF, Cons(_, Nil))) -> match cF.node {
+                ExVar(anm) if ((anm == "arrayGet" || anm == "immArrayGet") && isUnshadowedSpecPrim(pctx, bound, anm)) -> {
+                    let (ab1, ab2) = exprRefsNonEntryVar(arrF, pctx.pcEntryVars, bound, Nil, pctx.pcEnsBind);
+                    !ab1 && !ab2
+                },
+                _ -> false,
+            },
+            _ -> false,
+        };
+        if (okArrIdx) Ok(())
+        else Err(formatSpanDiagHint(
+            "Contract error", callSp,
+            "`old(...)` cannot depend on `ensures`-local bindings (except indexing a pre-state array via `old(arrayGet(arr, i))`)",
+            "wrap only the pre-state container/value read in `old(...)`, e.g. `old(cellGet(c))`"
+        ))
+    }
+}
+
+def checkContractExprCtx(pctx: PurityCtx, bound: List String, f: Form): Result Void String = match f.node {
+    ExVar(nm) ->
+        if (nm == "old" && isUnshadowedSpecPrim(pctx, bound, "old")) {
+            Err(formatSpanDiagHint(
+                "Contract error", f.pos,
+                "`old` cannot be used as a first-class value; call `old(expr)` inside an `ensures` postcondition",
+                "example: `ensures cellGet(c) == old(cellGet(c)) + 1`"
+            ))
+        } else Ok(()),
+    ExWhile(c, b) ->
+        if (pctx.pcInSpec) {
+            Err(formatSpanDiagHint("Purity error", f.pos, "`while` loop is not allowed inside a contract specification", "contracts (`requires`, `ensures`, `invariant`, `decreases`) must be pure and terminating"))
+        } else {
+            checkContractExprCtx(pctx, bound, c)?;
+            checkContractExprCtx(pctx, bound, b)
+        },
+    ExApply(callee, args) -> {
+        let isQuant = match callee.node {
+            ExVar(qnm) -> qnm == "$gs$forall" || qnm == "$gs$exists",
+            _ -> false,
+        };
+        let isOldCall = match callee.node {
+            ExVar(onm) -> onm == "old" && isUnshadowedSpecPrim(pctx, bound, "old"),
+            _ -> false,
+        };
+        let isAssertOrAssume = match callee.node {
+            ExVar(anm) -> (anm == "assert" || anm == "assume") && isUnshadowedSpecPrim(pctx, bound, anm),
+            _ -> false,
+        };
+        if (isQuant) {
+            if (!pctx.pcAllowQuant) {
+                Err(formatSpanDiagHint(
+                    "Contract error", f.pos,
+                    "quantifier expressions (`forall` / `exists`) are only allowed inside contract specifications (`requires`, `ensures`, `invariant`) and `assert`/`assume`",
+                    "move the quantified property into a `requires`, `ensures`, `invariant`, or `assert(...)` clause"
+                ))
+            } else match args {
+                Cons(lamF, Nil) -> match lamF.node {
+                    ExAbs(Cons(vd, Nil), _, qbody) -> {
+                        let fvs = ftvOrdered(schemeBody(vd.vscm));
+                        let cf = cellNew(fvs);
+                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                            match cellGet(cf) {
+                                Cons(tv, rf) -> {
+                                    if (!isModeVarName(tv) && !listContainsStr(pctx.pcFnTypeParams, tv)) {
+                                        Err(formatSpanDiagHint(
+                                            "Type error", f.pos,
+                                            "cannot infer concrete type for quantified variable `" + vd.vname + "`",
+                                            "add an explicit type annotation, e.g. `forall (" + vd.vname + ": Int) -> ...`"
+                                        ))?
+                                    } else ();
+                                    cellSet(cf, rf)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let qCtx = MkPurityCtx {
+                            pcImpure: pctx.pcImpure,
+                            pcUserDefs: pctx.pcUserDefs,
+                            pcFnTypeParams: pctx.pcFnTypeParams,
+                            pcEntryVars: pctx.pcEntryVars,
+                            pcEnsBind: pctx.pcEnsBind,
+                            pcInSpec: true,
+                            pcAllowQuant: true,
+                            pcInEnsures: pctx.pcInEnsures,
+                            pcInOld: pctx.pcInOld,
+                        };
+                        checkContractExprCtx(qCtx, Cons(vd.vname, bound), qbody)
+                    },
+                    _ -> Err(formatSpanDiag("Contract error", f.pos, "malformed quantifier binder")),
+                },
+                _ -> Err(formatSpanDiag("Contract error", f.pos, "malformed quantifier expression")),
+            }
+        } else if (isOldCall) {
+            if (!pctx.pcInEnsures) {
+                Err(formatSpanDiagHint(
+                    "Contract error", f.pos,
+                    "`old(expr)` is only allowed inside an `ensures` postcondition",
+                    "move `old(...)` into an `ensures` clause"
+                ))
+            } else if (pctx.pcInOld) {
+                Err(formatSpanDiagHint(
+                    "Contract error", f.pos,
+                    "nested `old(old(...))` is not allowed",
+                    "use a single `old(...)` around the pre-state expression"
+                ))
+            } else match args {
+                Cons(arg0, Nil) -> {
+                    checkOldArgScope(pctx, bound, f.pos, arg0)?;
+                    let oldCtx = MkPurityCtx {
+                        pcImpure: pctx.pcImpure,
+                        pcUserDefs: pctx.pcUserDefs,
+                        pcFnTypeParams: pctx.pcFnTypeParams,
+                        pcEntryVars: pctx.pcEntryVars,
+                        pcEnsBind: pctx.pcEnsBind,
+                        pcInSpec: true,
+                        pcAllowQuant: false,
+                        pcInEnsures: true,
+                        pcInOld: true,
+                    };
+                    checkContractExprCtx(oldCtx, bound, arg0)
+                },
+                _ -> Err(formatSpanDiag("Contract error", f.pos, "`old(...)` expects exactly 1 argument")),
+            }
+        } else if (pctx.pcInSpec) {
+            let calleeChk: Result Void String = match callee.node {
+                ExVar(nm) ->
+                    if (isImpureContractPrim(nm)) {
+                        Err(formatSpanDiagHint("Purity error", f.pos, "side-effecting primitive `" + nm + "` is not allowed inside a contract specification", "only pure expressions and read-only lookups (`cellGet`, `arrayLen`, `arrayGet`, `immArrayLen`, `immArrayGet`) are permitted in contracts"))
+                    } else if (listContainsStr(bound, nm)) {
+                        Err(formatSpanDiagHint("Purity error", f.pos, "calling higher-order local function `" + nm + "` is not allowed inside a contract specification", "contract specifications cannot invoke arbitrary closures with unknown side effects"))
+                    } else if (strMapContains(pctx.pcImpure, nm)) {
+                        Err(formatSpanDiagHint("Purity error", f.pos, "impure function `" + nm + "` is not allowed inside a contract specification", "`" + nm + "` directly or transitively performs mutation, I/O, extern FFI, or looping"))
+                    } else Ok(()),
+                _ -> Err(formatSpanDiagHint("Purity error", f.pos, "indirect function call is not allowed inside a contract specification", "only calls to statically known pure functions are permitted in contracts")),
+            };
+            calleeChk?;
+            checkContractExprCtxList(pctx, bound, args)
+        } else if (isAssertOrAssume) {
+            let aaCtx = MkPurityCtx {
+                pcImpure: pctx.pcImpure,
+                pcUserDefs: pctx.pcUserDefs,
+                pcFnTypeParams: pctx.pcFnTypeParams,
+                pcEntryVars: pctx.pcEntryVars,
+                pcEnsBind: None,
+                pcInSpec: false,
+                pcAllowQuant: true,
+                pcInEnsures: false,
+                pcInOld: false,
+            };
+            checkContractExprCtxList(aaCtx, bound, args)
+        } else {
+            checkContractExprCtx(pctx, bound, callee)?;
+            checkContractExprCtxList(pctx, bound, args)
+        }
+    },
+    ExTuple(es) -> checkContractExprCtxList(pctx, bound, es),
+    ExList(es) -> checkContractExprCtxList(pctx, bound, es),
+    ExBlock(es) -> checkContractExprCtxList(pctx, bound, es),
+    ExStructInit(_, fs) -> checkContractExprCtxNamed(pctx, bound, fs),
+    ExAbs(ps, _, b) -> {
+        let nextBound = extendBoundWithVarDecls(ps, bound);
+        let subCtx = match b.node {
+            ExContract(_, _) -> MkPurityCtx {
+                pcImpure: pctx.pcImpure,
+                pcUserDefs: pctx.pcUserDefs,
+                pcFnTypeParams: pctx.pcFnTypeParams,
+                pcEntryVars: nextBound,
+                pcEnsBind: None,
+                pcInSpec: pctx.pcInSpec,
+                pcAllowQuant: pctx.pcAllowQuant,
+                pcInEnsures: false,
+                pcInOld: false,
+            },
+            _ -> pctx,
+        };
+        checkContractExprCtx(subCtx, nextBound, b)
+    },
+    ExBin(_, l, r) -> { checkContractExprCtx(pctx, bound, l)?; checkContractExprCtx(pctx, bound, r) },
+    ExUn(_, e) -> checkContractExprCtx(pctx, bound, e),
+    ExField(e, _) -> checkContractExprCtx(pctx, bound, e),
+    ExTry(e) -> checkContractExprCtx(pctx, bound, e),
+    ExLet(vd, v, b) -> {
+        checkContractExprCtx(pctx, bound, v)?;
+        checkContractExprCtx(pctx, Cons(vd.vname, bound), b)
+    },
+    ExIf(c, t, e) -> {
+        checkContractExprCtx(pctx, bound, c)?;
+        checkContractExprCtx(pctx, bound, t)?;
+        checkContractExprCtx(pctx, bound, e)
+    },
     ExMatch(scrut, arms) -> {
-        checkPureExpr(impure, bound, scrut)?;
+        checkContractExprCtx(pctx, bound, scrut)?;
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(a, r) -> {
                     let ab = extendBoundWithPattern(a.pat, bound);
-                    match a.guard { Some(g) -> checkPureExpr(impure, ab, g)?, None -> () };
-                    checkPureExpr(impure, ab, a.body)?;
+                    match a.guard { Some(g) -> checkContractExprCtx(pctx, ab, g)?, None -> () };
+                    checkContractExprCtx(pctx, ab, a.body)?;
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -4288,105 +4606,143 @@ def checkPureExpr(impure: StrMap Bool, bound: List String, f: Form): Result Void
         };
         Ok(())
     },
-    ExContract(_, b) -> checkPureExpr(impure, bound, b),
-    ExLoopContract(_, _, b) -> checkPureExpr(impure, bound, b),
-    _ -> Ok(()),
-}
-
-def checkPureExprList(impure: StrMap Bool, bound: List String, es: List Form): Result Void String = match es {
-    Nil -> Ok(()),
-    Cons(h, t) -> { checkPureExpr(impure, bound, h)?; checkPureExprList(impure, bound, t) },
-}
-
-def checkPureExprNamed(impure: StrMap Bool, bound: List String, fs: List (String, Form)): Result Void String = match fs {
-    Nil -> Ok(()),
-    Cons((_, v), t) -> { checkPureExpr(impure, bound, v)?; checkPureExprNamed(impure, bound, t) },
-}
-
-def checkContractPurityInForm(impure: StrMap Bool, bound: List String, f: Form): Result Void String = match f.node {
     ExContract(fc, b) -> {
+        let reqCtx = MkPurityCtx {
+            pcImpure: pctx.pcImpure,
+            pcUserDefs: pctx.pcUserDefs,
+            pcFnTypeParams: pctx.pcFnTypeParams,
+            pcEntryVars: bound,
+            pcEnsBind: None,
+            pcInSpec: true,
+            pcAllowQuant: true,
+            pcInEnsures: false,
+            pcInOld: false,
+        };
+        let decCtx = MkPurityCtx {
+            pcImpure: pctx.pcImpure,
+            pcUserDefs: pctx.pcUserDefs,
+            pcFnTypeParams: pctx.pcFnTypeParams,
+            pcEntryVars: bound,
+            pcEnsBind: None,
+            pcInSpec: true,
+            pcAllowQuant: false,
+            pcInEnsures: false,
+            pcInOld: false,
+        };
         let cr = cellNew(fc.fcRequires);
         while (match cellGet(cr) { Nil -> false, _ -> true }) {
-            match cellGet(cr) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cr, r) }, Nil -> () }
+            match cellGet(cr) { Cons((_, e), r) -> { checkContractExprCtx(reqCtx, bound, e)?; cellSet(cr, r) }, Nil -> () }
         };
         let cd = cellNew(fc.fcDecreases);
         while (match cellGet(cd) { Nil -> false, _ -> true }) {
-            match cellGet(cd) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cd, r) }, Nil -> () }
+            match cellGet(cd) { Cons((_, e), r) -> { checkContractExprCtx(decCtx, bound, e)?; cellSet(cd, r) }, Nil -> () }
         };
         let ce = cellNew(fc.fcEnsures);
         while (match cellGet(ce) { Nil -> false, _ -> true }) {
             match cellGet(ce) {
                 Cons(ec, r) -> {
                     let eb = match ec.ecBind { Some(bn) -> Cons(bn, bound), None -> bound };
-                    checkPureExpr(impure, eb, ec.ecExpr)?;
+                    let ensCtx = MkPurityCtx {
+                        pcImpure: pctx.pcImpure,
+                        pcUserDefs: pctx.pcUserDefs,
+                        pcFnTypeParams: pctx.pcFnTypeParams,
+                        pcEntryVars: bound,
+                        pcEnsBind: ec.ecBind,
+                        pcInSpec: true,
+                        pcAllowQuant: true,
+                        pcInEnsures: true,
+                        pcInOld: false,
+                    };
+                    checkContractExprCtx(ensCtx, eb, ec.ecExpr)?;
                     cellSet(ce, r)
                 },
                 Nil -> (),
             }
         };
-        checkContractPurityInForm(impure, bound, b)
+        checkContractExprCtx(pctx, bound, b)
     },
     ExLoopContract(invs, decs, b) -> {
+        let invCtx = MkPurityCtx {
+            pcImpure: pctx.pcImpure,
+            pcUserDefs: pctx.pcUserDefs,
+            pcFnTypeParams: pctx.pcFnTypeParams,
+            pcEntryVars: pctx.pcEntryVars,
+            pcEnsBind: None,
+            pcInSpec: true,
+            pcAllowQuant: true,
+            pcInEnsures: false,
+            pcInOld: false,
+        };
+        let decCtx = MkPurityCtx {
+            pcImpure: pctx.pcImpure,
+            pcUserDefs: pctx.pcUserDefs,
+            pcFnTypeParams: pctx.pcFnTypeParams,
+            pcEntryVars: pctx.pcEntryVars,
+            pcEnsBind: None,
+            pcInSpec: true,
+            pcAllowQuant: false,
+            pcInEnsures: false,
+            pcInOld: false,
+        };
         let ci = cellNew(invs);
         while (match cellGet(ci) { Nil -> false, _ -> true }) {
-            match cellGet(ci) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(ci, r) }, Nil -> () }
+            match cellGet(ci) { Cons((_, e), r) -> { checkContractExprCtx(invCtx, bound, e)?; cellSet(ci, r) }, Nil -> () }
         };
         let cd = cellNew(decs);
         while (match cellGet(cd) { Nil -> false, _ -> true }) {
-            match cellGet(cd) { Cons((_, e), r) -> { checkPureExpr(impure, bound, e)?; cellSet(cd, r) }, Nil -> () }
+            match cellGet(cd) { Cons((_, e), r) -> { checkContractExprCtx(decCtx, bound, e)?; cellSet(cd, r) }, Nil -> () }
         };
-        checkContractPurityInForm(impure, bound, b)
-    },
-    ExApply(callee, args) -> { checkContractPurityInForm(impure, bound, callee)?; checkContractPurityInList(impure, bound, args) },
-    ExTuple(es) -> checkContractPurityInList(impure, bound, es),
-    ExList(es) -> checkContractPurityInList(impure, bound, es),
-    ExBlock(es) -> checkContractPurityInList(impure, bound, es),
-    ExStructInit(_, fs) -> checkContractPurityInNamed(impure, bound, fs),
-    ExAbs(ps, _, b) -> checkContractPurityInForm(impure, extendBoundWithVarDecls(ps, bound), b),
-    ExBin(_, l, r) -> { checkContractPurityInForm(impure, bound, l)?; checkContractPurityInForm(impure, bound, r) },
-    ExUn(_, e) -> checkContractPurityInForm(impure, bound, e),
-    ExField(e, _) -> checkContractPurityInForm(impure, bound, e),
-    ExTry(e) -> checkContractPurityInForm(impure, bound, e),
-    ExLet(vd, v, b) -> { checkContractPurityInForm(impure, bound, v)?; checkContractPurityInForm(impure, Cons(vd.vname, bound), b) },
-    ExIf(c, t, e) -> { checkContractPurityInForm(impure, bound, c)?; checkContractPurityInForm(impure, bound, t)?; checkContractPurityInForm(impure, bound, e) },
-    ExWhile(c, b) -> { checkContractPurityInForm(impure, bound, c)?; checkContractPurityInForm(impure, bound, b) },
-    ExMatch(scrut, arms) -> {
-        checkContractPurityInForm(impure, bound, scrut)?;
-        let cur = cellNew(arms);
-        while (match cellGet(cur) { Nil -> false, _ -> true }) {
-            match cellGet(cur) {
-                Cons(a, r) -> {
-                    let ab = extendBoundWithPattern(a.pat, bound);
-                    match a.guard { Some(g) -> checkContractPurityInForm(impure, ab, g)?, None -> () };
-                    checkContractPurityInForm(impure, ab, a.body)?;
-                    cellSet(cur, r)
-                },
-                Nil -> (),
-            }
-        };
-        Ok(())
+        checkContractExprCtx(pctx, bound, b)
     },
     _ -> Ok(()),
 }
 
-def checkContractPurityInList(impure: StrMap Bool, bound: List String, es: List Form): Result Void String = match es {
+def checkContractExprCtxList(pctx: PurityCtx, bound: List String, es: List Form): Result Void String = match es {
     Nil -> Ok(()),
-    Cons(h, t) -> { checkContractPurityInForm(impure, bound, h)?; checkContractPurityInList(impure, bound, t) },
+    Cons(h, t) -> { checkContractExprCtx(pctx, bound, h)?; checkContractExprCtxList(pctx, bound, t) },
 }
 
-def checkContractPurityInNamed(impure: StrMap Bool, bound: List String, fs: List (String, Form)): Result Void String = match fs {
+def checkContractExprCtxNamed(pctx: PurityCtx, bound: List String, fs: List (String, Form)): Result Void String = match fs {
     Nil -> Ok(()),
-    Cons((_, v), t) -> { checkContractPurityInForm(impure, bound, v)?; checkContractPurityInNamed(impure, bound, t) },
+    Cons((_, v), t) -> { checkContractExprCtx(pctx, bound, v)?; checkContractExprCtxNamed(pctx, bound, t) },
 }
 
 def checkAllContractPurity(ctx: InferCtx, defs: List Def): Result Void String = {
     let impure = buildImpureFnSet(ctx, defs);
+    let userDefs: StrMap Bool = strMapNew();
+    let cd0 = cellNew(defs);
+    while (match cellGet(cd0) { Nil -> false, _ -> true }) {
+        match cellGet(cd0) {
+            Cons(d, r) -> {
+                match d.item {
+                    ItForm(_) -> strMapInsert(userDefs, d.ident, true),
+                    ItExtern(_, _, _, _) -> strMapInsert(userDefs, d.ident, true),
+                    _ -> (),
+                };
+                cellSet(cd0, r)
+            },
+            Nil -> (),
+        }
+    };
     let cd = cellNew(defs);
     while (match cellGet(cd) { Nil -> false, _ -> true }) {
         match cellGet(cd) {
             Cons(d, r) -> {
                 match d.item {
-                    ItForm(f) -> checkContractPurityInForm(impure, Nil, f)?,
+                    ItForm(f) -> {
+                        let pctx = MkPurityCtx {
+                            pcImpure: impure,
+                            pcUserDefs: userDefs,
+                            pcFnTypeParams: schemeTypeParams(f.ty),
+                            pcEntryVars: Nil,
+                            pcEnsBind: None,
+                            pcInSpec: false,
+                            pcAllowQuant: false,
+                            pcInEnsures: false,
+                            pcInOld: false,
+                        };
+                        checkContractExprCtx(pctx, Nil, f)?
+                    },
                     _ -> (),
                 };
                 cellSet(cd, r)
@@ -5855,10 +6211,17 @@ def validateAllCStructs(ctx: InferCtx, defs: List Def): Result Void String = {
                         } else (),
                 };
                 match d.item {
-                    ItForm(_) -> (),
+                    ItForm(f) ->
+                        if (hasAttrVerified(d.attrs)) {
+                            match f.node {
+                                ExAbs(_, _, _) -> (),
+                                _ -> returnPatErr(d.dpos, "'verified' is only valid on top-level 'def' functions")?,
+                            }
+                        } else (),
                     _ -> {
                         if (hasAttrExport(d.attrs)) returnPatErr(d.dpos, "'extern' export is only valid on top-level 'def' functions")? else ();
-                        if (hasAttrCtor(d.attrs)) returnPatErr(d.dpos, "'extern init' is only valid on top-level 'def' functions")? else ()
+                        if (hasAttrCtor(d.attrs)) returnPatErr(d.dpos, "'extern init' is only valid on top-level 'def' functions")? else ();
+                        if (hasAttrVerified(d.attrs)) returnPatErr(d.dpos, "'verified' is only valid on top-level 'def' functions")? else ()
                     },
                 };
                 cellSet(cur, r)

@@ -5,12 +5,16 @@ pub data Result a e {
     Err(e),
 }
 
-pub def isOk(res: Result a e): Bool = match res {
+pub def isOk(res: Result a e): Bool
+    ensures r -> r <==> match res { Ok(_) -> true, Err(_) -> false }
+= match res {
     Ok(_) -> true,
     Err(_) -> false,
 }
 
-pub def isErr(res: Result a e): Bool = match res {
+pub def isErr(res: Result a e): Bool
+    ensures r -> r <==> match res { Err(_) -> true, Ok(_) -> false }
+= match res {
     Err(_) -> true,
     Ok(_) -> false,
 }
