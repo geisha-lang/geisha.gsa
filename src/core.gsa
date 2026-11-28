@@ -2173,7 +2173,13 @@ def applyExplicitSubstListCore(ts: List Type, sub: StrMap Type): List Type = mat
 }
 
 def specializeTerm(tm: TaggedTerm, typeSub: StrMap Type, fnRename: StrMap String): TaggedTerm = {
-    let nscm = applySchemeSubst(tm.tscm, typeSub);
+    let nscm = match tm.tnode {
+        TmVar(id) -> match strMapGet(fnRename, id) {
+            Some(_) -> ScmMono(applyExplicitSubst(schemeBody(tm.tscm), typeSub)),
+            None -> applySchemeSubst(tm.tscm, typeSub),
+        },
+        _ -> applySchemeSubst(tm.tscm, typeSub),
+    };
     let nnode = match tm.tnode {
         TmLit(l) -> TmLit(l),
         TmGlobalVar(g) -> TmGlobalVar(g),
@@ -2198,23 +2204,23 @@ def specializeTerm(tm: TaggedTerm, typeSub: StrMap Type, fnRename: StrMap String
         ),
         TmWhile(c, b) -> TmWhile(specializeTerm(c, typeSub, fnRename), specializeTerm(b, typeSub, fnRename)),
         TmApplyDir(vd, args) -> {
-            let nid = match strMapGet(fnRename, vd.vname) {
-                Some(r) -> r,
-                None -> vd.vname,
+            let (nid, nvscm) = match strMapGet(fnRename, vd.vname) {
+                Some(r) -> (r, ScmMono(applyExplicitSubst(schemeBody(vd.vscm), typeSub))),
+                None -> (vd.vname, applySchemeSubst(vd.vscm, typeSub)),
             };
             TmApplyDir(
-                MkVarDecl { vname: nid, vscm: applySchemeSubst(vd.vscm, typeSub) },
+                MkVarDecl { vname: nid, vscm: nvscm },
                 specializeTermList(args, typeSub, fnRename)
             )
         },
         TmApplyCls(c, args) -> TmApplyCls(specializeTerm(c, typeSub, fnRename), specializeTermList(args, typeSub, fnRename)),
         TmMakeCls(vd, cls, body) -> {
-            let newEntry = match strMapGet(fnRename, cls.clsEntry) {
-                Some(r) -> r,
-                None -> cls.clsEntry,
+            let (newEntry, nvscm) = match strMapGet(fnRename, cls.clsEntry) {
+                Some(r) -> (r, ScmMono(applyExplicitSubst(schemeBody(vd.vscm), typeSub))),
+                None -> (cls.clsEntry, applySchemeSubst(vd.vscm, typeSub)),
             };
             TmMakeCls(
-                MkVarDecl { vname: vd.vname, vscm: applySchemeSubst(vd.vscm, typeSub) },
+                MkVarDecl { vname: vd.vname, vscm: nvscm },
                 MkClosureSpec { clsEntry: newEntry, clsFvs: cls.clsFvs },
                 specializeTerm(body, typeSub, fnRename)
             )

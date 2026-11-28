@@ -3014,9 +3014,9 @@ if [ "$IS_WIN" = "0" ] && command -v lldb >/dev/null 2>&1; then
         "Vec(len=3) [100, 200, 300]" \
         "Vec(len=2) [(1, 2), (3, 4)]" \
         "Shape(tag=0, payload=7)" \
-        "optSome = 0x" \
+        "optSome = Some(42)" \
         "Some(42)" \
-        "optNone = 0x" \
+        "optNone = None" \
         "None" \
         "[1, 2, 3]" \
         "tag=0, payload=42"; do
@@ -3026,7 +3026,7 @@ if [ "$IS_WIN" = "0" ] && command -v lldb >/dev/null 2>&1; then
             exit 1
         fi
     done
-    if printf "%s" "$LLDB_OUT" | grep -Fq "resOpt = 0x" && printf "%s" "$LLDB_OUT" | grep "resOpt = " | grep -Fq "None"; then
+    if printf "%s" "$LLDB_OUT" | grep "resOpt = " | grep -Fq "= None"; then
         echo "FAIL [dwarf_lldb_e2e]: Result Int (Option String) misidentified as None!" >&2
         printf "%s\n" "$LLDB_OUT" >&2
         exit 1
@@ -7376,6 +7376,135 @@ fi
 if command -v node >/dev/null 2>&1; then
     "$GEISHA_BIN" --target js -o "$TMP_DIR/t48_std_simd.mjs" "$TMP_DIR/t48_std_simd.gsa"
     assert_eq "std_simd_js" "$EXPECTED_SIMD" "$(node "$TMP_DIR/t48_std_simd.mjs")"
+fi
+
+# 49. Transparent Value-Type Unboxing for `Option a` & Small Non-Recursive Sum Types (`Result`, `Either`, SIMD, GC, Concurrency)
+cat > "$TMP_DIR/t49_unboxed_option_result.gsa" << 'EOF'
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.simd.{U8x16, splat, extract}
+use std.str.intToStr
+
+data Span2 {
+    MkSpan2 { start: Int, end: Int },
+}
+
+pub def makeOptSpan(ok: Bool, s: Int, e: Int): Option Span2 =
+    if (ok) Some(MkSpan2 { start: s, end: e }) else None
+
+pub def makeResIntStr(ok: Bool, n: Int, msg: String): Result Int String =
+    if (ok) Ok(n) else Err(msg)
+
+def classifyPtrOpt(opt: Option Ptr): Int = match opt {
+    None -> 0,
+    Some(p) -> if (ptrIsNull(p)) 1 else 2,
+}
+
+def classifyNestedOpt(opt: Option (Option Int)): Int = match opt {
+    None -> 0,
+    Some(None) -> 1,
+    Some(Some(x)) -> 100 + x,
+}
+
+def main(): Void = {
+    // 1. Null-pointer & nested-None soundness (`Some(ptrNull) != None`, `Some(None) != None`)
+    let p0 = classifyPtrOpt(None);
+    let p1 = classifyPtrOpt(Some(ptrNull()));
+    let n0 = classifyNestedOpt(None);
+    let n1 = classifyNestedOpt(Some(None));
+    let n2 = classifyNestedOpt(Some(Some(7)));
+
+    // 2. Unboxed Option U8x16 & Option Span2
+    let ov: Option U8x16 = Some(splat(13));
+    let ovVal = match ov {
+        Some(v) -> extract(v, 15),
+        None -> -1,
+    };
+    let os = match makeOptSpan(true, 10, 42) {
+        Some(MkSpan2 { start, end }) -> end - start,
+        None -> -1,
+    };
+
+    // 3. Generational GC survival across Cell / MutArray of unboxed Option String & Result Int String
+    let arr: MutArray (Option String) = arrayNew(64, None);
+    let k = cellNew(0);
+    while (cellGet(k) < 64) {
+        let idx = cellGet(k);
+        if ((idx & 1) == 0) {
+            arraySet(arr, idx, Some("item-" + intToStr(idx)))
+        } else ();
+        cellSet(k, idx + 1)
+    };
+    let resCell: Cell (Result Int String) = cellNew(Ok(123456789));
+    gcTrim();
+    cellSet(resCell, makeResIntStr(false, 0, "err-" + intToStr(99)));
+    gcTrim();
+    let arrCheck = match (arrayGet(arr, 12), arrayGet(arr, 13)) {
+        (Some(s12), None) -> s12,
+        _ -> "bad",
+    };
+    let resCheck = match cellGet(resCell) {
+        Ok(n) -> "ok:" + intToStr(n),
+        Err(e) -> e,
+    };
+
+    // 4. Multicore parTabulate returning unboxed Result Int Span2
+    let parRes: ImmArray (Result Int Span2) = parTabulate(16, (idx) ->
+        if ((idx & 1) == 0) Ok(idx * 3)
+        else Err(MkSpan2 { start: idx, end: idx + 10 })
+    );
+    let parSum = cellNew(0);
+    let m = cellNew(0);
+    while (cellGet(m) < 16) {
+        let j = cellGet(m);
+        let v = match immArrayGet(parRes, j) {
+            Ok(x) -> x,
+            Err(MkSpan2 { start, end }) -> start + end,
+        };
+        cellSet(parSum, cellGet(parSum) + v);
+        cellSet(m, j + 1)
+    };
+
+    printLn(
+        intToStr(p0) + "," + intToStr(p1) + "|" +
+        intToStr(n0) + "," + intToStr(n1) + "," + intToStr(n2) + "|" +
+        intToStr(ovVal) + "|" +
+        intToStr(os) + "|" +
+        arrCheck + "|" +
+        resCheck + "|" +
+        intToStr(cellGet(parSum))
+    )
+}
+EOF
+
+EXPECTED_UNBOX49="0,1|0,1,107|13|32|item-12|err-99|376"
+
+"$GEISHA_BIN" -e -o "$TMP_DIR/t49_unbox.ll" "$TMP_DIR/t49_unboxed_option_result.gsa"
+if awk '/^define .*@makeOptSpan\(/,/^}/' "$TMP_DIR/t49_unbox.ll" | grep -q "gc_alloc\|__gs_tlab_alloc"; then
+    echo "FAIL [unbox_option_ir]: makeOptSpan should not heap-allocate Option Span2" >&2
+    exit 1
+fi
+if awk '/^define .*@makeResIntStr\(/,/^}/' "$TMP_DIR/t49_unbox.ll" | grep -q "gc_alloc\|__gs_tlab_alloc"; then
+    echo "FAIL [unbox_result_ir]: makeResIntStr should not heap-allocate Result Int String" >&2
+    exit 1
+fi
+echo "PASS [unbox_option_result_ir]: Option Span2 and Result Int String compiled to zero-alloc register values"
+PASS=$((PASS + 1))
+
+"$GEISHA_BIN" --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t49_unbox$EXE_EXT" "$TMP_DIR/t49_unboxed_option_result.gsa"
+assert_eq "unbox_option_result_native" "$EXPECTED_UNBOX49" "$("$TMP_DIR/t49_unbox$EXE_EXT")"
+
+"$GEISHA_BIN" -g --runtime "$GEISHA_RUNTIME" -o "$TMP_DIR/t49_unbox_dbg$EXE_EXT" "$TMP_DIR/t49_unboxed_option_result.gsa"
+assert_eq "unbox_option_result_debug" "$EXPECTED_UNBOX49" "$("$TMP_DIR/t49_unbox_dbg$EXE_EXT")"
+
+if [ -f "./build/wasm_rt.o" ]; then
+    "$GEISHA_BIN" --target wasm32 --runtime "./build/wasm_rt.o" -o "$TMP_DIR/t49_unbox.wasm" "$TMP_DIR/t49_unboxed_option_result.gsa"
+    PASS=$((PASS + 1))
+fi
+
+if command -v node >/dev/null 2>&1; then
+    "$GEISHA_BIN" --target js -o "$TMP_DIR/t49_unbox.mjs" "$TMP_DIR/t49_unboxed_option_result.gsa"
+    assert_eq "unbox_option_result_js" "$EXPECTED_UNBOX49" "$(node "$TMP_DIR/t49_unbox.mjs")"
 fi
 
 echo "All $PASS end-to-end test suites passed!"

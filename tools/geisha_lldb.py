@@ -253,6 +253,38 @@ def geisha_adt_summary(valobj, internal_dict):
     return f"{inner}(tag={tag})"
 
 
+def geisha_val_adt_summary(valobj, internal_dict):
+    tname = valobj.GetTypeName()
+    lt = tname.find("<")
+    gt = tname.rfind(">")
+    inner = tname[lt + 1 : gt].strip() if lt != -1 and gt > lt else tname
+
+    tag_child = valobj.GetChildMemberWithName("tag")
+    if not tag_child or not tag_child.IsValid():
+        return f"<{inner}>"
+    tag = tag_child.GetValueAsSigned(0)
+
+    if (inner.startswith("Option (") or inner.startswith("std.option.Option (")) and inner.endswith(")"):
+        if tag == 0:
+            return "None"
+        v1 = valobj.GetChildMemberWithName("v1_0")
+        return f"Some({_format_sbvalue(v1)})"
+
+    active = []
+    idx = 0
+    while idx < 8:
+        ch = valobj.GetChildMemberWithName(f"v{tag}_{idx}")
+        if not ch or not ch.IsValid():
+            break
+        active.append(_format_sbvalue(ch))
+        idx += 1
+    if not active:
+        return f"{inner}(tag={tag})"
+    if len(active) == 1:
+        return f"{inner}(tag={tag}, payload={active[0]})"
+    return f"{inner}(tag={tag}, payload=({', '.join(active)}))"
+
+
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand(
         'type summary add -F geisha_lldb.geisha_string_summary -w geisha "String"'
@@ -265,6 +297,9 @@ def __lldb_init_module(debugger, internal_dict):
     )
     debugger.HandleCommand(
         'type summary add -F geisha_lldb.geisha_adt_summary -w geisha -x "^gs_adt<.*> \\*$"'
+    )
+    debugger.HandleCommand(
+        'type summary add -F geisha_lldb.geisha_val_adt_summary -w geisha -x "^gs_val_adt<.*>$"'
     )
     debugger.HandleCommand("type category enable geisha")
     print("Geisha LLDB formatters loaded (String, Vec, MutArray/ImmArray, List/Option/ADT).")
