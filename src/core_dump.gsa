@@ -1952,7 +1952,7 @@ def isKnownCoreIntrinsic(name: String): Bool =
     || name == "scopedPtrCopyBytes"
     || name == "gcHandleNew" || name == "gcHandleGet" || name == "gcHandleFree"
     || name == "__blackBox"
-    || name == "__gs_contract_fail"
+    || name == "$gs$contract_fail"
     || name == "__gs_requires" || name == "__gs_ensures" || name == "__gs_invariant" || name == "__gs_decreases"
     || name == "assert" || name == "assume"
     || name == "__gs_builtin_assert" || name == "__gs_builtin_assume"
@@ -2456,6 +2456,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
     },
     TmApplyDir(vd, args) -> {
         let isShadowedBuiltin = !strStartsWith(vd.vname, "__gs_")
+            && !strStartsWith(vd.vname, "$gs$")
             && (strMapContains(ctx.dcProg.coreExterns, vd.vname) || strMapContains(ctx.dcProg.coreFns, vd.vname));
         if (!isShadowedBuiltin && vd.vname == "cellNew") {
             match args {

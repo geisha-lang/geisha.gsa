@@ -11,3 +11,4 @@ import CoreGeisha.Eval
 import CoreGeisha.Checker
 import CoreGeisha.Parser
 import CoreGeisha.VCG
+import CoreGeisha.OptSoundness

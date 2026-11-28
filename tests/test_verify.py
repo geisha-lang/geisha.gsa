@@ -102,6 +102,14 @@ def main() -> int:
         )
         r = run([geisha, "check", str(bad_internal)])
         assert r.returncode != 0, "user code must not be able to call internal __gs_contract_fail"
+
+        bad_internal_dollar = tmp / "bad_internal_dollar.gsa"
+        bad_internal_dollar.write_text(
+            "def main() = $gs$contract_fail(\"nope\")\n",
+            encoding="utf-8",
+        )
+        r = run([geisha, "check", str(bad_internal_dollar)])
+        assert r.returncode != 0, "user code must not be able to call internal $gs$contract_fail"
         print("PASS [contracts_typecheck_and_no_internal_leak]")
 
         # ------------------------------------------------------------------
@@ -855,12 +863,14 @@ def main() -> int:
         r_vk = run([geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root), str(vk_path)])
         assert r_vk.returncode == 0, f"D1 verified_kernels.gsa verify failed:\n{r_vk.stdout}\n{r_vk.stderr}"
         vk_json = json.loads(r_vk.stdout)
-        assert vk_json["ok"] is True and vk_json["failed"] == 0 and vk_json["unknown"] == 0 and vk_json["proved"] >= 30, (
+        assert vk_json["ok"] is True and vk_json["failed"] == 0 and vk_json["unknown"] == 0 and vk_json["proved"] >= 40, (
             f"D1 unexpected verified_kernels summary: {vk_json}"
         )
         r_vk_fn = run([
             geisha, "verify", "--json", "--solver", z3_bin, "--src-root", str(repo_root),
-            "--fn", "uleb32Byte", "--fn", "clampOffset", str(vk_path),
+            "--fn", "uleb32Byte", "--fn", "clampOffset",
+            "--fn", "coPatSeqStatus", "--fn", "coFreshBatchEnd", "--fn", "coFlatTotalArity",
+            str(vk_path),
         ])
         assert r_vk_fn.returncode == 0, f"D1 --fn filter failed:\n{r_vk_fn.stdout}\n{r_vk_fn.stderr}"
         vk_fn_json = json.loads(r_vk_fn.stdout)
@@ -1799,6 +1809,77 @@ def main() -> int:
 
         print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z7 adversarial/TCO/eval/zerosorts/mod-shadow/wasmgc-check/wasm-default-exp/native-exp + cache isolation verified")
 
+        # D4: Interoperability between `--verified-opt` (`safeFns` check elision + `@llvm.assume`)
+        # and Core HOF optimizations (`$spec$` loop specialization + `$flat$` closure devirtualization)
+        d4_src = tmp / "d4_hof_verified_opt.gsa"
+        d4_src.write_text(
+            "use std.option.{Option, Some, None}\n"
+            "use std.str.intToStr\n"
+            "def safeScale(x: Int, d: Int): Int\n"
+            "    requires d != 0\n"
+            "= (x * 10) / d\n"
+            "def verifiedEntry(x: Int): Int = {\n"
+            "    let c = if (x < 0) 0 else if (x > 1000) 1000 else x;\n"
+            "    safeScale(c, 5)\n"
+            "}\n"
+            "def foldScaleLoop(xs: List Int, acc: Int, cb: Int -> Int): Int = match xs {\n"
+            "    Nil -> acc,\n"
+            "    Cons(h, t) -> foldScaleLoop(t, acc + cb(h), cb),\n"
+            "}\n"
+            "def runMixed(bias: Int): Int = {\n"
+            "    let b = match Some(bias) { Some(v) -> v, None -> 0 };\n"
+            "    let cls = (elem: Int) -> verifiedEntry(elem) + b;\n"
+            "    let loopCls = (z: Int) -> {\n"
+            "        let cur = cellNew(0);\n"
+            "        while (cellGet(cur) < z) {\n"
+            "            cellSet(cur, cellGet(cur) + b)\n"
+            "        };\n"
+            "        cellGet(cur)\n"
+            "    };\n"
+            "    foldScaleLoop([1, 2, 3, 4], 0, cls) + loopCls(5)\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(runMixed(3)))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        d4_ll = tmp / "d4_hof_verified_opt.ll"
+        r_d4_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-O2", "-e", "-o", str(d4_ll), str(d4_src)])
+        assert r_d4_ir.returncode == 0, f"D4 HOF + --verified-opt IR failed:\n{r_d4_ir.stdout}\n{r_d4_ir.stderr}"
+        d4_ir_txt = d4_ll.read_text(encoding="utf-8")
+        d4_scale_blk = fn_ir_block(d4_ir_txt, "safeScale")
+        assert "call void @llvm.assume(i1" in d4_scale_blk, f"D4 safeScale missing @llvm.assume:\n{d4_scale_blk}"
+        assert "div.zero" not in d4_scale_blk, f"D4 safeScale did not elide div.zero:\n{d4_scale_blk}"
+        assert "foldScaleLoop$spec$" in d4_ir_txt, "D4 expected foldScaleLoop$spec$ specialization under --verified-opt -O2!"
+        assert "$flat$" in d4_ir_txt, "D4 expected $flat$ closure devirtualization under --verified-opt -O2!"
+        d4_bin = tmp / ("d4_hof_verified_opt.exe" if sys.platform == "win32" else "d4_hof_verified_opt")
+        r_d4_b = run([geisha, "--verified-opt", "--solver", z3_bin, "--runtime", runtime, "-O2", "-o", str(d4_bin), str(d4_src)])
+        assert r_d4_b.returncode == 0, f"D4 HOF + --verified-opt build failed:\n{r_d4_b.stdout}\n{r_d4_b.stderr}"
+        r_d4_r = run([str(d4_bin)])
+        assert r_d4_r.returncode == 0 and r_d4_r.stdout.strip() == "38", (
+            f"D4 expected '38', got rc={r_d4_r.returncode} out={r_d4_r.stdout!r} err={r_d4_r.stderr!r}"
+        )
+        # D4b: Verified tiny leaf (`plusOne` in `safeFns`) MUST NOT be inlined into an unverified
+        # caller (`caller` excluded due to `assume(true)`) or global initializer under `--verified-opt -O2`.
+        d4b_src = tmp / "d4b_leaf_boundary.gsa"
+        d4b_src.write_text(
+            "use std.str.intToStr\n"
+            "def plusOne(x: Int): Int\n"
+            "    ensures r -> r == x + 1\n"
+            "= x + 1\n"
+            "def caller(x: Int): Int = { assume(true); plusOne(x) }\n"
+            "def main(): Void = printLn(intToStr(caller(cellGet(cellNew(4)))))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        d4b_ll = tmp / "d4b_leaf_boundary.ll"
+        r_d4b_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-O2", "-e", "-o", str(d4b_ll), str(d4b_src)])
+        assert r_d4b_ir.returncode == 0, f"D4b leaf boundary IR failed:\n{r_d4b_ir.stdout}\n{r_d4b_ir.stderr}"
+        d4b_caller_blk = fn_ir_block(d4b_ll.read_text(encoding="utf-8"), "caller")
+        assert "@plusOne(" in d4b_caller_blk, (
+            f"D4b safeFns tiny leaf plusOne was inlined into unverified caller!\n{d4b_caller_blk}"
+        )
+        print("PASS [d4_hof_opt_verification]: --verified-opt safeScale elision + safeFns boundary + $spec$ & $flat$ HOF specialization verified")
+
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
     # (Runs on all platforms, independent of Z3)
@@ -1818,20 +1899,38 @@ def main() -> int:
         # Self-check the entire compiler under live runtime contracts
         r_self = run([str(checked_bin), "check", "--src-root", str(repo_root), str(repo_root / "src" / "geisha.gsa")])
         assert r_self.returncode == 0, f"D2 geisha_checked self-check failed:\n{r_self.stdout}\n{r_self.stderr}"
-        # Multi-backend codegen under live runtime contracts (native IR, wasm-gc, js)
+        # Multi-backend codegen under live runtime contracts (native IR, wasm-gc, js),
+        # exercising HOF combinator opt, `$spec$`, `$flat$`, and known-match reduction live!
         mini = tmp2 / "d2_mini.gsa"
         mini.write_text(
+            "use std.option.{Option, Some, None}\n"
             "use std.str.{intToStr}\n"
-            "def add(a: Int, b: Int): Int = a + b\n"
-            "def main(): Void = printLn(intToStr(add(20, 22)))\n",
+            "def foldLoop(xs: List Int, acc: Int, cb: Int -> Int): Int = match xs {\n"
+            "    Nil -> acc,\n"
+            "    Cons(h, t) -> foldLoop(t, acc + cb(h), cb),\n"
+            "}\n"
+            "def compute(k: Int): Int = {\n"
+            "    let bias = match Some(k) { Some(v) -> v, None -> 0 };\n"
+            "    let stepCls = (z: Int) -> {\n"
+            "        let c = cellNew(0);\n"
+            "        while (cellGet(c) < z) { cellSet(c, cellGet(c) + bias) };\n"
+            "        cellGet(c)\n"
+            "    };\n"
+            "    foldLoop([1, 2, 3], 0, (x: Int) -> x * 2 + bias) + stepCls(5)\n"
+            "}\n"
+            "def main(): Void = printLn(intToStr(compute(4)))\n",
             encoding="utf-8",
             newline="\n",
         )
-        r_nat = run([str(checked_bin), "-e", "-o", str(tmp2 / "mini.ll"), str(mini)])
+        r_nat = run([str(checked_bin), "-O2", "-e", "-o", str(tmp2 / "mini.ll"), str(mini)])
         assert r_nat.returncode == 0, f"D2 native codegen failed:\n{r_nat.stdout}\n{r_nat.stderr}"
-        r_wgc = run([str(checked_bin), "--target", "wasm-gc", "-o", str(tmp2 / "mini.wasm"), str(mini)])
+        mini_ll_txt = (tmp2 / "mini.ll").read_text(encoding="utf-8")
+        assert "foldLoop$spec$" in mini_ll_txt and "$flat$" in mini_ll_txt, (
+            "D2 geisha_checked -O2 missing live $spec$ / $flat$ optimization!"
+        )
+        r_wgc = run([str(checked_bin), "-O2", "--target", "wasm-gc", "-o", str(tmp2 / "mini.wasm"), str(mini)])
         assert r_wgc.returncode == 0, f"D2 wasm-gc codegen failed:\n{r_wgc.stdout}\n{r_wgc.stderr}"
-        r_js = run([str(checked_bin), "--target", "js", "-o", str(tmp2 / "mini.mjs"), str(mini)])
+        r_js = run([str(checked_bin), "-O2", "--target", "js", "-o", str(tmp2 / "mini.mjs"), str(mini)])
         assert r_js.returncode == 0, f"D2 js codegen failed:\n{r_js.stdout}\n{r_js.stderr}"
         print("PASS [d2_geisha_checked]: live contracts embedded, self-check + native/wasm-gc/js codegen passed")
 

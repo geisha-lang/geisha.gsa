@@ -1083,9 +1083,9 @@ def tryEmitBuiltinJs(
         Some("undefined")
     } else if (name == "gcHeapLiveBytes" || name == "gcExternalLiveBytes") {
         Some("0n")
-    } else if (name == "__gs_contract_fail") {
+    } else if (name == "$gs$contract_fail") {
         let vs = evalArgsJs(ctx, args, locals);
-        Some("(() => { throw new Error(\"Contract error: \" + " + nthStr(vs, 0) + "); })()")
+        Some("(() => { throw new Error(\"Contract error: \" + _gs_toJsStr(" + nthStr(vs, 0) + ")); })()")
     } else if (name == "assert" || name == "assume") {
         Some("undefined")
     } else if (name == "__blackBox") {
@@ -1241,12 +1241,19 @@ def emitJsExpr(ctx: JsEmitCtx, tm: TaggedTerm, locals: List (String, String)): S
             }
         },
         TmApplyCls(clsTm, args) -> {
-            let cv = emitJsExpr(ctx, clsTm, locals);
+            let cv0 = emitJsExpr(ctx, clsTm, locals);
+            let cv =
+                if (!isPureImmutableJsExpr(clsTm) && anyNonPureJsExpr(args)) {
+                    let t = jcFreshTmp(ctx);
+                    jcEmitLine(ctx, "const " + t + " = " + cv0 + ";");
+                    t
+                } else cv0;
             let avs = evalArgsJs(ctx, args, locals);
             "(" + cv + ")(" + strJoin(avs, ", ") + ")"
         },
         TmApplyDir(vd, args) -> {
             let isShadowed = !strStartsWith(vd.vname, "__gs_")
+                && !strStartsWith(vd.vname, "$gs$")
                 && (strMapContains(ctx.jcProg.coreExterns, vd.vname) || strMapContains(ctx.jcProg.coreFns, vd.vname));
             match (if (isShadowed) None else tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals)) {
                 Some(expr) -> expr,

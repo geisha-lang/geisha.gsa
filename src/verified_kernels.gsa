@@ -1,6 +1,6 @@
-// Mechanically verified pure arithmetic, encoding, span-clamping, alignment, and
-// GC-bitmap kernels used directly by the Geisha compiler passes (`codegen_wasmgc`,
-// `diag`, `doc`, `lsp`, `codegen`, `verify`).
+// Mechanically verified pure arithmetic, encoding, span-clamping, alignment,
+// GC-bitmap, and Core HOF optimization kernels used directly by the Geisha compiler
+// passes (`core`, `codegen_wasmgc`, `diag`, `doc`, `lsp`, `codegen`, `verify`).
 //
 // Every function in this module is restricted to the scalar/Cell fragment modeled
 // by BOTH `geisha verify` (Z3 QF_BV) and Lean 4 `CoreGeisha.VCG` (`geisha-check --verify-vcg`),
@@ -170,3 +170,71 @@ pub def hexNibbleVal(b: Int): Int
   else if (b >= 65 && b <= 70) b - 55
   else if (b >= 97 && b <= 102) b - 87
   else -1
+
+// ============================================================================
+// 4. Core Higher-Order Optimization, Pattern Lattice & Specialization Kernels
+// ============================================================================
+
+pub def coFreshNextId(curId: Int): Int
+    requires 0 <= curId && curId < 2147483647
+    ensures r -> r == curId + 1 && r > curId && r > 0
+= curId + 1
+
+pub def coFreshBatchEnd(startId: Int, count: Int): Int
+    requires 0 <= startId && startId <= 1073741824 && 0 <= count && count <= 1048576
+    ensures r -> r == startId + count && r >= startId
+= {
+    let cur = cellNew(startId);
+    let rem = cellNew(count);
+    while (cellGet(rem) > 0)
+        invariant 0 <= cellGet(rem) && cellGet(rem) <= count
+        invariant 0 <= cellGet(cur) && cellGet(cur) == startId + (count - cellGet(rem))
+        decreases cellGet(rem)
+    {
+        cellSet(cur, cellGet(cur) + 1);
+        cellSet(rem, cellGet(rem) - 1)
+    };
+    cellGet(cur)
+}
+
+pub def coFlatTotalArity(fvCount: Int, paramCount: Int): Int
+    requires 0 <= fvCount && fvCount <= 1048576 && 0 <= paramCount && paramCount <= 1048576
+    ensures r -> r == fvCount + paramCount && r >= fvCount && r >= paramCount
+= fvCount + paramCount
+
+pub def coSpecSlotStepArity(curArity: Int, isSpecCb: Bool, fvCount: Int): Int
+    requires 0 <= curArity && curArity <= 1048576 && 0 <= fvCount && fvCount <= 1024
+    ensures r -> r >= curArity
+        && ((isSpecCb && r == curArity + fvCount) || (!isSpecCb && r == curArity + 1))
+= if (isSpecCb) curArity + fvCount else curArity + 1
+
+pub def coAnfInFloatPrefix(idx: Int, lastFloatIdx: Int): Bool
+    requires idx >= 0 && lastFloatIdx >= -1
+    ensures r -> (r == (idx <= lastFloatIdx)) && (!r || lastFloatIdx >= 0)
+= idx <= lastFloatIdx
+
+// 3-valued sequential pattern-list conjunction lattice (`0 = CoPatYes`, `1 = CoPatNo`, `2 = CoPatUnknown`)
+pub def coPatSeqStatus(s1: Int, s2: Int): Int
+    requires 0 <= s1 && s1 <= 2 && 0 <= s2 && s2 <= 2
+    ensures r -> 0 <= r && r <= 2
+        && ((r == 1) == (s1 == 1 || s2 == 1))
+        && ((r == 0) == (s1 == 0 && s2 == 0))
+= if (s1 == 1) 1 else if (s1 == 2) { if (s2 == 1) 1 else 2 } else s2
+
+pub def coInlineBudgetAllows(
+    cost: Int,
+    maxCost: Int,
+    inlCnt: Int,
+    maxInlines: Int,
+    depth: Int,
+    maxDepth: Int
+): Bool
+    requires maxCost >= 1 && maxInlines >= 0 && maxDepth >= 0
+    ensures r -> r == (
+        1 <= cost && cost <= maxCost
+        && 0 <= inlCnt && inlCnt < maxInlines
+        && 0 <= depth && depth < maxDepth
+    )
+= 1 <= cost && cost <= maxCost
+    && 0 <= inlCnt && inlCnt < maxInlines
+    && 0 <= depth && depth < maxDepth
