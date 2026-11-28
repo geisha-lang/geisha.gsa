@@ -4045,6 +4045,7 @@ PASS=$((PASS + 1))
 
 # 39. Built-in Language Server (`geisha lsp`) JSON-RPC 2.0 stdio round-trip
 "$PYTHON" tests/test_lsp.py "$GEISHA_BIN"
+"$PYTHON" tests/test_watch.py "$GEISHA_BIN"
 PASS=$((PASS + 1))
 
 # 40. Wasm32 Size Optimization Mode, --target js (ES Module + .d.ts + [target.js]), & geisha-playground.wasm
@@ -6440,7 +6441,755 @@ mkdir -p "$TMP_DIR/t45_work"
 "$GEISHA_BIN" -o "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_utf8_and_group.gsa"
 assert_eq "utf8_paths_argv_env_and_own_group_signal" "1|1|1|1|1" "$(GS_UTF8_TEST="你好Geisha" "$TMP_DIR/t45_utf8_and_group$EXE_EXT" "$TMP_DIR/t45_work" "参数_λ" "$TMP_DIR/t45_proc_wait.py")"
 
-# 46. Contracts (M1) & SMT Static Verifier (`geisha verify`, M2)
-python3 tests/test_verify.py "$GEISHA_BIN"
+# 46. Static Documentation Site Generator (`geisha doc --html/--out/--json`) & Doctest (`geisha test --doc`)
+T44_PROJ="$TMP_DIR/t44_doc_proj"
+mkdir -p "$T44_PROJ/src"
+cat > "$T44_PROJ/geisha.toml" << 'EOF'
+name = "docdemo"
+version = "2.4.0"
+EOF
+cat > "$T44_PROJ/src/types.gsa" << 'EOF'
+/// Core geometry types for docdemo.
+
+/// A 2D integer point.
+pub data Point {
+    x: Int,
+    y: Int,
+}
+
+/// Pair type alias.
+pub type IntPair = (Int, Int)
+EOF
+cat > "$T44_PROJ/src/math.gsa" << 'EOF'
+/// Arithmetic helpers for docdemo.
+
+use types.Point
+
+/// Adds two integers.
+///
+/// ```geisha
+/// use docdemo.math.add
+/// use std.str.intToStr
+/// printLn(intToStr(add(4, 5)))
+/// // expect: 9
+/// ```
+///
+/// Default unlabeled fence also runs as a Geisha doctest:
+/// ```
+/// use docdemo.math.add
+/// use sys.proc.exit
+/// if (add(10, 20) != 30) exit(1) else ()
+/// ```
+pub def add(a: Int, b: Int): Int = a + b
+
+/// Builds a `Point` and demonstrates `no_run`, `compile_fail`, and `ignore`.
+///
+/// ```geisha,no_run
+/// use docdemo.math.mkPoint
+/// use sys.proc.exit
+/// let _ = mkPoint(1, 2);
+/// exit(99)
+/// ```
+///
+/// ```geisha,compile_fail
+/// use docdemo.math.add
+/// let _: Int = add(1, "bad");
+/// ()
+/// ```
+///
+/// ```geisha,ignore
+/// intentionally invalid syntax @@@
+/// ```
+pub def mkPoint(x: Int, y: Int): Point = Point { x: x, y: y }
+EOF
+
+# 44a: Static HTML site generation (`--out` + `--json`) + default `build/doc` (`--html`)
+T44_GEISHA_BIN="$(cd "$(dirname "$GEISHA_BIN")" && pwd)/$(basename "$GEISHA_BIN")"
+T44_GEISHA_RT="$(cd "$(dirname "$GEISHA_RUNTIME")" && pwd)/$(basename "$GEISHA_RUNTIME")"
+T44_SITE="$TMP_DIR/t44_site_out"
+(cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SITE" --json) >/dev/null
+for f in index.html style.css app.js search-index.json search-index.js doc.json modules/docdemo.math.html modules/docdemo.types.html modules/std.str.html src/docdemo.math.html; do
+    if [ ! -f "$T44_SITE/$f" ]; then
+        echo "FAIL [geisha_doc_site_files]: missing generated file '$f'" >&2
+        exit 1
+    fi
+done
+if ! grep -q "docdemo" "$T44_SITE/index.html" || ! grep -q "v2.4.0" "$T44_SITE/index.html"; then
+    echo "FAIL [geisha_doc_site_meta]: missing package name/version in index.html" >&2
+    exit 1
+fi
+if ! grep -q 'href="docdemo.types.html#item-Point"' "$T44_SITE/modules/docdemo.math.html"; then
+    echo "FAIL [geisha_doc_cross_link]: expected cross-module type link to Point in docdemo.math.html" >&2
+    exit 1
+fi
+if ! grep -q 'href="../src/docdemo.math.html#L' "$T44_SITE/modules/docdemo.math.html"; then
+    echo "FAIL [geisha_doc_src_link]: expected source line jump link in docdemo.math.html" >&2
+    exit 1
+fi
+if ! grep -q '"mkPoint"' "$T44_SITE/search-index.json" || ! grep -q '"std.str"' "$T44_SITE/search-index.json"; then
+    echo "FAIL [geisha_doc_search_index]: expected project + stdlib entries in search-index.json" >&2
+    exit 1
+fi
+if ! grep -q '"version": "2.4.0"' "$T44_SITE/doc.json"; then
+    echo "FAIL [geisha_doc_json_file]: expected version 2.4.0 in doc.json" >&2
+    exit 1
+fi
+(cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --html --no-stdlib) >/dev/null
+if [ ! -f "$T44_PROJ/build/doc/index.html" ]; then
+    echo "FAIL [geisha_doc_default_out]: expected default build/doc/index.html" >&2
+    exit 1
+fi
+T44_JSON_STDOUT="$("$T44_GEISHA_BIN" doc --json "$T44_PROJ/src/types.gsa")"
+if ! printf '%s' "$T44_JSON_STDOUT" | grep -q '"Point"' || ! printf '%s' "$T44_JSON_STDOUT" | grep -q '"IntPair"'; then
+    echo "FAIL [geisha_doc_json_stdout]: expected Point and IntPair in --json stdout" >&2
+    exit 1
+fi
+echo "PASS [geisha_doc_site]: HTML site, search index, cross-module links, source viewer & JSON export"
 PASS=$((PASS + 1))
+
+# 44b: `geisha test --doc` (passing, default fence, expect stdout, no_run, compile_fail, ignore)
+T44_DT_OUT="$(cd "$T44_PROJ" && "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT")"
+if ! printf '%s' "$T44_DT_OUT" | grep -q "Doctest summary: 4 passed, 0 failed, 1 ignored (5 total)."; then
+    echo "FAIL [geisha_doctest_pass]: unexpected summary: $T44_DT_OUT" >&2
+    exit 1
+fi
+echo "PASS [geisha_doctest_pass]: project doctests (normal, default fence, no_run, compile_fail, ignore)"
+PASS=$((PASS + 1))
+
+# 44c: `geisha test --doc` failure diagnostics (compile error line mapping, runtime exit, unexpected compile_fail pass)
+T44_BAD="$TMP_DIR/t44_bad_doctest.gsa"
+cat > "$T44_BAD" << 'EOF'
+/// Failing compile doctest (type error on line 5).
+///
+/// ```geisha
+/// let a: Int = 1;
+/// let b: Int = "wrong";
+/// ()
+/// ```
+///
+/// Failing runtime exit doctest (fence opens on line 9).
+/// ```geisha
+/// use sys.proc.exit
+/// exit(3)
+/// ```
+///
+/// Unexpectedly compiling `compile_fail` doctest (fence opens on line 15).
+/// ```geisha,compile_fail
+/// let ok: Int = 42;
+/// ()
+/// ```
+pub def dummy(): Int = 0
+EOF
+set +e
+T44_BAD_OUT="$("$GEISHA_BIN" test --doc --runtime "$GEISHA_RUNTIME" "$T44_BAD" 2>&1)"
+T44_BAD_RC=$?
+set -e
+if [ "$T44_BAD_RC" -eq 0 ]; then
+    echo "FAIL [geisha_doctest_fail_rc]: expected non-zero exit code on failing doctests" >&2
+    exit 1
+fi
+if ! printf '%s' "$T44_BAD_OUT" | grep -q 't44_bad_doctest.gsa:5:1: error\[doctest\]: doctest failed to compile:'; then
+    echo "FAIL [geisha_doctest_compile_loc]: expected exact doc line 5 diag, got: $T44_BAD_OUT" >&2
+    exit 1
+fi
+if ! printf '%s' "$T44_BAD_OUT" | grep -q 't44_bad_doctest.gsa:10:1: error\[doctest\]: doctest exited with non-zero status 3'; then
+    echo "FAIL [geisha_doctest_runtime_loc]: expected runtime failure diag at line 10, got: $T44_BAD_OUT" >&2
+    exit 1
+fi
+if ! printf '%s' "$T44_BAD_OUT" | grep -q 't44_bad_doctest.gsa:16:1: error\[doctest\]: doctest marked `compile_fail` unexpectedly passed type/semantic check'; then
+    echo "FAIL [geisha_doctest_cf_loc]: expected compile_fail failure diag at line 16, got: $T44_BAD_OUT" >&2
+    exit 1
+fi
+echo "PASS [geisha_doctest_fail_diag]: precise diag file:line:col reporting on compile/runtime/compile_fail failures"
+PASS=$((PASS + 1))
+
+# 44d: Regression tests from review:
+#   1) `compile_fail` must NOT pass when CC/toolchain fails on valid code
+#   2) `/* /// ... */` block comments and string literals must NOT be executed as doctests
+#   3) symlinked directories/files must NOT be traversed out of project tree
+#   4) colliding type names (`alpha.Marker` vs `beta.Marker`) resolve by lexical/import scope
+#   5) removing a module or dropping `--json` cleans stale generated artifacts via manifest
+T44_CF_CC="$TMP_DIR/t44_cf_cc.gsa"
+cat > "$T44_CF_CC" << 'EOF'
+/// ```geisha,compile_fail
+/// printLn("valid code")
+/// ```
+pub def ok(): Int = 1
+EOF
+set +e
+T44_CF_CC_OUT="$(CC=false "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_CF_CC" 2>&1)"
+T44_CF_CC_RC=$?
+set -e
+if [ "$T44_CF_CC_RC" -eq 0 ] || ! printf '%s' "$T44_CF_CC_OUT" | grep -q 'unexpectedly passed type/semantic check'; then
+    echo "FAIL [doctest_cf_immune_to_cc]: CC=false must not make valid compile_fail pass, got rc=$T44_CF_CC_RC out=$T44_CF_CC_OUT" >&2
+    exit 1
+fi
+
+T44_FAKE="$TMP_DIR/t44_fake_doc.gsa"
+cat > "$T44_FAKE" << 'EOF'
+/*
+/// ```geisha
+/// use sys.proc.exit
+/// exit(77)
+/// ```
+*/
+pub def fakeStr(): String = "
+/// ```geisha
+/// use sys.proc.exit
+/// exit(88)
+/// ```
+"
+/// Real doctest that passes.
+/// ```geisha
+/// let x: Int = 1 + 1;
+/// ()
+/// ```
+pub def realFn(): Int = 2
+EOF
+T44_FAKE_OUT="$("$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_FAKE")"
+if ! printf '%s' "$T44_FAKE_OUT" | grep -q "Doctest summary: 1 passed, 0 failed, 0 ignored (1 total)."; then
+    echo "FAIL [doctest_ignore_block_comment_and_string]: expected exactly 1 real doctest, got: $T44_FAKE_OUT" >&2
+    exit 1
+fi
+
+T44_OUTSIDE="$TMP_DIR/t44_outside"
+mkdir -p "$T44_OUTSIDE"
+cat > "$T44_OUTSIDE/escape.gsa" << 'EOF'
+/// ```geisha
+/// use sys.proc.exit
+/// exit(99)
+/// ```
+pub def escaped(): Int = 1
+EOF
+T44_SYM_PROJ="$TMP_DIR/t44_sym_proj"
+mkdir -p "$T44_SYM_PROJ/src"
+cat > "$T44_SYM_PROJ/geisha.toml" << 'EOF'
+name = "symproj"
+version = "0.1.0"
+EOF
+cat > "$T44_SYM_PROJ/src/alpha.gsa" << 'EOF'
+/// Alpha marker.
+pub data Marker { a: Int }
+pub def mkAlpha(): Marker = Marker { a: 1 }
+EOF
+cat > "$T44_SYM_PROJ/src/beta.gsa" << 'EOF'
+/// Beta marker.
+pub data Marker { b: Int }
+pub def mkBeta(): Marker = Marker { b: 2 }
+EOF
+cat > "$T44_SYM_PROJ/src/gamma.gsa" << 'EOF'
+use beta.Marker
+/// Uses beta.Marker explicitly.
+pub def takeBeta(m: Marker): Marker = m
+EOF
+cat > "$T44_SYM_PROJ/src/nested.gsa" << 'EOF'
+use alpha.Marker
+/// Parent uses alpha.Marker.
+pub def takeParent(m: Marker): Marker = m
+
+/// Nested submodule overrides scope with beta.Marker.
+pub mod sub {
+    use beta.Marker
+    pub def takeSub(m: Marker): Marker = m
+}
+
+/// Sibling nested submodules with colliding Marker types must get distinct anchors.
+pub mod left {
+    pub data Marker { l: Int }
+    pub def mkLeft(): Marker = Marker { l: 1 }
+}
+
+pub mod right {
+    pub data Marker { r: Int }
+    pub def mkRight(): Marker = Marker { r: 2 }
+}
+EOF
+T44_IS_WIN=0
+case "$UNAME_S" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) T44_IS_WIN=1 ;;
+esac
+if [ "$T44_IS_WIN" -eq 1 ]; then
+    cmd //c mklink //J "$(cygpath -w "$T44_SYM_PROJ/src/linked_dir")" "$(cygpath -w "$T44_OUTSIDE")" >/dev/null
+else
+    ln -s "$T44_OUTSIDE" "$T44_SYM_PROJ/src/linked_dir"
+    ln -s "$T44_OUTSIDE/escape.gsa" "$T44_SYM_PROJ/src/linked_file.gsa"
+fi
+
+T44_SYM_DT="$(cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT")"
+if ! printf '%s' "$T44_SYM_DT" | grep -q "Doctest summary: 0 passed, 0 failed, 0 ignored (0 total)."; then
+    echo "FAIL [doctest_no_symlink_escape]: symlinked file/dir was traversed: $T44_SYM_DT" >&2
+    exit 1
+fi
+set +e
+(cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" linked_dir.escape) >/dev/null 2>&1
+T44_SYM_MOD_RC=$?
+set -e
+if [ "$T44_SYM_MOD_RC" -eq 0 ]; then
+    echo "FAIL [doctest_no_symlink_mod_target]: explicit symlinked module target must be rejected" >&2
+    exit 1
+fi
+
+T44_SCOPED_SITE="$TMP_DIR/t44_scoped_site"
+(cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SCOPED_SITE" --json --no-stdlib) >/dev/null
+if [ -f "$T44_SCOPED_SITE/modules/symproj.linked_file.html" ] || [ -f "$T44_SCOPED_SITE/modules/symproj.linked_dir.escape.html" ]; then
+    echo "FAIL [doc_no_symlink_escape]: symlinked modules must not be indexed" >&2
+    exit 1
+fi
+if ! grep -q 'href="symproj.beta.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.beta.html"; then
+    echo "FAIL [doc_scoped_self_link]: beta.html should link Marker to symproj.beta.html#item-Marker" >&2
+    exit 1
+fi
+if grep -q 'href="symproj.alpha.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.beta.html"; then
+    echo "FAIL [doc_scoped_no_alpha_in_beta]: beta.html must NOT link Marker to alpha" >&2
+    exit 1
+fi
+if ! grep -q 'href="symproj.beta.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.gamma.html" || grep -q 'href="symproj.alpha.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.gamma.html"; then
+    echo "FAIL [doc_scoped_import_link]: gamma.html should link Marker to symproj.beta.html#item-Marker" >&2
+    exit 1
+fi
+# Nested `mod sub { use beta.Marker ... }` must link takeParent -> alpha and takeSub -> beta
+if ! grep -q 'takeParent.*href="symproj.alpha.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html"; then
+    echo "FAIL [doc_nested_parent_scope]: nested.html takeParent should link to alpha.Marker" >&2
+    exit 1
+fi
+if ! grep -q 'takeSub.*href="symproj.beta.html#item-Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html"; then
+    echo "FAIL [doc_nested_sub_scope]: nested.html sub.takeSub should link to beta.Marker" >&2
+    exit 1
+fi
+if ! grep -q 'id="item-left.Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html" || ! grep -q 'id="item-right.Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html"; then
+    echo "FAIL [doc_nested_unique_anchors]: expected distinct #item-left.Marker and #item-right.Marker" >&2
+    exit 1
+fi
+if ! grep -q 'mkLeft.*href="symproj.nested.html#item-left.Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html" || ! grep -q 'mkRight.*href="symproj.nested.html#item-right.Marker"' "$T44_SCOPED_SITE/modules/symproj.nested.html"; then
+    echo "FAIL [doc_nested_unique_links]: expected mkLeft/mkRight to link to #item-left.Marker / #item-right.Marker" >&2
+    exit 1
+fi
+if ! grep -q '#item-left.Marker' "$T44_SCOPED_SITE/search-index.json" || ! grep -q '#item-right.Marker' "$T44_SCOPED_SITE/search-index.json"; then
+    echo "FAIL [doc_nested_search_anchors]: expected #item-left.Marker and #item-right.Marker in search-index.json" >&2
+    exit 1
+fi
+if grep -q 'innerHTML' "$T44_SCOPED_SITE/app.js"; then
+    echo "FAIL [doc_dom_safe_search]: app.js must not use innerHTML" >&2
+    exit 1
+fi
+
+# Symlinked output directory (`outDir/modules`) must be rejected
+T44_SYM_OUT="$TMP_DIR/t44_sym_out"
+mkdir -p "$T44_SYM_OUT"
+if [ "$T44_IS_WIN" -eq 1 ]; then
+    cmd //c mklink //J "$(cygpath -w "$T44_SYM_OUT/modules")" "$(cygpath -w "$T44_OUTSIDE")" >/dev/null
+else
+    ln -s "$T44_OUTSIDE" "$T44_SYM_OUT/modules"
+fi
+set +e
+(cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SYM_OUT" --no-stdlib) >/dev/null 2>&1
+T44_SYM_OUT_RC=$?
+set -e
+if [ "$T44_SYM_OUT_RC" -eq 0 ]; then
+    echo "FAIL [doc_refuse_symlink_outdir]: symlinked outDir/modules must be rejected" >&2
+    exit 1
+fi
+
+# Delete gamma.gsa and drop --json; verify cleanup failure on both 0555 and 000 (EACCES) retains manifest entry, then succeeds when writable
+rm -f "$T44_SYM_PROJ/src/gamma.gsa"
+if [ "$T44_IS_WIN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    chmod 555 "$T44_SCOPED_SITE/modules"
+    set +e
+    (cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SCOPED_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_RO_RC=$?
+    set -e
+    chmod 755 "$T44_SCOPED_SITE/modules"
+    if [ "$T44_RO_RC" -eq 0 ] || ! grep -q 'modules/symproj.gamma.html' "$T44_SCOPED_SITE/.geisha-doc-manifest"; then
+        echo "FAIL [doc_stale_cleanup_0555]: 0555 modules dir must fail and retain manifest entry" >&2
+        exit 1
+    fi
+
+    # Also exercise 000 (EACCES) directly during stale cleanup with an empty project
+    T44_EMPTY_PROJ="$TMP_DIR/t44_empty_proj"
+    mkdir -p "$T44_EMPTY_PROJ/src"
+    cat > "$T44_EMPTY_PROJ/geisha.toml" << 'EOF'
+name = "emptyproj"
+version = "0.1.0"
+EOF
+    chmod 000 "$T44_SCOPED_SITE/modules"
+    set +e
+    (cd "$T44_EMPTY_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SCOPED_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_000_RC=$?
+    set -e
+    chmod 755 "$T44_SCOPED_SITE/modules"
+    if [ "$T44_000_RC" -eq 0 ] || ! grep -q 'modules/symproj.gamma.html' "$T44_SCOPED_SITE/.geisha-doc-manifest"; then
+        echo "FAIL [doc_stale_cleanup_000]: 000 (EACCES) modules dir must fail and retain manifest entry" >&2
+        exit 1
+    fi
+fi
+(cd "$T44_SYM_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SCOPED_SITE" --no-stdlib) >/dev/null
+if [ -f "$T44_SCOPED_SITE/modules/symproj.gamma.html" ] || [ -f "$T44_SCOPED_SITE/src/symproj.gamma.html" ] || [ -f "$T44_SCOPED_SITE/doc.json" ]; then
+    echo "FAIL [doc_stale_cleanup]: stale modules/src/doc.json were not cleaned on regeneration" >&2
+    exit 1
+fi
+
+# Case-only rename (`reader.gsa` -> `Reader.gsa`) on case-insensitive filesystems must keep new pages,
+# and unreadable `.geisha-doc-manifest` (000) must fail without clobbering the manifest.
+T44_CASE_PROJ="$TMP_DIR/t44_case_proj"
+T44_CASE_SITE="$TMP_DIR/t44_case_site"
+mkdir -p "$T44_CASE_PROJ/src"
+cat > "$T44_CASE_PROJ/geisha.toml" << 'EOF'
+name = "caseproj"
+version = "0.1.0"
+EOF
+cat > "$T44_CASE_PROJ/src/reader.gsa" << 'EOF'
+/// Lowercase reader module.
+pub def oldApi(): Int = 1
+EOF
+(cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+rm -f "$T44_CASE_PROJ/src/reader.gsa"
+cat > "$T44_CASE_PROJ/src/Reader.gsa" << 'EOF'
+/// Uppercase Reader module.
+pub def newApi(): Int = 2
+EOF
+(cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+if [ ! -f "$T44_CASE_SITE/modules/caseproj.Reader.html" ] || [ ! -f "$T44_CASE_SITE/src/caseproj.Reader.html" ]; then
+    echo "FAIL [doc_case_rename]: expected modules/caseproj.Reader.html and src/caseproj.Reader.html after case rename" >&2
+    exit 1
+fi
+if ! grep -q 'newApi' "$T44_CASE_SITE/modules/caseproj.Reader.html" || grep -q 'oldApi' "$T44_CASE_SITE/modules/caseproj.Reader.html" || ! grep -q 'newApi' "$T44_CASE_SITE/src/caseproj.Reader.html"; then
+    echo "FAIL [doc_case_rename_content]: Reader.html/src must contain newApi (never overwritten by oldApi)" >&2
+    exit 1
+fi
+if ! grep -q 'modules/caseproj.Reader.html' "$T44_CASE_SITE/search-index.json"; then
+    echo "FAIL [doc_case_rename_index]: expected modules/caseproj.Reader.html in search-index.json" >&2
+    exit 1
+fi
+while IFS= read -r rel_entry; do
+    [ -z "$rel_entry" ] && continue
+    if [ ! -f "$T44_CASE_SITE/$rel_entry" ]; then
+        echo "FAIL [doc_case_rename_manifest]: manifest entry '$rel_entry' missing on disk" >&2
+        exit 1
+    fi
+done < "$T44_CASE_SITE/.geisha-doc-manifest"
+if [ "$T44_IS_WIN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    # Deep symlinked intermediate outDir component and symlinked target file must be rejected
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_SYM_OUT/modules/deep/sub" --no-stdlib) >/dev/null 2>&1
+    T44_DEEP_SYM_RC=$?
+    set -e
+    if [ "$T44_DEEP_SYM_RC" -eq 0 ]; then
+        echo "FAIL [doc_refuse_deep_symlink_outdir]: deep symlinked outDir component must be rejected" >&2
+        exit 1
+    fi
+    T44_FILE_SYM_OUT="$TMP_DIR/t44_file_sym_out"
+    mkdir -p "$T44_FILE_SYM_OUT"
+    ln -s "$T44_OUTSIDE/escape.gsa" "$T44_FILE_SYM_OUT/index.html"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_FILE_SYM_OUT" --no-stdlib) >/dev/null 2>&1
+    T44_FILE_SYM_RC=$?
+    set -e
+    if [ "$T44_FILE_SYM_RC" -eq 0 ]; then
+        echo "FAIL [doc_refuse_symlink_target_file]: symlinked target file index.html must not be overwritten" >&2
+        exit 1
+    fi
+    chmod 000 "$T44_CASE_SITE/.geisha-doc-manifest"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_MF_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/.geisha-doc-manifest"
+    if [ "$T44_MF_RC" -eq 0 ]; then
+        echo "FAIL [doc_unreadable_manifest]: unreadable .geisha-doc-manifest must abort with error" >&2
+        exit 1
+    fi
+
+    # Write failure (read-only app.js) after renaming Reader.gsa -> writer.gsa must NOT delete old Reader pages
+    mv "$T44_CASE_PROJ/src/Reader.gsa" "$T44_CASE_PROJ/src/writer.gsa"
+    chmod 444 "$T44_CASE_SITE/app.js"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_APP_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/app.js"
+    if [ "$T44_APP_RO_RC" -eq 0 ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.Reader.html" ] || [ ! -f "$T44_CASE_SITE/src/caseproj.Reader.html" ]; then
+        echo "FAIL [doc_write_fail_preserves_old_site]: failed write must not delete previous site pages" >&2
+        exit 1
+    fi
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if [ -f "$T44_CASE_SITE/modules/caseproj.Reader.html" ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.writer.html" ]; then
+        echo "FAIL [doc_post_write_cleanup]: expected Reader.html cleaned and writer.html created after recovery" >&2
+        exit 1
+    fi
+
+    # Module page write failure must NOT update `index.html` with dead links
+    cat > "$T44_CASE_PROJ/src/blocked.gsa" << 'EOF'
+pub def blockedFn(): Int = 3
+EOF
+    printf 'locked' > "$T44_CASE_SITE/modules/caseproj.blocked.html"
+    chmod 444 "$T44_CASE_SITE/modules/caseproj.blocked.html"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_MOD_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/modules/caseproj.blocked.html"
+    if [ "$T44_MOD_RO_RC" -eq 0 ] || grep -q 'caseproj.blocked.html' "$T44_CASE_SITE/index.html"; then
+        echo "FAIL [doc_mod_write_fail_index_intact]: failed module write must not publish dead link in index.html" >&2
+        exit 1
+    fi
+    rm -f "$T44_CASE_PROJ/src/blocked.gsa" "$T44_CASE_SITE/modules/caseproj.blocked.html"
+
+    # Read-only `src/<mod>.html` during symbol update (`newApi` -> `v3Api`) must roll back `modules/<mod>.html`
+    cat > "$T44_CASE_PROJ/src/writer.gsa" << 'EOF'
+/// Updated writer module v3.
+pub def v3Api(): Int = 3
+EOF
+    chmod 444 "$T44_CASE_SITE/src/caseproj.writer.html"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_SRC_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/src/caseproj.writer.html"
+    if [ "$T44_SRC_RO_RC" -eq 0 ] || grep -q 'v3Api' "$T44_CASE_SITE/modules/caseproj.writer.html" || ! grep -q 'newApi' "$T44_CASE_SITE/modules/caseproj.writer.html"; then
+        echo "FAIL [doc_src_ro_rollback]: failed src write must roll back modules/caseproj.writer.html to previous newApi" >&2
+        exit 1
+    fi
+
+    # Unlistable `modules/` (`chmod 0311`) must fail cleanly via propagated readDir error without losing manifest
+    chmod 311 "$T44_CASE_SITE/modules"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_311_RC=$?
+    set -e
+    chmod 755 "$T44_CASE_SITE/modules"
+    if [ "$T44_311_RC" -eq 0 ] || ! grep -q 'modules/caseproj.writer.html' "$T44_CASE_SITE/.geisha-doc-manifest"; then
+        echo "FAIL [doc_unlistable_modules_0311]: chmod 0311 modules/ must abort and preserve manifest" >&2
+        exit 1
+    fi
+
+    # Read-only `.geisha-doc-manifest` (`chmod 444`) after module rename must roll back new pages and preserve old pages
+    mv "$T44_CASE_PROJ/src/writer.gsa" "$T44_CASE_PROJ/src/writer2.gsa"
+    chmod 444 "$T44_CASE_SITE/.geisha-doc-manifest"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_MF_RO_RC=$?
+    set -e
+    chmod 644 "$T44_CASE_SITE/.geisha-doc-manifest"
+    if [ "$T44_MF_RO_RC" -eq 0 ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.writer.html" ] || [ -f "$T44_CASE_SITE/modules/caseproj.writer2.html" ] || grep -q 'caseproj.writer2.html' "$T44_CASE_SITE/index.html"; then
+        echo "FAIL [doc_ro_manifest_rollback]: read-only manifest must roll back new pages and keep old pages intact" >&2
+        exit 1
+    fi
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if [ -f "$T44_CASE_SITE/modules/caseproj.writer.html" ] || [ ! -f "$T44_CASE_SITE/modules/caseproj.writer2.html" ]; then
+        echo "FAIL [doc_ro_manifest_recovery]: expected clean publish after restoring manifest permissions" >&2
+        exit 1
+    fi
+
+    # Short write (`RLIMIT_FSIZE` smaller than existing file!) must fail without truncating existing live files,
+    # and pre-existing user file `app.js.geisha-doc-tmp` must remain untouched.
+    printf 'user-owned-tmp-sentinel\n' > "$T44_CASE_SITE/app.js.geisha-doc-tmp"
+    T44_ORIG_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
+    cat > "$T44_CASE_PROJ/src/writer2.gsa" << 'EOF'
+/// Big doc update that exceeds RLIMIT_FSIZE to verify short-write rollback safety.
+pub def bigFn1(): Int = 1
+pub def bigFn2(): Int = 2
+pub def bigFn3(): Int = 3
+pub def bigFn4(): Int = 4
+pub def bigFn5(): Int = 5
+pub def bigFn6(): Int = 6
+pub def bigFn7(): Int = 7
+pub def bigFn8(): Int = 8
+EOF
+    T44_SW_LIMIT=$((T44_ORIG_SZ - 400))
+    if [ "$T44_SW_LIMIT" -lt 1024 ]; then T44_SW_LIMIT=1024; fi
+    set +e
+    python3 -c 'import resource, subprocess, sys
+lim = int(sys.argv[1])
+resource.setrlimit(resource.RLIMIT_FSIZE, (lim, lim))
+r = subprocess.run([sys.argv[2], "doc", "--out", sys.argv[3], "--no-stdlib"], cwd=sys.argv[4], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+sys.exit(r.returncode)' "$T44_SW_LIMIT" "$T44_GEISHA_BIN" "$T44_CASE_SITE" "$T44_CASE_PROJ"
+    T44_SW_RC=$?
+    set -e
+    T44_AFTER_SZ="$(wc -c < "$T44_CASE_SITE/modules/caseproj.writer2.html" | tr -d ' ')"
+    if [ "$T44_SW_RC" -eq 0 ] || [ "$T44_AFTER_SZ" != "$T44_ORIG_SZ" ] || ! grep -q 'v3Api' "$T44_CASE_SITE/modules/caseproj.writer2.html"; then
+        echo "FAIL [doc_short_write_rollback]: RLIMIT_FSIZE (< orig) short write must fail without truncating live file (orig=$T44_ORIG_SZ after=$T44_AFTER_SZ rc=$T44_SW_RC)" >&2
+        exit 1
+    fi
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if [ ! -f "$T44_CASE_SITE/app.js.geisha-doc-tmp" ] || ! grep -q 'user-owned-tmp-sentinel' "$T44_CASE_SITE/app.js.geisha-doc-tmp"; then
+        echo "FAIL [doc_preserve_user_tmp_file]: pre-existing app.js.geisha-doc-tmp must not be overwritten or deleted" >&2
+        exit 1
+    fi
+    # Stale deletion failure (`chmod 555 modules/` while removing `writer2.gsa`) must roll back `src/` and `index.html` too
+    rm -f "$T44_CASE_PROJ/src/writer2.gsa"
+    chmod 555 "$T44_CASE_SITE/modules"
+    set +e
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null 2>&1
+    T44_STALE_RB_RC=$?
+    set -e
+    chmod 755 "$T44_CASE_SITE/modules"
+    if [ "$T44_STALE_RB_RC" -eq 0 ] || [ ! -f "$T44_CASE_SITE/src/caseproj.writer2.html" ] || ! grep -q 'caseproj.writer2.html' "$T44_CASE_SITE/index.html"; then
+        echo "FAIL [doc_stale_del_fail_rollback]: stale deletion failure must roll back src/ and index.html" >&2
+        exit 1
+    fi
+
+    # Preserving existing file permissions (0600) across regeneration + long 237-byte output filename (no ENAMETOOLONG hang)
+    T44_LONG_NAME="m_$(python3 -c 'print("a" * 221)')"
+    cat > "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa" << 'EOF'
+pub def longModFn(): Int = 7
+EOF
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    T44_LONG_HTML="$T44_CASE_SITE/modules/caseproj.${T44_LONG_NAME}.html"
+    if [ ! -f "$T44_LONG_HTML" ]; then
+        echo "FAIL [doc_long_filename_237]: expected 237-byte module filename to generate cleanly without ENAMETOOLONG" >&2
+        exit 1
+    fi
+    chmod 600 "$T44_LONG_HTML"
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    T44_MODE_AFTER="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_LONG_HTML")"
+    if [ "$T44_MODE_AFTER" != "0o600" ]; then
+        echo "FAIL [doc_preserve_file_mode]: expected 0o600 preserved on replacement, got $T44_MODE_AFTER" >&2
+        exit 1
+    fi
+    if [ "$UNAME_S" = "Darwin" ]; then
+        chmod 644 "$T44_LONG_HTML"
+        if chmod +a "user:nobody deny read" "$T44_LONG_HTML" 2>/dev/null; then
+            (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+            if ! ls -le "$T44_LONG_HTML" | grep -q "user:nobody deny read"; then
+                echo "FAIL [doc_preserve_macos_acl]: expected macOS ACL 'user:nobody deny read' preserved after replacement" >&2
+                exit 1
+            fi
+        fi
+    fi
+    rm -f "$T44_CASE_PROJ/src/${T44_LONG_NAME}.gsa"
+
+    # POSIX umask 077 must be honored for brand-new generated files and match an ordinary sibling file's mode/ACL
+    T44_UMASK_SITE="$TMP_DIR/t44_umask_site"
+    mkdir -p "$T44_UMASK_SITE"
+    (umask 077 && : > "$T44_UMASK_SITE/plain.ref" && cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_UMASK_SITE" --no-stdlib) >/dev/null
+    T44_UMASK_REF="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/plain.ref")"
+    T44_UMASK_IDX="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/index.html")"
+    T44_UMASK_MOD="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/modules/docdemo.math.html")"
+    T44_UMASK_MF="$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$T44_UMASK_SITE/.geisha-doc-manifest")"
+    if [ "$T44_UMASK_IDX" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_MOD" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_MF" != "$T44_UMASK_REF" ] || [ "$T44_UMASK_REF" != "0o600" ]; then
+        echo "FAIL [doc_umask_077_new_files]: expected mode matching plain sibling ($T44_UMASK_REF == 0o600), got index=$T44_UMASK_IDX mod=$T44_UMASK_MOD mf=$T44_UMASK_MF" >&2
+        exit 1
+    fi
+    if [ "$UNAME_S" = "Darwin" ]; then
+        T44_INH_SITE="$TMP_DIR/t44_mac_inh_site"
+        mkdir -p "$T44_INH_SITE"
+        if chmod +a "user:nobody deny read,file_inherit" "$T44_INH_SITE" 2>/dev/null; then
+            : > "$T44_INH_SITE/plain.ref"
+            (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_INH_SITE" --no-stdlib) >/dev/null
+            T44_REF_ACL="$(ls -le "$T44_INH_SITE/plain.ref" | grep 'user:nobody' || true)"
+            T44_DOC_ACL="$(ls -le "$T44_INH_SITE/index.html" | grep 'user:nobody' || true)"
+            if [ -n "$T44_REF_ACL" ] && [ -z "$T44_DOC_ACL" ]; then
+                echo "FAIL [doc_posix_inherited_acl]: expected new doc file to match sibling inherited macOS ACL" >&2
+                exit 1
+            fi
+        fi
+        # Paired old-vs-new ACL test: existing ACL-free page must NOT pick up newly added parent
+        # file_inherit ACL on regeneration, while a brand-new page created in the same run MUST inherit it.
+        T44_MIX_SITE="$TMP_DIR/t44_mac_mix_site"
+        (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_MIX_SITE" --no-stdlib) >/dev/null
+        if chmod +a "user:nobody deny read,file_inherit" "$T44_MIX_SITE/modules" 2>/dev/null; then
+            cat > "$T44_PROJ/src/fresh_acl_mod.gsa" << 'EOF'
+/// Brand-new module for paired ACL test.
+pub def freshAcl(): Int = 1
+EOF
+            (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_MIX_SITE" --no-stdlib) >/dev/null
+            rm -f "$T44_PROJ/src/fresh_acl_mod.gsa"
+            T44_OLD_ACL="$(ls -le "$T44_MIX_SITE/modules/docdemo.math.html" | grep 'user:nobody' || true)"
+            T44_NEW_ACL="$(ls -le "$T44_MIX_SITE/modules/docdemo.fresh_acl_mod.html" | grep 'user:nobody' || true)"
+            if [ -n "$T44_OLD_ACL" ] || [ -z "$T44_NEW_ACL" ]; then
+                echo "FAIL [doc_paired_old_new_acl]: old page must stay ACL-free (got '$T44_OLD_ACL') while new page inherits ACL (got '$T44_NEW_ACL')" >&2
+                exit 1
+            fi
+        fi
+    fi
+
+    # POSIX backslash in outDir name (`notes\site`) must not be treated as a path separator when file `notes` exists
+    printf 'not a dir\n' > "$TMP_DIR/notes"
+    T44_BS_OUT="$TMP_DIR/notes\\site"
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_BS_OUT" --no-stdlib) >/dev/null
+    if [ ! -f "$T44_BS_OUT/index.html" ]; then
+        echo "FAIL [doc_posix_backslash_outdir]: expected POSIX literal backslash outDir to succeed" >&2
+        exit 1
+    fi
+fi
+if [ "$T44_IS_WIN" -eq 1 ]; then
+    # Verify Windows explicit DACL preservation across atomic replacement
+    T44_WIN_HTML="$T44_CASE_SITE/modules/caseproj.Reader.html"
+    T44_WIN_HTML_W="$(cygpath -w "$T44_WIN_HTML")"
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" /inheritance:d >/dev/null
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" /deny "*S-1-5-7:(R)" >/dev/null
+    (cd "$T44_CASE_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_CASE_SITE" --no-stdlib) >/dev/null
+    if ! MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_HTML_W" | grep -qi "DENY"; then
+        echo "FAIL [doc_preserve_win_dacl]: expected explicit Windows DACL DENY ACE preserved after replacement" >&2
+        exit 1
+    fi
+
+    # Verify Windows directory writable by creator with NO inheritable ACEs falls back to creator's
+    # default DACL (matching ordinary sibling file creation) and remains readable across regeneration
+    T44_WIN_NOINH="$TMP_DIR/t44_win_noinh"
+    mkdir -p "$T44_WIN_NOINH"
+    T44_WIN_NOINH_W="$(cygpath -w "$T44_WIN_NOINH")"
+    T44_WIN_ACCT="${USERNAME:-$(whoami)}"
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_NOINH_W" /inheritance:r >/dev/null
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" icacls "$T44_WIN_NOINH_W" /grant "${T44_WIN_ACCT}:(F)" >/dev/null
+    printf 'plain\n' > "$T44_WIN_NOINH/plain.ref"
+    (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_WIN_NOINH" --no-stdlib) >/dev/null
+    if ! grep -q 'plain' "$T44_WIN_NOINH/plain.ref" || ! grep -q 'docdemo' "$T44_WIN_NOINH/index.html"; then
+        echo "FAIL [doc_win_no_inherit_dir_read]: generated index.html in non-inheriting dir must be readable like plain sibling" >&2
+        exit 1
+    fi
+    (cd "$T44_PROJ" && "$T44_GEISHA_BIN" doc --out "$T44_WIN_NOINH" --no-stdlib) >/dev/null
+    if ! grep -q 'docdemo' "$T44_WIN_NOINH/index.html"; then
+        echo "FAIL [doc_win_no_inherit_dir_regen]: regeneration in non-inheriting dir must succeed and remain readable" >&2
+        exit 1
+    fi
+fi
+
+# 44e: Project module-name targets (`geisha test --doc docdemo.math` / `math`), `//!` module doctests, & CRLF multi-line expect
+T44_MOD_DT1="$(cd "$T44_PROJ" && "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" docdemo.math)"
+T44_MOD_DT2="$(cd "$T44_PROJ" && "$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" math)"
+if ! printf '%s' "$T44_MOD_DT1" | grep -q "Doctest summary: 4 passed, 0 failed, 1 ignored (5 total)." || ! printf '%s' "$T44_MOD_DT2" | grep -q "Doctest summary: 4 passed, 0 failed, 1 ignored (5 total)."; then
+    echo "FAIL [doctest_project_module_target]: expected module target resolution (with/without pkg prefix), got: $T44_MOD_DT1 | $T44_MOD_DT2" >&2
+    exit 1
+fi
+T44_MODDOC="$TMP_DIR/t44_moddoc_crlf.gsa"
+cat > "$T44_MODDOC" << 'EOF'
+//! Module-level doctest with multi-line CRLF output.
+//!
+//! ```geisha
+//! printLn("line1\r\nline2")
+//! // expect: line1
+//! // expect: line2
+//! ```
+pub def ok(): Int = 1
+EOF
+T44_MODDOC_OUT="$("$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_MODDOC")"
+if ! printf '%s' "$T44_MODDOC_OUT" | grep -q "Doctest summary: 1 passed, 0 failed, 0 ignored (1 total)."; then
+    echo "FAIL [doctest_moddoc_crlf]: expected //! module doctest + CRLF expect to pass, got: $T44_MODDOC_OUT" >&2
+    exit 1
+fi
+# Standalone `\r` inside `"A\rB"` must NOT be stripped to match `// expect: AB`
+T44_BARE_CR="$TMP_DIR/t44_bare_cr.gsa"
+cat > "$T44_BARE_CR" << 'EOF'
+/// ```geisha
+/// printLn("A\rB")
+/// // expect: AB
+/// ```
+pub def ok(): Int = 1
+EOF
+set +e
+"$T44_GEISHA_BIN" test --doc --runtime "$T44_GEISHA_RT" "$T44_BARE_CR" >/dev/null 2>&1
+T44_BARE_CR_RC=$?
+set -e
+if [ "$T44_BARE_CR_RC" -eq 0 ]; then
+    echo "FAIL [doctest_preserve_bare_cr]: printLn(\"A\\rB\") must NOT match // expect: AB" >&2
+    exit 1
+fi
+echo "PASS [geisha_doc_doctest_regressions]: compile_fail CC isolation, lexer doc scan, lstat symlink guard, scoped type links, DOM search, stale cleanup, module targets, //! & CRLF"
+PASS=$((PASS + 1))
+
+# 47. Contracts (M1) & SMT Static Verifier (`geisha verify`, M2)
+"$PYTHON" tests/test_verify.py "$GEISHA_BIN"
+PASS=$((PASS + 1))
+
 echo "All $PASS end-to-end test suites passed!"

@@ -515,7 +515,7 @@ def collectFvListWithBound(localEnv: List (String, Scheme), es: List TaggedTerm,
 }
 
 def collectPatVarsList(pat: Pattern, acc: List String): List String = match pat {
-    PatVar(v) -> Cons(v, acc),
+    PatVar(v, _) -> Cons(v, acc),
     PatWild -> acc,
     PatLit(_) -> acc,
     PatTuple(ps) -> collectPatVarsInList(ps, acc),
@@ -528,9 +528,9 @@ def collectPatVarsInList(ps: List Pattern, acc: List String): List String = matc
     Cons(h, t) -> collectPatVarsInList(t, collectPatVarsList(h, acc)),
 }
 
-def collectPatVarsInNamed(fs: List (String, Pattern), acc: List String): List String = match fs {
+def collectPatVarsInNamed(fs: List (String, Pattern, Span, Bool), acc: List String): List String = match fs {
     Nil -> acc,
-    Cons((_, p), t) -> collectPatVarsInNamed(t, collectPatVarsList(p, acc)),
+    Cons((_, p, _, _), t) -> collectPatVarsInNamed(t, collectPatVarsList(p, acc)),
 }
 
 // Pattern normalization (converts `PatStruct` -> positional `PatCtor` and collects typed local bindings)
@@ -563,13 +563,13 @@ def listNthTypeOrVoid(ts: List Type, idx: Int): Type = match ts {
     Cons(h, t) -> if (idx == 0) h else listNthTypeOrVoid(t, idx - 1),
 }
 
-def lookupNamedPatOrWild(named: List (String, Pattern), target: String): Pattern = match named {
+def lookupNamedPatOrWild(named: List (String, Pattern, Span, Bool), target: String): Pattern = match named {
     Nil -> PatWild,
-    Cons((k, p), r) -> if (k == target) p else lookupNamedPatOrWild(r, target),
+    Cons((k, p, _, _), r) -> if (k == target) p else lookupNamedPatOrWild(r, target),
 }
 
 def normalizeAndCollectPattern(ctx: KCtx, pat: Pattern, scrutTy: Type): (Pattern, List (String, Scheme)) = match pat {
-    PatVar(v) -> (PatVar(v), [(v, ScmMono(scrutTy))]),
+    PatVar(v, sp) -> (PatVar(v, sp), [(v, ScmMono(scrutTy))]),
     PatWild -> (PatWild, Nil),
     PatLit(l) -> (PatLit(l), Nil),
     PatTuple(ps) -> {
@@ -738,7 +738,7 @@ def lookupNamedForm(fs: List (String, Form), target: String): Option Form = matc
 def buildWildcardPatWithVar(len: Int, targetIdx: Int, varName: String, curIdx: Int): List Pattern =
     if (curIdx >= len) Nil
     else {
-        let p = if (curIdx == targetIdx) PatVar(varName) else PatWild;
+        let p = if (curIdx == targetIdx) PatVar(varName, emptySpan()) else PatWild;
         Cons(p, buildWildcardPatWithVar(len, targetIdx, varName, curIdx + 1))
     }
 
@@ -3874,7 +3874,7 @@ def analyzeAllocEscapes(
 def escPatBindsName(pat: Pattern, target: String): Bool = match pat {
     PatWild -> false,
     PatLit(_) -> false,
-    PatVar(x) -> x == target,
+    PatVar(x, _) -> x == target,
     PatTuple(ps) -> escPatListBindsName(ps, target),
     PatCtor(_, ps) -> escPatListBindsName(ps, target),
     PatStruct(_, _) -> false,
@@ -4448,7 +4448,7 @@ def isInlineSafeIntrinsic(name: String): Bool =
 def leafPatOk(pat: Pattern): Bool = match pat {
     PatWild -> true,
     PatLit(_) -> true,
-    PatVar(_) -> true,
+    PatVar(_, _) -> true,
     PatTuple(ps) -> leafPatListOk(ps),
     PatCtor(_, ps) -> leafPatListOk(ps),
     PatStruct(_, _) -> false,
@@ -4602,9 +4602,9 @@ def lookupInlineEnv(env: List (String, String), name: String): String = match en
 def alphaClonePat(pat: Pattern, pref: String, env: List (String, String)): (Pattern, List (String, String)) = match pat {
     PatWild -> (PatWild, env),
     PatLit(l) -> (PatLit(l), env),
-    PatVar(v) -> {
+    PatVar(v, sp) -> {
         let fv = pref + v;
-        (PatVar(fv), Cons((v, fv), env))
+        (PatVar(fv, sp), Cons((v, fv), env))
     },
     PatTuple(ps) -> {
         let (ps2, env2) = alphaClonePatList(ps, pref, env);

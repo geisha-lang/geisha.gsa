@@ -359,7 +359,7 @@ def emitPatternCondAndBinds(
     localsCell: Cell (List (String, String))
 ): Void = match pat {
     PatWild -> (),
-    PatVar(vname) -> {
+    PatVar(vname, _) -> {
         let (jsNm, nextLocs) = bindLocalJs(ctx, cellGet(localsCell), vname);
         cellSet(localsCell, nextLocs);
         cellSet(bindsRev, Cons((jsNm, scrutExpr), cellGet(bindsRev)))

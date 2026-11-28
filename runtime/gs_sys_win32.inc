@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
 #include <fcntl.h>
 #include <io.h>
@@ -19,6 +20,7 @@
 #if defined(_MSC_VER) || defined(__clang__)
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 int64_t gs_sys_rand_seed(void);
@@ -434,10 +436,37 @@ void *gs_sys_fopen(const char *path, const char *mode)
 {
     if (path == NULL || mode == NULL) return NULL;
     wchar_t *wp = gs_utf8_to_wide(path);
-    wchar_t *wm = gs_utf8_to_wide(mode);
-    if (wp == NULL || wm == NULL) {
+    if (wp == NULL) return NULL;
+    /* For read-only opens, grant FILE_SHARE_DELETE so concurrent atomic
+     * replace/rename (e.g. editors or `os.replace` during `--watch`) never
+     * fails with ERROR_ACCESS_DENIED (WinError 5). */
+    if (mode[0] == 'r' && strchr(mode, '+') == NULL) {
+        HANDLE h = CreateFileW(
+            wp,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
         free(wp);
-        free(wm);
+        if (h == INVALID_HANDLE_VALUE) return NULL;
+        int flags = _O_RDONLY | (strchr(mode, 'b') != NULL ? _O_BINARY : _O_TEXT);
+        int fd = _open_osfhandle((intptr_t)h, flags);
+        if (fd < 0) {
+            CloseHandle(h);
+            return NULL;
+        }
+        FILE *fp = _fdopen(fd, mode);
+        if (fp == NULL) {
+            _close(fd);
+            return NULL;
+        }
+        return (void *)fp;
+    }
+    wchar_t *wm = gs_utf8_to_wide(mode);
+    if (wm == NULL) {
+        free(wp);
         return NULL;
     }
     FILE *fp = _wfopen(wp, wm);
@@ -790,6 +819,195 @@ int32_t gs_sys_chmod(const char *path, int32_t mode)
     int rc = _wchmod(wp, pmode);
     free(wp);
     return (rc == 0) ? 0 : -1;
+}
+
+int32_t gs_sys_file_mode(const char *path)
+{
+    (void)path;
+    return -1;
+}
+
+int32_t gs_sys_write_excl(const char *path, const void *buf, int64_t len, int32_t mode)
+{
+    (void)mode;
+    if (path == NULL || path[0] == '\0' || len < 0 || (len > 0 && buf == NULL)) return -1;
+    wchar_t *wp = gs_utf8_to_wide(path);
+    if (wp == NULL) return -1;
+
+    /* Build a restrictive owner-only protected DACL so the staged file is never
+     * readable by other users between CreateFileW and gs_sys_copy_file_acl. */
+    HANDLE tok = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        free(wp);
+        return -1;
+    }
+    DWORD need = 0;
+    GetTokenInformation(tok, TokenUser, NULL, 0, &need);
+    if (need == 0) {
+        CloseHandle(tok);
+        free(wp);
+        return -1;
+    }
+    TOKEN_USER *tu = (TOKEN_USER *)malloc(need);
+    if (tu == NULL || !GetTokenInformation(tok, TokenUser, tu, need, &need)) {
+        free(tu);
+        CloseHandle(tok);
+        free(wp);
+        return -1;
+    }
+    CloseHandle(tok);
+
+    EXPLICIT_ACCESSW ea;
+    ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = FILE_ALL_ACCESS;
+    ea.grfAccessMode = SET_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    ea.Trustee.ptstrName = (LPWCH)tu->User.Sid;
+
+    PACL ownerDacl = NULL;
+    if (SetEntriesInAclW(1, &ea, NULL, &ownerDacl) != ERROR_SUCCESS || ownerDacl == NULL) {
+        free(tu);
+        free(wp);
+        return -1;
+    }
+    SECURITY_DESCRIPTOR sd;
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorDacl(&sd, TRUE, ownerDacl, FALSE) ||
+        !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        LocalFree(ownerDacl);
+        free(tu);
+        free(wp);
+        return -1;
+    }
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+
+    HANDLE h = CreateFileW(wp, GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD createErr = (h == INVALID_HANDLE_VALUE) ? GetLastError() : ERROR_SUCCESS;
+    LocalFree(ownerDacl);
+    free(tu);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(wp);
+        if (createErr == ERROR_FILE_EXISTS || createErr == ERROR_ALREADY_EXISTS) return 1;
+        return -1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    int64_t rem = len;
+    int ok = 1;
+    while (rem > 0) {
+        DWORD chunk = (rem > 0x40000000LL) ? (DWORD)0x40000000U : (DWORD)rem;
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, NULL) || written == 0) {
+            ok = 0;
+            break;
+        }
+        p += written;
+        rem -= (int64_t)written;
+    }
+    if (!CloseHandle(h)) ok = 0;
+    if (!ok) {
+        DeleteFileW(wp);
+        free(wp);
+        return -1;
+    }
+    free(wp);
+    return 0;
+}
+
+int32_t gs_sys_copy_file_acl(const char *src, const char *dst)
+{
+    if (src == NULL || dst == NULL || src[0] == '\0' || dst[0] == '\0') return -1;
+    wchar_t *wsrc = gs_utf8_to_wide(src);
+    wchar_t *wdst = gs_utf8_to_wide(dst);
+    if (wsrc == NULL || wdst == NULL) {
+        free(wsrc);
+        free(wdst);
+        return -1;
+    }
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD grc = GetNamedSecurityInfoW(wsrc, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &dacl, NULL, &sd);
+    if (grc != ERROR_SUCCESS) {
+        free(wsrc);
+        free(wdst);
+        return -1;
+    }
+    SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+    DWORD rev = 0;
+    SECURITY_INFORMATION secInfo = DACL_SECURITY_INFORMATION;
+    if (GetSecurityDescriptorControl(sd, &ctrl, &rev)) {
+        if (ctrl & SE_DACL_PROTECTED) secInfo |= PROTECTED_DACL_SECURITY_INFORMATION;
+        else secInfo |= UNPROTECTED_DACL_SECURITY_INFORMATION;
+    }
+    DWORD src_rc = SetNamedSecurityInfoW(wdst, SE_FILE_OBJECT, secInfo, NULL, NULL, dacl, NULL);
+    LocalFree(sd);
+    DWORD attrs = GetFileAttributesW(wsrc);
+    if (src_rc == ERROR_SUCCESS && attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+        DWORD dattrs = GetFileAttributesW(wdst);
+        if (dattrs != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(wdst, dattrs | FILE_ATTRIBUTE_READONLY);
+        }
+    }
+    free(wsrc);
+    free(wdst);
+    return (src_rc == ERROR_SUCCESS) ? 0 : -1;
+}
+
+/* For a brand-new file staged with an owner-only protected DACL, obtain the exact kernel-computed
+ * default DACL (inheritable parent ACEs or fallback to the creator token's default DACL) by
+ * creating an empty sibling template with NULL SECURITY_ATTRIBUTES, copying its DACL onto `path`,
+ * and deleting the empty template. */
+int32_t gs_sys_apply_umask_mode(const char *path, int32_t base_mode)
+{
+    (void)base_mode;
+    if (path == NULL || path[0] == '\0') return -1;
+    static volatile LONG gs_win_tmpl_seq = 0;
+    const char *s1 = strrchr(path, '\\');
+    const char *s2 = strrchr(path, '/');
+    const char *sep = (s1 != NULL && (s2 == NULL || s1 > s2)) ? s1 : s2;
+    size_t pfx_len = (sep != NULL) ? (size_t)(sep - path + 1) : 0;
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+    char *tmpl = (char *)malloc(pfx_len + 64);
+    if (tmpl == NULL) return -1;
+    if (pfx_len > 0) memcpy(tmpl, path, pfx_len);
+
+    wchar_t *wtmpl = NULL;
+    int created = 0;
+    for (int attempt = 0; attempt < 10000; attempt++) {
+        LONG seq = InterlockedIncrement(&gs_win_tmpl_seq);
+        snprintf(tmpl + pfx_len, 64, ".gsp_%lu_%ld", pid, (long)seq);
+        wtmpl = gs_utf8_to_wide(tmpl);
+        if (wtmpl == NULL) {
+            free(tmpl);
+            return -1;
+        }
+        HANDLE h = CreateFileW(wtmpl, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            CloseHandle(h);
+            created = 1;
+            break;
+        }
+        DWORD err = GetLastError();
+        free(wtmpl);
+        wtmpl = NULL;
+        if (err != ERROR_FILE_EXISTS && err != ERROR_ALREADY_EXISTS) {
+            free(tmpl);
+            return -1;
+        }
+    }
+    if (!created) {
+        free(tmpl);
+        return -1;
+    }
+    int32_t rc = gs_sys_copy_file_acl(tmpl, path);
+    DeleteFileW(wtmpl);
+    free(wtmpl);
+    free(tmpl);
+    return rc;
 }
 
 static int64_t gs_filetime_to_unix_ms(FILETIME ft)
@@ -2198,4 +2416,42 @@ int32_t gs_sys_shell(const char *cmd)
     int rc = _wsystem(wcmd);
     free(wcmd);
     return (int32_t)rc;
+}
+
+int32_t gs_proc_signal_group_only(int32_t pgid, int32_t sig_kind)
+{
+    return gs_proc_signal(pgid, sig_kind, 1);
+}
+
+int32_t gs_proc_poll_exited_no_reap(int32_t pid)
+{
+    HANDLE hProc = NULL;
+    if (!gs_proc_acquire(pid, &hProc, NULL) || hProc == NULL) return -1;
+    DWORD w = WaitForSingleObject(hProc, 0);
+    gs_proc_release(pid, 0, NULL, NULL);
+    if (w == WAIT_OBJECT_0) return 1;
+    if (w == WAIT_TIMEOUT) return 0;
+    return -1;
+}
+
+static volatile LONG g_gs_watch_stop = 0;
+
+static BOOL WINAPI gs_watch_ctrl_handler(DWORD ctrl_type)
+{
+    if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+        InterlockedExchange(&g_gs_watch_stop, 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void gs_watch_install_signal_handlers(void)
+{
+    InterlockedExchange(&g_gs_watch_stop, 0);
+    (void)SetConsoleCtrlHandler(gs_watch_ctrl_handler, TRUE);
+}
+
+int32_t gs_watch_should_stop(void)
+{
+    return InterlockedCompareExchange(&g_gs_watch_stop, 0, 0) != 0 ? 1 : 0;
 }

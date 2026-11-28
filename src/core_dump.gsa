@@ -754,7 +754,7 @@ def bindPatNonSendVars(
 ): Void = match pat {
     PatWild -> (),
     PatLit(_) -> (),
-    PatVar(x) -> if (scrutNonSend) strMapInsert(nonSendVars, x, true) else (),
+    PatVar(x, _) -> if (scrutNonSend) strMapInsert(nonSendVars, x, true) else (),
     PatTuple(ps) -> {
         let cur = cellNew(ps);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -952,7 +952,7 @@ def collectTermListBoundNames(es: List TaggedTerm, revOut: Cell (List String)): 
 }
 
 def collectPatBoundNames(pat: Pattern, revOut: Cell (List String)): Void = match pat {
-    PatVar(x) -> cellSet(revOut, Cons(x, cellGet(revOut))),
+    PatVar(x, _) -> cellSet(revOut, Cons(x, cellGet(revOut))),
     PatTuple(ps) -> collectPatListBoundNames(ps, revOut),
     PatCtor(_, ps) -> collectPatListBoundNames(ps, revOut),
     _ -> (),
@@ -1678,7 +1678,7 @@ def emitCoreLit(ctx: DumpCtx, b: StringBuf, l: Lit, expectedTy: Type): Void = ma
 
 def emitCorePatMode(ctx: DumpCtx, b: StringBuf, pat: Pattern, scrutTy: Type, scrutMode: String): Void = match pat {
     PatWild -> bufPushStr(b, "wild"),
-    PatVar(x) -> {
+    PatVar(x, _) -> {
         bufPushStr(b, "(pvar ");
         pushQuotedStr(b, x);
         bufPushByte(b, 41)
@@ -2013,7 +2013,7 @@ def getOrRegisterCoreExtern(
 
 def isIrrefutableDumpPat(pat: Pattern): Bool = match pat {
     PatWild -> true,
-    PatVar(_) -> true,
+    PatVar(_, _) -> true,
     PatTuple(ps) -> {
         let ok = cellNew(true);
         let cur = cellNew(ps);

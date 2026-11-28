@@ -696,7 +696,7 @@ pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 
 // Patterns
 // ============================================================================
 
-def parseStructPatFields(p: Parser): Result (List (String, Pattern)) String = {
+def parseStructPatFields(p: Parser): Result (List (String, Pattern, Span, Bool)) String = {
     let _ = expectLBrace(p)?;
     let acc = cellNew(Nil);
     let more = cellNew(true);
@@ -704,9 +704,13 @@ def parseStructPatFields(p: Parser): Result (List (String, Pattern)) String = {
         match peekTok(p).kind {
             TkRBrace -> cellSet(more, false),
             _ -> {
+                let fSp = peekTok(p).span;
                 let fname = parseLowerIdent(p)?;
-                let pat = if (eatSym(p, ":")) parsePattern(p)? else PatVar(fname);
-                cellSet(acc, listAppend(cellGet(acc), [(fname, pat)]));
+                let (pat, isShort) = if (eatSym(p, ":")) {
+                    let sub = parsePattern(p)?;
+                    (sub, false)
+                } else (PatVar(fname, fSp), true);
+                cellSet(acc, listAppend(cellGet(acc), [(fname, pat, fSp, isShort)]));
                 if (!eatComma(p)) cellSet(more, false) else ()
             },
         }
@@ -747,8 +751,8 @@ pub def parsePattern(p: Parser): Result Pattern String = match peekTok(p).kind {
                 _ -> Ok(PatCtor(s, Nil)),
             }
         } else {
-            let _ = bumpTok(p);
-            Ok(PatVar(s))
+            let vsp = bumpTok(p).span;
+            Ok(PatVar(s, vsp))
         },
     TkLParen -> {
         let _ = bumpTok(p);
@@ -2030,6 +2034,7 @@ def returnErrHelper(p: Parser): Result Void String =
     Err(parseErr(p, "expected 'def' or '}' inside instance block"))
 
 def parseUseSpec(p: Parser): Result UseSpec String = {
+    let origSp = peekTok(p).span;
     let name = parseCallableIdent(p)?;
     let aliasOpt = match peekTok(p).kind {
         TkAs -> {
@@ -2038,10 +2043,11 @@ def parseUseSpec(p: Parser): Result UseSpec String = {
         },
         _ -> None,
     };
-    Ok(MkUseSpec { orig: name, alias: aliasOpt })
+    Ok(MkUseSpec { orig: name, alias: aliasOpt, origSpan: origSp })
 }
 
 def parseUseStatement(p: Parser): Result UseItem String = {
+    let lastSpan = cellNew(peekTok(p).span);
     let seg0 = parseIdent(p)?;
     let segs = cellNew([seg0]);
     let isMulti = cellNew(false);
@@ -2068,6 +2074,7 @@ def parseUseStatement(p: Parser): Result UseItem String = {
                 ()
             },
             _ -> {
+                cellSet(lastSpan, peekTok(p).span);
                 let s = parseIdent(p)?;
                 cellSet(segs, listAppend(cellGet(segs), [s]))
             },
@@ -2079,9 +2086,9 @@ def parseUseStatement(p: Parser): Result UseItem String = {
         TkAs -> {
             let _ = bumpTok(p);
             let alias = parseIdent(p)?;
-            Ok(UseAlias(cellGet(segs), alias))
+            Ok(UseAlias(cellGet(segs), alias, cellGet(lastSpan)))
         },
-        _ -> Ok(UseSingle(cellGet(segs))),
+        _ -> Ok(UseSingle(cellGet(segs), cellGet(lastSpan))),
     }
 }
 
@@ -2379,9 +2386,9 @@ def wrapTryBinds(ctx: TryCtx, binds: List (String, Span, Form), cont0: Form): Fo
             Cons((okName, sp, scrut), rest) -> {
                 let (_, errName) = freshTryNames(ctx);
                 let errBody = mkForm(sp, ExApply(mkForm(sp, ExVar(ctx.errCtor)), [mkForm(sp, ExVar(errName))]));
-                let errArm = MkMatchArm { pat: PatCtor(ctx.errCtor, [PatVar(errName)]), guard: None, body: errBody };
+                let errArm = MkMatchArm { pat: PatCtor(ctx.errCtor, [PatVar(errName, emptySpan())]), guard: None, body: errBody };
                 let prevCont = cellGet(cont);
-                let okArm = MkMatchArm { pat: PatCtor(ctx.okCtor, [PatVar(okName)]), guard: None, body: prevCont };
+                let okArm = MkMatchArm { pat: PatCtor(ctx.okCtor, [PatVar(okName, emptySpan())]), guard: None, body: prevCont };
                 cellSet(cont, mkForm(unionSpan(sp, prevCont.pos), ExMatch(scrut, [errArm, okArm])));
                 cellSet(cur, rest)
             },

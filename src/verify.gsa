@@ -510,14 +510,14 @@ def canReachFn(graph: StrMap (List String), start: String, target: String): Bool
 // ============================================================================
 
 def bindPatEffectVars(pat: Pattern, stVars: List (String, String)): List (String, String) = match pat {
-    PatVar(vn) -> assocSet(stVars, vn, "__may_alias"),
+    PatVar(vn, _) -> assocSet(stVars, vn, "__may_alias"),
     PatCtor(_, subPats) -> bindPatEffectVarsList(subPats, stVars),
     PatStruct(_, namedPats) -> {
         let cur = cellNew(namedPats);
         let acc = cellNew(stVars);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
-                Cons((_, p), r) -> { cellSet(acc, bindPatEffectVars(p, cellGet(acc))); cellSet(cur, r) },
+                Cons((_, p, _, _), r) -> { cellSet(acc, bindPatEffectVars(p, cellGet(acc))); cellSet(cur, r) },
                 Nil -> (),
             }
         };
@@ -1099,7 +1099,7 @@ def bindPatternInSym(
     scrutTy: Type
 ): (SymState, Option String) = match pat {
     PatWild -> (st, Some("true")),
-    PatVar(vn) -> match scrutOpt {
+    PatVar(vn, _) -> match scrutOpt {
         Some(sv) -> {
             let st2 = MkSymState {
                 stDecls: st.stDecls,
@@ -1151,7 +1151,7 @@ def bindPatternInSym(
                 let cn = cellNew(namedPats);
                 while (match cellGet(cn) { Nil -> false, _ -> true }) {
                     match cellGet(cn) {
-                        Cons((_, p), r) -> { cellSet(subPats, listAppend(cellGet(subPats), [p])); cellSet(cn, r) },
+                        Cons((_, p, _, _), r) -> { cellSet(subPats, listAppend(cellGet(subPats), [p])); cellSet(cn, r) },
                         Nil -> (),
                     }
                 };

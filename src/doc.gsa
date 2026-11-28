@@ -1,30 +1,38 @@
-// Module & API Signature Inspector (`geisha doc [module] [--all]`)
+// Module & API Signature Inspector + Static Site / JSON Generator (`geisha doc`)
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
-use std.list.{listRev, listAppend}
+use std.list.{listRev, listAppend, listLen}
 use std.buf.{bufNew, bufPushStr, bufToString}
-use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith}
+use std.str.{strJoin, strSplitChar, strStartsWith, strEndsWith, strTrim, intToStr}
 use std.path.{pathJoin, pathStem}
 use sys.fs.{fileExists, isDir, readFile, readDir}
 use ast.{
+    Span, MkSpan,
     Visibility, isPublicVis,
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     ConstraintSpec, FunDep,
-    Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
+    Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot, schemeTypeParams,
     VarDecl, Expr, ExAbs, ExContract, FnContract, EnsuresClause,
     FieldDecl, VariantBody, VarUnit, VarTuple, VarStruct,
     VariantDef, MethodDecl,
     Item, ItForm, ItExtern, ItAlias, ItAlg, ItConcept, ItInstance,
     DefAttr, AttrExport, AttrCtor, AttrCStruct,
-    Def, ModuleItem, ModDef, ModSub,
+    Def, ModuleItem, ModDef, ModUse, ModSub,
+    UseItem, UseSingle, UseMulti, UseGlob, UseAlias, UseSpec, useSpecLocalName,
     typeToString, sortUniqueStrings
 }
-use diag.diagRegisterFile
+use diag.{diagRegisterFile, diagSpanLineCol}
 use parser.parseFileModuleInFile
 use stdlib_bundle.{builtinModuleKeys, builtinModuleSource}
 use pkg.{findProjectRoot, resolveProjectGraph, toLoaderPkgSpecs}
 use loader.PkgSpec
+use doc_site.{
+    DocItem, MkDocItem, DocModule, MkDocModule, DocSiteData, MkDocSiteData,
+    docSiteToJson, generateDocSite
+}
+
+extern "gs_sys_lstat_kind" def c_doc_lstat_kind(path: String): Int
 
 def formatTypeList(ts: List Type, sep: String): String = match ts {
     Nil -> "",
@@ -123,6 +131,13 @@ def formatParamsFromAbs(ps: List VarDecl): String = {
     strJoin(cellGet(parts), ", ")
 }
 
+def stripDocPrefix(line: String): String =
+    if (strStartsWith(line, "/// ")) strSlice(line, 4, strLen(line))
+    else if (strStartsWith(line, "///")) strSlice(line, 3, strLen(line))
+    else if (strStartsWith(line, "//! ")) strSlice(line, 4, strLen(line))
+    else if (strStartsWith(line, "//!")) strSlice(line, 3, strLen(line))
+    else line
+
 // Extract contiguous `///` doc comment lines immediately preceding `startByte`.
 pub def extractDocComment(src: String, startByte: Int): List String = {
     let n = strLen(src);
@@ -162,6 +177,70 @@ pub def extractDocComment(src: String, startByte: Int): List String = {
         }
     };
     cellGet(docLines)
+}
+
+def stripDocLines(raw: List String): List String = {
+    let rev = cellNew(Nil);
+    let cur = cellNew(raw);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(l, r) -> {
+                cellSet(rev, Cons(stripDocPrefix(l), cellGet(rev)));
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+// Extract module-level doc comment at the top of a file (`//!` lines or leading `///` lines
+// separated from the first declaration by a blank line or `use`/`open`).
+def extractModuleDocComment(src: String): List String = {
+    let n = strLen(src);
+    let pos = cellNew(0);
+    // Skip optional shebang line
+    if (strStartsWith(src, "#!")) {
+        while (cellGet(pos) < n && strByteAt(src, cellGet(pos)) != 10) {
+            cellSet(pos, cellGet(pos) + 1)
+        };
+        if (cellGet(pos) < n) cellSet(pos, cellGet(pos) + 1) else ()
+    } else ();
+
+    let rev = cellNew(Nil);
+    let sawDoc = cellNew(false);
+    let isDetached = cellNew(false);
+    let done = cellNew(false);
+    while (cellGet(pos) < n && !cellGet(done)) {
+        let start = cellGet(pos);
+        let e = cellNew(start);
+        while (cellGet(e) < n && strByteAt(src, cellGet(e)) != 10) {
+            cellSet(e, cellGet(e) + 1)
+        };
+        let endRaw = cellGet(e);
+        let endTrim = if (endRaw > start && strByteAt(src, endRaw - 1) == 13) endRaw - 1 else endRaw;
+        let line = strTrim(strSlice(src, start, endTrim));
+        if (strLen(line) == 0) {
+            if (cellGet(sawDoc)) {
+                cellSet(isDetached, true);
+                cellSet(done, true)
+            } else ()
+        } else if (strStartsWith(line, "//!")) {
+            cellSet(sawDoc, true);
+            cellSet(isDetached, true);
+            cellSet(rev, Cons(stripDocPrefix(line), cellGet(rev)))
+        } else if (strStartsWith(line, "///")) {
+            cellSet(sawDoc, true);
+            cellSet(rev, Cons(stripDocPrefix(line), cellGet(rev)))
+        } else if (strStartsWith(line, "use ") || strStartsWith(line, "open ")) {
+            if (cellGet(sawDoc)) cellSet(isDetached, true) else ();
+            cellSet(done, true)
+        } else {
+            cellSet(done, true)
+        };
+        cellSet(pos, if (endRaw < n) endRaw + 1 else n)
+    };
+    if (cellGet(isDetached)) listRev(cellGet(rev)) else Nil
 }
 
 def formatDefExternPrefix(attrs: List DefAttr): String = match attrs {
@@ -282,6 +361,188 @@ pub def formatDefSig(d: Def): String = {
     }
 }
 
+def defKindStr(d: Def): String = match d.item {
+    ItAlg(_, _) -> "data",
+    ItAlias(_, _) -> "type",
+    ItConcept(_, _, _, _) -> "concept",
+    ItInstance(_, _, _, _) -> "instance",
+    ItExtern(_, _, _, _) -> "extern",
+    ItForm(f) -> match f.node {
+        ExAbs(_, _, _) -> "def",
+        _ -> "const",
+    },
+}
+
+def defTypeParams(d: Def): List String = match d.item {
+    ItAlg(tps, _) -> tps,
+    ItAlias(tps, _) -> tps,
+    ItConcept(tps, _, _, _) -> tps,
+    ItExtern(_, scm, _, _) -> schemeTypeParams(scm),
+    ItForm(f) -> match f.annot {
+        Some(sc) -> schemeTypeParams(sc),
+        None -> Nil,
+    },
+    ItInstance(_, _, _, _) -> Nil,
+}
+
+def defDisplayName(d: Def): String = match d.item {
+    ItInstance(cname, targs, _, _) ->
+        cname + (match targs { Nil -> "", ts -> " " + formatTypeList(ts, " ") }),
+    _ -> d.ident,
+}
+
+def extractDocItemsRec(
+    src: String,
+    modKey: String,
+    fileLabel: String,
+    items: List ModuleItem,
+    showAll: Bool
+): List DocItem = {
+    let rev: Cell (List DocItem) = cellNew(Nil);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModDef(vis, d), r) -> {
+                if (showAll || isPublicVis(vis)) {
+                    let docs = stripDocLines(extractDocComment(src, d.dpos.start));
+                    let (startLine, _) = diagSpanLineCol(d.dpos);
+                    let endSp = MkSpan { fileId: d.dpos.fileId, start: d.dpos.end, end: d.dpos.end };
+                    let (endLine, _) = diagSpanLineCol(endSp);
+                    let item = MkDocItem {
+                        diName: defDisplayName(d),
+                        diKind: defKindStr(d),
+                        diVis: if (isPublicVis(vis)) "pub" else "private",
+                        diModule: modKey,
+                        diSig: formatDefSig(d),
+                        diTypeParams: defTypeParams(d),
+                        diDocs: docs,
+                        diFile: fileLabel,
+                        diLine: startLine,
+                        diEndLine: if (endLine >= startLine) endLine else startLine,
+                        diImports: Nil,
+                        diChildren: Nil,
+                    };
+                    cellSet(rev, Cons(item, cellGet(rev)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Cons(ModSub(vis, subName, subItems, sp), r) -> {
+                if (showAll || isPublicVis(vis)) {
+                    let docs = stripDocLines(extractDocComment(src, sp.start));
+                    let (startLine, _) = diagSpanLineCol(sp);
+                    let endSp = MkSpan { fileId: sp.fileId, start: sp.end, end: sp.end };
+                    let (endLine, _) = diagSpanLineCol(endSp);
+                    let subKey = modKey + "." + subName;
+                    let subImports = extractModuleImports(subItems);
+                    let children = extractDocItemsRec(src, subKey, fileLabel, subItems, showAll);
+                    let visPfx = if (isPublicVis(vis)) "pub " else "";
+                    let item = MkDocItem {
+                        diName: subName,
+                        diKind: "mod",
+                        diVis: if (isPublicVis(vis)) "pub" else "private",
+                        diModule: modKey,
+                        diSig: visPfx + "mod " + subName,
+                        diTypeParams: Nil,
+                        diDocs: docs,
+                        diFile: fileLabel,
+                        diLine: startLine,
+                        diEndLine: if (endLine >= startLine) endLine else startLine,
+                        diImports: subImports,
+                        diChildren: children,
+                    };
+                    cellSet(rev, Cons(item, cellGet(rev)))
+                } else ();
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def splitLastSeg(segs: List String): Option (List String, String) = match segs {
+    Nil -> None,
+    Cons(x, Nil) -> Some((Nil, x)),
+    Cons(x, rest) -> match splitLastSeg(rest) {
+        None -> None,
+        Some((init, last)) -> Some((Cons(x, init), last)),
+    },
+}
+
+def extractModuleImports(items: List ModuleItem): List (String, String, String) = {
+    let rev: Cell (List (String, String, String)) = cellNew(Nil);
+    let cur = cellNew(items);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(ModUse(_, u), r) -> {
+                match u {
+                    UseSingle(segs, _) -> match splitLastSeg(segs) {
+                        Some((modSegs, sym)) ->
+                            if (match modSegs { Nil -> false, _ -> true }) {
+                                cellSet(rev, Cons((sym, strJoin(modSegs, "."), sym), cellGet(rev)))
+                            } else (),
+                        None -> (),
+                    },
+                    UseAlias(segs, alias, _) -> match splitLastSeg(segs) {
+                        Some((modSegs, sym)) ->
+                            if (match modSegs { Nil -> false, _ -> true }) {
+                                cellSet(rev, Cons((alias, strJoin(modSegs, "."), sym), cellGet(rev)))
+                            } else (),
+                        None -> (),
+                    },
+                    UseMulti(modSegs, specs) -> {
+                        let mKey = strJoin(modSegs, ".");
+                        let cs = cellNew(specs);
+                        while (match cellGet(cs) { Nil -> false, _ -> true }) {
+                            match cellGet(cs) {
+                                Cons(sp, rs) -> {
+                                    cellSet(rev, Cons((useSpecLocalName(sp), mKey, sp.orig), cellGet(rev)));
+                                    cellSet(cs, rs)
+                                },
+                                Nil -> (),
+                            }
+                        }
+                    },
+                    UseGlob(modSegs) ->
+                        if (match modSegs { Nil -> false, _ -> true }) {
+                            cellSet(rev, Cons(("*", strJoin(modSegs, "."), "*"), cellGet(rev)))
+                        } else (),
+                };
+                cellSet(cur, r)
+            },
+            Cons(_, r) -> cellSet(cur, r),
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
+def buildDocModule(
+    modKey: String,
+    group: String,
+    pkgName: String,
+    srcLabel: String,
+    src: String,
+    showAll: Bool
+): Result DocModule String = {
+    let fid = diagRegisterFile(srcLabel, src);
+    let fm = parseFileModuleInFile(src, Nil, fid)?;
+    let items = extractDocItemsRec(src, modKey, srcLabel, fm.items, showAll);
+    let modDocs = extractModuleDocComment(src);
+    let imports = extractModuleImports(fm.items);
+    Ok(MkDocModule {
+        dmKey: modKey,
+        dmGroup: group,
+        dmPackage: pkgName,
+        dmSourceLabel: srcLabel,
+        dmSourceText: src,
+        dmModuleDocs: modDocs,
+        dmImports: imports,
+        dmItems: items,
+    })
+}
+
 def renderModuleItems(src: String, items: List ModuleItem, showAll: Bool, out: Cell (List String), prefix: String): Void = {
     let cur = cellNew(items);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
@@ -374,10 +635,11 @@ def collectGsaModulesRec(dir: String, modPrefix: String, out: Cell (List String)
                     Cons(name, r) -> {
                         if (name != "." && name != ".." && !strStartsWith(name, ".")) {
                             let full = pathJoin(dir, name);
-                            if (isDir(full)) {
+                            let kind = c_doc_lstat_kind(full);
+                            if (kind == 2) {
                                 let nextPfx = if (modPrefix == "") name else modPrefix + "." + name;
                                 collectGsaModulesRec(full, nextPfx, out)
-                            } else if (strEndsWith(name, ".gsa")) {
+                            } else if (kind == 1 && strEndsWith(name, ".gsa")) {
                                 let stem = pathStem(name);
                                 let modKey =
                                     if (stem == "mod") modPrefix
@@ -402,19 +664,34 @@ def resolveModPathInRoots(roots: List String, segs: List String): Option String 
     while (match cellGet(found) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(root, r) -> {
-                let p = cellNew(root);
-                let cs = cellNew(segs);
-                while (match cellGet(cs) { Nil -> false, _ -> true }) {
-                    match cellGet(cs) {
-                        Cons(s, rs) -> { cellSet(p, pathJoin(cellGet(p), s)); cellSet(cs, rs) },
-                        Nil -> (),
+                if (c_doc_lstat_kind(root) == 2) {
+                    let p = cellNew(root);
+                    let safe = cellNew(true);
+                    let cs = cellNew(segs);
+                    while (cellGet(safe) && match cellGet(cs) { Nil -> false, _ -> true }) {
+                        match cellGet(cs) {
+                            Cons(s, Nil) -> {
+                                let base = pathJoin(cellGet(p), s);
+                                let cand1 = base + ".gsa";
+                                let cand2 = pathJoin(base, "mod.gsa");
+                                if (c_doc_lstat_kind(cand1) == 1) cellSet(found, Some(cand1))
+                                else if (c_doc_lstat_kind(base) == 2 && c_doc_lstat_kind(cand2) == 1) cellSet(found, Some(cand2))
+                                else ();
+                                cellSet(cs, Nil)
+                            },
+                            Cons(s, rs) -> {
+                                let nextDir = pathJoin(cellGet(p), s);
+                                if (c_doc_lstat_kind(nextDir) == 2) {
+                                    cellSet(p, nextDir);
+                                    cellSet(cs, rs)
+                                } else {
+                                    cellSet(safe, false)
+                                }
+                            },
+                            Nil -> (),
+                        }
                     }
-                };
-                let cand1 = cellGet(p) + ".gsa";
-                let cand2 = pathJoin(cellGet(p), "mod.gsa");
-                if (fileExists(cand1)) cellSet(found, Some(cand1))
-                else if (fileExists(cand2)) cellSet(found, Some(cand2))
-                else ();
+                } else ();
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -450,7 +727,6 @@ def resolveTargetSource(target: String): Result (String, String) String =
                         match segs {
                             Nil -> Err("empty module name"),
                             Cons(first, rest) -> {
-                                // 1. Try local project module (or own package name prefix)
                                 let localSegs =
                                     if (first == rootMf.mfName && match rest { Nil -> false, _ -> true }) rest
                                     else segs;
@@ -460,7 +736,6 @@ def resolveTargetSource(target: String): Result (String, String) String =
                                         Ok((target + " (" + fpath + ")", src))
                                     },
                                     None ->
-                                        // 2. Try dependency alias in `[deps]`
                                         match lookupAlias(rootSpec.deps, first) {
                                             Some(depId) -> match lookupDepPkg(extSpecs, depId) {
                                                 Some(dp) -> {
@@ -491,9 +766,142 @@ def resolveTargetSource(target: String): Result (String, String) String =
             },
     }
 
+def appendStdlibDocModules(showAll: Bool, outRev: Cell (List DocModule)): Result Void String = {
+    let cur = cellNew(builtinModuleKeys());
+    let errOpt: Cell (Option String) = cellNew(None);
+    while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons(k, r) -> {
+                match builtinModuleSource(k) {
+                    Some(src) -> {
+                        let grp = if (strStartsWith(k, "sys.")) "sys" else "std";
+                        match buildDocModule(k, grp, grp, k + " (builtin)", src, showAll) {
+                            Ok(dm) -> cellSet(outRev, Cons(dm, cellGet(outRev))),
+                            Err(e) -> cellSet(errOpt, Some(e)),
+                        }
+                    },
+                    None -> (),
+                };
+                cellSet(cur, r)
+            },
+            Nil -> (),
+        }
+    };
+    match cellGet(errOpt) {
+        Some(e) -> Err(e),
+        None -> Ok(()),
+    }
+}
+
+def collectSiteData(
+    targetOpt: Option String,
+    showAll: Bool,
+    forceStdlib: Bool,
+    noStdlib: Bool
+): Result DocSiteData String = {
+    let modsRev: Cell (List DocModule) = cellNew(Nil);
+    match targetOpt {
+        Some(target) -> {
+            let (label, src) = resolveTargetSource(target)?;
+            let isBuiltin = match builtinModuleSource(target) { Some(_) -> true, None -> false };
+            let modKey =
+                if (isBuiltin) target
+                else if (strEndsWith(target, ".gsa")) pathStem(target)
+                else target;
+            let grp =
+                if (isBuiltin) (if (strStartsWith(target, "sys.")) "sys" else "std")
+                else if (strEndsWith(target, ".gsa")) "file"
+                else "package";
+            let (title, ver, pkgName) = match findProjectRoot(".") {
+                Some(projDir) if (!isBuiltin) -> match resolveProjectGraph(projDir, false, None, true) {
+                    Ok((mf, _, _)) -> (mf.mfName, mf.mfVersion, mf.mfName),
+                    Err(_) -> (modKey, "", ""),
+                },
+                _ -> (if (isBuiltin) "Geisha Standard Library" else modKey, "", if (isBuiltin) grp else ""),
+            };
+            let dm = buildDocModule(modKey, grp, pkgName, label, src, showAll)?;
+            cellSet(modsRev, Cons(dm, cellGet(modsRev)));
+            if (forceStdlib && !noStdlib) {
+                appendStdlibDocModules(showAll, modsRev)?
+            } else ();
+            Ok(MkDocSiteData {
+                dsTitle: title,
+                dsVersion: ver,
+                dsModules: listRev(cellGet(modsRev)),
+            })
+        },
+        None -> match findProjectRoot(".") {
+            Some(projDir) -> {
+                let (rootMf, rootSpec, _) = resolveProjectGraph(projDir, false, None, true)?;
+                let localMods = cellNew(Nil);
+                let cr = cellNew(rootSpec.srcRoots);
+                while (match cellGet(cr) { Nil -> false, _ -> true }) {
+                    match cellGet(cr) {
+                        Cons(sr, rr) -> {
+                            if (c_doc_lstat_kind(sr) == 2) {
+                                collectGsaModulesRec(sr, "", localMods)
+                            } else ();
+                            cellSet(cr, rr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                let sortedLocal = sortUniqueStrings(cellGet(localMods));
+                let cl = cellNew(sortedLocal);
+                let errOpt: Cell (Option String) = cellNew(None);
+                while (match cellGet(errOpt) { None -> true, Some(_) -> false } && match cellGet(cl) { Nil -> false, _ -> true }) {
+                    match cellGet(cl) {
+                        Cons(mKey, rm) -> {
+                            let segs = strSplitChar(mKey, '.');
+                            match resolveModPathInRoots(rootSpec.srcRoots, segs) {
+                                Some(fpath) -> match readFile(fpath) {
+                                    Err(e) -> cellSet(errOpt, Some(e)),
+                                    Ok(src) -> {
+                                        let fullKey =
+                                            if (rootMf.mfName != "" && mKey != rootMf.mfName) rootMf.mfName + "." + mKey
+                                            else mKey;
+                                        match buildDocModule(fullKey, "package", rootMf.mfName, fpath, src, showAll) {
+                                            Ok(dm) -> cellSet(modsRev, Cons(dm, cellGet(modsRev))),
+                                            Err(e) -> cellSet(errOpt, Some(e)),
+                                        }
+                                    },
+                                },
+                                None -> (),
+                            };
+                            cellSet(cl, rm)
+                        },
+                        Nil -> (),
+                    }
+                };
+                match cellGet(errOpt) {
+                    Some(e) -> Err(e),
+                    None -> {
+                        if (!noStdlib) {
+                            appendStdlibDocModules(showAll, modsRev)?
+                        } else ();
+                        Ok(MkDocSiteData {
+                            dsTitle: if (rootMf.mfName != "") rootMf.mfName else "Geisha Project",
+                            dsVersion: rootMf.mfVersion,
+                            dsModules: listRev(cellGet(modsRev)),
+                        })
+                    },
+                }
+            },
+            None -> {
+                appendStdlibDocModules(showAll, modsRev)?;
+                Ok(MkDocSiteData {
+                    dsTitle: "Geisha Standard Library",
+                    dsVersion: "",
+                    dsModules: listRev(cellGet(modsRev)),
+                })
+            },
+        },
+    }
+}
+
 def listAllDocModules(): Result Void String = {
     let b = bufNew();
-    bufPushStr(b, "Built-in modules (run `geisha doc <module>` for signatures):\n");
+    bufPushStr(b, "Built-in modules (run `geisha doc <module>` for signatures, or `geisha doc --html` for static site):\n");
     let cur = cellNew(builtinModuleKeys());
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
@@ -511,13 +919,15 @@ def listAllDocModules(): Result Void String = {
         None -> (),
         Some(projDir) -> match resolveProjectGraph(projDir, false, None, true) {
             Err(_) -> (),
-            Ok((rootMf, rootSpec, resolvedPkgs)) -> {
+            Ok((rootMf, rootSpec, _)) -> {
                 let localMods = cellNew(Nil);
                 let cr = cellNew(rootSpec.srcRoots);
                 while (match cellGet(cr) { Nil -> false, _ -> true }) {
                     match cellGet(cr) {
                         Cons(sr, rr) -> {
-                            collectGsaModulesRec(sr, "", localMods);
+                            if (c_doc_lstat_kind(sr) == 2) {
+                                collectGsaModulesRec(sr, "", localMods)
+                            } else ();
                             cellSet(cr, rr)
                         },
                         Nil -> (),
@@ -574,48 +984,100 @@ def listAllDocModules(): Result Void String = {
 
 pub def cmdDoc(args: List String): Result Void String = {
     let showAll = cellNew(false);
+    let htmlMode = cellNew(false);
+    let jsonMode = cellNew(false);
+    let forceStdlib = cellNew(false);
+    let noStdlib = cellNew(false);
+    let outDirOpt: Cell (Option String) = cellNew(None);
     let targetOpt: Cell (Option String) = cellNew(None);
     let errOpt: Cell (Option String) = cellNew(None);
+
     let cur = cellNew(args);
     while (match cellGet(cur) { Nil -> false, _ -> true } && match cellGet(errOpt) { None -> true, Some(_) -> false }) {
         match cellGet(cur) {
             Cons(a, r) -> {
                 if (a == "--all" || a == "-a") {
-                    cellSet(showAll, true)
+                    cellSet(showAll, true);
+                    cellSet(cur, r)
+                } else if (a == "--html" || a == "--site") {
+                    cellSet(htmlMode, true);
+                    cellSet(cur, r)
+                } else if (a == "--json") {
+                    cellSet(jsonMode, true);
+                    cellSet(cur, r)
+                } else if (a == "--stdlib") {
+                    cellSet(forceStdlib, true);
+                    cellSet(cur, r)
+                } else if (a == "--no-stdlib") {
+                    cellSet(noStdlib, true);
+                    cellSet(cur, r)
+                } else if (a == "--out" || a == "-o") {
+                    match r {
+                        Cons(dir, r2) -> {
+                            cellSet(outDirOpt, Some(dir));
+                            cellSet(htmlMode, true);
+                            cellSet(cur, r2)
+                        },
+                        Nil -> cellSet(errOpt, Some("missing output directory after '" + a + "'")),
+                    }
+                } else if (strStartsWith(a, "--out=")) {
+                    cellSet(outDirOpt, Some(strSlice(a, 6, strLen(a))));
+                    cellSet(htmlMode, true);
+                    cellSet(cur, r)
                 } else if (strStartsWith(a, "-")) {
                     cellSet(errOpt, Some("unknown option for 'geisha doc': " + a))
                 } else {
-                    cellSet(targetOpt, Some(a))
-                };
-                cellSet(cur, r)
+                    cellSet(targetOpt, Some(a));
+                    cellSet(cur, r)
+                }
             },
             Nil -> (),
         }
     };
+
     match cellGet(errOpt) {
         Some(e) -> Err(e),
-        None -> match cellGet(targetOpt) {
-            None -> listAllDocModules(),
-            Some(target) -> {
-                let (label, src) = resolveTargetSource(target)?;
-                let fid = diagRegisterFile(label, src);
-                let fm = parseFileModuleInFile(src, Nil, fid)?;
-                let lines = cellNew(Nil);
-                renderModuleItems(src, fm.items, cellGet(showAll), lines, "");
-                let out = bufNew();
-                bufPushStr(out, "// module ");
-                bufPushStr(out, label);
-                bufPushStr(out, "\n");
-                match cellGet(lines) {
-                    Nil -> bufPushStr(out, "// (no public items; pass --all to include private items)\n"),
-                    ls -> {
-                        bufPushStr(out, strJoin(ls, "\n"));
-                        bufPushStr(out, "\n")
+        None ->
+            if (cellGet(htmlMode)) {
+                let site = collectSiteData(cellGet(targetOpt), cellGet(showAll), cellGet(forceStdlib), cellGet(noStdlib))?;
+                let outDir = match cellGet(outDirOpt) {
+                    Some(d) -> d,
+                    None -> match findProjectRoot(".") {
+                        Some(projDir) -> pathJoin(projDir, "build/doc"),
+                        None -> "build/doc",
                     },
                 };
-                printLn(bufToString(out));
+                generateDocSite(site, outDir, cellGet(jsonMode))?;
+                printLn("Generated documentation site (" + intToStr(listLen(site.dsModules)) + " module(s)) in " + pathJoin(outDir, "index.html"));
                 Ok(())
+            } else if (cellGet(jsonMode)) {
+                let site = collectSiteData(cellGet(targetOpt), cellGet(showAll), cellGet(forceStdlib), cellGet(noStdlib))?;
+                printLn(docSiteToJson(site));
+                Ok(())
+            } else {
+                match cellGet(targetOpt) {
+                    None -> listAllDocModules(),
+                    Some(target) -> {
+                        let (label, src) = resolveTargetSource(target)?;
+                        let fid = diagRegisterFile(label, src);
+                        let fm = parseFileModuleInFile(src, Nil, fid)?;
+                        let lines = cellNew(Nil);
+                        renderModuleItems(src, fm.items, cellGet(showAll), lines, "");
+                        let out = bufNew();
+                        bufPushStr(out, "// module ");
+                        bufPushStr(out, label);
+                        bufPushStr(out, "\n");
+                        match cellGet(lines) {
+                            Nil -> bufPushStr(out, "// (no public items; pass --all to include private items)\n"),
+                            ls -> {
+                                bufPushStr(out, strJoin(ls, "\n"));
+                                bufPushStr(out, "\n")
+                            },
+                        };
+                        printLn(bufToString(out));
+                        Ok(())
+                    },
+                }
             },
-        },
     }
 }

@@ -9,22 +9,23 @@ Geisha (`.gsa`) is a statically typed, Hindley-Milner functional-imperative lang
    - `geisha doc` — list all built-in `std.*` / `sys.*` modules + current project modules/deps
    - `geisha doc std.str` — print public types, concepts, instances, and function signatures of `std.str`
    - `geisha doc path/to/file.gsa [--all]` — inspect any local file or dependency module
+   - `geisha doc --html [--out <dir>] [--json] [--stdlib|--no-stdlib] [module|file.gsa]` — generate a static HTML + CSS + JS documentation site (default `build/doc`, with live search index, sidebar navigation, cross-module type links, and line-numbered source viewer); `geisha doc --json [module|file.gsa]` prints structured JSON metadata to stdout
 3. **Fast typecheck & static verification loop (no LLVM/clang link)**:
    - `geisha check` — check current `geisha.toml` project
    - `geisha check file.gsa [--json]` — check a single file (optional `--json` output)
    - `geisha verify [file.gsa] [--json] [--solver z3] [--timeout 5000] [--no-implicit]` — SMT-based static contract & safety verifier (proves `requires`/`ensures`/`invariant`/`decreases`/`assert`, division-by-zero freedom, and array bounds with concrete counterexamples)
 4. **Run, script, test, build**:
-   - `geisha run [--dev | --release] [--no-cache] [file.gsa] [args...]` — build & run project, or run a standalone `.gsa` script (content-hashed cache in `~/.geisha/cache/scripts/`; tracks local imports automatically; `--` before args is optional)
+   - `geisha run [--watch | -w] [--dev | --release] [--no-cache] [file.gsa] [args...]` — build & run project, or run a standalone `.gsa` script (content-hashed cache in `~/.geisha/cache/scripts/`; tracks local imports automatically; `--` before args is optional; `--watch` clears the screen and re-runs incrementally when `.gsa` or `geisha.toml` changes)
    - `geisha eval '<code>' [args...]` — evaluate an inline Geisha snippet (cached)
    - **Script mode**: standalone entry files support Unix shebang (`#!/usr/bin/env -S geisha run`) and top-level statements (`let` / expressions) without needing an explicit `def main()`
-   - `geisha test [--dev | --release | --opt 0|1|2|3|s|z | -O<lvl>] [--single-cgu] [--no-cache]` (defaults to `--opt 0` / `--dev` and shares `-O0` CGU & C `.o` caches with `geisha build --dev`; `geisha test --release` shares `-O2` caches with default `geisha build`)
+   - `geisha test [--watch | -w] [--doc] [--filter <pat>] [--timeout <ms>] [--dev | --release | --opt 0|1|2|3|s|z | -O<lvl>] [--single-cgu] [--no-cache] [targets...]` — run `tests/*.gsa` or extract, compile, and run local trusted `///` fenced doctests with `--doc` (supports `geisha`/default blocks, `no_run`, `compile_fail` checked strictly via the compiler frontend, `ignore`, `should_panic`, `// expect:` / `// => ` stdout assertions, 30s default per-test timeout overridable with `--timeout <ms>`, and `diag` source-line failure reporting; defaults to `--opt 0` / `--dev` and shares `-O0` CGU & C `.o` caches with `geisha build --dev`; `geisha test --release` shares `-O2` caches with default `geisha build`; `--watch` watches `.gsa` & `geisha.toml` for incremental re-runs)
    - `geisha bench [file.gsa|filter] [--iters N] [--warmup N] [--rounds N] [--filter <pat>] [--json]` — run microbenchmarks in project mode (`benches/*.gsa`, `benches = [...]` in `geisha.toml`, or `bench_*` functions) or standalone script mode (outputs mean/median/min/max/ops/sec, with `--json` for CI/Agent regression tracking)
    - `geisha fmt [--check] [--write] [--stdout] [paths...]` — format `.gsa` files in-place (defaults to project/cwd; `--check` exits non-zero if any file needs formatting; `--stdout` prints formatted output)
    - `geisha build [--target native|wasm32|wasm-gc|js|ios|ios-sim|macos-app|ios-app|ios-sim-app] [-g|--debug] [-O0..-O3|-Os|-Oz|--opt[=]<lvl>|--dev|--release] [--strip] [--slim-runtime] [--no-dts] [--single-cgu] [--no-cache] [-o out]` (splits multi-module programs into per-module LLVM CGUs compiled in parallel with content-addressed `.o` caching in `build/cache/cgu/` and `build/cache/native/`; override concurrency via `GEISHA_JOBS`)
    - **Source-level debugging (`lldb` / `gdb` / VS Code CodeLLDB)**: compile with `-g` / `--debug` (defaults to `-O0`, disables tail-call optimization, emits DWARF v4 line info + `@llvm.dbg.declare` local variables, and runs `dsymutil` on macOS). Load `~/.geisha/lib/geisha_lldb.py` in LLDB for formatted `String`, `Vec`, `Array`, `List`, `Option`, and boxed ADT inspection (see `docs/DEBUGGING.md`).
    - `geisha init [--lib] [dir]` / `geisha add <pkg|git-url>` / `geisha remove <alias>` / `geisha fetch` / `geisha update`
 5. **Editor / IDE integration (LSP)**:
-   - `geisha lsp` — start the built-in JSON-RPC 2.0 Language Server over stdio (diagnostics, hover with inferred types & `///` docs, go-to-definition, document symbols, completion)
+   - `geisha lsp` — start the built-in JSON-RPC 2.0 Language Server over stdio (diagnostics, hover with inferred types & `///` docs, go-to-definition, find references, scope-aware rename with `prepareRename`, inlay hints for inferred `let` types & call parameter names, quick-fix code actions, document symbols, completion)
 
 ---
 
