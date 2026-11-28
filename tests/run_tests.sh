@@ -8217,6 +8217,8 @@ cat > "$TMP_DIR/t51_api_compat.gsa" << 'EOF'
 use std.option.{Some, None}
 use std.result.{Ok, Err}
 use std.list.listLen
+use std.vec.vecLen
+use std.buf.{StringBuf, bufNew, bufPushStr, bufToString}
 use std.str.intToStr
 use ast.emptySpan
 use diag.{diagRegisterFile, diagReset, diagLastError}
@@ -8224,6 +8226,13 @@ use lexer.{MkToken, TkEof, tokenizeInFile}
 use parser.{Parser, MkParser, newParser, parseExpr, parseDefinition}
 
 type Deep = ((((((((((((((((Int))))))))))))))))
+
+def buildDefsLoop(b: StringBuf, n: Int, i: Int): Void =
+    if (i >= n) ()
+    else {
+        bufPushStr(b, "def x" + intToStr(i) + " = 1\n");
+        buildDefsLoop(b, n, i + 1)
+    }
 
 def main(): Void = {
     diagReset();
@@ -8262,12 +8271,38 @@ def main(): Void = {
             f1 + "|" + eofLoc
         },
     };
-    printLn(pendRes + "|" + seqRes)
+    let mb = bufNew();
+    buildDefsLoop(mb, 512, 0);
+    let incRes = match tokenizeInFile(bufToString(mb), 0) {
+        Err(e) -> e,
+        Ok(mts) -> {
+            let mp = MkParser {
+                tokens: mts,
+                idx: cellNew(0),
+                pushedSym: cellNew(None),
+                eofTok: MkToken { kind: TkEof, span: emptySpan(), hadNewline: true },
+                pendingItems: cellNew(Nil),
+            };
+            let limit = vecLen(mts) - 1;
+            let count = cellNew(0);
+            while (cellGet(mp.idx) < limit) {
+                match parseDefinition(mp, None) {
+                    Ok(_) -> cellSet(count, cellGet(count) + 1),
+                    Err(e) -> {
+                        printLn(e);
+                        cellSet(mp.idx, limit)
+                    },
+                }
+            };
+            intToStr(cellGet(count))
+        },
+    };
+    printLn(pendRes + "|" + seqRes + "|" + incRes)
 }
 EOF
 if [ -n "$PARSEC_PKG_SRC" ]; then
     "$GEISHA_BIN" --src-root src --pkg "parsec=$PARSEC_PKG_SRC" -o "$TMP_DIR/t51_api_compat$EXE_EXT" "$TMP_DIR/t51_api_compat.gsa"
-    assert_eq "parser_public_api_and_deep_paren_type" "Box:1|0:1|16:16" "$("$TMP_DIR/t51_api_compat$EXE_EXT")"
+    assert_eq "parser_public_api_and_deep_paren_type" "Box:1|0:1|16:16|512" "$("$TMP_DIR/t51_api_compat$EXE_EXT")"
 fi
 
 # Cold `GEISHA_HOME` single-file check must NOT fetch ancestor `[deps]`, while project `check` reports corrupted `geisha.lock`

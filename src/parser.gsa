@@ -44,7 +44,7 @@ use lexer.{
 use diag.{formatSpanDiag, formatSpanDiagHint}
 use parsec.core.{
     Span as PSpan, ParseFail, ParseError, TokEntry, TokCursor, InfixInfo,
-    curAtEnd, curOffset, newTokCursorEof, parseTokensFile, finishErrorFor,
+    curAtEnd, curOffset, newTokCursorEof, newTokCursorLazy, parseTokensFile, finishErrorFor,
     fail, failHint, failSpan, between,
     commit, (<|>), backtrack, opt, optOr, peek, hadNewline, spanFrom,
     many1, skipMany, sepBy1, sepEndBy, sepEndBy1, sepEndByUntil,
@@ -200,20 +200,33 @@ def makeCompatCursor(p: Parser): GsCursor = {
     let rawLen = vecLen(p.tokens);
     let fallbackEof = p.eofTok;
     let lastTok = if (rawLen > 0) vecGetOr(p.tokens, rawLen - 1, fallbackEof) else fallbackEof;
+    let count =
+        if (rawLen > 0) {
+            match lastTok.kind {
+                TkEof -> rawLen - 1,
+                _ -> rawLen,
+            }
+        } else 0;
     let firstTok = if (rawLen > 0) vecGetOr(p.tokens, 0, lastTok) else lastTok;
     let fileId = firstTok.span.fileId;
     let eofOff =
         if (lastTok.span.end >= fallbackEof.span.end) lastTok.span.end
         else fallbackEof.span.end;
-    let frozen = freezeLexTokens(p.tokens);
-    let count = immArrayLen(frozen);
-    let cur = newTokCursorEof("", frozen, eofOff, "<parser>", fileId, describeGsTok);
+    let fetchOne = (i: Int) -> {
+        let lt = vecGetOr(p.tokens, i, fallbackEof);
+        TokEntry {
+            kind: lt.kind,
+            span: toPSpan(lt.span),
+            hadNewline: lt.hadNewline,
+        }
+    };
+    let cur = newTokCursorLazy("", count, eofOff, fetchOne, "<parser>", fileId, describeGsTok);
     let rawIdx = cellGet(p.idx);
     let clampedIdx = if (rawIdx < 0) 0 else if (rawIdx > count) count else rawIdx;
     cellSet(cur.idx, clampedIdx);
     if (clampedIdx > 0 && clampedIdx <= count) {
-        let prevE = immArrayGet(frozen, clampedIdx - 1);
-        cellSet(cur.lastEnd, (prevE.span.end, 0))
+        let prevLt = vecGetOr(p.tokens, clampedIdx - 1, fallbackEof);
+        cellSet(cur.lastEnd, prevLt.span.end)
     } else ();
     match cellGet(p.pushedSym) {
         Some(pt) -> pushToken(cur, TokEntry {
@@ -229,7 +242,7 @@ def makeCompatCursor(p: Parser): GsCursor = {
 def syncCompatParser(p: Parser, cur: GsCursor): Void = {
     cellSet(p.idx, cellGet(cur.idx));
     match cellGet(cur.pushed) {
-        Cons((_, pe), _) -> cellSet(p.pushedSym, Some(MkToken {
+        Cons(pe, _) -> cellSet(p.pushedSym, Some(MkToken {
             kind: pe.kind,
             span: toAstSpan(pe.span),
             hadNewline: pe.hadNewline,
