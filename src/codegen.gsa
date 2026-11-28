@@ -3237,9 +3237,9 @@ def nthArgTerm(args: List TaggedTerm, idx: Int): TaggedTerm = match args {
     Nil -> MkTerm { tspan: emptySpan(), tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) },
 }
 
-def isPureScalarAssumeTermList(ts: List TaggedTerm): Bool = match ts {
+def isPureScalarAssumeTermList(mctx: ModEmitCtx, ts: List TaggedTerm): Bool = match ts {
     Nil -> true,
-    Cons(t, r) -> if (isPureScalarAssumeTerm(t)) isPureScalarAssumeTermList(r) else false,
+    Cons(t, r) -> if (isPureScalarAssumeTerm(mctx, t)) isPureScalarAssumeTermList(mctx, r) else false,
 }
 
 def isAllowedScalarAssumeType(ty: Type): Bool = match ty {
@@ -3250,7 +3250,7 @@ def isAllowedScalarAssumeType(ty: Type): Bool = match ty {
     _ -> false,
 }
 
-def isPureScalarAssumeTerm(tm: TaggedTerm): Bool = match tm.tnode {
+def isPureScalarAssumeTerm(mctx: ModEmitCtx, tm: TaggedTerm): Bool = match tm.tnode {
     TmLit(_) -> isAllowedScalarAssumeType(schemeBody(tm.tscm)),
     TmVar(_) -> isAllowedScalarAssumeType(schemeBody(tm.tscm)),
     TmBin(op, a, b) -> {
@@ -3259,23 +3259,24 @@ def isPureScalarAssumeTerm(tm: TaggedTerm): Bool = match tm.tnode {
         && isAllowedScalarAssumeType(schemeBody(tm.tscm))
         && isAllowedScalarAssumeType(schemeBody(a.tscm))
         && isAllowedScalarAssumeType(schemeBody(b.tscm))
-        && isPureScalarAssumeTerm(a)
-        && isPureScalarAssumeTerm(b)
+        && isPureScalarAssumeTerm(mctx, a)
+        && isPureScalarAssumeTerm(mctx, b)
     },
     TmUn(_, a) ->
         isAllowedScalarAssumeType(schemeBody(tm.tscm))
         && isAllowedScalarAssumeType(schemeBody(a.tscm))
-        && isPureScalarAssumeTerm(a),
+        && isPureScalarAssumeTerm(mctx, a),
     TmIf(c, t, e) ->
         isAllowedScalarAssumeType(schemeBody(tm.tscm))
-        && isPureScalarAssumeTerm(c)
-        && isPureScalarAssumeTerm(t)
-        && isPureScalarAssumeTerm(e),
+        && isPureScalarAssumeTerm(mctx, c)
+        && isPureScalarAssumeTerm(mctx, t)
+        && isPureScalarAssumeTerm(mctx, e),
     TmGetTag(e) ->
         isAllowedScalarAssumeType(schemeBody(tm.tscm))
         && match e.tnode { TmVar(_) -> true, _ -> false },
     TmApplyDir(vd, args) ->
-        if (vd.vname == "cellGet") {
+        if (strMapContains(mctx.mcExterns, vd.vname) || strMapContains(mctx.mcFns, vd.vname)) false
+        else if (vd.vname == "cellGet") {
             isAllowedScalarAssumeType(schemeBody(tm.tscm))
             && match args { Cons(a0, Nil) -> match a0.tnode { TmVar(_) -> true, _ -> false }, _ -> false }
         } else if (vd.vname == "arrayLen" || vd.vname == "immArrayLen") {
@@ -3302,7 +3303,7 @@ def tryEmitIntrinsic(
         if (fctx.fcVerifiedSafe) {
             match args {
                 Cons(a0, _) ->
-                    if (isPureScalarAssumeTerm(a0)) {
+                    if (isPureScalarAssumeTerm(mctx, a0)) {
                         let condVal = genExpr(mctx, fctx, a0, locals, false);
                         emitLine(fctx, "call void @llvm.assume(i1 " + condVal + ")");
                         Some("0")
@@ -5197,7 +5198,10 @@ def genExpr(
         TmApplyDir(funDecl, args) -> {
             let calleeName = funDecl.vname;
             let retGeishaTy = schemeBody(tm.tscm);
-            match tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals, directLetVar) {
+            let isShadowed = !strStartsWith(calleeName, "__gs_")
+                && (strMapContains(mctx.mcExterns, calleeName) || strMapContains(mctx.mcFns, calleeName));
+            let intrinRes = if (isShadowed) None else tryEmitIntrinsic(mctx, fctx, calleeName, args, retGeishaTy, locals, directLetVar);
+            match intrinRes {
                 Some(intrinVal) -> intrinVal,
                 None -> match strMapGet(mctx.mcExterns, calleeName) {
                     Some(extDef) -> {

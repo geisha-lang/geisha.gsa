@@ -2744,7 +2744,9 @@ def emitWgcExpr(fctx: WgcFnCtx, tm: TaggedTerm, locals: List (String, Int, WgcVa
             emitUleb(c, clsFnIdx)
         },
         TmApplyDir(vd, args) -> {
-            if (tryEmitBuiltinWgc(fctx, vd.vname, args, resTy, locals)) {
+            let isShadowed = !strStartsWith(vd.vname, "__gs_")
+                && (strMapContains(wm.wmProg.coreExterns, vd.vname) || strMapContains(wm.wmProg.coreFns, vd.vname));
+            if (!isShadowed && tryEmitBuiltinWgc(fctx, vd.vname, args, resTy, locals)) {
                 ()
             } else {
                 match strMapGet(wm.wmProg.coreExterns, vd.vname) {

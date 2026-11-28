@@ -9,7 +9,7 @@ use std.result.{Result, Ok, Err}
 use std.list.{listRev, listLen, listAppend}
 use std.buf.{StringBuf, bufNew, bufPushStr, bufPushByte, bufToString}
 use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapContains}
-use std.str.{intToStr, i64ToStr}
+use std.str.{intToStr, i64ToStr, strStartsWith}
 use ast.{
     Type, TyVoid, TyVar, TyCon, TyArr, TyTuple, TyComp,
     Scheme, ScmMono, ScmSlot, schemeBody,
@@ -2453,7 +2453,9 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
         bufPushByte(b, 41)
     },
     TmApplyDir(vd, args) -> {
-        if (vd.vname == "cellNew") {
+        let isShadowedBuiltin = !strStartsWith(vd.vname, "__gs_")
+            && (strMapContains(ctx.dcProg.coreExterns, vd.vname) || strMapContains(ctx.dcProg.coreFns, vd.vname));
+        if (!isShadowedBuiltin && vd.vname == "cellNew") {
             match args {
                 Cons(a0, Nil) -> {
                     bufPushStr(b, "(cell-new ");
@@ -2465,7 +2467,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     bufPushStr(b, "(lit-unit)")
                 },
             }
-        } else if (vd.vname == "cellGet") {
+        } else if (!isShadowedBuiltin && vd.vname == "cellGet") {
             match args {
                 Cons(a0, Nil) -> {
                     bufPushStr(b, "(cell-get ");
@@ -2477,7 +2479,7 @@ def emitCoreTerm(ctx: DumpCtx, b: StringBuf, tm: TaggedTerm): Void = match tm.tn
                     bufPushStr(b, "(lit-unit)")
                 },
             }
-        } else if (vd.vname == "cellSet") {
+        } else if (!isShadowedBuiltin && vd.vname == "cellSet") {
             match args {
                 Cons(a0, Cons(a1, Nil)) -> {
                     bufPushStr(b, "(cell-set ");

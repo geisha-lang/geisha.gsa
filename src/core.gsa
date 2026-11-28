@@ -3395,35 +3395,38 @@ def insertOrMergeAlloc(
     },
 }
 
-def collectNonAllocBindings(tm: TaggedTerm, nonAlloc: StrMap Bool): Void = match tm.tnode {
-    TmMakeCls(_, _, body) -> collectNonAllocBindings(body, nonAlloc),
+def isShadowedBuiltin(nm: String, fns: StrMap FunDef, externs: StrMap ExternDef): Bool =
+    !strStartsWith(nm, "__gs_") && (strMapContains(externs, nm) || strMapContains(fns, nm))
+
+def collectNonAllocBindings(tm: TaggedTerm, nonAlloc: StrMap Bool, allowCellOps: Bool): Void = match tm.tnode {
+    TmMakeCls(_, _, body) -> collectNonAllocBindings(body, nonAlloc, allowCellOps),
     TmLet(vd, val, body) -> {
         let isEligibleAlloc = match val.tnode {
             TmMakeData(_, _, _, _, _) -> true,
-            TmApplyDir(fvd, _) if (fvd.vname == "cellNew") -> true,
+            TmApplyDir(fvd, _) if (allowCellOps && fvd.vname == "cellNew") -> true,
             _ -> false,
         };
         if (!isEligibleAlloc) strMapInsert(nonAlloc, vd.vname, true) else ();
-        collectNonAllocBindings(val, nonAlloc);
-        collectNonAllocBindings(body, nonAlloc)
+        collectNonAllocBindings(val, nonAlloc, allowCellOps);
+        collectNonAllocBindings(body, nonAlloc, allowCellOps)
     },
     TmIf(c, t, e) -> {
-        collectNonAllocBindings(c, nonAlloc);
-        collectNonAllocBindings(t, nonAlloc);
-        collectNonAllocBindings(e, nonAlloc)
+        collectNonAllocBindings(c, nonAlloc, allowCellOps);
+        collectNonAllocBindings(t, nonAlloc, allowCellOps);
+        collectNonAllocBindings(e, nonAlloc, allowCellOps)
     },
     TmWhile(c, b) -> {
-        collectNonAllocBindings(c, nonAlloc);
-        collectNonAllocBindings(b, nonAlloc)
+        collectNonAllocBindings(c, nonAlloc, allowCellOps);
+        collectNonAllocBindings(b, nonAlloc, allowCellOps)
     },
     TmBin(_, l, r) -> {
-        collectNonAllocBindings(l, nonAlloc);
-        collectNonAllocBindings(r, nonAlloc)
+        collectNonAllocBindings(l, nonAlloc, allowCellOps);
+        collectNonAllocBindings(r, nonAlloc, allowCellOps)
     },
-    TmUn(_, e) -> collectNonAllocBindings(e, nonAlloc),
-    TmGetTag(e) -> collectNonAllocBindings(e, nonAlloc),
+    TmUn(_, e) -> collectNonAllocBindings(e, nonAlloc, allowCellOps),
+    TmGetTag(e) -> collectNonAllocBindings(e, nonAlloc, allowCellOps),
     TmMatch(s, arms) -> {
-        collectNonAllocBindings(s, nonAlloc);
+        collectNonAllocBindings(s, nonAlloc, allowCellOps);
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
@@ -3439,30 +3442,30 @@ def collectNonAllocBindings(tm: TaggedTerm, nonAlloc: StrMap Bool): Void = match
                             Nil -> (),
                         }
                     };
-                    match a.caGuard { Some(g) -> collectNonAllocBindings(g, nonAlloc), None -> () };
-                    collectNonAllocBindings(a.caBody, nonAlloc);
+                    match a.caGuard { Some(g) -> collectNonAllocBindings(g, nonAlloc, allowCellOps), None -> () };
+                    collectNonAllocBindings(a.caBody, nonAlloc, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
         }
     },
-    TmApplyDir(_, es) -> collectNonAllocBindingsInList(es, nonAlloc),
-    TmTuple(es) -> collectNonAllocBindingsInList(es, nonAlloc),
-    TmBlock(es) -> collectNonAllocBindingsInList(es, nonAlloc),
-    TmMakeData(_, _, es, _, _) -> collectNonAllocBindingsInList(es, nonAlloc),
+    TmApplyDir(_, es) -> collectNonAllocBindingsInList(es, nonAlloc, allowCellOps),
+    TmTuple(es) -> collectNonAllocBindingsInList(es, nonAlloc, allowCellOps),
+    TmBlock(es) -> collectNonAllocBindingsInList(es, nonAlloc, allowCellOps),
+    TmMakeData(_, _, es, _, _) -> collectNonAllocBindingsInList(es, nonAlloc, allowCellOps),
     TmApplyCls(c, args) -> {
-        collectNonAllocBindings(c, nonAlloc);
-        collectNonAllocBindingsInList(args, nonAlloc)
+        collectNonAllocBindings(c, nonAlloc, allowCellOps);
+        collectNonAllocBindingsInList(args, nonAlloc, allowCellOps)
     },
     _ -> (),
 }
 
-def collectNonAllocBindingsInList(es: List TaggedTerm, nonAlloc: StrMap Bool): Void = match es {
+def collectNonAllocBindingsInList(es: List TaggedTerm, nonAlloc: StrMap Bool, allowCellOps: Bool): Void = match es {
     Nil -> (),
     Cons(h, t) -> {
-        collectNonAllocBindings(h, nonAlloc);
-        collectNonAllocBindingsInList(t, nonAlloc)
+        collectNonAllocBindings(h, nonAlloc, allowCellOps);
+        collectNonAllocBindingsInList(t, nonAlloc, allowCellOps)
     },
 }
 
@@ -3470,11 +3473,12 @@ def collectLocalAllocs(
     tm: TaggedTerm,
     recAdts: StrMap Bool,
     allocMap: StrMap (Bool, List String),
-    allocKeys: Cell (List String)
+    allocKeys: Cell (List String),
+    allowCellOps: Bool
 ): Void = match tm.tnode {
     TmMakeCls(vd, cls, body) -> {
         insertOrMergeAlloc(allocMap, allocKeys, vd.vname, false, cls.clsFvs);
-        collectLocalAllocs(body, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(body, recAdts, allocMap, allocKeys, allowCellOps)
     },
     TmLet(vd, val, body) -> {
         match val.tnode {
@@ -3484,7 +3488,7 @@ def collectLocalAllocs(
                 collectVarsInCoreList(fs, seen, contained);
                 insertOrMergeAlloc(allocMap, allocKeys, vd.vname, strMapContains(recAdts, tn), cellGet(contained))
             },
-            TmApplyDir(fvd, args) if (fvd.vname == "cellNew") -> {
+            TmApplyDir(fvd, args) if (allowCellOps && fvd.vname == "cellNew") -> {
                 let seen: StrMap Bool = strMapNew();
                 let contained = cellNew(Nil);
                 collectVarsInCoreList(args, seen, contained);
@@ -3492,45 +3496,45 @@ def collectLocalAllocs(
             },
             _ -> (),
         };
-        collectLocalAllocs(val, recAdts, allocMap, allocKeys);
-        collectLocalAllocs(body, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(val, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocs(body, recAdts, allocMap, allocKeys, allowCellOps)
     },
     TmIf(c, t, e) -> {
-        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
-        collectLocalAllocs(t, recAdts, allocMap, allocKeys);
-        collectLocalAllocs(e, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocs(t, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocs(e, recAdts, allocMap, allocKeys, allowCellOps)
     },
     TmWhile(c, b) -> {
-        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
-        collectLocalAllocs(b, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocs(b, recAdts, allocMap, allocKeys, allowCellOps)
     },
     TmBin(_, l, r) -> {
-        collectLocalAllocs(l, recAdts, allocMap, allocKeys);
-        collectLocalAllocs(r, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(l, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocs(r, recAdts, allocMap, allocKeys, allowCellOps)
     },
-    TmUn(_, e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys),
-    TmGetTag(e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys),
+    TmUn(_, e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys, allowCellOps),
+    TmGetTag(e) -> collectLocalAllocs(e, recAdts, allocMap, allocKeys, allowCellOps),
     TmMatch(s, arms) -> {
-        collectLocalAllocs(s, recAdts, allocMap, allocKeys);
+        collectLocalAllocs(s, recAdts, allocMap, allocKeys, allowCellOps);
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(a, r) -> {
-                    match a.caGuard { Some(g) -> collectLocalAllocs(g, recAdts, allocMap, allocKeys), None -> () };
-                    collectLocalAllocs(a.caBody, recAdts, allocMap, allocKeys);
+                    match a.caGuard { Some(g) -> collectLocalAllocs(g, recAdts, allocMap, allocKeys, allowCellOps), None -> () };
+                    collectLocalAllocs(a.caBody, recAdts, allocMap, allocKeys, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
         }
     },
-    TmApplyDir(_, es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
-    TmTuple(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
-    TmBlock(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
-    TmMakeData(_, _, es, _, _) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys),
+    TmApplyDir(_, es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys, allowCellOps),
+    TmTuple(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys, allowCellOps),
+    TmBlock(es) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys, allowCellOps),
+    TmMakeData(_, _, es, _, _) -> collectLocalAllocsInList(es, recAdts, allocMap, allocKeys, allowCellOps),
     TmApplyCls(c, args) -> {
-        collectLocalAllocs(c, recAdts, allocMap, allocKeys);
-        collectLocalAllocsInList(args, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(c, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocsInList(args, recAdts, allocMap, allocKeys, allowCellOps)
     },
     _ -> (),
 }
@@ -3539,12 +3543,13 @@ def collectLocalAllocsInList(
     es: List TaggedTerm,
     recAdts: StrMap Bool,
     allocMap: StrMap (Bool, List String),
-    allocKeys: Cell (List String)
+    allocKeys: Cell (List String),
+    allowCellOps: Bool
 ): Void = match es {
     Nil -> (),
     Cons(h, t) -> {
-        collectLocalAllocs(h, recAdts, allocMap, allocKeys);
-        collectLocalAllocsInList(t, recAdts, allocMap, allocKeys)
+        collectLocalAllocs(h, recAdts, allocMap, allocKeys, allowCellOps);
+        collectLocalAllocsInList(t, recAdts, allocMap, allocKeys, allowCellOps)
     },
 }
 
@@ -3651,7 +3656,8 @@ def analyzeAllocEscapes(
     escList: Cell (List String),
     allParamEscapes: StrMap (MutArray Int),
     recAdts: StrMap Bool,
-    inTail: Bool
+    inTail: Bool,
+    allowCellOps: Bool
 ): Void = match tm.tnode {
     TmVar(id) -> if (inTail) markEscaping(id, allocMap, escaping, escList) else (),
     TmTuple(es) -> {
@@ -3659,7 +3665,7 @@ def analyzeAllocEscapes(
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(e, r) -> {
-                    analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
+                    analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -3668,7 +3674,7 @@ def analyzeAllocEscapes(
     },
     TmMakeCls(_, cls, body) -> {
         markVarsEscaping(cls.clsFvs, allocMap, escaping, escList);
-        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps)
     },
     TmLet(_, val, body) -> {
         match val.tnode {
@@ -3677,53 +3683,53 @@ def analyzeAllocEscapes(
                 while (match cellGet(cur) { Nil -> false, _ -> true }) {
                     match cellGet(cur) {
                         Cons(f, r) -> {
-                            analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+                            analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
                             cellSet(cur, r)
                         },
                         Nil -> (),
                     }
                 }
             },
-            TmApplyDir(fvd, args) if (fvd.vname == "cellNew") -> {
+            TmApplyDir(fvd, args) if (allowCellOps && fvd.vname == "cellNew") -> {
                 let cur = cellNew(args);
                 while (match cellGet(cur) { Nil -> false, _ -> true }) {
                     match cellGet(cur) {
                         Cons(a, r) -> {
                             markVarsEscaping(varsOfTerm(a), allocMap, escaping, escList);
-                            analyzeAllocEscapes(a, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                            analyzeAllocEscapes(a, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps);
                             cellSet(cur, r)
                         },
                         Nil -> (),
                     }
                 }
             },
-            TmApplyDir(fvd, _) if (fvd.vname == "cellGet") ->
-                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+            TmApplyDir(fvd, _) if (allowCellOps && fvd.vname == "cellGet") ->
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
             TmBin(_, _, _) ->
-                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
             TmUn(_, _) ->
-                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
             TmGetTag(_) ->
-                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
             _ -> {
                 markVarsEscaping(varsOfTerm(val), allocMap, escaping, escList);
-                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false)
+                analyzeAllocEscapes(val, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps)
             },
         };
-        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+        analyzeAllocEscapes(body, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps)
     },
     TmApplyDir(vd, args) ->
-        if (vd.vname == "cellGet") {
+        if (allowCellOps && vd.vname == "cellGet") {
             match args {
-                Cons(cellArg, _) -> analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+                Cons(cellArg, _) -> analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
                 Nil -> (),
             }
-        } else if (vd.vname == "cellSet") {
+        } else if (allowCellOps && vd.vname == "cellSet") {
             match args {
                 Cons(cellArg, Cons(valArg, _)) -> {
-                    analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+                    analyzeAllocEscapes(cellArg, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
                     markVarsEscaping(varsOfTerm(valArg), allocMap, escaping, escList);
-                    analyzeAllocEscapes(valArg, allocMap, escaping, escList, allParamEscapes, recAdts, true)
+                    analyzeAllocEscapes(valArg, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps)
                 },
                 _ -> (),
             }
@@ -3742,7 +3748,7 @@ def analyzeAllocEscapes(
                                 if (ce >= 2) true else if (ce == 1) inTail else false
                             } else true;
                         if (argEscapes) markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList) else ();
-                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, argEscapes);
+                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, argEscapes, allowCellOps);
                         cellSet(idx, i + 1);
                         cellSet(cur, r)
                     },
@@ -3756,7 +3762,7 @@ def analyzeAllocEscapes(
                 match cellGet(cur) {
                     Cons(arg, r) -> {
                         markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList);
-                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                        analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps);
                         cellSet(cur, r)
                     },
                     Nil -> (),
@@ -3765,13 +3771,13 @@ def analyzeAllocEscapes(
         },
     },
     TmApplyCls(c, args) -> {
-        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
         let cur = cellNew(args);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(arg, r) -> {
                     markVarsEscaping(varsOfTerm(arg), allocMap, escaping, escList);
-                    analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                    analyzeAllocEscapes(arg, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -3779,25 +3785,25 @@ def analyzeAllocEscapes(
         }
     },
     TmIf(c, t, e) -> {
-        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
-        analyzeAllocEscapes(t, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
-        analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail)
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
+        analyzeAllocEscapes(t, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps);
+        analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps)
     },
     TmWhile(c, b) -> {
-        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        analyzeAllocEscapes(c, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
         let loopMap: StrMap (Bool, List String) = strMapNew();
         let loopKeys = cellNew(Nil);
-        collectLocalAllocs(b, recAdts, loopMap, loopKeys);
+        collectLocalAllocs(b, recAdts, loopMap, loopKeys, allowCellOps);
         let escLoopKeys = collectPureLoopCells(b, cellGet(loopKeys));
         markVarsEscaping(escLoopKeys, allocMap, escaping, escList);
-        analyzeAllocEscapes(b, allocMap, escaping, escList, allParamEscapes, recAdts, true)
+        analyzeAllocEscapes(b, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps)
     },
     TmBin(_, l, r) -> {
-        analyzeAllocEscapes(l, allocMap, escaping, escList, allParamEscapes, recAdts, false);
-        analyzeAllocEscapes(r, allocMap, escaping, escList, allParamEscapes, recAdts, false)
+        analyzeAllocEscapes(l, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
+        analyzeAllocEscapes(r, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps)
     },
-    TmUn(_, e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false),
-    TmGetTag(e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false),
+    TmUn(_, e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
+    TmGetTag(e) -> analyzeAllocEscapes(e, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps),
     TmMatch(s, arms) -> {
         if (inTail) markVarsEscaping(varsOfTerm(s), allocMap, escaping, escList) else ();
         let scrutVars = varsOfTerm(s);
@@ -3837,13 +3843,13 @@ def analyzeAllocEscapes(
                 Nil -> (),
             }
         };
-        analyzeAllocEscapes(s, allocMap, escaping, escList, allParamEscapes, recAdts, false);
+        analyzeAllocEscapes(s, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps);
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(a, r) -> {
-                    match a.caGuard { Some(g) -> analyzeAllocEscapes(g, allocMap, escaping, escList, allParamEscapes, recAdts, false), None -> () };
-                    analyzeAllocEscapes(a.caBody, allocMap, escaping, escList, allParamEscapes, recAdts, inTail);
+                    match a.caGuard { Some(g) -> analyzeAllocEscapes(g, allocMap, escaping, escList, allParamEscapes, recAdts, false, allowCellOps), None -> () };
+                    analyzeAllocEscapes(a.caBody, allocMap, escaping, escList, allParamEscapes, recAdts, inTail, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -3856,7 +3862,7 @@ def analyzeAllocEscapes(
             match cellGet(cur) {
                 Cons(f, r) -> {
                     markVarsEscaping(varsOfTerm(f), allocMap, escaping, escList);
-                    analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, true);
+                    analyzeAllocEscapes(f, allocMap, escaping, escList, allParamEscapes, recAdts, true, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -3869,7 +3875,7 @@ def analyzeAllocEscapes(
             match cellGet(cur) {
                 Cons(it, r) -> {
                     let isLast = match r { Nil -> true, _ -> false };
-                    analyzeAllocEscapes(it, allocMap, escaping, escList, allParamEscapes, recAdts, inTail && isLast);
+                    analyzeAllocEscapes(it, allocMap, escaping, escList, allParamEscapes, recAdts, inTail && isLast, allowCellOps);
                     cellSet(cur, r)
                 },
                 Nil -> (),
@@ -4201,10 +4207,15 @@ def isVerifiedStackCellInFn(fd: FunDef, fns: StrMap FunDef, x: String): Bool = {
 def runEscapeAnalysis(
     fns: StrMap FunDef,
     fnNames: List String,
+    externs: StrMap ExternDef,
     adtReg: StrMap AdtInfo,
     adtNames: Vec String
 ): EscapeInfo = {
     let recAdts = computeRecursiveAdts(adtReg, adtNames);
+    let allowCellOps =
+        !isShadowedBuiltin("cellNew", fns, externs)
+        && !isShadowedBuiltin("cellGet", fns, externs)
+        && !isShadowedBuiltin("cellSet", fns, externs);
 
     // Phase 1: Interprocedural parameter escape fixed-point
     let paramEscapes: StrMap (MutArray Int) = strMapNew();
@@ -4288,14 +4299,14 @@ def runEscapeAnalysis(
                                 Nil -> (),
                             }
                         };
-                        collectNonAllocBindings(fd.fnBody, nonAlloc);
+                        collectNonAllocBindings(fd.fnBody, nonAlloc, allowCellOps);
 
                         let allocMap: StrMap (Bool, List String) = strMapNew();
                         let allocKeys = cellNew(Nil);
-                        collectLocalAllocs(fd.fnBody, recAdts, allocMap, allocKeys);
+                        collectLocalAllocs(fd.fnBody, recAdts, allocMap, allocKeys, allowCellOps);
                         let origKeys = cellGet(allocKeys);
                         let cellAllocs: StrMap Bool = strMapNew();
-                        escCollectCellAllocs(fd.fnBody, cellAllocs);
+                        if (allowCellOps) escCollectCellAllocs(fd.fnBody, cellAllocs) else ();
 
                         let escaping: StrMap Bool = strMapNew();
                         let escList = cellNew(Nil);
@@ -4306,7 +4317,7 @@ def runEscapeAnalysis(
                                     if (strMapContains(nonAlloc, aid)) {
                                         markEscaping(aid, allocMap, escaping, escList)
                                     } else ();
-                                    if (strMapContains(cellAllocs, aid) && !isVerifiedStackCellInFn(fd, fns, aid)) {
+                                    if (strMapContains(cellAllocs, aid) && (!allowCellOps || !isVerifiedStackCellInFn(fd, fns, aid))) {
                                         markEscaping(aid, allocMap, escaping, escList)
                                     } else ();
                                     match strMapGet(allocMap, aid) {
@@ -4319,7 +4330,7 @@ def runEscapeAnalysis(
                             }
                         };
 
-                        analyzeAllocEscapes(fd.fnBody, allocMap, escaping, escList, paramEscapes, recAdts, true);
+                        analyzeAllocEscapes(fd.fnBody, allocMap, escaping, escList, paramEscapes, recAdts, true, allowCellOps);
 
                         // Containment fixed-point propagation
                         let propChanged = cellNew(true);
@@ -4885,48 +4896,49 @@ def rewriteArmListInlineLeaves(
     },
 }
 
-def termListHasCheckedOp(ts: List TaggedTerm): Bool = match ts {
+def termListHasCheckedOp(ts: List TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Bool = match ts {
     Nil -> false,
-    Cons(t, r) -> if (termHasCheckedOp(t)) true else termListHasCheckedOp(r),
+    Cons(t, r) -> if (termHasCheckedOp(t, fns, externs)) true else termListHasCheckedOp(r, fns, externs),
 }
 
-def armListHasCheckedOp(arms: List CoreArm): Bool = match arms {
+def armListHasCheckedOp(arms: List CoreArm, fns: StrMap FunDef, externs: StrMap ExternDef): Bool = match arms {
     Nil -> false,
     Cons(a, r) -> {
-        let gHas = match a.caGuard { Some(g) -> termHasCheckedOp(g), None -> false };
-        if (gHas || termHasCheckedOp(a.caBody)) true else armListHasCheckedOp(r)
+        let gHas = match a.caGuard { Some(g) -> termHasCheckedOp(g, fns, externs), None -> false };
+        if (gHas || termHasCheckedOp(a.caBody, fns, externs)) true else armListHasCheckedOp(r, fns, externs)
     },
 }
 
-def termHasCheckedOp(tm: TaggedTerm): Bool = match tm.tnode {
+def termHasCheckedOp(tm: TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Bool = match tm.tnode {
     TmBin(op, a, b) -> {
         let isDiv = match op { OpDiv -> true, OpRem -> true, _ -> false };
-        isDiv || termHasCheckedOp(a) || termHasCheckedOp(b)
+        isDiv || termHasCheckedOp(a, fns, externs) || termHasCheckedOp(b, fns, externs)
     },
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
         let isArr =
-            nm == "arrayGet" || nm == "immArrayGet" || nm == "arraySet"
-            || nm == "arrayNew" || nm == "arrayNewZeroed";
-        isArr || termListHasCheckedOp(args)
+            !isShadowedBuiltin(nm, fns, externs)
+            && (nm == "arrayGet" || nm == "immArrayGet" || nm == "arraySet"
+                || nm == "arrayNew" || nm == "arrayNewZeroed");
+        isArr || termListHasCheckedOp(args, fns, externs)
     },
-    TmApplyCls(f, args) -> termHasCheckedOp(f) || termListHasCheckedOp(args),
-    TmTuple(es) -> termListHasCheckedOp(es),
-    TmBlock(es) -> termListHasCheckedOp(es),
-    TmMakeCls(_, _, body) -> termHasCheckedOp(body),
-    TmMakeData(_, _, fs, _, _) -> termListHasCheckedOp(fs),
-    TmUn(_, a) -> termHasCheckedOp(a),
-    TmLet(_, v, b) -> termHasCheckedOp(v) || termHasCheckedOp(b),
-    TmIf(c, t, e) -> termHasCheckedOp(c) || termHasCheckedOp(t) || termHasCheckedOp(e),
-    TmWhile(c, b) -> termHasCheckedOp(c) || termHasCheckedOp(b),
-    TmMatch(s, arms) -> termHasCheckedOp(s) || armListHasCheckedOp(arms),
-    TmGetTag(e) -> termHasCheckedOp(e),
+    TmApplyCls(f, args) -> termHasCheckedOp(f, fns, externs) || termListHasCheckedOp(args, fns, externs),
+    TmTuple(es) -> termListHasCheckedOp(es, fns, externs),
+    TmBlock(es) -> termListHasCheckedOp(es, fns, externs),
+    TmMakeCls(_, _, body) -> termHasCheckedOp(body, fns, externs),
+    TmMakeData(_, _, fs, _, _) -> termListHasCheckedOp(fs, fns, externs),
+    TmUn(_, a) -> termHasCheckedOp(a, fns, externs),
+    TmLet(_, v, b) -> termHasCheckedOp(v, fns, externs) || termHasCheckedOp(b, fns, externs),
+    TmIf(c, t, e) -> termHasCheckedOp(c, fns, externs) || termHasCheckedOp(t, fns, externs) || termHasCheckedOp(e, fns, externs),
+    TmWhile(c, b) -> termHasCheckedOp(c, fns, externs) || termHasCheckedOp(b, fns, externs),
+    TmMatch(s, arms) -> termHasCheckedOp(s, fns, externs) || armListHasCheckedOp(arms, fns, externs),
+    TmGetTag(e) -> termHasCheckedOp(e, fns, externs),
     _ -> false,
 }
 
-def isPureScalarAssumeTermCoreList(ts: List TaggedTerm): Bool = match ts {
+def isPureScalarAssumeTermCoreList(ts: List TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Bool = match ts {
     Nil -> true,
-    Cons(t, r) -> if (isPureScalarAssumeTermCore(t)) isPureScalarAssumeTermCoreList(r) else false,
+    Cons(t, r) -> if (isPureScalarAssumeTermCore(t, fns, externs)) isPureScalarAssumeTermCoreList(r, fns, externs) else false,
 }
 
 def isAllowedScalarAssumeTypeCore(ty: Type): Bool = match ty {
@@ -4937,7 +4949,7 @@ def isAllowedScalarAssumeTypeCore(ty: Type): Bool = match ty {
     _ -> false,
 }
 
-def isPureScalarAssumeTermCore(tm: TaggedTerm): Bool = match tm.tnode {
+def isPureScalarAssumeTermCore(tm: TaggedTerm, fns: StrMap FunDef, externs: StrMap ExternDef): Bool = match tm.tnode {
     TmLit(_) -> isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm)),
     TmVar(_) -> isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm)),
     TmBin(op, a, b) -> {
@@ -4946,23 +4958,24 @@ def isPureScalarAssumeTermCore(tm: TaggedTerm): Bool = match tm.tnode {
         && isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
         && isAllowedScalarAssumeTypeCore(schemeBody(a.tscm))
         && isAllowedScalarAssumeTypeCore(schemeBody(b.tscm))
-        && isPureScalarAssumeTermCore(a)
-        && isPureScalarAssumeTermCore(b)
+        && isPureScalarAssumeTermCore(a, fns, externs)
+        && isPureScalarAssumeTermCore(b, fns, externs)
     },
     TmUn(_, a) ->
         isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
         && isAllowedScalarAssumeTypeCore(schemeBody(a.tscm))
-        && isPureScalarAssumeTermCore(a),
+        && isPureScalarAssumeTermCore(a, fns, externs),
     TmIf(c, t, e) ->
         isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
-        && isPureScalarAssumeTermCore(c)
-        && isPureScalarAssumeTermCore(t)
-        && isPureScalarAssumeTermCore(e),
+        && isPureScalarAssumeTermCore(c, fns, externs)
+        && isPureScalarAssumeTermCore(t, fns, externs)
+        && isPureScalarAssumeTermCore(e, fns, externs),
     TmGetTag(e) ->
         isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
         && match e.tnode { TmVar(_) -> true, _ -> false },
     TmApplyDir(vd, args) ->
-        if (vd.vname == "cellGet") {
+        if (isShadowedBuiltin(vd.vname, fns, externs)) false
+        else if (vd.vname == "cellGet") {
             isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
             && match args { Cons(a0, Nil) -> match a0.tnode { TmVar(_) -> true, _ -> false }, _ -> false }
         } else if (vd.vname == "arrayLen" || vd.vname == "immArrayLen") {
@@ -4995,44 +5008,44 @@ def pruneLeadingUnitStmts(es: List TaggedTerm): List TaggedTerm = match es {
         else Cons(hd, pruneLeadingUnitStmts(rest)),
 }
 
-def eraseContractsTermList(ts: List TaggedTerm, keepReq: Bool): List TaggedTerm = match ts {
+def eraseContractsTermList(ts: List TaggedTerm, keepReq: Bool, fns: StrMap FunDef, externs: StrMap ExternDef): List TaggedTerm = match ts {
     Nil -> Nil,
-    Cons(t, r) -> Cons(eraseContractsTerm(t, keepReq), eraseContractsTermList(r, keepReq)),
+    Cons(t, r) -> Cons(eraseContractsTerm(t, keepReq, fns, externs), eraseContractsTermList(r, keepReq, fns, externs)),
 }
 
-def eraseContractsArms(arms: List CoreArm, keepReq: Bool): List CoreArm = match arms {
+def eraseContractsArms(arms: List CoreArm, keepReq: Bool, fns: StrMap FunDef, externs: StrMap ExternDef): List CoreArm = match arms {
     Nil -> Nil,
     Cons(a, r) -> {
-        let g2 = match a.caGuard { Some(g) -> Some(eraseContractsTerm(g, keepReq)), None -> None };
+        let g2 = match a.caGuard { Some(g) -> Some(eraseContractsTerm(g, keepReq, fns, externs)), None -> None };
         Cons(
-            MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: eraseContractsTerm(a.caBody, keepReq) },
-            eraseContractsArms(r, keepReq)
+            MkCoreArm { caPat: a.caPat, caGuard: g2, caBody: eraseContractsTerm(a.caBody, keepReq, fns, externs) },
+            eraseContractsArms(r, keepReq, fns, externs)
         )
     },
 }
 
-def eraseContractsTerm(tm: TaggedTerm, keepReq: Bool): TaggedTerm = {
+def eraseContractsTerm(tm: TaggedTerm, keepReq: Bool, fns: StrMap FunDef, externs: StrMap ExternDef): TaggedTerm = {
     let mk = (n: Term) -> MkTerm { tspan: tm.tspan, tscm: tm.tscm, tnode: n };
     match tm.tnode {
         TmApplyDir(vd, args) -> {
             let nm = vd.vname;
-            if (nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases" || nm == "assume") {
+            if (nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases" || (nm == "assume" && !isShadowedBuiltin(nm, fns, externs))) {
                 MkTerm { tspan: tm.tspan, tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
-            } else if (nm == "__gs_requires" || nm == "assert") {
+            } else if (nm == "__gs_requires" || (nm == "assert" && !isShadowedBuiltin(nm, fns, externs))) {
                 let keepThis = keepReq && match args {
-                    Cons(a0, _) -> isPureScalarAssumeTermCore(a0),
+                    Cons(a0, _) -> isPureScalarAssumeTermCore(a0, fns, externs),
                     Nil -> false,
                 };
-                if (keepThis) mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq)))
+                if (keepThis) mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq, fns, externs)))
                 else MkTerm { tspan: tm.tspan, tscm: ScmMono(TyVoid), tnode: TmLit(LitUnit) }
             } else {
-                mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq)))
+                mk(TmApplyDir(vd, eraseContractsTermList(args, keepReq, fns, externs)))
             }
         },
         TmLet(vd, v, b) -> {
             // Erase `let r = __gs_res in ()` left behind after erasing `ensures r -> ...`,
             // and unwrap `let __gs_res = body in __gs_res` to restore tail-call TCO!
-            let b2 = eraseContractsTerm(b, keepReq);
+            let b2 = eraseContractsTerm(b, keepReq, fns, externs);
             let isResVar = match v.tnode { TmVar(nm) -> nm == "__gs_res", _ -> false };
             if (isUnitLitTerm(b2) && isResVar) {
                 b2
@@ -5040,27 +5053,27 @@ def eraseContractsTerm(tm: TaggedTerm, keepReq: Bool): TaggedTerm = {
                 let isRetRes =
                     vd.vname == "__gs_res"
                     && match b2.tnode { TmVar(nm) -> nm == "__gs_res", _ -> false };
-                if (isRetRes) eraseContractsTerm(v, keepReq)
-                else mk(TmLet(vd, eraseContractsTerm(v, keepReq), b2))
+                if (isRetRes) eraseContractsTerm(v, keepReq, fns, externs)
+                else mk(TmLet(vd, eraseContractsTerm(v, keepReq, fns, externs), b2))
             }
         },
         TmBlock(es) -> {
-            let mapped = pruneLeadingUnitStmts(eraseContractsTermList(es, keepReq));
+            let mapped = pruneLeadingUnitStmts(eraseContractsTermList(es, keepReq, fns, externs));
             match mapped {
                 Cons(single, Nil) -> single,
                 _ -> mk(TmBlock(mapped)),
             }
         },
-        TmApplyCls(f, args) -> mk(TmApplyCls(eraseContractsTerm(f, keepReq), eraseContractsTermList(args, keepReq))),
-        TmTuple(es) -> mk(TmTuple(eraseContractsTermList(es, keepReq))),
-        TmMakeCls(vd, cs, body) -> mk(TmMakeCls(vd, cs, eraseContractsTerm(body, keepReq))),
-        TmMakeData(adt, tag, fs, t1, t2) -> mk(TmMakeData(adt, tag, eraseContractsTermList(fs, keepReq), t1, t2)),
-        TmBin(op, a, b) -> mk(TmBin(op, eraseContractsTerm(a, keepReq), eraseContractsTerm(b, keepReq))),
-        TmUn(op, a) -> mk(TmUn(op, eraseContractsTerm(a, keepReq))),
-        TmIf(c, t, e) -> mk(TmIf(eraseContractsTerm(c, keepReq), eraseContractsTerm(t, keepReq), eraseContractsTerm(e, keepReq))),
-        TmWhile(c, b) -> mk(TmWhile(eraseContractsTerm(c, keepReq), eraseContractsTerm(b, keepReq))),
-        TmMatch(s, arms) -> mk(TmMatch(eraseContractsTerm(s, keepReq), eraseContractsArms(arms, keepReq))),
-        TmGetTag(e) -> mk(TmGetTag(eraseContractsTerm(e, keepReq))),
+        TmApplyCls(f, args) -> mk(TmApplyCls(eraseContractsTerm(f, keepReq, fns, externs), eraseContractsTermList(args, keepReq, fns, externs))),
+        TmTuple(es) -> mk(TmTuple(eraseContractsTermList(es, keepReq, fns, externs))),
+        TmMakeCls(vd, cs, body) -> mk(TmMakeCls(vd, cs, eraseContractsTerm(body, keepReq, fns, externs))),
+        TmMakeData(adt, tag, fs, t1, t2) -> mk(TmMakeData(adt, tag, eraseContractsTermList(fs, keepReq, fns, externs), t1, t2)),
+        TmBin(op, a, b) -> mk(TmBin(op, eraseContractsTerm(a, keepReq, fns, externs), eraseContractsTerm(b, keepReq, fns, externs))),
+        TmUn(op, a) -> mk(TmUn(op, eraseContractsTerm(a, keepReq, fns, externs))),
+        TmIf(c, t, e) -> mk(TmIf(eraseContractsTerm(c, keepReq, fns, externs), eraseContractsTerm(t, keepReq, fns, externs), eraseContractsTerm(e, keepReq, fns, externs))),
+        TmWhile(c, b) -> mk(TmWhile(eraseContractsTerm(c, keepReq, fns, externs), eraseContractsTerm(b, keepReq, fns, externs))),
+        TmMatch(s, arms) -> mk(TmMatch(eraseContractsTerm(s, keepReq, fns, externs), eraseContractsArms(arms, keepReq, fns, externs))),
+        TmGetTag(e) -> mk(TmGetTag(eraseContractsTerm(e, keepReq, fns, externs))),
         _ -> tm,
     }
 }
@@ -5088,7 +5101,7 @@ pub def prepareVerifiedOptCore(
                             fnScm: fd.fnScm,
                             fnParams: fd.fnParams,
                             fnFvs: fd.fnFvs,
-                            fnBody: eraseContractsTerm(fd.fnBody, keepReq),
+                            fnBody: eraseContractsTerm(fd.fnBody, keepReq, prog.coreFns, prog.coreExterns),
                         })
                     },
                     None -> (),
@@ -5107,7 +5120,7 @@ pub def prepareVerifiedOptCore(
                     gvName: gv.gvName,
                     gvSpan: gv.gvSpan,
                     gvTy: gv.gvTy,
-                    gvInit: eraseContractsTerm(gv.gvInit, false),
+                    gvInit: eraseContractsTerm(gv.gvInit, false, prog.coreFns, prog.coreExterns),
                 }, cellGet(globsRev)));
                 cellSet(cg, r)
             },
@@ -5134,7 +5147,7 @@ pub def prepareVerifiedOptCore(
                                 Some(fd) ->
                                     if (isEligibleTinyLeafFn(fd, fns2, prog.coreExterns)) {
                                         strMapInsert(allLeaves, fnm, fd);
-                                        if (strMapContains(safeFns, fnm) || !termHasCheckedOp(fd.fnBody)) {
+                                        if (strMapContains(safeFns, fnm) || !termHasCheckedOp(fd.fnBody, fns2, prog.coreExterns)) {
                                             strMapInsert(safeLeaves, fnm, fd)
                                         } else ();
                                         cellSet(leafCount, cellGet(leafCount) + 1)
@@ -5354,7 +5367,7 @@ def mkDecreasesCheckTerm(sp: Span, expr: TaggedTerm): TaggedTerm = {
     mkContractCheckTerm(sp, "decreases", cond)
 }
 
-def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
+def lowerContractsInTerm(t: TaggedTerm, mode: String, fns: StrMap FunDef, externs: StrMap ExternDef): TaggedTerm =
     if (mode == "keep") t
     else {
         let sp = t.tspan;
@@ -5362,11 +5375,11 @@ def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
         match t.tnode {
             TmApplyDir(vd, args) -> {
                 let nm = vd.vname;
-                if (nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "assert") {
+                if (nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || (nm == "assert" && !isShadowedBuiltin(nm, fns, externs))) {
                     if (mode == "check") {
                         match args {
                             Cons(cond0, _) -> {
-                                let cond = lowerContractsInTerm(cond0, mode);
+                                let cond = lowerContractsInTerm(cond0, mode, fns, externs);
                                 let lbl =
                                     if (nm == "__gs_requires") "requires"
                                     else if (nm == "__gs_ensures") "ensures"
@@ -5380,26 +5393,26 @@ def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
                 } else if (nm == "__gs_decreases") {
                     if (mode == "check") {
                         match args {
-                            Cons(d0, _) -> mkDecreasesCheckTerm(sp, lowerContractsInTerm(d0, mode)),
+                            Cons(d0, _) -> mkDecreasesCheckTerm(sp, lowerContractsInTerm(d0, mode, fns, externs)),
                             Nil -> mkUnitTerm(sp),
                         }
                     } else mkUnitTerm(sp)
-                } else if (nm == "assume") {
+                } else if (nm == "assume" && !isShadowedBuiltin(nm, fns, externs)) {
                     mkUnitTerm(sp)
                 } else {
-                    MkTerm { tspan: sp, tscm: scm, tnode: TmApplyDir(vd, lowerContractsInList(args, mode)) }
+                    MkTerm { tspan: sp, tscm: scm, tnode: TmApplyDir(vd, lowerContractsInList(args, mode, fns, externs)) }
                 }
             },
-            TmTuple(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmTuple(lowerContractsInList(es, mode)) },
-            TmBlock(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBlock(lowerContractsInList(es, mode)) },
-            TmMakeCls(vd, cs, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmMakeCls(vd, cs, lowerContractsInTerm(b, mode)) },
-            TmApplyCls(c, args) -> MkTerm { tspan: sp, tscm: scm, tnode: TmApplyCls(lowerContractsInTerm(c, mode), lowerContractsInList(args, mode)) },
-            TmBin(op, l, r) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBin(op, lowerContractsInTerm(l, mode), lowerContractsInTerm(r, mode)) },
-            TmUn(op, e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmUn(op, lowerContractsInTerm(e, mode)) },
-            TmLet(vd, v, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmLet(vd, lowerContractsInTerm(v, mode), lowerContractsInTerm(b, mode)) },
-            TmIf(c, th, el) -> MkTerm { tspan: sp, tscm: scm, tnode: TmIf(lowerContractsInTerm(c, mode), lowerContractsInTerm(th, mode), lowerContractsInTerm(el, mode)) },
+            TmTuple(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmTuple(lowerContractsInList(es, mode, fns, externs)) },
+            TmBlock(es) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBlock(lowerContractsInList(es, mode, fns, externs)) },
+            TmMakeCls(vd, cs, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmMakeCls(vd, cs, lowerContractsInTerm(b, mode, fns, externs)) },
+            TmApplyCls(c, args) -> MkTerm { tspan: sp, tscm: scm, tnode: TmApplyCls(lowerContractsInTerm(c, mode, fns, externs), lowerContractsInList(args, mode, fns, externs)) },
+            TmBin(op, l, r) -> MkTerm { tspan: sp, tscm: scm, tnode: TmBin(op, lowerContractsInTerm(l, mode, fns, externs), lowerContractsInTerm(r, mode, fns, externs)) },
+            TmUn(op, e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmUn(op, lowerContractsInTerm(e, mode, fns, externs)) },
+            TmLet(vd, v, b) -> MkTerm { tspan: sp, tscm: scm, tnode: TmLet(vd, lowerContractsInTerm(v, mode, fns, externs), lowerContractsInTerm(b, mode, fns, externs)) },
+            TmIf(c, th, el) -> MkTerm { tspan: sp, tscm: scm, tnode: TmIf(lowerContractsInTerm(c, mode, fns, externs), lowerContractsInTerm(th, mode, fns, externs), lowerContractsInTerm(el, mode, fns, externs)) },
             TmWhile(c, b) -> {
-                let lc = lowerContractsInTerm(c, mode);
+                let lc = lowerContractsInTerm(c, mode, fns, externs);
                 if (mode == "check") {
                     // Extract leading invariant checks to run both before the loop and at each iteration
                     let invChecksRev: Cell (List TaggedTerm) = cellNew(Nil);
@@ -5413,7 +5426,7 @@ def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
                                     Cons(st, r) -> match st.tnode {
                                         TmApplyDir(vd, args) if (vd.vname == "__gs_invariant") -> {
                                             match args {
-                                                Cons(ic, _) -> cellSet(invChecksRev, Cons(mkContractCheckTerm(st.tspan, "invariant", lowerContractsInTerm(ic, mode)), cellGet(invChecksRev))),
+                                                Cons(ic, _) -> cellSet(invChecksRev, Cons(mkContractCheckTerm(st.tspan, "invariant", lowerContractsInTerm(ic, mode, fns, externs)), cellGet(invChecksRev))),
                                                 Nil -> (),
                                             };
                                             cellSet(cur, r)
@@ -5430,17 +5443,17 @@ def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
                         _ -> cellSet(restStmts, [b]),
                     };
                     match cellGet(invChecksRev) {
-                        Nil -> MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode)) },
+                        Nil -> MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode, fns, externs)) },
                         invsR -> {
                             let invs = listRev(invsR);
-                            let loweredRest = lowerContractsInList(cellGet(restStmts), mode);
+                            let loweredRest = lowerContractsInList(cellGet(restStmts), mode, fns, externs);
                             let loopBody = MkTerm { tspan: b.tspan, tscm: b.tscm, tnode: TmBlock(listAppend(loweredRest, invs)) };
                             let wTerm = MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, loopBody) };
                             MkTerm { tspan: sp, tscm: scm, tnode: TmBlock(listAppend(invs, [wTerm])) }
                         },
                     }
                 } else {
-                    MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode)) }
+                    MkTerm { tspan: sp, tscm: scm, tnode: TmWhile(lc, lowerContractsInTerm(b, mode, fns, externs)) }
                 }
             },
             TmMatch(s, arms) -> {
@@ -5449,30 +5462,30 @@ def lowerContractsInTerm(t: TaggedTerm, mode: String): TaggedTerm =
                 while (match cellGet(cur) { Nil -> false, _ -> true }) {
                     match cellGet(cur) {
                         Cons(a, r) -> {
-                            let ng = match a.caGuard { Some(g) -> Some(lowerContractsInTerm(g, mode)), None -> None };
-                            let nb = lowerContractsInTerm(a.caBody, mode);
+                            let ng = match a.caGuard { Some(g) -> Some(lowerContractsInTerm(g, mode, fns, externs)), None -> None };
+                            let nb = lowerContractsInTerm(a.caBody, mode, fns, externs);
                             cellSet(rev, Cons(MkCoreArm { caPat: a.caPat, caGuard: ng, caBody: nb }, cellGet(rev)));
                             cellSet(cur, r)
                         },
                         Nil -> (),
                     }
                 };
-                MkTerm { tspan: sp, tscm: scm, tnode: TmMatch(lowerContractsInTerm(s, mode), listRev(cellGet(rev))) }
+                MkTerm { tspan: sp, tscm: scm, tnode: TmMatch(lowerContractsInTerm(s, mode, fns, externs), listRev(cellGet(rev))) }
             },
             TmMakeData(adt, tag, fs, ftys, targs) ->
-                MkTerm { tspan: sp, tscm: scm, tnode: TmMakeData(adt, tag, lowerContractsInList(fs, mode), ftys, targs) },
-            TmGetTag(e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmGetTag(lowerContractsInTerm(e, mode)) },
+                MkTerm { tspan: sp, tscm: scm, tnode: TmMakeData(adt, tag, lowerContractsInList(fs, mode, fns, externs), ftys, targs) },
+            TmGetTag(e) -> MkTerm { tspan: sp, tscm: scm, tnode: TmGetTag(lowerContractsInTerm(e, mode, fns, externs)) },
             _ -> t,
         }
     }
 
-def lowerContractsInList(ts: List TaggedTerm, mode: String): List TaggedTerm = {
+def lowerContractsInList(ts: List TaggedTerm, mode: String, fns: StrMap FunDef, externs: StrMap ExternDef): List TaggedTerm = {
     let rev = cellNew(Nil);
     let cur = cellNew(ts);
     while (match cellGet(cur) { Nil -> false, _ -> true }) {
         match cellGet(cur) {
             Cons(h, r) -> {
-                cellSet(rev, Cons(lowerContractsInTerm(h, mode), cellGet(rev)));
+                cellSet(rev, Cons(lowerContractsInTerm(h, mode, fns, externs), cellGet(rev)));
                 cellSet(cur, r)
             },
             Nil -> (),
@@ -5485,6 +5498,7 @@ def lowerContractsInProgramFns(
     fns: StrMap FunDef,
     fnNames: List String,
     globals: List GlobalValDef,
+    externs: StrMap ExternDef,
     mode: String
 ): (StrMap FunDef, List GlobalValDef) =
     if (mode == "keep") (fns, globals)
@@ -5501,7 +5515,7 @@ def lowerContractsInProgramFns(
                             fnScm: fd.fnScm,
                             fnParams: fd.fnParams,
                             fnFvs: fd.fnFvs,
-                            fnBody: lowerContractsInTerm(fd.fnBody, mode),
+                            fnBody: lowerContractsInTerm(fd.fnBody, mode, fns, externs),
                         }),
                         None -> (),
                     };
@@ -5519,7 +5533,7 @@ def lowerContractsInProgramFns(
                         gvName: g.gvName,
                         gvSpan: g.gvSpan,
                         gvTy: g.gvTy,
-                        gvInit: lowerContractsInTerm(g.gvInit, mode),
+                        gvInit: lowerContractsInTerm(g.gvInit, mode, fns, externs),
                     }, cellGet(outGlobalsRev)));
                     cellSet(cg, r)
                 },
@@ -5684,13 +5698,13 @@ pub def lowerToCoreOptMode(inf: InferOutput, runEscape: Bool, runInline: Bool, c
         Some(emsg) -> Err(emsg),
         None -> {
             let (concreteFns0, concreteNames, concreteGlobals0) = runMonomorphizationWorklist(ctx);
-            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames, concreteGlobals0, contractMode);
+            let (concreteFns, concreteGlobals1) = lowerContractsInProgramFns(concreteFns0, concreteNames, concreteGlobals0, ctx.kExterns, contractMode);
             let concreteGlobals =
                 if (runInline && contractMode != "keep") inlineTinyLeafFns(concreteFns, concreteNames, concreteGlobals1, ctx.kExterns)
                 else concreteGlobals1;
             verifyConcurrentClosures(concreteFns, concreteNames, concreteGlobals, inf.adtReg)?;
             let escapeInfo =
-                if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, inf.adtReg, inf.adtNames)
+                if (runEscape) runEscapeAnalysis(concreteFns, concreteNames, ctx.kExterns, inf.adtReg, inf.adtNames)
                 else MkEscapeInfo {
                     escRecAdts: strMapNew(),
                     escFnStackVars: strMapNew(),

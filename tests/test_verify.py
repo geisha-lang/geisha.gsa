@@ -1508,7 +1508,125 @@ def main() -> int:
         z4p_blk = fn_ir_block(z4p_ll.read_text(encoding="utf-8"), "observePure")
         assert "call void @llvm.assume" in z4p_blk, f"Z4 pure intrinsics should still emit @llvm.assume in observePure!\n{z4p_blk}"
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z4 adversarial/TCO/eval/zerosorts + cache isolation verified")
+        # Z5 Adversarial: explicit `extern` or user `def` declarations MUST shadow built-in intrinsics
+        # (`assert`, `bitAnd`, etc.) consistently across verifier, contract lowering, and LLVM codegen.
+        z5_c = tmp / "z5_stubs.c"
+        z5_c.write_text(
+            "#include <stdint.h>\n"
+            "void review_assert(int32_t b) { (void)b; }\n"
+            "int32_t review_add(int32_t a, int32_t b) { return a + b; }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        z5_obj = tmp / "z5_stubs.o"
+        cc = os.environ.get("CC", "clang")
+        cc_base = [cc, "-target", "arm64-apple-macosx14.0"] if sys.platform == "darwin" else [cc]
+        r_cc = run([*cc_base, "-c", str(z5_c), "-o", str(z5_obj)])
+        assert r_cc.returncode == 0, f"Z5 C stub compile failed:\n{r_cc.stdout}\n{r_cc.stderr}"
+
+        def link_with_z5_stub(ll_path: Path, out_bin: Path) -> None:
+            cmd = [*cc_base, "-O2", "-Wno-override-module"]
+            if sys.platform != "win32":
+                cmd.append("-pthread")
+            cmd.extend(["-x", "ir", str(ll_path), "-x", "none", str(z5_obj), runtime])
+            if sys.platform.startswith("linux"):
+                cmd.append("-lm")
+            cmd.extend(["-o", str(out_bin)])
+            r_lk = run(cmd)
+            assert r_lk.returncode == 0, f"Z5 link failed ({out_bin.name}):\n{r_lk.stdout}\n{r_lk.stderr}"
+
+        # Z5a: `extern "review_assert" def assert(b: Bool): Void`
+        z5a_src = tmp / "z5_exact_extern_assert.gsa"
+        z5a_src.write_text(
+            "use std.str.intToStr\n"
+            'extern "review_assert" def assert(b: Bool): Void\n'
+            "def observe(): Int = { assert(false); 7 }\n"
+            "def main(): Void = printLn(intToStr(observe()))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        z5a_ll = tmp / "z5a_vopt.ll"
+        r_z5a_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z5a_ll), str(z5a_src)])
+        assert r_z5a_ir.returncode == 0, f"Z5a IR compile failed:\n{r_z5a_ir.stdout}\n{r_z5a_ir.stderr}"
+        z5a_blk = fn_ir_block(z5a_ll.read_text(encoding="utf-8"), "observe")
+        assert "call void @review_assert" in z5a_blk, f"Z5a missing @review_assert call!\n{z5a_blk}"
+        assert "call void @llvm.assume" not in z5a_blk, f"Z5a emitted false @llvm.assume!\n{z5a_blk}"
+        for mode_lbl, extra_flags in [
+            ("default", []),
+            ("check", ["--contracts=check"]),
+            ("vopt", ["--verified-opt", "--solver", z3_bin]),
+        ]:
+            z5a_m_ll = tmp / f"z5a_{mode_lbl}.ll"
+            z5a_bin = tmp / (f"z5a_{mode_lbl}.exe" if sys.platform == "win32" else f"z5a_{mode_lbl}")
+            r_z5a_b = run([geisha, *extra_flags, "-e", "-o", str(z5a_m_ll), str(z5a_src)])
+            assert r_z5a_b.returncode == 0, f"Z5a ({mode_lbl}) IR build failed:\n{r_z5a_b.stdout}\n{r_z5a_b.stderr}"
+            link_with_z5_stub(z5a_m_ll, z5a_bin)
+            r_z5a_r = run([str(z5a_bin)])
+            assert r_z5a_r.returncode == 0 and r_z5a_r.stdout.strip() == "7", (
+                f"Z5a ({mode_lbl}) expected exit 0 and '7', got rc={r_z5a_r.returncode} out={r_z5a_r.stdout!r} err={r_z5a_r.stderr!r}"
+            )
+
+        # Z5b: `extern "review_add" def bitAnd(a: Int, b: Int): Int`
+        z5b_src = tmp / "z5_exact_extern_bitand.gsa"
+        z5b_src.write_text(
+            "use std.str.intToStr\n"
+            'extern "review_add" def bitAnd(a: Int, b: Int): Int\n'
+            "def observe(a: Int, b: Int): Int = bitAnd(a, b)\n"
+            "def main(): Void = printLn(intToStr(observe(3, 5)))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        for mode_lbl, extra_flags in [("default", []), ("vopt", ["--verified-opt", "--solver", z3_bin])]:
+            z5b_m_ll = tmp / f"z5b_{mode_lbl}.ll"
+            z5b_bin = tmp / (f"z5b_{mode_lbl}.exe" if sys.platform == "win32" else f"z5b_{mode_lbl}")
+            r_z5b_b = run([geisha, *extra_flags, "-e", "-o", str(z5b_m_ll), str(z5b_src)])
+            assert r_z5b_b.returncode == 0, f"Z5b ({mode_lbl}) IR build failed:\n{r_z5b_b.stdout}\n{r_z5b_b.stderr}"
+            link_with_z5_stub(z5b_m_ll, z5b_bin)
+            r_z5b_r = run([str(z5b_bin)])
+            assert r_z5b_r.returncode == 0 and r_z5b_r.stdout.strip() == "8", (
+                f"Z5b ({mode_lbl}) expected '8' (review_add), got rc={r_z5b_r.returncode} out={r_z5b_r.stdout!r} err={r_z5b_r.stderr!r}"
+            )
+
+        # Z5c: user `def assert(b: Bool): Void = ()`
+        z5c_src = tmp / "z5_user_def_assert.gsa"
+        z5c_src.write_text(
+            "use std.str.intToStr\n"
+            "def assert(b: Bool): Void = ()\n"
+            "def observe(): Int = { assert(false); 7 }\n"
+            "def main(): Void = printLn(intToStr(observe()))\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        z5c_ll = tmp / "z5c_vopt.ll"
+        r_z5c_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z5c_ll), str(z5c_src)])
+        assert r_z5c_ir.returncode == 0, f"Z5c IR compile failed:\n{r_z5c_ir.stdout}\n{r_z5c_ir.stderr}"
+        z5c_blk = fn_ir_block(z5c_ll.read_text(encoding="utf-8"), "observe")
+        assert "call void @llvm.assume" not in z5c_blk, f"Z5c emitted false @llvm.assume!\n{z5c_blk}"
+        z5c_bin = tmp / "z5c_check"
+        r_z5c_b = run([geisha, "--contracts=check", "--runtime", runtime, "-o", str(z5c_bin), str(z5c_src)])
+        assert r_z5c_b.returncode == 0, f"Z5c --contracts=check build failed:\n{r_z5c_b.stdout}\n{r_z5c_b.stderr}"
+        r_z5c_r = run([str(z5c_bin)])
+        assert r_z5c_r.returncode == 0 and r_z5c_r.stdout.strip() == "7", (
+            f"Z5c --contracts=check expected '7', got rc={r_z5c_r.returncode} out={r_z5c_r.stdout!r} err={r_z5c_r.stderr!r}"
+        )
+
+        # Z5d: genuine built-in `assert(false)` MUST still fail verify and emit no `@llvm.assume`
+        z5d_src = tmp / "z5_builtin_assert_false.gsa"
+        z5d_src.write_text(
+            "def observe(): Int = { assert(false); 7 }\n"
+            "def main(): Void = { let _ = observe(); () }\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_z5d_v = run([geisha, "verify", "--json", "--solver", z3_bin, str(z5d_src)])
+        assert r_z5d_v.returncode == 1, f"Z5d builtin assert(false) MUST fail verify, got {r_z5d_v.returncode}"
+        z5d_ll = tmp / "z5d_vopt.ll"
+        r_z5d_ir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z5d_ll), str(z5d_src)])
+        assert r_z5d_ir.returncode == 0
+        z5d_blk = fn_ir_block(z5d_ll.read_text(encoding="utf-8"), "observe")
+        assert "call void @llvm.assume" not in z5d_blk, f"Z5d builtin assert(false) emitted false @llvm.assume!\n{z5d_blk}"
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z5 adversarial/TCO/eval/zerosorts + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)

@@ -1245,15 +1245,19 @@ def emitJsExpr(ctx: JsEmitCtx, tm: TaggedTerm, locals: List (String, String)): S
             let avs = evalArgsJs(ctx, args, locals);
             "(" + cv + ")(" + strJoin(avs, ", ") + ")"
         },
-        TmApplyDir(vd, args) -> match tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals) {
-            Some(expr) -> expr,
-            None -> {
-                let avs = evalArgsJs(ctx, args, locals);
-                match strMapGet(ctx.jcProg.coreExterns, vd.vname) {
-                    Some(ext) -> emitExternCallJs(ext, avs),
-                    None -> jsFnIdent(vd.vname) + "(" + strJoin(avs, ", ") + ")",
-                }
-            },
+        TmApplyDir(vd, args) -> {
+            let isShadowed = !strStartsWith(vd.vname, "__gs_")
+                && (strMapContains(ctx.jcProg.coreExterns, vd.vname) || strMapContains(ctx.jcProg.coreFns, vd.vname));
+            match (if (isShadowed) None else tryEmitBuiltinJs(ctx, vd.vname, args, resTy, locals)) {
+                Some(expr) -> expr,
+                None -> {
+                    let avs = evalArgsJs(ctx, args, locals);
+                    match strMapGet(ctx.jcProg.coreExterns, vd.vname) {
+                        Some(ext) -> emitExternCallJs(ext, avs),
+                        None -> jsFnIdent(vd.vname) + "(" + strJoin(avs, ", ") + ")",
+                    }
+                },
+            }
         },
         TmBlock(_) -> {
             let tmp = jcFreshTmp(ctx);

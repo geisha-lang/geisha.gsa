@@ -574,8 +574,11 @@ def bindPatEffectVarsList(pats: List Pattern, stVars: List (String, String)): Li
     Cons(p, r) -> bindPatEffectVarsList(r, bindPatEffectVars(p, stVars)),
 }
 
-def isKnownLocalOnlyIntrinsic(externs: StrMap ExternDef, nm: String): Bool =
-    if (strMapContains(externs, nm)) false
+def isShadowedByDecl(specs: StrMap FnSpec, externs: StrMap ExternDef, nm: String): Bool =
+    !strStartsWith(nm, "__gs_") && (strMapContains(externs, nm) || strMapContains(specs, nm))
+
+def isKnownLocalOnlyIntrinsic(specs: StrMap FnSpec, externs: StrMap ExternDef, nm: String): Bool =
+    if (isShadowedByDecl(specs, externs, nm)) false
     else
         // Core mutable/pure container & string & verification intrinsics
         nm == "cellNew" || nm == "cellGet" || nm == "cellSet"
@@ -624,7 +627,7 @@ def termHasDirectAmbientEffect(t: TaggedTerm, specs: StrMap FnSpec, externs: Str
     TmApplyCls(_, _) -> true,
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
-        if (strMapContains(externs, nm) || (!strMapContains(specs, nm) && !isKnownLocalOnlyIntrinsic(externs, nm))) true
+        if (strMapContains(externs, nm) || (!strMapContains(specs, nm) && !isKnownLocalOnlyIntrinsic(specs, externs, nm))) true
         else termListHasDirectAmbientEffect(args, specs, externs)
     },
     TmMakeCls(_, _, b) -> termHasDirectAmbientEffect(b, specs, externs),
@@ -710,9 +713,10 @@ def scanEffectsInTerm(
     TmGlobalVar(_) -> cellSet(hasOpaqueCall, true),
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
+        let shadowed = isShadowedByDecl(ctx.vcSpecs, ctx.vcExterns, nm);
         if (strMapContains(ctx.vcExterns, nm)) {
             cellSet(hasOpaqueCall, true)
-        } else if (nm == "cellSet") {
+        } else if (!shadowed && nm == "cellSet") {
             match args {
                 Cons(cArg, _) -> match cArg.tnode {
                     TmVar(cn) -> match assocGet(stVars, cn) {
@@ -724,7 +728,7 @@ def scanEffectsInTerm(
                 },
                 Nil -> (),
             }
-        } else if (nm == "arraySet") {
+        } else if (!shadowed && nm == "arraySet") {
             match args {
                 Cons(aArg, _) -> match aArg.tnode {
                     TmVar(an) -> match assocGet(stVars, an) {
@@ -736,12 +740,12 @@ def scanEffectsInTerm(
                 },
                 Nil -> (),
             }
-        } else if (strMapContains(ctx.vcAmbientMutFns, nm) || (!strMapContains(ctx.vcSpecs, nm) && !isKnownLocalOnlyIntrinsic(ctx.vcExterns, nm))) {
+        } else if (strMapContains(ctx.vcAmbientMutFns, nm) || (!strMapContains(ctx.vcSpecs, nm) && !isKnownLocalOnlyIntrinsic(ctx.vcSpecs, ctx.vcExterns, nm))) {
             cellSet(hasOpaqueCall, true)
-        } else if (nm != "cellGet" && nm != "cellNew" && nm != "arrayLen" && nm != "immArrayLen"
+        } else if (shadowed || (nm != "cellGet" && nm != "cellNew" && nm != "arrayLen" && nm != "immArrayLen"
             && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew" && nm != "arrayNewZeroed"
             && nm != "assert" && nm != "assume"
-            && nm != "__gs_requires" && nm != "__gs_ensures" && nm != "__gs_invariant" && nm != "__gs_decreases") {
+            && nm != "__gs_requires" && nm != "__gs_ensures" && nm != "__gs_invariant" && nm != "__gs_decreases")) {
             // Any user/extern call inside a loop may mutate Cell/MutArray (directly or wrapped in Tuple/ADT)
             let ca = cellNew(args);
             while (match cellGet(ca) { Nil -> false, _ -> true }) {
@@ -1725,7 +1729,7 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
             let vname = vd.vname;
             let vty = schemeBody(vd.vscm);
             match valT.tnode {
-                TmApplyDir(cvd, cargs) if (cvd.vname == "cellNew" && !strMapContains(ctx.vcExterns, cvd.vname)) -> match cargs {
+                TmApplyDir(cvd, cargs) if (cvd.vname == "cellNew" && !isShadowedByDecl(ctx.vcSpecs, ctx.vcExterns, cvd.vname)) -> match cargs {
                     Cons(initT, _) -> {
                         let (st1, iv) = evalTerm(ctx, st, initT, emitObs);
                         let loc = freshLoc(ctx, vname);
@@ -1757,7 +1761,7 @@ def evalTerm(ctx: VerifyCtx, st: SymState, t: TaggedTerm, emitObs: Bool): (SymSt
                     },
                     Nil -> evalTerm(ctx, st, bodyT, emitObs),
                 },
-                TmApplyDir(avd, aargs) if ((avd.vname == "arrayNew" || avd.vname == "arrayNewZeroed") && !strMapContains(ctx.vcExterns, avd.vname)) -> match aargs {
+                TmApplyDir(avd, aargs) if ((avd.vname == "arrayNew" || avd.vname == "arrayNewZeroed") && !isShadowedByDecl(ctx.vcSpecs, ctx.vcExterns, avd.vname)) -> match aargs {
                     Cons(lenT, restA) -> {
                         let (st1, lenV) = evalTerm(ctx, st, lenT, emitObs);
                         let (st2, initV) = match restA {
@@ -2382,55 +2386,53 @@ def collectMutLocsFromSym(
         },
     }
 
-def isSideEffectFreeVerifyList(specs: StrMap FnSpec, ts: List TaggedTerm, visited: List String): Bool = match ts {
+def isSideEffectFreeVerifyList(specs: StrMap FnSpec, externs: StrMap ExternDef, ts: List TaggedTerm, visited: List String): Bool = match ts {
     Nil -> true,
-    Cons(t, r) -> if (isSideEffectFreeVerifyTerm(specs, t, visited)) isSideEffectFreeVerifyList(specs, r, visited) else false,
+    Cons(t, r) -> if (isSideEffectFreeVerifyTerm(specs, externs, t, visited)) isSideEffectFreeVerifyList(specs, externs, r, visited) else false,
 }
 
-def isSideEffectFreeVerifyArms(specs: StrMap FnSpec, arms: List CoreArm, visited: List String): Bool = match arms {
+def isSideEffectFreeVerifyArms(specs: StrMap FnSpec, externs: StrMap ExternDef, arms: List CoreArm, visited: List String): Bool = match arms {
     Nil -> true,
     Cons(a, r) -> {
-        let gOk = match a.caGuard { Some(g) -> isSideEffectFreeVerifyTerm(specs, g, visited), None -> true };
-        if (gOk && isSideEffectFreeVerifyTerm(specs, a.caBody, visited)) isSideEffectFreeVerifyArms(specs, r, visited)
+        let gOk = match a.caGuard { Some(g) -> isSideEffectFreeVerifyTerm(specs, externs, g, visited), None -> true };
+        if (gOk && isSideEffectFreeVerifyTerm(specs, externs, a.caBody, visited)) isSideEffectFreeVerifyArms(specs, externs, r, visited)
         else false
     },
 }
 
-def isSideEffectFreeVerifyTerm(specs: StrMap FnSpec, tm: TaggedTerm, visited: List String): Bool = match tm.tnode {
+def isSideEffectFreeVerifyTerm(specs: StrMap FnSpec, externs: StrMap ExternDef, tm: TaggedTerm, visited: List String): Bool = match tm.tnode {
     TmLit(_) -> true,
     TmVar(_) -> true,
     TmGlobalVar(_) -> true,
-    TmTuple(es) -> isSideEffectFreeVerifyList(specs, es, visited),
-    TmBlock(es) -> isSideEffectFreeVerifyList(specs, es, visited),
-    TmMakeData(_, _, fs, _, _) -> isSideEffectFreeVerifyList(specs, fs, visited),
-    TmBin(_, a, b) -> isSideEffectFreeVerifyTerm(specs, a, visited) && isSideEffectFreeVerifyTerm(specs, b, visited),
-    TmUn(_, a) -> isSideEffectFreeVerifyTerm(specs, a, visited),
-    TmLet(_, v, b) -> isSideEffectFreeVerifyTerm(specs, v, visited) && isSideEffectFreeVerifyTerm(specs, b, visited),
+    TmTuple(es) -> isSideEffectFreeVerifyList(specs, externs, es, visited),
+    TmBlock(es) -> isSideEffectFreeVerifyList(specs, externs, es, visited),
+    TmMakeData(_, _, fs, _, _) -> isSideEffectFreeVerifyList(specs, externs, fs, visited),
+    TmBin(_, a, b) -> isSideEffectFreeVerifyTerm(specs, externs, a, visited) && isSideEffectFreeVerifyTerm(specs, externs, b, visited),
+    TmUn(_, a) -> isSideEffectFreeVerifyTerm(specs, externs, a, visited),
+    TmLet(_, v, b) -> isSideEffectFreeVerifyTerm(specs, externs, v, visited) && isSideEffectFreeVerifyTerm(specs, externs, b, visited),
     TmIf(c, t, e) ->
-        isSideEffectFreeVerifyTerm(specs, c, visited)
-        && isSideEffectFreeVerifyTerm(specs, t, visited)
-        && isSideEffectFreeVerifyTerm(specs, e, visited),
-    TmMatch(s, arms) -> isSideEffectFreeVerifyTerm(specs, s, visited) && isSideEffectFreeVerifyArms(specs, arms, visited),
-    TmGetTag(e) -> isSideEffectFreeVerifyTerm(specs, e, visited),
+        isSideEffectFreeVerifyTerm(specs, externs, c, visited)
+        && isSideEffectFreeVerifyTerm(specs, externs, t, visited)
+        && isSideEffectFreeVerifyTerm(specs, externs, e, visited),
+    TmMatch(s, arms) -> isSideEffectFreeVerifyTerm(specs, externs, s, visited) && isSideEffectFreeVerifyArms(specs, externs, arms, visited),
+    TmGetTag(e) -> isSideEffectFreeVerifyTerm(specs, externs, e, visited),
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
-        if (!isSideEffectFreeVerifyList(specs, args, visited)) false
-        else if (
+        if (!isSideEffectFreeVerifyList(specs, externs, args, visited)) false
+        else if (strMapContains(externs, nm)) false
+        else if (!strStartsWith(nm, "__gs_") && strMapContains(specs, nm)) {
+            if (listHasStr(visited, nm)) false
+            else match strMapGet(specs, nm) {
+                Some(sp) -> isSideEffectFreeVerifyTerm(specs, externs, sp.fsBody, Cons(nm, visited)),
+                None -> false,
+            }
+        } else if (
             nm == "cellGet" || nm == "arrayLen" || nm == "immArrayLen"
             || nm == "arrayGet" || nm == "immArrayGet"
             || nm == "intToI64" || nm == "i64ToInt"
             || nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases"
         ) true
-        else if (
-            nm == "cellSet" || nm == "arraySet" || nm == "cellNew"
-            || nm == "arrayNew" || nm == "arrayNewZeroed" || nm == "parTabulate"
-            || nm == "assert" || nm == "assume"
-        ) false
-        else if (listHasStr(visited, nm)) false
-        else match strMapGet(specs, nm) {
-            Some(sp) -> isSideEffectFreeVerifyTerm(specs, sp.fsBody, Cons(nm, visited)),
-            None -> false,
-        }
+        else false
     },
     _ -> false,
 }
@@ -2449,6 +2451,8 @@ def evalApplyDir(
         let (st1, _) = evalArgs(ctx, st, args, emitObs);
         let stOut = havocLocs(ctx, st1, assocKeysUnique(st1.stCells), assocKeysUnique(st1.stArrMems), "ext");
         (stOut, None)
+    } else if (!strStartsWith(nm, "__gs_") && strMapContains(ctx.vcSpecs, nm)) {
+        evalUserOrUnknownCallDir(ctx, st, sp, retTy, nm, args, emitObs)
     } else if (nm == "cellNew") {
         match args {
             Cons(initT, _) -> {
@@ -2716,7 +2720,7 @@ def evalApplyDir(
     } else if (nm == "assert") {
         match args {
             Cons(cArg, _) ->
-                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, cArg, Nil)) {
+                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, ctx.vcExterns, cArg, Nil)) {
                     if (emitObs) {
                         recordUnknown(
                             ctx, "assert", sp,
@@ -2744,7 +2748,7 @@ def evalApplyDir(
     } else if (nm == "assume") {
         match args {
             Cons(cArg, _) ->
-                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, cArg, Nil)) {
+                if (!isSideEffectFreeVerifyTerm(ctx.vcSpecs, ctx.vcExterns, cArg, Nil)) {
                     if (emitObs) {
                         recordUnknown(
                             ctx, "assume", sp,
@@ -2787,6 +2791,18 @@ def evalApplyDir(
     } else if (nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases") {
         (st, Some("#x00000000"))
     } else {
+        evalUserOrUnknownCallDir(ctx, st, sp, retTy, nm, args, emitObs)
+    }
+
+def evalUserOrUnknownCallDir(
+    ctx: VerifyCtx,
+    st: SymState,
+    sp: Span,
+    retTy: Type,
+    nm: String,
+    args: List TaggedTerm,
+    emitObs: Bool
+): (SymState, Option String) = {
         // Modular user function call:
         // 1. Evaluate arguments
         // 2. Build ISOLATED callee variable map (never inherit caller's local names!)
@@ -3137,7 +3153,7 @@ def evalApplyDir(
                         _ -> (),
                     }
                 };
-                if (!isKnownLocalOnlyIntrinsic(ctx.vcExterns, nm)) {
+                if (!isKnownLocalOnlyIntrinsic(ctx.vcSpecs, ctx.vcExterns, nm)) {
                     cellSet(unknownMutContainer, true)
                 } else ();
                 let havocCells = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
@@ -4085,6 +4101,7 @@ pub def computeVerifiedSafeFns(
     };
 
     let userFnsRev: Cell (List FnSpec) = cellNew(Nil);
+    let assumeShadowed = strMapContains(prog.coreExterns, "assume") || strMapContains(prog.coreFns, "assume");
     let cf = cellNew(prog.coreFnNames);
     while (match cellGet(cf) { Nil -> false, _ -> true }) {
         match cellGet(cf) {
@@ -4092,7 +4109,7 @@ pub def computeVerifiedSafeFns(
                 match strMapGet(prog.coreFns, nm) {
                     Some(fd) -> {
                         let spRaw = extractFnSpec(fd);
-                        let fnHasAssume = termContainsAssume(fd.fnBody);
+                        let fnHasAssume = !assumeShadowed && termContainsAssume(fd.fnBody);
                         if (fnHasAssume) strMapInsert(hasAssume, nm, true) else ();
                         let eligible = isUserFnForVerifiedOpt(fd) && !fnHasAssume;
                         let sp =
