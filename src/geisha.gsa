@@ -280,7 +280,9 @@ def parseCliArgs(): Result CliOpts String = {
                 } else if (match cellGet(restArgsRev) { Nil -> true, _ -> false } && a == "--timeout") {
                     if (cellGet(i) + 1 >= argc) cellSet(errOpt, Some("Missing timeout milliseconds after '--timeout'"))
                     else match parseInt(argAt(cellGet(i) + 1)) {
-                        Ok(ms) -> { cellSet(timeoutMs, ms); cellSet(i, cellGet(i) + 2) },
+                        Ok(ms) ->
+                            if (ms <= 0) cellSet(errOpt, Some("'--timeout' must be a positive integer (milliseconds)"))
+                            else { cellSet(timeoutMs, ms); cellSet(i, cellGet(i) + 2) },
                         Err(_) -> cellSet(errOpt, Some("Invalid integer after '--timeout': " + argAt(cellGet(i) + 1))),
                     }
                 } else {

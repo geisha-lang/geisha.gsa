@@ -1228,7 +1228,127 @@ def main() -> int:
             x_blk = fn_ir_block(x_ll.read_text(encoding="utf-8"), x_target_fn)
             assert "llvm.assume" not in x_blk, f"X1-X3 {x_name} emitted false @llvm.assume in {x_target_fn}!\n{x_blk}"
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 adversarial/TCO/eval + cache isolation verified")
+        # Y1-Y2 Adversarial: shadowed pattern vars on unknown scrutinee & nested Cell(Cell)/MutArray(Cell)
+        for y_name, y_target_fn, y_code in [
+            (
+                "y1_shadow_option",
+                "observe",
+                "use std.option.{Option, Some, None}\n"
+                "def observe(b: Bool): Int = {\n"
+                "    let x = 1;\n"
+                "    let picked = if (b) Some(7) else None;\n"
+                "    match picked {\n"
+                "        Some(x) -> { assert(x == 1); x },\n"
+                "        None -> x,\n"
+                "    }\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(true); () }\n",
+            ),
+            (
+                "y1_shadow_nested_tuple",
+                "observeTuple",
+                "use std.option.{Option, Some, None}\n"
+                "def observeTuple(b: Bool): Int = {\n"
+                "    let x = 1;\n"
+                "    let y = 2;\n"
+                "    let picked = if (b) Some((7, 8)) else None;\n"
+                "    match picked {\n"
+                "        Some((x, y)) -> { assert(x == 1 && y == 2); x + y },\n"
+                "        None -> x + y,\n"
+                "    }\n"
+                "}\n"
+                "def main(): Void = { let _ = observeTuple(true); () }\n",
+            ),
+            (
+                "y2_nested_cell_havoc",
+                "observe",
+                "def update(box: Cell (Cell Int)): Void = cellSet(cellGet(box), 7)\n"
+                "def observe(): Int = {\n"
+                "    let value = cellNew(1);\n"
+                "    let box = cellNew(value);\n"
+                "    update(box);\n"
+                "    assert(cellGet(value) == 1);\n"
+                "    cellGet(value)\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(); () }\n",
+            ),
+            (
+                "y2_nested_cell_alias",
+                "twoArg",
+                "def twoArg(box: Cell (Cell Int), direct: Cell Int): Int = {\n"
+                "    cellSet(direct, 1);\n"
+                "    cellSet(cellGet(box), 9);\n"
+                "    assert(cellGet(direct) == 1);\n"
+                "    cellGet(direct)\n"
+                "}\n"
+                "def main(): Void = {\n"
+                "    let v = cellNew(0);\n"
+                "    let b = cellNew(v);\n"
+                "    let _ = twoArg(b, v);\n"
+                "    ()\n"
+                "}\n",
+            ),
+            (
+                "y2_mutarray_cell_havoc",
+                "observeArr",
+                "def mutateArr(xs: MutArray (Cell Int)): Void = {\n"
+                "    if (arrayLen(xs) > 0) cellSet(arrayGet(xs, 0), 7) else ()\n"
+                "}\n"
+                "def observeArr(): Int = {\n"
+                "    let value = cellNew(1);\n"
+                "    let xs = arrayNew(1, value);\n"
+                "    mutateArr(xs);\n"
+                "    assert(cellGet(value) == 1);\n"
+                "    cellGet(value)\n"
+                "}\n"
+                "def main(): Void = { let _ = observeArr(); () }\n",
+            ),
+        ]:
+            y_src = tmp / f"{y_name}.gsa"
+            y_src.write_text(y_code, encoding="utf-8", newline="\n")
+            r_yv = run([geisha, "verify", "--json", "--solver", z3_bin, str(y_src)])
+            assert r_yv.returncode == 1, f"Y1-Y2 {y_name} verify MUST fail (exit 1), got {r_yv.returncode}:\n{r_yv.stdout}\n{r_yv.stderr}"
+            y_ll = tmp / f"{y_name}.ll"
+            r_yir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(y_ll), str(y_src)])
+            assert r_yir.returncode == 0, f"Y1-Y2 {y_name} IR compile failed:\n{r_yir.stdout}\n{r_yir.stderr}"
+            y_blk = fn_ir_block(y_ll.read_text(encoding="utf-8"), y_target_fn)
+            assert "llvm.assume" not in y_blk, f"Y1-Y2 {y_name} emitted false @llvm.assume in {y_target_fn}!\n{y_blk}"
+
+        # Y3 Positive: `arrayNewZeroed` on `MutArray Bool` and `MutArray Int64` proves 100% cleanly
+        y3_src = tmp / "y3_zerosorts.gsa"
+        y3_src.write_text(
+            "def checkZeroBool(n: Int): Bool\n"
+            "    requires n > 0\n"
+            "    ensures r -> !r\n"
+            "= {\n"
+            "    let a: MutArray Bool = arrayNewZeroed(n);\n"
+            "    arrayGet(a, 0)\n"
+            "}\n"
+            "def checkZeroI64(n: Int): Int64\n"
+            "    requires n > 0\n"
+            "    ensures r -> r == intToI64(0)\n"
+            "= {\n"
+            "    let a: MutArray Int64 = arrayNewZeroed(n);\n"
+            "    arrayGet(a, 0)\n"
+            "}\n"
+            "def main(): Void = ()\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        r_y3 = run([geisha, "verify", "--json", "--solver", z3_bin, str(y3_src)])
+        assert r_y3.returncode == 0, f"Y3 zerosorts verify failed:\n{r_y3.stdout}\n{r_y3.stderr}"
+        y3_j = json.loads(r_y3.stdout)
+        assert y3_j["ok"] is True and y3_j["failed"] == 0 and y3_j["unknown"] == 0 and y3_j["proved"] >= 6, (
+            f"Y3 zerosorts unexpected summary: {y3_j}"
+        )
+
+        # Y4 Negative: `geisha eval --timeout -1` MUST reject non-positive timeout
+        r_y4 = run([geisha, "eval", "--timeout", "-1", "1"])
+        assert r_y4.returncode != 0 and "positive integer" in (r_y4.stdout + r_y4.stderr), (
+            f"Y4 eval --timeout -1 should fail with positive-integer diagnostic:\nrc={r_y4.returncode}\nout={r_y4.stdout}\nerr={r_y4.stderr}"
+        )
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 adversarial/TCO/eval/zerosorts + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)
