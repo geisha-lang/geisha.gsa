@@ -125,24 +125,24 @@ $(BUILD_DIR)/geisha0$(EXE_EXT): $(BUILD_DIR)/stage0.ll $(RUNTIME_LIB)
 
 stage1: $(BUILD_DIR)/geisha1$(EXE_EXT)
 
-$(BUILD_DIR)/stage1.ll: $(STAGE0_DEP) src/*.gsa | $(BUILD_DIR)
-	$(STAGE0) --src-root . -e -o $(BUILD_DIR)/stage1.ll $(ENTRY)
+$(BUILD_DIR)/stage1.ll: $(STAGE0_DEP) src/*.gsa geisha.toml geisha.lock | $(BUILD_DIR)
+	$(STAGE0) build -e -o $(BUILD_DIR)/stage1.ll
 
 $(BUILD_DIR)/geisha1$(EXE_EXT): $(BUILD_DIR)/stage1.ll $(RUNTIME_LIB)
 	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 -Wno-override-module $(HOST_PTHREAD) -x ir $(BUILD_DIR)/stage1.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha1$(EXE_EXT)
 
 stage2: $(BUILD_DIR)/geisha2$(EXE_EXT)
 
-$(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1$(EXE_EXT) src/*.gsa
-	$(BUILD_DIR)/geisha1$(EXE_EXT) --src-root . -e -o $(BUILD_DIR)/stage2.ll $(ENTRY)
+$(BUILD_DIR)/stage2.ll: $(BUILD_DIR)/geisha1$(EXE_EXT) src/*.gsa geisha.toml geisha.lock
+	$(BUILD_DIR)/geisha1$(EXE_EXT) build -e -o $(BUILD_DIR)/stage2.ll
 
 $(BUILD_DIR)/geisha2$(EXE_EXT): $(BUILD_DIR)/stage2.ll $(RUNTIME_LIB)
 	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 -Wno-override-module $(HOST_PTHREAD) -x ir $(BUILD_DIR)/stage2.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha2$(EXE_EXT)
 
 stage3: $(BUILD_DIR)/geisha3$(EXE_EXT)
 
-$(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2$(EXE_EXT) src/*.gsa
-	$(BUILD_DIR)/geisha2$(EXE_EXT) --src-root . -e -o $(BUILD_DIR)/stage3.ll $(ENTRY)
+$(BUILD_DIR)/stage3.ll: $(BUILD_DIR)/geisha2$(EXE_EXT) src/*.gsa geisha.toml geisha.lock
+	$(BUILD_DIR)/geisha2$(EXE_EXT) build -e -o $(BUILD_DIR)/stage3.ll
 
 $(BUILD_DIR)/geisha3$(EXE_EXT): $(BUILD_DIR)/stage3.ll $(RUNTIME_LIB)
 	$(HOST_ENV) $(CC) $(HOST_TARGET) -O2 -Wno-override-module $(HOST_PTHREAD) -x ir $(BUILD_DIR)/stage3.ll -x none $(RUNTIME_LIB) $(HOST_LIBS) -o $(BUILD_DIR)/geisha3$(EXE_EXT)

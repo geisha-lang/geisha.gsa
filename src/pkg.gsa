@@ -1536,7 +1536,7 @@ def materializeCachedTree(
 
             let stageTarAbs = pathJoin(absPath(tmpDir), stageTarName);
             let treeSpec = if (strLen(subdir) > 0) rev + ":" + subdir else rev;
-            let extractRes = match gitCapture(["-C", dbDir, "archive", "--format=tar", "--output=" + stageTarAbs, treeSpec], false) {
+            let extractRes = match gitCapture(["-c", "core.autocrlf=false", "-C", dbDir, "archive", "--format=tar", "--output=" + stageTarAbs, treeSpec], false) {
                 Err(e) -> Err(e),
                 Ok(_) -> {
                     let tarRes = runCmdCapture("tar", ["-xf", stageTarName, "-C", stageName], Nil, Some(tmpDir));

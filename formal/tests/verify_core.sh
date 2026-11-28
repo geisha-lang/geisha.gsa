@@ -469,7 +469,7 @@ echo "PASS [e2e_suite_translation_validation]: all $E2E_COUNT positive E2E langu
 
 # 11. Full Self-Hosting Compiler Translation Validation:
 #     Dump and mechanically verify the entire ~20,000-line self-hosted Geisha compiler (`src/geisha.gsa`)!
-"$GEISHA_BIN" --src-root . --dump-core "$TMP_DIR/compiler.gscore" -e -o "$TMP_DIR/compiler.ll" src/geisha.gsa
+"$GEISHA_BIN" build --dump-core "$TMP_DIR/compiler.gscore" -e -o "$TMP_DIR/compiler.ll"
 "$CHECKER_BIN" "$TMP_DIR/compiler.gscore"
 echo "PASS [self_hosted_compiler_verified]: entire src/geisha.gsa compiler verified by Lean 4 geisha-check"
 

@@ -49,6 +49,51 @@ pub data TokKind {
     TkEof,
 }
 
+pub instance Eq TokKind {
+    def (==)(a: TokKind, b: TokKind): Bool = match (a, b) {
+        (TkIdent(x), TkIdent(y)) -> x == y,
+        (TkInt(x), TkInt(y)) -> x == y,
+        (TkFloat(x), TkFloat(y)) -> x == y,
+        (TkStr(x), TkStr(y)) -> x == y,
+        (TkChar(x), TkChar(y)) -> x == y,
+        (TkSym(x), TkSym(y)) -> x == y,
+        (TkQuestion, TkQuestion) -> true,
+        (TkLParen, TkLParen) -> true,
+        (TkRParen, TkRParen) -> true,
+        (TkLBrace, TkLBrace) -> true,
+        (TkRBrace, TkRBrace) -> true,
+        (TkLBracket, TkLBracket) -> true,
+        (TkRBracket, TkRBracket) -> true,
+        (TkComma, TkComma) -> true,
+        (TkSemi, TkSemi) -> true,
+        (TkDot, TkDot) -> true,
+        (TkDef, TkDef) -> true,
+        (TkExtern, TkExtern) -> true,
+        (TkIf, TkIf) -> true,
+        (TkElse, TkElse) -> true,
+        (TkWhile, TkWhile) -> true,
+        (TkLet, TkLet) -> true,
+        (TkIn, TkIn) -> true,
+        (TkType, TkType) -> true,
+        (TkData, TkData) -> true,
+        (TkMatch, TkMatch) -> true,
+        (TkConcept, TkConcept) -> true,
+        (TkInstance, TkInstance) -> true,
+        (TkForall, TkForall) -> true,
+        (TkPub, TkPub) -> true,
+        (TkUse, TkUse) -> true,
+        (TkMod, TkMod) -> true,
+        (TkOpen, TkOpen) -> true,
+        (TkAs, TkAs) -> true,
+        (TkTrue, TkTrue) -> true,
+        (TkFalse, TkFalse) -> true,
+        (TkVoid, TkVoid) -> true,
+        (TkEof, TkEof) -> true,
+        _ -> false,
+    }
+    def (!=)(a: TokKind, b: TokKind): Bool = !(a == b)
+}
+
 pub data Token {
     MkToken { kind: TokKind, span: Span, hadNewline: Bool },
 }
