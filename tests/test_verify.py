@@ -1348,7 +1348,113 @@ def main() -> int:
             f"Y4 eval --timeout -1 should fail with positive-integer diagnostic:\nrc={r_y4.returncode}\nout={r_y4.stdout}\nerr={r_y4.stderr}"
         )
 
-        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 adversarial/TCO/eval/zerosorts + cache isolation verified")
+        # Z1-Z3 Adversarial: transitive ambient heap effects (global Cell, Int-wrapped global write,
+        # while-loop global write, callee-ensures downward pruning, and gcHandleNew/gcHandleGet)
+        for z_name, z_target_fn, z_code in [
+            (
+                "z1_escaped_global",
+                "observe",
+                "def slot: Cell (Cell Int) = cellNew(cellNew(0))\n"
+                "def remember(c: Cell Int): Void = cellSet(slot, c)\n"
+                "def writeSaved(): Void = cellSet(cellGet(slot), 7)\n"
+                "def observe(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    remember(c);\n"
+                "    cellSet(c, 1);\n"
+                "    writeSaved();\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(); () }\n",
+            ),
+            (
+                "z1_wrapped_global",
+                "observe",
+                "def slot: Cell (Cell Int) = cellNew(cellNew(0))\n"
+                "def remember(c: Cell Int): Void = cellSet(slot, c)\n"
+                "def writeGlobal(v: Int): Void = cellSet(cellGet(slot), v)\n"
+                "def writeSaved(v: Int): Void = writeGlobal(v)\n"
+                "def observe(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    remember(c);\n"
+                "    cellSet(c, 1);\n"
+                "    writeSaved(7);\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(); () }\n",
+            ),
+            (
+                "z1_loop_global",
+                "observe",
+                "def slot: Cell (Cell Int) = cellNew(cellNew(0))\n"
+                "def remember(c: Cell Int): Void = cellSet(slot, c)\n"
+                "def writeGlobal(v: Int): Void = cellSet(cellGet(slot), v)\n"
+                "def writeSaved(v: Int): Void = writeGlobal(v)\n"
+                "def observe(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    remember(c);\n"
+                "    cellSet(c, 1);\n"
+                "    let flag = cellNew(true);\n"
+                "    while (cellGet(flag))\n"
+                "        invariant true\n"
+                "    {\n"
+                "        writeSaved(7);\n"
+                "        cellSet(flag, false)\n"
+                "    };\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = observe(); () }\n",
+            ),
+            (
+                "z1_victim_callee_ensures",
+                "victimCaller",
+                "def slot: Cell (Cell Int) = cellNew(cellNew(0))\n"
+                "def remember(c: Cell Int): Void = cellSet(slot, c)\n"
+                "def writeSaved(): Void = cellSet(cellGet(slot), 7)\n"
+                "def bogusHelper(): Int\n"
+                "    ensures r -> r == 1\n"
+                "= {\n"
+                "    let c = cellNew(0);\n"
+                "    remember(c);\n"
+                "    cellSet(c, 1);\n"
+                "    writeSaved();\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def victimCaller(): Int = {\n"
+                "    let v = bogusHelper();\n"
+                "    assert(v == 1);\n"
+                "    v\n"
+                "}\n"
+                "def main(): Void = { let _ = victimCaller(); () }\n",
+            ),
+            (
+                "z1_handle_escape",
+                "observeHandle",
+                "def writeByHandle(h: Int64): Void = cellSet(gcHandleGet(h), 7)\n"
+                "def observeHandle(): Int = {\n"
+                "    let c = cellNew(0);\n"
+                "    let h = gcHandleNew(c);\n"
+                "    cellSet(c, 1);\n"
+                "    writeByHandle(h);\n"
+                "    assert(cellGet(c) == 1);\n"
+                "    cellGet(c)\n"
+                "}\n"
+                "def main(): Void = { let _ = observeHandle(); () }\n",
+            ),
+        ]:
+            z_src = tmp / f"{z_name}.gsa"
+            z_src.write_text(z_code, encoding="utf-8", newline="\n")
+            r_zv = run([geisha, "verify", "--json", "--solver", z3_bin, str(z_src)])
+            assert r_zv.returncode == 1, f"Z1 {z_name} verify MUST fail (exit 1), got {r_zv.returncode}:\n{r_zv.stdout}\n{r_zv.stderr}"
+            z_ll = tmp / f"{z_name}.ll"
+            r_zir = run([geisha, "--verified-opt", "--solver", z3_bin, "-e", "-o", str(z_ll), str(z_src)])
+            assert r_zir.returncode == 0, f"Z1 {z_name} IR compile failed:\n{r_zir.stdout}\n{r_zir.stderr}"
+            z_blk = fn_ir_block(z_ll.read_text(encoding="utf-8"), z_target_fn)
+            assert "call void @llvm.assume" not in z_blk, f"Z1 {z_name} emitted false @llvm.assume in {z_target_fn}!\n{z_blk}"
+
+        print("PASS [d3_verified_opt]: positive IR/O2 + Iron Law 1 & 2 + V1-V3 + W1-W4 + X1-X3 + Y1-Y4 + Z1-Z3 adversarial/TCO/eval/zerosorts + cache isolation verified")
 
     # ------------------------------------------------------------------
     # D2: Compiler self-check with `--contracts=check` (`geisha_checked`)

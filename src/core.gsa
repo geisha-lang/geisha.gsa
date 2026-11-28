@@ -4929,26 +4929,45 @@ def isPureScalarAssumeTermCoreList(ts: List TaggedTerm): Bool = match ts {
     Cons(t, r) -> if (isPureScalarAssumeTermCore(t)) isPureScalarAssumeTermCoreList(r) else false,
 }
 
-def isFloatTypeForAssumeCore(ty: Type): Bool = match ty {
-    TyCon("Float") -> true,
-    TyCon("Float32") -> true,
+def isAllowedScalarAssumeTypeCore(ty: Type): Bool = match ty {
+    TyCon("Int") -> true,
+    TyCon("Int64") -> true,
+    TyCon("Bool") -> true,
+    TyCon("Char") -> true,
     _ -> false,
 }
 
 def isPureScalarAssumeTermCore(tm: TaggedTerm): Bool = match tm.tnode {
-    TmLit(_) -> !isFloatTypeForAssumeCore(schemeBody(tm.tscm)),
-    TmVar(_) -> !isFloatTypeForAssumeCore(schemeBody(tm.tscm)),
+    TmLit(_) -> isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm)),
+    TmVar(_) -> isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm)),
     TmBin(op, a, b) -> {
         let isDiv = match op { OpDiv -> true, OpRem -> true, _ -> false };
-        let hasFloat = isFloatTypeForAssumeCore(schemeBody(a.tscm)) || isFloatTypeForAssumeCore(schemeBody(b.tscm));
-        !isDiv && !hasFloat && isPureScalarAssumeTermCore(a) && isPureScalarAssumeTermCore(b)
+        !isDiv
+        && isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
+        && isAllowedScalarAssumeTypeCore(schemeBody(a.tscm))
+        && isAllowedScalarAssumeTypeCore(schemeBody(b.tscm))
+        && isPureScalarAssumeTermCore(a)
+        && isPureScalarAssumeTermCore(b)
     },
-    TmUn(_, a) -> !isFloatTypeForAssumeCore(schemeBody(a.tscm)) && isPureScalarAssumeTermCore(a),
-    TmIf(c, t, e) -> isPureScalarAssumeTermCore(c) && isPureScalarAssumeTermCore(t) && isPureScalarAssumeTermCore(e),
-    TmGetTag(e) -> isPureScalarAssumeTermCore(e),
+    TmUn(_, a) ->
+        isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
+        && isAllowedScalarAssumeTypeCore(schemeBody(a.tscm))
+        && isPureScalarAssumeTermCore(a),
+    TmIf(c, t, e) ->
+        isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
+        && isPureScalarAssumeTermCore(c)
+        && isPureScalarAssumeTermCore(t)
+        && isPureScalarAssumeTermCore(e),
+    TmGetTag(e) ->
+        isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
+        && match e.tnode { TmVar(_) -> true, _ -> false },
     TmApplyDir(vd, args) ->
-        (vd.vname == "cellGet" || vd.vname == "arrayLen" || vd.vname == "immArrayLen")
-        && isPureScalarAssumeTermCoreList(args),
+        if (vd.vname == "cellGet") {
+            isAllowedScalarAssumeTypeCore(schemeBody(tm.tscm))
+            && match args { Cons(a0, Nil) -> match a0.tnode { TmVar(_) -> true, _ -> false }, _ -> false }
+        } else if (vd.vname == "arrayLen" || vd.vname == "immArrayLen") {
+            match args { Cons(a0, Nil) -> match a0.tnode { TmVar(_) -> true, _ -> false }, _ -> false }
+        } else false,
     _ -> false,
 }
 

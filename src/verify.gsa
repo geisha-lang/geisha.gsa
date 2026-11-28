@@ -114,6 +114,7 @@ data VerifyCtx {
         vcAdtTypeParams: StrMap (List String),
         vcAdtReg: StrMap AdtInfo,
         vcCallGraph: StrMap (List String),
+        vcAmbientMutFns: StrMap Bool,
         vcCurFn: String,
         vcCurDecExpr: Option TaggedTerm,
         vcCurDecVal: Option String,
@@ -572,13 +573,121 @@ def bindPatEffectVarsList(pats: List Pattern, stVars: List (String, String)): Li
     Cons(p, r) -> bindPatEffectVarsList(r, bindPatEffectVars(p, stVars)),
 }
 
+def isKnownLocalOnlyIntrinsic(nm: String): Bool =
+    nm == "cellNew" || nm == "cellGet" || nm == "cellSet"
+    || nm == "arrayNew" || nm == "arrayNewZeroed"
+    || nm == "arrayLen" || nm == "immArrayLen"
+    || nm == "arrayGet" || nm == "immArrayGet"
+    || nm == "arraySet" || nm == "arrayClearSlot" || nm == "arrayFreeze"
+    || nm == "intToI64" || nm == "i64ToInt" || nm == "charToInt" || nm == "intToChar"
+    || nm == "strLen" || nm == "strByteAt" || nm == "strSlice" || nm == "strConcat"
+    || nm == "__blackBox" || nm == "assert" || nm == "assume"
+    || nm == "__gs_requires" || nm == "__gs_ensures" || nm == "__gs_invariant" || nm == "__gs_decreases"
+    || strStartsWith(nm, "bit") || strStartsWith(nm, "float") || strStartsWith(nm, "f32")
+    || strStartsWith(nm, "bits") || strStartsWith(nm, "intToF") || strStartsWith(nm, "math")
+
+def termListHasDirectAmbientEffect(ts: List TaggedTerm, specs: StrMap FnSpec): Bool = match ts {
+    Nil -> false,
+    Cons(t, r) -> if (termHasDirectAmbientEffect(t, specs)) true else termListHasDirectAmbientEffect(r, specs),
+}
+
+def armListHasDirectAmbientEffect(arms: List CoreArm, specs: StrMap FnSpec): Bool = match arms {
+    Nil -> false,
+    Cons(a, r) -> {
+        let gHas = match a.caGuard { Some(g) -> termHasDirectAmbientEffect(g, specs), None -> false };
+        if (gHas || termHasDirectAmbientEffect(a.caBody, specs)) true else armListHasDirectAmbientEffect(r, specs)
+    },
+}
+
+def termHasDirectAmbientEffect(t: TaggedTerm, specs: StrMap FnSpec): Bool = match t.tnode {
+    TmGlobalVar(_) -> true,
+    TmApplyCls(_, _) -> true,
+    TmApplyDir(vd, args) -> {
+        let nm = vd.vname;
+        if (!strMapContains(specs, nm) && !isKnownLocalOnlyIntrinsic(nm)) true
+        else termListHasDirectAmbientEffect(args, specs)
+    },
+    TmMakeCls(_, _, b) -> termHasDirectAmbientEffect(b, specs),
+    TmTuple(es) -> termListHasDirectAmbientEffect(es, specs),
+    TmBlock(es) -> termListHasDirectAmbientEffect(es, specs),
+    TmMakeData(_, _, fs, _, _) -> termListHasDirectAmbientEffect(fs, specs),
+    TmBin(_, l, r) -> termHasDirectAmbientEffect(l, specs) || termHasDirectAmbientEffect(r, specs),
+    TmUn(_, e) -> termHasDirectAmbientEffect(e, specs),
+    TmLet(_, v, b) -> termHasDirectAmbientEffect(v, specs) || termHasDirectAmbientEffect(b, specs),
+    TmIf(c, th, el) -> termHasDirectAmbientEffect(c, specs) || termHasDirectAmbientEffect(th, specs) || termHasDirectAmbientEffect(el, specs),
+    TmWhile(c, b) -> termHasDirectAmbientEffect(c, specs) || termHasDirectAmbientEffect(b, specs),
+    TmMatch(s, arms) -> termHasDirectAmbientEffect(s, specs) || armListHasDirectAmbientEffect(arms, specs),
+    TmGetTag(e) -> termHasDirectAmbientEffect(e, specs),
+    _ -> false,
+}
+
+def computeAmbientHeapEffectFns(
+    prog: CoreProgram,
+    specs: StrMap FnSpec,
+    callGraph: StrMap (List String)
+): StrMap Bool = {
+    let ambient: StrMap Bool = strMapNew();
+    let cf = cellNew(prog.coreFnNames);
+    while (match cellGet(cf) { Nil -> false, _ -> true }) {
+        match cellGet(cf) {
+            Cons(nm, r) -> {
+                match strMapGet(prog.coreFns, nm) {
+                    Some(fd) -> {
+                        let hasFvs = match fd.fnFvs { Nil -> false, _ -> true };
+                        if (hasFvs || termHasDirectAmbientEffect(fd.fnBody, specs)) {
+                            strMapInsert(ambient, nm, true)
+                        } else ()
+                    },
+                    None -> (),
+                };
+                cellSet(cf, r)
+            },
+            Nil -> (),
+        }
+    };
+    let changed = cellNew(true);
+    while (cellGet(changed)) {
+        cellSet(changed, false);
+        let cf2 = cellNew(prog.coreFnNames);
+        while (match cellGet(cf2) { Nil -> false, _ -> true }) {
+            match cellGet(cf2) {
+                Cons(nm, r) -> {
+                    if (!strMapContains(ambient, nm)) {
+                        let callees = match strMapGet(callGraph, nm) { Some(xs) -> xs, None -> Nil };
+                        let cc = cellNew(callees);
+                        let hit = cellNew(false);
+                        while (!cellGet(hit) && match cellGet(cc) { Nil -> false, _ -> true }) {
+                            match cellGet(cc) {
+                                Cons(calleeNm, rc) -> {
+                                    if (strMapContains(ambient, calleeNm)) cellSet(hit, true) else ();
+                                    cellSet(cc, rc)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        if (cellGet(hit)) {
+                            strMapInsert(ambient, nm, true);
+                            cellSet(changed, true)
+                        } else ()
+                    } else ();
+                    cellSet(cf2, r)
+                },
+                Nil -> (),
+            }
+        }
+    };
+    ambient
+}
+
 def scanEffectsInTerm(
+    ctx: VerifyCtx,
     t: TaggedTerm,
     stVars: List (String, String),
     modCells: Cell (List String),
     modArrs: Cell (List String),
     hasOpaqueCall: Cell Bool
 ): Void = match t.tnode {
+    TmGlobalVar(_) -> cellSet(hasOpaqueCall, true),
     TmApplyDir(vd, args) -> {
         let nm = vd.vname;
         if (nm == "cellSet") {
@@ -605,6 +714,8 @@ def scanEffectsInTerm(
                 },
                 Nil -> (),
             }
+        } else if (strMapContains(ctx.vcAmbientMutFns, nm) || (!strMapContains(ctx.vcSpecs, nm) && !isKnownLocalOnlyIntrinsic(nm))) {
+            cellSet(hasOpaqueCall, true)
         } else if (nm != "cellGet" && nm != "cellNew" && nm != "arrayLen" && nm != "immArrayLen"
             && nm != "arrayGet" && nm != "immArrayGet" && nm != "arrayNew" && nm != "arrayNewZeroed"
             && nm != "assert" && nm != "assume"
@@ -633,23 +744,23 @@ def scanEffectsInTerm(
                 }
             }
         } else ();
-        scanEffectsInList(args, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInList(ctx, args, stVars, modCells, modArrs, hasOpaqueCall)
     },
     TmApplyCls(c, args) -> {
         cellSet(hasOpaqueCall, true);
-        scanEffectsInTerm(c, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInList(args, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, c, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInList(ctx, args, stVars, modCells, modArrs, hasOpaqueCall)
     },
-    TmMakeCls(_, _, b) -> scanEffectsInTerm(b, stVars, modCells, modArrs, hasOpaqueCall),
-    TmTuple(es) -> scanEffectsInList(es, stVars, modCells, modArrs, hasOpaqueCall),
-    TmBlock(es) -> scanEffectsInList(es, stVars, modCells, modArrs, hasOpaqueCall),
+    TmMakeCls(_, _, b) -> scanEffectsInTerm(ctx, b, stVars, modCells, modArrs, hasOpaqueCall),
+    TmTuple(es) -> scanEffectsInList(ctx, es, stVars, modCells, modArrs, hasOpaqueCall),
+    TmBlock(es) -> scanEffectsInList(ctx, es, stVars, modCells, modArrs, hasOpaqueCall),
     TmBin(_, l, r) -> {
-        scanEffectsInTerm(l, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInTerm(r, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, l, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, r, stVars, modCells, modArrs, hasOpaqueCall)
     },
-    TmUn(_, e) -> scanEffectsInTerm(e, stVars, modCells, modArrs, hasOpaqueCall),
+    TmUn(_, e) -> scanEffectsInTerm(ctx, e, stVars, modCells, modArrs, hasOpaqueCall),
     TmLet(vd, v, b) -> {
-        scanEffectsInTerm(v, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, v, stVars, modCells, modArrs, hasOpaqueCall);
         // S4 & R3: Propagate direct `TmVar` alias; only fresh `cellNew`/`arrayNew`/`arrayNewZeroed`
         // allocations are disjoint (`__fresh_`); any other expression (e.g. `if (b) c1 else c2`)
         // may alias an outer mutable location and is bound to `__may_alias`.
@@ -662,38 +773,39 @@ def scanEffectsInTerm(
                 assocSet(stVars, vd.vname, "__fresh_" + vd.vname),
             _ -> assocSet(stVars, vd.vname, "__may_alias"),
         };
-        scanEffectsInTerm(b, innerVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, b, innerVars, modCells, modArrs, hasOpaqueCall)
     },
     TmIf(c, th, el) -> {
-        scanEffectsInTerm(c, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInTerm(th, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInTerm(el, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, c, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, th, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, el, stVars, modCells, modArrs, hasOpaqueCall)
     },
     TmWhile(c, b) -> {
-        scanEffectsInTerm(c, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInTerm(b, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, c, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, b, stVars, modCells, modArrs, hasOpaqueCall)
     },
     TmMatch(s, arms) -> {
-        scanEffectsInTerm(s, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInTerm(ctx, s, stVars, modCells, modArrs, hasOpaqueCall);
         let cur = cellNew(arms);
         while (match cellGet(cur) { Nil -> false, _ -> true }) {
             match cellGet(cur) {
                 Cons(a, r) -> {
                     let armVars = bindPatEffectVars(a.caPat, stVars);
-                    match a.caGuard { Some(g) -> scanEffectsInTerm(g, armVars, modCells, modArrs, hasOpaqueCall), None -> () };
-                    scanEffectsInTerm(a.caBody, armVars, modCells, modArrs, hasOpaqueCall);
+                    match a.caGuard { Some(g) -> scanEffectsInTerm(ctx, g, armVars, modCells, modArrs, hasOpaqueCall), None -> () };
+                    scanEffectsInTerm(ctx, a.caBody, armVars, modCells, modArrs, hasOpaqueCall);
                     cellSet(cur, r)
                 },
                 Nil -> (),
             }
         }
     },
-    TmMakeData(_, _, fs, _, _) -> scanEffectsInList(fs, stVars, modCells, modArrs, hasOpaqueCall),
-    TmGetTag(e) -> scanEffectsInTerm(e, stVars, modCells, modArrs, hasOpaqueCall),
+    TmMakeData(_, _, fs, _, _) -> scanEffectsInList(ctx, fs, stVars, modCells, modArrs, hasOpaqueCall),
+    TmGetTag(e) -> scanEffectsInTerm(ctx, e, stVars, modCells, modArrs, hasOpaqueCall),
     _ -> (),
 }
 
 def scanEffectsInList(
+    ctx: VerifyCtx,
     ts: List TaggedTerm,
     stVars: List (String, String),
     modCells: Cell (List String),
@@ -702,8 +814,8 @@ def scanEffectsInList(
 ): Void = match ts {
     Nil -> (),
     Cons(h, r) -> {
-        scanEffectsInTerm(h, stVars, modCells, modArrs, hasOpaqueCall);
-        scanEffectsInList(r, stVars, modCells, modArrs, hasOpaqueCall)
+        scanEffectsInTerm(ctx, h, stVars, modCells, modArrs, hasOpaqueCall);
+        scanEffectsInList(ctx, r, stVars, modCells, modArrs, hasOpaqueCall)
     },
 }
 
@@ -1967,7 +2079,7 @@ def evalMatch(
                         let gmc: Cell (List String) = cellNew(Nil);
                         let gma: Cell (List String) = cellNew(Nil);
                         let goc = cellNew(false);
-                        scanEffectsInTerm(g, armVars, gmc, gma, goc);
+                        scanEffectsInTerm(ctx, g, armVars, gmc, gma, goc);
                         if (cellGet(goc) || match (cellGet(gmc), cellGet(gma)) { (Nil, Nil) -> false, _ -> true }) {
                             cellSet(anyMut, true);
                             let hCells = if (cellGet(goc)) assocKeysUnique(cellGet(curCells)) else cellGet(gmc);
@@ -2046,8 +2158,8 @@ def evalMatch(
                 let ma: Cell (List String) = cellNew(Nil);
                 let oc = cellNew(false);
                 let armVars = bindPatEffectVars(arm.caPat, st1.stVars);
-                match arm.caGuard { Some(g) -> scanEffectsInTerm(g, armVars, mc, ma, oc), None -> () };
-                scanEffectsInTerm(arm.caBody, armVars, mc, ma, oc);
+                match arm.caGuard { Some(g) -> scanEffectsInTerm(ctx, g, armVars, mc, ma, oc), None -> () };
+                scanEffectsInTerm(ctx, arm.caBody, armVars, mc, ma, oc);
                 if (cellGet(oc) || match (cellGet(mc), cellGet(ma)) { (Nil, Nil) -> false, _ -> true }) {
                     cellSet(anyMut, true)
                 } else ();
@@ -2878,9 +2990,11 @@ def evalApplyDir(
                     }
                 } else ();
 
-                // Conservatively havoc any passed Cell or MutArray parameters (including wrapped in Tuple/ADT)
-                let havocCellList = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
-                let havocArrList = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stArrMems) else cellGet(passedMutArrLocs);
+                // Conservatively havoc any passed Cell or MutArray parameters (including wrapped in Tuple/ADT),
+                // and full-havoc whenever callee has transitive ambient heap effects (Z1: globals / gcHandleGet / FVs / closures)
+                let fullHavoc = cellGet(unknownMutContainer) || strMapContains(ctx.vcAmbientMutFns, nm);
+                let havocCellList = if (fullHavoc) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
+                let havocArrList = if (fullHavoc) assocKeysUnique(st1.stArrMems) else cellGet(passedMutArrLocs);
                 let stAfterMut = havocLocs(ctx, st1, havocCellList, havocArrList, "call");
 
                 // Allocate fresh return symbol ONLY for modeled types (fail-closed `None` for Float/String/Ptr/closures)
@@ -2996,6 +3110,9 @@ def evalApplyDir(
                         _ -> (),
                     }
                 };
+                if (!isKnownLocalOnlyIntrinsic(nm)) {
+                    cellSet(unknownMutContainer, true)
+                } else ();
                 let havocCells = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stCells) else cellGet(passedCellLocs);
                 let havocArrs = if (cellGet(unknownMutContainer)) assocKeysUnique(st1.stArrMems) else cellGet(passedMutArrLocs);
                 let stOut = havocLocs(ctx, st1, havocCells, havocArrs, "ext");
@@ -3058,8 +3175,8 @@ def evalWhile(
     let modCellsCell: Cell (List String) = cellNew(Nil);
     let modArrsCell: Cell (List String) = cellNew(Nil);
     let hasOpaque = cellNew(false);
-    scanEffectsInTerm(cond, st.stVars, modCellsCell, modArrsCell, hasOpaque);
-    scanEffectsInTerm(actualBody, st.stVars, modCellsCell, modArrsCell, hasOpaque);
+    scanEffectsInTerm(ctx, cond, st.stVars, modCellsCell, modArrsCell, hasOpaque);
+    scanEffectsInTerm(ctx, actualBody, st.stVars, modCellsCell, modArrsCell, hasOpaque);
     let modCells = if (cellGet(hasOpaque)) assocKeysUnique(st.stCells) else cellGet(modCellsCell);
     let modArrs = if (cellGet(hasOpaque)) assocKeysUnique(st.stArrMems) else cellGet(modArrsCell);
 
@@ -3343,6 +3460,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
         vcAdtTypeParams: ctx.vcAdtTypeParams,
         vcAdtReg: ctx.vcAdtReg,
         vcCallGraph: ctx.vcCallGraph,
+        vcAmbientMutFns: ctx.vcAmbientMutFns,
         vcCurFn: spec.fsName,
         vcCurDecExpr: match spec.fsDecreases { Some((_, de)) -> Some(de), None -> None },
         vcCurDecVal: None,
@@ -3401,6 +3519,7 @@ def verifySingleFn(ctx: VerifyCtx, spec: FnSpec): Void = {
         vcAdtTypeParams: ctx.vcAdtTypeParams,
         vcAdtReg: ctx.vcAdtReg,
         vcCallGraph: ctx.vcCallGraph,
+        vcAmbientMutFns: ctx.vcAmbientMutFns,
         vcCurFn: spec.fsName,
         vcCurDecExpr: match spec.fsDecreases { Some((_, de)) -> Some(de), None -> None },
         vcCurDecVal: decValOpt,
@@ -3595,6 +3714,7 @@ pub def verifyCoreProgram(
     };
 
     let (ctorTags, ctorAdt, ctorFtys, adtCounts, adtTps) = buildAdtVerifyMaps(prog.coreAdtNames, prog.coreAdtReg);
+    let ambientMutFns = computeAmbientHeapEffectFns(prog, specs, callGraph);
     let ctx = MkVerifyCtx {
         vcSpecs: specs,
         vcCtorTags: ctorTags,
@@ -3604,6 +3724,7 @@ pub def verifyCoreProgram(
         vcAdtTypeParams: adtTps,
         vcAdtReg: prog.coreAdtReg,
         vcCallGraph: callGraph,
+        vcAmbientMutFns: ambientMutFns,
         vcCurFn: "",
         vcCurDecExpr: None,
         vcCurDecVal: None,
@@ -3983,6 +4104,7 @@ pub def computeVerifiedSafeFns(
     };
 
     let (ctorTags, ctorAdt, ctorFtys, adtCounts, adtTps) = buildAdtVerifyMaps(prog.coreAdtNames, prog.coreAdtReg);
+    let ambientMutFns = computeAmbientHeapEffectFns(prog, specs, callGraph);
     let provedMap: StrMap Bool = strMapNew();
     let solverErr: Cell (Option String) = cellNew(None);
 
@@ -3996,6 +4118,7 @@ pub def computeVerifiedSafeFns(
             vcAdtTypeParams: adtTps,
             vcAdtReg: prog.coreAdtReg,
             vcCallGraph: callGraph,
+            vcAmbientMutFns: ambientMutFns,
             vcCurFn: "",
             vcCurDecExpr: None,
             vcCurDecVal: None,
@@ -4119,6 +4242,7 @@ pub def computeVerifiedSafeFns(
                 vcAdtTypeParams: adtTps,
                 vcAdtReg: prog.coreAdtReg,
                 vcCallGraph: callGraph,
+                vcAmbientMutFns: ambientMutFns,
                 vcCurFn: "",
                 vcCurDecExpr: None,
                 vcCurDecVal: None,
