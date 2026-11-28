@@ -681,10 +681,11 @@ if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_shadow_assume.gscore" 2>/dev/null; 
     exit 1
 fi
 
-# Z6b direct bare `.gscore` regression: even if a `.gscore` contains bare `(fun "assume" ...)` (unprefixed),
-# `verifyGscoreProgram` must alpha-rename shadowed decls and reject the unsound ensures!
+# Z6b/Z8 direct `.gscore` regressions (must fail in VCG, NEVER in Parser!):
+# 1. Versioned `(vcg-format 2)` with bare `(fun "assume" ...)` -> deflected to `$bare$assume`, refuted by Z3
 cat > "$TMP_DIR/vcg_bare_shadow_assume.gscore" << 'EOF'
 (program
+  (vcg-format 2)
   (adts)
   (externs)
   (funs
@@ -692,38 +693,103 @@ cat > "$TMP_DIR/vcg_bare_shadow_assume.gscore" << 'EOF'
     (fun "observe" (("x" int)) int
       (let "__gs_res"
         (block
-          (apply-dir "assume" (bin eq (var "x") (lit-int 1)))
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
           (var "x"))
         (block
           (let "r" (var "__gs_res")
-            (apply-dir "__gs_ensures" (bin eq (var "r") (lit-int 1))))
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
           (var "__gs_res"))))
     (fun "main" () void (lit-unit))))
 EOF
-if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_shadow_assume.gscore" 2>/dev/null; then
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_shadow_assume.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
     echo "FAIL [vcg_bare_shadow_assume_lean]: Lean geisha-check --verify-vcg accepted bare shadowed (fun \"assume\" ...)!" >&2
     exit 1
 fi
+if ! grep -q "^VCG " "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_shadow_assume_err]: expected VCG diagnostic (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
 
-# Z7b legacy bare `(extern "assume" ...)` regression: unprefixed bare `assume` extern must fail-closed
-cat > "$TMP_DIR/vcg_bare_extern_assume.gscore" << 'EOF'
+# 2. Versioned `(vcg-format 2)` with bare `(extern "assume" (("p0" bool)) void)` -> VCG ERROR (fail-closed)
+cat > "$TMP_DIR/vcg_bare_extern_assume_v2.gscore" << 'EOF'
 (program
+  (vcg-format 2)
   (adts)
-  (externs (extern "assume" (bool) void))
+  (externs (extern "assume" (("p0" bool)) void))
   (funs
     (fun "observe" (("x" int)) int
       (let "__gs_res"
         (block
-          (apply-dir "assume" (bin eq (var "x") (lit-int 1)))
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
           (var "x"))
         (block
           (let "r" (var "__gs_res")
-            (apply-dir "__gs_ensures" (bin eq (var "r") (lit-int 1))))
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
           (var "__gs_res"))))
     (fun "main" () void (lit-unit))))
 EOF
-if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_extern_assume.gscore" 2>/dev/null; then
-    echo "FAIL [vcg_bare_extern_assume_lean]: Lean geisha-check --verify-vcg accepted bare (extern \"assume\" ...)!" >&2
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_bare_extern_assume_v2.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_extern_assume_v2_lean]: Lean geisha-check --verify-vcg accepted bare (extern \"assume\" ...)!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_bare_extern_assume_v2_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# 3. Unversioned legacy `.gscore` with `(extern "__gs_builtin_assume" ...)` (base2-ordinary-extern) -> VCG ERROR
+cat > "$TMP_DIR/vcg_legacy_builtin_extern.gscore" << 'EOF'
+(program
+  (adts)
+  (externs (extern "__gs_builtin_assume" (("p0" bool)) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "__gs_builtin_assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_legacy_builtin_extern.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_builtin_extern_lean]: Lean geisha-check --verify-vcg accepted unversioned legacy __gs_builtin_assume!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_builtin_extern_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
+    exit 1
+fi
+
+# 4. Unversioned legacy `.gscore` with `(extern "assume" ...)` -> VCG ERROR
+cat > "$TMP_DIR/vcg_legacy_bare_extern.gscore" << 'EOF'
+(program
+  (adts)
+  (externs (extern "assume" (("p0" bool)) void))
+  (funs
+    (fun "observe" (("x" int)) int
+      (let "__gs_res"
+        (block
+          (apply-dir "assume" (bin eqInt (var "x") (lit-int 1)))
+          (var "x"))
+        (block
+          (let "r" (var "__gs_res")
+            (apply-dir "__gs_ensures" (bin eqInt (var "r") (lit-int 1))))
+          (var "__gs_res"))))
+    (fun "main" () void (lit-unit))))
+EOF
+if "$CHECKER_BIN" --verify-vcg "$TMP_DIR/vcg_legacy_bare_extern.gscore" 2>"$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_bare_extern_lean]: Lean geisha-check --verify-vcg accepted unversioned legacy extern assume!" >&2
+    exit 1
+fi
+if ! grep -q "^VCG ERROR" "$TMP_DIR/vcg_err.txt"; then
+    echo "FAIL [vcg_legacy_bare_extern_err]: expected '^VCG ERROR' (not PARSE ERROR), got:" >&2
+    cat "$TMP_DIR/vcg_err.txt" >&2
     exit 1
 fi
 

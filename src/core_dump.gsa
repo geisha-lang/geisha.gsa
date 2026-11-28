@@ -3635,7 +3635,7 @@ pub def dumpCoreProgramSExprWithRoots(prog: CoreProgram, extraRoots: List String
         None -> {
             let extStr = bufToString(externsBuf);
             let out = bufNew();
-            bufPushStr(out, "(program\n  (adts\n");
+            bufPushStr(out, "(program\n  (vcg-format 2)\n  (adts\n");
             bufPushStr(out, bufToString(adtsBuf));
             if (strLen(extStr) > 0) {
                 bufPushStr(out, "  )\n  (externs\n");

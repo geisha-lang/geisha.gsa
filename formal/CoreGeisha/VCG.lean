@@ -8372,11 +8372,14 @@ end
     Rejects fail-closed whenever any user function contains unmodeled constructs
     (e.g. Float equality, aliased mutable `Cell` calls, unannotated loops, or
     mutually recursive calls missing `decreases`). -/
-def verifyGscoreProgram (funs : List FunDef) (_externs : List ExternDecl := []) : Except String (Nat × List (Ident × SForm)) := do
-  -- 0. Fail-closed on any FunDef claiming reserved `__gs_builtin_*` names, and map explicit
-  --    `__gs_builtin_*` tags to true VCG built-ins while deflecting all bare legacy names
-  --    (`assert`, `assume`, `intToI64`, `i64ToInt`) to `$bare$<nm>` so neither shadowed FunDefs
-  --    nor unprefixed legacy extern decls can ever masquerade as built-in VCG primitives.
+def verifyGscoreProgram (funs : List FunDef) (_externs : List ExternDecl := []) (vcgFormat : Nat := 1) : Except String (Nat × List (Ident × SForm)) := do
+  -- 0. Reject legacy unversioned `.gscore` inputs lacking `(vcg-format 2)` fail-closed so no
+  --    pre-Z8 extern declaration (including user `extern "__gs_builtin_assume"`) can ever be
+  --    mistaken for a trusted built-in VCG primitive; then fail-closed on any FunDef claiming
+  --    reserved `__gs_builtin_*` names and map only explicit `__gs_builtin_*` tags to true VCG
+  --    built-ins while deflecting all bare legacy names to `$bare$<nm>`.
+  if vcgFormat < 2 then
+    throw "VCG FAIL-CLOSED: legacy unversioned .gscore input (missing '(vcg-format 2)'); please regenerate from source with 'geisha verify --dump-core'"
   if funs.any (fun fd => fd.name.startsWith "__gs_builtin_") then
     throw "VCG FAIL-CLOSED: user function name cannot start with reserved '__gs_builtin_' prefix"
   let funsAlpha : List FunDef := funs.map fun fd =>

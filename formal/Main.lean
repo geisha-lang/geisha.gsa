@@ -19,7 +19,7 @@ def main (args : List String) : IO UInt32 := do
       IO.eprintln s!"PARSE ERROR ({path}): {err}"
       return 1
     | .ok prog =>
-      match verifyGscoreProgram prog.funs prog.externs with
+      match verifyGscoreProgram prog.funs prog.externs prog.vcgFormat with
       | .error err =>
         IO.eprintln s!"VCG ERROR ({path}): {err}"
         return 1
