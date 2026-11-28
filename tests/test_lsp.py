@@ -66,6 +66,12 @@ class LspClient:
             self.notifications.append(resp)
 
     def notify(self, method: str, params: dict | None = None) -> None:
+        if method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"):
+            self.request("workspace/symbol", {"query": "__sync__"})
+            self.notifications = [
+                n for n in self.notifications
+                if n.get("method") != "textDocument/publishDiagnostics"
+            ]
         msg: dict = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params

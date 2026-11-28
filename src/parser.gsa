@@ -1,8 +1,9 @@
-// Recursive-Descent + 15-Level Pratt Precedence Parser & `?` Desugarer (`parser`)
+// Geisha Parser Built on Geisha-Native `parsec` v0.2 (`TokCursor` + `?` + `pratt` + `backtrack`)
+// & AST `?` (`ExTry`) Desugarer (`parser`)
 
 use std.option.{Option, Some, None}
 use std.result.{Result, Ok, Err}
-use std.list.{listRev, listAppend, listLen}
+use std.list.{listRev, listAppend}
 use std.vec.{Vec, vecLen, vecGetOr}
 use std.str.{intToStr, parseInt, parseFloat}
 use std.char.{isUpperByte, isLowerByte}
@@ -13,7 +14,7 @@ use ast.{
     ConstraintSpec, MkConstraint,
     Scheme, ScmMono, ScmPoly, ScmPolyConstrained, ScmSlot,
     Lit, LitInt, LitFloat, LitChar, LitStr, LitBool, LitUnit,
-    BinOp, OpAdd, OpSub, OpMul, OpDiv, OpRem, OpAnd, OpOr, OpLt, OpGe,
+    BinOp, OpAnd, OpOr, OpLt, OpGe,
     UnOp, UnNot, UnNeg, UnBitNot,
     VarDecl, MkVarDecl,
     Pattern, PatVar, PatWild, PatLit, PatTuple, PatCtor, PatStruct,
@@ -41,19 +42,136 @@ use lexer.{
     Token, MkToken, tokenizeInFile
 }
 use diag.{formatSpanDiag, formatSpanDiagHint}
+use parsec.{
+    Span as PSpan, ParseFail, ParseError, TokEntry, TokCursor, TokParser, InfixInfo,
+    curAtEnd, curOffset, newTokCursor, parseTokensFile, finishErrorFor,
+    fail, failHint, failAt, map, value, between,
+    commit, (<|>), backtrack, opt, optOr, peek, hadNewline, mark, spanFrom,
+    many, many1, skipMany, sepBy1, sepEndBy, sepEndBy1,
+    prattInfix, prattPostfix,
+    peekTok, atTok, atTokIf, peekNthTok, pushToken, bumpTok,
+    eatTok, expectTok, matchTok, tok, skipTok
+}
 
-pub data Parser {
-    MkParser {
-        tokens: Vec Token,
-        idx: Cell Int,
-        pushedSym: Cell (Option Token),
-        eofTok: Token,
-        pendingItems: Cell (List ModuleItem),
+type GsCursor = TokCursor TokKind
+type GsResult a = Result a ParseFail
+
+def toAstSpan(sp: PSpan): Span =
+    MkSpan { fileId: sp.fileId, start: sp.start, end: sp.end }
+
+def toPSpan(sp: Span): PSpan =
+    PSpan { fileId: sp.fileId, start: sp.start, end: sp.end }
+
+def curAstSpan(s: GsCursor): Span = match peekTok(s) {
+    Some(e) -> toAstSpan(e.span),
+    None -> {
+        let off = curOffset(s);
+        let startSp = spanFrom(s, off);
+        MkSpan { fileId: startSp.fileId, start: off, end: off }
     },
 }
 
-def eofToken(): Token =
-    MkToken { kind: TkEof, span: emptySpan(), hadNewline: true }
+def describeGsTok(tk: TokKind): String = match tk {
+    TkIdent(s) -> "'" + s + "'",
+    TkInt(s) -> "integer '" + s + "'",
+    TkFloat(s) -> "float '" + s + "'",
+    TkStr(_) -> "string literal",
+    TkChar(_) -> "character literal",
+    TkSym(s) -> "'" + s + "'",
+    TkQuestion -> "'?'",
+    TkLParen -> "'('",
+    TkRParen -> "')'",
+    TkLBrace -> "'{'",
+    TkRBrace -> "'}'",
+    TkLBracket -> "'['",
+    TkRBracket -> "']'",
+    TkComma -> "','",
+    TkSemi -> "';'",
+    TkDot -> "'.'",
+    TkDef -> "'def'",
+    TkExtern -> "'extern'",
+    TkIf -> "'if'",
+    TkElse -> "'else'",
+    TkWhile -> "'while'",
+    TkLet -> "'let'",
+    TkIn -> "'in'",
+    TkType -> "'type'",
+    TkData -> "'data'",
+    TkMatch -> "'match'",
+    TkConcept -> "'concept'",
+    TkInstance -> "'instance'",
+    TkForall -> "'forall'",
+    TkPub -> "'pub'",
+    TkUse -> "'use'",
+    TkMod -> "'mod'",
+    TkOpen -> "'open'",
+    TkAs -> "'as'",
+    TkTrue -> "'true'",
+    TkFalse -> "'false'",
+    TkVoid -> "'Void'",
+    TkEof -> "end of input",
+}
+
+def copyTokensLoop(toks: Vec Token, out: MutArray (TokEntry TokKind), count: Int, idx: Int, dummy: Token): Void =
+    if (idx >= count) ()
+    else {
+        let t = vecGetOr(toks, idx, dummy);
+        arraySet(out, idx, TokEntry {
+            kind: t.kind,
+            span: toPSpan(t.span),
+            hadNewline: t.hadNewline,
+        });
+        copyTokensLoop(toks, out, count, idx + 1, dummy)
+    }
+
+def freezeLexTokens(toks: Vec Token): ImmArray (TokEntry TokKind) = {
+    let rawLen = vecLen(toks);
+    // `lexer.tokenizeInFile` appends a sentinel `TkEof` at `rawLen - 1`
+    let count =
+        if (rawLen > 0) {
+            let last = vecGetOr(toks, rawLen - 1, MkToken { kind: TkEof, span: emptySpan(), hadNewline: true });
+            match last.kind {
+                TkEof -> rawLen - 1,
+                _ -> rawLen,
+            }
+        } else 0;
+    if (count <= 0) {
+        arrayFreeze(arrayNewZeroed(0))
+    } else {
+        let dummy = MkToken { kind: TkEof, span: emptySpan(), hadNewline: true };
+        let t0 = vecGetOr(toks, 0, dummy);
+        let arr = arrayNew(count, TokEntry { kind: t0.kind, span: toPSpan(t0.span), hadNewline: t0.hadNewline });
+        copyTokensLoop(toks, arr, count, 1, dummy);
+        arrayFreeze(arr)
+    }
+}
+
+def formatParseErrorDiag(pe: ParseError): String = {
+    let sp = MkSpan { fileId: pe.fileId, start: pe.offset, end: pe.endOffset };
+    let msg =
+        if (strLen(pe.expected) > 0 && strByteAt(pe.expected, 0) == 33)
+            ptrSliceFromStr(pe.expected, 1, strLen(pe.expected) - 1)
+        else
+            "expected " + pe.expected + ", found " + pe.found;
+    if (strLen(pe.hint) > 0) formatSpanDiagHint("Parse error", sp, msg, pe.hint)
+    else formatSpanDiag("Parse error", sp, msg)
+}
+
+def failMsg(s: GsCursor, msg: String): GsResult a =
+    fail("!" + msg)(s)
+
+def failMsgHint(s: GsCursor, msg: String, hint: String): GsResult a =
+    failHint("!" + msg, hint)(s)
+
+def failSpanMsg(s: GsCursor, sp: Span, msg: String): GsResult a =
+    failAt(s, sp.start, "!" + msg, "")
+
+def failSpanMsgHint(s: GsCursor, sp: Span, msg: String, hint: String): GsResult a =
+    failAt(s, sp.start, "!" + msg, hint)
+
+// ============================================================================
+// Lexical Helpers & Strict 32-Bit Numeric Literals
+// ============================================================================
 
 def hexDigitVal(b: Int): Int =
     if (b >= 48 && b <= 57) b - 48
@@ -67,304 +185,159 @@ def isRadixIntRaw(raw: String): Bool =
         b1 == 120 || b1 == 111 || b1 == 98
     } else false
 
-def parseRadixLitInt(raw: String, neg: Bool, sp: Span): Result Int String = {
-    let b1 = strByteAt(raw, 1);
-    let radix = if (b1 == 120) 16 else if (b1 == 111) 8 else 2;
-    let rad64 = intToI64(radix);
-    let maxU32 = (intToI64(65535) << 16) | intToI64(65535);
-    let maxNegMag = intToI64(1) << 31;
-    let limit = if (neg) maxNegMag else maxU32;
-    let n = strLen(raw);
-    let acc = cellNew(intToI64(0));
-    let i = cellNew(2);
-    let overflow = cellNew(false);
-    while (cellGet(i) < n && !cellGet(overflow)) {
-        let dv = hexDigitVal(strByteAt(raw, cellGet(i)));
-        let next = cellGet(acc) * rad64 + intToI64(dv);
-        if (dv < 0 || dv >= radix || next > limit) {
-            cellSet(overflow, true)
-        } else {
-            cellSet(acc, next);
-            cellSet(i, cellGet(i) + 1)
-        }
-    };
-    if (cellGet(overflow)) {
-        let disp = if (neg) "-" + raw else raw;
-        Err(formatSpanDiag("Parse error", sp, "integer literal '" + disp + "' out of 32-bit Int range"))
-    } else {
-        let v64 = cellGet(acc);
-        if (neg) Ok(i64ToInt(intToI64(0) - v64))
-        else Ok(i64ToInt(v64))
-    }
-}
-
-def parseStrictIntTok(raw: String, neg: Bool, sp: Span): Result Int String =
-    if (isRadixIntRaw(raw)) {
-        parseRadixLitInt(raw, neg, sp)
-    } else {
-        let s = if (neg) "-" + raw else raw;
-        match parseInt(s) {
-            Ok(n) -> Ok(n),
-            Err(_) -> Err(formatSpanDiagHint(
-                "Parse error",
-                sp,
-                "integer literal '" + s + "' out of 32-bit Int range (-2147483648..2147483647)",
-                "append '.0' for Float, or parse via std.str.parseInt64 for 64-bit integers"
-            )),
-        }
-    }
-
-def prependRev(xs: List a, accRev: List a): List a = match xs {
-    Nil -> accRev,
-    Cons(h, t) -> prependRev(t, Cons(h, accRev)),
-}
-
-def newParser(toks: Vec Token): Parser =
-    MkParser {
-        tokens: toks,
-        idx: cellNew(0),
-        pushedSym: cellNew(None),
-        eofTok: eofToken(),
-        pendingItems: cellNew(Nil),
-    }
-
-def savePos(p: Parser): (Int, Option Token) =
-    (cellGet(p.idx), cellGet(p.pushedSym))
-
-def restorePos(p: Parser, snap: (Int, Option Token)): Void = match snap {
-    (i, ps) -> {
-        cellSet(p.idx, i);
-        cellSet(p.pushedSym, ps)
-    },
-}
-
-def peekTok(p: Parser): Token = match cellGet(p.pushedSym) {
-    Some(t) -> t,
-    None -> {
-        let i = cellGet(p.idx);
-        let n = vecLen(p.tokens);
-        if (i < n) vecGetOr(p.tokens, i, p.eofTok) else p.eofTok
-    },
-}
-
-def bumpTok(p: Parser): Token = match cellGet(p.pushedSym) {
-    Some(t) -> {
-        cellSet(p.pushedSym, None);
-        t
-    },
-    None -> {
-        let i = cellGet(p.idx);
-        let n = vecLen(p.tokens);
-        if (i < n) {
-            let t = vecGetOr(p.tokens, i, p.eofTok);
-            if (i + 1 < n) cellSet(p.idx, i + 1) else ();
-            t
-        } else p.eofTok
-    },
-}
-
-def peekAt(p: Parser, offset: Int): Token =
-    if (offset == 0) peekTok(p)
+def scanRadixLoop(raw: String, n: Int, radix: Int, rad64: Int64, limit: Int64, i: Int, acc: Int64): Option Int64 =
+    if (i >= n) Some(acc)
     else {
-        let base = match cellGet(p.pushedSym) {
-            Some(_) -> cellGet(p.idx) + offset - 1,
-            None -> cellGet(p.idx) + offset,
-        };
-        let n = vecLen(p.tokens);
-        if (base < n) vecGetOr(p.tokens, base, p.eofTok) else p.eofTok
+        let dv = hexDigitVal(strByteAt(raw, i));
+        let next = acc * rad64 + intToI64(dv);
+        if (dv < 0 || dv >= radix || next > limit) None
+        else scanRadixLoop(raw, n, radix, rad64, limit, i + 1, next)
     }
 
-def parseErr(p: Parser, msg: String): String =
-    formatSpanDiag("Parse error", peekTok(p).span, msg)
-
-def parseErrHint(p: Parser, msg: String, hint: String): String =
-    formatSpanDiagHint("Parse error", peekTok(p).span, msg, hint)
-
-def isEof(p: Parser): Bool = match peekTok(p).kind {
-    TkEof -> true,
-    _ -> false,
-}
-
-def eatSemi(p: Parser): Bool = match peekTok(p).kind {
-    TkSemi -> { let _ = bumpTok(p); true },
-    _ -> false,
-}
-
-def skipSemis(p: Parser): Void = {
-    while (eatSemi(p)) { () }
-}
-
-def eatComma(p: Parser): Bool = match peekTok(p).kind {
-    TkComma -> { let _ = bumpTok(p); true },
-    _ -> false,
-}
-
-def eatSym(p: Parser, target: String): Bool = match peekTok(p).kind {
-    TkSym(s) -> if (s == target) { let _ = bumpTok(p); true } else false,
-    _ -> false,
-}
-
-def expectSym(p: Parser, target: String): Result Span String = {
-    let t = peekTok(p);
-    match t.kind {
-        TkSym(s) ->
-            if (s == target) { let _ = bumpTok(p); Ok(t.span) }
-            else Err(parseErr(p, "expected '" + target + "', got '" + s + "'")),
-        _ -> Err(parseErr(p, "expected '" + target + "'")),
-    }
-}
-
-def expectLParen(p: Parser): Result Span String = match peekTok(p).kind {
-    TkLParen -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected '('")),
-}
-
-def expectRParen(p: Parser): Result Span String = match peekTok(p).kind {
-    TkRParen -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected ')'")),
-}
-
-def expectLBrace(p: Parser): Result Span String = match peekTok(p).kind {
-    TkLBrace -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected '{'")),
-}
-
-def expectRBrace(p: Parser): Result Span String = match peekTok(p).kind {
-    TkRBrace -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected '}'")),
-}
-
-def expectRBracket(p: Parser): Result Span String = match peekTok(p).kind {
-    TkRBracket -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected ']'")),
-}
-
-def expectDot(p: Parser): Result Span String = match peekTok(p).kind {
-    TkDot -> Ok(bumpTok(p).span),
-    _ -> Err(parseErr(p, "expected '.'")),
-}
-
-def parseIdent(p: Parser): Result String String = match peekTok(p).kind {
-    TkIdent(s) -> { let _ = bumpTok(p); Ok(s) },
-    _ -> Err(parseErr(p, "expected identifier")),
-}
-
-def parseLowerIdent(p: Parser): Result String String = match peekTok(p).kind {
-    TkIdent(s) -> {
-        let b0 = strByteAt(s, 0);
-        if ((isLowerByte(b0) || b0 == 95) && s != "_") {
-            let _ = bumpTok(p);
-            Ok(s)
-        } else Err(parseErr(p, "expected lowercase identifier, got '" + s + "'"))
-    },
-    _ -> Err(parseErr(p, "expected lowercase identifier")),
-}
-
-def parseTypeVarIdent(p: Parser): Result String String = match peekTok(p).kind {
-    TkIdent(s) ->
-        if (isLowerByte(strByteAt(s, 0))) {
-            let _ = bumpTok(p);
-            Ok(s)
-        } else Err(parseErr(p, "expected type variable, got '" + s + "'")),
-    _ -> Err(parseErr(p, "expected type variable")),
-}
-
-def parseUpperIdent(p: Parser): Result String String = match peekTok(p).kind {
-    TkIdent(s) ->
-        if (isUpperByte(strByteAt(s, 0))) {
-            let _ = bumpTok(p);
-            Ok(s)
-        } else Err(parseErr(p, "expected uppercase type/constructor name, got '" + s + "'")),
-    _ -> Err(parseErr(p, "expected uppercase name")),
-}
-
-/// Parse an identifier OR parenthesized operator `(op)` (e.g. `def (|>)(x, f)` or `use m.{ (<+>) }`).
-def parseCallableIdent(p: Parser): Result String String = match peekTok(p).kind {
-    TkLParen -> {
-        let snap = savePos(p);
-        let _ = bumpTok(p);
-        match peekTok(p).kind {
-            TkSym(op) ->
-                if (isDefinableOp(op)) {
-                    let _ = bumpTok(p);
-                    match peekTok(p).kind {
-                        TkRParen -> {
-                            let _ = bumpTok(p);
-                            Ok(encodeOpName(op))
-                        },
-                        _ -> {
-                            restorePos(p, snap);
-                            Err(parseErr(p, "expected ')' after operator name"))
-                        },
-                    }
-                } else {
-                    restorePos(p, snap);
-                    Err(parseErr(p, "reserved symbol '" + op + "' cannot be defined as an operator"))
-                },
-            _ -> {
-                restorePos(p, snap);
-                Err(parseErr(p, "expected operator inside parentheses"))
+def parseStrictIntTok(s: GsCursor, raw: String, neg: Bool, sp: Span): GsResult Int =
+    if (isRadixIntRaw(raw)) {
+        let b1 = strByteAt(raw, 1);
+        let radix = if (b1 == 120) 16 else if (b1 == 111) 8 else 2;
+        let maxU32 = (intToI64(65535) << 16) | intToI64(65535);
+        let maxNegMag = intToI64(1) << 31;
+        let limit = if (neg) maxNegMag else maxU32;
+        match scanRadixLoop(raw, strLen(raw), radix, intToI64(radix), limit, 2, intToI64(0)) {
+            None -> {
+                let disp = if (neg) "-" + raw else raw;
+                failSpanMsg(s, sp, "integer literal '" + disp + "' out of 32-bit Int range")
             },
+            Some(v64) ->
+                if (neg) Ok(i64ToInt(intToI64(0) - v64))
+                else Ok(i64ToInt(v64)),
         }
-    },
-    _ -> parseIdent(p),
+    } else {
+        let full = if (neg) "-" + raw else raw;
+        match parseInt(full) {
+            Ok(n) -> Ok(n),
+            Err(_) -> failSpanMsgHint(
+                s,
+                sp,
+                "integer literal '" + full + "' out of 32-bit Int range (-2147483648..2147483647)",
+                "append '.0' for Float, or parse via std.str.parseInt64 for 64-bit integers"
+            ),
+        }
+    }
+
+def parseFloatTok(s: GsCursor, raw: String, sp: Span): GsResult Float =
+    match parseFloat(raw) {
+        Ok(f) -> Ok(f),
+        Err(msg) -> failSpanMsg(s, sp, msg),
+    }
+
+def skipSemis(s: GsCursor): GsResult Void =
+    skipMany(skipTok(TkSemi))(s)
+
+def tryEatSym(s: GsCursor, target: String): Bool =
+    if (atTok(s, TkSym(target))) {
+        let _ = bumpTok(s);
+        true
+    } else false
+
+def tryEatTok(s: GsCursor, target: TokKind): Bool =
+    if (atTok(s, target)) {
+        let _ = bumpTok(s);
+        true
+    } else false
+
+def eatSym(s: GsCursor, target: String): GsResult Span = {
+    let sp = eatTok(s, TkSym(target))?;
+    Ok(toAstSpan(sp))
 }
 
+def asIdent(tk: TokKind): Option String = match tk {
+    TkIdent(id) -> Some(id),
+    _ -> None,
+}
+
+def asLowerIdent(tk: TokKind): Option String = match tk {
+    TkIdent(id) -> {
+        let b0 = strByteAt(id, 0);
+        if ((isLowerByte(b0) || b0 == 95) && id != "_") Some(id) else None
+    },
+    _ -> None,
+}
+
+def asTypeVarIdent(tk: TokKind): Option String = match tk {
+    TkIdent(id) -> if (isLowerByte(strByteAt(id, 0))) Some(id) else None,
+    _ -> None,
+}
+
+def asUpperIdent(tk: TokKind): Option String = match tk {
+    TkIdent(id) -> if (isUpperByte(strByteAt(id, 0))) Some(id) else None,
+    _ -> None,
+}
+
+def parseIdent(s: GsCursor): GsResult String = {
+    let (_, id) = matchTok(s, asIdent, "identifier")?;
+    Ok(id)
+}
+
+def parseIdentSpan(s: GsCursor): GsResult (Span, String) = {
+    let (sp, id) = matchTok(s, asIdent, "identifier")?;
+    Ok((toAstSpan(sp), id))
+}
+
+def parseLowerIdent(s: GsCursor): GsResult String = {
+    let (_, id) = matchTok(s, asLowerIdent, "lowercase identifier")?;
+    Ok(id)
+}
+
+def parseTypeVarIdent(s: GsCursor): GsResult String = {
+    let (_, id) = matchTok(s, asTypeVarIdent, "type variable")?;
+    Ok(id)
+}
+
+def parseUpperIdent(s: GsCursor): GsResult String = {
+    let (_, id) = matchTok(s, asUpperIdent, "uppercase name")?;
+    Ok(id)
+}
+
+def parseParenOpName(s: GsCursor): GsResult String = {
+    let _ = eatTok(s, TkLParen)?;
+    let (_, sym) = matchTok(s, (tk) -> match tk { TkSym(op) -> Some(op), _ -> None }, "operator")?;
+    if (!isDefinableOp(sym)) {
+        failMsg(s, "reserved symbol '" + sym + "' cannot be defined as an operator")
+    } else {
+        let _ = eatTok(s, TkRParen)?;
+        Ok(encodeOpName(sym))
+    }
+}
+
+def parseCallableIdent(s: GsCursor): GsResult String =
+    if (atTok(s, TkLParen)) backtrack(parseParenOpName)(s)
+    else parseIdent(s)
+
 // ============================================================================
-// Type & Scheme Grammar
+// Layer 1: Type, Constraint, FunDep & Scheme Grammar
 // ============================================================================
+
+def addFtvsFromTypes(ts: List Type, acc: List String): List String = match ts {
+    Nil -> acc,
+    Cons(ta, rest) -> {
+        let nextAcc = addStringsUnique(ftvOrdered(ta), acc);
+        addFtvsFromTypes(rest, nextAcc)
+    },
+}
+
+def addStringsUnique(xs: List String, acc: List String): List String = match xs {
+    Nil -> acc,
+    Cons(x, rest) -> addStringsUnique(rest, addUniqueStr(acc, x)),
+}
+
+def addFtvsFromConstraints(cs: List ConstraintSpec, acc: List String): List String = match cs {
+    Nil -> acc,
+    Cons(c, rest) -> addFtvsFromConstraints(rest, addFtvsFromTypes(c.typeArgs, acc)),
+}
 
 def buildConstrainedScheme(explicitVars: List String, cs: List ConstraintSpec, body: Type): Scheme = {
-    let vars = cellNew(Nil);
-    let cur1 = cellNew(explicitVars);
-    while (match cellGet(cur1) { Nil -> false, _ -> true }) {
-        match cellGet(cur1) {
-            Cons(v, r) -> {
-                cellSet(vars, addUniqueStr(cellGet(vars), v));
-                cellSet(cur1, r)
-            },
-            Nil -> (),
-        }
-    };
-    let cur2 = cellNew(cs);
-    while (match cellGet(cur2) { Nil -> false, _ -> true }) {
-        match cellGet(cur2) {
-            Cons(c, r) -> {
-                let ca = cellNew(c.typeArgs);
-                while (match cellGet(ca) { Nil -> false, _ -> true }) {
-                    match cellGet(ca) {
-                        Cons(ta, ra) -> {
-                            let cfv = cellNew(ftvOrdered(ta));
-                            while (match cellGet(cfv) { Nil -> false, _ -> true }) {
-                                match cellGet(cfv) {
-                                    Cons(fv, rfv) -> {
-                                        cellSet(vars, addUniqueStr(cellGet(vars), fv));
-                                        cellSet(cfv, rfv)
-                                    },
-                                    Nil -> (),
-                                }
-                            };
-                            cellSet(ca, ra)
-                        },
-                        Nil -> (),
-                    }
-                };
-                cellSet(cur2, r)
-            },
-            Nil -> (),
-        }
-    };
-    let cur3 = cellNew(ftvOrdered(body));
-    while (match cellGet(cur3) { Nil -> false, _ -> true }) {
-        match cellGet(cur3) {
-            Cons(fv, r) -> {
-                cellSet(vars, addUniqueStr(cellGet(vars), fv));
-                cellSet(cur3, r)
-            },
-            Nil -> (),
-        }
-    };
-    let binders = cellGet(vars);
+    let v1 = addStringsUnique(explicitVars, Nil);
+    let v2 = addFtvsFromConstraints(cs, v1);
+    let binders = addStringsUnique(ftvOrdered(body), v2);
     match cs {
         Nil -> match binders {
             Nil -> ScmMono(body),
@@ -374,318 +347,176 @@ def buildConstrainedScheme(explicitVars: List String, cs: List ConstraintSpec, b
     }
 }
 
-def parseTypeConstraint(p: Parser): Result ConstraintSpec String = {
-    let cname = parseUpperIdent(p)?;
-    let a0 = parseTypeAtom(p)?;
-    let args = cellNew([a0]);
-    while (canStartTypeAtomInline(p)) {
-        let an = parseTypeAtom(p)?;
-        cellSet(args, listAppend(cellGet(args), [an]))
-    };
-    Ok(MkConstraint { conceptName: cname, typeArgs: cellGet(args) })
-}
-
-def canStartLowerIdentInline(p: Parser): Bool = {
-    let t = peekTok(p);
-    if (t.hadNewline) false
-    else match t.kind {
-        TkIdent(s) -> strLen(s) > 0 && isLowerByte(strByteAt(s, 0)),
-        _ -> false,
-    }
-}
-
-def parseConceptSupersClause(p: Parser): Result (List ConstraintSpec) String =
-    if (eatSym(p, ":")) {
-        match peekTok(p).kind {
-            TkLParen -> {
-                let _ = bumpTok(p);
-                let first = parseTypeConstraint(p)?;
-                let acc = cellNew([first]);
-                while (eatComma(p)) {
-                    match peekTok(p).kind {
-                        TkRParen -> (),
-                        _ -> {
-                            let c = parseTypeConstraint(p)?;
-                            cellSet(acc, listAppend(cellGet(acc), [c]))
-                        },
-                    }
-                };
-                let _ = expectRParen(p)?;
-                Ok(cellGet(acc))
-            },
-            _ -> {
-                let c = parseTypeConstraint(p)?;
-                Ok([c])
-            },
-        }
-    } else match tryParseConstraintPrefix(p) {
-        Some(cs) -> Ok(cs),
-        None -> Ok(Nil),
-    }
-
-def parseFunDepVarList(p: Parser): Result (List String) String = {
-    let v0 = parseTypeVarIdent(p)?;
-    let vs = cellNew([v0]);
-    while (canStartLowerIdentInline(p)) {
-        let vn = parseTypeVarIdent(p)?;
-        cellSet(vs, listAppend(cellGet(vs), [vn]))
-    };
-    Ok(cellGet(vs))
-}
-
-def parseFunDepsClause(p: Parser): Result (List FunDep) String =
-    if (!eatSym(p, "|")) Ok(Nil)
-    else {
-        let fds = cellNew(Nil);
-        let more = cellNew(true);
-        while (cellGet(more)) {
-            let lhs = parseFunDepVarList(p)?;
-            let _ = expectSym(p, "->")?;
-            let rhs = parseFunDepVarList(p)?;
-            cellSet(fds, listAppend(cellGet(fds), [MkFunDep { fdLhs: lhs, fdRhs: rhs }]));
-            if (!eatComma(p)) cellSet(more, false) else ()
-        };
-        Ok(cellGet(fds))
-    }
-
-/// Try parsing `(C1 a, C2 b) =>` or `C a =>`; backtracks cleanly if `=>` is absent!
-def tryParseConstraintPrefix(p: Parser): Option (List ConstraintSpec) = {
-    let snap = savePos(p);
-    match peekTok(p).kind {
-        TkLParen -> {
-            let _ = bumpTok(p);
-            match parseTypeConstraint(p) {
-                Err(_) -> { restorePos(p, snap); None },
-                Ok(first) -> {
-                    let acc = cellNew([first]);
-                    let ok = cellNew(true);
-                    while (cellGet(ok) && eatComma(p)) {
-                        match peekTok(p).kind {
-                            TkRParen -> (),
-                            _ -> match parseTypeConstraint(p) {
-                                Ok(c) -> cellSet(acc, listAppend(cellGet(acc), [c])),
-                                Err(_) -> cellSet(ok, false),
-                            },
-                        }
-                    };
-                    if (!cellGet(ok)) { restorePos(p, snap); None }
-                    else match peekTok(p).kind {
-                        TkRParen -> {
-                            let _ = bumpTok(p);
-                            if (eatSym(p, "=>")) Some(cellGet(acc))
-                            else { restorePos(p, snap); None }
-                        },
-                        _ -> { restorePos(p, snap); None },
-                    }
-                },
-            }
-        },
-        TkIdent(s) ->
-            if (isUpperByte(strByteAt(s, 0))) {
-                match parseTypeConstraint(p) {
-                    Ok(c) ->
-                        if (eatSym(p, "=>")) Some([c])
-                        else { restorePos(p, snap); None },
-                    Err(_) -> { restorePos(p, snap); None },
-                }
-            } else None,
-        _ -> None,
-    }
-}
-
-def canStartTypeAtomInline(p: Parser): Bool = {
-    let t = peekTok(p);
-    if (t.hadNewline) false
-    else match t.kind {
+def canStartTypeAtomInline(s: GsCursor): Bool =
+    if (hadNewline(s)) false
+    else atTokIf(s, (tk) -> match tk {
         TkLParen -> true,
         TkVoid -> true,
-        TkIdent(s) -> s != "_",
+        TkIdent(id) -> id != "_",
         _ -> false,
+    })
+
+def parseInlineTypeAtoms(s: GsCursor, accRev: List Type): GsResult (List Type) =
+    if (!canStartTypeAtomInline(s)) Ok(listRev(accRev))
+    else {
+        let a = parseTypeAtom(s)?;
+        parseInlineTypeAtoms(s, Cons(a, accRev))
     }
+
+def parseTypeConstraint(s: GsCursor): GsResult ConstraintSpec = {
+    let cname = parseUpperIdent(s)?;
+    let a0 = parseTypeAtom(s)?;
+    let args = parseInlineTypeAtoms(s, [a0])?;
+    Ok(MkConstraint { conceptName: cname, typeArgs: args })
 }
 
-def parseTypeAtom(p: Parser): Result Type String = match peekTok(p).kind {
-    TkVoid -> { let _ = bumpTok(p); Ok(TyVoid) },
-    TkLParen -> {
-        let _ = bumpTok(p);
-        match peekTok(p).kind {
-            TkRParen -> { let _ = bumpTok(p); Ok(TyVoid) },
-            _ -> {
-                let first = parseTypeExpr(p)?;
-                if (eatComma(p)) {
-                    let elems = cellNew([first]);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRParen -> cellSet(more, false),
-                            _ -> {
-                                let nxt = parseTypeExpr(p)?;
-                                cellSet(elems, listAppend(cellGet(elems), [nxt]));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
-                    };
-                    let _ = expectRParen(p)?;
-                    Ok(TyTuple(cellGet(elems)))
-                } else {
-                    let _ = expectRParen(p)?;
-                    Ok(first)
-                }
-            },
+def parseConstraintPrefix(s: GsCursor): GsResult (List ConstraintSpec) =
+    if (atTok(s, TkLParen)) {
+        let cs = between(tok(TkLParen), tok(TkRParen), sepEndBy1(parseTypeConstraint, skipTok(TkComma)))(s)?;
+        let _ = eatSym(s, "=>")?;
+        Ok(cs)
+    } else {
+        let c = parseTypeConstraint(s)?;
+        let _ = eatSym(s, "=>")?;
+        Ok([c])
+    }
+
+def parseConceptSupersClause(s: GsCursor): GsResult (List ConstraintSpec) =
+    if (tryEatSym(s, ":")) {
+        commit(s);
+        if (atTok(s, TkLParen))
+            between(tok(TkLParen), tok(TkRParen), sepEndBy1(parseTypeConstraint, skipTok(TkComma)))(s)
+        else {
+            let c = parseTypeConstraint(s)?;
+            Ok([c])
         }
-    },
-    TkIdent(s) -> {
-        let _ = bumpTok(p);
-        if (isUpperByte(strByteAt(s, 0))) Ok(TyCon(s))
-        else if (isLowerByte(strByteAt(s, 0))) {
-            // Check qualified type `mod1.mod2.UpperType`
-            if (match peekTok(p).kind { TkDot -> true, _ -> false }) {
-                let full = cellNew(s);
-                while (match peekTok(p).kind { TkDot -> true, _ -> false }) {
-                    let _ = bumpTok(p);
-                    let seg = parseIdent(p)?;
-                    cellSet(full, cellGet(full) + "." + seg)
-                };
-                Ok(TyCon(cellGet(full)))
-            } else Ok(TyVar(s))
-        } else Err(parseErr(p, "invalid type identifier '" + s + "'"))
-    },
-    _ -> Err(parseErr(p, "expected type")),
+    } else optOr(backtrack(parseConstraintPrefix), Nil)(s)
+
+def parseInlineLowerIdents(s: GsCursor, accRev: List String): GsResult (List String) =
+    if (hadNewline(s) || !atTokIf(s, (tk) -> match asTypeVarIdent(tk) { Some(_) -> true, None -> false }))
+        Ok(listRev(accRev))
+    else {
+        let v = parseTypeVarIdent(s)?;
+        parseInlineLowerIdents(s, Cons(v, accRev))
+    }
+
+def parseFunDep(s: GsCursor): GsResult FunDep = {
+    let v0 = parseTypeVarIdent(s)?;
+    let lhs = parseInlineLowerIdents(s, [v0])?;
+    let _ = eatSym(s, "->")?;
+    let r0 = parseTypeVarIdent(s)?;
+    let rhs = parseInlineLowerIdents(s, [r0])?;
+    Ok(MkFunDep { fdLhs: lhs, fdRhs: rhs })
 }
 
-def parseBType(p: Parser): Result Type String = {
-    let first = parseTypeAtom(p)?;
-    let args = cellNew([first]);
-    while (canStartTypeAtomInline(p)) {
-        let a = parseTypeAtom(p)?;
-        cellSet(args, listAppend(cellGet(args), [a]))
-    };
-    Ok(composeTypes(cellGet(args)))
-}
+def parseFunDepsClause(s: GsCursor): GsResult (List FunDep) =
+    if (!tryEatSym(s, "|")) Ok(Nil)
+    else {
+        commit(s);
+        sepBy1(parseFunDep, skipTok(TkComma))(s)
+    }
 
-pub def parseTypeExpr(p: Parser): Result Type String = {
-    // Check `(T1, T2, ...) -> R` or `() -> R` first via backtrack
-    let snap = savePos(p);
-    let arrowTry: Option (Result Type String) = match peekTok(p).kind {
-        TkLParen -> {
-            let _ = bumpTok(p);
-            let ps = cellNew(Nil);
-            let ok = cellNew(true);
-            let looping = cellNew(true);
-            while (cellGet(looping) && cellGet(ok)) {
-                match peekTok(p).kind {
-                    TkRParen -> cellSet(looping, false),
-                    _ -> match parseTypeExpr(p) {
-                        Ok(t) -> {
-                            cellSet(ps, listAppend(cellGet(ps), [t]));
-                            if (!eatComma(p)) cellSet(looping, false) else ()
-                        },
-                        Err(_) -> cellSet(ok, false),
-                    },
-                }
-            };
-            if (!cellGet(ok)) {
-                restorePos(p, snap);
-                None
-            } else match peekTok(p).kind {
-                TkRParen -> {
-                    let _ = bumpTok(p);
-                    if (eatSym(p, "->")) {
-                        Some(match parseTypeExpr(p) {
-                            Ok(rhs) -> Ok(TyArr(TyVoid, cellGet(ps), rhs)),
-                            Err(e) -> Err(e),
-                        })
-                    } else {
-                        restorePos(p, snap);
-                        None
-                    }
-                },
-                _ -> {
-                    restorePos(p, snap);
-                    None
-                },
+def parseQualifiedTypeTail(s: GsCursor, prefix: String): GsResult String =
+    if (!tryEatTok(s, TkDot)) Ok(prefix)
+    else {
+        commit(s);
+        let seg = parseIdent(s)?;
+        parseQualifiedTypeTail(s, prefix + "." + seg)
+    }
+
+def parseTypeAtom(s: GsCursor): GsResult Type =
+    if (tryEatTok(s, TkVoid)) Ok(TyVoid)
+    else if (atTok(s, TkLParen)) {
+        let _ = eatTok(s, TkLParen)?;
+        commit(s);
+        if (tryEatTok(s, TkRParen)) Ok(TyVoid)
+        else {
+            let first = parseTypeExpr(s)?;
+            if (tryEatTok(s, TkComma)) {
+                let rest = sepEndBy(parseTypeExpr, skipTok(TkComma))(s)?;
+                let _ = eatTok(s, TkRParen)?;
+                Ok(TyTuple(Cons(first, rest)))
+            } else {
+                let _ = eatTok(s, TkRParen)?;
+                Ok(first)
             }
-        },
-        _ -> None,
-    };
-
-    match arrowTry {
-        Some(res) -> res,
-        None -> {
-            let lhs = parseBType(p)?;
-            if (eatSym(p, "->")) {
-                let rhs = parseTypeExpr(p)?;
-                let params = match lhs {
-                    TyVoid -> Nil,
-                    _ -> [lhs],
-                };
-                Ok(TyArr(TyVoid, params, rhs))
-            } else Ok(lhs)
-        },
-    }
-}
-
-pub def parseTypeScheme(p: Parser): Result Scheme String = match peekTok(p).kind {
-    TkForall -> {
-        let _ = bumpTok(p);
-        match peekTok(p).kind {
-            TkLParen -> {
-                // Sugar: `forall (Eq a, Show a). body`
-                let _ = bumpTok(p);
-                let first = parseTypeConstraint(p)?;
-                let cs = cellNew([first]);
-                while (eatComma(p)) {
-                    match peekTok(p).kind {
-                        TkRParen -> (),
-                        _ -> {
-                            let c = parseTypeConstraint(p)?;
-                            cellSet(cs, listAppend(cellGet(cs), [c]))
-                        },
-                    }
-                };
-                let _ = expectRParen(p)?;
-                let _ = expectDot(p)?;
-                let body = parseTypeExpr(p)?;
-                Ok(buildConstrainedScheme(Nil, cellGet(cs), body))
-            },
-            _ -> {
-                let v0 = parseTypeVarIdent(p)?;
-                let vs = cellNew([v0]);
-                while (match peekTok(p).kind { TkIdent(s) -> isLowerByte(strByteAt(s, 0)), _ -> false }) {
-                    let v = parseTypeVarIdent(p)?;
-                    cellSet(vs, addUniqueStr(cellGet(vs), v))
-                };
-                let _ = expectDot(p)?;
-                match tryParseConstraintPrefix(p) {
-                    Some(cs) -> {
-                        let body = parseTypeExpr(p)?;
-                        Ok(buildConstrainedScheme(cellGet(vs), cs, body))
-                    },
-                    None -> {
-                        let body = parseTypeExpr(p)?;
-                        Ok(ScmPoly(cellGet(vs), body))
-                    },
-                }
-            },
         }
-    },
-    _ -> match tryParseConstraintPrefix(p) {
-        Some(cs) -> {
-            let body = parseTypeExpr(p)?;
-            Ok(buildConstrainedScheme(Nil, cs, body))
-        },
-        None -> {
-            let body = parseTypeExpr(p)?;
-            Ok(ScmMono(body))
-        },
-    },
+    } else if (atTokIf(s, (tk) -> match asIdent(tk) { Some(_) -> true, None -> false })) {
+        let id = parseIdent(s)?;
+        if (isUpperByte(strByteAt(id, 0))) Ok(TyCon(id))
+        else if (isLowerByte(strByteAt(id, 0))) {
+            if (atTok(s, TkDot)) {
+                let full = parseQualifiedTypeTail(s, id)?;
+                Ok(TyCon(full))
+            } else Ok(TyVar(id))
+        } else failMsg(s, "invalid type identifier '" + id + "'")
+    } else fail("type")(s)
+
+def parseBType(s: GsCursor): GsResult Type = {
+    let first = parseTypeAtom(s)?;
+    let all = parseInlineTypeAtoms(s, [first])?;
+    Ok(composeTypes(all))
 }
+
+def parseParenArrowType(s: GsCursor): GsResult Type = {
+    let params = between(tok(TkLParen), tok(TkRParen), sepEndBy(parseTypeExpr, skipTok(TkComma)))(s)?;
+    let _ = eatSym(s, "->")?;
+    commit(s);
+    let rhs = parseTypeExpr(s)?;
+    Ok(TyArr(TyVoid, params, rhs))
+}
+
+def parseSingleOrBType(s: GsCursor): GsResult Type = {
+    let lhs = parseBType(s)?;
+    if (tryEatSym(s, "->")) {
+        commit(s);
+        let rhs = parseTypeExpr(s)?;
+        let params = match lhs {
+            TyVoid -> Nil,
+            _ -> [lhs],
+        };
+        Ok(TyArr(TyVoid, params, rhs))
+    } else Ok(lhs)
+}
+
+def parseTypeExpr(s: GsCursor): GsResult Type =
+    if (atTok(s, TkLParen)) (backtrack(parseParenArrowType) <|> parseSingleOrBType)(s)
+    else parseSingleOrBType(s)
+
+def parseTypeScheme(s: GsCursor): GsResult Scheme =
+    if (tryEatTok(s, TkForall)) {
+        commit(s);
+        if (atTok(s, TkLParen)) {
+            let cs = between(tok(TkLParen), tok(TkRParen), sepEndBy1(parseTypeConstraint, skipTok(TkComma)))(s)?;
+            let _ = eatTok(s, TkDot)?;
+            let body = parseTypeExpr(s)?;
+            Ok(buildConstrainedScheme(Nil, cs, body))
+        } else {
+            let rawVars = many1(parseTypeVarIdent)(s)?;
+            let vs = addStringsUnique(rawVars, Nil);
+            let _ = eatTok(s, TkDot)?;
+            let csOpt = opt(backtrack(parseConstraintPrefix))(s)?;
+            let body = parseTypeExpr(s)?;
+            match csOpt {
+                Some(cs) -> Ok(buildConstrainedScheme(vs, cs, body)),
+                None -> Ok(ScmPoly(vs, body)),
+            }
+        }
+    } else {
+        let csOpt = opt(backtrack(parseConstraintPrefix))(s)?;
+        let body = parseTypeExpr(s)?;
+        match csOpt {
+            Some(cs) -> Ok(buildConstrainedScheme(Nil, cs, body)),
+            None -> Ok(ScmMono(body)),
+        }
+    }
 
 pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 0) {
     Err(_) -> ScmMono(TyVoid),
     Ok(toks) -> {
-        let p = newParser(toks);
-        match parseTypeScheme(p) {
+        let frozen = freezeLexTokens(toks);
+        let cur = newTokCursor(src, frozen, "<scheme>", 0, describeGsTok);
+        match parseTypeScheme(cur) {
             Ok(scm) -> scm,
             Err(_) -> ScmMono(TyVoid),
         }
@@ -693,131 +524,99 @@ pub def parseTypeSchemeFromStr(src: String): Scheme = match tokenizeInFile(src, 
 }
 
 // ============================================================================
-// Patterns
+// Layer 2: Pattern Grammar
 // ============================================================================
 
-def parseStructPatFields(p: Parser): Result (List (String, Pattern, Span, Bool)) String = {
-    let _ = expectLBrace(p)?;
-    let acc = cellNew(Nil);
-    let more = cellNew(true);
-    while (cellGet(more)) {
-        match peekTok(p).kind {
-            TkRBrace -> cellSet(more, false),
-            _ -> {
-                let fSp = peekTok(p).span;
-                let fname = parseLowerIdent(p)?;
-                let (pat, isShort) = if (eatSym(p, ":")) {
-                    let sub = parsePattern(p)?;
-                    (sub, false)
-                } else (PatVar(fname, fSp), true);
-                cellSet(acc, listAppend(cellGet(acc), [(fname, pat, fSp, isShort)]));
-                if (!eatComma(p)) cellSet(more, false) else ()
-            },
-        }
-    };
-    let _ = expectRBrace(p)?;
-    Ok(cellGet(acc))
+def parseStructPatField(s: GsCursor): GsResult (String, Pattern, Span, Bool) = {
+    let fSp = curAstSpan(s);
+    let fname = parseLowerIdent(s)?;
+    if (tryEatSym(s, ":")) {
+        commit(s);
+        let sub = parsePattern(s)?;
+        Ok((fname, sub, fSp, false))
+    } else Ok((fname, PatVar(fname, fSp), fSp, true))
 }
 
-pub def parsePattern(p: Parser): Result Pattern String = match peekTok(p).kind {
-    TkIdent(s) ->
-        if (s == "_") {
-            let _ = bumpTok(p);
-            Ok(PatWild)
-        } else if (isUpperByte(strByteAt(s, 0))) {
-            let _ = bumpTok(p);
-            match peekTok(p).kind {
-                TkLBrace -> {
-                    let fs = parseStructPatFields(p)?;
-                    Ok(PatStruct(s, fs))
-                },
-                TkLParen -> {
-                    let _ = bumpTok(p);
-                    let args = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRParen -> cellSet(more, false),
-                            _ -> {
-                                let sp = parsePattern(p)?;
-                                cellSet(args, listAppend(cellGet(args), [sp]));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
-                    };
-                    let _ = expectRParen(p)?;
-                    Ok(PatCtor(s, cellGet(args)))
-                },
-                _ -> Ok(PatCtor(s, Nil)),
-            }
-        } else {
-            let vsp = bumpTok(p).span;
-            Ok(PatVar(s, vsp))
+def parsePattern(s: GsCursor): GsResult Pattern = match peekTok(s) {
+    None -> fail("pattern")(s),
+    Some(e) -> match e.kind {
+        TkIdent(name) -> {
+            let _ = bumpTok(s)?;
+            if (name == "_") Ok(PatWild)
+            else if (isUpperByte(strByteAt(name, 0))) {
+                if (atTok(s, TkLBrace)) {
+                    let _ = eatTok(s, TkLBrace)?;
+                    commit(s);
+                    let fs = sepEndBy(parseStructPatField, skipTok(TkComma))(s)?;
+                    let _ = eatTok(s, TkRBrace)?;
+                    Ok(PatStruct(name, fs))
+                } else if (atTok(s, TkLParen)) {
+                    let _ = eatTok(s, TkLParen)?;
+                    commit(s);
+                    let args = sepEndBy(parsePattern, skipTok(TkComma))(s)?;
+                    let _ = eatTok(s, TkRParen)?;
+                    Ok(PatCtor(name, args))
+                } else Ok(PatCtor(name, Nil))
+            } else Ok(PatVar(name, toAstSpan(e.span)))
         },
-    TkLParen -> {
-        let _ = bumpTok(p);
-        match peekTok(p).kind {
-            TkRParen -> { let _ = bumpTok(p); Ok(PatLit(LitUnit)) },
-            _ -> {
-                let first = parsePattern(p)?;
-                if (eatComma(p)) {
-                    let pats = cellNew([first]);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRParen -> cellSet(more, false),
-                            _ -> {
-                                let nxt = parsePattern(p)?;
-                                cellSet(pats, listAppend(cellGet(pats), [nxt]));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
-                    };
-                    let _ = expectRParen(p)?;
-                    Ok(PatTuple(cellGet(pats)))
+        TkLParen -> {
+            let _ = bumpTok(s)?;
+            commit(s);
+            if (tryEatTok(s, TkRParen)) Ok(PatLit(LitUnit))
+            else {
+                let first = parsePattern(s)?;
+                if (tryEatTok(s, TkComma)) {
+                    let rest = sepEndBy(parsePattern, skipTok(TkComma))(s)?;
+                    let _ = eatTok(s, TkRParen)?;
+                    Ok(PatTuple(Cons(first, rest)))
                 } else {
-                    let _ = expectRParen(p)?;
+                    let _ = eatTok(s, TkRParen)?;
                     Ok(first)
                 }
-            },
-        }
-    },
-    TkTrue -> { let _ = bumpTok(p); Ok(PatLit(LitBool(true))) },
-    TkFalse -> { let _ = bumpTok(p); Ok(PatLit(LitBool(false))) },
-    TkChar(c) -> { let _ = bumpTok(p); Ok(PatLit(LitChar(c))) },
-    TkStr(s) -> { let _ = bumpTok(p); Ok(PatLit(LitStr(s))) },
-    TkInt(raw) -> {
-        let tok = bumpTok(p);
-        let n = parseStrictIntTok(raw, false, tok.span)?;
-        Ok(PatLit(LitInt(n)))
-    },
-    TkFloat(raw) -> {
-        let _ = bumpTok(p);
-        let f = parseFloat(raw)?;
-        Ok(PatLit(LitFloat(f)))
-    },
-    TkSym(sym) ->
-        if (sym == "-") {
-            let negSp = bumpTok(p).span;
-            match peekTok(p).kind {
-                TkInt(raw) -> {
-                    let intSp = bumpTok(p).span;
-                    let n = parseStrictIntTok(raw, true, unionSpan(negSp, intSp))?;
-                    Ok(PatLit(LitInt(n)))
-                },
-                TkFloat(raw) -> {
-                    let _ = bumpTok(p);
-                    let f = parseFloat("-" + raw)?;
-                    Ok(PatLit(LitFloat(f)))
-                },
-                _ -> Err(parseErr(p, "expected numeric literal after '-' in pattern")),
             }
-        } else Err(parseErr(p, "unexpected symbol '" + sym + "' in pattern")),
-    _ -> Err(parseErr(p, "expected pattern")),
+        },
+        TkTrue -> { let _ = bumpTok(s)?; Ok(PatLit(LitBool(true))) },
+        TkFalse -> { let _ = bumpTok(s)?; Ok(PatLit(LitBool(false))) },
+        TkChar(c) -> { let _ = bumpTok(s)?; Ok(PatLit(LitChar(c))) },
+        TkStr(str) -> { let _ = bumpTok(s)?; Ok(PatLit(LitStr(str))) },
+        TkInt(raw) -> {
+            let _ = bumpTok(s)?;
+            let n = parseStrictIntTok(s, raw, false, toAstSpan(e.span))?;
+            Ok(PatLit(LitInt(n)))
+        },
+        TkFloat(raw) -> {
+            let _ = bumpTok(s)?;
+            let f = parseFloatTok(s, raw, toAstSpan(e.span))?;
+            Ok(PatLit(LitFloat(f)))
+        },
+        TkSym(sym) ->
+            if (sym == "-") {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let negSp = toAstSpan(e.span);
+                match peekTok(s) {
+                    Some(ne) -> match ne.kind {
+                        TkInt(raw) -> {
+                            let _ = bumpTok(s)?;
+                            let n = parseStrictIntTok(s, raw, true, unionSpan(negSp, toAstSpan(ne.span)))?;
+                            Ok(PatLit(LitInt(n)))
+                        },
+                        TkFloat(raw) -> {
+                            let _ = bumpTok(s)?;
+                            let f = parseFloatTok(s, "-" + raw, unionSpan(negSp, toAstSpan(ne.span)))?;
+                            Ok(PatLit(LitFloat(f)))
+                        },
+                        _ -> failMsg(s, "expected numeric literal after '-' in pattern"),
+                    },
+                    None -> failMsg(s, "expected numeric literal after '-' in pattern"),
+                }
+            } else failMsg(s, "unexpected symbol '" + sym + "' in pattern"),
+        _ -> fail("pattern")(s),
+    },
 }
 
 // ============================================================================
-// Expressions (Pratt Infix + Prefix `!` `-` `~` + Postfix `()` `.field` `?`)
+// Layer 3: Expressions (`pratt` + `pushToken` + `hadNewline` + `backtrack`)
 // ============================================================================
 
 data BlockStmtItem {
@@ -826,195 +625,126 @@ data BlockStmtItem {
     BsExpr(Form),
 }
 
-def foldBlockItems(items: List BlockStmtItem): Result Form String = {
-    let rev = listRev(items);
-    match rev {
-        Cons(BsExpr(tailExpr), restRev) -> {
-            let curTail: Cell (List Form) = cellNew([tailExpr]);
-            let cur = cellNew(restRev);
-            while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                match cellGet(cur) {
-                    Cons(BsExpr(e), r) -> {
-                        cellSet(curTail, Cons(e, cellGet(curTail)));
-                        cellSet(cur, r)
-                    },
-                    Cons(BsLetVar(sp, vd, val), r) -> {
-                        let bodyList = cellGet(curTail);
-                        let bodyForm = match bodyList {
-                            Cons(single, Nil) -> single,
-                            Cons(first, _) -> mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(bodyList)),
-                            Nil -> tailExpr,
-                        };
-                        let fullSp = unionSpan(sp, bodyForm.pos);
-                        cellSet(curTail, [mkForm(fullSp, ExLet(vd, val, bodyForm))]);
-                        cellSet(cur, r)
-                    },
-                    Cons(BsLetPat(sp, pat, val), r) -> {
-                        let bodyList = cellGet(curTail);
-                        let bodyForm = match bodyList {
-                            Cons(single, Nil) -> single,
-                            Cons(first, _) -> mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(bodyList)),
-                            Nil -> tailExpr,
-                        };
-                        let fullSp = unionSpan(sp, bodyForm.pos);
-                        let arm = MkMatchArm { pat: pat, guard: None, body: bodyForm };
-                        cellSet(curTail, [mkForm(fullSp, ExMatch(val, [arm]))]);
-                        cellSet(cur, r)
-                    },
-                    Nil -> (),
-                }
-            };
-            let finalItems = cellGet(curTail);
-            match finalItems {
-                Cons(first, _) -> Ok(mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(finalItems))),
-                Nil -> Err("empty block"),
-            }
-        },
-        _ -> Err("Last item in a block must be an expression"),
-    }
+def foldBlockRevLoop(revItems: List BlockStmtItem, curTail: List Form, tailExpr: Form): List Form = match revItems {
+    Nil -> curTail,
+    Cons(BsExpr(e), r) -> foldBlockRevLoop(r, Cons(e, curTail), tailExpr),
+    Cons(BsLetVar(sp, vd, val), r) -> {
+        let bodyForm = match curTail {
+            Cons(single, Nil) -> single,
+            Cons(first, _) -> mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(curTail)),
+            Nil -> tailExpr,
+        };
+        foldBlockRevLoop(r, [mkForm(unionSpan(sp, bodyForm.pos), ExLet(vd, val, bodyForm))], tailExpr)
+    },
+    Cons(BsLetPat(sp, pat, val), r) -> {
+        let bodyForm = match curTail {
+            Cons(single, Nil) -> single,
+            Cons(first, _) -> mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(curTail)),
+            Nil -> tailExpr,
+        };
+        let arm = MkMatchArm { pat: pat, guard: None, body: bodyForm };
+        foldBlockRevLoop(r, [mkForm(unionSpan(sp, bodyForm.pos), ExMatch(val, [arm]))], tailExpr)
+    },
 }
 
-def parseVarDecl(p: Parser): Result VarDecl String = {
-    let name = parseIdent(p)?;
-    if (eatSym(p, ":")) {
-        let ty = parseTypeExpr(p)?;
+def foldBlockItems(s: GsCursor, blockSp: Span, items: List BlockStmtItem): GsResult Form = match listRev(items) {
+    Cons(BsExpr(tailExpr), restRev) -> {
+        let finalItems = foldBlockRevLoop(restRev, [tailExpr], tailExpr);
+        match finalItems {
+            Cons(first, _) -> Ok(mkForm(unionSpan(first.pos, tailExpr.pos), ExBlock(finalItems))),
+            Nil -> failSpanMsg(s, blockSp, "empty block"),
+        }
+    },
+    _ -> failSpanMsg(s, blockSp, "Last item in a block must be an expression"),
+}
+
+def parseVarDecl(s: GsCursor): GsResult VarDecl = {
+    let name = parseIdent(s)?;
+    if (tryEatSym(s, ":")) {
+        commit(s);
+        let ty = parseTypeExpr(s)?;
         Ok(MkVarDecl { vname: name, vscm: ScmMono(ty) })
     } else Ok(MkVarDecl { vname: name, vscm: ScmSlot })
 }
 
-def parseParamSeq(p: Parser): Result (List VarDecl) String = {
-    let acc = cellNew(Nil);
-    let more = cellNew(true);
-    while (cellGet(more)) {
-        match peekTok(p).kind {
-            TkRParen -> cellSet(more, false),
-            _ -> {
-                let vd = parseVarDecl(p)?;
-                cellSet(acc, listAppend(cellGet(acc), [vd]));
-                if (!eatComma(p)) cellSet(more, false) else ()
-            },
-        }
-    };
-    Ok(cellGet(acc))
+def parseParamSeq(s: GsCursor): GsResult (List VarDecl) =
+    sepEndBy(parseVarDecl, skipTok(TkComma))(s)
+
+def parseLambdaHeader(s: GsCursor): GsResult (Span, List VarDecl, Option Type) = {
+    let openSp = toAstSpan(eatTok(s, TkLParen)?);
+    let ps = parseParamSeq(s)?;
+    let _ = eatTok(s, TkRParen)?;
+    let retOpt =
+        if (tryEatSym(s, ":")) Some(parseTypeExpr(s)?)
+        else None;
+    let _ = eatSym(s, "->")?;
+    Ok((openSp, ps, retOpt))
 }
 
-/// Try parsing lambda `(p1, p2, ...) [: RetTy] -> body`; backtracks cleanly if not a lambda!
-def tryParseLambda(p: Parser): Option (Result Form String) = {
-    let snap = savePos(p);
-    let startSp = peekTok(p).span;
-    match peekTok(p).kind {
-        TkLParen -> {
-            let _ = bumpTok(p);
-            match parseParamSeq(p) {
-                Err(_) -> { restorePos(p, snap); None },
-                Ok(ps) -> match peekTok(p).kind {
-                    TkRParen -> {
-                        let _ = bumpTok(p);
-                        let retTry: Result (Option Type) String =
-                            if (eatSym(p, ":")) {
-                                match parseTypeExpr(p) {
-                                    Ok(rt) -> Ok(Some(rt)),
-                                    Err(e) -> Err(e),
-                                }
-                            } else Ok(None);
-                        match retTry {
-                            Err(_) -> { restorePos(p, snap); None },
-                            Ok(retOpt) ->
-                                if (eatSym(p, "->")) {
-                                    let bodyRes: Result Form String = parseExpr(p);
-                                    Some(match bodyRes {
-                                        Ok(body) -> Ok(mkForm(unionSpan(startSp, body.pos), ExAbs(ps, retOpt, body))),
-                                        Err(e) -> Err(e),
-                                    })
-                                } else {
-                                    restorePos(p, snap);
-                                    None
-                                },
-                        }
-                    },
-                    _ -> { restorePos(p, snap); None },
-                },
-            }
-        },
-        _ -> None,
-    }
+def parseVarDeclHeadBeforeEq(s: GsCursor): GsResult VarDecl = {
+    let vd = parseVarDecl(s)?;
+    if (atTok(s, TkSym("="))) Ok(vd)
+    else fail("expected '='")(s)
 }
 
-def parseLetBindingHead(p: Parser): Result (Bool, VarDecl, Pattern) String = {
-    // Try `ident [: Type] =` first; otherwise pattern destructuring `let (a, b) = ...`
-    let snap = savePos(p);
-    let vdTry: Option VarDecl = match parseVarDecl(p) {
-        Ok(vd) ->
-            if (match peekTok(p).kind { TkSym(s) -> s == "=", _ -> false }) Some(vd)
-            else { restorePos(p, snap); None },
-        Err(_) -> { restorePos(p, snap); None },
-    };
-    match vdTry {
+def parseLetBindingHead(s: GsCursor): GsResult (Bool, VarDecl, Pattern) = {
+    let vdOpt = opt(backtrack(parseVarDeclHeadBeforeEq))(s)?;
+    match vdOpt {
         Some(vd) -> Ok((true, vd, PatWild)),
         None -> {
-            let pat = parsePattern(p)?;
+            let pat = parsePattern(s)?;
             Ok((false, MkVarDecl { vname: "", vscm: ScmSlot }, pat))
         },
     }
 }
 
-def parseBlockExpr(p: Parser): Result Form String = {
-    let openSp = expectLBrace(p)?;
-    let items = cellNew(Nil);
-    let more = cellNew(true);
-    while (cellGet(more)) {
-        skipSemis(p);
-        match peekTok(p).kind {
-            TkRBrace -> cellSet(more, false),
-            TkLet -> {
-                let letSp = bumpTok(p).span;
-                // Note: if `let x = v in e` is used as a single expression inside `{ ... }`, check for `in`!
-                let (isVar, vd, pat) = parseLetBindingHead(p)?;
-                let _ = expectSym(p, "=")?;
-                let val = parseExpr(p)?;
-                match peekTok(p).kind {
-                    TkIn -> {
-                        let _ = bumpTok(p);
-                        let body = parseExpr(p)?;
-                        let fullSp = unionSpan(letSp, body.pos);
-                        let eForm = if (isVar) mkForm(fullSp, ExLet(vd, val, body))
-                            else mkForm(fullSp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }]));
-                        cellSet(items, Cons(BsExpr(eForm), cellGet(items)))
-                    },
-                    _ -> {
-                        let fullSp = unionSpan(letSp, val.pos);
-                        let bs = if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val);
-                        cellSet(items, Cons(bs, cellGet(items)))
-                    },
-                };
-                match peekTok(p).kind {
-                    TkRBrace -> cellSet(more, false),
-                    _ ->
-                        if (eatSemi(p) || peekTok(p).hadNewline) { skipSemis(p) }
-                        else {
-                            let _ = expectSym(p, ";")?;
-                            ()
-                        },
+def parseBlockItemsLoop(s: GsCursor, accRev: List BlockStmtItem): GsResult (List BlockStmtItem) = {
+    skipSemis(s)?;
+    if (atTok(s, TkRBrace)) Ok(listRev(accRev))
+    else {
+        let item =
+            if (atTok(s, TkLet)) {
+                let letSp = toAstSpan(bumpTok(s)?.span);
+                let (isVar, vd, pat) = parseLetBindingHead(s)?;
+                let _ = eatSym(s, "=")?;
+                let val: Form = parseExpr(s)?;
+                if (tryEatTok(s, TkIn)) {
+                    let body: Form = parseExpr(s)?;
+                    let fullSp = unionSpan(letSp, body.pos);
+                    let eForm =
+                        if (isVar) mkForm(fullSp, ExLet(vd, val, body))
+                        else mkForm(fullSp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }]));
+                    BsExpr(eForm)
+                } else {
+                    let fullSp = unionSpan(letSp, val.pos);
+                    if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val)
                 }
-            },
-            _ -> {
-                let e = parseExpr(p)?;
-                cellSet(items, Cons(BsExpr(e), cellGet(items)));
-                match peekTok(p).kind {
-                    TkRBrace -> cellSet(more, false),
-                    _ ->
-                        if (eatSemi(p) || peekTok(p).hadNewline) { skipSemis(p) }
-                        else {
-                            let _ = expectSym(p, ";")?;
-                            ()
-                        },
-                }
-            },
+            } else {
+                let e = parseExpr(s)?;
+                BsExpr(e)
+            };
+        if (atTok(s, TkRBrace)) {
+            Ok(listRev(Cons(item, accRev)))
+        } else {
+            if (tryEatTok(s, TkSemi) || hadNewline(s)) {
+                skipSemis(s)?
+            } else {
+                let _ = eatTok(s, TkSemi)?;
+                ()
+            };
+            parseBlockItemsLoop(s, Cons(item, accRev))
         }
-    };
-    let closeSp = expectRBrace(p)?;
-    let folded = foldBlockItems(listRev(cellGet(items)))?;
-    Ok(MkForm { pos: unionSpan(openSp, closeSp), ty: folded.ty, annot: folded.annot, node: folded.node })
+    }
+}
+
+def parseBlockExpr(s: GsCursor): GsResult Form = {
+    let openSp = toAstSpan(eatTok(s, TkLBrace)?);
+    commit(s);
+    let items = parseBlockItemsLoop(s, Nil)?;
+    let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+    let fullSp = unionSpan(openSp, closeSp);
+    let folded = foldBlockItems(s, fullSp, items)?;
+    Ok(MkForm { pos: fullSp, ty: folded.ty, annot: folded.annot, node: folded.node })
 }
 
 def makeOperatorSectionForm(sp: Span, op: String): Form =
@@ -1032,362 +762,303 @@ def makeOperatorSectionForm(sp: Span, op: String): Form =
         None -> mkForm(sp, ExVar(encodeOpName(op))),
     }
 
-def parseAtomExpr(p: Parser): Result Form String = {
-    let t = peekTok(p);
-    match t.kind {
-        TkIf -> {
-            let _ = bumpTok(p);
-            let _ = match peekTok(p).kind {
-                TkLParen -> Ok(bumpTok(p).span),
-                _ -> Err(parseErrHint(p, "expected `(` after `if`", "conditions require parentheses, e.g. `if (cond) ... else ...`")),
-            }?;
-            let cond = parseExpr(p)?;
-            let _ = expectRParen(p)?;
-            let thenE = parseExpr(p)?;
-            match peekTok(p).kind {
-                TkElse -> {
-                    let _ = bumpTok(p);
-                    let elseE = parseExpr(p)?;
-                    Ok(mkForm(unionSpan(t.span, elseE.pos), ExIf(cond, thenE, elseE)))
-                },
-                _ -> Err(parseErrHint(p, "missing `else` branch in `if` expression", "add `else ()` if no value is needed")),
-            }
-        },
-        TkWhile -> {
-            let _ = bumpTok(p);
-            let _ = match peekTok(p).kind {
-                TkLParen -> Ok(bumpTok(p).span),
-                _ -> Err(parseErrHint(p, "expected `(` after `while`", "conditions require parentheses, e.g. `while (cond) { ... }`")),
-            }?;
-            let cond = parseExpr(p)?;
-            let _ = expectRParen(p)?;
-            let invsRev: Cell (List (Span, Form)) = cellNew(Nil);
-            let decsRev: Cell (List (Span, Form)) = cellNew(Nil);
-            let moreClauses = cellNew(true);
-            while (cellGet(moreClauses)) {
-                match peekTok(p).kind {
-                    TkIdent(w) if (w == "invariant") -> {
-                        let kwTok = bumpTok(p);
-                        let invExpr = parseExpr(p)?;
-                        let callSp = unionSpan(kwTok.span, invExpr.pos);
-                        cellSet(invsRev, Cons((callSp, invExpr), cellGet(invsRev)))
-                    },
-                    TkIdent(w) if (w == "decreases") -> {
-                        let kwTok = bumpTok(p);
-                        let decExpr = parseExpr(p)?;
-                        let callSp = unionSpan(kwTok.span, decExpr.pos);
-                        match cellGet(decsRev) {
-                            Cons(_, _) -> Err(formatSpanDiagHint(
-                                "Parse error", callSp,
-                                "at most one `decreases` clause is allowed per `while` loop",
-                                "combine termination measures into a single non-negative `Int` expression"
-                            ))?,
-                            Nil -> (),
-                        };
-                        cellSet(decsRev, Cons((callSp, decExpr), cellGet(decsRev)))
-                    },
-                    _ -> cellSet(moreClauses, false),
-                }
-            };
-            let rawBody = parseExpr(p)?;
-            let body = match (cellGet(invsRev), cellGet(decsRev)) {
-                (Nil, Nil) -> rawBody,
-                (ir, dr) -> mkForm(rawBody.pos, ExLoopContract(listRev(ir), listRev(dr), rawBody)),
-            };
-            Ok(mkForm(unionSpan(t.span, rawBody.pos), ExWhile(cond, body)))
-        },
-        TkLet -> {
-            let _ = bumpTok(p);
-            let (isVar, vd, pat) = parseLetBindingHead(p)?;
-            let _ = expectSym(p, "=")?;
-            let val = parseExpr(p)?;
-            match peekTok(p).kind {
-                TkIn -> {
-                    let _ = bumpTok(p);
-                    let body = parseExpr(p)?;
-                    let sp = unionSpan(t.span, body.pos);
-                    if (isVar) Ok(mkForm(sp, ExLet(vd, val, body)))
-                    else Ok(mkForm(sp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }])))
-                },
-                _ -> Err(parseErr(p, "expected 'in' after let binding")),
-            }
-        },
-        TkMatch -> {
-            let _ = bumpTok(p);
-            let scrut = parseExpr(p)?;
-            let _ = expectLBrace(p)?;
-            let arms = cellNew(Nil);
-            let more = cellNew(true);
-            while (cellGet(more)) {
-                match peekTok(p).kind {
-                    TkRBrace -> cellSet(more, false),
-                    _ -> {
-                        let pat = parsePattern(p)?;
-                        let guardOpt = match peekTok(p).kind {
-                            TkIf -> {
-                                let _ = bumpTok(p);
-                                let _ = expectLParen(p)?;
-                                let g = parseExpr(p)?;
-                                let _ = expectRParen(p)?;
-                                Some(g)
-                            },
-                            _ -> None,
-                        };
-                        let _ = match peekTok(p).kind {
-                            TkSym(s) if (s == "->") -> Ok(bumpTok(p).span),
-                            TkSym(s) if (s == "=>") -> Err(parseErrHint(p, "expected `->` in match arm, found `=>`", "Geisha uses `->` (not `=>`) in match arms")),
-                            _ -> expectSym(p, "->"),
-                        }?;
-                        let armBody = parseExpr(p)?;
-                        cellSet(arms, Cons(MkMatchArm { pat: pat, guard: guardOpt, body: armBody }, cellGet(arms)));
-                        if (!eatComma(p)) cellSet(more, false) else ()
-                    },
-                }
-            };
-            let closeSp = expectRBrace(p)?;
-            Ok(mkForm(unionSpan(t.span, closeSp), ExMatch(scrut, listRev(cellGet(arms)))))
-        },
-        TkLBrace -> parseBlockExpr(p),
-        TkLBracket -> {
-            let _ = bumpTok(p);
-            let elems = cellNew(Nil);
-            let more = cellNew(true);
-            while (cellGet(more)) {
-                match peekTok(p).kind {
-                    TkRBracket -> cellSet(more, false),
-                    _ -> {
-                        let el = parseExpr(p)?;
-                        cellSet(elems, Cons(el, cellGet(elems)));
-                        if (!eatComma(p)) cellSet(more, false) else ()
-                    },
-                }
-            };
-            let closeSp = expectRBracket(p)?;
-            Ok(mkForm(unionSpan(t.span, closeSp), ExList(listRev(cellGet(elems)))))
-        },
-        TkLParen -> match tryParseLambda(p) {
-            Some(lamRes) -> lamRes,
-            None -> {
-                let openSp = bumpTok(p).span;
-                match peekTok(p).kind {
-                    TkRParen -> {
-                        let closeSp = bumpTok(p).span;
-                        Ok(mkForm(unionSpan(openSp, closeSp), ExLit(LitUnit)))
-                    },
-                    _ -> {
-                        // Check first-class operator section `(op)` before parenthesized/tuple expr!
-                        let snapOp = savePos(p);
-                        let opSec: Option Form = match peekTok(p).kind {
-                            TkSym(op) ->
-                                if (isDefinableOp(op)) {
-                                    let _ = bumpTok(p);
-                                    match peekTok(p).kind {
-                                        TkRParen -> {
-                                            let closeSp = bumpTok(p).span;
-                                            Some(makeOperatorSectionForm(unionSpan(openSp, closeSp), op))
-                                        },
-                                        _ -> { restorePos(p, snapOp); None },
-                                    }
-                                } else None,
-                            _ -> None,
-                        };
-                        match opSec {
-                            Some(secForm) -> Ok(secForm),
-                            None -> {
-                                let first = parseExpr(p)?;
-                                if (eatComma(p)) {
-                                    let elems = cellNew([first]);
-                                    let more = cellNew(true);
-                                    while (cellGet(more)) {
-                                        match peekTok(p).kind {
-                                            TkRParen -> cellSet(more, false),
-                                            _ -> {
-                                                let nxt = parseExpr(p)?;
-                                                cellSet(elems, Cons(nxt, cellGet(elems)));
-                                                if (!eatComma(p)) cellSet(more, false) else ()
-                                            },
-                                        }
-                                    };
-                                    let closeSp = expectRParen(p)?;
-                                    Ok(mkForm(unionSpan(openSp, closeSp), ExTuple(listRev(cellGet(elems)))))
-                                } else {
-                                    let closeSp = expectRParen(p)?;
-                                    Ok(MkForm { pos: unionSpan(openSp, closeSp), ty: first.ty, annot: first.annot, node: first.node })
-                                }
-                            },
-                        }
-                    },
-                }
-            },
-        },
-        TkInt(raw) -> {
-            let _ = bumpTok(p);
-            let n = parseStrictIntTok(raw, false, t.span)?;
-            Ok(mkForm(t.span, ExLit(LitInt(n))))
-        },
-        TkFloat(raw) -> {
-            let _ = bumpTok(p);
-            let f = parseFloat(raw)?;
-            Ok(mkForm(t.span, ExLit(LitFloat(f))))
-        },
-        TkChar(c) -> {
-            let _ = bumpTok(p);
-            Ok(mkForm(t.span, ExLit(LitChar(c))))
-        },
-        TkStr(s) -> {
-            let _ = bumpTok(p);
-            Ok(mkForm(t.span, ExLit(LitStr(s))))
-        },
-        TkTrue -> {
-            let _ = bumpTok(p);
-            Ok(mkForm(t.span, ExLit(LitBool(true))))
-        },
-        TkFalse -> {
-            let _ = bumpTok(p);
-            Ok(mkForm(t.span, ExLit(LitBool(false))))
-        },
-        TkIdent(name) -> {
-            let _ = bumpTok(p);
-            // Check struct construction `Ctor { f1: v1, ... }` when `name` is uppercase!
-            if (isUpperByte(strByteAt(name, 0)) && match peekTok(p).kind { TkLBrace -> true, _ -> false }) {
-                let snapSt = savePos(p);
-                let _ = bumpTok(p);
-                // Verify `{ ident : ... }` so `match Ctor { ... }` scruts don't misparse as `Ctor { ... }`!
-                let looksLikeStruct = match (peekAt(p, 0).kind, peekAt(p, 1).kind) {
-                    (TkIdent(fn0), TkSym(colon)) -> isLowerByte(strByteAt(fn0, 0)) && colon == ":",
-                    _ -> false,
-                };
-                if (!looksLikeStruct) {
-                    restorePos(p, snapSt);
-                    Ok(mkForm(t.span, ExVar(name)))
-                } else {
-                    let fields = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRBrace -> cellSet(more, false),
-                            _ -> {
-                                let fnm = parseLowerIdent(p)?;
-                                let _ = expectSym(p, ":")?;
-                                let fval = parseExpr(p)?;
-                                cellSet(fields, Cons((fnm, fval), cellGet(fields)));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
-                    };
-                    let closeSp = expectRBrace(p)?;
-                    Ok(mkForm(unionSpan(t.span, closeSp), ExStructInit(name, listRev(cellGet(fields)))))
-                }
-            } else Ok(mkForm(t.span, ExVar(name)))
-        },
-        _ -> Err(parseErr(p, "expected expression")),
-    }
+def parseOpSectionAfterLParen(s: GsCursor, openSp: Span): GsResult Form = {
+    let (_, op) = matchTok(s, (tk) -> match tk { TkSym(sym) -> if (isDefinableOp(sym)) Some(sym) else None, _ -> None }, "operator")?;
+    let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+    Ok(makeOperatorSectionForm(unionSpan(openSp, closeSp), op))
 }
 
-def parsePostfixExpr(p: Parser): Result Form String = {
-    let base = parseAtomExpr(p)?;
-    let cur = cellNew(base);
-    let looping = cellNew(true);
-    while (cellGet(looping)) {
-        let nxt = peekTok(p);
-        match nxt.kind {
-            TkLParen ->
-                if (nxt.hadNewline) cellSet(looping, false)
-                else {
-                    let _ = bumpTok(p);
-                    let args = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        match peekTok(p).kind {
-                            TkRParen -> cellSet(more, false),
-                            _ -> {
-                                let a = parseExpr(p)?;
-                                cellSet(args, Cons(a, cellGet(args)));
-                                if (!eatComma(p)) cellSet(more, false) else ()
-                            },
-                        }
-                    };
-                    let closeSp = expectRParen(p)?;
-                    let prev = cellGet(cur);
-                    cellSet(cur, mkForm(unionSpan(prev.pos, closeSp), ExApply(prev, listRev(cellGet(args)))))
-                },
-            TkDot -> {
-                let _ = bumpTok(p);
-                let fnameTok = peekTok(p);
-                let fname = parseIdent(p)?;
-                let prev = cellGet(cur);
-                cellSet(cur, mkForm(unionSpan(prev.pos, fnameTok.span), ExField(prev, fname)))
-            },
-            TkQuestion -> {
-                let qSp = bumpTok(p).span;
-                let prev = cellGet(cur);
-                cellSet(cur, mkForm(unionSpan(prev.pos, qSp), ExTry(prev)))
-            },
-            _ -> cellSet(looping, false),
+def parseWhileSpecsLoop(
+    s: GsCursor,
+    invsRev: List (Span, Form),
+    decsRev: List (Span, Form)
+): GsResult (List (Span, Form), List (Span, Form)) =
+    if (atTok(s, TkIdent("invariant"))) {
+        let kwSp = toAstSpan(bumpTok(s)?.span);
+        let invE: Form = parseExpr(s)?;
+        parseWhileSpecsLoop(s, Cons((unionSpan(kwSp, invE.pos), invE), invsRev), decsRev)
+    } else if (atTok(s, TkIdent("decreases"))) {
+        let kwSp = toAstSpan(bumpTok(s)?.span);
+        let decE: Form = parseExpr(s)?;
+        let callSp = unionSpan(kwSp, decE.pos);
+        match decsRev {
+            Cons(_, _) -> failSpanMsgHint(
+                s,
+                callSp,
+                "at most one `decreases` clause is allowed per `while` loop",
+                "combine termination measures into a single non-negative `Int` expression"
+            ),
+            Nil -> parseWhileSpecsLoop(s, invsRev, Cons((callSp, decE), decsRev)),
         }
-    };
-    Ok(cellGet(cur))
-}
+    } else Ok((listRev(invsRev), listRev(decsRev)))
 
-def consumePrefixChar(p: Parser, sym: String, tokSp: Span): Void = {
-    let _ = bumpTok(p);
-    if (strLen(sym) > 1) {
-        let rem = strSlice(sym, 1, strLen(sym));
-        let remSp = MkSpan { fileId: tokSp.fileId, start: tokSp.start + 1, end: tokSp.end };
-        cellSet(p.pushedSym, Some(MkToken { kind: TkSym(rem), span: remSp, hadNewline: false }))
-    } else ()
-}
-
-def parseUnaryExpr(p: Parser): Result Form String = {
-    let t = peekTok(p);
-    match t.kind {
-        TkSym(s) -> {
-            let b0 = strByteAt(s, 0);
-            if (b0 == 33 && s != "!=") {
-                consumePrefixChar(p, s, t.span);
-                let operand: Form = parseUnaryExpr(p)?;
-                Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNot, operand)))
-            } else if (b0 == 126) {
-                consumePrefixChar(p, s, t.span);
-                let operand: Form = parseUnaryExpr(p)?;
-                Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnBitNot, operand)))
-            } else if (b0 == 45 && s != "->") {
-                consumePrefixChar(p, s, t.span);
-                // Fold `-42` / `-3.14` directly into negative literals (supports INT32_MIN `-2147483648` too!)
-                let nextT = peekTok(p);
-                match nextT.kind {
-                    TkInt(raw) ->
-                        if (!nextT.hadNewline && nextT.span.start == t.span.start + 1) {
-                            let _ = bumpTok(p);
-                            let fullSp = unionSpan(t.span, nextT.span);
-                            let n = parseStrictIntTok(raw, true, fullSp)?;
-                            Ok(mkForm(fullSp, ExLit(LitInt(n))))
-                        } else {
-                            let operand: Form = parseUnaryExpr(p)?;
-                            Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
-                        },
-                    TkFloat(raw) ->
-                        if (!nextT.hadNewline && nextT.span.start == t.span.start + 1) {
-                            let _ = bumpTok(p);
-                            let fullSp = unionSpan(t.span, nextT.span);
-                            let f = parseFloat("-" + raw)?;
-                            Ok(mkForm(fullSp, ExLit(LitFloat(f))))
-                        } else {
-                            let operand: Form = parseUnaryExpr(p)?;
-                            Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
-                        },
-                    _ -> {
-                        let operand: Form = parseUnaryExpr(p)?;
-                        Ok(mkForm(unionSpan(t.span, operand.pos), ExUn(UnNeg, operand)))
-                    },
-                }
-            } else parsePostfixExpr(p)
-        },
-        _ -> parsePostfixExpr(p),
+def parseMatchArm(s: GsCursor): GsResult MatchArm = {
+    let pat = parsePattern(s)?;
+    commit(s);
+    let guardOpt =
+        if (tryEatTok(s, TkIf)) {
+            let g = between(tok(TkLParen), tok(TkRParen), parseExpr)(s)?;
+            Some(g)
+        } else None;
+    if (atTok(s, TkSym("=>"))) {
+        failMsgHint(s, "expected `->` in match arm, found `=>`", "Geisha uses `->` (not `=>`) in match arms")
+    } else {
+        let _ = eatSym(s, "->")?;
+        let body = parseExpr(s)?;
+        Ok(MkMatchArm { pat: pat, guard: guardOpt, body: body })
     }
 }
 
-def makeInfixForm(op: String, opSp: Span, lhs: Form, rhs: Form): Form = {
+def parseStructInitField(s: GsCursor): GsResult (String, Form) = {
+    let fnm = parseLowerIdent(s)?;
+    commit(s);
+    let _ = eatSym(s, ":")?;
+    let fval = parseExpr(s)?;
+    Ok((fnm, fval))
+}
+
+def looksLikeStructInitAfterBrace(s: GsCursor): Bool =
+    match (peekNthTok(s, 1), peekNthTok(s, 2)) {
+        (Some(t1), Some(t2)) -> match (t1.kind, t2.kind) {
+            (TkIdent(fn0), TkSym(colon)) -> isLowerByte(strByteAt(fn0, 0)) && colon == ":",
+            _ -> false,
+        },
+        _ -> false,
+    }
+
+def parseAtomExpr(s: GsCursor): GsResult Form = match peekTok(s) {
+    None -> fail("expression")(s),
+    Some(e) -> {
+        let tSp = toAstSpan(e.span);
+        match e.kind {
+            TkIf -> {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let _ = expectTok(s, TkLParen, "conditions require parentheses, e.g. `if (cond) ... else ...`")?;
+                let cond = parseExpr(s)?;
+                let _ = eatTok(s, TkRParen)?;
+                let thenE = parseExpr(s)?;
+                if (tryEatTok(s, TkElse)) {
+                    let elseE: Form = parseExpr(s)?;
+                    Ok(mkForm(unionSpan(tSp, elseE.pos), ExIf(cond, thenE, elseE)))
+                } else {
+                    failMsgHint(s, "missing `else` branch in `if` expression", "add `else ()` if no value is needed")
+                }
+            },
+            TkWhile -> {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let _ = expectTok(s, TkLParen, "conditions require parentheses, e.g. `while (cond) { ... }`")?;
+                let cond = parseExpr(s)?;
+                let _ = eatTok(s, TkRParen)?;
+                let (invs, decs) = parseWhileSpecsLoop(s, Nil, Nil)?;
+                let rawBody: Form = parseExpr(s)?;
+                let body = match (invs, decs) {
+                    (Nil, Nil) -> rawBody,
+                    _ -> mkForm(rawBody.pos, ExLoopContract(invs, decs, rawBody)),
+                };
+                Ok(mkForm(unionSpan(tSp, rawBody.pos), ExWhile(cond, body)))
+            },
+            TkLet -> {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let (isVar, vd, pat) = parseLetBindingHead(s)?;
+                let _ = eatSym(s, "=")?;
+                let val = parseExpr(s)?;
+                let _ = expectTok(s, TkIn, "in expression context write `let x = v in body`, or wrap statements in `{ ... }`")?;
+                let body: Form = parseExpr(s)?;
+                let sp = unionSpan(tSp, body.pos);
+                if (isVar) Ok(mkForm(sp, ExLet(vd, val, body)))
+                else Ok(mkForm(sp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }])))
+            },
+            TkMatch -> {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let scrut = parseExpr(s)?;
+                let _ = eatTok(s, TkLBrace)?;
+                let arms = sepEndBy(parseMatchArm, skipTok(TkComma))(s)?;
+                let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                Ok(mkForm(unionSpan(tSp, closeSp), ExMatch(scrut, arms)))
+            },
+            TkLBrace -> parseBlockExpr(s),
+            TkLBracket -> {
+                let _ = bumpTok(s)?;
+                commit(s);
+                let elems = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
+                let closeSp = toAstSpan(eatTok(s, TkRBracket)?);
+                Ok(mkForm(unionSpan(tSp, closeSp), ExList(elems)))
+            },
+            TkLParen -> {
+                let lamHdrOpt = opt(backtrack(parseLambdaHeader))(s)?;
+                match lamHdrOpt {
+                    Some((openSp, ps, retOpt)) -> {
+                        commit(s);
+                        let body: Form = parseExpr(s)?;
+                        Ok(mkForm(unionSpan(openSp, body.pos), ExAbs(ps, retOpt, body)))
+                    },
+                    None -> {
+                        let openSp = toAstSpan(bumpTok(s)?.span);
+                        commit(s);
+                        if (atTok(s, TkRParen)) {
+                            let closeSp = toAstSpan(bumpTok(s)?.span);
+                            Ok(mkForm(unionSpan(openSp, closeSp), ExLit(LitUnit)))
+                        } else {
+                            let secOpt = opt(backtrack((sc) -> parseOpSectionAfterLParen(sc, openSp)))(s)?;
+                            match secOpt {
+                                Some(secForm) -> Ok(secForm),
+                                None -> {
+                                    let first: Form = parseExpr(s)?;
+                                    if (tryEatTok(s, TkComma)) {
+                                        let rest = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
+                                        let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+                                        Ok(mkForm(unionSpan(openSp, closeSp), ExTuple(Cons(first, rest))))
+                                    } else {
+                                        let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+                                        Ok(MkForm { pos: unionSpan(openSp, closeSp), ty: first.ty, annot: first.annot, node: first.node })
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+            TkInt(raw) -> {
+                let _ = bumpTok(s)?;
+                let n = parseStrictIntTok(s, raw, false, tSp)?;
+                Ok(mkForm(tSp, ExLit(LitInt(n))))
+            },
+            TkFloat(raw) -> {
+                let _ = bumpTok(s)?;
+                let f = parseFloatTok(s, raw, tSp)?;
+                Ok(mkForm(tSp, ExLit(LitFloat(f))))
+            },
+            TkChar(c) -> {
+                let _ = bumpTok(s)?;
+                Ok(mkForm(tSp, ExLit(LitChar(c))))
+            },
+            TkStr(str) -> {
+                let _ = bumpTok(s)?;
+                Ok(mkForm(tSp, ExLit(LitStr(str))))
+            },
+            TkTrue -> {
+                let _ = bumpTok(s)?;
+                Ok(mkForm(tSp, ExLit(LitBool(true))))
+            },
+            TkFalse -> {
+                let _ = bumpTok(s)?;
+                Ok(mkForm(tSp, ExLit(LitBool(false))))
+            },
+            TkIdent(name) -> {
+                let _ = bumpTok(s)?;
+                if (isUpperByte(strByteAt(name, 0)) && atTok(s, TkLBrace) && looksLikeStructInitAfterBrace(s)) {
+                    let _ = eatTok(s, TkLBrace)?;
+                    commit(s);
+                    let fields = sepEndBy(parseStructInitField, skipTok(TkComma))(s)?;
+                    let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                    Ok(mkForm(unionSpan(tSp, closeSp), ExStructInit(name, fields)))
+                } else Ok(mkForm(tSp, ExVar(name)))
+            },
+            _ -> fail("expression")(s),
+        }
+    },
+}
+
+def parsePostfixStep(s: GsCursor, prev: Form): GsResult (Option Form) =
+    if (!hadNewline(s) && atTok(s, TkLParen)) {
+        let _ = eatTok(s, TkLParen)?;
+        commit(s);
+        let args = sepEndBy(parseExpr, skipTok(TkComma))(s)?;
+        let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+        Ok(Some(mkForm(unionSpan(prev.pos, closeSp), ExApply(prev, args))))
+    } else if (atTok(s, TkDot)) {
+        let _ = eatTok(s, TkDot)?;
+        commit(s);
+        let (fsp, fname) = parseIdentSpan(s)?;
+        Ok(Some(mkForm(unionSpan(prev.pos, fsp), ExField(prev, fname))))
+    } else if (atTok(s, TkQuestion)) {
+        let qsp = toAstSpan(bumpTok(s)?.span);
+        Ok(Some(mkForm(unionSpan(prev.pos, qsp), ExTry(prev))))
+    } else Ok(None)
+
+def parsePostfixExpr(s: GsCursor): GsResult Form =
+    prattPostfix(parseAtomExpr, parsePostfixStep)(s)
+
+def consumeUnaryPrefixChar(s: GsCursor, sym: String, tokSp: PSpan): GsResult Void = {
+    let _ = bumpTok(s)?;
+    if (strLen(sym) > 1) {
+        let rem = ptrSliceFromStr(sym, 1, strLen(sym) - 1);
+        let remSp = PSpan { fileId: tokSp.fileId, start: tokSp.start + 1, end: tokSp.end };
+        pushToken(s, TokEntry { kind: TkSym(rem), span: remSp, hadNewline: false })
+    } else ();
+    Ok(())
+}
+
+def parseUnaryExpr(s: GsCursor): GsResult Form = match peekTok(s) {
+    Some(e) -> match e.kind {
+        TkSym(sym) -> {
+            let b0 = strByteAt(sym, 0);
+            let opSp = toAstSpan(e.span);
+            if (b0 == 33 && sym != "!=") {
+                consumeUnaryPrefixChar(s, sym, e.span)?;
+                commit(s);
+                let operand: Form = parseUnaryExpr(s)?;
+                Ok(mkForm(unionSpan(opSp, operand.pos), ExUn(UnNot, operand)))
+            } else if (b0 == 126) {
+                consumeUnaryPrefixChar(s, sym, e.span)?;
+                commit(s);
+                let operand: Form = parseUnaryExpr(s)?;
+                Ok(mkForm(unionSpan(opSp, operand.pos), ExUn(UnBitNot, operand)))
+            } else if (b0 == 45 && sym != "->") {
+                consumeUnaryPrefixChar(s, sym, e.span)?;
+                commit(s);
+                match peekTok(s) {
+                    Some(ne) -> match ne.kind {
+                        TkInt(raw) if (!ne.hadNewline && ne.span.start == e.span.start + 1) -> {
+                            let _ = bumpTok(s)?;
+                            let fullSp = unionSpan(opSp, toAstSpan(ne.span));
+                            let n = parseStrictIntTok(s, raw, true, fullSp)?;
+                            Ok(mkForm(fullSp, ExLit(LitInt(n))))
+                        },
+                        TkFloat(raw) if (!ne.hadNewline && ne.span.start == e.span.start + 1) -> {
+                            let _ = bumpTok(s)?;
+                            let fullSp = unionSpan(opSp, toAstSpan(ne.span));
+                            let f = parseFloatTok(s, "-" + raw, fullSp)?;
+                            Ok(mkForm(fullSp, ExLit(LitFloat(f))))
+                        },
+                        _ -> {
+                            let operand: Form = parseUnaryExpr(s)?;
+                            Ok(mkForm(unionSpan(opSp, operand.pos), ExUn(UnNeg, operand)))
+                        },
+                    },
+                    None -> {
+                        let operand: Form = parseUnaryExpr(s)?;
+                        Ok(mkForm(unionSpan(opSp, operand.pos), ExUn(UnNeg, operand)))
+                    },
+                }
+            } else parsePostfixExpr(s)
+        },
+        _ -> parsePostfixExpr(s),
+    },
+    None -> parsePostfixExpr(s),
+}
+
+def parseGeishaInfixOp(s: GsCursor): GsResult (InfixInfo (String, Span)) = match peekTok(s) {
+    Some(e) -> match e.kind {
+        TkSym(op) -> {
+            let prec = infixPrecedence(op);
+            if (prec <= 0) fail("binary operator")(s)
+            else {
+                let _ = bumpTok(s)?;
+                Ok(InfixInfo { op: (op, toAstSpan(e.span)), prec: prec, rightAssoc: isRightAssocOp(op) })
+            }
+        },
+        _ -> fail("binary operator")(s),
+    },
+    None -> fail("binary operator")(s),
+}
+
+def combineGeishaInfix(lhs: Form, opInfo: (String, Span), rhs: Form): Form = {
+    let (op, opSp) = opInfo;
     let sp = unionSpan(lhs.pos, rhs.pos);
     if (op == "||") mkForm(sp, ExBin(OpOr, lhs, rhs))
     else if (op == "&&") mkForm(sp, ExBin(OpAnd, lhs, rhs))
@@ -1397,829 +1068,575 @@ def makeInfixForm(op: String, opSp: Span, lhs: Form, rhs: Form): Form = {
     }
 }
 
-def parseInfixPrec(p: Parser, minPrec: Int): Result Form String = {
-    let lhs0 = parseUnaryExpr(p)?;
-    let lhs = cellNew(lhs0);
-    let looping = cellNew(true);
-    while (cellGet(looping)) {
-        let t = peekTok(p);
-        match t.kind {
-            TkSym(op) -> {
-                let prec = infixPrecedence(op);
-                if (prec < minPrec || prec == 0) {
-                    cellSet(looping, false)
-                } else {
-                    let _ = bumpTok(p);
-                    let nextMin = if (isRightAssocOp(op)) prec else prec + 1;
-                    let rhs = parseInfixPrec(p, nextMin)?;
-                    cellSet(lhs, makeInfixForm(op, t.span, cellGet(lhs), rhs))
-                }
-            },
-            _ -> cellSet(looping, false),
-        }
-    };
-    Ok(cellGet(lhs))
-}
-
-pub def parseExpr(p: Parser): Result Form String = parseInfixPrec(p, 1)
+def parseExpr(s: GsCursor): GsResult Form =
+    prattInfix(parseUnaryExpr, parseGeishaInfixOp, combineGeishaInfix)(s)
 
 // ============================================================================
-// Top-Level & Module Item Definitions
+// Layer 4: Top-Level Declarations, Modules & Script Mode
 // ============================================================================
 
-def parseVisibility(p: Parser): Visibility = match peekTok(p).kind {
-    TkPub -> { let _ = bumpTok(p); VisPublic },
-    _ -> VisPrivate,
+def parseVisibility(s: GsCursor): Visibility =
+    if (tryEatTok(s, TkPub)) VisPublic else VisPrivate
+
+def parseNamedFieldDecl(s: GsCursor): GsResult FieldDecl = {
+    let fnm = parseIdent(s)?;
+    commit(s);
+    let _ = eatSym(s, ":")?;
+    let ft = parseTypeExpr(s)?;
+    Ok(MkFieldDecl { fname: Some(fnm), fty: ft })
 }
 
-def parseDataVariant(p: Parser): Result VariantDef String = {
-    let vname = parseUpperIdent(p)?;
-    match peekTok(p).kind {
-        TkLParen -> {
-            let _ = bumpTok(p);
-            let fs = cellNew(Nil);
-            let more = cellNew(true);
-            while (cellGet(more)) {
-                match peekTok(p).kind {
-                    TkRParen -> cellSet(more, false),
-                    _ -> {
-                        let ft = parseTypeExpr(p)?;
-                        cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: None, fty: ft }]));
-                        if (!eatComma(p)) cellSet(more, false) else ()
-                    },
-                }
-            };
-            let _ = expectRParen(p)?;
-            Ok(MkVariantDef { vname: vname, vbody: VarTuple(cellGet(fs)) })
-        },
-        TkLBrace -> {
-            let _ = bumpTok(p);
-            let fs = cellNew(Nil);
-            let more = cellNew(true);
-            while (cellGet(more)) {
-                match peekTok(p).kind {
-                    TkRBrace -> cellSet(more, false),
-                    _ -> {
-                        let fnm = parseIdent(p)?;
-                        let _ = expectSym(p, ":")?;
-                        let ft = parseTypeExpr(p)?;
-                        cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: Some(fnm), fty: ft }]));
-                        if (!eatComma(p)) cellSet(more, false) else ()
-                    },
-                }
-            };
-            let _ = expectRBrace(p)?;
-            Ok(MkVariantDef { vname: vname, vbody: VarStruct(cellGet(fs)) })
-        },
-        _ -> Ok(MkVariantDef { vname: vname, vbody: VarUnit }),
-    }
+def parseTupleFieldDecl(s: GsCursor): GsResult FieldDecl = {
+    let ft = parseTypeExpr(s)?;
+    Ok(MkFieldDecl { fname: None, fty: ft })
 }
 
-def parseInlineTypeParams(p: Parser): Result (List String) String = {
-    let ps = cellNew(Nil);
-    while (!peekTok(p).hadNewline && match peekTok(p).kind { TkIdent(s) -> isLowerByte(strByteAt(s, 0)), _ -> false }) {
-        let tv = parseTypeVarIdent(p)?;
-        cellSet(ps, listAppend(cellGet(ps), [tv]))
-    };
-    Ok(cellGet(ps))
+def parseDataVariant(s: GsCursor): GsResult VariantDef = {
+    let vname = parseUpperIdent(s)?;
+    commit(s);
+    if (atTok(s, TkLParen)) {
+        let fs = between(tok(TkLParen), tok(TkRParen), sepEndBy(parseTupleFieldDecl, skipTok(TkComma)))(s)?;
+        Ok(MkVariantDef { vname: vname, vbody: VarTuple(fs) })
+    } else if (atTok(s, TkLBrace)) {
+        let fs = between(tok(TkLBrace), tok(TkRBrace), sepEndBy(parseNamedFieldDecl, skipTok(TkComma)))(s)?;
+        Ok(MkVariantDef { vname: vname, vbody: VarStruct(fs) })
+    } else Ok(MkVariantDef { vname: vname, vbody: VarUnit })
 }
 
-def parseExternParam(p: Parser): Result Type String = {
-    let snap = savePos(p);
-    let namedTry: Option (Result Type String) = match peekTok(p).kind {
-        TkIdent(_) -> {
-            let _ = bumpTok(p);
-            if (eatSym(p, ":")) Some(parseTypeExpr(p))
-            else { restorePos(p, snap); None }
-        },
-        _ -> None,
-    };
-    match namedTry {
-        Some(r) -> r,
-        None -> parseTypeExpr(p),
-    }
+def parseInlineTypeParams(s: GsCursor): GsResult (List String) =
+    parseInlineLowerIdents(s, Nil)
+
+def parseExternParamNamed(s: GsCursor): GsResult Type = {
+    let _ = parseIdent(s)?;
+    let _ = eatSym(s, ":")?;
+    commit(s);
+    parseTypeExpr(s)
 }
 
-def parseFnContractClauses(p: Parser): Result FnContract String = {
-    let reqRev: Cell (List (Span, Form)) = cellNew(Nil);
-    let ensRev: Cell (List EnsuresClause) = cellNew(Nil);
-    let decRev: Cell (List (Span, Form)) = cellNew(Nil);
-    let moreSpecs = cellNew(true);
-    while (cellGet(moreSpecs)) {
-        match peekTok(p).kind {
-            TkIdent(w) if (w == "requires") -> {
-                let kwTok = bumpTok(p);
-                let reqExpr = parseExpr(p)?;
-                let callSp = unionSpan(kwTok.span, reqExpr.pos);
-                cellSet(reqRev, Cons((callSp, reqExpr), cellGet(reqRev)))
-            },
-            TkIdent(w) if (w == "ensures") -> {
-                let kwTok = bumpTok(p);
-                let bindOpt: Option String = match peekTok(p).kind {
-                    TkSym(s) if (s == "|") -> {
-                        let _ = bumpTok(p);
-                        let rname = parseIdent(p)?;
-                        let _ = expectSym(p, "|")?;
-                        Some(rname)
-                    },
-                    TkIdent(rname) -> match peekAt(p, 1).kind {
-                        TkSym(s) if (s == "->") -> {
-                            let _ = bumpTok(p);
-                            let _ = bumpTok(p);
-                            Some(rname)
-                        },
-                        _ -> None,
-                    },
-                    _ -> None,
-                };
-                let ensExpr = parseExpr(p)?;
-                let callSp = unionSpan(kwTok.span, ensExpr.pos);
-                cellSet(ensRev, Cons(MkEnsuresClause { ecBind: bindOpt, ecSpan: callSp, ecExpr: ensExpr }, cellGet(ensRev)))
-            },
-            TkIdent(w) if (w == "decreases") -> {
-                let kwTok = bumpTok(p);
-                let decExpr = parseExpr(p)?;
-                let callSp = unionSpan(kwTok.span, decExpr.pos);
-                match cellGet(decRev) {
-                    Cons(_, _) -> Err(formatSpanDiagHint(
-                        "Parse error", callSp,
-                        "at most one `decreases` clause is allowed per function",
-                        "combine termination measures into a single non-negative `Int` expression"
-                    ))?,
-                    Nil -> (),
-                };
-                cellSet(decRev, Cons((callSp, decExpr), cellGet(decRev)))
-            },
-            _ -> cellSet(moreSpecs, false),
+def parseExternParam(s: GsCursor): GsResult Type =
+    (backtrack(parseExternParamNamed) <|> parseTypeExpr)(s)
+
+def parseEnsuresBindArrow(s: GsCursor): GsResult String = {
+    let rname = parseIdent(s)?;
+    let _ = eatSym(s, "->")?;
+    Ok(rname)
+}
+
+def parseFnContractLoop(
+    s: GsCursor,
+    reqRev: List (Span, Form),
+    ensRev: List EnsuresClause,
+    decRev: List (Span, Form)
+): GsResult FnContract =
+    if (atTok(s, TkIdent("requires"))) {
+        let kwSp = toAstSpan(bumpTok(s)?.span);
+        commit(s);
+        let reqE = parseExpr(s)?;
+        parseFnContractLoop(s, Cons((unionSpan(kwSp, reqE.pos), reqE), reqRev), ensRev, decRev)
+    } else if (atTok(s, TkIdent("ensures"))) {
+        let kwSp = toAstSpan(bumpTok(s)?.span);
+        commit(s);
+        let bindOpt =
+            if (tryEatSym(s, "|")) {
+                let rname = parseIdent(s)?;
+                let _ = eatSym(s, "|")?;
+                Some(rname)
+            } else opt(backtrack(parseEnsuresBindArrow))(s)?;
+        let ensE = parseExpr(s)?;
+        let clause = MkEnsuresClause { ecBind: bindOpt, ecSpan: unionSpan(kwSp, ensE.pos), ecExpr: ensE };
+        parseFnContractLoop(s, reqRev, Cons(clause, ensRev), decRev)
+    } else if (atTok(s, TkIdent("decreases"))) {
+        let kwSp = toAstSpan(bumpTok(s)?.span);
+        commit(s);
+        let decE = parseExpr(s)?;
+        let callSp = unionSpan(kwSp, decE.pos);
+        match decRev {
+            Cons(_, _) -> failSpanMsgHint(
+                s,
+                callSp,
+                "at most one `decreases` clause is allowed per function",
+                "combine termination measures into a single non-negative `Int` expression"
+            ),
+            Nil -> parseFnContractLoop(s, reqRev, ensRev, Cons((callSp, decE), decRev)),
         }
-    };
-    Ok(MkFnContract {
-        fcRequires: listRev(cellGet(reqRev)),
-        fcEnsures: listRev(cellGet(ensRev)),
-        fcDecreases: listRev(cellGet(decRev)),
+    } else Ok(MkFnContract {
+        fcRequires: listRev(reqRev),
+        fcEnsures: listRev(ensRev),
+        fcDecreases: listRev(decRev),
     })
-}
 
 def wrapFnContractBody(fc: FnContract, rawBody: Form): Form =
     if (!hasFnContract(fc)) rawBody
     else mkForm(rawBody.pos, ExContract(fc, rawBody))
 
-def parseFormDefBody(p: Parser, vis: Visibility, startSp: Span): Result Def String = {
-    let _ = bumpTok(p); // consume `def`
-    let name = parseCallableIdent(p)?;
-    match peekTok(p).kind {
-        TkLParen -> {
-            let _ = bumpTok(p);
-            let ps = parseParamSeq(p)?;
-            let _ = expectRParen(p)?;
-            let retScmOpt: Option Scheme = if (eatSym(p, ":")) Some(parseTypeScheme(p)?) else None;
-            let fc = parseFnContractClauses(p)?;
-            let _ = expectSym(p, "=")?;
-            let rawBody = parseExpr(p)?;
-            let body = wrapFnContractBody(fc, rawBody);
-            let (retTy, fnScmAnn) = match retScmOpt {
-                Some(ScmMono(t)) -> (Some(t), None),
-                Some(poly) -> (None, Some(poly)),
-                None -> (None, None),
-            };
-            let fullSp = unionSpan(startSp, rawBody.pos);
-            let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
-            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: Nil, item: ItForm(form) })
-        },
-        _ -> {
-            let valAnn: Option Scheme = if (eatSym(p, ":")) Some(parseTypeScheme(p)?) else None;
-            let _ = expectSym(p, "=")?;
-            let val = parseExpr(p)?;
-            let fullSp = unionSpan(startSp, val.pos);
-            let annotatedVal = MkForm { pos: val.pos, ty: val.ty, annot: valAnn, node: val.node };
-            Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: Nil, item: ItForm(annotatedVal) })
-        },
+def parseFormDefBody(s: GsCursor, vis: Visibility, startSp: Span): GsResult Def = {
+    let _ = eatTok(s, TkDef)?;
+    commit(s);
+    let name = parseCallableIdent(s)?;
+    if (atTok(s, TkLParen)) {
+        let ps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
+        let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+        let fc = parseFnContractLoop(s, Nil, Nil, Nil)?;
+        let _ = eatSym(s, "=")?;
+        let rawBody = parseExpr(s)?;
+        let body = wrapFnContractBody(fc, rawBody);
+        let (retTy, fnScmAnn) = match retScmOpt {
+            Some(ScmMono(t)) -> (Some(t), None),
+            Some(poly) -> (None, Some(poly)),
+            None -> (None, None),
+        };
+        let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
+        Ok(MkDef { ident: name, dpos: unionSpan(startSp, rawBody.pos), vis: vis, attrs: Nil, item: ItForm(form) })
+    } else {
+        let valAnn = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+        let _ = eatSym(s, "=")?;
+        let val = parseExpr(s)?;
+        let annotatedVal = MkForm { pos: val.pos, ty: val.ty, annot: valAnn, node: val.node };
+        Ok(MkDef { ident: name, dpos: unionSpan(startSp, val.pos), vis: vis, attrs: Nil, item: ItForm(annotatedVal) })
     }
 }
 
-def parseDataDefBody(p: Parser, vis: Visibility, startSp: Span, attrs: List DefAttr): Result Def String = {
-    let _ = bumpTok(p); // consume `data`
-    let dname = parseUpperIdent(p)?;
-    let tparams = parseInlineTypeParams(p)?;
-    let derivedConcepts = cellNew(Nil);
-    if (eatSym(p, ":")) {
-        let c0 = parseUpperIdent(p)?;
-        cellSet(derivedConcepts, [c0]);
-        while (eatComma(p)) {
-            let cn = parseUpperIdent(p)?;
-            cellSet(derivedConcepts, listAppend(cellGet(derivedConcepts), [cn]))
-        }
-    } else ();
-    let variants = cellNew(Nil);
-    let closeSp = match peekTok(p).kind {
-        TkLParen -> {
-            // Tuple / newtype shorthand: `data Box a (a)` or `data Box a : Eq (a)` or `data Box a (a) : Eq`
-            let _ = bumpTok(p);
-            let fs = cellNew(Nil);
-            let more = cellNew(true);
-            while (cellGet(more)) {
-                match peekTok(p).kind {
-                    TkRParen -> cellSet(more, false),
-                    _ -> {
-                        let ft = parseTypeExpr(p)?;
-                        cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: None, fty: ft }]));
-                        if (!eatComma(p)) cellSet(more, false) else ()
-                    },
-                }
-            };
-            let spClose = expectRParen(p)?;
-            cellSet(variants, [MkVariantDef { vname: dname, vbody: VarTuple(cellGet(fs)) }]);
-            if (match cellGet(derivedConcepts) { Nil -> eatSym(p, ":"), _ -> false }) {
-                let c0 = parseUpperIdent(p)?;
-                cellSet(derivedConcepts, [c0]);
-                while (eatComma(p)) {
-                    let cn = parseUpperIdent(p)?;
-                    cellSet(derivedConcepts, listAppend(cellGet(derivedConcepts), [cn]))
-                }
-            } else ();
-            spClose
-        },
-        _ -> {
-            let _ = expectLBrace(p)?;
-            let isRecordShorthand = match peekTok(p).kind {
-                TkIdent(s) -> strLen(s) > 0 && isLowerByte(strByteAt(s, 0)) && match peekAt(p, 1).kind {
-                    TkSym(sym) -> sym == ":",
-                    _ -> false,
-                },
-                _ -> false,
-            };
-            if (isRecordShorthand) {
-                let fs = cellNew(Nil);
-                let more = cellNew(true);
-                while (cellGet(more)) {
-                    match peekTok(p).kind {
-                        TkRBrace -> cellSet(more, false),
-                        _ -> {
-                            let fnm = parseIdent(p)?;
-                            let _ = expectSym(p, ":")?;
-                            let ft = parseTypeExpr(p)?;
-                            cellSet(fs, listAppend(cellGet(fs), [MkFieldDecl { fname: Some(fnm), fty: ft }]));
-                            if (!eatComma(p)) cellSet(more, false) else ()
-                        },
-                    }
-                };
-                cellSet(variants, [MkVariantDef { vname: dname, vbody: VarStruct(cellGet(fs)) }])
-            } else {
-                let more = cellNew(true);
-                while (cellGet(more)) {
-                    match peekTok(p).kind {
-                        TkRBrace -> cellSet(more, false),
-                        _ -> {
-                            let v = parseDataVariant(p)?;
-                            cellSet(variants, listAppend(cellGet(variants), [v]));
-                            if (!eatComma(p)) cellSet(more, false) else ()
-                        },
-                    }
-                }
-            };
-            expectRBrace(p)?
-        },
+def buildDerivedInstItem(
+    dname: String,
+    tparams: List String,
+    cn: String,
+    fullSp: Span,
+    vis: Visibility
+): ModuleItem = {
+    let (targetTy, autoCsRev) = buildDerivedTargetLoop(tparams, cn, TyCon(dname), Nil);
+    let instDef = MkDef {
+        ident: "instance_" + cn,
+        dpos: fullSp,
+        vis: vis,
+        attrs: Nil,
+        item: ItInstance(cn, [targetTy], listRev(autoCsRev), Nil),
     };
+    ModDef(vis, instDef)
+}
+
+def buildDerivedTargetLoop(
+    tps: List String,
+    cn: String,
+    tyAcc: Type,
+    csRev: List ConstraintSpec
+): (Type, List ConstraintSpec) = match tps {
+    Nil -> (tyAcc, csRev),
+    Cons(tp, rest) -> buildDerivedTargetLoop(
+        rest,
+        cn,
+        TyComp(tyAcc, TyVar(tp)),
+        Cons(MkConstraint { conceptName: cn, typeArgs: [TyVar(tp)] }, csRev)
+    ),
+}
+
+def buildDerivedItems(
+    derived: List String,
+    dname: String,
+    tparams: List String,
+    fullSp: Span,
+    vis: Visibility
+): List ModuleItem = match derived {
+    Nil -> Nil,
+    Cons(cn, rest) -> Cons(
+        buildDerivedInstItem(dname, tparams, cn, fullSp, vis),
+        buildDerivedItems(rest, dname, tparams, fullSp, vis)
+    ),
+}
+
+def isRecordShorthandAfterLBrace(s: GsCursor): Bool =
+    match (peekTok(s), peekNthTok(s, 1)) {
+        (Some(t0), Some(t1)) -> match (t0.kind, t1.kind) {
+            (TkIdent(fnm), TkSym(colon)) -> strLen(fnm) > 0 && isLowerByte(strByteAt(fnm, 0)) && colon == ":",
+            _ -> false,
+        },
+        _ -> false,
+    }
+
+def parseDataDefBody(
+    s: GsCursor,
+    vis: Visibility,
+    startSp: Span,
+    attrs: List DefAttr
+): GsResult (Def, List ModuleItem) = {
+    let _ = eatTok(s, TkData)?;
+    commit(s);
+    let dname = parseUpperIdent(s)?;
+    let tparams = parseInlineTypeParams(s)?;
+    let derived0 =
+        if (tryEatSym(s, ":")) sepBy1(parseUpperIdent, skipTok(TkComma))(s)?
+        else Nil;
+    let (variants, closeSp, derived) =
+        if (atTok(s, TkLParen)) {
+            let _ = eatTok(s, TkLParen)?;
+            let fs = sepEndBy(parseTupleFieldDecl, skipTok(TkComma))(s)?;
+            let spClose = toAstSpan(eatTok(s, TkRParen)?);
+            let derived1 = match derived0 {
+                Nil -> if (tryEatSym(s, ":")) sepBy1(parseUpperIdent, skipTok(TkComma))(s)? else Nil,
+                _ -> derived0,
+            };
+            ([MkVariantDef { vname: dname, vbody: VarTuple(fs) }], spClose, derived1)
+        } else {
+            let _ = eatTok(s, TkLBrace)?;
+            let vs =
+                if (isRecordShorthandAfterLBrace(s)) {
+                    let fs = sepEndBy(parseNamedFieldDecl, skipTok(TkComma))(s)?;
+                    [MkVariantDef { vname: dname, vbody: VarStruct(fs) }]
+                } else {
+                    sepEndBy(parseDataVariant, skipTok(TkComma))(s)?
+                };
+            let spClose = toAstSpan(eatTok(s, TkRBrace)?);
+            (vs, spClose, derived0)
+        };
     let fullSp = unionSpan(startSp, closeSp);
-    // Desugar `data T a : C1, C2 { ... }` into bodyless `instance (C1 a) => C1 (T a)` items
-    let cd = cellNew(cellGet(derivedConcepts));
-    while (match cellGet(cd) { Nil -> false, _ -> true }) {
-        match cellGet(cd) {
-            Cons(cn, rcd) -> {
-                let targetTy = cellNew(TyCon(dname));
-                let autoCs = cellNew(Nil);
-                let ctp = cellNew(tparams);
-                while (match cellGet(ctp) { Nil -> false, _ -> true }) {
-                    match cellGet(ctp) {
-                        Cons(tp, rtp) -> {
-                            cellSet(targetTy, TyComp(cellGet(targetTy), TyVar(tp)));
-                            cellSet(autoCs, listAppend(cellGet(autoCs), [MkConstraint { conceptName: cn, typeArgs: [TyVar(tp)] }]));
-                            cellSet(ctp, rtp)
-                        },
-                        Nil -> (),
-                    }
-                };
-                let instDef = MkDef {
-                    ident: "instance_" + cn,
-                    dpos: fullSp,
-                    vis: vis,
-                    attrs: Nil,
-                    item: ItInstance(cn, [cellGet(targetTy)], cellGet(autoCs), Nil),
-                };
-                cellSet(p.pendingItems, listAppend(cellGet(p.pendingItems), [ModDef(vis, instDef)]));
-                cellSet(cd, rcd)
-            },
-            Nil -> (),
-        }
-    };
-    Ok(MkDef { ident: dname, dpos: fullSp, vis: vis, attrs: attrs, item: ItAlg(tparams, cellGet(variants)) })
+    let extraItems = buildDerivedItems(derived, dname, tparams, fullSp, vis);
+    Ok((MkDef { ident: dname, dpos: fullSp, vis: vis, attrs: attrs, item: ItAlg(tparams, variants) }, extraItems))
 }
 
-def tryParseExternExportHeader(p: Parser): Option (String, List VarDecl, Option Scheme, FnContract) = {
-    let snap = savePos(p);
-    match peekTok(p).kind {
-        TkDef -> {
-            let _ = bumpTok(p);
-            match parseCallableIdent(p) {
-                Err(_) -> { restorePos(p, snap); None },
-                Ok(name) -> match peekTok(p).kind {
-                    TkLParen -> {
-                        let _ = bumpTok(p);
-                        match parseParamSeq(p) {
-                            Err(_) -> { restorePos(p, snap); None },
-                            Ok(ps) -> match expectRParen(p) {
-                                Err(_) -> { restorePos(p, snap); None },
-                                Ok(_) -> {
-                                    let retRes: Result (Option Scheme) String =
-                                        if (eatSym(p, ":")) {
-                                            match parseTypeScheme(p) {
-                                                Ok(sc) -> Ok(Some(sc)),
-                                                Err(e) -> Err(e),
-                                            }
-                                        } else Ok(None);
-                                    match retRes {
-                                        Err(_) -> { restorePos(p, snap); None },
-                                        Ok(retScmOpt) -> match parseFnContractClauses(p) {
-                                            Err(_) -> { restorePos(p, snap); None },
-                                            Ok(fc) ->
-                                                if (eatSym(p, "=")) Some((name, ps, retScmOpt, fc))
-                                                else { restorePos(p, snap); None },
-                                        },
-                                    }
-                                },
-                            },
-                        }
-                    },
-                    _ -> { restorePos(p, snap); None },
-                },
-            }
-        },
-        _ -> None,
+def parseExternExportHeader(s: GsCursor): GsResult (String, List VarDecl, Option Scheme, FnContract) = {
+    let _ = eatTok(s, TkDef)?;
+    let name = parseCallableIdent(s)?;
+    let ps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
+    let retScmOpt = if (tryEatSym(s, ":")) Some(parseTypeScheme(s)?) else None;
+    let fc = parseFnContractLoop(s, Nil, Nil, Nil)?;
+    let _ = eatSym(s, "=")?;
+    Ok((name, ps, retScmOpt, fc))
+}
+
+def parseExternModsLoop(s: GsCursor, isNoAlloc: Bool, isFnPtr: Bool): GsResult (Bool, Bool) =
+    if (tryEatTok(s, TkIdent("noalloc"))) parseExternModsLoop(s, true, isFnPtr)
+    else if (tryEatTok(s, TkIdent("ptr"))) parseExternModsLoop(s, isNoAlloc, true)
+    else Ok((isNoAlloc, isFnPtr))
+
+def parseForwardDecl(s: GsCursor): GsResult (String, Scheme) = {
+    let fname = parseCallableIdent(s)?;
+    let _ = eatSym(s, ":")?;
+    let scm = parseTypeScheme(s)?;
+    Ok((fname, scm))
+}
+
+def parseConceptMethodsLoop(s: GsCursor, accRev: List MethodDecl): GsResult (List MethodDecl) = {
+    skipSemis(s)?;
+    if (atTok(s, TkRBrace)) Ok(listRev(accRev))
+    else if (tryEatTok(s, TkDef)) {
+        commit(s);
+        let mname = parseCallableIdent(s)?;
+        let ptys = between(tok(TkLParen), tok(TkRParen), sepEndBy(parseExternParam, skipTok(TkComma)))(s)?;
+        let retTy = if (tryEatSym(s, ":")) parseTypeExpr(s)? else TyVoid;
+        let mscm = ScmMono(TyArr(TyVoid, ptys, retTy));
+        let _ = tryEatTok(s, TkComma);
+        skipSemis(s)?;
+        parseConceptMethodsLoop(s, Cons(MkMethodDecl { mname: mname, mty: mscm }, accRev))
+    } else {
+        let mname = parseCallableIdent(s)?;
+        commit(s);
+        let _ = eatSym(s, ":")?;
+        let mscm = parseTypeScheme(s)?;
+        let _ = tryEatTok(s, TkComma);
+        skipSemis(s)?;
+        parseConceptMethodsLoop(s, Cons(MkMethodDecl { mname: mname, mty: mscm }, accRev))
     }
 }
 
-def tryParseForwardDecl(p: Parser): Option (String, Scheme) = {
-    let snap = savePos(p);
-    match parseCallableIdent(p) {
-        Err(_) -> { restorePos(p, snap); None },
-        Ok(fname) ->
-            if (!eatSym(p, ":")) { restorePos(p, snap); None }
-            else match parseTypeScheme(p) {
-                Err(_) -> { restorePos(p, snap); None },
-                Ok(scm) -> Some((fname, scm)),
-            },
-    }
+def parseInstanceImplsLoop(s: GsCursor, accRev: List MethodImpl): GsResult (List MethodImpl) = {
+    skipSemis(s)?;
+    if (atTok(s, TkRBrace)) Ok(listRev(accRev))
+    else if (atTok(s, TkDef)) {
+        let mSp = toAstSpan(bumpTok(s)?.span);
+        commit(s);
+        let mname = parseCallableIdent(s)?;
+        let mps = between(tok(TkLParen), tok(TkRParen), parseParamSeq)(s)?;
+        let mret = if (tryEatSym(s, ":")) Some(parseTypeExpr(s)?) else None;
+        let mfc = parseFnContractLoop(s, Nil, Nil, Nil)?;
+        let _ = eatSym(s, "=")?;
+        let rawMBody = parseExpr(s)?;
+        let mbody = wrapFnContractBody(mfc, rawMBody);
+        let lam = mkForm(unionSpan(mSp, rawMBody.pos), ExAbs(mps, mret, mbody));
+        let _ = tryEatTok(s, TkComma);
+        skipSemis(s)?;
+        parseInstanceImplsLoop(s, Cons(MkMethodImpl { implName: mname, implBody: lam }, accRev))
+    } else failMsg(s, "expected 'def' or '}' inside instance block")
 }
 
-pub def parseDefinition(p: Parser, knownVis: Option Visibility): Result Def String = {
-    // Check optional `name : Scheme` forward declaration before `[pub] def name ...`
+def parseDefinition(s: GsCursor, knownVis: Option Visibility): GsResult (Def, List ModuleItem) = {
     let fwdOpt: Option (String, Scheme) = match knownVis {
         Some(_) -> None,
-        None -> match peekTok(p).kind {
-            TkIdent(_) -> tryParseForwardDecl(p),
-            TkLParen -> tryParseForwardDecl(p),
-            _ -> None,
-        },
+        None ->
+            if (atTokIf(s, (tk) -> match tk { TkIdent(_) -> true, TkLParen -> true, _ -> false }))
+                opt(backtrack(parseForwardDecl))(s)?
+            else None,
     };
-
     match fwdOpt {
         Some((fwdName, fwdScm)) -> {
-            skipSemis(p);
-            let startSp = peekTok(p).span;
-            let vis = parseVisibility(p);
-            match peekTok(p).kind {
-                TkDef -> {
-                    let d = parseFormDefBody(p, vis, startSp)?;
-                    if (d.ident != fwdName) {
-                        Err(parseErr(p, "Forward declaration for '" + fwdName + "' must be followed by its definition"))
-                    } else match d.item {
-                        ItForm(f) -> {
-                            let f2 = MkForm { pos: f.pos, ty: f.ty, annot: Some(fwdScm), node: f.node };
-                            Ok(MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: Nil, item: ItForm(f2) })
-                        },
-                        _ -> Ok(d),
-                    }
-                },
-                _ -> Err(parseErr(p, "Expected 'def' after forward type declaration")),
+            commit(s);
+            skipSemis(s)?;
+            let startSp = curAstSpan(s);
+            let vis = parseVisibility(s);
+            if (!atTok(s, TkDef)) failMsg(s, "Expected 'def' after forward type declaration")
+            else {
+                let d = parseFormDefBody(s, vis, startSp)?;
+                if (d.ident != fwdName) {
+                    failMsg(s, "Forward declaration for '" + fwdName + "' must be followed by its definition")
+                } else match d.item {
+                    ItForm(f) -> {
+                        let f2 = MkForm { pos: f.pos, ty: f.ty, annot: Some(fwdScm), node: f.node };
+                        Ok((MkDef { ident: d.ident, dpos: d.dpos, vis: d.vis, attrs: Nil, item: ItForm(f2) }, Nil))
+                    },
+                    _ -> Ok((d, Nil)),
+                }
             }
         },
         None -> {
-            let startSp = peekTok(p).span;
+            let startSp = curAstSpan(s);
             let vis = match knownVis {
                 Some(v) -> v,
-                None -> parseVisibility(p),
+                None -> parseVisibility(s),
             };
-            match peekTok(p).kind {
-                TkDef -> parseFormDefBody(p, vis, startSp),
-                TkExtern -> {
-                    let _ = bumpTok(p);
-                    match peekTok(p).kind {
-                        // C ABI value struct: `[pub] extern data CGPoint { x: Float, y: Float }`
-                        TkData -> parseDataDefBody(p, vis, startSp, [AttrCStruct]),
-                        // Static constructor: `[pub] extern init[(priority)] def f(): Void = ...`
-                        TkIdent(w) if (w == "init") -> {
-                            let _ = bumpTok(p);
-                            let prio = match peekTok(p).kind {
-                                TkLParen -> {
-                                    let _ = bumpTok(p);
-                                    let pv = match peekTok(p).kind {
-                                        TkInt(ns) -> {
-                                            let itok = bumpTok(p);
-                                            match parseStrictIntTok(ns, false, itok.span) {
-                                                Ok(v) -> Ok(v),
-                                                Err(_) -> Err(parseErr(p, "Invalid integer priority in 'extern init(...)'")),
-                                            }
-                                        },
-                                        _ -> Err(parseErr(p, "Expected integer priority inside 'extern init(...)'")),
-                                    }?;
-                                    let _ = expectRParen(p)?;
-                                    Ok(pv)
-                                },
-                                _ -> Ok(65535),
-                            }?;
-                            match peekTok(p).kind {
-                                TkDef -> {
-                                    let d = parseFormDefBody(p, vis, startSp)?;
-                                    Ok(MkDef { ident: d.ident, dpos: unionSpan(startSp, d.dpos), vis: vis, attrs: [AttrCtor(prio)], item: d.item })
-                                },
-                                _ -> Err(parseErr(p, "Expected 'def' after 'extern init'")),
-                            }
+            if (atTok(s, TkDef)) {
+                let d = parseFormDefBody(s, vis, startSp)?;
+                Ok((d, Nil))
+            } else if (tryEatTok(s, TkExtern)) {
+                commit(s);
+                if (atTok(s, TkData)) {
+                    parseDataDefBody(s, vis, startSp, [AttrCStruct])
+                } else if (tryEatTok(s, TkIdent("init"))) {
+                    let prio =
+                        if (tryEatTok(s, TkLParen)) {
+                            let (isp, raw) = matchTok(s, (tk) -> match tk { TkInt(ns) -> Some(ns), _ -> None }, "integer priority")?;
+                            let pv = parseStrictIntTok(s, raw, false, toAstSpan(isp))?;
+                            let _ = eatTok(s, TkRParen)?;
+                            pv
+                        } else 65535;
+                    if (!atTok(s, TkDef)) failMsg(s, "Expected 'def' after 'extern init'")
+                    else {
+                        let d = parseFormDefBody(s, vis, startSp)?;
+                        Ok((MkDef { ident: d.ident, dpos: unionSpan(startSp, d.dpos), vis: vis, attrs: [AttrCtor(prio)], item: d.item }, Nil))
+                    }
+                } else {
+                    let (isNoAlloc, isFnPtr) = parseExternModsLoop(s, false, false)?;
+                    let linkOpt = opt((sc) -> {
+                        let (_, str) = matchTok(sc, (tk) -> match tk { TkStr(st) -> Some(st), _ -> None }, "link symbol")?;
+                        Ok(str)
+                    })(s)?;
+                    let exportHdrOpt =
+                        if (!isNoAlloc && !isFnPtr) opt(backtrack(parseExternExportHeader))(s)?
+                        else None;
+                    match exportHdrOpt {
+                        Some((name, ps, retScmOpt, fc)) -> {
+                            let rawBody = parseExpr(s)?;
+                            let body = wrapFnContractBody(fc, rawBody);
+                            let (retTy, fnScmAnn) = match retScmOpt {
+                                Some(ScmMono(t)) -> (Some(t), None),
+                                Some(poly) -> (None, Some(poly)),
+                                None -> (None, None),
+                            };
+                            let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
+                            let d = MkDef { ident: name, dpos: unionSpan(startSp, rawBody.pos), vis: vis, attrs: [AttrExport(linkOpt)], item: ItForm(form) };
+                            Ok((d, Nil))
                         },
-                        _ -> {
-                            let isNoAlloc = cellNew(false);
-                            let isFnPtr = cellNew(false);
-                            let modMore = cellNew(true);
-                            while (cellGet(modMore)) {
-                                match peekTok(p).kind {
-                                    TkIdent(w) if (w == "noalloc") -> { let _ = bumpTok(p); cellSet(isNoAlloc, true) },
-                                    TkIdent(w) if (w == "ptr") -> { let _ = bumpTok(p); cellSet(isFnPtr, true) },
-                                    _ -> cellSet(modMore, false),
-                                }
+                        None -> {
+                            let _ = eatTok(s, TkDef)?;
+                            let fnName = parseIdent(s)?;
+                            let _ = eatTok(s, TkLParen)?;
+                            let ps = sepEndBy(parseExternParam, skipTok(TkComma))(s)?;
+                            let closeSp = toAstSpan(eatTok(s, TkRParen)?);
+                            let retTy = if (tryEatSym(s, ":")) parseTypeExpr(s)? else TyVoid;
+                            let linkSym = match linkOpt {
+                                Some(st) -> st,
+                                None -> if (isFnPtr) "" else fnName,
                             };
-                            let linkOpt: Option String = match peekTok(p).kind {
-                                TkStr(s) -> { let _ = bumpTok(p); Some(s) },
-                                _ -> None,
+                            let fnTy = TyArr(TyVoid, ps, retTy);
+                            let d = MkDef {
+                                ident: fnName,
+                                dpos: unionSpan(startSp, closeSp),
+                                vis: vis,
+                                attrs: Nil,
+                                item: ItExtern(linkSym, ScmMono(fnTy), isNoAlloc, isFnPtr),
                             };
-                            // Symmetric C ABI export when `= body` follows `extern ["sym"] def name(...)[: Ret]`
-                            let exportHdrOpt =
-                                if (!cellGet(isNoAlloc) && !cellGet(isFnPtr)) tryParseExternExportHeader(p)
-                                else None;
-                            match exportHdrOpt {
-                                Some((name, ps, retScmOpt, fc)) -> {
-                                    let rawBody = parseExpr(p)?;
-                                    let body = wrapFnContractBody(fc, rawBody);
-                                    let (retTy, fnScmAnn) = match retScmOpt {
-                                        Some(ScmMono(t)) -> (Some(t), None),
-                                        Some(poly) -> (None, Some(poly)),
-                                        None -> (None, None),
-                                    };
-                                    let fullSp = unionSpan(startSp, rawBody.pos);
-                                    let form = MkForm { pos: rawBody.pos, ty: ScmSlot, annot: fnScmAnn, node: ExAbs(ps, retTy, body) };
-                                    Ok(MkDef { ident: name, dpos: fullSp, vis: vis, attrs: [AttrExport(linkOpt)], item: ItForm(form) })
-                                },
-                                None -> {
-                                    match peekTok(p).kind {
-                                        TkDef -> { let _ = bumpTok(p); () },
-                                        _ -> { let _ = expectSym(p, "def")?; () },
-                                    };
-                                    let fnName = parseIdent(p)?;
-                                    let _ = expectLParen(p)?;
-                                    let ps = cellNew(Nil);
-                                    let more = cellNew(true);
-                                    while (cellGet(more)) {
-                                        match peekTok(p).kind {
-                                            TkRParen -> cellSet(more, false),
-                                            _ -> {
-                                                let pt = parseExternParam(p)?;
-                                                cellSet(ps, listAppend(cellGet(ps), [pt]));
-                                                if (!eatComma(p)) cellSet(more, false) else ()
-                                            },
-                                        }
-                                    };
-                                    let closeSp = expectRParen(p)?;
-                                    let retTy = if (eatSym(p, ":")) parseTypeExpr(p)? else TyVoid;
-                                    let linkSym = match linkOpt {
-                                        Some(s) -> s,
-                                        None -> if (cellGet(isFnPtr)) "" else fnName,
-                                    };
-                                    let fnTy = TyArr(TyVoid, cellGet(ps), retTy);
-                                    Ok(MkDef {
-                                        ident: fnName,
-                                        dpos: unionSpan(startSp, closeSp),
-                                        vis: vis,
-                                        attrs: Nil,
-                                        item: ItExtern(linkSym, ScmMono(fnTy), cellGet(isNoAlloc), cellGet(isFnPtr)),
-                                    })
-                                },
-                            }
+                            Ok((d, Nil))
                         },
                     }
-                },
-                TkType -> {
-                    let _ = bumpTok(p);
-                    let tname = parseUpperIdent(p)?;
-                    let tparams = parseInlineTypeParams(p)?;
-                    let _ = expectSym(p, "=")?;
-                    let target = parseTypeScheme(p)?;
-                    Ok(MkDef { ident: tname, dpos: startSp, vis: vis, attrs: Nil, item: ItAlias(tparams, target) })
-                },
-                TkData -> parseDataDefBody(p, vis, startSp, Nil),
-                TkConcept -> {
-                    let _ = bumpTok(p);
-                    let cname = parseUpperIdent(p)?;
-                    let tparams = parseInlineTypeParams(p)?;
-                    let supers = parseConceptSupersClause(p)?;
-                    let fundeps = parseFunDepsClause(p)?;
-                    let _ = expectLBrace(p)?;
-                    let methods = cellNew(Nil);
-                    let more = cellNew(true);
-                    while (cellGet(more)) {
-                        skipSemis(p);
-                        match peekTok(p).kind {
-                            TkRBrace -> cellSet(more, false),
-                            TkDef -> {
-                                let _ = bumpTok(p);
-                                let mname = parseCallableIdent(p)?;
-                                let _ = expectLParen(p)?;
-                                let ptysRev = cellNew(Nil);
-                                let pmore = cellNew(true);
-                                while (cellGet(pmore)) {
-                                    match peekTok(p).kind {
-                                        TkRParen -> cellSet(pmore, false),
-                                        _ -> {
-                                            let pt = parseExternParam(p)?;
-                                            cellSet(ptysRev, Cons(pt, cellGet(ptysRev)));
-                                            if (!eatComma(p)) cellSet(pmore, false) else ()
-                                        },
-                                    }
-                                };
-                                let _ = expectRParen(p)?;
-                                let retTy = if (eatSym(p, ":")) parseTypeExpr(p)? else TyVoid;
-                                let mscm = ScmMono(TyArr(TyVoid, listRev(cellGet(ptysRev)), retTy));
-                                cellSet(methods, listAppend(cellGet(methods), [MkMethodDecl { mname: mname, mty: mscm }]));
-                                let _ = eatComma(p);
-                                skipSemis(p)
-                            },
-                            _ -> {
-                                let mname = parseCallableIdent(p)?;
-                                let _ = expectSym(p, ":")?;
-                                let mscm = parseTypeScheme(p)?;
-                                cellSet(methods, listAppend(cellGet(methods), [MkMethodDecl { mname: mname, mty: mscm }]));
-                                let _ = eatComma(p);
-                                skipSemis(p)
-                            },
-                        }
-                    };
-                    let closeSp = expectRBrace(p)?;
-                    Ok(MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: Nil, item: ItConcept(tparams, supers, fundeps, cellGet(methods)) })
-                },
-                TkInstance -> {
-                    let _ = bumpTok(p);
-                    let cs = match tryParseConstraintPrefix(p) {
-                        Some(c) -> c,
-                        None -> Nil,
-                    };
-                    let cname = parseUpperIdent(p)?;
-                    let t0 = parseTypeAtom(p)?;
-                    let targs = cellNew([t0]);
-                    while (canStartTypeAtomInline(p)) {
-                        let ta = parseTypeAtom(p)?;
-                        cellSet(targs, listAppend(cellGet(targs), [ta]))
-                    };
-                    let instIdent = "instance_" + cname;
-                    match peekTok(p).kind {
-                        TkLBrace -> {
-                            let _ = bumpTok(p);
-                            let impls = cellNew(Nil);
-                            let more = cellNew(true);
-                            while (cellGet(more)) {
-                                skipSemis(p);
-                                match peekTok(p).kind {
-                                    TkRBrace -> cellSet(more, false),
-                                    TkDef -> {
-                                        let mSp = bumpTok(p).span;
-                                        let mname = parseCallableIdent(p)?;
-                                        let _ = expectLParen(p)?;
-                                        let mps = parseParamSeq(p)?;
-                                        let _ = expectRParen(p)?;
-                                        let mret = if (eatSym(p, ":")) Some(parseTypeExpr(p)?) else None;
-                                        let mfc = parseFnContractClauses(p)?;
-                                        let _ = expectSym(p, "=")?;
-                                        let rawMBody = parseExpr(p)?;
-                                        let mbody = wrapFnContractBody(mfc, rawMBody);
-                                        let lam = mkForm(unionSpan(mSp, rawMBody.pos), ExAbs(mps, mret, mbody));
-                                        cellSet(impls, listAppend(cellGet(impls), [MkMethodImpl { implName: mname, implBody: lam }]));
-                                        let _ = eatComma(p);
-                                        skipSemis(p)
-                                    },
-                                    _ -> {
-                                        returnErrHelper(p)?;
-                                        cellSet(more, false)
-                                    },
-                                }
-                            };
-                            let closeSp = expectRBrace(p)?;
-                            Ok(MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: Nil, item: ItInstance(cname, cellGet(targs), cs, cellGet(impls)) })
-                        },
-                        _ -> Ok(MkDef { ident: instIdent, dpos: startSp, vis: vis, attrs: Nil, item: ItInstance(cname, cellGet(targs), cs, Nil) }),
-                    }
-                },
-                _ -> Err(parseErr(p, "expected top-level definition")),
-            }
+                }
+            } else if (tryEatTok(s, TkType)) {
+                commit(s);
+                let tname = parseUpperIdent(s)?;
+                let tparams = parseInlineTypeParams(s)?;
+                let _ = eatSym(s, "=")?;
+                let target = parseTypeScheme(s)?;
+                Ok((MkDef { ident: tname, dpos: startSp, vis: vis, attrs: Nil, item: ItAlias(tparams, target) }, Nil))
+            } else if (atTok(s, TkData)) {
+                parseDataDefBody(s, vis, startSp, Nil)
+            } else if (tryEatTok(s, TkConcept)) {
+                commit(s);
+                let cname = parseUpperIdent(s)?;
+                let tparams = parseInlineTypeParams(s)?;
+                let supers = parseConceptSupersClause(s)?;
+                let fundeps = parseFunDepsClause(s)?;
+                let _ = eatTok(s, TkLBrace)?;
+                let methods = parseConceptMethodsLoop(s, Nil)?;
+                let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                let d = MkDef { ident: cname, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: Nil, item: ItConcept(tparams, supers, fundeps, methods) };
+                Ok((d, Nil))
+            } else if (tryEatTok(s, TkInstance)) {
+                commit(s);
+                let cs = optOr(backtrack(parseConstraintPrefix), Nil)(s)?;
+                let cname = parseUpperIdent(s)?;
+                let t0 = parseTypeAtom(s)?;
+                let targs = parseInlineTypeAtoms(s, [t0])?;
+                let instIdent = "instance_" + cname;
+                if (tryEatTok(s, TkLBrace)) {
+                    let impls = parseInstanceImplsLoop(s, Nil)?;
+                    let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+                    Ok((MkDef { ident: instIdent, dpos: unionSpan(startSp, closeSp), vis: vis, attrs: Nil, item: ItInstance(cname, targs, cs, impls) }, Nil))
+                } else {
+                    Ok((MkDef { ident: instIdent, dpos: startSp, vis: vis, attrs: Nil, item: ItInstance(cname, targs, cs, Nil) }, Nil))
+                }
+            } else fail("top-level definition")(s)
         },
     }
 }
 
-def returnErrHelper(p: Parser): Result Void String =
-    Err(parseErr(p, "expected 'def' or '}' inside instance block"))
-
-def parseUseSpec(p: Parser): Result UseSpec String = {
-    let origSp = peekTok(p).span;
-    let name = parseCallableIdent(p)?;
-    let aliasOpt = match peekTok(p).kind {
-        TkAs -> {
-            let _ = bumpTok(p);
-            Some(parseCallableIdent(p)?)
-        },
-        _ -> None,
-    };
+def parseUseSpec(s: GsCursor): GsResult UseSpec = {
+    let origSp = curAstSpan(s);
+    let name = parseCallableIdent(s)?;
+    let aliasOpt =
+        if (tryEatTok(s, TkAs)) {
+            commit(s);
+            Some(parseCallableIdent(s)?)
+        } else None;
     Ok(MkUseSpec { orig: name, alias: aliasOpt, origSpan: origSp })
 }
 
-def parseUseStatement(p: Parser): Result UseItem String = {
-    let lastSpan = cellNew(peekTok(p).span);
-    let seg0 = parseIdent(p)?;
-    let segs = cellNew([seg0]);
-    let isMulti = cellNew(false);
-    let specsCell: Cell (List UseSpec) = cellNew(Nil);
-
-    while (!cellGet(isMulti) && match peekTok(p).kind { TkDot -> true, _ -> false }) {
-        let _ = bumpTok(p);
-        match peekTok(p).kind {
-            TkLBrace -> {
-                let _ = bumpTok(p);
-                cellSet(isMulti, true);
-                let more = cellNew(true);
-                while (cellGet(more)) {
-                    match peekTok(p).kind {
-                        TkRBrace -> cellSet(more, false),
-                        _ -> {
-                            let sp = parseUseSpec(p)?;
-                            cellSet(specsCell, listAppend(cellGet(specsCell), [sp]));
-                            if (!eatComma(p)) cellSet(more, false) else ()
-                        },
-                    }
-                };
-                let _ = expectRBrace(p)?;
-                ()
-            },
-            _ -> {
-                cellSet(lastSpan, peekTok(p).span);
-                let s = parseIdent(p)?;
-                cellSet(segs, listAppend(cellGet(segs), [s]))
-            },
+def parseUseTailLoop(
+    s: GsCursor,
+    segsRev: List String,
+    lastSpan: Span
+): GsResult UseItem =
+    if (tryEatTok(s, TkDot)) {
+        commit(s);
+        if (atTok(s, TkLBrace)) {
+            let specs = between(tok(TkLBrace), tok(TkRBrace), sepEndBy(parseUseSpec, skipTok(TkComma)))(s)?;
+            Ok(UseMulti(listRev(segsRev), specs))
+        } else {
+            let nextSp = curAstSpan(s);
+            let seg = parseIdent(s)?;
+            parseUseTailLoop(s, Cons(seg, segsRev), nextSp)
         }
-    };
+    } else if (tryEatTok(s, TkAs)) {
+        commit(s);
+        let alias = parseIdent(s)?;
+        Ok(UseAlias(listRev(segsRev), alias, lastSpan))
+    } else Ok(UseSingle(listRev(segsRev), lastSpan))
 
-    if (cellGet(isMulti)) Ok(UseMulti(cellGet(segs), cellGet(specsCell)))
-    else match peekTok(p).kind {
-        TkAs -> {
-            let _ = bumpTok(p);
-            let alias = parseIdent(p)?;
-            Ok(UseAlias(cellGet(segs), alias, cellGet(lastSpan)))
-        },
-        _ -> Ok(UseSingle(cellGet(segs), cellGet(lastSpan))),
+def parseUseStatement(s: GsCursor): GsResult UseItem = {
+    let firstSp = curAstSpan(s);
+    let seg0 = parseIdent(s)?;
+    parseUseTailLoop(s, [seg0], firstSp)
+}
+
+def parseModPath(s: GsCursor): GsResult (List String) =
+    sepBy1(parseIdent, skipTok(TkDot))(s)
+
+def prependRev(xs: List a, accRev: List a): List a = match xs {
+    Nil -> accRev,
+    Cons(h, t) -> prependRev(t, Cons(h, accRev)),
+}
+
+def parseSubModItemsLoop(s: GsCursor, accRev: List ModuleItem): GsResult (List ModuleItem) = {
+    skipSemis(s)?;
+    if (atTok(s, TkRBrace) || curAtEnd(s)) Ok(listRev(accRev))
+    else {
+        let items = parseModuleItem(s)?;
+        skipSemis(s)?;
+        parseSubModItemsLoop(s, prependRev(items, accRev))
     }
 }
 
-def parseModPath(p: Parser): Result (List String) String = {
-    let first = parseIdent(p)?;
-    let segs = cellNew([first]);
-    while (match peekTok(p).kind { TkDot -> true, _ -> false }) {
-        let _ = bumpTok(p);
-        let nxt = parseIdent(p)?;
-        cellSet(segs, listAppend(cellGet(segs), [nxt]))
-    };
-    Ok(cellGet(segs))
-}
-
-def parseModuleItem(p: Parser): Result ModuleItem String = {
-    let startSp = peekTok(p).span;
-    let visOpt: Option Visibility = match peekTok(p).kind {
-        TkPub -> { let _ = bumpTok(p); Some(VisPublic) },
-        _ -> None,
-    };
+def parseModuleItem(s: GsCursor): GsResult (List ModuleItem) = {
+    let startSp = curAstSpan(s);
+    let visOpt: Option Visibility =
+        if (tryEatTok(s, TkPub)) {
+            commit(s);
+            Some(VisPublic)
+        } else None;
     let vis = match visOpt {
         Some(v) -> v,
         None -> VisPrivate,
     };
-    match peekTok(p).kind {
-        TkUse -> {
-            let _ = bumpTok(p);
-            let u = parseUseStatement(p)?;
-            Ok(ModUse(vis, u))
-        },
-        TkOpen -> {
-            let _ = bumpTok(p);
-            let mp = parseModPath(p)?;
-            Ok(ModUse(vis, UseGlob(mp)))
-        },
-        TkMod -> {
-            let _ = bumpTok(p);
-            let mname = parseIdent(p)?;
-            match peekTok(p).kind {
-                TkLBrace -> {
-                    let _ = bumpTok(p);
-                    let subItemsRev = cellNew(Nil);
-                    while ({ skipSemis(p); match peekTok(p).kind { TkRBrace -> false, TkEof -> false, _ -> true } }) {
-                        let it = parseModuleItem(p)?;
-                        let pend = cellGet(p.pendingItems);
-                        cellSet(p.pendingItems, Nil);
-                        cellSet(subItemsRev, prependRev(pend, Cons(it, cellGet(subItemsRev))));
-                        skipSemis(p)
-                    };
-                    let closeSp = expectRBrace(p)?;
-                    Ok(ModSub(vis, mname, listRev(cellGet(subItemsRev)), unionSpan(startSp, closeSp)))
-                },
-                _ -> Ok(ModDecl(vis, mname)),
-            }
-        },
-        _ -> {
-            let d = parseDefinition(p, visOpt)?;
-            Ok(ModDef(d.vis, d))
-        },
+    if (tryEatTok(s, TkUse)) {
+        commit(s);
+        let u = parseUseStatement(s)?;
+        Ok([ModUse(vis, u)])
+    } else if (tryEatTok(s, TkOpen)) {
+        commit(s);
+        let mp = parseModPath(s)?;
+        Ok([ModUse(vis, UseGlob(mp))])
+    } else if (tryEatTok(s, TkMod)) {
+        commit(s);
+        let mname = parseIdent(s)?;
+        if (tryEatTok(s, TkLBrace)) {
+            let subItems = parseSubModItemsLoop(s, Nil)?;
+            let closeSp = toAstSpan(eatTok(s, TkRBrace)?);
+            Ok([ModSub(vis, mname, subItems, unionSpan(startSp, closeSp))])
+        } else Ok([ModDecl(vis, mname)])
+    } else {
+        let (d, derivedItems) = parseDefinition(s, visOpt)?;
+        Ok(Cons(ModDef(d.vis, d), derivedItems))
     }
 }
 
-def isTopLevelModuleItemStart(p: Parser): Bool = match peekTok(p).kind {
-    TkPub -> true,
-    TkUse -> true,
-    TkOpen -> true,
-    TkMod -> true,
-    TkDef -> true,
-    TkExtern -> true,
-    TkData -> true,
-    TkType -> true,
-    TkConcept -> true,
-    TkInstance -> true,
-    TkIdent(_) -> {
-        let snap = savePos(p);
-        let hit = match tryParseForwardDecl(p) {
-            Some(_) -> true,
-            None -> false,
-        };
-        restorePos(p, snap);
-        hit
+def isTopLevelModuleItemStart(s: GsCursor): Bool = match peekTok(s) {
+    None -> false,
+    Some(e) -> match e.kind {
+        TkPub -> true,
+        TkUse -> true,
+        TkOpen -> true,
+        TkMod -> true,
+        TkDef -> true,
+        TkExtern -> true,
+        TkData -> true,
+        TkType -> true,
+        TkConcept -> true,
+        TkInstance -> true,
+        TkIdent(_) -> match peek(parseForwardDecl)(s) { Ok(_) -> true, Err(_) -> false },
+        TkLParen -> match peek(parseForwardDecl)(s) { Ok(_) -> true, Err(_) -> false },
+        _ -> false,
     },
-    TkLParen -> {
-        let snap = savePos(p);
-        let hit = match tryParseForwardDecl(p) {
-            Some(_) -> true,
-            None -> false,
-        };
-        restorePos(p, snap);
-        hit
-    },
-    _ -> false,
 }
 
-def eatScriptStmtSep(p: Parser): Result Void String =
-    if (isEof(p)) Ok(())
-    else if (eatSemi(p) || peekTok(p).hadNewline) { skipSemis(p); Ok(()) }
+def eatScriptStmtSep(s: GsCursor): GsResult Void =
+    if (curAtEnd(s)) Ok(())
+    else if (tryEatTok(s, TkSemi) || hadNewline(s)) skipSemis(s)
     else {
-        let _ = expectSym(p, ";")?;
+        let _ = eatTok(s, TkSemi)?;
         Ok(())
     }
 
-def parseTopLevelScriptStmt(p: Parser): Result BlockStmtItem String = match peekTok(p).kind {
-    TkLet -> {
-        let letSp = bumpTok(p).span;
-        let (isVar, vd, pat) = parseLetBindingHead(p)?;
-        let _ = expectSym(p, "=")?;
-        let val = parseExpr(p)?;
-        let res = match peekTok(p).kind {
-            TkIn -> {
-                let _ = bumpTok(p);
-                let body = parseExpr(p)?;
+def parseTopLevelScriptStmt(s: GsCursor): GsResult BlockStmtItem =
+    if (atTok(s, TkLet)) {
+        let letSp = toAstSpan(bumpTok(s)?.span);
+        commit(s);
+        let (isVar, vd, pat) = parseLetBindingHead(s)?;
+        let _ = eatSym(s, "=")?;
+        let val = parseExpr(s)?;
+        let res =
+            if (tryEatTok(s, TkIn)) {
+                let body = parseExpr(s)?;
                 let fullSp = unionSpan(letSp, body.pos);
-                let eForm = if (isVar) mkForm(fullSp, ExLet(vd, val, body))
+                let eForm =
+                    if (isVar) mkForm(fullSp, ExLet(vd, val, body))
                     else mkForm(fullSp, ExMatch(val, [MkMatchArm { pat: pat, guard: None, body: body }]));
                 BsExpr(eForm)
-            },
-            _ -> {
+            } else {
                 let fullSp = unionSpan(letSp, val.pos);
                 if (isVar) BsLetVar(fullSp, vd, val) else BsLetPat(fullSp, pat, val)
-            },
-        };
-        eatScriptStmtSep(p)?;
+            };
+        eatScriptStmtSep(s)?;
         Ok(res)
-    },
-    _ -> {
-        let e = parseExpr(p)?;
-        eatScriptStmtSep(p)?;
+    } else {
+        let e = parseExpr(s)?;
+        eatScriptStmtSep(s)?;
         Ok(BsExpr(e))
-    },
-}
+    }
 
 def findMainDefSpan(items: List ModuleItem): Option Span = match items {
     Nil -> None,
@@ -2248,36 +1665,33 @@ def normalizeScriptStmts(stmts: List BlockStmtItem): List BlockStmtItem = match 
     },
 }
 
-pub def parseFileModule(src: String, modPath: List String): Result FileModule String =
-    parseFileModuleInFile(src, modPath, 0)
+def parseFileLoop(
+    s: GsCursor,
+    allowTopStmts: Bool,
+    itemsRev: List ModuleItem,
+    stmtsRev: List BlockStmtItem
+): GsResult (List ModuleItem, List BlockStmtItem) = {
+    skipSemis(s)?;
+    if (curAtEnd(s)) Ok((listRev(itemsRev), listRev(stmtsRev)))
+    else if (allowTopStmts && !isTopLevelModuleItemStart(s)) {
+        let st = parseTopLevelScriptStmt(s)?;
+        parseFileLoop(s, allowTopStmts, itemsRev, Cons(st, stmtsRev))
+    } else {
+        let modItems = parseModuleItem(s)?;
+        parseFileLoop(s, allowTopStmts, prependRev(modItems, itemsRev), stmtsRev)
+    }
+}
 
-pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): Result FileModule String = {
-    let toks = tokenizeInFile(src, fileId)?;
-    let p = newParser(toks);
-    let itemsRev = cellNew(Nil);
-    let scriptStmtsRev: Cell (List BlockStmtItem) = cellNew(Nil);
+def parseFileModuleBody(s: GsCursor, modPath: List String): GsResult FileModule = {
     let allowTopStmts = match modPath { Nil -> true, _ -> false };
-    skipSemis(p);
-    while (!isEof(p)) {
-        if (allowTopStmts && !isTopLevelModuleItemStart(p)) {
-            let st = parseTopLevelScriptStmt(p)?;
-            cellSet(scriptStmtsRev, Cons(st, cellGet(scriptStmtsRev)))
-        } else {
-            let item = parseModuleItem(p)?;
-            let pend = cellGet(p.pendingItems);
-            cellSet(p.pendingItems, Nil);
-            cellSet(itemsRev, prependRev(pend, Cons(item, cellGet(itemsRev))));
-            skipSemis(p)
-        }
-    };
-    let items = listRev(cellGet(itemsRev));
-    match listRev(cellGet(scriptStmtsRev)) {
+    let (items, stmts) = parseFileLoop(s, allowTopStmts, Nil, Nil)?;
+    match stmts {
         Nil -> Ok(MkFileModule { modPath: modPath, items: items }),
-        stmts -> match findMainDefSpan(items) {
-            Some(mainSp) -> Err(formatSpanDiag("Parse error", mainSp, "cannot mix top-level script statements with an explicit `def main`")),
+        _ -> match findMainDefSpan(items) {
+            Some(mainSp) -> failSpanMsg(s, mainSp, "cannot mix top-level script statements with an explicit `def main`"),
             None -> {
                 let normStmts = normalizeScriptStmts(stmts);
-                let bodyForm = foldBlockItems(normStmts)?;
+                let bodyForm = foldBlockItems(s, emptySpan(), normStmts)?;
                 let mainForm = mkForm(bodyForm.pos, ExAbs(Nil, Some(TyVoid), bodyForm));
                 let mainDef = MkDef {
                     ident: "main",
@@ -2288,10 +1702,22 @@ pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): R
                 };
                 Ok(MkFileModule {
                     modPath: modPath,
-                    items: listRev(Cons(ModDef(VisPrivate, mainDef), cellGet(itemsRev))),
+                    items: listAppend(items, [ModDef(VisPrivate, mainDef)]),
                 })
             },
         },
+    }
+}
+
+pub def parseFileModule(src: String, modPath: List String): Result FileModule String =
+    parseFileModuleInFile(src, modPath, 0)
+
+pub def parseFileModuleInFile(src: String, modPath: List String, fileId: Int): Result FileModule String = {
+    let toks = tokenizeInFile(src, fileId)?;
+    let frozen = freezeLexTokens(toks);
+    match parseTokensFile((s) -> parseFileModuleBody(s, modPath), src, frozen, "<module>", fileId, describeGsTok) {
+        Ok(fm) -> Ok(fm),
+        Err(pe) -> Err(formatParseErrorDiag(pe)),
     }
 }
 

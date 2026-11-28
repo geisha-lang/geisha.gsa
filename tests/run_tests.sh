@@ -1117,6 +1117,8 @@ EOF
 assert_eq "mod_free_demand_loader_and_sibling_umbrella" "modfree:33" "$("$TMP_DIR/t17_modfree")"
 
 # 18. Decentralized Package Manager (`geisha init/add/fetch/build/run/test`, MVS, static Git index, C host, lockfile tamper check, overrides & Orphan Rule)
+SAVED_T18_GEISHA_HOME="${GEISHA_HOME:-}"
+SAVED_T18_GEISHA_INDEX="${GEISHA_INDEX:-}"
 export GEISHA_HOME="$TMP_DIR/ghome"
 export GEISHA_INDEX="$TMP_DIR/pkg_index.git"
 
@@ -1327,6 +1329,17 @@ if "$ABS_GEISHA" --src-root "$TMP_DIR/orphan_app/src" \
 fi
 echo "PASS [pkg_orphan_instance_rejected]: rejected cross-package orphan instance"
 PASS=$((PASS + 1))
+
+if [ -n "$SAVED_T18_GEISHA_HOME" ]; then
+    export GEISHA_HOME="$SAVED_T18_GEISHA_HOME"
+else
+    unset GEISHA_HOME
+fi
+if [ -n "$SAVED_T18_GEISHA_INDEX" ]; then
+    export GEISHA_INDEX="$SAVED_T18_GEISHA_INDEX"
+else
+    unset GEISHA_INDEX
+fi
 
 # 19. Zero-Copy Binary `Ptr` Read/Write + `floatToBits32` / `bits32ToFloat` + `ptrOffset`
 cat > "$TMP_DIR/t19_ptr_bin.gsa" << 'EOF'
