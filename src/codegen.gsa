@@ -208,10 +208,26 @@ def isAdtGeishaType(ty: Type): Bool = match ty {
     _ -> false,
 }
 
+pub data UnboxedVariantSlice {
+    MkUnboxedVariantSlice {
+        uvTag: Int,
+        uvStartIdx: Int,
+        uvFieldTys: List Type,
+    },
+}
+
+pub data UnboxedAdtSpec {
+    MkUnboxedAdtSpec {
+        uaHasTag: Bool,
+        uaFlatFields: List Type,
+        uaVariants: List UnboxedVariantSlice,
+    },
+}
+
 def gActiveAdtReg: Cell (StrMap AdtInfo) = cellNew(strMapNew())
 def gActiveEscape: Cell (Option EscapeInfo) = cellNew(None)
 def gActivePtrSize: Cell Int = cellNew(8)
-def gUnboxMemo: Cell (StrMap (Option (List Type))) = cellNew(strMapNew())
+def gUnboxMemo: Cell (StrMap (Option UnboxedAdtSpec)) = cellNew(strMapNew())
 
 def typeHasTyVar(ty: Type): Bool = match ty {
     TyVar(_) -> true,
@@ -246,20 +262,82 @@ def listContainsStr(xs: List String, target: String): Bool = match xs {
     Cons(h, t) -> if (h == target) true else listContainsStr(t, target),
 }
 
-// Transparent value-type unboxing for small, non-recursive, single-constructor ADTs (<= 64 bytes).
-// Memoized in `gUnboxMemo` with explicit cycle guard `visiting` so mutual recursion is O(1) and safe.
-def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (List Type) =
+def findUnboxedVariant(vs: List UnboxedVariantSlice, tag: Int): Option UnboxedVariantSlice = match vs {
+    Nil -> None,
+    Cons(v, r) -> if (v.uvTag == tag) Some(v) else findUnboxedVariant(r, tag),
+}
+
+def buildMultiVariantUnboxSpec(ainfo: AdtInfo, typeArgs: List Type): Option (UnboxedAdtSpec, Int) = {
+    let nVars = listLen(ainfo.variants);
+    if (ainfo.isCStruct || nVars < 2 || nVars > 4) None
+    else {
+        let sub = buildPairMap(ainfo.typeParams, typeArgs);
+        let nextIdx = cellNew(1);
+        let flatRev: Cell (List Type) = cellNew([TyCon("Int")]);
+        let slicesRev: Cell (List UnboxedVariantSlice) = cellNew(Nil);
+        let payloadVars = cellNew(0);
+        let hasTyVar = cellNew(false);
+        let cv = cellNew(ainfo.variants);
+        while (!cellGet(hasTyVar) && match cellGet(cv) { Nil -> false, _ -> true }) {
+            match cellGet(cv) {
+                Cons(vi, r) -> {
+                    let instFts = substTypeList(vi.fieldTypes, sub);
+                    if (typeListHasTyVar(instFts)) {
+                        cellSet(hasTyVar, true)
+                    } else {
+                        let startIdx = cellGet(nextIdx);
+                        let cnt = listLen(instFts);
+                        if (cnt > 0) cellSet(payloadVars, cellGet(payloadVars) + 1) else ();
+                        let cf = cellNew(instFts);
+                        while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                            match cellGet(cf) {
+                                Cons(ft, fr) -> {
+                                    cellSet(flatRev, Cons(ft, cellGet(flatRev)));
+                                    cellSet(cf, fr)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        cellSet(nextIdx, startIdx + cnt);
+                        cellSet(slicesRev, Cons(MkUnboxedVariantSlice {
+                            uvTag: vi.tag,
+                            uvStartIdx: startIdx,
+                            uvFieldTys: instFts,
+                        }, cellGet(slicesRev)))
+                    };
+                    cellSet(cv, r)
+                },
+                Nil -> (),
+            }
+        };
+        let pv = cellGet(payloadVars);
+        if (cellGet(hasTyVar) || pv == 0) None
+        else Some((MkUnboxedAdtSpec {
+            uaHasTag: true,
+            uaFlatFields: listRev(cellGet(flatRev)),
+            uaVariants: listRev(cellGet(slicesRev)),
+        }, pv))
+    }
+}
+
+// Transparent value-type unboxing for small, non-recursive ADTs:
+// - Single-constructor structs (`<= 64B` on LP64, or `@repr(C)`): `{ f0, f1, ... }` (no tag).
+// - Multi-constructor sums (`2..4` variants, `>= 1` payload variant, `<= 48B` for 1-payload sums
+//   such as `Option a` and `<= 32B` for 2+ payload sums such as `Result a e`): disjoint-slot
+//   tagged value `{ i32 tag, ...variantPayloads }` so GC pointer offsets are statically exact
+//   and `Some(ptrNull)` / `Some(None)` never collide with `None`.
+def unboxedAdtSpecRec(ty: Type, visiting: List String, depth: Int): Option UnboxedAdtSpec =
     if (depth > 32 || !isAdtGeishaType(ty)) None
     else match cellGet(gActiveEscape) {
         None -> None,
         Some(esc) -> {
             let key = unboxTypeKey(ty);
-            let memo = cellGet(gUnboxMemo);
-            match strMapGet(memo, key) {
-                Some(cached) -> cached,
-                None ->
-                    if (listContainsStr(visiting, key)) None
-                    else {
+            if (listContainsStr(visiting, key)) None
+            else {
+                let memo = cellGet(gUnboxMemo);
+                match strMapGet(memo, key) {
+                    Some(cached) -> cached,
+                    None -> {
                         let adtReg = cellGet(gActiveAdtReg);
                         let (adtName, typeArgs) = match ty {
                             TyCon(n) -> (n, Nil),
@@ -279,19 +357,49 @@ def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (Li
                                             if (typeListHasTyVar(concreteFields)) None
                                             else {
                                                 let nextVis = Cons(key, visiting);
-                                                let (sz, _) = structSizeAndAlignRec(concreteFields, cellGet(gActivePtrSize), nextVis, depth + 1);
-                                                if (ainfo.isCStruct || (sz > 0 && sz <= 64)) Some(concreteFields) else None
+                                                let (sz64, _) = structSizeAndAlignRec(concreteFields, 8, nextVis, depth + 1);
+                                                if (ainfo.isCStruct || (sz64 > 0 && sz64 <= 64))
+                                                    Some(MkUnboxedAdtSpec {
+                                                        uaHasTag: false,
+                                                        uaFlatFields: concreteFields,
+                                                        uaVariants: [MkUnboxedVariantSlice {
+                                                            uvTag: vinfo.tag,
+                                                            uvStartIdx: 0,
+                                                            uvFieldTys: concreteFields,
+                                                        }],
+                                                    })
+                                                else None
                                             }
                                         },
                                     },
-                                    _ -> None,
+                                    _ -> match buildMultiVariantUnboxSpec(ainfo, typeArgs) {
+                                        None -> None,
+                                        Some((spec, pv)) -> {
+                                            let nextVis = Cons(key, visiting);
+                                            let (sz64, _) = structSizeAndAlignRec(spec.uaFlatFields, 8, nextVis, depth + 1);
+                                            let maxBytes = if (pv == 1) 48 else 32;
+                                            if (sz64 > 0 && sz64 <= maxBytes) Some(spec) else None
+                                        },
+                                    },
                                 },
                             };
-                        strMapInsert(memo, key, res);
+                        match visiting {
+                            Nil -> strMapInsert(memo, key, res),
+                            _ -> (),
+                        };
                         res
                     },
+                }
             }
         },
+    }
+
+pub def unboxedAdtSpec(ty: Type): Option UnboxedAdtSpec = unboxedAdtSpecRec(ty, Nil, 0)
+
+def unboxedAdtFieldsRec(ty: Type, visiting: List String, depth: Int): Option (List Type) =
+    match unboxedAdtSpecRec(ty, visiting, depth) {
+        Some(spec) -> Some(spec.uaFlatFields),
+        None -> None,
     }
 
 pub def unboxedAdtFields(ty: Type): Option (List Type) = unboxedAdtFieldsRec(ty, Nil, 0)
@@ -569,20 +677,19 @@ pub def initCodegenLayoutContext(prog: CoreProgram): Void = {
     cellSet(gUnboxMemo, strMapNew())
 }
 
-pub def computeCodegenVariantGcMaskSExpr(baseName: String, targs: List Type, fieldTys: List Type): String =
-    match fieldTys {
-        Nil -> "static",
-        _ -> {
-            let adtTy = applyTypeArgs(TyCon(baseName), targs);
-            match unboxedAdtFields(adtTy) {
-                Some(_) -> "unboxed",
-                None -> match computeFieldsGcMask64(fieldTys, 8) {
-                    Some(m) -> "(mask " + i64ToStr(m) + ")",
-                    None -> "conservative",
-                },
-            }
+pub def computeCodegenVariantGcMaskSExpr(baseName: String, targs: List Type, fieldTys: List Type): String = {
+    let adtTy = applyTypeArgs(TyCon(baseName), targs);
+    match unboxedAdtFields(adtTy) {
+        Some(_) -> "unboxed",
+        None -> match fieldTys {
+            Nil -> "static",
+            _ -> match computeFieldsGcMask64(fieldTys, 8) {
+                Some(m) -> "(mask " + i64ToStr(m) + ")",
+                None -> "conservative",
+            },
         },
     }
+}
 
 def emitGcAllocForFields(mctx: ModEmitCtx, fctx: FnEmitCtx, byteSz: Int, fieldTys: List Type, startOff: Int): String =
     if (isNoscanList(fieldTys)) {
@@ -1168,6 +1275,10 @@ def isAllZeroBitsTerm(tm: TaggedTerm): Bool = match tm.tnode {
     TmLit(LitChar(c)) -> (c & 255) == 0,
     TmLit(LitFloat(f)) -> floatToBits64(f) == intToI64(0),
     TmLit(LitUnit) -> true,
+    TmMakeData(_, 0, Nil, _, _) -> match unboxedAdtSpec(schemeBody(tm.tscm)) {
+        Some(_) -> true,
+        None -> false,
+    },
     TmApplyDir(vd, Cons(arg, Nil)) ->
         if (vd.vname == "intToI64" || vd.vname == "intToFloat" || vd.vname == "intToF32" || vd.vname == "floatToF32" || vd.vname == "intToChar" || vd.vname == "i64ToInt")
             isAllZeroBitsTerm(arg)
@@ -1535,20 +1646,51 @@ def dbgTypeForGeishaType(mctx: ModEmitCtx, ty: Type): Int = {
     }
 }
 
+def buildUnboxedDbgFieldNames(vs: List UnboxedVariantSlice): List String = {
+    let rev: Cell (List String) = cellNew(["tag"]);
+    let cv = cellNew(vs);
+    while (match cellGet(cv) { Nil -> false, _ -> true }) {
+        match cellGet(cv) {
+            Cons(s, r) -> {
+                let k = cellNew(0);
+                let cf = cellNew(s.uvFieldTys);
+                while (match cellGet(cf) { Nil -> false, _ -> true }) {
+                    match cellGet(cf) {
+                        Cons(_, fr) -> {
+                            let idx = cellGet(k);
+                            cellSet(rev, Cons("v" + intToStr(s.uvTag) + "_" + intToStr(idx), cellGet(rev)));
+                            cellSet(k, idx + 1);
+                            cellSet(cf, fr)
+                        },
+                        Nil -> (),
+                    }
+                };
+                cellSet(cv, r)
+            },
+            Nil -> (),
+        }
+    };
+    listRev(cellGet(rev))
+}
+
 def dbgTypeForAdtOrOpaque(mctx: ModEmitCtx, ty: Type, key: String, ptrBits: Int): Int =
-    match unboxedAdtFields(ty) {
-        Some(fs) -> {
+    match unboxedAdtSpec(ty) {
+        Some(spec) -> {
             let structId = dbgAllocId(mctx);
             strMapInsert(mctx.mcDbgTypeCache, key, structId);
-            let adtBase = getCompBaseName(ty);
-            let fnames = match strMapGet(mctx.mcAdtReg, adtBase) {
-                Some(ainfo) -> match ainfo.variants {
-                    Cons(v, _) -> match v.fieldNames { Some(ns) -> ns, None -> Nil },
-                    Nil -> Nil,
-                },
-                None -> Nil,
+            if (!spec.uaHasTag) {
+                let adtBase = getCompBaseName(ty);
+                let fnames = match strMapGet(mctx.mcAdtReg, adtBase) {
+                    Some(ainfo) -> match ainfo.variants {
+                        Cons(v, _) -> match v.fieldNames { Some(ns) -> ns, None -> Nil },
+                        Nil -> Nil,
+                    },
+                    None -> Nil,
+                };
+                dbgEmitStructType(mctx, structId, key, fnames, spec.uaFlatFields)
+            } else {
+                dbgEmitStructType(mctx, structId, "gs_val_adt<" + key + ">", buildUnboxedDbgFieldNames(spec.uaVariants), spec.uaFlatFields)
             };
-            dbgEmitStructType(mctx, structId, key, fnames, fs);
             structId
         },
         None ->
@@ -4370,32 +4512,77 @@ def emitPatternCheck(
             }
         }
     },
-    PatCtor(ctorName, subPats) -> match unboxedAdtFields(valTy) {
-        Some(concreteFieldTys) -> {
-            let structLlvm = getValLlvmType(valTy);
-            let idx = cellNew(0);
-            let cp = cellNew(subPats);
-            let cgt = cellNew(concreteFieldTys);
-            while (match (cellGet(cp), cellGet(cgt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
-                match (cellGet(cp), cellGet(cgt)) {
-                    (Cons(sp, rp), Cons(gt, rgt)) -> {
-                        let i = cellGet(idx);
-                        match sp {
-                            PatWild -> (),
-                            _ -> {
-                                let rawFVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(i));
-                                let fVal = unpackStructFieldVal(fctx, gt, rawFVal);
-                                emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
-                            },
-                        };
-                        cellSet(idx, i + 1);
-                        cellSet(cp, rp);
-                        cellSet(cgt, rgt)
-                    },
-                    _ -> (),
+    PatCtor(ctorName, subPats) -> match unboxedAdtSpec(valTy) {
+        Some(spec) ->
+            if (!spec.uaHasTag) {
+                let structLlvm = getValLlvmType(valTy);
+                let idx = cellNew(0);
+                let cp = cellNew(subPats);
+                let cgt = cellNew(spec.uaFlatFields);
+                while (match (cellGet(cp), cellGet(cgt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                    match (cellGet(cp), cellGet(cgt)) {
+                        (Cons(sp, rp), Cons(gt, rgt)) -> {
+                            let i = cellGet(idx);
+                            match sp {
+                                PatWild -> (),
+                                _ -> {
+                                    let rawFVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(i));
+                                    let fVal = unpackStructFieldVal(fctx, gt, rawFVal);
+                                    emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
+                                },
+                            };
+                            cellSet(idx, i + 1);
+                            cellSet(cp, rp);
+                            cellSet(cgt, rgt)
+                        },
+                        _ -> (),
+                    }
                 }
-            }
-        },
+            } else {
+                let (adtName, _) = extractAdtNameAndArgs(mctx.mcAdtReg, valTy, ctorName);
+                match strMapGet(mctx.mcAdtReg, adtName) {
+                    None -> (),
+                    Some(ainfo) -> match findVariantByName(ainfo.variants, ctorName) {
+                        None -> (),
+                        Some(vinfo) -> {
+                            let structLlvm = getValLlvmType(valTy);
+                            let actualTag = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", 0");
+                            let tagEq = emitAssign(fctx, "icmp eq i32 " + actualTag + ", " + intToStr(vinfo.tag));
+                            let tagOkBlk = appendBlock(fctx, "pat.ctor.ok");
+                            emitCondBr(fctx, tagEq, tagOkBlk, failBlk);
+                            setInsertBlock(fctx, tagOkBlk);
+
+                            match findUnboxedVariant(spec.uaVariants, vinfo.tag) {
+                                None -> (),
+                                Some(slice) -> {
+                                    let idx = cellNew(0);
+                                    let cp = cellNew(subPats);
+                                    let cgt = cellNew(slice.uvFieldTys);
+                                    while (match (cellGet(cp), cellGet(cgt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                        match (cellGet(cp), cellGet(cgt)) {
+                                            (Cons(sp, rp), Cons(gt, rgt)) -> {
+                                                let i = cellGet(idx);
+                                                match sp {
+                                                    PatWild -> (),
+                                                    _ -> {
+                                                        let rawFVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + val + ", " + intToStr(slice.uvStartIdx + i));
+                                                        let fVal = unpackStructFieldVal(fctx, gt, rawFVal);
+                                                        emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
+                                                    },
+                                                };
+                                                cellSet(idx, i + 1);
+                                                cellSet(cp, rp);
+                                                cellSet(cgt, rgt)
+                                            },
+                                            _ -> (),
+                                        }
+                                    }
+                                },
+                            }
+                        },
+                    },
+                }
+            },
         None -> {
             let (adtName, typeArgs) = extractAdtNameAndArgs(mctx.mcAdtReg, valTy, ctorName);
             match strMapGet(mctx.mcAdtReg, adtName) {
@@ -4558,6 +4745,47 @@ def bindCtorSubPats(
     },
 }
 
+def bindUnboxedCtorSubPats(
+    mctx: ModEmitCtx,
+    fctx: FnEmitCtx,
+    scrutVal: String,
+    structLlvm: String,
+    spec: UnboxedAdtSpec,
+    tag: Int,
+    subPats: List Pattern,
+    localsCell: Cell (List (String, VarSlot)),
+    failBlk: Int
+): Void = match subPats {
+    Nil -> (),
+    _ -> match findUnboxedVariant(spec.uaVariants, tag) {
+        None -> (),
+        Some(slice) -> {
+            let idx = cellNew(0);
+            let cp = cellNew(subPats);
+            let cgt = cellNew(slice.uvFieldTys);
+            while (match (cellGet(cp), cellGet(cgt)) { (Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                match (cellGet(cp), cellGet(cgt)) {
+                    (Cons(sp, rp), Cons(gt, rgt)) -> {
+                        let i = cellGet(idx);
+                        match sp {
+                            PatWild -> (),
+                            _ -> {
+                                let rawFVal = emitAssign(fctx, "extractvalue " + structLlvm + " " + scrutVal + ", " + intToStr(slice.uvStartIdx + i));
+                                let fVal = unpackStructFieldVal(fctx, gt, rawFVal);
+                                emitPatternCheck(mctx, fctx, fVal, gt, sp, localsCell, failBlk)
+                            },
+                        };
+                        cellSet(idx, i + 1);
+                        cellSet(cp, rp);
+                        cellSet(cgt, rgt)
+                    },
+                    _ -> (),
+                }
+            }
+        },
+    },
+}
+
 def emitAdtSwitchMatch(
     mctx: ModEmitCtx,
     fctx: FnEmitCtx,
@@ -4572,9 +4800,19 @@ def emitAdtSwitchMatch(
     match strMapGet(mctx.mcAdtReg, adtName) {
         None -> llvmZeroValue(getValLlvmType(resTy)),
         Some(ainfo) -> {
-            let (adtStorageTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
-            let tagPtr = emitStructFieldPtr(fctx, adtStorageTy, scrutVal, 0);
-            let tagVal = emitLoad(fctx, "i32", tagPtr);
+            let unboxSpecOpt = unboxedAdtSpec(scrutTy);
+            let scrutStructLlvm = getValLlvmType(scrutTy);
+            let (adtStorageTy, tagVal) = match unboxSpecOpt {
+                Some(spec) -> {
+                    let tv = if (spec.uaHasTag) emitAssign(fctx, "extractvalue " + scrutStructLlvm + " " + scrutVal + ", 0") else "0";
+                    ("", tv)
+                },
+                None -> {
+                    let (stTy, _) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
+                    let tagPtr = emitStructFieldPtr(fctx, stTy, scrutVal, 0);
+                    (stTy, emitLoad(fctx, "i32", tagPtr))
+                },
+            };
 
             let contBlk = appendBlock(fctx, "sw.cont");
             let armBlks: Vec Int = vecNew();
@@ -4621,7 +4859,10 @@ def emitAdtSwitchMatch(
                         let armLocals = cellNew(locals);
                         match arm.caPat {
                             PatCtor(cname, subPats) -> match findVariantByName(ainfo.variants, cname) {
-                                Some(vinfo) -> bindCtorSubPats(mctx, fctx, scrutVal, adtStorageTy, ainfo, typeArgs, vinfo, subPats, armLocals, failBlk),
+                                Some(vinfo) -> match unboxSpecOpt {
+                                    Some(spec) -> bindUnboxedCtorSubPats(mctx, fctx, scrutVal, scrutStructLlvm, spec, vinfo.tag, subPats, armLocals, failBlk),
+                                    None -> bindCtorSubPats(mctx, fctx, scrutVal, adtStorageTy, ainfo, typeArgs, vinfo, subPats, armLocals, failBlk),
+                                },
                                 None -> (),
                             },
                             PatVar(vname, sp) -> emitPatternCheck(mctx, fctx, scrutVal, scrutTy, PatVar(vname, sp), armLocals, failBlk),
@@ -5015,9 +5256,15 @@ def genExpr(
                         let allVals = listRev(Cons("null", cellGet(argValsRev)));
                         let typedArgsStr = formatTypedArgs(allTys, allVals);
 
-                        let fnRetTy = match schemeBody(funDecl.vscm) {
-                            TyArr(_, _, r) -> r,
-                            _ -> retGeishaTy,
+                        let fnRetTy = match strMapGet(mctx.mcFns, calleeName) {
+                            Some(targetFd) -> match schemeBody(targetFd.fnScm) {
+                                TyArr(_, _, r) -> r,
+                                _ -> retGeishaTy,
+                            },
+                            None -> match schemeBody(funDecl.vscm) {
+                                TyArr(_, _, r) -> r,
+                                _ -> retGeishaTy,
+                            },
                         };
                         let retLlvm = getFnRetLlvmType(fnRetTy);
                         let isIoFn =
@@ -5173,30 +5420,29 @@ def genExpr(
             "0"
         },
 
-        TmMakeData(adtName, tag, fields, fieldTys, typeArgs) -> match fields {
-            Nil -> emitNullaryAdtConst(mctx, tag),
-            _ -> {
-                let fvalsRev = cellNew(Nil);
-                let cur = cellNew(fields);
-                while (match cellGet(cur) { Nil -> false, _ -> true }) {
-                    match cellGet(cur) {
-                        Cons(f, r) -> {
-                            cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
-                            cellSet(cur, r)
-                        },
-                        Nil -> (),
-                    }
-                };
-                let fieldVals = listRev(cellGet(fvalsRev));
-                let resTy = schemeBody(tm.tscm);
-                match unboxedAdtFields(resTy) {
-                    Some(_) -> {
-                        let structLlvm = getValLlvmType(resTy);
-                        let fLlvmTys = mapValLlvmTypes(fieldTys);
+        TmMakeData(adtName, tag, fields, fieldTys, typeArgs) -> {
+            let resTy = schemeBody(tm.tscm);
+            match unboxedAdtSpec(resTy) {
+                Some(spec) -> {
+                    let fvalsRev = cellNew(Nil);
+                    let cur = cellNew(fields);
+                    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                        match cellGet(cur) {
+                            Cons(f, r) -> {
+                                cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
+                                cellSet(cur, r)
+                            },
+                            Nil -> (),
+                        }
+                    };
+                    let fieldVals = listRev(cellGet(fvalsRev));
+                    let structLlvm = getValLlvmType(resTy);
+                    if (!spec.uaHasTag) {
+                        let fLlvmTys = mapValLlvmTypes(spec.uaFlatFields);
                         let agg = cellNew("undef");
                         let idx = cellNew(0);
                         let cv = cellNew(fieldVals);
-                        let cg = cellNew(fieldTys);
+                        let cg = cellNew(spec.uaFlatFields);
                         let ct = cellNew(fLlvmTys);
                         while (match (cellGet(cv), cellGet(cg), cellGet(ct)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
                             match (cellGet(cv), cellGet(cg), cellGet(ct)) {
@@ -5213,8 +5459,55 @@ def genExpr(
                             }
                         };
                         cellGet(agg)
-                    },
-                    None -> {
+                    } else if (tag == 0 && match fields { Nil -> true, _ -> false }) {
+                        "zeroinitializer"
+                    } else {
+                        let agg = cellNew("zeroinitializer");
+                        if (tag != 0) {
+                            cellSet(agg, emitAssign(fctx, "insertvalue " + structLlvm + " zeroinitializer, i32 " + intToStr(tag) + ", 0"))
+                        } else ();
+                        match findUnboxedVariant(spec.uaVariants, tag) {
+                            None -> (),
+                            Some(slice) -> {
+                                let fLlvmTys = mapValLlvmTypes(slice.uvFieldTys);
+                                let idx = cellNew(0);
+                                let cv = cellNew(fieldVals);
+                                let cg = cellNew(slice.uvFieldTys);
+                                let ct = cellNew(fLlvmTys);
+                                while (match (cellGet(cv), cellGet(cg), cellGet(ct)) { (Cons(_, _), Cons(_, _), Cons(_, _)) -> true, _ -> false }) {
+                                    match (cellGet(cv), cellGet(cg), cellGet(ct)) {
+                                        (Cons(fv, rv), Cons(fgt, rgt), Cons(flt, rt)) -> {
+                                            let i = cellGet(idx);
+                                            let packedFv = packStructFieldVal(fctx, fgt, fv);
+                                            cellSet(agg, emitAssign(fctx, "insertvalue " + structLlvm + " " + cellGet(agg) + ", " + flt + " " + packedFv + ", " + intToStr(slice.uvStartIdx + i)));
+                                            cellSet(idx, i + 1);
+                                            cellSet(cv, rv);
+                                            cellSet(cg, rgt);
+                                            cellSet(ct, rt)
+                                        },
+                                        _ -> (),
+                                    }
+                                }
+                            },
+                        };
+                        cellGet(agg)
+                    }
+                },
+                None -> match fields {
+                    Nil -> emitNullaryAdtConst(mctx, tag),
+                    _ -> {
+                        let fvalsRev = cellNew(Nil);
+                        let cur = cellNew(fields);
+                        while (match cellGet(cur) { Nil -> false, _ -> true }) {
+                            match cellGet(cur) {
+                                Cons(f, r) -> {
+                                    cellSet(fvalsRev, Cons(genExpr(mctx, fctx, f, locals, false), cellGet(fvalsRev)));
+                                    cellSet(cur, r)
+                                },
+                                Nil -> (),
+                            }
+                        };
+                        let fieldVals = listRev(cellGet(fvalsRev));
                         let (adtStorageTy, adtByteSz) = getAdtStorageTypeAndSize(mctx.mcAdtReg, adtName, typeArgs, mctx.mcPtrSize);
                         let useStack =
                             if (isRecursiveAdt(mctx.mcEscape, adtName)) false
@@ -5250,16 +5543,20 @@ def genExpr(
                         };
                         adtPtr
                     },
-                }
-            },
+                },
+            }
         },
 
         TmGetTag(node) -> {
             let nodeTy = schemeBody(node.tscm);
-            match unboxedAdtFields(nodeTy) {
-                Some(_) -> {
-                    let _ = genExpr(mctx, fctx, node, locals, false);
-                    "0"
+            match unboxedAdtSpec(nodeTy) {
+                Some(spec) -> {
+                    let v = genExpr(mctx, fctx, node, locals, false);
+                    if (spec.uaHasTag) {
+                        emitAssign(fctx, "extractvalue " + getValLlvmType(nodeTy) + " " + v + ", 0")
+                    } else {
+                        "0"
+                    }
                 },
                 None -> {
                     let adtPtr = genExpr(mctx, fctx, node, locals, false);

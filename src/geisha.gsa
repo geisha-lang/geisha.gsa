@@ -2313,7 +2313,7 @@ def compileCgusToCachedObjs(
     let ccFp =
         if (target == "wasm32") resolveWasmCc()
         else resolveNativeCc() + "|" + currentHostOs() + "|" + currentHostArch();
-    let keyPrefix = "cgu-v4|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
+    let keyPrefix = "cgu-v5|" + target + "|O" + optLevel + "|dbg" + (if (optDebug) "1" else "0") + "|contracts:" + cellGet(gContractMode) + "|" + minOs + "|" + (if (isExt) "ext" else "app") + "|" + ccFp + "\n";
     let pidStr = intToStr(c_getpid());
 
     let objsRev = cellNew(Nil);

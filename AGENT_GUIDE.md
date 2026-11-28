@@ -105,6 +105,7 @@ pub type StrPair = (String, String)
 ```
 - Field access: `p.x` (resolved statically by type).
 - Pattern matching is checked for exhaustiveness (Maranget algorithm).
+- **Transparent Value Unboxing**: Non-recursive single-constructor structs (`<= 64B`), `Option a` (`<= 48B`), and small non-recursive sum types such as `Result a e` (`2..4` variants, `<= 32B`) unbox transparently into SSA registers and flat array/struct slots with zero `gc_alloc` overhead, while preserving exact generational GC pointer masks (`Some(ptrNull)` and `Some(None)` remain distinct from `None`).
 
 ### Concepts & Instances (Typeclasses)
 ```geisha

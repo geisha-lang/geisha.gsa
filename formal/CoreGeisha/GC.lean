@@ -1739,8 +1739,15 @@ private def abiUnboxedFieldsFromSet (adts : List AdtDef) (unboxedSet : List Iden
     (adtName : Ident) : Option (List Ty) :=
   if unboxedSet.contains adtName then
     match adts.find? (·.name == adtName) with
-    | some { variants := [vinfo], .. } => some vinfo.fields
-    | _ => none
+    | some { variants := [vinfo], .. } =>
+      if vinfo.fields.isEmpty then none else some vinfo.fields
+    | some { variants := vs, .. } =>
+      if 2 ≤ vs.length && vs.length ≤ 4 then
+        let payloads := vs.foldr (fun v acc => v.fields ++ acc) []
+        if payloads.isEmpty then none else some (.int :: payloads)
+      else
+        none
+    | none => none
   else
     none
 
@@ -1937,9 +1944,7 @@ def checkEmittedGcMasks (adts : List AdtDef) (hasGcMasks : Bool)
   else
     let unboxedSet : List Ident :=
       (specs.filter (fun s =>
-        match s.variants with
-        | [(_, .unboxedValue)] => true
-        | _ => false)).map (·.adtName)
+        !s.variants.isEmpty && s.variants.all (fun p => p.2 == .unboxedValue))).map (·.adtName)
     let rec checkAdts : List AdtDef → Except String Unit
       | [] => .ok ()
       | adt :: rest =>
@@ -1955,16 +1960,27 @@ def checkEmittedGcMasks (adts : List AdtDef) (hasGcMasks : Bool)
                 match spec.variants.find? (·.1 == v.tag) with
                 | none => .error s!"missing vmask for ADT '{adt.name}' tag {v.tag}"
                 | some (_, .unboxedValue) =>
-                  if adt.variants.length != 1 || v.fields.isEmpty then
-                    .error s!"invalid unboxed ADT '{adt.name}': must have 1 non-empty variant"
+                  if !(unboxedSet.contains adt.name) then
+                    .error s!"inconsistent unboxed status on ADT '{adt.name}': partial variant unboxing"
                   else if abiHasInlineUnboxCycle adts unboxedSet adt.name then
                     .error s!"invalid unboxed ADT '{adt.name}': cyclic inline value layout"
                   else
-                    let (sz, _) := abiStructSizeAlign adts unboxedSet 34 v.fields
-                    if !(spec.isCStruct || (0 < sz && sz ≤ 64)) then
-                      .error s!"invalid unboxed ADT '{adt.name}': byte size {sz} exceeds 64B without @repr(C)"
-                    else
-                      checkVars vs
+                    match abiUnboxedFieldsFromSet adts unboxedSet adt.name with
+                    | none =>
+                      .error s!"invalid unboxed ADT '{adt.name}': unsupported variant shape for value unboxing"
+                    | some flatFields =>
+                      let (sz, _) := abiStructSizeAlign adts unboxedSet 34 flatFields
+                      let okSize :=
+                        if adt.variants.length == 1 then
+                          spec.isCStruct || (0 < sz && sz ≤ 64)
+                        else
+                          let payloadVars := (adt.variants.filter (fun vi => !vi.fields.isEmpty)).length
+                          let maxBytes := if payloadVars == 1 then 48 else 32
+                          !spec.isCStruct && 0 < sz && sz ≤ maxBytes
+                      if !okSize then
+                        .error s!"invalid unboxed ADT '{adt.name}': byte size {sz} exceeds unboxed ABI limit"
+                      else
+                        checkVars vs
                 | some (_, actual) =>
                   if unboxedSet.contains adt.name then
                     .error s!"inconsistent unboxed status on ADT '{adt.name}'"
