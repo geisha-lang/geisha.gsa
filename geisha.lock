@@ -4,6 +4,6 @@ version = 2
 [[pkg]]
 name = "parsec"
 url = "github.com/geisha-lang/parsec.gsa"
-version = "0.2.2"
-rev = "8c3fa4063ed525d58043e1e49264791f0157fba6"
-sha256 = "4e4e948176e2aece46f3472c47f24bc9015262f9c26b59a66da0f614cf9ee68b"
+version = "0.2.3"
+rev = "1e6ebbe35824d2a1cf43dbf75d2aea51050c8f3a"
+sha256 = "3ce3c42a786db9e22874bec3462dcab9276e27619693adefac125224e5295a9f"

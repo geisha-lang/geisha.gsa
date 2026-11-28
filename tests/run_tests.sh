@@ -8212,27 +8212,62 @@ case "$T51_OPEN_DIAG" in
     *) echo "FAIL [open_trailing_dot_diag]: expected identifier diagnostic, got: $T51_OPEN_DIAG" >&2; exit 1 ;;
 esac
 
-# Public `parser.{Parser, newParser, parseExpr}` source-module compatibility + deeply nested parenthesized types
+# Public `parser.{Parser, MkParser, newParser, parseExpr, parseDefinition}` compatibility + pendingItems + EOF trivia span
 cat > "$TMP_DIR/t51_api_compat.gsa" << 'EOF'
+use std.option.{Some, None}
 use std.result.{Ok, Err}
-use lexer.tokenizeInFile
-use parser.{Parser, newParser, parseExpr}
+use std.list.listLen
+use std.str.intToStr
+use ast.emptySpan
+use diag.{diagRegisterFile, diagReset, diagLastError}
+use lexer.{MkToken, TkEof, tokenizeInFile}
+use parser.{Parser, MkParser, newParser, parseExpr, parseDefinition}
 
 type Deep = ((((((((((((((((Int))))))))))))))))
 
-def checkOne(p: Parser): Bool = match parseExpr(p) {
-    Ok(_) -> true,
-    Err(_) -> false,
-}
-
-def main(): Void = match tokenizeInFile("40 + 2", 0) {
-    Ok(toks) -> printLn(if (checkOne(newParser(toks))) "compat-ok" else "compat-bad"),
-    Err(e) -> printLn(e),
+def main(): Void = {
+    diagReset();
+    let dsrc = "data Box a : Eq { Box(a) }";
+    let pendRes = match tokenizeInFile(dsrc, 0) {
+        Err(e) -> e,
+        Ok(dts) -> {
+            let p5 = MkParser {
+                tokens: dts,
+                idx: cellNew(0),
+                pushedSym: cellNew(None),
+                eofTok: MkToken { kind: TkEof, span: emptySpan(), hadNewline: true },
+                pendingItems: cellNew(Nil),
+            };
+            match parseDefinition(p5, None) {
+                Ok(d) -> d.ident + ":" + intToStr(listLen(cellGet(p5.pendingItems))),
+                Err(e) -> e,
+            }
+        },
+    };
+    let esrc = "1 2 +   \n// eof\n";
+    let fid = diagRegisterFile("case.gsa", esrc);
+    let seqRes = match tokenizeInFile(esrc, fid) {
+        Err(e) -> e,
+        Ok(ets) -> {
+            let p = newParser(ets);
+            let f1 = match parseExpr(p) {
+                Ok(x) -> intToStr(x.pos.start) + ":" + intToStr(x.pos.end),
+                Err(e) -> e,
+            };
+            let _ = parseExpr(p);
+            let eofLoc = match diagLastError() {
+                Some(dr) -> intToStr(dr.drStart) + ":" + intToStr(dr.drEnd),
+                None -> "none",
+            };
+            f1 + "|" + eofLoc
+        },
+    };
+    printLn(pendRes + "|" + seqRes)
 }
 EOF
 if [ -n "$PARSEC_PKG_SRC" ]; then
     "$GEISHA_BIN" --src-root src --pkg "parsec=$PARSEC_PKG_SRC" -o "$TMP_DIR/t51_api_compat$EXE_EXT" "$TMP_DIR/t51_api_compat.gsa"
-    assert_eq "parser_public_api_and_deep_paren_type" "compat-ok" "$("$TMP_DIR/t51_api_compat$EXE_EXT")"
+    assert_eq "parser_public_api_and_deep_paren_type" "Box:1|0:1|16:16" "$("$TMP_DIR/t51_api_compat$EXE_EXT")"
 fi
 
 # Cold `GEISHA_HOME` single-file check must NOT fetch ancestor `[deps]`, while project `check` reports corrupted `geisha.lock`
